@@ -2162,13 +2162,32 @@ export class WalletManager {
     try {
       // BIP44 path for QNet: m/44'/9999'/accountIndex'/0'/0'
       
-      // Step 1: Generate master key from seed (keep as WordArray)
+      // Step 1: Generate master key from seed (SLIP-0010)
+      // HMAC-SHA512(Key = "ed25519 seed", Data = seed)
+      // CRITICAL: Must match browser extension exactly!
       const seedWordArray = CryptoJS.lib.WordArray.create(seed);
-      let currentKey = CryptoJS.HmacSHA512(seedWordArray, "ed25519 seed");
+      const ed25519SeedKey = CryptoJS.enc.Utf8.parse("ed25519 seed");
+      const masterHmac = CryptoJS.HmacSHA512(seedWordArray, ed25519SeedKey);
       
-      // Split into key and chain code using WordArray directly
-      let keyWords = currentKey.words.slice(0, 8); // First 32 bytes (8 words)
-      let chainWords = currentKey.words.slice(8, 16); // Next 32 bytes
+      // Split into key and chain code (64 bytes total = 16 words)
+      let currentKeyBytes = new Uint8Array(32);
+      let currentChainCodeBytes = new Uint8Array(32);
+      
+      // Convert masterHmac (WordArray) to Uint8Array
+      for (let i = 0; i < 8; i++) {
+        const word = masterHmac.words[i];
+        currentKeyBytes[i * 4] = (word >>> 24) & 0xff;
+        currentKeyBytes[i * 4 + 1] = (word >>> 16) & 0xff;
+        currentKeyBytes[i * 4 + 2] = (word >>> 8) & 0xff;
+        currentKeyBytes[i * 4 + 3] = word & 0xff;
+      }
+      for (let i = 0; i < 8; i++) {
+        const word = masterHmac.words[i + 8];
+        currentChainCodeBytes[i * 4] = (word >>> 24) & 0xff;
+        currentChainCodeBytes[i * 4 + 1] = (word >>> 16) & 0xff;
+        currentChainCodeBytes[i * 4 + 2] = (word >>> 8) & 0xff;
+        currentChainCodeBytes[i * 4 + 3] = word & 0xff;
+      }
       
       // Step 2: Derive path m/44'/9999'/accountIndex'/0'/0'
       const levels = [
@@ -2179,42 +2198,52 @@ export class WalletManager {
         0x80000000  // 0' (hardened address index)
       ];
       
-      // Step 3: Derive each level (optimized with WordArray)
+      // Step 3: Derive each level (FIXED: match browser extension format exactly)
       for (const index of levels) {
-        // Build data: 0x00 || key || index (37 bytes total)
-        const dataWords = new Array(10); // 37 bytes = ~10 words
-        dataWords[0] = 0x00000000 | (keyWords[0] >>> 8); // 0x00 prefix + first 3 bytes of key
+        // HMAC-SHA512(Key = chainCode, Data = 0x00 || privateKey || index)
+        // Build data: 0x00 || key (32 bytes) || index (4 bytes) = 37 bytes total
+        const dataBytes = new Uint8Array(37);
+        dataBytes[0] = 0x00; // Prefix byte
+        dataBytes.set(currentKeyBytes, 1); // Copy 32 bytes of key
+        dataBytes[33] = (index >>> 24) & 0xff;
+        dataBytes[34] = (index >>> 16) & 0xff;
+        dataBytes[35] = (index >>> 8) & 0xff;
+        dataBytes[36] = index & 0xff;
         
-        // Copy key bytes (shifted by 1 byte)
-        for (let i = 0; i < 7; i++) {
-          dataWords[i + 1] = ((keyWords[i] << 8) | (keyWords[i + 1] >>> 24)) >>> 0;
+        // HMAC-SHA512 with chainCode as key
+        const dataWordArray = CryptoJS.lib.WordArray.create(dataBytes);
+        const chainCodeWordArray = CryptoJS.lib.WordArray.create(currentChainCodeBytes);
+        const derivedHmac = CryptoJS.HmacSHA512(dataWordArray, chainCodeWordArray);
+        
+        // Extract new key and chain code (64 bytes = 16 words)
+        const derivedBytes = new Uint8Array(64);
+        for (let i = 0; i < 16; i++) {
+          const word = derivedHmac.words[i];
+          derivedBytes[i * 4] = (word >>> 24) & 0xff;
+          derivedBytes[i * 4 + 1] = (word >>> 16) & 0xff;
+          derivedBytes[i * 4 + 2] = (word >>> 8) & 0xff;
+          derivedBytes[i * 4 + 3] = word & 0xff;
         }
-        dataWords[8] = ((keyWords[7] << 8) | (index >>> 24)) >>> 0;
-        dataWords[9] = (index << 8) >>> 0;
         
-        const dataWordArray = CryptoJS.lib.WordArray.create(dataWords, 37);
-        const chainWordArray = CryptoJS.lib.WordArray.create(chainWords);
-        
-        const derived = CryptoJS.HmacSHA512(dataWordArray, chainWordArray);
-        keyWords = derived.words.slice(0, 8);
-        chainWords = derived.words.slice(8, 16);
+        currentKeyBytes = derivedBytes.slice(0, 32);
+        currentChainCodeBytes = derivedBytes.slice(32, 64);
       }
       
       // Step 4: Generate public key from private key
-      const privateKeyWordArray = CryptoJS.lib.WordArray.create(keyWords);
+      // Use SHA-256 hash of private key (same as browser extension)
+      const privateKeyWordArray = CryptoJS.lib.WordArray.create(currentKeyBytes);
       const publicKeyHash = CryptoJS.SHA256(privateKeyWordArray);
       
-      // Convert to Uint8Array only at the end
+      // Convert to Uint8Array
       const privateKey = new Uint8Array(32);
       const publicKey = new Uint8Array(32);
       
+      // Copy private key directly
+      privateKey.set(currentKeyBytes);
+      
+      // Copy public key from hash
       for (let i = 0; i < 8; i++) {
-        const kw = keyWords[i];
         const pw = publicKeyHash.words[i];
-        privateKey[i * 4] = (kw >>> 24) & 0xff;
-        privateKey[i * 4 + 1] = (kw >>> 16) & 0xff;
-        privateKey[i * 4 + 2] = (kw >>> 8) & 0xff;
-        privateKey[i * 4 + 3] = kw & 0xff;
         publicKey[i * 4] = (pw >>> 24) & 0xff;
         publicKey[i * 4 + 1] = (pw >>> 16) & 0xff;
         publicKey[i * 4 + 2] = (pw >>> 8) & 0xff;

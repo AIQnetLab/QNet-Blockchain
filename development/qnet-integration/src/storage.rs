@@ -1310,6 +1310,19 @@ impl PersistentStorage {
         }
     }
     
+    /// PRODUCTION v2.45: Delete macroblock by index (for fork recovery)
+    /// Used when node is stuck on fork and needs to resync from network
+    pub fn delete_macroblock(&self, macroblock_index: u64) -> IntegrationResult<()> {
+        let microblocks_cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        
+        let key = format!("macroblock_{}", macroblock_index);
+        self.db.delete_cf(&microblocks_cf, key.as_bytes())?;
+        
+        println!("[INFO][STORAGE] delete_mb idx={}", macroblock_index);
+        Ok(())
+    }
+    
     pub fn get_stats(&self) -> IntegrationResult<StorageStats> {
         let mut stats = StorageStats::default();
         
@@ -2378,6 +2391,11 @@ impl Storage {
     /// Get macroblock by its index (height / 90)
     pub fn get_macroblock_by_height(&self, macroblock_index: u64) -> IntegrationResult<Option<Vec<u8>>> {
         self.persistent.get_macroblock_by_height(macroblock_index)
+    }
+    
+    /// PRODUCTION v2.45: Delete macroblock by index (for fork recovery)
+    pub fn delete_macroblock(&self, macroblock_index: u64) -> IntegrationResult<()> {
+        self.persistent.delete_macroblock(macroblock_index)
     }
     
     /// Save state snapshot for efficient storage

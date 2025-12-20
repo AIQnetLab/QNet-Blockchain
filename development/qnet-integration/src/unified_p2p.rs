@@ -6971,8 +6971,6 @@ impl SimplifiedP2P {
             let genesis_ips = get_genesis_bootstrap_ips();
             let mut genesis_peers = Vec::new();
             
-            println!("[P2P] 📋 Building peer list from bootstrap config (deterministic for consensus)");
-            
             for (i, ip) in genesis_ips.iter().enumerate() {
                 let node_id = format!("genesis_node_{:03}", i + 1);
                 let peer_addr = format!("{}:8001", ip);
@@ -7004,8 +7002,6 @@ impl SimplifiedP2P {
                     match peer_data {
                         Some(real_peer) => {
                             // PRODUCTION: Use ALL real data from P2P state
-                            println!("[P2P]   ├── {} (rep: {:.1}%, latency: {}ms)", 
-                                     real_peer.id, real_peer.consensus_score, real_peer.latency_ms);
                             genesis_peers.push(real_peer);
                         }
                         None => {
@@ -7049,16 +7045,11 @@ impl SimplifiedP2P {
                                     failed_pings: 0,
                                     last_block_height: 0,  // v2.24.3
                                 };
-                                println!("[P2P]   ├── {} (from active_nodes registry, rep: {:.1}%)", 
-                                         node_id, active_info.reputation);
                                 genesis_peers.push(peer_info);
                             } else {
                                 // CRITICAL FIX v2.19.25: Check QUIC connections as last resort
                                 if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
-                                    println!("[P2P]   ├── {} (from QUIC, rep: {:.1}%)", node_id, peer_info.consensus_score);
                                     genesis_peers.push(peer_info);
-                                } else {
-                                    println!("[P2P]   ├── {} (NOT CONNECTED - skipping)", node_id);
                                 }
                             }
                         }
@@ -7066,7 +7057,6 @@ impl SimplifiedP2P {
                 }
             }
             
-            println!("[P2P] ✅ Peer list: {} REAL connected nodes (all data from P2P state)", genesis_peers.len());
             return genesis_peers;
         }
         
@@ -7274,17 +7264,12 @@ impl SimplifiedP2P {
                         match peer_data {
                             Some(real_peer) => {
                                 // PRODUCTION: Use ALL real data from P2P state
-                                println!("[P2P]   ├── {} (rep: {:.1}%, latency: {}ms)", 
-                                         real_peer.id, real_peer.consensus_score, real_peer.latency_ms);
                                 all_validated_peers.push(real_peer);
                             }
                             None => {
                                 // CRITICAL FIX v2.19.25: Check QUIC connections as last resort
                                 if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
-                                    println!("[P2P]   ├── {} (from QUIC, rep: {:.1}%)", node_id, peer_info.consensus_score);
                                     all_validated_peers.push(peer_info);
-                                } else {
-                                    println!("[P2P]   ├── {} (NOT CONNECTED - skipping)", node_id);
                                 }
                             }
                         }

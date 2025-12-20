@@ -29,6 +29,7 @@ import {
   checkServerNodeStatus,
   getAllNodesByWallet
 } from '../services/PushService';
+import logger from '../utils/logger';
 
 // 1DEV Burn Tracker Contract (same as browser extension)
 const BURN_CONTRACT_PROGRAM_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
@@ -901,8 +902,9 @@ const WalletScreen = () => {
   // - Full/Super/Genesis: Server is the node, app just monitors via single API call
   // - NEW: Load ALL nodes owned by this wallet for unified display
   useEffect(() => {
-    if (activeTab === 'node' && wallet && wallet.publicKey) {
+    if (activeTab === 'node' && wallet) {
       // UNIFIED: Load ALL nodes for this wallet (Light + Full + Super + Genesis)
+      // Uses QNet address for lookup (Genesis nodes use QNet addresses)
       loadAllUserNodes();
       
       // Also load specific node data if activated
@@ -915,10 +917,7 @@ const WalletScreen = () => {
           loadNodeRewards();
           loadLightNodeStatus();
           
-          // Start ping interval if not already running (for responding to challenges)
-          if (!global.nodePingInterval) {
-            startNodePingInterval();
-          }
+          // No automatic ping interval - user can manually refresh
           
           // NO POLLING - user can pull-to-refresh
           // Light nodes get push notifications for pings anyway
@@ -991,7 +990,29 @@ const WalletScreen = () => {
     if (activatedNodeType === 'light' || !activationCode) return;
     
     try {
-      const status = await checkServerNodeStatus(activationCode);
+      // For Genesis nodes, also pass nodePseudonym as nodeId for better API lookup
+      const nodeId = (activatedNodeType === 'super' && nodePseudonym && nodePseudonym.startsWith('genesis_node_')) 
+        ? nodePseudonym 
+        : null;
+      
+      console.log(`[Node] Loading server node status: activationCode=${activationCode}, nodeId=${nodeId}, nodeType=${activatedNodeType}`);
+      
+      const status = await checkServerNodeStatus(activationCode, nodeId);
+      
+      console.log(`[Node] Server node status loaded:`, {
+        success: status.success,
+        isOnline: status.isOnline,
+        nodeId: status.nodeId,
+        nodeType: status.nodeType,
+        heartbeatCount: status.heartbeatCount,
+        requiredHeartbeats: status.requiredHeartbeats,
+        pendingRewards: status.pendingRewards,
+        pendingRewards_type: typeof status.pendingRewards,
+        isRewardEligible: status.isRewardEligible,
+        reputation: status.reputation,
+        error: status.error
+      });
+      
       setServerNodeStatus(status);
       
       // Also load pseudonym for display
@@ -1000,27 +1021,214 @@ const WalletScreen = () => {
       if (status.needsAttention) {
         console.log('[Node] Server node needs attention:', status.message);
       }
+      
+      if (!status.success) {
+        console.error('[Node] Server node status check failed:', status.error);
+      }
     } catch (error) {
-      console.error('Failed to load server node status:', error);
+      console.error('[Node] Failed to load server node status:', error);
     }
   };
   
   // Load ALL nodes owned by this wallet (unified view for Light + Full + Super + Genesis)
   const loadAllUserNodes = async () => {
-    if (!wallet || !wallet.publicKey || loadingAllNodes) return;
+    if (!wallet || loadingAllNodes) return;
+    
+    // CRITICAL: Use QNet address for node lookup (not Solana address)
+    // Genesis nodes and server nodes are registered with QNet addresses
+    const walletAddress = wallet.qnetAddress || wallet.address;
+    if (!walletAddress) {
+      console.log('[Nodes] ❌ No QNet address available for node lookup');
+      console.log('[Nodes] Wallet object:', { 
+        hasQnetAddress: !!wallet.qnetAddress, 
+        hasAddress: !!wallet.address,
+        hasPublicKey: !!wallet.publicKey,
+        qnetAddress: wallet.qnetAddress,
+        address: wallet.address,
+        publicKey: wallet.publicKey?.substring(0, 20) + '...'
+      });
+      return;
+    }
+    
+    console.log(`[Nodes] Checking nodes for QNet address: ${walletAddress.substring(0, 20)}...`);
     
     setLoadingAllNodes(true);
     try {
-      const result = await getAllNodesByWallet(wallet.publicKey);
+      const result = await getAllNodesByWallet(walletAddress);
       
       if (result.success) {
         setAllUserNodes(result.nodes || []);
         console.log(`[Nodes] Loaded ${result.nodes?.length || 0} nodes for wallet`);
+        if (result.nodes && result.nodes.length > 0) {
+          console.log('[Nodes] Found nodes:', result.nodes.map(n => ({ 
+            node_id: n.node_id, 
+            node_type: n.node_type, 
+            status: n.status 
+          })));
+        } else {
+          console.log('[Nodes] No nodes found in API response');
+        }
         
-        // If we found server nodes that aren't activated locally, show them
+        // AUTO-LINK: If we found server nodes that aren't activated locally, link them automatically
         const serverNodes = (result.nodes || []).filter(n => n.node_type !== 'light' && n.status === 'active');
+        
         if (serverNodes.length > 0 && !activatedNodeType) {
           console.log('[Nodes] Found active server nodes - auto-linking...');
+          
+          // Priority 1: Check for Genesis nodes first (bootstrap nodes)
+          const genesisNodes = serverNodes.filter(n => 
+            n.node_id && n.node_id.startsWith('genesis_node_')
+          );
+          
+          if (genesisNodes.length > 0) {
+            // Auto-link first Genesis node found
+            const genesisNode = genesisNodes[0];
+            const bootstrapId = genesisNode.node_id.replace('genesis_node_', '');
+            const genesisCode = `QNET-BOOT-${bootstrapId}-STRAP`;
+            
+            console.log(`[Nodes] Auto-linking Genesis node: ${genesisNode.node_id}`);
+            
+            // Set activation state
+            setActivationCode(genesisCode);
+            setActivatedNodeType('super'); // Genesis nodes are Super nodes
+            setNodePseudonym(genesisNode.node_id);
+            
+            // Save to AsyncStorage
+            await AsyncStorage.setItem(`node_pseudonym_${genesisCode}`, genesisNode.node_id);
+            await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+              nodeType: 'super',
+              code: genesisCode,
+              pseudonym: genesisNode.node_id,
+              isGenesis: true,
+              bootstrapId: bootstrapId,
+              timestamp: Date.now()
+            }));
+            
+            // Load server status immediately
+            loadServerNodeStatus();
+            
+            console.log(`[Nodes] Auto-linked Genesis node ${genesisNode.node_id}`);
+            return; // Don't process other nodes if Genesis found
+          }
+          
+          // Priority 2: Auto-link other server nodes (Full/Super)
+          const otherServerNodes = serverNodes.filter(n => 
+            !n.node_id || !n.node_id.startsWith('genesis_node_')
+          );
+          
+          if (otherServerNodes.length > 0) {
+            // Auto-link first active server node found
+            const serverNode = otherServerNodes[0];
+            const activationCode = serverNode.activation_code || serverNode.node_id;
+            
+            console.log(`[Nodes] Auto-linking ${serverNode.node_type} node: ${serverNode.node_id || activationCode}`);
+            
+            // Set activation state
+            setActivationCode(activationCode);
+            setActivatedNodeType(serverNode.node_type);
+            setNodePseudonym(serverNode.node_id || serverNode.pseudonym);
+            
+            // Save to AsyncStorage
+            if (serverNode.node_id) {
+              await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, serverNode.node_id);
+            }
+            await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+              nodeType: serverNode.node_type,
+              code: activationCode,
+              pseudonym: serverNode.node_id || serverNode.pseudonym,
+              timestamp: Date.now()
+            }));
+            
+            // Load server status immediately
+            loadServerNodeStatus();
+            
+            console.log(`[Nodes] Auto-linked ${serverNode.node_type} node`);
+          }
+        }
+        
+        // AUTO-LINK: Also check if wallet matches Genesis wallet (even if not in API response)
+        if (!activatedNodeType && wallet) {
+          const GENESIS_WALLETS = {
+            '001': '7bc83500fd08525250feonff5503d0dce4dbdede8',
+            '002': '714a0f700a4dbcc0d88eonf635ace76ed2eb9a186',
+            '003': '357842d58e86cc300cfeon0203e16eef3e7044db1',
+            '004': '4f710f9b3152659c56aeond4c05f2731a1890aedf',
+            '005': '8fa8ebe9e85dee95080eond0a7365096572f03e1c',
+          };
+          
+          const userQNetAddress = (wallet.qnetAddress || wallet.address || '').toLowerCase();
+          
+          if (!userQNetAddress) {
+            console.log('[Nodes] No QNet address available for Genesis check');
+            return;
+          }
+          
+          console.log(`[Nodes] Checking Genesis wallets. User QNet: ${userQNetAddress.substring(0, 20)}...`);
+          console.log(`[Nodes] Full QNet address: ${userQNetAddress}`);
+          
+          // Check if wallet matches any Genesis wallet
+          for (const [bootstrapId, genesisWallet] of Object.entries(GENESIS_WALLETS)) {
+            const normalizedGenesis = genesisWallet.toLowerCase();
+            
+            // Check exact match first
+            let isMatch = false;
+            if (userQNetAddress === normalizedGenesis) {
+              console.log(`[Nodes] Exact match with Genesis ${bootstrapId}`);
+              isMatch = true;
+            } else {
+              // Check format match (legacy vs new format)
+              const userPart1 = userQNetAddress.substring(0, 19);
+              const expectedPart1 = normalizedGenesis.substring(0, 19);
+              
+              if (userPart1 === expectedPart1 && userQNetAddress.includes('eon')) {
+                console.log(`[Nodes] Format match with Genesis ${bootstrapId} (first 19 chars match)`);
+                isMatch = true;
+              } else {
+                console.log(`[Nodes] No match with Genesis ${bootstrapId} (user: ${userPart1}, expected: ${expectedPart1})`);
+              }
+            }
+            
+            if (isMatch) {
+              // Wallet matches Genesis wallet - check if node is active via API
+              const genesisNodeId = `genesis_node_${bootstrapId}`;
+              const genesisCode = `QNET-BOOT-${bootstrapId}-STRAP`;
+              
+              console.log(`[Nodes] Wallet matches Genesis ${bootstrapId}, checking node status...`);
+              
+              try {
+                // Check if Genesis node is active in network
+                const status = await checkServerNodeStatus(genesisCode, genesisNodeId);
+                
+                if (status.success && status.isOnline) {
+                  console.log(`[Nodes] Genesis node ${genesisNodeId} is active - auto-linking`);
+                  
+                  // Set activation state
+                  setActivationCode(genesisCode);
+                  setActivatedNodeType('super');
+                  setNodePseudonym(genesisNodeId);
+                  
+                  // Save to AsyncStorage
+                  await AsyncStorage.setItem(`node_pseudonym_${genesisCode}`, genesisNodeId);
+                  await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                    nodeType: 'super',
+                    code: genesisCode,
+                    pseudonym: genesisNodeId,
+                    isGenesis: true,
+                    bootstrapId: bootstrapId,
+                    timestamp: Date.now()
+                  }));
+                  
+                  // Load server status immediately
+                  loadServerNodeStatus();
+                  
+                  break; // Found matching Genesis node, stop checking
+                }
+              } catch (error) {
+                console.log(`[Nodes] Genesis node ${genesisNodeId} check failed:`, error.message);
+                // Continue checking other Genesis nodes
+              }
+            }
+          }
         }
       }
     } catch (error) {
@@ -1062,16 +1270,7 @@ const WalletScreen = () => {
       const rewards = await walletManager.getNodeRewards(activatedNodeType, activationCode, wallet.publicKey);
       setNodeRewards(rewards);
       
-      // Auto-ping node if needed (4 hour interval)
-      if (rewards && !rewards.isActive && password) {
-        // Send automatic ping to keep node active
-        const pingResult = await walletManager.pingNode(activationCode, wallet.publicKey, activatedNodeType, password);
-        if (pingResult.success) {
-          // Reload rewards after successful ping
-          const updatedRewards = await walletManager.getNodeRewards(activatedNodeType, activationCode, wallet.publicKey);
-          setNodeRewards(updatedRewards);
-        }
-      }
+      // No auto-ping - user can manually ping via UI if needed
       
       // Load system-generated pseudonym
       await loadNodePseudonym(activationCode);
@@ -1198,7 +1397,7 @@ const WalletScreen = () => {
           );
         }
         
-        console.log('[GENESIS] ✅ Wallet verification passed for node', bootstrapId);
+        console.log('[GENESIS] Wallet verification passed for node', bootstrapId);
         
         // Genesis node verified - set up as Super node
         setActivationCode(code);
@@ -1268,7 +1467,7 @@ const WalletScreen = () => {
         }));
         
         // Start automatic ping interval (every 4 hours)
-        startNodePingInterval();
+        // No automatic ping interval
         
         showAlert(
           'Node Activated!',
@@ -1289,44 +1488,7 @@ const WalletScreen = () => {
     }
   };
   
-  // Start automatic ping interval for active nodes
-  const startNodePingInterval = () => {
-    // Clear any existing interval
-    if (global.nodePingInterval) {
-      clearInterval(global.nodePingInterval);
-    }
-    
-    // Ping every 4 hours (14400000 ms)
-    global.nodePingInterval = setInterval(async () => {
-      if (activationCode && wallet && password) {
-        const pingResult = await walletManager.pingNode(
-          activationCode,
-          wallet.publicKey,
-          activatedNodeType || 'light',
-          password
-        );
-        
-        if (pingResult.success) {
-          // Update rewards after successful ping
-          loadNodeRewards();
-        }
-      }
-    }, 4 * 60 * 60 * 1000); // 4 hours
-    
-    // Also do an immediate ping
-    if (activationCode && wallet && password) {
-      walletManager.pingNode(
-        activationCode,
-        wallet.publicKey,
-        activatedNodeType || 'light',
-        password
-      ).then(result => {
-        if (result.success) {
-          loadNodeRewards();
-        }
-      });
-    }
-  };
+  // No automatic ping interval - user can manually refresh via pull-to-refresh
   
   // Get the correct wallet address for claims based on activation phase and node type
   // SECURITY: Different node types use different wallet address formats
@@ -1577,9 +1739,7 @@ const WalletScreen = () => {
                       timestamp: Date.now()
                     }));
                     // Start ping interval for active node
-                    if (!global.nodePingInterval) {
-                      setTimeout(() => startNodePingInterval(), 1000);
-                    }
+                    // No automatic ping interval
                   } else {
                     // Code doesn't match current wallet, clear it
                     setActivatedNodeType(null);
@@ -1592,9 +1752,7 @@ const WalletScreen = () => {
               setActivatedNodeType(nodeType);
               setActivationCode(code.code || code);
               // Start ping interval for active node
-              if (!global.nodePingInterval) {
-                setTimeout(() => startNodePingInterval(), 1000);
-              }
+              // No automatic ping interval
             }
           } else {
             // No codes found, ensure state is cleared
@@ -3851,6 +4009,32 @@ const WalletScreen = () => {
             scrollEnabled={true}
             onScroll={handleUserActivity}
             scrollEventThrottle={500}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={async () => {
+                  setRefreshing(true);
+                  try {
+                    // Reload all node data
+                    await loadAllUserNodes();
+                    if (activatedNodeType === 'light') {
+                      await loadNodeRewards();
+                      await loadLightNodeStatus();
+                    } else if (activatedNodeType) {
+                      await loadServerNodeStatus();
+                    }
+                  } catch (error) {
+                    console.error('Error refreshing node data:', error);
+                  } finally {
+                    setRefreshing(false);
+                  }
+                }}
+                colors={['#00d4ff']}
+                tintColor="#00d4ff"
+                titleColor="#00d4ff"
+                title="Pull to refresh"
+              />
+            }
           >
             <Text style={styles.tabTitle}>Node Monitoring</Text>
             
@@ -3922,23 +4106,24 @@ const WalletScreen = () => {
                   Activate a Light node here, or use your EON address when setting up a Full/Super node on a server.
                 </Text>
                 
-                {/* Copy EON address for server activation */}
+                {/* Copy QNet EON address for server activation */}
                 <View style={{padding: 10, backgroundColor: '#1a1a2e', borderRadius: 8}}>
                   <Text style={[styles.nodeMonitoringLabel, {fontSize: 11, color: '#888'}]}>
-                    Your EON Address (for server node activation):
+                    Your QNet Address (for server node activation):
                   </Text>
                   <TouchableOpacity 
                     onPress={() => {
-                      if (wallet?.publicKey) {
-                        Clipboard.setString(wallet.publicKey);
-                        setCopiedAddress(wallet.publicKey);
+                      const qnetAddr = wallet?.qnetAddress || wallet?.address;
+                      if (qnetAddr) {
+                        Clipboard.setString(qnetAddr);
+                        setCopiedAddress(qnetAddr);
                         setTimeout(() => setCopiedAddress(''), 2000);
                       }
                     }}
                     style={{marginTop: 6}}
                   >
                     <Text style={[styles.nodeMonitoringLabel, {fontSize: 11, color: '#007AFF'}]}>
-                      {copiedAddress === wallet?.publicKey ? 'Copied!' : `Copy: ${wallet?.publicKey?.substring(0, 20)}...`}
+                      {copiedAddress === (wallet?.qnetAddress || wallet?.address) ? 'Copied!' : `Copy: ${(wallet?.qnetAddress || wallet?.address)?.substring(0, 20)}...`}
                     </Text>
                   </TouchableOpacity>
                 </View>
@@ -4012,7 +4197,7 @@ const WalletScreen = () => {
                         ) : lightNodeStatus?.isActive ? (
                           <View style={[styles.serverActivationNotice, {backgroundColor: '#34c75920', borderColor: '#34c759'}]}>
                             <Text style={[styles.serverActivationText, {color: '#34c759'}]}>
-                              ✅ Node Active - Responding to pings
+                              Node Active - Responding to pings
                             </Text>
                             <Text style={styles.serverActivationSubtext}>
                               Next ping: {lightNodeStatus.nextPingTime ? 
@@ -4058,29 +4243,8 @@ const WalletScreen = () => {
                     )
                   ) : (
                     <>
-                      {/* Server Node Status from Network */}
-                      {serverNodeStatus?.success ? (
-                        serverNodeStatus.isOnline ? (
-                          <View style={[styles.serverActivationNotice, {backgroundColor: '#34c75920', borderColor: '#34c759'}]}>
-                            <Text style={[styles.serverActivationText, {color: '#34c759'}]}>
-                              ✅ Server Online - {serverNodeStatus.heartbeatCount}/{serverNodeStatus.requiredHeartbeats} heartbeats
-                            </Text>
-                            <Text style={styles.serverActivationSubtext}>
-                              Reputation: {serverNodeStatus.reputation?.toFixed(1) || 'N/A'} • 
-                              Block: {serverNodeStatus.currentBlockHeight || 'N/A'}
-                            </Text>
-                          </View>
-                        ) : (
-                          <View style={[styles.serverActivationNotice, {backgroundColor: '#ff3b3020', borderColor: '#ff3b30'}]}>
-                            <Text style={[styles.serverActivationText, {color: '#ff3b30'}]}>
-                              ⚠️ Server Offline - Last seen {Math.floor((serverNodeStatus.lastSeenAgoSeconds || 0) / 60)} min ago
-                            </Text>
-                            <Text style={styles.serverActivationSubtext}>
-                              {serverNodeStatus.message || 'Check your server is running'}
-                            </Text>
-                          </View>
-                        )
-                      ) : (
+                      {/* Server Node Status from Network - Status shown in badge, no need for separate notice */}
+                      {!serverNodeStatus?.success && (
                         <View style={styles.serverActivationNotice}>
                           <Text style={styles.serverActivationText}>
                             {activatedNodeType === 'full' ? 'Full' : 'Super'} nodes require server activation
@@ -4146,7 +4310,7 @@ const WalletScreen = () => {
                         <Text style={[styles.rewardValue, {
                           color: serverNodeStatus.isRewardEligible ? '#34c759' : '#ff9500'
                         }]}>
-                          {serverNodeStatus.heartbeatCount || 0}/{serverNodeStatus.requiredHeartbeats || 8} 
+                          {serverNodeStatus.heartbeatCount || 0}/{serverNodeStatus.requiredHeartbeats || (activatedNodeType === 'super' ? 9 : activatedNodeType === 'full' ? 8 : 8)} 
                           {serverNodeStatus.isRewardEligible ? ' ✓' : ' (need more)'}
                         </Text>
                       </View>
@@ -4156,7 +4320,12 @@ const WalletScreen = () => {
                         <Text style={[styles.rewardValue, {
                           color: (serverNodeStatus.reputation || 0) >= 70 ? '#34c759' : '#ff9500'
                         }]}>
-                          {serverNodeStatus.reputation?.toFixed(1) || '0.0'}
+                          {(() => {
+                            const rep = serverNodeStatus.reputation || 0;
+                            // Remove trailing zeros - show as integer if whole number
+                            const formatted = rep.toFixed(1).replace(/\.0+$/, '');
+                            return formatted;
+                          })()}
                         </Text>
                       </View>
                       
@@ -4165,16 +4334,16 @@ const WalletScreen = () => {
                         <Text style={[styles.rewardValue, {
                           color: (serverNodeStatus.pendingRewards || 0) > 0 ? '#34c759' : '#00d4ff'
                         }]}>
-                          {((serverNodeStatus.pendingRewards || 0) / 1e9).toFixed(4)} QNC
+                          {(() => {
+                            const rewards = (serverNodeStatus.pendingRewards || 0) / 1e9;
+                            if (rewards === 0) return '0 QNC';
+                            // Round to 5-6 decimal places and remove trailing zeros
+                            const formatted = rewards.toFixed(6).replace(/\.?0+$/, '');
+                            return `${formatted} QNC`;
+                          })()}
                         </Text>
                       </View>
                       
-                      <View style={styles.rewardItem}>
-                        <Text style={styles.rewardLabel}>Block Height:</Text>
-                        <Text style={styles.rewardValue}>
-                          {serverNodeStatus.currentBlockHeight?.toLocaleString() || 'N/A'}
-                        </Text>
-                      </View>
                     </>
                   )}
                   
@@ -4210,29 +4379,15 @@ const WalletScreen = () => {
                       <Text style={styles.buttonText}>
                         {processingValidation ? 'Claiming...' : 
                          (serverNodeStatus.pendingRewards || 0) <= 0 ? 'Claim Rewards' :
-                         `Claim ${((serverNodeStatus.pendingRewards || 0) / 1e9).toFixed(4)} QNC`}
+                         (() => {
+                           const rewards = (serverNodeStatus.pendingRewards || 0) / 1e9;
+                           const formatted = rewards.toFixed(6).replace(/\.?0+$/, '');
+                           return `Claim ${formatted} QNC`;
+                         })()}
                       </Text>
                     </TouchableOpacity>
                   )}
                   
-                  <TouchableOpacity 
-                    style={[styles.button, styles.secondaryButton, {marginTop: 10}]}
-                    onPress={() => {
-                      // Open blockchain explorer
-                      const explorerUrl = `https://explorer.aiqnet.io/validator/${walletAddress}`;
-                      Linking.openURL(explorerUrl).catch(err => 
-                        showAlert('Error', 'Unable to open blockchain explorer')
-                      );
-                    }}
-                  >
-                    <Text style={styles.buttonText}>
-                      View on Explorer
-                    </Text>
-                  </TouchableOpacity>
-                  
-                  <Text style={styles.validatorNote}>
-                    Validator activities are recorded on-chain. Process pending activities to finalize them on the blockchain. View complete history on explorer.
-                  </Text>
                 </View>
               </View>
             ) : (

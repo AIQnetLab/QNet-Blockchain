@@ -6363,6 +6363,101 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                         println!("[STALL] ⚠️ Failed to broadcast emergency: {}", e);
                                     }
                                 }
+                                
+                                // ═══════════════════════════════════════════════════════════════════
+                                // CRITICAL v2.45: FORCE RESYNC ON PROLONGED STALL (FORK RECOVERY)
+                                // ═══════════════════════════════════════════════════════════════════
+                                // Problem: Node stuck on fork cannot sync because:
+                                // 1. Blocks from main chain have different PoH/previous_hash
+                                // 2. Validation fails → blocks rejected → node stays stuck
+                                // 
+                                // Solution: After 120s stall, force rollback to last macroblock and resync
+                                // This allows node to "jump" to correct chain
+                                // ═══════════════════════════════════════════════════════════════════
+                                if time_since_last_block > 120 {
+                                    // Check if network is ahead
+                                    let network_height = p2p.get_cached_network_height().unwrap_or(0);
+                                    let height_gap = network_height.saturating_sub(microblock_height);
+                                    
+                                    if height_gap > 50 {
+                                        println!("[ERR][FORK] stuck={}s behind={} blocks", time_since_last_block, height_gap);
+                                        println!("[INFO][FORK] force_resync local={} network={}", microblock_height, network_height);
+                                        
+                                        // Calculate rollback point: last confirmed macroblock boundary
+                                        // Macroblocks are Byzantine-finalized, safe to trust
+                                        let last_macroblock_height = (microblock_height / 90) * 90;
+                                        let rollback_to = if last_macroblock_height > 90 { 
+                                            last_macroblock_height - 90  // Go back one full epoch for safety
+                                        } else { 
+                                            0  // Genesis
+                                        };
+                                        
+                                        println!("[INFO][FORK] rollback from={} to={}", microblock_height, rollback_to);
+                                        
+                                        // Delete blocks from rollback_to+1 to current
+                                        for h in (rollback_to + 1)..=microblock_height {
+                                            if let Err(e) = storage.delete_microblock(h) {
+                                                println!("[WARN][FORK] delete_block_failed h={} err={}", h, e);
+                                            }
+                                        }
+                                        
+                                        // Delete macroblocks that might be corrupted
+                                        let mb_from = (rollback_to / 90) + 1;
+                                        let mb_to = microblock_height / 90;
+                                        for mb_idx in mb_from..=mb_to {
+                                            if let Err(e) = storage.delete_macroblock(mb_idx) {
+                                                println!("[WARN][FORK] delete_mb_failed idx={} err={}", mb_idx, e);
+                                            }
+                                        }
+                                        
+                                        // Update local height
+                                        microblock_height = rollback_to;
+                                        {
+                                            let mut h = height.write().await;
+                                            *h = rollback_to;
+                                        }
+                                        storage.set_chain_height(rollback_to).ok();
+                                        
+                                        println!("[INFO][FORK] rollback_complete new_h={}", rollback_to);
+                                        
+                                        // Reset stall timer to prevent immediate re-trigger
+                                        LAST_BLOCK_PRODUCED_TIME.store(current_time, Ordering::Relaxed);
+                                        LAST_BLOCK_PRODUCED_HEIGHT.store(rollback_to, Ordering::Relaxed);
+                                        
+                                        // Request fresh blocks and macroblocks from network
+                                        println!("[INFO][FORK] request_blocks from={} to={}", rollback_to + 1, network_height);
+                                        
+                                        // Sync macroblocks first (they provide entropy for block validation)
+                                        let target_mb = network_height / 90;
+                                        if target_mb > mb_from {
+                                            if let Err(e) = p2p.sync_macroblocks(mb_from, target_mb).await {
+                                                println!("[WARN][FORK] mb_sync_failed err={}", e);
+                                            }
+                                        }
+                                        
+                                        // Then sync microblocks in batches
+                                        let mut sync_from = rollback_to + 1;
+                                        while sync_from <= network_height {
+                                            let sync_to = std::cmp::min(sync_from + 100, network_height);
+                                            if let Err(e) = p2p.sync_blocks(sync_from, sync_to).await {
+                                                println!("[WARN][FORK] block_sync_failed h={} err={}", sync_from, e);
+                                                break;
+                                            }
+                                            sync_from = sync_to + 1;
+                                            // Small delay between batches
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                        }
+                                        
+                                        println!("[INFO][FORK] resync_initiated target={}", network_height);
+                                        
+                                        // Set state
+                                        set_node_state(NodeState::Syncing {
+                                            local_height: rollback_to,
+                                            target_height: network_height,
+                                            progress_percent: 0,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -10949,6 +11044,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // New nodes MUST sync before they can participate in macroblock creation
         let stored_height = storage.get_chain_height().unwrap_or(0);
         
+        // ═══════════════════════════════════════════════════════════════════
+        // CRITICAL v2.45: CHECK vs NETWORK HEIGHT (not just local)
+        // Node on fork may think it's synced but actually far behind network!
+        // ═══════════════════════════════════════════════════════════════════
+        let network_height = p2p.get_cached_network_height().unwrap_or(0);
+        if network_height > 0 && stored_height + 50 < network_height {
+            println!("[WARN][CONS] desync_skip local={} network={} gap={}", 
+                     stored_height, network_height, network_height - stored_height);
+            return false; // Cannot participate - we're too far behind network!
+        }
+        
         // CRITICAL FIX: Allow participation in EARLY consensus (29 blocks ahead for macroblock)
         // Consensus for macroblock 90 starts at height 61 (29 blocks early)
         // So we need to allow nodes that are within 29 blocks of the macroblock height
@@ -10967,16 +11073,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // CRITICAL: For consensus that starts EARLY (block 61 for macroblock 90),
         // we need to be more lenient because consensus_lookahead adds 29 blocks
         if stored_height + max_allowed_lag < current_height - consensus_lookahead {
-            println!("[WARN][CONS] Node not synchronized for consensus participation!");
-            println!("[INFO][CONS] stored={} consensus={} max_lag={}", 
+            println!("[WARN][CONS] local_lag stored={} consensus={} max_lag={}", 
                      stored_height, current_height, max_allowed_lag);
             return false; // Cannot initiate or participate if not synced
         }
         
         // Check if node is TOO FAR AHEAD (should not happen, but safety check)
         if stored_height > current_height + consensus_lookahead {
-            println!("[WARN][CONS] Node is ahead of consensus round!");
-            println!("[INFO][CONS] h={} round={}", 
+            println!("[WARN][CONS] local_ahead h={} round={}", 
                      stored_height, current_height);
             return false;
         }
@@ -11053,19 +11157,29 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
         } else {
-            // Use actual hash of previous macroblock as entropy source
-            // This makes initiator selection truly unpredictable
-            match storage.get_latest_macroblock_hash() {
-                Ok(hash) => {
-                    // Previous macroblock hash for initiator
-                    hash.to_vec()
+            // CRITICAL FIX v2.40: Use SPECIFIC macroblock N-1, NOT "latest"!
+            // BUG: get_latest_macroblock_hash() returns different values on different nodes
+            // if they received macroblocks at different times → different entropy → multiple initiators → FORK!
+            // FIX: Use get_macroblock_by_height(N-1) to ensure ALL nodes use the SAME entropy source
+            let previous_macroblock_index = macroblock_round - 1;
+            match storage.get_macroblock_by_height(previous_macroblock_index) {
+                Ok(Some(macroblock_data)) => {
+                    // Hash the specific macroblock N-1 for deterministic entropy
+                    use sha3::{Sha3_512, Digest};
+                    let mut hasher = Sha3_512::new();
+                    hasher.update(&macroblock_data);
+                    hasher.finalize().to_vec()
                 }
-                Err(_) => {
-                    // CRITICAL: If previous macroblock not found, node CANNOT participate
-                    // This prevents different nodes from using different entropy sources
-                    println!("[ERR][CONS] Previous macroblock not found - node not synchronized!");
-                    println!("[WARN][CONS] Cannot participate in consensus without previous macroblock");
-                    return false; // Cannot initiate consensus without previous macroblock
+                Ok(None) => {
+                    // CRITICAL: Macroblock N-1 not found - node is DESYNCHRONIZED
+                    // Cannot participate in consensus without the specific previous macroblock
+                    println!("[ERR][CONS] Macroblock #{} not found - node not synchronized!", previous_macroblock_index);
+                    println!("[WARN][CONS] Cannot participate in consensus - missing macroblock #{}", previous_macroblock_index);
+                    return false;
+                }
+                Err(e) => {
+                    println!("[ERR][CONS] Failed to load macroblock #{}: {}", previous_macroblock_index, e);
+                    return false;
                 }
             }
         };
@@ -11454,6 +11568,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // ═══════════════════════════════════════════════════════════════════
                 let expected_macroblock = current_height / 90;
                 
+                // ═══════════════════════════════════════════════════════════════════
+                // CRITICAL v2.45: DESYNC CHECK - Node MUST be synchronized to participate!
+                // Desynchronized nodes selecting different leaders → FORK!
+                // ═══════════════════════════════════════════════════════════════════
+                let network_height = p2p_finalize.get_cached_network_height().unwrap_or(0);
+                let local_height = storage_finalize.get_chain_height().unwrap_or(0);
+                
+                if network_height > 0 && local_height + 50 < network_height {
+                    println!("[WARN][PFP] desync_skip local={} network={} gap={}", 
+                             local_height, network_height, network_height - local_height);
+                    return; // Do NOT participate - we're too far behind!
+                }
+                
                 if is_info() { println!("[INFO][PFP] sync_attempt mb={} h={}", expected_macroblock, current_height); }
                 
                 // Step 1: Try to sync from network first
@@ -11521,32 +11648,42 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     use sha3::{Sha3_512, Digest};
                     let mut hasher = Sha3_512::new();
                     
-                    // Entropy from blockchain (deterministic across all nodes)
-                    hasher.update(b"QNet_PFP_Leader_Selection_v2.43");
+                    // ═══════════════════════════════════════════════════════════════════
+                    // CRITICAL FIX v2.45: FULLY DETERMINISTIC PFP LEADER SELECTION
+                    // ═══════════════════════════════════════════════════════════════════
+                    // REMOVED: current_height, pfp_attempt (both can differ between nodes!)
+                    // 
+                    // WHY pfp_attempt was BROKEN:
+                    //   → DIFFERENT attempt → DIFFERENT leader → FORK!
+                    //
+                    // SOLUTION: Use ONLY data that is IDENTICAL on all synchronized nodes:
+                    //   1. expected_macroblock (deterministic from trigger)
+                    //   2. macroblock N-2 hash (Byzantine-finalized, same on all nodes)
+                    //   3. sorted participants list (from consensus)
+                    //
+                    // LEADER ROTATION: If leader doesn't produce macroblock within timeout,
+                    // PFP will be triggered again with SAME leader. After multiple failures,
+                    // fork recovery will kick in (120s stall → rollback → resync)
+                    // ═══════════════════════════════════════════════════════════════════
+                    
+                    hasher.update(b"QNet_PFP_Leader_Selection_v2.45_Deterministic");
                     hasher.update(&expected_macroblock.to_le_bytes());
-                    hasher.update(&current_height.to_le_bytes());
                     
-                    // v2.43: Add attempt-based rotation to prevent deadlock
-                    // Uses deterministic counter based on how many times PFP was triggered
-                    // All nodes increment this counter together when they detect stall
-                    // REMOVED time-based: different node clocks could cause different leaders!
-                    
-                    // Calculate PFP attempt from blockchain state (deterministic!)
-                    // If macroblock doesn't exist after expected_height, increment attempt
-                    let blocks_past_expected = current_height.saturating_sub(expected_macroblock * 90);
-                    let pfp_attempt = blocks_past_expected / 30;  // New leader every 30 blocks past deadline
-                    hasher.update(&pfp_attempt.to_le_bytes());
-                    
-                    // Add finality block hash for additional entropy
-                    let finality_height = current_height.saturating_sub(10);
-                    if let Ok(Some(block_data)) = storage_finalize.load_microblock(finality_height) {
+                    // Use macroblock N-2 hash for deterministic entropy
+                    // N-2 is always Byzantine-finalized and identical on all synced nodes
+                    let entropy_macroblock_index = expected_macroblock.saturating_sub(2).max(1);
+                    if let Ok(Some(macroblock_data)) = storage_finalize.get_macroblock_by_height(entropy_macroblock_index) {
                         use sha3::Sha3_256;
-                        let mut block_hasher = Sha3_256::new();
-                        block_hasher.update(&block_data);
-                        hasher.update(&block_hasher.finalize());
+                        let mut mb_hasher = Sha3_256::new();
+                        mb_hasher.update(&macroblock_data);
+                        hasher.update(&mb_hasher.finalize());
+                    } else {
+                        // Macroblock N-2 not found - node is desynchronized, skip PFP
+                        println!("[WARN][PFP] mb_not_found idx={} skip_pfp=true", entropy_macroblock_index);
+                        return;
                     }
                     
-                    // Add sorted participant list
+                    // Add sorted participant list (already sorted above)
                     for p in &participants {
                         hasher.update(p.as_bytes());
                     }
@@ -11560,8 +11697,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     let leader_index = (selection_value as usize) % participants.len();
                     
                     if is_info() { 
-                        println!("[INFO][PFP] entropy mb={} h={} attempt={} candidates={}", 
-                                 expected_macroblock, current_height, pfp_attempt, participants.len()); 
+                        println!("[INFO][PFP] leader_select mb={} entropy_src=mb#{} candidates={}", 
+                                 expected_macroblock, entropy_macroblock_index, participants.len()); 
                     }
                     
                     participants[leader_index].clone()
