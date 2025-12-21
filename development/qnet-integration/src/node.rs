@@ -11630,30 +11630,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
                 
                 // ═══════════════════════════════════════════════════════════════════
-                // CRITICAL v2.42: DETERMINISTIC PARTICIPANTS LIST
-                // All nodes MUST compute IDENTICAL list for deterministic leader!
+                // UNIFIED v2.47: DETERMINISTIC PARTICIPANTS LIST
+                // Use SAME source as should_initiate_consensus() - blockchain-based!
                 // ═══════════════════════════════════════════════════════════════════
                 
-                // Get all validated peers + self = complete participant list
-                let mut all_participants: Vec<String> = p2p_finalize.get_validated_active_peers()
-                    .into_iter()
-                    .map(|peer| peer.id)
-                    .collect();
+                // Get participants from calculate_qualified_candidates (same as should_initiate)
+                // This returns static Genesis list for height <= 180, or macroblock snapshot for height > 180
+                let own_node_id = p2p_finalize.get_node_id();
+                let qualified = Self::calculate_qualified_candidates(
+                    &p2p_finalize, 
+                    &own_node_id, 
+                    NodeType::Super // Genesis nodes are Super type
+                ).await;
                 
-                // CRITICAL: Always include self in participants (was the bug!)
-                let self_id = p2p_finalize.get_node_id();
-                if !all_participants.contains(&self_id) {
-                    all_participants.push(self_id.clone());
-                }
+                let mut participants: Vec<String> = qualified.iter()
+                    .map(|(id, _)| id.clone())
+                    .collect();
                 
                 // CRITICAL: Sort for deterministic ordering across ALL nodes
-                all_participants.sort();
-                
-                // Limit to required nodes (deterministic: first N after sort)
-                let participants: Vec<String> = all_participants.iter()
-                    .take(required_nodes.max(1))
-                    .cloned()
-                    .collect();
+                participants.sort();
                 
                 if participants.is_empty() {
                     println!("[ERR][PFP] no_participants mb={}", expected_macroblock);
@@ -11691,33 +11686,46 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     hasher.update(b"QNet_PFP_Leader_Selection_v2.46_Deterministic");
                     hasher.update(&expected_macroblock.to_le_bytes());
                     
-                    // Use macroblock N-2 hash for deterministic entropy
-                    // N-2 is always Byzantine-finalized and identical on all synced nodes
-                    // CRITICAL FIX v2.46: For first macroblocks (#1, #2), use Genesis block hash
-                    // because MacroBlock #0 does NOT exist and #1/#2 may not exist yet
-                    let entropy_macroblock_index = expected_macroblock.saturating_sub(2);
-                    if entropy_macroblock_index >= 1 {
-                        // Normal case: use macroblock N-2
-                        if let Ok(Some(macroblock_data)) = storage_finalize.get_macroblock_by_height(entropy_macroblock_index) {
-                            use sha3::Sha3_256;
-                            let mut mb_hasher = Sha3_256::new();
-                            mb_hasher.update(&macroblock_data);
-                            hasher.update(&mb_hasher.finalize());
+                    // ═══════════════════════════════════════════════════════════════════
+                    // UNIFIED v2.47: ENTROPY SOURCE (same as should_initiate_consensus)
+                    // Epoch 1-2 (MB #1, #2): SHA3-512(Genesis block)[..32]
+                    // Epoch 3+  (MB #3+):    randomness_beacon from MB N-2
+                    // ═══════════════════════════════════════════════════════════════════
+                    if expected_macroblock <= 2 {
+                        // Epoch 1-2: Genesis block hash
+                        if let Ok(Some(genesis_data)) = storage_finalize.load_microblock(0) {
+                            let mut genesis_hasher = Sha3_512::new();
+                            genesis_hasher.update(&genesis_data);
+                            let result = genesis_hasher.finalize();
+                            hasher.update(&result[..32]);
                         } else {
-                            // Macroblock N-2 not found - node is desynchronized, skip PFP
-                            println!("[WARN][PFP] mb_not_found idx={} skip_pfp=true", entropy_macroblock_index);
+                            println!("[WARN][PFP] genesis_not_found skip_pfp=true");
                             return;
                         }
                     } else {
-                        // First macroblocks (#1, #2): use Genesis block hash as entropy
-                        if let Ok(Some(genesis_data)) = storage_finalize.load_microblock(0) {
-                            use sha3::Sha3_256;
-                            let mut genesis_hasher = Sha3_256::new();
-                            genesis_hasher.update(&genesis_data);
-                            hasher.update(&genesis_hasher.finalize());
-                            println!("[INFO][PFP] using_genesis_entropy for mb={}", expected_macroblock);
+                        // Epoch 3+: randomness_beacon from MB N-2
+                        let n_minus_2_index = expected_macroblock - 2;
+                        if let Ok(Some(macroblock_data)) = storage_finalize.get_macroblock_by_height(n_minus_2_index) {
+                            match bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
+                                Ok(macroblock) => {
+                                    if let Some(beacon) = macroblock.consensus_data.randomness_beacon {
+                                        hasher.update(&beacon);
+                                    } else {
+                                        // Fallback: hash block if no beacon
+                                        println!("[WARN][PFP] mb#{} no_beacon using_hash", n_minus_2_index);
+                                        let mut mb_hasher = Sha3_512::new();
+                                        mb_hasher.update(&macroblock_data);
+                                        let result = mb_hasher.finalize();
+                                        hasher.update(&result[..32]);
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("[ERR][PFP] deserialize_failed mb={} err={}", n_minus_2_index, e);
+                                    return;
+                                }
+                            }
                         } else {
-                            println!("[WARN][PFP] genesis_not_found skip_pfp=true");
+                            println!("[WARN][PFP] mb_not_found idx={} skip_pfp=true", n_minus_2_index);
                             return;
                         }
                     }
@@ -11736,8 +11744,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     let leader_index = (selection_value as usize) % participants.len();
                     
                     if is_info() { 
-                        println!("[INFO][PFP] leader_select mb={} entropy_src=mb#{} candidates={}", 
-                                 expected_macroblock, entropy_macroblock_index, participants.len()); 
+                        let entropy_src = if expected_macroblock <= 2 { "genesis".to_string() } else { format!("mb#{}_beacon", expected_macroblock - 2) };
+                        println!("[INFO][PFP] leader_select mb={} entropy_src={} candidates={}", 
+                                 expected_macroblock, entropy_src, participants.len()); 
                     }
                     
                     participants[leader_index].clone()

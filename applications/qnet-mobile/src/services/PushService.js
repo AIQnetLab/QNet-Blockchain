@@ -641,8 +641,9 @@ export async function getAllNodesByWallet(walletAddress) {
     
     return { success: true, nodes: [], totalNodes: 0 };
   } catch (error) {
-    console.error('[Nodes] ❌ Failed to get nodes by wallet:', error);
-    return { success: false, error: error.message, nodes: [] };
+    // Silent fail - no nodes found is not an error, just return empty
+    // Battery optimization: don't spam logs
+    return { success: true, nodes: [], totalNodes: 0 };
   }
 }
 

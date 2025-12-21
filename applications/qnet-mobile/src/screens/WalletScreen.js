@@ -1031,26 +1031,13 @@ const WalletScreen = () => {
   };
   
   // Load ALL nodes owned by this wallet (unified view for Light + Full + Super + Genesis)
+  // Battery optimization: runs once on tab open, no polling
   const loadAllUserNodes = async () => {
     if (!wallet || loadingAllNodes) return;
     
     // CRITICAL: Use QNet address for node lookup (not Solana address)
-    // Genesis nodes and server nodes are registered with QNet addresses
     const walletAddress = wallet.qnetAddress || wallet.address;
-    if (!walletAddress) {
-      console.log('[Nodes] ❌ No QNet address available for node lookup');
-      console.log('[Nodes] Wallet object:', { 
-        hasQnetAddress: !!wallet.qnetAddress, 
-        hasAddress: !!wallet.address,
-        hasPublicKey: !!wallet.publicKey,
-        qnetAddress: wallet.qnetAddress,
-        address: wallet.address,
-        publicKey: wallet.publicKey?.substring(0, 20) + '...'
-      });
-      return;
-    }
-    
-    console.log(`[Nodes] Checking nodes for QNet address: ${walletAddress.substring(0, 20)}...`);
+    if (!walletAddress) return; // Silent fail - no address
     
     setLoadingAllNodes(true);
     try {
@@ -1058,23 +1045,11 @@ const WalletScreen = () => {
       
       if (result.success) {
         setAllUserNodes(result.nodes || []);
-        console.log(`[Nodes] Loaded ${result.nodes?.length || 0} nodes for wallet`);
-        if (result.nodes && result.nodes.length > 0) {
-          console.log('[Nodes] Found nodes:', result.nodes.map(n => ({ 
-            node_id: n.node_id, 
-            node_type: n.node_type, 
-            status: n.status 
-          })));
-        } else {
-          console.log('[Nodes] No nodes found in API response');
-        }
         
         // AUTO-LINK: If we found server nodes that aren't activated locally, link them automatically
         const serverNodes = (result.nodes || []).filter(n => n.node_type !== 'light' && n.status === 'active');
         
         if (serverNodes.length > 0 && !activatedNodeType) {
-          console.log('[Nodes] Found active server nodes - auto-linking...');
-          
           // Priority 1: Check for Genesis nodes first (bootstrap nodes)
           const genesisNodes = serverNodes.filter(n => 
             n.node_id && n.node_id.startsWith('genesis_node_')
@@ -1085,8 +1060,6 @@ const WalletScreen = () => {
             const genesisNode = genesisNodes[0];
             const bootstrapId = genesisNode.node_id.replace('genesis_node_', '');
             const genesisCode = `QNET-BOOT-${bootstrapId}-STRAP`;
-            
-            console.log(`[Nodes] Auto-linking Genesis node: ${genesisNode.node_id}`);
             
             // Set activation state
             setActivationCode(genesisCode);
@@ -1106,8 +1079,6 @@ const WalletScreen = () => {
             
             // Load server status immediately
             loadServerNodeStatus();
-            
-            console.log(`[Nodes] Auto-linked Genesis node ${genesisNode.node_id}`);
             return; // Don't process other nodes if Genesis found
           }
           
@@ -1120,8 +1091,6 @@ const WalletScreen = () => {
             // Auto-link first active server node found
             const serverNode = otherServerNodes[0];
             const activationCode = serverNode.activation_code || serverNode.node_id;
-            
-            console.log(`[Nodes] Auto-linking ${serverNode.node_type} node: ${serverNode.node_id || activationCode}`);
             
             // Set activation state
             setActivationCode(activationCode);
@@ -4089,12 +4058,7 @@ const WalletScreen = () => {
               </View>
             )}
             
-            {/* Loading indicator */}
-            {loadingAllNodes && !activatedNodeType && (
-              <View style={{padding: 20, alignItems: 'center'}}>
-                <Text style={styles.nodeMonitoringLabel}>Checking for linked nodes...</Text>
-              </View>
-            )}
+            {/* Loading indicator - hidden, runs silently in background */}
             
             {/* No node yet - show how to activate */}
             {!loadingAllNodes && allUserNodes.length === 0 && !activatedNodeType && (
