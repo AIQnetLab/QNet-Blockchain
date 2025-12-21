@@ -2257,64 +2257,64 @@ const WalletScreen = () => {
   };
 
   const fetchTokenPrices = async () => {
-    // Set fallback prices immediately
-    setTokenPrices({
-      qnc: 0.0125,
-      sol: 150.00,
-      '1dev': 0.0001
+    // Set fallback prices ONLY if not already set (prevent resetting real prices)
+    setTokenPrices(prev => {
+      if (prev.sol === 0 || prev.sol === undefined) {
+        return { qnc: 0.0125, sol: 150.00, '1dev': 0.0001 };
+      }
+      return prev; // Keep existing prices
     });
     
-    // Then try to fetch real prices in background
-    setTimeout(async () => {
+    // Fetch real prices (no delay needed)
     try {
       // Only fetch prices if wallet is loaded
       if (!wallet) return;
         
-        // Helper function to fetch with timeout (1 second)
-        const fetchWithTimeout = async (url, timeout = 1000) => {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), timeout);
-          
-          try {
-            const response = await fetch(url, { signal: controller.signal });
-            clearTimeout(timeoutId);
-            return response;
-          } catch (error) {
-            clearTimeout(timeoutId);
-            throw error;
-          }
-        };
+      // Helper function to fetch with timeout (2 seconds)
+      const fetchWithTimeout = async (url, timeout = 2000) => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        
+        try {
+          const response = await fetch(url, { signal: controller.signal });
+          clearTimeout(timeoutId);
+          return response;
+        } catch (error) {
+          clearTimeout(timeoutId);
+          throw error;
+        }
+      };
       
-      // Fetch real prices from CoinGecko API
-        const prices = { qnc: 0.0125, sol: 150.00, '1dev': 0.0001 };
-      
-        // Fetch SOL price with timeout
+      // Fetch SOL price with timeout
       try {
-          const solResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+        const solResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
         if (solResponse.ok) {
           const solData = await solResponse.json();
-            prices.sol = solData.solana?.usd || 150.00;
-            setTokenPrices(prev => ({ ...prev, sol: prices.sol }));
+          const realPrice = solData.solana?.usd;
+          if (realPrice && realPrice > 0) {
+            setTokenPrices(prev => ({ ...prev, sol: realPrice }));
+          }
         }
       } catch (e) {
-          // Silently fail, use fallback
-        }
-        
-        // Fetch 1DEV price (if available) with timeout
-        try {
-          const devResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=1dev&vs_currencies=usd');
+        // Silently fail, keep existing price
+      }
+      
+      // Fetch 1DEV price (if available) with timeout
+      try {
+        const devResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=1dev&vs_currencies=usd');
         if (devResponse.ok) {
           const devData = await devResponse.json();
-          prices['1dev'] = devData['1dev']?.usd || 0.0001;
-            setTokenPrices(prev => ({ ...prev, '1dev': prices['1dev'] }));
+          const devPrice = devData['1dev']?.usd;
+          if (devPrice && devPrice > 0) {
+            setTokenPrices(prev => ({ ...prev, '1dev': devPrice }));
+          }
         }
       } catch (e) {
-          // Silently fail, use fallback
+        // Silently fail, keep existing price
       }
     } catch (error) {
-        // Silently fail, fallback prices already set
-      }
-    }, 100); // Small delay to not block UI
+      // Silently fail, keep existing prices
+    }
   };
 
   const generateActivationCode = async () => {
@@ -4270,12 +4270,22 @@ const WalletScreen = () => {
                   {activatedNodeType !== 'light' && serverNodeStatus?.success && (
                     <>
                       <View style={styles.rewardItem}>
-                        <Text style={styles.rewardLabel}>Heartbeats (4h window):</Text>
-                        <Text style={[styles.rewardValue, {
-                          color: serverNodeStatus.isRewardEligible ? '#34c759' : '#ff9500'
-                        }]}>
-                          {serverNodeStatus.heartbeatCount || 0}/{serverNodeStatus.requiredHeartbeats || (activatedNodeType === 'super' ? 9 : activatedNodeType === 'full' ? 8 : 8)} 
-                          {serverNodeStatus.isRewardEligible ? ' ✓' : ' (need more)'}
+                        <Text style={styles.rewardLabel}>Next Rewards:</Text>
+                        <Text style={[styles.rewardValue, { color: '#34c759' }]}>
+                          {(() => {
+                            const EMISSION_INTERVAL = 14400; // 4 hours in blocks
+                            const currentHeight = serverNodeStatus.currentBlockHeight || 0;
+                            if (currentHeight === 0) return 'Loading...';
+                            const blocksUntil = EMISSION_INTERVAL - (currentHeight % EMISSION_INTERVAL);
+                            // Convert to time estimate
+                            const minutes = Math.floor(blocksUntil / 60);
+                            const hours = Math.floor(minutes / 60);
+                            const mins = minutes % 60;
+                            if (hours > 0) {
+                              return `${blocksUntil.toLocaleString()} blocks (~${hours}h ${mins}m)`;
+                            }
+                            return `${blocksUntil.toLocaleString()} blocks (~${mins}m)`;
+                          })()}
                         </Text>
                       </View>
                       

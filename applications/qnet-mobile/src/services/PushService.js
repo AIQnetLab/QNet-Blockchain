@@ -600,7 +600,7 @@ export async function checkServerNodeStatus(activationCode, nodeId = null) {
 
     return { success: false, error: result.error || 'Unknown error' };
   } catch (error) {
-    console.error('[Push] Server node status check failed:', error);
+    // Silent fail - network errors are expected when nodes are offline
     return { success: false, error: error.message };
   }
 }

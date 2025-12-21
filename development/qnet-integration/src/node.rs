@@ -5470,8 +5470,9 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     signature,
                 };
                 
-                // PRODUCTION v2.40: Submit with block_height for phase validation
-                match consensus_engine.process_commit(remote_commit, block_height).await {
+                // CRITICAL FIX v2.48: Use round_id (sender's intended round) for phase validation
+                // NOT block_height (receiver's current height) - this caused epoch mismatch!
+                match consensus_engine.process_commit(remote_commit, round_id).await {
                     Ok(_) => {
                         if is_info() { println!("[INFO][CONS] commit from={} h={}", node_id, block_height); }
                         (node_id, true, None)
@@ -5513,8 +5514,9 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     signature: String::new(), // v2.40.3: Legacy support - P2P reveals don't have signature yet
                 };
                 
-                // PRODUCTION v2.40.3: Submit with block_height for phase validation (async)
-                match consensus_engine.submit_reveal(remote_reveal, block_height).await {
+                // CRITICAL FIX v2.48: Use round_id (sender's intended round) for phase validation
+                // NOT block_height (receiver's current height) - ensures commit/reveal match!
+                match consensus_engine.submit_reveal(remote_reveal, round_id).await {
                     Ok(_) => {
                         if is_info() { println!("[INFO][CONS] reveal from={} h={}", node_id, block_height); }
                         (node_id, true, None)
@@ -12135,17 +12137,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 signature,
             };
             
-            // PRODUCTION v2.40: Get current block height for deterministic phase validation
-            let current_block_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            // CRITICAL FIX v2.48: Use round_id (NOT local block_height) for OWN commits
+            // This ensures commit is stored in correct round's state
+            // round_id is the macroblock height (90, 180, 270...) passed to this function
             
             // CRITICAL FIX: Debug commit before processing
             if is_debug() {
-                println!("[DBG][CONS] process_commit node={} h={} sig_len={}", 
-                    commit.node_id, current_block_height, commit.signature.len());
+                println!("[DBG][CONS] process_commit node={} round={} sig_len={}", 
+                    commit.node_id, round_id, commit.signature.len());
             }
             
-            // Submit OWN commit to consensus engine with block height
-            match consensus_engine.process_commit(commit.clone(), current_block_height).await {
+            // Submit OWN commit to consensus engine with round_id (NOT block_height!)
+            match consensus_engine.process_commit(commit.clone(), round_id).await {
                 Ok(_) => {
                     if is_debug() { println!("[DBG][CONS] own_commit id={}", our_id); }
                     
@@ -12382,11 +12385,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 signature: String::new(), // OWN reveal - no need to verify ourselves
             };
             
-            // PRODUCTION v2.40.3: Get current block height for deterministic phase validation
-            let current_block_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            // CRITICAL FIX v2.48: Use round_id (NOT local block_height) for OWN reveals
+            // This ensures reveal is stored in correct round's state and matches commit
+            // round_id is the macroblock height (90, 180, 270...) passed to this function
             
-            // Submit OWN reveal with block height (async)
-            match consensus_engine.submit_reveal(reveal.clone(), current_block_height).await {
+            // Submit OWN reveal with round_id (NOT block_height!)
+            match consensus_engine.submit_reveal(reveal.clone(), round_id).await {
                 Ok(_) => {
                     if is_debug() { println!("[DBG][CONS] own_reveal id={}", our_id); }
                     

@@ -251,12 +251,22 @@ impl CommitRevealConsensus {
             return Err(ConsensusError::NoActiveRound);
         }
         
+        // CRITICAL FIX v2.48: Verify commit is for OUR EXACT round!
+        // block_height here is round_id from sender (after v2.48 fix in node.rs)
+        // This prevents commits being stored in wrong round's state!
+        let our_round_number = self.current_round.as_ref().unwrap().round_number;
+        if block_height != our_round_number {
+            return Err(ConsensusError::InvalidPhase(
+                format!("Round mismatch: message_round={} our_round={}", block_height, our_round_number)
+            ));
+        }
+        
         // PRODUCTION v2.40.2: Proper EPOCH-based validation
         let message_epoch = block_height / 90;
         let position_in_epoch = block_height % 90;
         
         // CRITICAL: Get OUR current epoch from active round (guaranteed to exist)
-        let our_epoch = self.current_round.as_ref().unwrap().round_number / 90;
+        let our_epoch = our_round_number / 90;
         
         // STEP 1: Verify EPOCH match (±1 grace for network timing)
         let epoch_diff = if message_epoch > our_epoch {
@@ -342,22 +352,30 @@ impl CommitRevealConsensus {
     
     /// PRODUCTION v2.40.3: Submit reveal with EPOCH-based validation
     /// ARCHITECTURE: Validate by EPOCH match, not by local phase
-    /// 1. Check message_epoch matches our_epoch (±1 grace for network latency)
+    /// 1. Check message round matches our round EXACTLY (v2.48 strict validation)
     /// 2. Then check position - reveals accepted during ENTIRE consensus window (61-89)
     /// 3. Verify hybrid signature (Dilithium3 + Ed25519) - prevents impersonation attacks
-    /// This fixes: sender at pos=73, receiver at pos=65 → SAME EPOCH → ACCEPT!
     pub async fn submit_reveal(&mut self, reveal: Reveal, block_height: u64) -> Result<(), ConsensusError> {
+        // CRITICAL FIX v2.48: Verify reveal is for OUR EXACT round!
+        // block_height here is round_id from sender (after v2.48 fix in node.rs)
+        let our_round_number = if let Some(state) = &self.current_round {
+            state.round_number
+        } else {
+            return Err(ConsensusError::NoActiveRound);
+        };
+        
+        if block_height != our_round_number {
+            return Err(ConsensusError::InvalidPhase(
+                format!("Round mismatch for reveal: message_round={} our_round={}", block_height, our_round_number)
+            ));
+        }
+        
         // PRODUCTION v2.40.2: Proper EPOCH-based validation
         let message_epoch = block_height / 90;
         let position_in_epoch = block_height % 90;
         
         // CRITICAL: Get OUR current epoch from active round
-        let our_epoch = if let Some(state) = &self.current_round {
-            state.round_number / 90
-        } else {
-            // No active round - this is an error for reveals
-            return Err(ConsensusError::NoActiveRound);
-        };
+        let our_epoch = our_round_number / 90;
         
         // STEP 1: Verify EPOCH match (±1 grace for network timing)
         let epoch_diff = if message_epoch > our_epoch {
