@@ -1135,13 +1135,16 @@ impl CommitRevealConsensus {
         // Version tag for hash domain separation (updated for v2.40.3)
         hasher.update(b"QNet_Failover_Leader_v2.40.3");
 
-        // ENTROPY: Randomness beacon (historical accumulation)
-        // For failover, we don't have current reveals, so use beacon only
+        // ENTROPY: Randomness beacon (from blockchain)
+        // UNIFIED v2.47: Beacon is ALWAYS provided (Genesis hash for epoch 1-2, MB N-2 for epoch 3+)
+        // This ensures compute_leader matches should_initiate_consensus entropy
         if let Some(b) = beacon {
             hasher.update(b);
         } else {
-            // Fallback for epochs 1-2: Use Genesis seed
-            hasher.update(b"QNet_Genesis_Seed_Fallback");
+            // CRITICAL: Beacon should ALWAYS be provided after v2.47
+            // If missing, use deterministic fallback but log warning
+            println!("[WARN][CONS] beacon=None using_fallback (should not happen after v2.47)");
+            hasher.update(b"QNet_Genesis_Beacon_v2.47");
         }
 
         // Height (deterministic)

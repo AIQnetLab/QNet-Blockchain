@@ -11132,53 +11132,75 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Get current macroblock round (every 90 blocks)
         let macroblock_round = current_height / 90;
         
-        // Add entropy from the blockchain
-        // For first macroblock, use genesis hash; otherwise use real macroblock hash
-        let entropy_source: Vec<u8> = if macroblock_round == 0 {
-            // First macroblock (block 90) - use Genesis block (block 0) hash as entropy
-            // This ensures all nodes agree on the initiator selection
+        // ═══════════════════════════════════════════════════════════════════════════
+        // UNIFIED v2.47: ENTROPY SOURCE FOR LEADER SELECTION (RANDAO-style)
+        // Same source used by: should_initiate, compute_leader_for_round, PFP
+        // 
+        // Epoch 1-2 (macroblock #1, #2): Genesis block hash (microblock #0)
+        // Epoch 3+  (macroblock #3+):    randomness_beacon from MB N-2 (VRF XOR accumulator)
+        //
+        // WHY randomness_beacon (not block hash):
+        // - Industry standard (Ethereum RANDAO, Solana VRF, Cosmos)
+        // - Unpredictable: each producer contributes VRF output
+        // - Manipulation-resistant: cannot predict future beacon values
+        // - Format-independent: doesn't depend on block structure changes
+        //
+        // WHY N-2 (not N-1):
+        // - N-1 may not be fully propagated yet
+        // - N-2 is Byzantine-finalized and identical on all synced nodes
+        // - Gives ~90 blocks buffer for consensus propagation
+        // ═══════════════════════════════════════════════════════════════════════════
+        let entropy_source: Vec<u8> = if macroblock_round <= 2 {
+            // Epoch 1-2 (macroblock #1, #2): Use Genesis block hash
+            // No randomness_beacon available yet - Genesis is the bootstrap entropy
+            // UNIFIED v2.47: SHA3-512 for max security, first 32 bytes for beacon compatibility
             match storage.load_microblock(0) {
                 Ok(Some(genesis_data)) => {
-                    // Calculate hash of Genesis block
-                    // UNIFIED v2.36: SHA3-512 everywhere for maximum security
                     use sha3::{Sha3_512, Digest};
                     let mut hasher = Sha3_512::new();
                     hasher.update(&genesis_data);
-                    let hash_result = hasher.finalize();
-                    // Genesis hash for first macroblock initiator
-                    hash_result.to_vec()
+                    let result = hasher.finalize();
+                    // Use first 32 bytes to match beacon size
+                    result[..32].to_vec()
                 }
                 _ => {
-                    // CRITICAL: If Genesis not found at block 60+, node CANNOT participate
-                    // This prevents different nodes from using different entropy sources
                     println!("[ERR][CONS] Genesis block not found - node not synchronized!");
-                    println!("[WARN][CONS] Cannot participate in consensus without Genesis block");
-                    return false; // Cannot initiate consensus without Genesis
+                    return false;
                 }
             }
         } else {
-            // CRITICAL FIX v2.40: Use SPECIFIC macroblock N-1, NOT "latest"!
-            // BUG: get_latest_macroblock_hash() returns different values on different nodes
-            // if they received macroblocks at different times → different entropy → multiple initiators → FORK!
-            // FIX: Use get_macroblock_by_height(N-1) to ensure ALL nodes use the SAME entropy source
-            let previous_macroblock_index = macroblock_round - 1;
-            match storage.get_macroblock_by_height(previous_macroblock_index) {
+            // Epoch 3+ (macroblock #3+): Use randomness_beacon from MB N-2
+            // This is the VRF XOR accumulator - RANDAO-style unpredictable entropy
+            let n_minus_2_index = macroblock_round - 2;
+            match storage.get_macroblock_by_height(n_minus_2_index) {
                 Ok(Some(macroblock_data)) => {
-                    // Hash the specific macroblock N-1 for deterministic entropy
-                    use sha3::{Sha3_512, Digest};
-                    let mut hasher = Sha3_512::new();
-                    hasher.update(&macroblock_data);
-                    hasher.finalize().to_vec()
+                    match bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
+                        Ok(macroblock) => {
+                            if let Some(beacon) = macroblock.consensus_data.randomness_beacon {
+                                // Use randomness_beacon directly (32 bytes)
+                                beacon.to_vec()
+                            } else {
+                                // Fallback: hash the entire macroblock if no beacon
+                                println!("[WARN][CONS] MB #{} has no beacon, using block hash", n_minus_2_index);
+                                use sha3::{Sha3_512, Digest};
+                                let mut hasher = Sha3_512::new();
+                                hasher.update(&macroblock_data);
+                                let result = hasher.finalize();
+                                result[..32].to_vec()
+                            }
+                        }
+                        Err(e) => {
+                            println!("[ERR][CONS] Failed to deserialize MB #{}: {}", n_minus_2_index, e);
+                            return false;
+                        }
+                    }
                 }
                 Ok(None) => {
-                    // CRITICAL: Macroblock N-1 not found - node is DESYNCHRONIZED
-                    // Cannot participate in consensus without the specific previous macroblock
-                    println!("[ERR][CONS] Macroblock #{} not found - node not synchronized!", previous_macroblock_index);
-                    println!("[WARN][CONS] Cannot participate in consensus - missing macroblock #{}", previous_macroblock_index);
+                    println!("[ERR][CONS] Macroblock #{} not found - node not synchronized!", n_minus_2_index);
                     return false;
                 }
                 Err(e) => {
-                    println!("[ERR][CONS] Failed to load macroblock #{}: {}", previous_macroblock_index, e);
+                    println!("[ERR][CONS] Failed to load macroblock #{}: {}", n_minus_2_index, e);
                     return false;
                 }
             }
@@ -11666,21 +11688,38 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // fork recovery will kick in (120s stall → rollback → resync)
                     // ═══════════════════════════════════════════════════════════════════
                     
-                    hasher.update(b"QNet_PFP_Leader_Selection_v2.45_Deterministic");
+                    hasher.update(b"QNet_PFP_Leader_Selection_v2.46_Deterministic");
                     hasher.update(&expected_macroblock.to_le_bytes());
                     
                     // Use macroblock N-2 hash for deterministic entropy
                     // N-2 is always Byzantine-finalized and identical on all synced nodes
-                    let entropy_macroblock_index = expected_macroblock.saturating_sub(2).max(1);
-                    if let Ok(Some(macroblock_data)) = storage_finalize.get_macroblock_by_height(entropy_macroblock_index) {
-                        use sha3::Sha3_256;
-                        let mut mb_hasher = Sha3_256::new();
-                        mb_hasher.update(&macroblock_data);
-                        hasher.update(&mb_hasher.finalize());
+                    // CRITICAL FIX v2.46: For first macroblocks (#1, #2), use Genesis block hash
+                    // because MacroBlock #0 does NOT exist and #1/#2 may not exist yet
+                    let entropy_macroblock_index = expected_macroblock.saturating_sub(2);
+                    if entropy_macroblock_index >= 1 {
+                        // Normal case: use macroblock N-2
+                        if let Ok(Some(macroblock_data)) = storage_finalize.get_macroblock_by_height(entropy_macroblock_index) {
+                            use sha3::Sha3_256;
+                            let mut mb_hasher = Sha3_256::new();
+                            mb_hasher.update(&macroblock_data);
+                            hasher.update(&mb_hasher.finalize());
+                        } else {
+                            // Macroblock N-2 not found - node is desynchronized, skip PFP
+                            println!("[WARN][PFP] mb_not_found idx={} skip_pfp=true", entropy_macroblock_index);
+                            return;
+                        }
                     } else {
-                        // Macroblock N-2 not found - node is desynchronized, skip PFP
-                        println!("[WARN][PFP] mb_not_found idx={} skip_pfp=true", entropy_macroblock_index);
-                        return;
+                        // First macroblocks (#1, #2): use Genesis block hash as entropy
+                        if let Ok(Some(genesis_data)) = storage_finalize.load_microblock(0) {
+                            use sha3::Sha3_256;
+                            let mut genesis_hasher = Sha3_256::new();
+                            genesis_hasher.update(&genesis_data);
+                            hasher.update(&genesis_hasher.finalize());
+                            println!("[INFO][PFP] using_genesis_entropy for mb={}", expected_macroblock);
+                        } else {
+                            println!("[WARN][PFP] genesis_not_found skip_pfp=true");
+                            return;
+                        }
                     }
                     
                     // Add sorted participant list (already sorted above)
@@ -13744,7 +13783,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if is_info() { println!("[INFO][MB_PART] participants={} source=n2_snapshot", all_participants.len()); }
         
         // Get randomness beacon from MacroBlock N-2 (for unpredictable leader selection)
-        let beacon: Option<[u8; 32]> = if macroblock_index >= 2 {
+        // UNIFIED v2.47: Same entropy source for ALL leader selection mechanisms
+        let beacon: Option<[u8; 32]> = if macroblock_index >= 3 {
+            // Epoch 3+: Use MacroBlock N-2 randomness_beacon
             let n_minus_2_index = macroblock_index - 2;
             match storage.get_macroblock_by_height(n_minus_2_index) {
                 Ok(Some(prev_mb_data)) => {
@@ -13756,7 +13797,24 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 _ => None,
             }
         } else {
-            None // Genesis epochs 1-2: use fallback
+            // Epoch 1-2 (macroblock #1, #2): Use Genesis block hash as beacon
+            // CRITICAL: Must match should_initiate_consensus() entropy!
+            match storage.load_microblock(0) {
+                Ok(Some(genesis_data)) => {
+                    use sha3::{Sha3_512, Digest};
+                    let mut hasher = Sha3_512::new();
+                    hasher.update(&genesis_data);
+                    let result = hasher.finalize();
+                    // Take first 32 bytes of SHA3-512 for beacon
+                    let mut beacon_bytes = [0u8; 32];
+                    beacon_bytes.copy_from_slice(&result[..32]);
+                    Some(beacon_bytes)
+                }
+                _ => {
+                    println!("[ERR][MB_PART] genesis_not_found for beacon");
+                    None
+                }
+            }
         };
         
         if is_debug() { println!("[DBG][MB_PART] beacon={}", beacon.is_some()); }
