@@ -208,8 +208,9 @@ pub fn init_logging() {
 // Testing showed that natural timing without interrupts prevents race conditions
 
 // CRITICAL: Global storage for entropy responses during consensus verification
+// PRODUCTION v2.51: Made public for unified_p2p.rs to store incoming entropy responses
 lazy_static::lazy_static! {
-    static ref ENTROPY_RESPONSES: Mutex<std::collections::HashMap<(u64, String), [u8; 32]>> = Mutex::new(std::collections::HashMap::new());
+    pub static ref ENTROPY_RESPONSES: Mutex<std::collections::HashMap<(u64, String), [u8; 32]>> = Mutex::new(std::collections::HashMap::new());
 }
 
 /// Helper: Safe lock for ENTROPY_RESPONSES with poisoned lock recovery
@@ -6273,34 +6274,64 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 }
                 }
                 
-                // CRITICAL FIX: Sync local microblock_height with global height at loop start
-                // This ensures producer selection uses latest height after rotation
+                // CRITICAL FIX v2.50: Unify height sources within THIS NODE
+                // 
+                // ARCHITECTURE: Two LOCAL height sources exist on each node:
+                // 1. Arc<RwLock<u64>> height - RAM variable, updated by received_block handler
+                // 2. storage.get_chain_height() - RocksDB on disk, updated by save_microblock()
+                // 
+                // PROBLEM: sync_blocks() downloads from network and saves to RocksDB
+                //          but does NOT update the RAM variable (Arc<RwLock>)!
+                // RESULT: State machine uses stale RAM height, causing rotation desync
+                // 
+                // SOLUTION: Use RocksDB as single source of truth (it's always updated)
+                //           Then sync RAM variable for consistency with other components
+                // 
+                // NOTE: This is INTERNAL synchronization within one node, NOT network sync!
+                //       Network sync happens via sync_blocks() -> save_microblock() -> RocksDB
                 {
-                    let global_height = *height.read().await;
-                    if global_height > microblock_height {
-                        // CRITICAL: Always sync to global height if we're behind
-                        // Check if we have all intermediate blocks
+                    // LOCAL: Get height from this node's RocksDB (disk = source of truth)
+                    let local_chain_height = storage.get_chain_height().unwrap_or(0);
+                    
+                    // Also get RAM height variable for comparison
+                    let ram_height = *height.read().await;
+                    
+                    // CRITICAL: Use MAX of both to handle all sync paths
+                    let canonical_height = std::cmp::max(local_chain_height, ram_height);
+                    
+                    // INTERNAL SYNC: Update RAM if RocksDB is ahead (fixes API/other components)
+                    if local_chain_height > ram_height {
+                        *height.write().await = local_chain_height;
+                        if is_debug() { 
+                            println!("[DBG][SYNC] RAM height updated: {} -> {} (from RocksDB)", 
+                                     ram_height, local_chain_height); 
+                        }
+                    }
+                    
+                    if canonical_height > microblock_height {
+                        // CRITICAL: Always sync state machine to canonical height if behind
+                        // Check if we have all intermediate blocks in RocksDB
                         let mut can_sync = true;
-                        for h in (microblock_height + 1)..=global_height {
+                        for h in (microblock_height + 1)..=canonical_height {
                             if storage.load_microblock(h).unwrap_or(None).is_none() {
                                 can_sync = false;
-                                println!("[WARN][SYNC] Cannot sync to height {} - missing block #{}", 
-                                        global_height, h);
+                                println!("[WARN][SYNC] Cannot sync state machine to {} - missing block #{}", 
+                                        canonical_height, h);
                                 break;
                             }
                         }
                         
                         if can_sync {
-                            println!("[SYNC] ⚡ Syncing local height {} → {} (all blocks present)", 
-                                    microblock_height, global_height);
-                            microblock_height = global_height;
+                            println!("[SYNC] ⚡ State machine height {} → {} (all blocks in RocksDB)", 
+                                    microblock_height, canonical_height);
+                            microblock_height = canonical_height;
                             
                             // CRITICAL FIX v2.26.8: Also update last_macroblock_trigger when syncing!
                             // Without this, trigger stays at 0 after sync, causing:
                             // - PFP to search for macroblock #0 (doesn't exist)
                             // - Infinite loop of creating macroblock #1
                             // - Producer gets stuck in PFP instead of producing blocks
-                            let new_trigger = (global_height / 90) * 90;
+                            let new_trigger = (canonical_height / 90) * 90;
                             if new_trigger > last_macroblock_trigger {
                                 if is_debug() { println!("[DBG][SYNC] mb_trigger {} -> {} (synced)", 
                                         last_macroblock_trigger, new_trigger); }
@@ -10101,8 +10132,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if own_node_id != failed_producer && can_participate_emergency {
                 let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
                 
-                // CRITICAL: Check if own node is synchronized for emergency production
-                // Log sync status but don't change selection probability
+                // CRITICAL FIX v2.51: Check if own node is synchronized for emergency production
+                // EXCLUDE unsynchronized nodes from candidates, not just log them!
                 let is_synchronized = if let Some(ref store) = storage {
                     let stored_height = store.get_chain_height().unwrap_or(0);
                     // Allow max 10 blocks behind for emergency producer
@@ -10111,19 +10142,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     true // If no storage, assume synced (shouldn't happen)
                 };
                 
-                // Add as candidate with ORIGINAL reputation (no boost)
-                candidates.push((own_node_id.to_string(), own_reputation));
-                
+                // CRITICAL FIX v2.51: Only add SYNCHRONIZED nodes as candidates!
+                // This prevents selecting lagging nodes that cannot produce blocks
+                // Before: all nodes were added, then lagging ones would timeout (slow!)
+                // After: only synchronized nodes are candidates (fast selection!)
                 if is_synchronized {
-                    println!("[EMERGENCY_SELECTION] ✅ Own node {} eligible and SYNCHRONIZED (reputation: {:.1}%)", 
+                    candidates.push((own_node_id.to_string(), own_reputation));
+                    println!("[EMERGENCY_SELECTION] ✅ Own node {} SYNCHRONIZED and added to candidates (reputation: {:.1}%)", 
                              own_node_id, own_reputation * 100.0);
                 } else {
-                    // SECURITY: Use safe unwrap_or to prevent panic if storage became None
+                    // EXCLUDED: Node is behind, cannot produce blocks for this height
                     let stored_height = storage.as_ref()
                         .map(|s| s.get_chain_height().unwrap_or(0))
                         .unwrap_or(0);
-                    println!("[EMERGENCY_SELECTION] ⚠️ Own node {} eligible but NOT SYNCHRONIZED (height behind: {})", 
-                             own_node_id, current_height.saturating_sub(stored_height));
+                    println!("[EMERGENCY_SELECTION] ❌ Own node {} EXCLUDED - NOT SYNCHRONIZED (height: {} vs expected: {}, behind: {} blocks)", 
+                             own_node_id, stored_height, current_height, current_height.saturating_sub(stored_height));
                 }
             } else if own_node_id == failed_producer {
                 println!("[EMERGENCY_SELECTION] 💀 Own node {} is the failed producer - excluding", own_node_id);
@@ -16929,6 +16962,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         });
                     
                     if let Some(tx) = tx_opt {
+                        // Extract tx_type as string for explorer
+                        let tx_type_str = format!("{:?}", tx.tx_type);
+                        
                         return Ok(Some(TransactionInfo {
                             hash: stored_hash, // Use the mempool hash for consistency
                             from: tx.from,
@@ -16940,6 +16976,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             timestamp: tx.timestamp,
                             block_height: None,
                             status: "pending".to_string(),
+                            tx_type: Some(tx_type_str),
                             // Fast Finality Indicators for pending tx
                             confirmation_level: Some(ConfirmationLevel::Pending),
                             safety_percentage: Some(0.0),
@@ -17000,6 +17037,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 };
                 let time_to_finality = blocks_to_macroblock; // 1 block = 1 second
                 
+                // Extract tx_type as string for explorer
+                let tx_type_str = format!("{:?}", tx.tx_type);
+                
                 Ok(Some(TransactionInfo {
                     hash: tx.hash,
                     from: tx.from,
@@ -17011,6 +17051,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     timestamp: tx.timestamp,
                     block_height,
                     status: "confirmed".to_string(),
+                    tx_type: Some(tx_type_str),
                     // Fast Finality Indicators
                     confirmation_level: Some(confirmation_level),
                     safety_percentage: Some(safety_percentage),
@@ -17642,6 +17683,7 @@ pub struct TransactionInfo {
     pub timestamp: u64,
     pub block_height: Option<u64>,
     pub status: String,
+    pub tx_type: Option<String>,
     // Fast Finality Indicators (optional for backward compatibility)
     pub confirmation_level: Option<ConfirmationLevel>,
     pub safety_percentage: Option<f64>,

@@ -214,6 +214,18 @@ static EMERGENCY_CONFIRMATIONS: Lazy<Arc<DashMap<(u64, String), (AtomicU64, Inst
 static PEER_BLACKLIST: Lazy<Arc<DashMap<String, BlacklistEntry>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
 
+// BROADCAST OPTIMIZATION: Short-term cooldown for unresponsive peers
+// Key: peer_addr → Value: (retry_count, cooldown_until)
+// SCALABILITY: Prevents retry storms to "not ready" peers
+// Cooldown: 2s base, exponential backoff up to 30s max
+static PEER_RETRY_COOLDOWN: Lazy<Arc<DashMap<String, (u32, std::time::Instant)>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+// Cooldown constants
+const PEER_COOLDOWN_BASE_SECS: u64 = 2;    // Base cooldown: 2 seconds
+const PEER_COOLDOWN_MAX_SECS: u64 = 30;    // Max cooldown: 30 seconds
+const PEER_COOLDOWN_RESET_SECS: u64 = 60;  // Reset retry count after 60s of success
+
 /// SYNC: Blacklist reason categories (Soft vs Hard)
 /// Soft: Temporary network issues (timeouts, latency) - affects network_score only
 /// Hard: Byzantine attacks (invalid blocks, malicious behavior) - affects consensus_score
@@ -6874,8 +6886,9 @@ impl SimplifiedP2P {
         // Atomic counter for successful deliveries
         let success_count = Arc::new(AtomicUsize::new(0));
         
-        // Create async tasks for each peer
+        // Create async tasks for each peer (with cooldown check)
         let mut tasks = Vec::new();
+        let mut skipped_peers = 0usize;
         
         for peer_info in peers {
             if peer_info.id == self.node_id {
@@ -6883,9 +6896,22 @@ impl SimplifiedP2P {
             }
             
             let peer_addr = peer_info.addr.clone();
+            
+            // OPTIMIZATION v2.50: Check peer cooldown before sending
+            // Prevents retry storms to unresponsive/"not ready" peers
+            if let Some(entry) = PEER_RETRY_COOLDOWN.get(&peer_addr) {
+                let (retry_count, cooldown_until) = entry.value();
+                if std::time::Instant::now() < *cooldown_until {
+                    // Peer is in cooldown - skip this round
+                    skipped_peers += 1;
+                    continue;
+                }
+            }
+            
             let message_json_clone = Arc::clone(&message_json);
             let success_count_clone = Arc::clone(&success_count);
             let cert_serial_clone = cert_serial.clone();
+            let peer_addr_for_cooldown = peer_addr.clone();
             
             // PRODUCTION v2.19.22: Send via QUIC
             let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
@@ -6907,10 +6933,32 @@ impl SimplifiedP2P {
                                         success_count_clone.fetch_add(1, Ordering::SeqCst);
                                         // PRIVACY: Use pseudonym for peer address
                                         println!("[QUIC] ✅ Certificate {} delivered to {}", cert_serial_clone, get_privacy_id_for_addr(&peer_addr));
+                                        
+                                        // SUCCESS: Reset cooldown for this peer
+                                        PEER_RETRY_COOLDOWN.remove(&peer_addr_for_cooldown);
                                     }
                                     Err(e) => {
                                         println!("[QUIC] ⚠️ Certificate {} failed to {}: {}", 
                                                  cert_serial_clone, peer_addr, e);
+                                        
+                                        // FAILURE: Apply exponential backoff cooldown
+                                        let (retry_count, _) = PEER_RETRY_COOLDOWN
+                                            .get(&peer_addr_for_cooldown)
+                                            .map(|e| *e.value())
+                                            .unwrap_or((0, std::time::Instant::now()));
+                                        
+                                        let new_retry_count = retry_count + 1;
+                                        let backoff_secs = std::cmp::min(
+                                            PEER_COOLDOWN_BASE_SECS * (1 << new_retry_count.min(4)),
+                                            PEER_COOLDOWN_MAX_SECS
+                                        );
+                                        let cooldown_until = std::time::Instant::now() + 
+                                            std::time::Duration::from_secs(backoff_secs);
+                                        
+                                        PEER_RETRY_COOLDOWN.insert(
+                                            peer_addr_for_cooldown, 
+                                            (new_retry_count, cooldown_until)
+                                        );
                                     }
                                 }
                             }
@@ -6922,6 +6970,19 @@ impl SimplifiedP2P {
             tasks.push(task);
         }
         
+        // Log skipped peers if any
+        if skipped_peers > 0 {
+            println!("[P2P] ⏭️ Skipped {} peers in cooldown", skipped_peers);
+        }
+        
+        // CRITICAL: Recalculate effective peers and threshold after cooldown filtering
+        let effective_peers = total_peers - skipped_peers;
+        let effective_threshold = if effective_peers > 0 {
+            (effective_peers * 2 + 2) / 3  // 2/3+1 of EFFECTIVE peers
+        } else {
+            1  // At least 1 confirmation needed
+        };
+        
         // Wait for all tasks to complete (with adaptive timeout)
         let broadcast_start = std::time::Instant::now();
         
@@ -6929,9 +6990,9 @@ impl SimplifiedP2P {
         // Small networks (<=10): 3s is sufficient (local/fast network)
         // Medium networks (<=100): 5s for moderate WAN latency
         // Large networks (>100): 10s for global distribution
-        let timeout_secs = if total_peers <= 10 {
+        let timeout_secs = if effective_peers <= 10 {
             3  // 3s for small networks (doesn't conflict with Adaptive BFT 4s timeout)
-        } else if total_peers <= 100 {
+        } else if effective_peers <= 100 {
             5  // 5s for medium networks
         } else {
             10 // 10s for large networks (1000 validators)
@@ -6943,20 +7004,20 @@ impl SimplifiedP2P {
                 let delivery_time = broadcast_start.elapsed();
                 let successful = success_count.load(Ordering::SeqCst);
                 
-                println!("[P2P] 📊 Certificate {} delivery: {}/{} peers ({:.1}%) in {:?}", 
-                         cert_serial, successful, total_peers, 
-                         (successful as f64 / total_peers as f64) * 100.0,
+                println!("[P2P] 📊 Certificate {} delivery: {}/{} effective peers ({:.1}%) in {:?}", 
+                         cert_serial, successful, effective_peers, 
+                         if effective_peers > 0 { (successful as f64 / effective_peers as f64) * 100.0 } else { 0.0 },
                          delivery_time);
                 
-                // Check Byzantine threshold
-                if successful >= byzantine_threshold {
-                    println!("[P2P] ✅ Byzantine threshold reached: {}/{} ≥ 2/3", 
-                             successful, total_peers);
+                // Check Byzantine threshold (based on effective peers, not total)
+                if successful >= effective_threshold {
+                    println!("[P2P] ✅ Byzantine threshold reached: {}/{} ≥ 2/3 (effective)", 
+                             successful, effective_peers);
                     Ok(())
                 } else {
                     let err = format!(
-                        "Byzantine threshold NOT reached: {}/{} < 2/3 (need {})",
-                        successful, total_peers, byzantine_threshold
+                        "Byzantine threshold NOT reached: {}/{} < 2/3 (need {}, {} in cooldown)",
+                        successful, effective_peers, effective_threshold, skipped_peers
                     );
                     println!("[P2P] ❌ {}", err);
                     Err(err)
@@ -6965,8 +7026,8 @@ impl SimplifiedP2P {
             Err(_) => {
                 let successful = success_count.load(Ordering::SeqCst);
                 Err(format!(
-                    "Certificate broadcast timeout: only {}/{} confirmed in 10s",
-                    successful, total_peers
+                    "Certificate broadcast timeout: only {}/{} confirmed in {}s",
+                    successful, total_peers, timeout_secs
                 ))
             }
         }
@@ -9902,19 +9963,74 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::EntropyRequest { block_height, requester_id } => {
-                // Handle entropy request for rotation boundary verification
-                println!("[CONSENSUS] 🎲 Entropy request for block {} from {}", block_height, requester_id);
-                // Response will be sent by node.rs which has access to storage
-                // Store request for processing
+                // PRODUCTION FIX v2.51: Actually respond to entropy requests!
+                // Before: just logged, never responded -> "no_entropy_responses" fallback always
+                // After: calculate entropy hash and send response back
+                
+                // Get storage from global instance
+                let entropy_hash = if let Ok(storage_guard) = crate::node::GLOBAL_STORAGE_INSTANCE.lock() {
+                    if let Some(ref storage) = *storage_guard {
+                        match storage.load_microblock(block_height) {
+                            Ok(Some(block_data)) => {
+                                // Calculate entropy hash (same as node.rs get_previous_microblock_hash)
+                                use sha3::{Sha3_256, Digest};
+                                let mut hasher = Sha3_256::new();
+                                hasher.update(&block_data);
+                                let result = hasher.finalize();
+                                let mut hash = [0u8; 32];
+                                hash.copy_from_slice(&result);
+                                hash
+                            },
+                            Ok(None) => {
+                                // Block not found - we don't have it yet (lagging)
+                                // Return zero = "I don't have this block"
+                                [0u8; 32]
+                            },
+                            Err(e) => {
+                                println!("[CONSENSUS] ❌ Error loading block {}: {}", block_height, e);
+                                [0u8; 32]
+                            }
+                        }
+                    } else {
+                        // Storage not initialized yet
+                        [0u8; 32]
+                    }
+                } else {
+                    // Lock failed
+                    [0u8; 32]
+                };
+                
+                // Send response back to requester
+                let response = NetworkMessage::EntropyResponse {
+                    block_height,
+                    entropy_hash,
+                    responder_id: self.node_id.clone(),
+                };
+                
+                // Find requester address and send response
+                if let Some(requester_addr) = self.get_peer_address(&requester_id) {
+                    self.send_network_message(&requester_addr, response);
+                }
+                // Note: if requester not found, silently skip (peer may have disconnected)
             }
             
             NetworkMessage::EntropyResponse { block_height, entropy_hash, responder_id } => {
-                // Handle entropy response for consensus verification
-                println!("[CONSENSUS] 🎯 Entropy response for block {} from {}: {:x}", 
-                        block_height, responder_id,
-                        u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
-                                           entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
-                // Store response for verification in node.rs
+                // PRODUCTION FIX v2.51: Actually store entropy responses!
+                // Before: just logged -> never stored -> "no_entropy_responses" fallback
+                // After: store in ENTROPY_RESPONSES for consensus verification
+                
+                // Store response in global ENTROPY_RESPONSES map (used by node.rs)
+                if let Ok(mut responses) = crate::node::ENTROPY_RESPONSES.lock() {
+                    responses.insert((block_height, responder_id.clone()), entropy_hash);
+                }
+                
+                // Log only significant responses (not zeros)
+                if entropy_hash != [0u8; 32] {
+                    println!("[CONSENSUS] 🎯 Entropy response h={} from={}: {:x}", 
+                            block_height, responder_id,
+                            u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
+                                               entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
+                }
             }
             
             // PRODUCTION: Certificate management for compact signatures
