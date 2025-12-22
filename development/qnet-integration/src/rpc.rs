@@ -3297,6 +3297,7 @@ async fn handle_transaction_get(
                 "timestamp": tx.timestamp,
                 "block_height": tx.block_height,
                 "status": tx.status,
+                "tx_type": tx.tx_type,  // Include transaction type for explorer
                 "is_quantum_signed": is_quantum,
                 "signature_type": if is_quantum { "Ed25519 + Dilithium3" } else { "Ed25519" }
             });

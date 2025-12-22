@@ -1,148 +1,184 @@
 'use client';
 
-import { useState } from 'react';
+import { memo, useState, useEffect } from 'react';
+import Link from 'next/link';
 
-const mockBlocks = [
-  { number: 1337, hash: '0xab3d...8f2e', txs: 45, time: '2s ago', status: 'confirmed' },
-  { number: 1336, hash: '0x7c9a...4b1d', txs: 38, time: '14s ago', status: 'confirmed' },
-  { number: 1335, hash: '0x9e5f...7a8c', txs: 52, time: '26s ago', status: 'confirmed' },
-  { number: 1334, hash: '0x2d8b...1f9e', txs: 41, time: '38s ago', status: 'pending' },
-];
+interface ActivityItem {
+  hash: string;
+  type: string;
+  from: string;
+  to: string;
+  amount: string;
+  block: number;
+  time: string;
+}
 
-const mockTransactions = [
-  { hash: '0xa7c3...9d2e', type: 'Transfer', amount: '125.5 QNC', block: 1337 },
-  { hash: '0x8f1b...4a7c', type: 'Node Activation', amount: '7,500 QNC → Pool #3 (Dynamic)', block: 1337 },
-  { hash: '0x5e9d...3c8f', type: 'Smart Contract', amount: '89.2 QNC', block: 1336 },
-  { hash: '0x2a6f...7e1d', type: '1DEV Burn', amount: '1,500 1DEV', block: 1336 },
-];
-
-export default function ExplorerPage() {
-  const [activeTab, setActiveTab] = useState('blocks');
-  const [searchQuery, setSearchQuery] = useState('');
+// Memoized row for performance
+const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) {
+  const badgeClass = {
+    'Transfer': 'badge-transfer',
+    'Swap': 'badge-swap',
+    'Node Activation': 'badge-activation',
+    'Reward': 'badge-reward',
+    'Smart Contract': 'badge-contract',
+  }[item.type] || 'badge-default';
 
   return (
-    <div className="page-explorer">
-      <section className="explorer-section">
-        <div className="explorer-header">
-          <h2 className="section-title">Quantum Blockchain Explorer</h2>
-          <p className="section-subtitle">
-            Real-time network data and blockchain analytics
-          </p>
-          
-          <div className="search-container">
-            <input
-              type="text"
-              placeholder="Search transactions, blocks, or addresses..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="search-input"
-            />
-            <button className="search-button">
-              <div style={{
-                width: '18px',
-                height: '18px',
-                border: '2px solid #ffffff',
-                borderRadius: '50%',
-                position: 'relative',
-                display: 'inline-block'
-              }}>
-                <div style={{
-                  position: 'absolute',
-                  width: '8px',
-                  height: '2px',
-                  background: '#ffffff',
-                  bottom: '-4px',
-                  right: '-4px',
-                  transform: 'rotate(45deg)',
-                  borderRadius: '1px'
-                }}></div>
-              </div>
-            </button>
-          </div>
+    <tr className="activity-row">
+      <td className="col-hash">
+        <Link href={`/explorer/tx/${item.hash}`} className="addr">
+          {item.hash.slice(0, 8)}...{item.hash.slice(-6)}
+        </Link>
+        <span className={`type-badge ${badgeClass}`}>{item.type}</span>
+      </td>
+      <td className="col-addresses">
+        <Link href={`/explorer/address/${item.from}`} className="addr">
+          {item.from.slice(0, 6)}...{item.from.slice(-4)}
+        </Link>
+        <span className="arr">→</span>
+        <Link href={`/explorer/address/${item.to}`} className="addr">
+          {item.to.slice(0, 6)}...{item.to.slice(-4)}
+        </Link>
+      </td>
+      <td className="col-amount">{item.amount}</td>
+      <td className="col-block">
+        <Link href={`/explorer/block/${item.block}`}>{item.block}</Link>
+      </td>
+      <td className="col-time">{item.time}</td>
+    </tr>
+  );
+});
+
+const ITEMS_PER_PAGE = 10;
+
+export default function ExplorerPage() {
+  const [activity, setActivity] = useState<ActivityItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [page, setPage] = useState(1);
+
+  // Fetch activity on mount and every 5 seconds
+  useEffect(() => {
+    const fetchActivity = async () => {
+      try {
+        const res = await fetch('/api/activity?limit=50');
+        const data = await res.json();
+        if (data.success && data.data) {
+          setActivity(data.data);
+        }
+      } catch (err) {
+        console.error('Failed to fetch activity:', err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchActivity();
+    const interval = setInterval(fetchActivity, 5000);
+    return () => clearInterval(interval);
+  }, []);
+  
+  const totalPages = Math.ceil(activity.length / ITEMS_PER_PAGE);
+  const paginatedActivity = activity.slice((page - 1) * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE);
+
+  // Handle search
+  const handleSearch = () => {
+    if (!searchQuery.trim()) return;
+    
+    const q = searchQuery.trim();
+    
+    // Detect type and redirect
+    if (q.length === 64 && /^[0-9A-Fa-f]+$/.test(q)) {
+      // 64 hex chars = block hash or tx hash
+      window.location.href = `/explorer/block/${q}`;
+    } else if (q.length === 41 && q.includes('eon')) {
+      // EON address
+      window.location.href = `/explorer/address/${q}`;
+    } else if (/^\d+$/.test(q)) {
+      // Block number
+      window.location.href = `/explorer/block/${q}`;
+    } else {
+      // General search
+      window.location.href = `/explorer/search?q=${encodeURIComponent(q)}`;
+    }
+  };
+
+  return (
+    <div className="explorer-page">
+      <div className="explorer-header">
+        <h1>Quantum Blockchain Explorer</h1>
+        <p>Real-time network data and blockchain analytics</p>
+      </div>
+
+      <div className="explorer-search">
+        <input
+          type="text"
+          placeholder="Search transactions, blocks, or addresses..."
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+        />
+        <button className="search-btn" type="button" onClick={handleSearch}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="11" cy="11" r="7" stroke="#00e5f0" strokeWidth="2"/>
+            <path d="M16.5 16.5L21 21" stroke="#00e5f0" strokeWidth="2" strokeLinecap="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <div className="explorer-activity">
+        <div className="activity-header">
+          <h2>Latest Activity</h2>
         </div>
-
-        <div className="network-stats compact">
-          <div className="stat-card">
-            <div className="stat-number">1,337</div>
-            <div className="stat-label">Latest Block</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-number">30/min</div>
-            <div className="stat-label">Rate Limit</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-number">4.29B</div>
-            <div className="stat-label">QNC Supply</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-number">6</div>
-            <div className="stat-label">Regions Online</div>
-          </div>
-        </div>
-
-        <div className="explorer-tabs">
-          <div className="tabs-nav">
-            <button 
-              data-state={activeTab === 'blocks' ? 'active' : ''}
-              onClick={() => setActiveTab('blocks')}
-            >
-              Recent Blocks
-            </button>
-            <button 
-              data-state={activeTab === 'transactions' ? 'active' : ''}
-              onClick={() => setActiveTab('transactions')}
-            >
-              Transaction Stream
-            </button>
-          </div>
-
-          {activeTab === 'blocks' && (
-            <div className="explorer-card">
-              <div className="card-header">
-                <h3>Recent Blocks</h3>
-              </div>
-              <div className="block-list">
-                {mockBlocks.map((block) => (
-                  <div key={block.number} className={`block-item ${block.status}`}>
-                    <div className="block-info">
-                      <div className="block-number">#{block.number}</div>
-                      <div className="block-hash">{block.hash}</div>
-                    </div>
-                    <div className="block-meta">
-                      <span className="txs-count">{block.txs} txs</span>
-                      <span className="block-time">{block.time}</span>
-                      <div className={`status-indicator ${block.status}`}></div>
-                    </div>
-                  </div>
-                ))}
-              </div>
+        
+        <div className="table-wrapper">
+          {loading ? (
+            <div className="loading-state">Loading...</div>
+          ) : activity.length === 0 ? (
+            <div className="empty-state">
+              <p>No transactions yet</p>
+              <span>Waiting for network activity...</span>
             </div>
-          )}
-
-          {activeTab === 'transactions' && (
-            <div className="explorer-card">
-              <div className="card-header">
-                <h3>Transaction Stream</h3>
-              </div>
-              <div className="tx-stream">
-                {mockTransactions.map((tx) => (
-                  <div key={tx.hash} className="block-item">
-                    <div className="block-info">
-                      <div className="block-number">{tx.hash}</div>
-                      <div className="block-hash">{tx.type}</div>
-                    </div>
-                    <div className="block-meta">
-                      <span className="txs-count">{tx.amount}</span>
-                      <span className="block-time">Block #{tx.block}</span>
-                      <div className="status-indicator confirmed"></div>
-                    </div>
-                  </div>
+          ) : (
+            <table className="activity-table">
+              <thead>
+                <tr>
+                  <th>Transaction</th>
+                  <th>From → To</th>
+                  <th>Amount</th>
+                  <th>Block</th>
+                  <th>Time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {paginatedActivity.map((item) => (
+                  <ActivityRow key={item.hash} item={item} />
                 ))}
-              </div>
-            </div>
+              </tbody>
+            </table>
           )}
         </div>
-      </section>
+        
+        {totalPages > 1 && (
+          <div className="pagination">
+            <button 
+              onClick={() => setPage(p => Math.max(1, p - 1))} 
+              disabled={page === 1}
+              className="page-btn"
+            >
+              ← Prev
+            </button>
+            <span className="page-info">Page {page} of {totalPages}</span>
+            <button 
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))} 
+              disabled={page === totalPages}
+              className="page-btn"
+            >
+              Next →
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
-} 
+}

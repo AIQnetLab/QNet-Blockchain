@@ -3834,13 +3834,59 @@ impl BlockchainNode {
                                     if !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
                                         let fee_amount = tx.effective_gas_price() * tx.gas_limit;
                                         if fee_amount > 0 {
+                                            // v2.51.1: Add fees to BOTH sources for deterministic distribution
+                                            // 1. reward_manager for local calculation (legacy)
                                             let mut reward_mgr = reward_manager.write().await;
                                             reward_mgr.add_transaction_fees(fee_amount);
+                                            
+                                            // 2. p2p accumulator for MacroBlock recording (deterministic)
+                                            // CRITICAL: This is used by MacroBlock.consensus_data.pool2_total_fees
+                                            if let Some(ref p2p) = unified_p2p {
+                                                p2p.add_to_pool2(fee_amount);
+                                            }
+                                            
                                             // Log only for significant fees (> 0.001 QNC)
                                             if fee_amount > 1_000_000 {
-                                                println!("[INFO][POOL2] fee_collected amount={} dest=pool2", fee_amount);
+                                                println!("[INFO][POOL2] fee_collected amount={} nanoQNC", fee_amount);
                                             }
                                         }
+                                    }
+                                    
+                                    // POOL #3 INTEGRATION: Collect Phase 2 activation payments
+                                    // Phase 2: QNC from node activation goes to Pool 3 (equal share to all)
+                                    match &tx.tx_type {
+                                        qnet_state::TransactionType::NodeActivation { 
+                                            amount, 
+                                            phase: qnet_state::account::ActivationPhase::Phase2, 
+                                            .. 
+                                        } => {
+                                            if *amount > 0 {
+                                                // Add activation payment to Pool 3
+                                                // CRITICAL: This is distributed equally to ALL eligible nodes
+                                                if let Some(ref p2p) = unified_p2p {
+                                                    p2p.add_to_pool3(*amount);
+                                                }
+                                                println!("[INFO][POOL3] activation_collected amount={} nanoQNC phase2", amount);
+                                            }
+                                        }
+                                        qnet_state::TransactionType::BatchNodeActivations { activation_data, .. } => {
+                                            // Batch activations - sum all activation amounts (Phase 2 = amount > 0)
+                                            // Phase 1: activation_amount = 0 (1DEV burned externally)
+                                            // Phase 2: activation_amount > 0 (QNC to Pool 3)
+                                            let total_pool3: u64 = activation_data.iter()
+                                                .filter(|d| d.activation_amount > 0)  // Phase 2 indicator
+                                                .map(|d| d.activation_amount)
+                                                .sum();
+                                            
+                                            if total_pool3 > 0 {
+                                                if let Some(ref p2p) = unified_p2p {
+                                                    p2p.add_to_pool3(total_pool3);
+                                                }
+                                                println!("[INFO][POOL3] batch_activation_collected amount={} nanoQNC count={}", 
+                                                         total_pool3, activation_data.len());
+                                            }
+                                        }
+                                        _ => {} // Other transaction types don't contribute to Pool 3
                                     }
                                 }
                             }
@@ -11970,6 +12016,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // v2.41.0: No heartbeats in emergency mode (use previous data)
             reward_heartbeats: None,
             heartbeats_merkle_root: None,
+            // v2.50.0: Pool totals for deterministic reward calculation
+            // Emergency macroblocks don't include pool data (not emission blocks)
+            pool2_total_fees: None,
+            pool3_total_activations: None,
         };
         
         // Count microblocks before moving
@@ -14573,6 +14623,48 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     Some(randomness_accumulator)
                 },
                 vrf_contributions_count: Some(vrf_contributions_count),
+                // ═══════════════════════════════════════════════════════════════════
+                // v2.50.0: POOL 2 & POOL 3 TOTALS - Deterministic reward calculation
+                // Recorded ONLY in EMISSION MacroBlocks (every 160 = 4 hours)
+                // All nodes use SAME values from blockchain for identical rewards
+                // Pool 2: 70% Super, 30% Full, 0% Light (transaction fees)
+                // Pool 3: Equal share to ALL eligible (Phase 2 only)
+                // ═══════════════════════════════════════════════════════════════════
+                pool2_total_fees: {
+                    const EMISSION_MB_INTERVAL: u64 = 160;
+                    let mb_index = consensus_data.round_number;
+                    let is_emission_mb = mb_index > 0 && mb_index % EMISSION_MB_INTERVAL == 0;
+                    
+                    if is_emission_mb {
+                        // Get current pool2 fees accumulated since last emission
+                        // These will be distributed to validators via this macroblock
+                        let pool2_fees = p2p.get_pool2_accumulated_fees().await;
+                        if pool2_fees > 0 {
+                            println!("[INFO][MB] EMISSION_POOL2 mb={} fees={} nanoQNC", 
+                                     mb_index, pool2_fees);
+                        }
+                        Some(pool2_fees)
+                    } else {
+                        None // Regular MacroBlock - no pool data
+                    }
+                },
+                pool3_total_activations: {
+                    const EMISSION_MB_INTERVAL: u64 = 160;
+                    let mb_index = consensus_data.round_number;
+                    let is_emission_mb = mb_index > 0 && mb_index % EMISSION_MB_INTERVAL == 0;
+                    
+                    if is_emission_mb {
+                        // Get current pool3 activations (Phase 2 only)
+                        let pool3_activations = p2p.get_pool3_accumulated_activations().await;
+                        if pool3_activations > 0 {
+                            println!("[INFO][MB] EMISSION_POOL3 mb={} activations={} nanoQNC",
+                                     mb_index, pool3_activations);
+                        }
+                        Some(pool3_activations)
+                    } else {
+                        None // Regular MacroBlock - no pool data
+                    }
+                },
             },
             previous_hash: previous_macroblock_hash,
             poh_hash: poh_hash.to_vec(),
@@ -15964,15 +16056,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             .collect();
                         
                         // Process heartbeats for rewards - ONLY at emission macroblocks!
+                        // v2.50.0: Use DETERMINISTIC pool2/pool3 values from MacroBlock
                         let reward_manager_arc = self.get_reward_manager();
                         let mut reward_manager = reward_manager_arc.write().await;
                         
-                        match reward_manager.process_macroblock_heartbeats(&summary_data) {
+                        // Get deterministic pool values from MacroBlock (all nodes see same!)
+                        let pool2_total = macroblock.consensus_data.pool2_total_fees;
+                        let pool3_total = macroblock.consensus_data.pool3_total_activations;
+                        
+                        match reward_manager.process_macroblock_heartbeats_deterministic(
+                            &summary_data,
+                            pool2_total,
+                            pool3_total,
+                        ) {
                             Ok(_) => {
                                 let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
-                                println!("[INFO][REWARDS] EMISSION_MACROBLOCK mb={} window={} nodes={} eligible={}", 
+                                println!("[INFO][REWARDS] EMISSION_MACROBLOCK mb={} window={} nodes={} eligible={} pool2={:?} pool3={:?}", 
                                          index, index / EMISSION_MACROBLOCK_INTERVAL, 
-                                         heartbeat_summaries.len(), eligible);
+                                         heartbeat_summaries.len(), eligible,
+                                         pool2_total, pool3_total);
                             }
                             Err(e) => {
                                 println!("[WARN][REWARDS] emission_failed mb={} err={}", index, e);

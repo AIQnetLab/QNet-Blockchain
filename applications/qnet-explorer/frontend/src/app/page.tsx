@@ -1,20 +1,37 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Link from 'next/link';
 
-// Mock data can be moved to a shared context or service if needed
-const mockNodes = [
-  { id: 1, name: 'Node Alpha', location: 'North America', uptime: 247, status: 'online' },
-  { id: 2, name: 'Node Beta', location: 'Europe', uptime: 186, status: 'online' },
-  { id: 3, name: 'Node Gamma', location: 'Asia Pacific', uptime: 321, status: 'online' },
-  { id: 4, name: 'Node Delta', location: 'South America', uptime: 92, status: 'offline' },
-];
-
+interface NetworkStats {
+  activeNodes: number;
+  currentRound: number;
+  height: number;
+}
 
 export default function HomePage() {
-  // The state management for section switching is no longer needed here.
-  // Each page will handle its own state.
+  const [stats, setStats] = useState<NetworkStats>({
+    activeNodes: 0,
+    currentRound: 0,
+    height: 0
+  });
+
+  useEffect(() => {
+    const fetchStats = async () => {
+      try {
+        const res = await fetch('/api/network/stats');
+        const data = await res.json();
+        if (data.success && data.data) {
+          setStats(data.data);
+        }
+      } catch (err) {
+        console.error('Failed to fetch network stats:', err);
+      }
+    };
+    fetchStats();
+    const interval = setInterval(fetchStats, 10000);
+    return () => clearInterval(interval);
+  }, []);
   
   return (
     <div className="page-home">
@@ -41,19 +58,19 @@ export default function HomePage() {
           
           <div className="hero-stats">
             <div className="stat-card">
-              <div className="stat-number">156</div>
+              <div className="stat-number">{stats.activeNodes || '—'}</div>
               <div className="stat-label">ACTIVE NODES</div>
-              <div className="stat-trend">+12 this hour</div>
+              <div className="stat-trend">Live data</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">424,411</div>
-              <div className="stat-label">TPS ACHIEVED</div>
-              <div className="stat-trend">Peak performance</div>
+              <div className="stat-number">~100k</div>
+              <div className="stat-label">TPS PER SHARD</div>
+              <div className="stat-trend">256 shards available</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">100%</div>
-              <div className="stat-label">NETWORK UPTIME</div>
-              <div className="stat-trend">24h average</div>
+              <div className="stat-number">{stats.currentRound || '—'}</div>
+              <div className="stat-label">REWARD EPOCH</div>
+              <div className="stat-trend">Every 4 hours</div>
             </div>
             <div className="stat-card">
               <div className="stat-number">4.29B</div>
@@ -140,10 +157,10 @@ export default function HomePage() {
                 animation: 'lightningFlash 1.5s ease-in-out infinite'
               }}></div>
             </div>
-            <h3>Verified 424,411 TPS</h3>
+            <h3>~100k TPS per Shard</h3>
             <p>
-              Real performance test June 11, 2025: Single Thread 282,337 | Multi-Process 334,218 | 
-              Maximum Burst 424,411 TPS. Microblock architecture with pBFT consensus.
+              Scalable sharding architecture with 256 shards. Each shard achieves ~100k TPS. 
+              Microblock architecture with pBFT consensus for high throughput.
             </p>
           </div>
           

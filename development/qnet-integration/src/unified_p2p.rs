@@ -665,6 +665,24 @@ pub struct SimplifiedP2P {
     /// Auto-cleaned every 60 seconds (TX older than 2 minutes removed)
     /// Capacity: 1M TX hashes (~64MB memory)
     seen_tx_hashes: Arc<DashSet<String>>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v2.50.0: POOL 2 & POOL 3 ACCUMULATORS
+    // Accumulated fees/activations for deterministic reward distribution
+    // Reset to 0 after each EMISSION MacroBlock (every 160 = 4 hours)
+    // Values are stored in MacroBlock for all nodes to use identical amounts
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Pool 2: Accumulated transaction fees (nanoQNC)
+    /// Distribution: 70% Super nodes, 30% Full nodes, 0% Light nodes
+    /// Reset after each EMISSION MacroBlock (every 4 hours)
+    pool2_accumulated_fees: Arc<AtomicU64>,
+    
+    /// Pool 3: Accumulated node activation payments (nanoQNC)
+    /// Phase 1: Always 0 (1DEV burn, Pool 3 disabled)
+    /// Phase 2: Sum of all activation payments (equal share to ALL nodes)
+    /// Reset after each EMISSION MacroBlock (every 4 hours)
+    pool3_accumulated_activations: Arc<AtomicU64>,
 }
 
 /// HYBRID: Simplified certificate manager for microblocks only
@@ -1406,6 +1424,10 @@ impl SimplifiedP2P {
             
             // ANTI-STORM v2.25: Prevent gossip amplification
             seen_tx_hashes: Arc::new(DashSet::new()),
+            
+            // v2.50.0: Pool 2 & Pool 3 accumulators for deterministic rewards
+            pool2_accumulated_fees: Arc::new(AtomicU64::new(0)),
+            pool3_accumulated_activations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -12135,6 +12157,50 @@ impl SimplifiedP2P {
         }
         
         leaves[0]
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v2.50.0: POOL 2 & POOL 3 METHODS - Deterministic reward calculation
+    // These values are accumulated locally and written to MacroBlock at emission time
+    // All nodes then use SAME values from blockchain for identical reward calculation
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Add transaction fee to Pool 2 accumulator (called when TX is processed)
+    /// Pool 2: Distributed to validators (70% Super, 30% Full, 0% Light)
+    pub fn add_to_pool2(&self, fee_amount: u64) {
+        self.pool2_accumulated_fees.fetch_add(fee_amount, Ordering::SeqCst);
+    }
+    
+    /// Add activation payment to Pool 3 accumulator (Phase 2 only)
+    /// Pool 3: Distributed equally to ALL eligible nodes (Light + Full + Super)
+    pub fn add_to_pool3(&self, activation_amount: u64) {
+        self.pool3_accumulated_activations.fetch_add(activation_amount, Ordering::SeqCst);
+    }
+    
+    /// Get Pool 2 accumulated fees for MacroBlock inclusion (async for API compatibility)
+    /// Called during EMISSION MacroBlock creation to record fees in blockchain
+    /// Returns current accumulation and resets to 0
+    pub async fn get_pool2_accumulated_fees(&self) -> u64 {
+        // Atomic swap: read and reset in one operation (no race conditions)
+        self.pool2_accumulated_fees.swap(0, Ordering::SeqCst)
+    }
+    
+    /// Get Pool 3 accumulated activations for MacroBlock inclusion (async for API compatibility)
+    /// Called during EMISSION MacroBlock creation to record activations in blockchain
+    /// Returns current accumulation and resets to 0 (Phase 2 only, Phase 1 always returns 0)
+    pub async fn get_pool3_accumulated_activations(&self) -> u64 {
+        // Atomic swap: read and reset in one operation (no race conditions)
+        self.pool3_accumulated_activations.swap(0, Ordering::SeqCst)
+    }
+    
+    /// Get current Pool 2 balance without resetting (for monitoring)
+    pub fn peek_pool2_fees(&self) -> u64 {
+        self.pool2_accumulated_fees.load(Ordering::SeqCst)
+    }
+    
+    /// Get current Pool 3 balance without resetting (for monitoring)
+    pub fn peek_pool3_activations(&self) -> u64 {
+        self.pool3_accumulated_activations.load(Ordering::SeqCst)
     }
     
     /// Get Light Node registry (for ping service)

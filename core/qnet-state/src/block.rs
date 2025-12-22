@@ -173,6 +173,27 @@ pub struct ConsensusData {
     /// Allows light clients to verify heartbeat inclusion without full data
     #[serde(default)]
     pub heartbeats_merkle_root: Option<[u8; 32]>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // POOL 2 & POOL 3 TOTALS (v2.50.0)
+    // Deterministic fee totals for reward calculation
+    // Leader aggregates all transaction fees in epoch → all nodes use same value
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Pool 2: Total transaction fees collected in this emission window (4 hours)
+    /// Recorded ONLY in EMISSION MacroBlocks (every 160th = 4 hours)
+    /// Distribution: 70% Super nodes, 30% Full nodes, 0% Light nodes
+    /// All nodes use this SAME value for deterministic reward calculation
+    #[serde(default)]
+    pub pool2_total_fees: Option<u64>,
+    
+    /// Pool 3: Total activation QNC collected in this emission window (Phase 2 only)
+    /// Recorded ONLY in EMISSION MacroBlocks when Phase 2 is active
+    /// Distribution: Equal share to ALL eligible nodes (Light + Full + Super)
+    /// Phase 1: Always None (Pool 3 disabled, 1DEV burn instead)
+    /// Phase 2: Sum of all node activation QNC payments
+    #[serde(default)]
+    pub pool3_total_activations: Option<u64>,
 }
 
 /// Eligible producer entry for epoch-based validator set

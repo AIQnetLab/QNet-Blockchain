@@ -600,6 +600,27 @@ impl BlockValidator {
                 
                 // Ping commitments are FREE system operations
             }
+            TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, pool_address, .. } => {
+                // v2.50.0: DEX Swap transaction validation
+                if from.is_empty() {
+                    return Err(IntegrationError::ValidationError("Swap from address cannot be empty".to_string()));
+                }
+                if token_in.is_empty() || token_out.is_empty() {
+                    return Err(IntegrationError::ValidationError("Swap token identifiers cannot be empty".to_string()));
+                }
+                if token_in == token_out {
+                    return Err(IntegrationError::ValidationError("Cannot swap token for itself".to_string()));
+                }
+                if *amount_in == 0 {
+                    return Err(IntegrationError::ValidationError("Swap amount must be greater than 0".to_string()));
+                }
+                if pool_address.is_empty() {
+                    return Err(IntegrationError::ValidationError("DEX pool address cannot be empty".to_string()));
+                }
+                // amount_out_min can be 0 (no slippage protection - risky but allowed)
+                let _ = amount_out_min; // Explicitly mark as intentionally unused here
+                // Gas fee for swaps goes to Pool 2 (70% Super, 30% Full)
+            }
         }
         
         Ok(())

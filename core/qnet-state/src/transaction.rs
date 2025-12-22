@@ -98,6 +98,25 @@ pub enum TransactionType {
         amount: u64,
     },
     
+    /// Token swap via DEX smart contract
+    /// Fee: standard gas fee goes to Pool 2 (distributed to validators)
+    Swap {
+        /// Address initiating the swap
+        from: String,
+        /// Token being sold (e.g., "QNC", contract address for custom tokens)
+        token_in: String,
+        /// Token being bought
+        token_out: String,
+        /// Amount of token_in being swapped
+        amount_in: u64,
+        /// Minimum amount of token_out expected (slippage protection)
+        amount_out_min: u64,
+        /// Actual amount of token_out received (filled after execution)
+        amount_out: u64,
+        /// DEX pool/contract address
+        pool_address: String,
+    },
+    
     /// Node activation (Phase 1: 1DEV burn on Solana, Phase 2: QNC transfer to Pool 3)
     NodeActivation {
         node_type: NodeType,
@@ -439,6 +458,25 @@ impl Transaction {
                     return Err("Empty contract address".to_string());
                 }
             }
+            TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, pool_address, .. } => {
+                if from.is_empty() {
+                    return Err("Swap sender address cannot be empty".to_string());
+                }
+                if token_in.is_empty() || token_out.is_empty() {
+                    return Err("Swap token identifiers cannot be empty".to_string());
+                }
+                if token_in == token_out {
+                    return Err("Cannot swap token for itself".to_string());
+                }
+                if *amount_in == 0 {
+                    return Err("Swap amount must be greater than 0".to_string());
+                }
+                if pool_address.is_empty() {
+                    return Err("DEX pool address cannot be empty".to_string());
+                }
+                // amount_out_min can be 0 (no slippage protection, risky but allowed)
+                let _ = amount_out_min; // Explicitly mark as intentionally unused here
+            }
             TransactionType::RewardDistribution => {
                 // No additional validation needed for RewardDistribution
             }
@@ -692,6 +730,64 @@ impl Transaction {
                 
                 // Contract call logic would go here
                 println!("Contract call by {} with fee {} QNC, value {} QNC", self.from, fee, self.amount);
+            }
+            TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, amount_out, pool_address } => {
+                // Token swap via DEX
+                // Gas fee goes to Pool 2 (distributed to validators: 70% Super, 30% Full)
+                let sender = accounts.get_mut(from)
+                    .ok_or_else(|| StateError::AccountNotFound(from.clone()))?;
+                
+                // CRITICAL SECURITY: Check nonce to prevent replay attacks
+                if self.nonce != sender.nonce + 1 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        sender.nonce + 1, self.nonce
+                    )));
+                }
+                
+                // Calculate gas fee (QUANTUM v2.25: +50% for Dilithium TX)
+                let fee = self.effective_gas_price() * self.gas_limit;
+                
+                // For QNC swaps: check if user has enough balance (amount_in + fee)
+                // For other tokens: only check fee (token balance checked by DEX contract)
+                let total_cost = if token_in == "QNC" {
+                    amount_in + fee
+                } else {
+                    fee
+                };
+                
+                if sender.balance < total_cost {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: total_cost,
+                    });
+                }
+                
+                // Slippage protection: ensure amount_out >= amount_out_min
+                if *amount_out < *amount_out_min {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Slippage exceeded: got {} {}, minimum was {} {}",
+                        amount_out, token_out, amount_out_min, token_out
+                    )));
+                }
+                
+                // Deduct fee (always in QNC)
+                sender.balance -= fee;
+                
+                // If swapping QNC for another token, deduct amount_in
+                if token_in == "QNC" {
+                    sender.balance -= amount_in;
+                }
+                
+                // If receiving QNC, add amount_out
+                if token_out == "QNC" {
+                    sender.balance += amount_out;
+                }
+                
+                sender.nonce += 1;
+                
+                println!("[SWAP] 🔄 {} swapped {} {} for {} {} via pool {} (fee: {} QNC → Pool 2)", 
+                         from, amount_in, token_in, amount_out, token_out, pool_address, fee);
             }
             TransactionType::RewardDistribution => {
                 // System transaction for reward distribution

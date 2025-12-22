@@ -728,7 +728,7 @@ const WalletScreen = () => {
   const [sendAmount, setSendAmount] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [selectedToken, setSelectedToken] = useState('sol');
-  const [selectedNetwork, setSelectedNetwork] = useState('solana'); // 'qnet' or 'solana'
+  const [selectedNetwork, setSelectedNetwork] = useState('qnet'); // 'qnet' or 'solana' - default to QNet
   const [isTestnet, setIsTestnet] = useState(true); // testnet by default (true = testnet RPC)
   const [tokenPrices, setTokenPrices] = useState({
     qnc: 0.0,
@@ -995,38 +995,19 @@ const WalletScreen = () => {
         ? nodePseudonym 
         : null;
       
-      console.log(`[Node] Loading server node status: activationCode=${activationCode}, nodeId=${nodeId}, nodeType=${activatedNodeType}`);
-      
       const status = await checkServerNodeStatus(activationCode, nodeId);
       
-      console.log(`[Node] Server node status loaded:`, {
-        success: status.success,
-        isOnline: status.isOnline,
-        nodeId: status.nodeId,
-        nodeType: status.nodeType,
-        heartbeatCount: status.heartbeatCount,
-        requiredHeartbeats: status.requiredHeartbeats,
-        pendingRewards: status.pendingRewards,
-        pendingRewards_type: typeof status.pendingRewards,
-        isRewardEligible: status.isRewardEligible,
-        reputation: status.reputation,
-        error: status.error
-      });
-      
+      // Set status (UI will show appropriate state based on success flag)
       setServerNodeStatus(status);
       
       // Also load pseudonym for display
       await loadNodePseudonym(activationCode);
       
-      if (status.needsAttention) {
-        console.log('[Node] Server node needs attention:', status.message);
-      }
-      
-      if (!status.success) {
-        console.error('[Node] Server node status check failed:', status.error);
-      }
+      // Silent handling - no errors shown to user
+      // If node not found, UI shows "Server nodes require server activation"
     } catch (error) {
-      console.error('[Node] Failed to load server node status:', error);
+      // Network error - set null status, UI will show activation prompt
+      setServerNodeStatus({ success: false, error: 'Network unavailable' });
     }
   };
   
