@@ -2132,7 +2132,7 @@ impl BlockchainNode {
                 }
             }
         } else {
-            println!("[NODE] 📱 Light node: Skipping certificate history (no consensus participation)");
+            if is_info() { println!("[INFO][NODE] skip_cert_history reason=light_node"); }
         }
         
         // CRITICAL: Initialize all Genesis node reputations deterministically at startup
@@ -2317,7 +2317,7 @@ impl BlockchainNode {
         // CRITICAL: Update global pricing state with Genesis timestamp
         // This enables dynamic pricing in quantum_crypto.rs
         crate::update_global_pricing_state(0.0, 5, genesis_timestamp);
-        println!("[INFO][PRICING] init genesis_ts={}", genesis_timestamp);
+        if is_info() { println!("[INFO][PRICING] init genesis_ts={}", genesis_timestamp); }
         
         // CRITICAL: Restore pending rewards from storage (survive restarts)
         {
@@ -2538,7 +2538,7 @@ impl BlockchainNode {
             latency_window_size: 100,   
         };
         let adaptive_bft = Arc::new(crate::adaptive_bft::AdaptiveBft::new(adaptive_bft_config));
-        println!("[INFO][BFT] adaptive_timeout_manager=ready");
+        if is_info() { println!("[INFO][BFT] adaptive_timeout_manager=ready"); }
         
         // Initialize Pre-execution manager
         let pre_execution_config = crate::pre_execution::PreExecutionConfig {
@@ -2548,12 +2548,12 @@ impl BlockchainNode {
             timeout_ms: 500,          // 500ms timeout
         };
         let pre_execution = Arc::new(crate::pre_execution::PreExecutionManager::new(pre_execution_config));
-        println!("[INFO][PREEXEC] speculative_exec=ready");
+        if is_info() { println!("[INFO][PREEXEC] speculative_exec=ready"); }
         
         // Initialize event-based block notification system
         // Channel capacity: 100 (enough for burst of blocks, old events auto-dropped)
         let (block_event_tx, _block_event_rx) = tokio::sync::broadcast::channel(100);
-        println!("[INFO][EVENTS] block_notifications=ready");
+        if is_info() { println!("[INFO][EVENTS] block_notifications=ready"); }
         
         // DETERMINISTIC REPUTATION: Initialize blockchain-based reputation state
         // All reputation is calculated from on-chain data (no P2P gossip vulnerabilities)
@@ -2572,10 +2572,10 @@ impl BlockchainNode {
                     "genesis_node_005".to_string(),
                 ];
                 rep_state.init_genesis_nodes(&genesis_nodes);
-                println!("[INFO][REP] genesis_nodes={} reputation=70%", genesis_nodes.len());
+                if is_info() { println!("[INFO][REP] genesis_nodes={} reputation=70%", genesis_nodes.len()); }
             }
         }
-        println!("[INFO][REP] deterministic_system=ready source=blockchain");
+        if is_info() { println!("[INFO][REP] deterministic_system=ready source=blockchain"); }
         
         // MEV PROTECTION: Initialize optional private bundle mempool
         // ARCHITECTURE: Dynamic 0-20% allocation protects public TX throughput
@@ -2595,10 +2595,10 @@ impl BlockchainNode {
                 bundle_config,
             ));
             
-            println!("[INFO][MEV] protection=enabled allocation=0-20%");
+            if is_info() { println!("[INFO][MEV] protection=enabled allocation=0-20%"); }
             Some(mev_pool)
         } else {
-            println!("[INFO][MEV] protection=disabled mode=public_mempool");
+            if is_info() { println!("[INFO][MEV] protection=disabled mode=public_mempool"); }
             None
         };
         
@@ -2648,7 +2648,7 @@ impl BlockchainNode {
             deterministic_reputation,
         };
         
-        println!("[Node] 🔍 DEBUG: BlockchainNode created successfully for node_id: {}", node_id);
+        if is_debug() { println!("[DBG][NODE] created node_id={}", node_id); }
         
         // CRITICAL: Link deterministic reputation to P2P for unified access
         // This allows deterministic producer selection to use blockchain-based reputation
@@ -2662,7 +2662,7 @@ impl BlockchainNode {
         {
             let current_height = *blockchain.height.read().await;
             if current_height > 0 {
-                println!("[REPUTATION] 📜 Replaying {} blocks to restore reputation state...", current_height);
+                if is_info() { println!("[INFO][REP] replay_start blocks={}", current_height); }
                 
                 if let Ok(mut rep_state) = blockchain.deterministic_reputation.write() {
                     let start_time = std::time::Instant::now();
@@ -2758,8 +2758,8 @@ impl BlockchainNode {
                             if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
                                 if !snapshot_data.is_empty() {
                                     if let Ok(count) = rep_state.apply_snapshot(snapshot_data) {
-                                        println!("[REPUTATION-REPLAY] 📸 Applied snapshot from macroblock #{}: {} nodes", 
-                                                 macroblock_index, count);
+                                        if is_debug() { println!("[DBG][REP] snapshot_applied mb={} nodes={}", 
+                                                 macroblock_index, count); }
                                     }
                                 } else {
                                     rep_state.process_macroblock(&macro_data, macroblock.timestamp);
@@ -2772,16 +2772,16 @@ impl BlockchainNode {
                     }
 
                     let elapsed = start_time.elapsed();
-                    println!("[INFO][REP] replay_complete rotations={} macroblocks={} time={:?}",
-                             blocks_processed, macroblocks_processed, elapsed);
+                    if is_info() { println!("[INFO][REP] replay_complete rotations={} macroblocks={} time={:?}",
+                             blocks_processed, macroblocks_processed, elapsed); }
                     
                     // Log current reputation state
                     let stats = rep_state.get_stats();
-                    println!("[INFO][REP] state nodes={} eligible={} jailed={}",
-                             stats.total_nodes, stats.consensus_eligible, stats.active_jails);
+                    if is_info() { println!("[INFO][REP] state nodes={} eligible={} jailed={}",
+                             stats.total_nodes, stats.consensus_eligible, stats.active_jails); }
                 }
             } else {
-                println!("[REPUTATION] 🆕 Fresh start - no blocks to replay");
+                if is_info() { println!("[INFO][REP] fresh_start no_blocks"); }
             }
         }
         
@@ -2816,7 +2816,7 @@ impl BlockchainNode {
         if let Some(ref mev_pool) = blockchain.mev_mempool {
             let mev_pool_for_cleanup = mev_pool.clone();
             tokio::spawn(async move {
-                println!("[MEV] 🧹 Started periodic bundle cleanup task (every 30s)");
+                if is_info() { println!("[INFO][MEV] bundle_cleanup_task=started interval=30s"); }
                 loop {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     
@@ -2827,7 +2827,7 @@ impl BlockchainNode {
                     
                     let removed = mev_pool_for_cleanup.cleanup_expired_bundles(current_time);
                     if removed > 0 {
-                        println!("[INFO][MEV] cleanup expired_bundles={}", removed);
+                        if is_debug() { println!("[DBG][MEV] cleanup expired_bundles={}", removed); }
                     }
                 }
             });
@@ -2846,7 +2846,7 @@ impl BlockchainNode {
                 let genesis_wallet = match crate::genesis_constants::get_genesis_wallet_by_id(&bootstrap_id) {
                     Some(wallet) => wallet.to_string(),
                     None => {
-                        println!("[ERR][WALLET] genesis_node={} wallet=not_found", bootstrap_id);
+                        eprintln!("[ERR][WALLET] genesis_node={} wallet=not_found", bootstrap_id);
                         // STATE MACHINE: Fatal configuration error
                         set_node_state(NodeState::Error {
                             reason: format!("No predefined wallet for Genesis node {}", bootstrap_id),
@@ -2915,14 +2915,14 @@ impl BlockchainNode {
                 ).await {
                     println!("[WARN][REGISTRY] genesis_register_failed err={}", e);
                 } else {
-                    println!("[INFO][REGISTRY] genesis_registered node={}", genesis_node_id);
+                    if is_info() { println!("[INFO][REGISTRY] genesis_registered node={}", genesis_node_id); }
                 }
             }
             
             // Reward processing is handled by RPC system, not by individual nodes
             // This ensures centralized control of emission and distribution
             if bootstrap_id == "001" {
-                println!("[INFO][REWARDS] ping_receiver=ready");
+                if is_info() { println!("[INFO][REWARDS] ping_receiver=ready"); }
             }
         }
         
@@ -2932,7 +2932,7 @@ impl BlockchainNode {
             while let Some((from_height, to_height, requester_id)) = sync_request_rx.recv().await {
                 // Use existing handle_sync_request method
                 if let Err(e) = blockchain_clone.handle_sync_request(from_height, to_height, requester_id).await {
-                    println!("[ERR][SYNC] Failed to handle sync request: {}", e);
+                    eprintln!("[ERR][SYNC] handle_request_failed err={}", e);
                 }
             }
         });
@@ -2943,7 +2943,7 @@ impl BlockchainNode {
             while let Some((from_index, to_index, requester_id)) = macroblock_sync_rx.recv().await {
                 // Handle macroblock sync request
                 if let Err(e) = blockchain_for_macrosync.handle_macroblock_sync_request(from_index, to_index, requester_id).await {
-                    println!("[ERR][MB-SYNC] handle_request_failed err={}", e);
+                    eprintln!("[ERR][MB-SYNC] handle_request_failed err={}", e);
                 }
             }
         });
@@ -2954,7 +2954,7 @@ impl BlockchainNode {
             while let Some(received_macroblock) = macroblock_rx.recv().await {
                 // Process received macroblock
                 if let Err(e) = blockchain_for_macroblocks.process_received_macroblock(received_macroblock).await {
-                    println!("[ERR][MB-SYNC] process_failed err={}", e);
+                    eprintln!("[ERR][MB-SYNC] process_failed err={}", e);
                 }
             }
         });
@@ -3053,7 +3053,7 @@ impl BlockchainNode {
                     }
                     
                     if added > 0 {
-                        println!("[INFO][TX-SYNC] batch_added count={} mode=batch_verify", added);
+                        if is_info() { println!("[INFO][TX-SYNC] batch_added count={} mode=batch_verify", added); }
                     }
                     
                     last_batch_time = std::time::Instant::now();
@@ -3066,7 +3066,7 @@ impl BlockchainNode {
                         for key in to_remove {
                             processed_txs.remove(&key);
                         }
-                        println!("[TX-SYNC] 🧹 Cleaned up deduplication cache: {} entries remaining", processed_txs.len());
+                        if is_debug() { println!("[DBG][TX-SYNC] cache_cleanup remaining={}", processed_txs.len()); }
                     }
                     last_cleanup = std::time::Instant::now();
                 }
@@ -3111,7 +3111,7 @@ impl BlockchainNode {
                             let rollback_from = network_height + 1;
                             let rollback_to = local_height;
                             
-                            println!("[INFO][ROLLBACK] deleting from={} to={}", rollback_from, rollback_to);
+                            if is_info() { println!("[INFO][ROLLBACK] deleting from={} to={}", rollback_from, rollback_to); }
                             
                             for h in rollback_from..=rollback_to {
                                 if let Err(e) = blockchain_for_sync.storage.delete_microblock(h) {
@@ -3130,12 +3130,12 @@ impl BlockchainNode {
                             // Storage uses height as key, so new macroblocks will replace old ones
                             let network_macroblock_index = network_height / 90;
                             
-                            println!("[INFO][ROLLBACK] complete new_height={}", network_height);
+                            if is_info() { println!("[INFO][ROLLBACK] complete new_height={}", network_height); }
                             if is_info() { println!("[INFO][SYNC] req_fresh_blocks"); }
                             
                             // Now sync macroblocks from network to ensure we have correct data
                             if network_macroblock_index > 0 {
-                                println!("[INFO][MB-SYNC] resync from=1 to={}", network_macroblock_index);
+                                if is_info() { println!("[INFO][MB-SYNC] resync from=1 to={}", network_macroblock_index); }
                                 if let Err(e) = p2p.sync_macroblocks(1, network_macroblock_index).await {
                                     println!("[WARN][MB-SYNC] resync_failed err={}", e);
                                 }
@@ -3164,7 +3164,7 @@ impl BlockchainNode {
                             while current <= network_height {
                                 let chunk_end = std::cmp::min(current + 100, network_height);
                                 
-                                println!("[INFO][SYNC] request from={} to={}", current, chunk_end);
+                                if is_debug() { println!("[DBG][SYNC] request from={} to={}", current, chunk_end); }
                                 if let Err(e) = p2p.sync_blocks(current, chunk_end).await {
                                     println!("[WARN][SYNC] Sync failed at block {}: {}", current, e);
                                     break;
@@ -3187,15 +3187,15 @@ impl BlockchainNode {
                             let network_macroblock_index = network_height / 90;
                             
                             if network_macroblock_index > local_macroblock_index {
-                                println!("[INFO][MB-SYNC] syncing from={} to={}", 
-                                         local_macroblock_index + 1, network_macroblock_index);
+                                if is_info() { println!("[INFO][MB-SYNC] syncing from={} to={}", 
+                                    local_macroblock_index + 1, network_macroblock_index); }
                                 
                                 // Sync macroblocks in batches of 10
                                 let mut current_macro = local_macroblock_index + 1;
                                 while current_macro <= network_macroblock_index {
                                     let batch_end = std::cmp::min(current_macro + 9, network_macroblock_index);
                                     
-                                    println!("[INFO][MB-SYNC] request from={} to={}", current_macro, batch_end);
+                                    if is_debug() { println!("[DBG][MB-SYNC] request from={} to={}", current_macro, batch_end); }
                                     if let Err(e) = p2p.sync_macroblocks(current_macro, batch_end).await {
                                         println!("[WARN][MB-SYNC] sync_failed idx={} err={}", current_macro, e);
                                         break;
@@ -3207,9 +3207,9 @@ impl BlockchainNode {
                                     tokio::time::sleep(Duration::from_millis(200)).await;
                                 }
                                 
-                                println!("[INFO][MB-SYNC] complete");
+                                if is_info() { println!("[INFO][MB-SYNC] complete"); }
                             } else {
-                                println!("[INFO][MB-SYNC] synchronized idx={}", local_macroblock_index);
+                                if is_info() { println!("[INFO][MB-SYNC] synchronized idx={}", local_macroblock_index); }
                             }
                             
                             if is_info() { println!("[INFO][SYNC] initial_sync_complete"); }
@@ -3291,7 +3291,7 @@ impl BlockchainNode {
                     // Request missing macroblocks from network (limit to 10 per cycle to prevent overload)
                     if let Some(ref p2p) = blockchain_for_macrocheck.unified_p2p {
                         for mb_index in missing_macroblocks.iter().take(10) {
-                            println!("[MACROBLOCK-CHECK] 📥 Requesting macroblock #{}", mb_index);
+                            if is_debug() { println!("[DBG][MB-CHECK] request idx={}", mb_index); }
                             if let Err(e) = p2p.sync_macroblocks(*mb_index, *mb_index).await {
                                 println!("[WARN][MB-CHECK] sync_failed idx={} err={}", mb_index, e);
                             }
@@ -3301,8 +3301,8 @@ impl BlockchainNode {
                     }
                 } else if current_height % 180 == 0 {
                     // Log health every 180 blocks (~3 minutes)
-                    println!("[INFO][MB-CHECK] verified count={} range={}-{}", 
-                             expected_macroblocks, check_from, expected_macroblocks);
+                    if is_info() { println!("[INFO][MB-CHECK] verified count={} range={}-{}", 
+                             expected_macroblocks, check_from, expected_macroblocks); }
                 }
             }
         });
@@ -3372,7 +3372,7 @@ impl BlockchainNode {
             
             // DIAGNOSTIC: Log retry attempts
             if is_retry {
-                println!("[INFO][BLOCK] retry h={}", received_block.height);
+                if is_debug() { println!("[DBG][BLOCK] retry h={}", received_block.height); }
             }
             
             // Check for special ping signal
@@ -3385,12 +3385,12 @@ impl BlockchainNode {
                         let success = parts[2] == "true";
                         let response_time_ms = parts[3].parse::<u32>().unwrap_or(0);
                         
-                        println!("[INFO][PING] processing node={} latency={}ms", node_id, response_time_ms);
+                        if is_debug() { println!("[DBG][PING] processing node={} latency={}ms", node_id, response_time_ms); }
                         
                         // CRITICAL FIX: Forward to reward manager for tracking
                         // Note: In this context we only log, actual recording happens in RPC handler
                         if success {
-                            println!("[INFO][PING] recorded node={} status=ok", node_id);
+                            if is_debug() { println!("[DBG][PING] recorded node={} status=ok", node_id); }
                         } else {
                             println!("[WARN][PING] failed node={}", node_id);
                         }
@@ -3410,12 +3410,12 @@ impl BlockchainNode {
             // Log every 10th block or special cases
             let should_log = received_block.height % 10 == 0 || received_block.height <= 5;
             if should_log {
-                println!("[INFO][BLOCK] recv type={} h={} from={} bytes={} zstd={}",
+                if is_info() { println!("[INFO][BLOCK] recv type={} h={} from={} bytes={} zstd={}",
                          received_block.block_type, 
                          received_block.height, 
                          received_block.from_peer, 
                          received_block.data.len(),
-                         if is_compressed { "✓ Zstd" } else { "✗ Raw" });
+                         if is_compressed { "yes" } else { "no" }); }
             }
             
             // PRODUCTION: Validate and store received block
@@ -3435,8 +3435,8 @@ impl BlockchainNode {
                                 .unwrap_or(0);
                             
                             if retry_count < 5 { // Max 5 retries for certificate race (more than missing block)
-                                println!("[INFO][BLOCK] buffer h={} retry={} wait_cert={}", 
-                                         received_block.height, retry_count, received_block.from_peer);
+                                if is_debug() { println!("[DBG][BLOCK] buffer h={} retry={} wait_cert={}", 
+                                         received_block.height, retry_count, received_block.from_peer); }
                                 
                                 // MEMORY PROTECTION: Enforce maximum buffer size (adaptive by node type)
                                 if pending_blocks.len() >= max_pending_blocks {
@@ -3462,10 +3462,10 @@ impl BlockchainNode {
                                 
                                 // Certificate will arrive via periodic broadcast (every 10s during first 2 minutes)
                                 // No need to request - adaptive re-broadcast will provide it
-                                println!("[INFO][BLOCK] cert_pending via_rebroadcast");
+                                if is_debug() { println!("[DBG][BLOCK] cert_pending via_rebroadcast"); }
                                 continue; // Skip error logging, this is expected race condition
                             } else {
-                                println!("[ERR][BLOCK] rejected h={} cert_retries={}", 
+                                eprintln!("[ERR][BLOCK] rejected h={} cert_retries={}", 
                                          received_block.height, retry_count);
                             }
                         }
@@ -3491,8 +3491,8 @@ impl BlockchainNode {
                                     // - Retries 0-9: aggressive (immediate)
                                     // - Retries 10+: exponential (30s, 60s, 120s, 240s, 300s max)
                                     let backoff_phase = if retry_count < 10 { "aggressive" } else { "backoff" };
-                                    println!("[INFO][BLOCK] buffer h={} retry={} reason={} wait_prev={}", 
-                                             received_block.height, retry_count, backoff_phase, missing_height);
+                                    if is_debug() { println!("[DBG][BLOCK] buffer h={} retry={} reason={} wait_prev={}", 
+                                             received_block.height, retry_count, backoff_phase, missing_height); }
                                     
                                     // ALWAYS buffer - never discard! (pseudo-infinite)
                                         
@@ -3543,7 +3543,7 @@ impl BlockchainNode {
                                             };
                                             
                                             if can_request {
-                                                println!("[INFO][BLOCK] request_missing h={}", missing_height);
+                                                if is_debug() { println!("[DBG][BLOCK] request_missing h={}", missing_height); }
                                                 
                                                 // Update request tracking
                                                 let request_count = requested_blocks.get(&missing_height)
@@ -3561,7 +3561,7 @@ impl BlockchainNode {
                                                         for attempt in 1..=3 {
                                                         // SPECIAL CASE: Genesis block request
                                                             if retry_missing_height == 0 {
-                                                                println!("[INFO][BLOCK] request_genesis attempt={}", attempt);
+                                                                if is_debug() { println!("[DBG][BLOCK] request_genesis attempt={}", attempt); }
                                                             if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
                                                                     println!("[WARN][BLOCK] genesis_req_fail attempt={} err={}", attempt, e);
                                                                     if attempt < 3 {
@@ -3569,7 +3569,7 @@ impl BlockchainNode {
                                                                         continue;
                                                                     }
                                                             } else {
-                                                                println!("[INFO][BLOCK] genesis_requested");
+                                                                if is_debug() { println!("[DBG][BLOCK] genesis_requested"); }
                                                                     break;
                                                             }
                                                         } else {
@@ -3581,7 +3581,7 @@ impl BlockchainNode {
                                                                         continue;
                                                                     }
                                                             } else {
-                                                                    println!("[INFO][BLOCK] requested h={}", retry_missing_height);
+                                                                    if is_debug() { println!("[DBG][BLOCK] requested h={}", retry_missing_height); }
                                                                     break;
                                                                 }
                                                             }
@@ -3589,7 +3589,7 @@ impl BlockchainNode {
                                                     });
                                                 }
                                             } else {
-                                                println!("[BLOCKS] ⏳ Rate limit: delaying request for block #{}", missing_height);
+                                                if is_debug() { println!("[DBG][BLOCK] rate_limit delay h={}", missing_height); }
                                             }
                                         }
                                     
@@ -3609,7 +3609,7 @@ impl BlockchainNode {
                                         // CRITICAL: Check if reorg already in progress (prevent race condition)
                                         let is_reorg_active = *reorg_in_progress.read().await;
                                         if is_reorg_active {
-                                            println!("[INFO][REORG] in_progress=true skip fork_from={}", fork_producer);
+                                            if is_debug() { println!("[DBG][REORG] in_progress=true skip fork_from={}", fork_producer); }
                                             continue;
                                         }
                                         
@@ -3629,7 +3629,7 @@ impl BlockchainNode {
                                         // Update last attempt timestamp
                                         *last_fork_attempt.write().await = std::time::Instant::now();
                                         
-                                        println!("[REORG] 🔀 Fork detected at height {} from {} - syncing with majority", fork_height, fork_producer);
+                                        if is_info() { println!("[INFO][REORG] fork_detected h={} producer={}", fork_height, fork_producer); }
                                         
                                         // PRODUCTION: Compute our hash BEFORE spawning async task
                                         let our_hash_for_state = if let Ok(Some(our_block)) = storage.load_microblock(fork_height) {
@@ -3665,16 +3665,16 @@ impl BlockchainNode {
                                                 if let Ok(network_height) = p2p.sync_blockchain_height().await {
                                                     let local_height = *height_clone.read().await;
                                                     
-                                                    println!("[INFO][REORG] compare local={} network={} fork={}", 
-                                                             local_height, network_height, fork_height);
+                                                    if is_debug() { println!("[DBG][REORG] compare local={} network={} fork={}", 
+                                                             local_height, network_height, fork_height); }
                                                     
                                                     // CASE 1: Network is ahead - sync to catch up
                                                     if network_height > local_height {
-                                                        println!("[REORG] 📥 Network ahead: {} > {} - syncing", network_height, local_height);
+                                                        if is_info() { println!("[INFO][REORG] network_ahead local={} network={}", local_height, network_height); }
                                                         
                                                         // Rollback to fork point and resync
                                                         if fork_height <= local_height {
-                                                            println!("[INFO][REORG] rollback from={} to={}", local_height, fork_height - 1);
+                                                            if is_info() { println!("[INFO][REORG] rollback from={} to={}", local_height, fork_height - 1); }
                                                             
                                                             for h in fork_height..=local_height {
                                                                 if let Err(e) = storage_clone.delete_microblock(h) {
@@ -3688,18 +3688,18 @@ impl BlockchainNode {
                                                         
                                                         // Sync missing blocks
                                                         let sync_to = std::cmp::min(network_height, fork_height + 100);
-                                                        println!("[INFO][REORG] request from={} to={}", fork_height, sync_to);
+                                                        if is_debug() { println!("[DBG][REORG] request from={} to={}", fork_height, sync_to); }
                                                         if let Err(e) = p2p.sync_blocks(fork_height, sync_to).await {
                                                             println!("[ERR][REORG] sync_failed err={}", e);
                                                         } else {
-                                                            println!("[INFO][REORG] resolved synced=longer_chain");
+                                                            if is_info() { println!("[INFO][REORG] resolved synced=longer_chain"); }
                                                         }
                                                     }
                                                     // CASE 2: Same height - resync from network to resolve
                                                     // ARCHITECTURE: We can't know which chain is "correct" without querying peers
                                                     // The safest approach is to resync and let the network decide
                                                     else if network_height == local_height && fork_height <= local_height {
-                                                        println!("[INFO][REORG] same_height={} fork=detected resync=network", local_height);
+                                                        if is_info() { println!("[INFO][REORG] same_height={} fork=detected resync=network", local_height); }
                                                         
                                                         // Get our hash at fork_height for logging
                                                         let our_hash = if let Ok(Some(our_block)) = storage_clone.load_microblock(fork_height) {
@@ -3711,8 +3711,8 @@ impl BlockchainNode {
                                                             "unknown".to_string()
                                                         };
                                                         
-                                                        println!("[DBG][REORG] our_block h={} hash={}", fork_height, our_hash);
-                                                        println!("[DBG][REORG] fork_from={}", fork_producer_clone);
+                                                        if is_debug() { println!("[DBG][REORG] our_block h={} hash={}", fork_height, our_hash); }
+                                                        if is_debug() { println!("[DBG][REORG] fork_from={}", fork_producer_clone); }
                                                         
                                                         // SIMPLE AND RELIABLE APPROACH:
                                                         // 1. Rollback to fork point
@@ -3726,14 +3726,14 @@ impl BlockchainNode {
                                                             .filter(|p| p.consensus_score >= 70.0)
                                                             .count();
                                                         
-                                                        println!("[INFO][REORG] high_rep_validators={}", high_rep_count);
+                                                        if is_debug() { println!("[DBG][REORG] high_rep_validators={}", high_rep_count); }
                                                         
                                                         // Only resync if we have enough validators to trust
                                                         // MIN_PEERS_FOR_CONSENSUS = 4 (Byzantine 3f+1 where f=1)
                                                         const MIN_PEERS_FOR_RESYNC: usize = 3;
                                                         
                                                         if high_rep_count >= MIN_PEERS_FOR_RESYNC {
-                                                            println!("[INFO][REORG] resync validators={}", high_rep_count);
+                                                            if is_info() { println!("[INFO][REORG] resync validators={}", high_rep_count); }
                                                             
                                                             // Rollback to fork point
                                                             for h in fork_height..=local_height {
@@ -3748,21 +3748,21 @@ impl BlockchainNode {
                                                             if let Err(e) = p2p.sync_blocks(fork_height, local_height).await {
                                                                 println!("[ERR][REORG] sync_failed err={}", e);
                                                             } else {
-                                                                println!("[INFO][REORG] resolved resync=network");
-                                                                println!("[INFO][REORG] finalize=pending blocks=90");
+                                                                if is_info() { println!("[INFO][REORG] resolved resync=network"); }
+                                                                if is_info() { println!("[INFO][REORG] finalize=pending blocks=90"); }
                                                             }
                                                         } else {
                                                             // Not enough validators - keep our chain and wait
                                                             // This prevents switching to a malicious chain from few nodes
                                                             println!("[WARN][REORG] insufficient validators={} need={} action=keep", 
                                                                      high_rep_count, MIN_PEERS_FOR_RESYNC);
-                                                            println!("[INFO][REORG] retry=pending wait=validators");
+                                                            if is_debug() { println!("[DBG][REORG] retry=pending wait=validators"); }
                                                         }
                                                     }
                                                     // CASE 3: We're ahead - keep our chain
                                                     else {
-                                                        println!("[INFO][REORG] ahead local={} network={} action=keep", 
-                                                                 local_height, network_height);
+                                                        if is_debug() { println!("[DBG][REORG] ahead local={} network={} action=keep", 
+                                                                 local_height, network_height); }
                                                     }
                                                 }
                                             }
@@ -3772,13 +3772,13 @@ impl BlockchainNode {
                                         });
                                         
                                         // Continue processing other blocks immediately
-                                        println!("[INFO][REORG] fork_analysis=background status=continue");
+                                        if is_debug() { println!("[DBG][REORG] fork_analysis=background status=continue"); }
                                     }
                                 }
                             }
                         } else {
                             // SECURITY: Track invalid block for malicious behavior detection
-                            println!("[ERR][BLOCK] invalid_microblock h={} err={}", received_block.height, e);
+                            eprintln!("[ERR][BLOCK] invalid_microblock h={} err={}", received_block.height, e);
                             
                             // Report to P2P system for soft punishment tracking
                             if let Some(p2p) = &unified_p2p {
@@ -3801,15 +3801,15 @@ impl BlockchainNode {
                         Ok(microblock) => {
                             // CRITICAL: Save producer_id for reputation update after storage
                             block_producer_id = Some(microblock.producer.clone());
-                            println!("[REPUTATION] 🔍 Block #{} producer extracted: {}", received_block.height, microblock.producer);
+                            if is_debug() { println!("[DBG][REP] block={} producer={}", received_block.height, microblock.producer); }
                             // Apply ALL transactions from block to state
                             for tx in &microblock.transactions {
                                 // SPECIAL HANDLING: RewardDistribution transactions
                                 // These update total_supply on non-producer nodes
                                 if tx.tx_type == qnet_state::TransactionType::RewardDistribution 
                                    && tx.from == "system_emission" {
-                                    println!("[INFO][STATE] emission amount={} block={}", 
-                                             tx.amount / 1_000_000_000, microblock.height);
+                                    if is_debug() { println!("[DBG][STATE] emission amount={} block={}", 
+                                             tx.amount / 1_000_000_000, microblock.height); }
                                     
                                     // Update total_supply for emission transactions
                                     // This is CRITICAL for state consistency across network
@@ -3818,7 +3818,7 @@ impl BlockchainNode {
                                         eprintln!("[WARN][STATE] emission_failed err={}", e);
                                     } else {
                                         let new_supply = state_guard.get_total_supply();
-                                        println!("[INFO][STATE] supply_updated total={} QNC", new_supply / 1_000_000_000);
+                                        if is_debug() { println!("[DBG][STATE] supply_updated total={} QNC", new_supply / 1_000_000_000); }
                                     }
                                 }
                                 
@@ -3848,7 +3848,7 @@ impl BlockchainNode {
                                             
                                             // Log only for significant fees (> 0.001 QNC)
                                             if fee_amount > 1_000_000 {
-                                                println!("[INFO][POOL2] fee_collected amount={} nanoQNC", fee_amount);
+                                                if is_debug() { println!("[DBG][POOL2] fee_collected amount={} nanoQNC", fee_amount); }
                                             }
                                         }
                                     }
@@ -3867,7 +3867,7 @@ impl BlockchainNode {
                                                 if let Some(ref p2p) = unified_p2p {
                                                     p2p.add_to_pool3(*amount);
                                                 }
-                                                println!("[INFO][POOL3] activation_collected amount={} nanoQNC phase2", amount);
+                                                if is_debug() { println!("[DBG][POOL3] activation_collected amount={} nanoQNC phase2", amount); }
                                             }
                                         }
                                         qnet_state::TransactionType::BatchNodeActivations { activation_data, .. } => {
@@ -3883,8 +3883,8 @@ impl BlockchainNode {
                                                 if let Some(ref p2p) = unified_p2p {
                                                     p2p.add_to_pool3(total_pool3);
                                                 }
-                                                println!("[INFO][POOL3] batch_activation_collected amount={} nanoQNC count={}", 
-                                                         total_pool3, activation_data.len());
+                                                if is_debug() { println!("[DBG][POOL3] batch_activation_collected amount={} nanoQNC count={}", 
+                                                         total_pool3, activation_data.len()); }
                                             }
                                         }
                                         _ => {} // Other transaction types don't contribute to Pool 3
@@ -3904,7 +3904,7 @@ impl BlockchainNode {
                 "macro" => {
                     // Validate macroblock consensus and finality
                     if let Err(e) = Self::validate_received_macroblock(&received_block, &storage).await {
-                        println!("[ERR][BLOCK] invalid_macroblock h={} err={}", received_block.height, e);
+                        eprintln!("[ERR][BLOCK] invalid_macroblock h={} err={}", received_block.height, e);
                         continue;
                     }
                     
@@ -3963,8 +3963,8 @@ impl BlockchainNode {
                                     }).collect())
                                     .unwrap_or_default();
                                 
-                                println!("[INFO][MB] read slashing={} jails={}",
-                                         slashing_events.len(), automatic_jails.len());
+                                if is_debug() { println!("[DBG][MB] read slashing={} jails={}",
+                                         slashing_events.len(), automatic_jails.len()); }
                                 
                                 let macro_consensus = MacroBlockConsensus {
                                     index: macroblock.height,
@@ -3989,8 +3989,8 @@ impl BlockchainNode {
                                             if !snapshot_data.is_empty() {
                                                 match rep_state.apply_snapshot(snapshot_data) {
                                                     Ok(count) => {
-                                                        println!("[REPUTATION] 📸 Applied snapshot from macroblock #{}: {} nodes synced", 
-                                                                 macroblock.height, count);
+                                                        if is_debug() { println!("[DBG][REP] snapshot_applied mb={} nodes={}", 
+                                                                 macroblock.height, count); }
                                                     }
                                                     Err(e) => {
                                                         println!("[WARN][REP] snapshot_apply_failed err={} fallback=process_macroblock", e);
@@ -4038,7 +4038,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
             match store_result {
                 Ok(_) => {
                     if should_log {
-                        println!("[INFO][BLOCK] stored h={}", received_block.height);
+                        if is_debug() { println!("[DBG][BLOCK] stored h={}", received_block.height); }
                     }
                     
                     // CRITICAL v2.32: If we just received Genesis block, update GLOBAL_GENESIS_TIMESTAMP!
@@ -4053,7 +4053,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                         genesis_block.timestamp,
                                         std::sync::atomic::Ordering::Relaxed
                                     );
-                                    println!("[INFO][GENESIS] synced_timestamp ts={}", genesis_block.timestamp);
+                                    if is_info() { println!("[INFO][GENESIS] synced_timestamp ts={}", genesis_block.timestamp); }
                                 }
                             }
                         }
@@ -4064,15 +4064,15 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     if pending_blocks.remove(&received_block.height).is_some() {
                         // METRICS: Track successful retry
                         RETRY_SUCCESS.fetch_add(1, Ordering::Relaxed);
-                        println!("[INFO][BLOCK] pending_removed h={} retry=ok", received_block.height);
+                        if is_debug() { println!("[DBG][BLOCK] pending_removed h={} retry=ok", received_block.height); }
                     }
                     
                     // CRITICAL FIX: Check if we're the producer for next block after rotation boundary
                     // This ensures nodes immediately know they're selected after receiving rotation block
                     if received_block.height > 0 && received_block.height % 30 == 0 {
                         // Just received last block of a round (30, 60, 90...)
-                        println!("[INFO][ROTATION] boundary h={} check=next_producer", received_block.height);
-                        println!("[ROTATION] 🔍 DEBUG: block_type='{}', producer_id={:?}", received_block.block_type, block_producer_id);
+                        if is_debug() { println!("[DBG][ROTATION] boundary h={} check=next_producer", received_block.height); }
+                        if is_debug() { println!("[DBG][ROTATION] block_type={} producer_id={:?}", received_block.block_type, block_producer_id); }
                         
                         // DETERMINISTIC REPUTATION: Update via blockchain-based system
                         // All nodes compute same reputation from block data (no P2P gossip)
@@ -4116,8 +4116,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                 .unwrap_or_default()
                                                 .as_secs());
                                         
-                                        println!("[INFO][REP] rotation={} node={} rep={:.1}%", 
-                                                 received_block.height / 30, producer_id, new_rep);
+                                        if is_debug() { println!("[DBG][REP] rotation={} node={} rep={:.1}%", 
+                                                 received_block.height / 30, producer_id, new_rep); }
                                     }
                                 }
                             }
@@ -4128,7 +4128,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             let mut global_height = height.write().await;
                             if received_block.height > *global_height {
                                 *global_height = received_block.height;
-                                println!("[INFO][ROTATION] height_updated h={}", received_block.height);
+                                if is_debug() { println!("[DBG][ROTATION] height_updated h={}", received_block.height); }
                             }
                         }
                         
@@ -4149,9 +4149,9 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         ).await;
                         
                         if next_producer == node_id {
-                            println!("[INFO][ROTATION] we_are_producer h={} notify=main_loop", next_height);
+                            if is_info() { println!("[INFO][ROTATION] we_are_producer h={} notify=main_loop", next_height); }
                         } else {
-                            println!("[ROTATION] 👥 Producer for block #{}: {}", next_height, next_producer);
+                            if is_debug() { println!("[DBG][ROTATION] producer h={} node={}", next_height, next_producer); }
                         }
                         
                         // NOTE: Main loop will naturally check on next iteration (max 1 second delay)
@@ -4169,8 +4169,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
                                     if !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
                                         poh.sync_from_checkpoint(&microblock.poh_hash, microblock.poh_count).await;
-                                        println!("[INFO][POH] synced h={} count={}", 
-                                                microblock.height, microblock.poh_count);
+                                        if is_debug() { println!("[DBG][POH] synced h={} count={}", 
+                                                microblock.height, microblock.poh_count); }
                                     }
                                 }
                             }
@@ -4183,7 +4183,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         let current_height = *height.read().await;
                         if received_block.height > current_height {
                             *height.write().await = received_block.height;
-                            println!("[INFO][BLOCK] height_updated h={}", received_block.height);
+                            if is_debug() { println!("[DBG][BLOCK] height_updated h={}", received_block.height); }
                             
                             // CRITICAL FIX: Update last block time for stall detection
                             LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
@@ -4209,10 +4209,10 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 let theoretical_tps = blocks_per_second * avg_tx_per_block as f64 * shard_count as f64;
                                 
                                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                                println!("[INFO][MB] boundary h={} consensus=background", received_block.height);
-                                println!("[INFO][MB] microblocks=continue downtime=zero");
-                                println!("[INFO][PERF] tps_capacity={:.0} shards={} tx_per_block={}", 
-                                         theoretical_tps, shard_count, avg_tx_per_block);
+                                if is_info() { println!("[INFO][MB] boundary h={} consensus=background", received_block.height); }
+                                if is_debug() { println!("[DBG][MB] microblocks=continue downtime=zero"); }
+                                if is_debug() { println!("[DBG][PERF] tps_capacity={:.0} shards={} tx_per_block={}", 
+                                         theoretical_tps, shard_count, avg_tx_per_block); }
                                 if is_info() { println!("[INFO][MB] consensus_boundary h={} next={}", received_block.height, received_block.height + 1); }
                                 
                                 // ═══════════════════════════════════════════════════════════════════
@@ -4247,7 +4247,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                             .unwrap_or(false);
                                         
                                         if has_macroblock {
-                                            println!("[INFO][MB-VERIFY] confirmed idx={}", expected_macroblock);
+                                            if is_debug() { println!("[DBG][MB-VERIFY] confirmed idx={}", expected_macroblock); }
                                         } else {
                                             println!("[WARN][MB-VERIFY] missing idx={} action=request", expected_macroblock);
                                             
@@ -4264,7 +4264,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                         .map(|mb| mb.is_some())
                                                         .unwrap_or(false);
                                                     if received {
-                                                        println!("[INFO][MB-VERIFY] received idx={} sync=ok", expected_macroblock);
+                                                        if is_info() { println!("[INFO][MB-VERIFY] received idx={} sync=ok", expected_macroblock); }
                                                         break;
                                                     }
                                                 }
@@ -4296,8 +4296,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     
                     // Re-queue all found blocks for parallel processing
                     if !blocks_to_retry.is_empty() {
-                        println!("[INFO][BLOCK] fast_forward count={} after={}", 
-                                 blocks_to_retry.len(), received_block.height);
+                        if is_debug() { println!("[DBG][BLOCK] fast_forward count={} after={}", 
+                                 blocks_to_retry.len(), received_block.height); }
                         for pending_block in blocks_to_retry {
                             if let Err(e) = retry_tx.send(pending_block) {
                                 println!("[WARN][BLOCK] requeue_failed err={:?}", e);
@@ -4306,7 +4306,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     }
                 },
                 Err(e) => {
-                    println!("[ERR][BLOCK] store_failed h={} err={}", received_block.height, e);
+                    eprintln!("[ERR][BLOCK] store_failed h={} err={}", received_block.height, e);
                 }
             }
             
@@ -4320,8 +4320,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
             
             if cert_arrived || last_retry_check.elapsed() > std::time::Duration::from_secs(2) {
                 if cert_arrived && !pending_blocks.is_empty() {
-                    println!("[BLOCKS] 🔔 New certificate received - triggering immediate retry for {} buffered blocks", 
-                             pending_blocks.len());
+                    if is_debug() { println!("[DBG][BLOCK] cert_received pending_retry={}", pending_blocks.len()); }
                 }
                 last_retry_check = std::time::Instant::now();
                 
@@ -4350,12 +4349,12 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     
                     // Log every 5 cycles (10 seconds) instead of 60 cycles
                     if log_count % 5 == 0 {
-                        println!("[INFO][BLOCK] retry pending={}", heights_to_retry.len());
+                        if is_debug() { println!("[DBG][BLOCK] retry pending={}", heights_to_retry.len()); }
                         // Log first 3 heights for debugging
                         for (i, h) in heights_to_retry.iter().take(3).enumerate() {
                             if let Some((_, retry_count, ts)) = pending_blocks.get(h) {
-                                println!("[BLOCKS]   #{}: block {} (retry #{}, age {}s)", 
-                                         i+1, h, retry_count, ts.elapsed().as_secs());
+                                if is_debug() { println!("[DBG][BLOCK] retry_item idx={} h={} count={} age={}s", 
+                                         i+1, h, retry_count, ts.elapsed().as_secs()); }
                             }
                         }
                     }
@@ -4416,8 +4415,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         
                         if can_request {
                             let phase = if retry_count < 10 { "aggressive" } else { "backoff" };
-                            println!("[INFO][BLOCK] rerequest missing={} pending={} retry={} status={} next={}s", 
-                                     missing_height, height, retry_count, phase, backoff_secs);
+                            if is_debug() { println!("[DBG][BLOCK] rerequest missing={} pending={} retry={} status={} next={}s", 
+                                     missing_height, height, retry_count, phase, backoff_secs); }
                             
                             // Update request tracking
                             // SECURITY: Use saturating_add to prevent overflow at u8::MAX (255)
@@ -4466,18 +4465,17 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     
                     if total > 0 {
                         let success_rate = (success as f64 / total as f64 * 100.0) as u64;
-                        println!("[INFO][METRICS] retry_stats window=5min");
-                        println!("[METRICS]   Total retries: {}", total);
-                        println!("[METRICS]   Successful: {} ({:.1}%)", success, success_rate);
-                        println!("[METRICS]   Certificate race: {}", cert_race);
-                        println!("[METRICS]   Missing previous: {}", missing_prev);
+                        if is_debug() { 
+                            println!("[DBG][METRICS] retry_stats window=5min total={} success={} rate={:.1}% cert_race={} missing_prev={}", 
+                                     total, success, success_rate, cert_race, missing_prev);
+                        }
                     }
                 }
                 
                 // Log status
                 if !pending_blocks.is_empty() || !requested_blocks.is_empty() {
-                    println!("[INFO][BLOCK] status buffered={} requested={}", 
-                             pending_blocks.len(), requested_blocks.len());
+                    if is_debug() { println!("[DBG][BLOCK] status buffered={} requested={}", 
+                             pending_blocks.len(), requested_blocks.len()); }
                 }
             }
         }
@@ -4498,8 +4496,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
             Ok(data) => {
                 // Successfully decompressed - block was compressed
                 if block.height % 10 == 0 {
-                    println!("[INFO][BLOCK] decompressed h={} from={} to={}", 
-                             block.height, block.data.len(), data.len());
+                    if is_debug() { println!("[DBG][BLOCK] decompressed h={} from={} to={}", 
+                             block.height, block.data.len(), data.len()); }
                 }
                 data
             },
@@ -4527,7 +4525,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 println!("[ERR][VALIDATION] genesis_invalid reason=nonzero_prev_hash");
                 return Err("Genesis block must have zero previous_hash".to_string());
             }
-            println!("[INFO][VALIDATION] genesis_valid h=0 prev_hash=zero");
+            if is_debug() { println!("[DBG][VALIDATION] genesis_valid h=0 prev_hash=zero"); }
         } else if microblock.height >= 1 {
             // ALL other blocks (including #1) must have correct previous_hash
             // Get actual hash of previous block from storage
@@ -4543,9 +4541,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 
                 if microblock.previous_hash != prev_hash_result.as_slice() {
                         // CRITICAL: previous_hash mismatch detected!
-                        println!("[VALIDATION] ❌ Block #{} previous_hash mismatch!", microblock.height);
-                        println!("[VALIDATION] Expected (from storage): {:?}", &prev_hash_result[0..8]);
-                        println!("[VALIDATION] Got (from block): {:?}", &microblock.previous_hash[0..8]);
+                        eprintln!("[ERR][VALIDATION] prev_hash_mismatch h={} expected={:?} got={:?}", 
+                                 microblock.height, &prev_hash_result[0..8], &microblock.previous_hash[0..8]);
                         
                         // NO FALLBACK ALLOWED - all blocks must have correct previous_hash
                     return Err(format!(
@@ -4554,7 +4551,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             microblock.height - 1
                     ));
                     } else {
-                println!("[VALIDATION] ✅ Chain continuity verified for block #{}", microblock.height);
+                if is_debug() { println!("[DBG][VALIDATION] chain_continuity_ok h={}", microblock.height); }
                     }
                 },
                 _ => {
@@ -4562,15 +4559,14 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     if microblock.height == 1 {
                         // Block #1 SPECIAL CASE: Genesis might not be synced yet
                         // Return special error to trigger Genesis sync
-                        println!("[VALIDATION] ⚠️ Block #1 received but Genesis block #0 not found");
-                        println!("[VALIDATION] 🔄 Triggering Genesis sync request");
+                        if is_warn() { println!("[WARN][VALIDATION] genesis_missing action=sync_request"); }
                         
                         // CRITICAL: Return special error for missing Genesis
                         return Err("MISSING_PREVIOUS:0".to_string());
                     } else {
                         // ALL other blocks: MUST have previous block for security
-                        println!("[VALIDATION] ❌ Block #{} cannot be validated - previous block #{} not found", 
-                                 microblock.height, microblock.height - 1);
+                        if is_warn() { println!("[WARN][VALIDATION] prev_block_missing h={} need={}", 
+                                 microblock.height, microblock.height - 1); }
                         
                         // CRITICAL: Return special error to trigger sync request
                         return Err(format!("MISSING_PREVIOUS:{}", microblock.height - 1));
@@ -4601,7 +4597,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
         if !Self::verify_microblock_signature(&microblock, &microblock.producer, p2p).await? {
             // SECURITY: Invalid signature - ALWAYS reject
             // This applies to ALL blocks (live, sync, any source)
-            println!("[SECURITY] ❌ Invalid signature detected from producer: {}", microblock.producer);
+            eprintln!("[ERR][SEC] invalid_signature producer={}", microblock.producer);
             
             return Err(format!(
                 "Invalid signature on block #{} from producer {}",
@@ -4657,7 +4653,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 const MAX_ACCEPTABLE_REGRESSION: u64 = 15_000_000;
                 
                 if regression > MAX_ACCEPTABLE_REGRESSION {
-                    println!("[PoH] ❌ SEVERE PoH regression detected! Block #{}: {} <= prev: {} (diff: {})", 
+                    eprintln!("[ERR][POH] severe_regression h={} count={} prev={} diff={}", 
                             microblock.height, microblock.poh_count, prev_poh_count, regression);
                     return Err(format!(
                         "Severe PoH regression: block #{} has {} but previous has {} (diff: {})",
@@ -4665,15 +4661,15 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     ));
                 } else {
                     // Log warning but accept the block - Byzantine consensus will validate
-                    println!("[PoH] ⚠️ Minor PoH regression at block #{}: {} <= prev: {} (acceptable)", 
-                            microblock.height, microblock.poh_count, prev_poh_count);
+                    if is_warn() { println!("[WARN][POH] minor_regression h={} count={} prev={}", 
+                            microblock.height, microblock.poh_count, prev_poh_count); }
                 }
             }
             
             // Log PoH progression (reduced frequency to avoid log spam)
             if microblock.height % 100 == 0 {
-                println!("[PoH] ✅ PoH verified for block #{}: count={} (prev={})", 
-                        microblock.height, microblock.poh_count, prev_poh_count);
+                if is_debug() { println!("[DBG][POH] verified h={} count={} prev={}", 
+                        microblock.height, microblock.poh_count, prev_poh_count); }
             }
         }
         
@@ -4691,9 +4687,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
             
             if new_hash != existing_hash {
                 // CRITICAL: Chain fork detected - need to determine which chain to follow
-                println!("[SECURITY] ⚠️ Chain fork detected at block #{}!", microblock.height);
-                println!("[SECURITY] 🔍 Existing hash: {:?}", &existing_hash[0..8]);
-                println!("[SECURITY] 🔍 New hash: {:?}", &new_hash[0..8]);
+                if is_warn() { println!("[WARN][SEC] fork_detected h={} existing={:?} new={:?}", 
+                         microblock.height, &existing_hash[0..8], &new_hash[0..8]); }
                 
                 // CRITICAL: Don't immediately reject - this might be a valid longer chain
                 // Mark for potential chain reorganization
@@ -4710,7 +4705,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
         let is_emission_block = microblock.height % EMISSION_INTERVAL_BLOCKS == 0 && microblock.height > 0;
         
         if is_emission_block {
-            println!("[EMISSION] 🔍 Validating emission block #{}", microblock.height);
+            if is_debug() { println!("[DBG][EMISSION] validating h={}", microblock.height); }
             
             // Check if block contains emission transaction
             let emission_tx = microblock.transactions.iter()
@@ -4731,13 +4726,13 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 
                 // 1. Amount must be > 0
                 if tx.amount == 0 {
-                    println!("[EMISSION] ❌ Emission amount is zero");
+                    eprintln!("[ERR][EMISSION] amount_zero");
                     return Err("Emission amount cannot be zero".to_string());
                 }
                 
                 // 2. Amount must not exceed MAX_SUPPLY (in nanoQNC)
                 if tx.amount > MAX_QNC_SUPPLY_NANO {
-                    println!("[EMISSION] ❌ Emission amount {} nanoQNC exceeds MAX_SUPPLY {} QNC", 
+                    eprintln!("[ERR][EMISSION] exceeds_max amount={} max={}", 
                              tx.amount, MAX_QNC_SUPPLY);
                     return Err("Emission amount exceeds maximum supply".to_string());
                 }
@@ -4757,16 +4752,16 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         sample_seed,
                         ping_samples,
                     } = &commitment_tx.tx_type {
-                        println!("[PING-COMMITMENT] 🔍 Validating Merkle commitment...");
+                        if is_debug() { println!("[DBG][PING-COMMIT] validating_merkle"); }
                         
                         // Step 1: Verify window matches this emission block
                         let expected_window_end = microblock.height;
                         let expected_window_start = microblock.height.saturating_sub(EMISSION_INTERVAL_BLOCKS);
                         
                         if *window_start_height != expected_window_start || *window_end_height != expected_window_end {
-                            println!("[PING-COMMITMENT] ❌ Window mismatch: expected {}-{}, got {}-{}",
+                            if is_warn() { println!("[WARN][PING-COMMIT] window_mismatch expected={}-{} got={}-{}",
                                      expected_window_start, expected_window_end,
-                                     window_start_height, window_end_height);
+                                     window_start_height, window_end_height); }
                             return Err("Ping commitment window does not match emission block".to_string());
                         }
                         
@@ -4786,11 +4781,11 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         let expected_seed_hex = hex::encode(&expected_seed[..]);
                         
                         if sample_seed != &expected_seed_hex {
-                            println!("[PING-COMMITMENT] ❌ Sample seed mismatch");
+                            if is_warn() { println!("[WARN][PING-COMMIT] sample_seed_mismatch"); }
                             return Err("Ping commitment has invalid sample seed".to_string());
                         }
                         
-                        println!("[PING-COMMITMENT] ✅ Sample seed verified (deterministic)");
+                        if is_debug() { println!("[DBG][PING-COMMIT] sample_seed_ok"); }
                         
                         // Step 3: Verify Merkle proofs for ALL samples
                         use qnet_core::crypto::merkle::verify_merkle_proof;
@@ -4809,28 +4804,28 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             
                             // Verify Merkle proof
                             if !verify_merkle_proof(&ping_hash, merkle_root, &sample.merkle_proof) {
-                                println!("[PING-COMMITMENT] ❌ Invalid Merkle proof for sample #{}", idx);
+                                if is_warn() { println!("[WARN][PING-COMMIT] invalid_merkle_proof idx={}", idx); }
                                 return Err(format!("Invalid Merkle proof for ping sample #{}", idx));
                             }
                             verified_count += 1;
                         }
                         
-                        println!("[PING-COMMITMENT] ✅ All {} Merkle proofs verified", verified_count);
+                        if is_debug() { println!("[DBG][PING-COMMIT] merkle_proofs_ok count={}", verified_count); }
                         
                         // Step 4: Verify sample size is sufficient - ADAPTIVE!
                         // Small network (<10K): verify ALL pings (min_samples = total)
                         // Large network (10K+): 1% sampling (min_samples = 10K)
                         let min_samples = ((*total_ping_count / 100).max(MIN_PING_SAMPLES.min(*total_ping_count as usize) as u32)) as usize;
                         if ping_samples.len() < min_samples {
-                            println!("[PING-COMMITMENT] ❌ Insufficient samples: {} < {} (total={})", 
-                                     ping_samples.len(), min_samples, total_ping_count);
+                            if is_warn() { println!("[WARN][PING-COMMIT] insufficient_samples got={} need={} total={}", 
+                                     ping_samples.len(), min_samples, total_ping_count); }
                             return Err(format!("Insufficient ping samples: {} < {} (total={})", 
                                              ping_samples.len(), min_samples, total_ping_count));
                         }
                         
-                        println!("[PING-COMMITMENT] ✅ Sample size sufficient: {}/{} ({:.1}%)",
+                        if is_debug() { println!("[DBG][PING-COMMIT] sample_size_ok count={} total={} pct={:.1}%",
                                  ping_samples.len(), total_ping_count,
-                                 (ping_samples.len() as f64 / *total_ping_count as f64) * 100.0);
+                                 (ping_samples.len() as f64 / *total_ping_count as f64) * 100.0); }
                         
                         println!("[PING-COMMITMENT] 🎉 Ping commitment fully validated!");
                         println!("[PING-COMMITMENT] 📊 Total: {}, Successful: {}, Root: {}",
@@ -4840,15 +4835,14 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     // PRODUCTION: Ping commitment is now mandatory for reward transactions
                     // All nodes should include ping commitment in emission blocks
                     // Grace period: Log warning but don't reject (for rolling upgrades)
-                    println!("[PING-COMMITMENT] ⚠️ No ping commitment found");
-                    println!("[PING-COMMITMENT] 📢 Note: Ping commitment will be mandatory in future versions");
+                    if is_debug() { println!("[DBG][PING-COMMIT] no_commitment h={}", microblock.height); }
                     
                     // Track blocks without commitment for monitoring (static counter)
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static MISSING_COMMITMENT_COUNT: AtomicU64 = AtomicU64::new(0);
                     let missing_count = MISSING_COMMITMENT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                     if missing_count % 100 == 0 {
-                        println!("[PING-COMMITMENT] ⚠️ {} blocks without commitment - consider upgrading producer nodes", missing_count);
+                        if is_warn() { println!("[WARN][PING-COMMIT] missing_commitment blocks={}", missing_count); }
                     }
                 }
                 
@@ -6069,8 +6063,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 println!("[INFO][GEN] Genesis block found at height 0, proceeding with normal operation");
             }
             
-            // PRECISION TIMING: Track exact 1-second intervals to prevent drift
-            let mut next_block_time = std::time::Instant::now() + microblock_interval;
+            // NOTE: Timing is now Unix-based in main loop (v2.42)
+            // Uses genesis_timestamp + height for deterministic slot timing
             
             println!("[Microblock] 🚀 Starting production-ready microblock system");
             println!("[Microblock] ⚡ Target: 100k+ TPS with batch processing");
@@ -6116,6 +6110,54 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
             let mut last_certificate_broadcast_round: Option<u64> = None;
             
             while *is_running.read().await {
+                // ═══════════════════════════════════════════════════════════════════
+                // SLOT-BASED TIMING v2.42: Wait based on UNIX timestamp (not Instant!)
+                // This GUARANTEES blocks are created at correct absolute time
+                // Uses genesis_timestamp + height formula for deterministic timing
+                // ═══════════════════════════════════════════════════════════════════
+                {
+                    // Maximum time drift before considering height desynchronized
+                    // = ~1 macroblock worth of time (60 seconds)
+                    // Normal operation: 0-2 sec, sync: 0-10 sec, >60 sec = error
+                    const MAX_SLOT_WAIT_SECS: u64 = 60;
+                    
+                    let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    
+                    if genesis_ts > 0 {
+                        // Calculate expected Unix timestamp for next block
+                        let current_height = *height.read().await;
+                        let expected_unix_time = genesis_ts + current_height + 1;
+                        
+                        let current_unix_time = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        
+                        if expected_unix_time > current_unix_time {
+                            let wait_secs = expected_unix_time - current_unix_time;
+                            
+                            if wait_secs > MAX_SLOT_WAIT_SECS {
+                                // Height is ahead of wall clock by >3 minutes
+                                // This indicates sync issue - don't busy loop, wait for correction
+                                if is_warn() { 
+                                    println!("[WARN][SLOT] height_desync h={} expected_ts={} current_ts={} drift={}s", 
+                                             current_height + 1, expected_unix_time, current_unix_time, wait_secs); 
+                                }
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                continue;
+                            }
+                            
+                            // Normal case: wait until correct Unix time for this block slot
+                            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                        }
+                        // If current_unix >= expected - we're on time or late, proceed immediately
+                    } else {
+                        // No genesis timestamp yet - use simple 1 second interval
+                        tokio::time::sleep(microblock_interval).await;
+                    }
+                }
+                
                 cpu_check_counter += 1;
                 certificate_cleanup_counter += 1;
                 certificate_broadcast_counter += 1;
@@ -9403,52 +9445,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
                 
-                
-                // PRECISION TIMING: Sleep until exact next block time (no drift accumulation)
-                let now = std::time::Instant::now();
-                if now < next_block_time {
-                    let precise_sleep_duration = next_block_time - now;
-                    
-                    // ARCHITECTURE FIX: Compensate for tokio sleep inaccuracy
-                    // Sleep slightly less to account for wakeup delay (typically 5-20ms on Linux)
-                    const SLEEP_COMPENSATION_MS: u64 = 10; // Compensate for tokio wakeup delay
-                    let compensated_duration = if precise_sleep_duration.as_millis() > SLEEP_COMPENSATION_MS as u128 {
-                        precise_sleep_duration - Duration::from_millis(SLEEP_COMPENSATION_MS)
-                    } else {
-                        precise_sleep_duration
-                    };
-                    
-                    // ARCHITECTURE: Simple and reliable timing without race conditions
-                    // Each node sleeps for exactly 1 second, then checks if it's producer
-                    // This worked perfectly in commit 669ca77 - don't overcomplicate!
-                    tokio::time::sleep(compensated_duration).await;
-                    
-                    // Busy-wait for remaining time for precise timing (only if not interrupted)
-                    while std::time::Instant::now() < next_block_time {
-                        tokio::task::yield_now().await; // Yield to other tasks but stay ready
-                    }
-                    
-                    // Update next block time for precise 1-second intervals
-                    next_block_time += microblock_interval;
-                } else {
-                    // We're running behind - catch up without accumulating delay
-                    let behind_ms = (now - next_block_time).as_millis();
-                    if behind_ms > 50 && is_debug() {
-                        println!("[DBG][MB] behind_schedule ms={}", behind_ms);
-                    }
-                    
-                    // CRITICAL FIX: Don't reset timing, just skip missed intervals
-                    // This prevents accumulating delay over time
-                    while next_block_time < now {
-                        next_block_time += microblock_interval;
-                    }
-                    
-                    // If we're too far behind (>5 seconds), reset to avoid infinite catch-up
-                    if behind_ms > 5000 {
-                        if is_warn() { println!("[WARN][MB] schedule_reset behind_ms={}", behind_ms); }
-                        next_block_time = now + microblock_interval;
-                    }
-                }
+                // NOTE: Timing is now at START of loop (v2.42) - no timing needed here
+                // This ensures ALL iterations wait exactly 1 second, even after `continue`
             }
         });
     }
@@ -13805,9 +13803,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // Validate timestamp is not too far in future
+        // NOTE: Producer uses slot-based waiting (v2.42), so this should rarely trigger
+        // Threshold = ~1 macroblock (60 sec) - same as MAX_SLOT_WAIT_SECS in timing
+        // Normal: 0-2 sec, sync: 0-10 sec, >60 sec = attack/bug
+        const MAX_FUTURE_TIMESTAMP_SECS: u64 = 60;
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        if microblock.timestamp > current_time + 30 {
-            return Err("Timestamp too far in future".to_string());
+        if microblock.timestamp > current_time + MAX_FUTURE_TIMESTAMP_SECS {
+            return Err(format!(
+                "Timestamp too far in future: block #{} ts={} now={} drift={}s max={}s",
+                microblock.height, microblock.timestamp, current_time, 
+                microblock.timestamp - current_time, MAX_FUTURE_TIMESTAMP_SECS
+            ));
         }
         
         Ok(())
