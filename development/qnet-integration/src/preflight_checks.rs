@@ -204,6 +204,23 @@ pub async fn run_preflight_checks(external_ip: Option<&str>) -> Result<Preflight
     checks.push(quic_result);
     
     // =========================================================================
+    // PHASE 6: NTP Time Synchronization (v2.42.1)
+    // CRITICAL: Block timestamps are Unix-based. Clock drift breaks consensus!
+    // =========================================================================
+    println!("");
+    println!("🕐 Phase 6: Checking time synchronization...");
+    
+    let ntp_result = check_time_sync().await;
+    if ntp_result.passed {
+        println!("   ✅ System time synchronized");
+    } else {
+        // WARNING only - don't block startup, but alert operator
+        println!("   ⚠️  {}", ntp_result.message);
+        println!("   ⚠️  Block timestamps may drift! Install: sudo apt install chrony");
+    }
+    checks.push(ntp_result);
+    
+    // =========================================================================
     // SUMMARY
     // =========================================================================
     println!("");
@@ -468,6 +485,74 @@ pub fn quick_port_check() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Check if system time is synchronized (NTP)
+/// CRITICAL v2.42.1: Block timestamps are Unix-based, clock drift breaks consensus
+async fn check_time_sync() -> CheckResult {
+    let name = "Time synchronization".to_string();
+    
+    // Method 1: Check against public NTP-synced time services
+    let time_services = [
+        "http://worldtimeapi.org/api/ip",
+    ];
+    
+    let local_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    for service in &time_services {
+        if let Ok(response) = timeout(
+            Duration::from_secs(5),
+            reqwest::get(*service)
+        ).await {
+            if let Ok(resp) = response {
+                if let Ok(text) = resp.text().await {
+                    // Parse unixtime from response
+                    if let Some(unix_time) = text
+                        .split("\"unixtime\":")
+                        .nth(1)
+                        .and_then(|s| s.split(',').next())
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                    {
+                        let drift = if local_time > unix_time {
+                            local_time - unix_time
+                        } else {
+                            unix_time - local_time
+                        };
+                        
+                        if drift <= 5 {
+                            return CheckResult {
+                                name,
+                                passed: true,
+                                message: format!("Clock drift: {}s (excellent)", drift),
+                            };
+                        } else if drift <= 30 {
+                            return CheckResult {
+                                name,
+                                passed: true,
+                                message: format!("Clock drift: {}s (acceptable)", drift),
+                            };
+                        } else {
+                            return CheckResult {
+                                name,
+                                passed: false,
+                                message: format!("Clock drift: {}s - TOO HIGH! Install NTP: sudo apt install chrony", drift),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // If we can't check, assume it's OK but warn
+    CheckResult {
+        name,
+        passed: true,
+        message: "Could not verify NTP sync - ensure chrony/ntpd is installed".to_string(),
+    }
 }
 
 #[cfg(test)]

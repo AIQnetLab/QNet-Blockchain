@@ -22,14 +22,20 @@ impl Default for GenesisConfig {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or_else(|| {
-                // Use REAL current time when Genesis is created by node_001
-                // Other nodes will receive this timestamp via P2P
+                // Use REAL current time + QUIC_INIT_OFFSET when Genesis is created by node_001
+                // CRITICAL v2.42.1: Add offset to account for QUIC initialization time (10-15 sec)
+                // Without this, first 10-30 blocks are created instantly "catching up" to real time,
+                // overwhelming QUIC and causing block propagation failures
+                // Other nodes receive Genesis and start production at the SAME future timestamp
+                const QUIC_INIT_OFFSET_SECS: u64 = 15; // Time for QUIC connections to establish
                 let real_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                println!("[GENESIS] ⏰ Using real-time timestamp for Genesis: {}", real_time);
-                real_time
+                let genesis_time = real_time + QUIC_INIT_OFFSET_SECS;
+                println!("[INFO][GEN] genesis_ts={} current={} quic_offset={}s", 
+                         genesis_time, real_time, QUIC_INIT_OFFSET_SECS);
+                genesis_time
             });
         
         // PRODUCTION v2.26: Auto-add benchmark accounts if QNET_BENCHMARK_MODE=true
@@ -41,7 +47,7 @@ impl Default for GenesisConfig {
         let accounts = if benchmark_mode {
             // Add 1000 benchmark accounts with 1M QNC each for load testing
             // Total: 1B QNC reserved for benchmarks (doesn't affect Fair Launch economics)
-            println!("[GENESIS] 🧪 BENCHMARK MODE: Adding 1000 benchmark accounts with 1M QNC each");
+            println!("[INFO][GEN] benchmark_mode accounts=1000 balance=1M_QNC");
             let one_million_qnc = 1_000_000_000_000_000u64; // 1M QNC in nanoQNC
             (0..1000)
                 .map(|i| (format!("EON1benchmark{:06}", i), one_million_qnc))

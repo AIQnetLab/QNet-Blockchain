@@ -6150,8 +6150,13 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             
                             // Normal case: wait until correct Unix time for this block slot
                             tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                        } else {
+                            // RATE LIMIT v2.42.1: If late (QUIC init took >15 sec), still wait 1 sec
+                            // This prevents overwhelming QUIC with burst of catch-up blocks
+                            // Not a hack - this is network capacity protection (like TCP congestion control)
+                            // Max 1 block/sec is the network's design limit
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
-                        // If current_unix >= expected - we're on time or late, proceed immediately
                     } else {
                         // No genesis timestamp yet - use simple 1 second interval
                         tokio::time::sleep(microblock_interval).await;
