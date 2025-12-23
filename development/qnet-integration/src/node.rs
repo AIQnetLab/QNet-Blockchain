@@ -163,6 +163,12 @@ pub static NEW_CERTIFICATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MACROBLOCK_CHECK_TASKS: AtomicU64 = AtomicU64::new(0);
 const MAX_CONCURRENT_MACROBLOCK_CHECKS: u64 = 5;
 
+// PRODUCTION v2.43: Backpressure for block broadcasts
+// Prevents producer from creating blocks faster than network can propagate
+// Critical during stress tests - ensures blocks are delivered before creating more
+pub static PENDING_BROADCAST_COUNT: AtomicU64 = AtomicU64::new(0);
+const MAX_PENDING_BROADCASTS: u64 = 3;  // Max concurrent broadcasts before waiting
+
 // ═══════════════════════════════════════════════════════════════════════════
 // QNET STRUCTURED LOGGING SYSTEM v2.32
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4540,16 +4546,21 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 let prev_hash_result = hasher.finalize();
                 
                 if microblock.previous_hash != prev_hash_result.as_slice() {
-                        // CRITICAL: previous_hash mismatch detected!
-                        eprintln!("[ERR][VALIDATION] prev_hash_mismatch h={} expected={:?} got={:?}", 
+                        // CRITICAL v2.43: previous_hash mismatch = FORK!
+                        // This triggers fork resolution mechanism instead of just rejecting
+                        // ARCHITECTURE: If we have block N-1 but incoming block N has different prev_hash,
+                        // the sender is on a different fork. We must resolve via fork mechanism.
+                        eprintln!("[ERR][VALIDATION] prev_hash_mismatch h={} expected={:?} got={:?} → FORK_DETECTED!", 
                                  microblock.height, &prev_hash_result[0..8], &microblock.previous_hash[0..8]);
                         
-                        // NO FALLBACK ALLOWED - all blocks must have correct previous_hash
-                    return Err(format!(
-                            "Block #{} has invalid previous_hash (mismatch with block #{})",
-                        microblock.height,
-                            microblock.height - 1
-                    ));
+                        // PRODUCTION v2.43: Return FORK_DETECTED to trigger reorg mechanism
+                        // Format: FORK_DETECTED:fork_height:producer
+                        // fork_height = height - 1 (the block where chains diverged)
+                        return Err(format!(
+                            "FORK_DETECTED:{}:{}",
+                            microblock.height - 1,  // Fork point is previous block
+                            microblock.producer
+                        ));
                     } else {
                 if is_debug() { println!("[DBG][VALIDATION] chain_continuity_ok h={}", microblock.height); }
                     }
@@ -8734,7 +8745,25 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // Clone P2P for async task
                         let p2p_clone = p2p.clone();
                         
-                        // ASYNC: Spawn broadcast in background
+                        // PRODUCTION v2.43: BACKPRESSURE - Wait if too many broadcasts pending
+                        // This prevents producer from overwhelming network during stress tests
+                        // Ensures blocks are actually delivered before creating more
+                        let pending = PENDING_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                        if pending >= MAX_PENDING_BROADCASTS {
+                            println!("[BACKPRESSURE] ⏳ Block #{} waiting - {} broadcasts pending (max={})",
+                                    height_for_broadcast, pending, MAX_PENDING_BROADCASTS);
+                            // Wait for broadcasts to complete (max 500ms to not delay block production too much)
+                            let wait_start = std::time::Instant::now();
+                            while PENDING_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed) >= MAX_PENDING_BROADCASTS 
+                                  && wait_start.elapsed().as_millis() < 500 {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                            }
+                        }
+                        
+                        // Increment pending count BEFORE spawning
+                        PENDING_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        
+                        // ASYNC: Spawn broadcast in background with backpressure tracking
                         tokio::spawn(async move {
                             // TIMING: Measure broadcast time
                             let broadcast_start = std::time::Instant::now();
@@ -8744,6 +8773,9 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             // Works for ANY network size (5 nodes to millions)
                             // Deadlock fix in unified_p2p.rs handle_shred_protocol_chunk() makes this safe
                             let result = p2p_clone.broadcast_block_shred_protocol(height_for_broadcast, broadcast_data).await;
+                            
+                            // PRODUCTION v2.43: Decrement pending count AFTER broadcast complete
+                            PENDING_BROADCAST_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             
                             let broadcast_time = broadcast_start.elapsed();
                             
@@ -8762,7 +8794,9 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         
                         // Log that async broadcast started
                         if height_for_broadcast <= 5 || height_for_broadcast % 10 == 0 {
-                            println!("[P2P] 🚀 Async broadcast started for block #{}", height_for_broadcast);
+                            let pending_now = PENDING_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                            println!("[P2P] 🚀 Async broadcast started for block #{} (pending={})", 
+                                    height_for_broadcast, pending_now);
                         }
                     } else {
                         println!("[WARN][P2P] P2P system not available - cannot broadcast block #{}", microblock.height);
@@ -14856,6 +14890,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     pub async fn get_height(&self) -> u64 {
         *self.height.read().await
+    }
+    
+    /// v2.42.2: Synchronous height access for heartbeat service
+    /// Uses try_read to avoid blocking - returns last known height or 0
+    /// SAFE: Can be called from any context (sync or async)
+    pub fn get_height_sync(&self) -> u64 {
+        // Try non-blocking read first
+        match self.height.try_read() {
+            Ok(guard) => *guard,
+            Err(_) => {
+                // Lock contention - return 0 (heartbeat will use current height next time)
+                // This is safe because heartbeats are not height-critical
+                0
+            }
+        }
     }
     
     pub async fn get_peer_count(&self) -> Result<usize, QNetError> {

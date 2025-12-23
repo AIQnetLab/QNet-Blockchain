@@ -1901,16 +1901,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         
         // CRITICAL: Start heartbeat service for Full/Super nodes (required for rewards!)
         // Full nodes need 8/10 heartbeats, Super nodes need 9/10 per 4h window
+        // v2.42.2: Now uses tokio::spawn with sync height access (no block_on!)
         if let Some(p2p) = blockchain.get_unified_p2p() {
             let blockchain_for_heartbeat = blockchain.clone();
-            // CRITICAL FIX: Get runtime handle BEFORE spawning std::thread
-            // Otherwise Handle::current() panics in non-tokio thread
-            let runtime_handle = tokio::runtime::Handle::current();
+            // v2.42.2: Use sync height accessor to avoid block_on in async context
             p2p.start_heartbeat_service(move || {
-                // Use pre-captured handle instead of Handle::current()
-                runtime_handle.block_on(async { blockchain_for_heartbeat.get_height().await })
+                blockchain_for_heartbeat.get_height_sync()
             });
-            println!("💓 Heartbeat service started (10 heartbeats per 4h window for rewards)");
+            println!("💓 Heartbeat service started (10 heartbeats per 4h window for rewards) [v2.42.2 tokio]");
         }
     }
     
@@ -3177,11 +3175,14 @@ async fn handle_transaction_submit(
     // =========================================================================
     
     // Build message to verify (canonical format)
-    let message_to_sign = format!("transfer:{}:{}:{}:{}", 
+    // v2.43: Changed from nonce to gas_price:gas_limit for client compatibility
+    // This is MORE secure: different gas params = different signature = replay-resistant
+    let message_to_sign = format!("transfer:{}:{}:{}:{}:{}", 
         tx_request.from, 
         tx_request.to,
         tx_request.amount,
-        tx_request.nonce
+        tx_request.gas_price,
+        tx_request.gas_limit
     );
     
     // Verify Ed25519 signature
@@ -3199,7 +3200,7 @@ async fn handle_transaction_submit(
             "success": false,
             "error": "Signature verification failed (NIST FIPS 186-5)",
             "details": "Ed25519 signature does not match the transaction data",
-            "message_format": "transfer:{from}:{to}:{amount}:{nonce}"
+            "message_format": "transfer:{from}:{to}:{amount}:{gas_price}:{gas_limit}"
         })));
     }
     
@@ -6324,10 +6325,11 @@ async fn handle_claim_rewards(
     }
     
     // PRODUCTION: Create RewardDistribution transaction for blockchain transparency
-    // This ensures all reward claims are recorded on-chain and auditable
+    // CRITICAL: Rewards come from system_rewards_pool (emission), NOT from node_id
+    // Node_id has no balance - rewards are minted from system pool
     let mut tx = qnet_state::Transaction {
         hash: String::new(), // will be calculated
-        from: claim_request.node_id.clone(), // Node claiming rewards
+        from: "system_rewards_pool".to_string(), // FIXED: Rewards come from system pool (like emission)
         to: Some(claim_request.wallet_address.clone()), // User's wallet receiving rewards
         amount: reward_amount,
         nonce: 0, // will be set by state
@@ -6337,7 +6339,7 @@ async fn handle_claim_rewards(
         signature: Some(claim_request.quantum_signature.clone()), // User's Ed25519 signature
         public_key: Some(claim_request.public_key.clone()), // User's Ed25519 public key
         tx_type: qnet_state::TransactionType::RewardDistribution,
-        data: None,
+        data: Some(format!("reward_claim:{}:{}", claim_request.node_id, reward_amount)), // Track which node claimed
         dilithium_signature: None,   // Reward claim - no quantum sig
         dilithium_public_key: None,
     };

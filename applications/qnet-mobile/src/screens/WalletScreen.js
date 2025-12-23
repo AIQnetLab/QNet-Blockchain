@@ -727,7 +727,13 @@ const WalletScreen = () => {
   const [sendAddress, setSendAddress] = useState('');
   const [sendAmount, setSendAmount] = useState('');
   const [showSettings, setShowSettings] = useState(false);
-  const [selectedToken, setSelectedToken] = useState('sol');
+  const [selectedToken, setSelectedToken] = useState('qnc');
+  
+  // Send Screen state (triggered from Assets) - NOT modal, inline screen
+  const [showSendScreen, setShowSendScreen] = useState(false);
+  const [sendingToken, setSendingToken] = useState(null); // { symbol: 'QNC', balance: 100.0, network: 'qnet' }
+  const [sendingTransaction, setSendingTransaction] = useState(false);
+  const [txResult, setTxResult] = useState(null); // { success: true/false, txHash, error }
   const [selectedNetwork, setSelectedNetwork] = useState('qnet'); // 'qnet' or 'solana' - default to QNet
   const [isTestnet, setIsTestnet] = useState(true); // testnet by default (true = testnet RPC)
   const [tokenPrices, setTokenPrices] = useState({
@@ -1477,6 +1483,114 @@ const WalletScreen = () => {
       console.error('[CLAIM] Error getting wallet address:', e);
       // Fallback to Solana address for non-Genesis nodes
       return wallet.solanaAddress || wallet.address;
+    }
+  };
+  
+  // Open Send Screen from Assets (click on token) - inline, not modal
+  const openSendModal = (tokenSymbol, tokenBalance, network) => {
+    setSendingToken({
+      symbol: tokenSymbol,
+      balance: tokenBalance,
+      network: network
+    });
+    setSendAddress('');
+    setSendAmount('');
+    setTxResult(null);
+    setShowSendScreen(true);
+  };
+  
+  // Close Send Screen and go back to assets
+  const closeSendScreen = () => {
+    setShowSendScreen(false);
+    setSendingToken(null);
+    setTxResult(null);
+    setSendAddress('');
+    setSendAmount('');
+  };
+  
+  // Set amount as percentage of balance
+  const setAmountPercentage = (percentage) => {
+    if (!sendingToken) return;
+    const amount = (sendingToken.balance * percentage / 100).toFixed(sendingToken.symbol === 'QNC' ? 4 : 6);
+    setSendAmount(amount);
+  };
+  
+  // QNet transaction fee constants (matching blockchain)
+  const QNET_GAS_PRICE = 1; // nanoQNC
+  const QNET_GAS_LIMIT = 10000; // for transfers
+  const QNET_TX_FEE = (QNET_GAS_PRICE * QNET_GAS_LIMIT) / 1_000_000_000; // 0.00001 QNC
+  
+  // Send QNC transaction (real blockchain transaction)
+  const handleSendTransaction = async () => {
+    if (!sendAddress || !sendAmount || sendingTransaction) return;
+    
+    const amount = parseFloat(sendAmount);
+    if (isNaN(amount) || amount <= 0) {
+      setTxResult({ success: false, error: 'Please enter a valid amount' });
+      return;
+    }
+    
+    // Calculate total cost (amount + fee)
+    const totalCost = amount + QNET_TX_FEE;
+    
+    if (totalCost > sendingToken.balance) {
+      setTxResult({ 
+        success: false, 
+        error: `Insufficient balance. Need ${totalCost.toFixed(6)} ${sendingToken.symbol} (including fee).\nYour balance: ${sendingToken.balance.toFixed(6)} ${sendingToken.symbol}`
+      });
+      return;
+    }
+    
+    // Validate address format for QNet EON: 41 chars with 'eon' in middle
+    if (sendingToken.network === 'qnet') {
+      const isValidEon = sendAddress.includes('eon') && sendAddress.length === 41;
+      const isValidHex = /^[0-9a-fA-F]{64}$/.test(sendAddress);
+      
+      if (!isValidEon && !isValidHex) {
+        setTxResult({ 
+          success: false, 
+          error: 'Invalid address format.\nMust be EON (41 chars) or Hex (64 chars)'
+        });
+        return;
+      }
+    }
+    
+    setSendingTransaction(true);
+    try {
+      // Get wallet address
+      const fromAddress = sendingToken.network === 'qnet' 
+        ? (wallet.qnetAddress || wallet.address)
+        : (wallet.solanaAddress || wallet.address);
+      
+      // Call WalletManager to send transaction
+      const result = await walletManager.sendTransaction(
+        fromAddress,
+        sendAddress,
+        amount,
+        sendingToken.symbol,
+        password
+      );
+      
+      if (result.success) {
+        // Show success screen (not alert)
+        setTxResult({
+          success: true,
+          txHash: result.txHash,
+          amount: amount,
+          to: sendAddress,
+          symbol: sendingToken.symbol
+        });
+        // Refresh balance
+        if (wallet && wallet.publicKey) {
+          loadBalance(wallet.publicKey);
+        }
+      } else {
+        setTxResult({ success: false, error: result.error || 'Transaction failed' });
+      }
+    } catch (error) {
+      setTxResult({ success: false, error: error.message || 'Transaction failed' });
+    } finally {
+      setSendingTransaction(false);
     }
   };
   
@@ -3132,6 +3246,172 @@ const WalletScreen = () => {
   const renderTabContent = () => {
     switch(activeTab) {
       case 'assets':
+        // Show Send Screen (inline, same size as assets)
+        if (showSendScreen && sendingToken) {
+          // Transaction Result Screen
+          if (txResult) {
+            return (
+              <ScrollView 
+                style={styles.content}
+                contentContainerStyle={[styles.scrollContentContainer, styles.sendScreenContainer]}
+              >
+                <View style={styles.sendScreenHeader}>
+                  <TouchableOpacity onPress={closeSendScreen} style={styles.backButton}>
+                    <Text style={styles.backButtonText}>← Back</Text>
+                  </TouchableOpacity>
+                  <Text style={styles.sendScreenTitle}>
+                    {txResult.success ? 'Success' : 'Failed'}
+                  </Text>
+                  <View style={{width: 60}} />
+                </View>
+                
+                <View style={styles.txResultContainer}>
+                  {txResult.success ? (
+                    <>
+                      <View style={styles.txSuccessIcon}>
+                        <Text style={styles.txSuccessIconText}>✓</Text>
+                      </View>
+                      <Text style={styles.txResultTitle}>Transaction Sent!</Text>
+                      <Text style={styles.txResultAmount}>
+                        {txResult.amount} {txResult.symbol}
+                      </Text>
+                      <Text style={styles.txResultTo}>
+                        To: {txResult.to?.substring(0, 12)}...{txResult.to?.substring(txResult.to.length - 8)}
+                      </Text>
+                      <View style={styles.txHashContainer}>
+                        <Text style={styles.txHashLabel}>Transaction Hash</Text>
+                        <Text style={styles.txHashValue}>{txResult.txHash?.substring(0, 24)}...</Text>
+                      </View>
+                    </>
+                  ) : (
+                    <>
+                      <View style={styles.txErrorIcon}>
+                        <Text style={styles.txErrorIconText}>✕</Text>
+                      </View>
+                      <Text style={styles.txResultTitle}>Transaction Failed</Text>
+                      <Text style={styles.txErrorMessage}>{txResult.error}</Text>
+                    </>
+                  )}
+                  
+                  <TouchableOpacity 
+                    style={styles.txDoneButton}
+                    onPress={closeSendScreen}
+                  >
+                    <Text style={styles.txDoneButtonText}>Done</Text>
+                  </TouchableOpacity>
+                </View>
+              </ScrollView>
+            );
+          }
+          
+          // Send Form Screen
+          return (
+            <ScrollView 
+              style={styles.content}
+              contentContainerStyle={[styles.scrollContentContainer, styles.sendScreenContainer]}
+            >
+              <View style={styles.sendScreenHeader}>
+                <TouchableOpacity onPress={closeSendScreen} style={styles.backButton}>
+                  <Text style={styles.backButtonText}>← Back</Text>
+                </TouchableOpacity>
+                <Text style={styles.sendScreenTitle}>Send {sendingToken.symbol}</Text>
+                <View style={{width: 60}} />
+              </View>
+              
+              {/* Balance Info */}
+              <View style={styles.sendBalanceInfo}>
+                <Text style={styles.sendBalanceLabel}>Available Balance</Text>
+                <Text style={styles.sendBalanceAmount}>{sendingToken.balance.toFixed(4)} {sendingToken.symbol}</Text>
+              </View>
+              
+              {/* Recipient Address */}
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>To Address</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder={sendingToken.network === 'qnet' ? 'Enter EON address' : 'Enter address'}
+                  placeholderTextColor="#888"
+                  value={sendAddress}
+                  onChangeText={setSendAddress}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+              </View>
+              
+              {/* Amount Input */}
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>Amount</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="0.00"
+                  placeholderTextColor="#888"
+                  keyboardType="decimal-pad"
+                  value={sendAmount}
+                  onChangeText={setSendAmount}
+                />
+                
+                {/* Percentage Buttons */}
+                <View style={styles.percentageButtons}>
+                  <TouchableOpacity 
+                    style={styles.percentButton}
+                    onPress={() => setAmountPercentage(25)}
+                  >
+                    <Text style={styles.percentButtonText}>25%</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity 
+                    style={styles.percentButton}
+                    onPress={() => setAmountPercentage(50)}
+                  >
+                    <Text style={styles.percentButtonText}>50%</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity 
+                    style={styles.percentButton}
+                    onPress={() => setAmountPercentage(75)}
+                  >
+                    <Text style={styles.percentButtonText}>75%</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity 
+                    style={styles.percentButton}
+                    onPress={() => setAmountPercentage(100)}
+                  >
+                    <Text style={styles.percentButtonText}>MAX</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+              
+              {/* Network Fee */}
+              <View style={styles.sendFeeContainer}>
+                <Text style={styles.sendFeeLabel}>Network Fee</Text>
+                <Text style={styles.sendFeeValue}>
+                  {sendingToken.network === 'qnet' ? '0.00001 QNC' : '~0.00025 SOL'}
+                </Text>
+              </View>
+              
+              {/* Total Cost */}
+              {sendAmount && parseFloat(sendAmount) > 0 && (
+                <View style={styles.sendTotalContainer}>
+                  <Text style={styles.sendTotalLabel}>Total</Text>
+                  <Text style={styles.sendTotalValue}>
+                    {(parseFloat(sendAmount) + (sendingToken.network === 'qnet' ? 0.00001 : 0.00025)).toFixed(6)} {sendingToken.symbol}
+                  </Text>
+                </View>
+              )}
+              
+              {/* Send Button */}
+              <TouchableOpacity 
+                style={[styles.button, (!sendAddress || !sendAmount || sendingTransaction) && styles.buttonDisabled]}
+                onPress={handleSendTransaction}
+                disabled={!sendAddress || !sendAmount || sendingTransaction}
+              >
+                <Text style={styles.buttonText}>
+                  {sendingTransaction ? 'Sending...' : 'Send Transaction'}
+                </Text>
+              </TouchableOpacity>
+            </ScrollView>
+          );
+        }
+        
+        // Normal Assets View
         return (
           <ScrollView 
             style={styles.content}
@@ -3224,8 +3504,12 @@ const WalletScreen = () => {
             {/* Token List based on selected network */}
             {selectedNetwork === 'qnet' ? (
               <View style={styles.tokenList}>
-                {/* QNC Token */}
-                <View style={styles.tokenItem}>
+                {/* QNC Token - Clickable to open Send screen */}
+                <TouchableOpacity 
+                  style={styles.tokenItemClickable}
+                  onPress={() => openSendModal('QNC', tokenBalances.qnc, 'qnet')}
+                  activeOpacity={0.6}
+                >
                   <View style={styles.tokenInfo}>
                     <View style={styles.tokenIcon}>
                         <Image 
@@ -3241,7 +3525,7 @@ const WalletScreen = () => {
                   <View style={styles.tokenBalance}>
                     <Text style={styles.tokenAmount}>{tokenBalances.qnc.toFixed(4)}</Text>
                   </View>
-                </View>
+                </TouchableOpacity>
               </View>
             ) : (
               <View style={styles.tokenList}>
@@ -4203,12 +4487,12 @@ const WalletScreen = () => {
                   )}
                 </View>
                 
-                {/* Validator Status Section */}
+                {/* Status Section */}
                 <View style={styles.rewardsCard}>
-                  <Text style={styles.rewardsTitle}>Validator Status</Text>
+                  <Text style={styles.rewardsTitle}>Status</Text>
                   
                   <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>Validator Node:</Text>
+                    <Text style={styles.rewardLabel}>Node:</Text>
                     <Text style={[styles.rewardValue, {
                       color: !nodePseudonym 
                         ? '#ff3b30'  // Red - not activated
@@ -4583,15 +4867,7 @@ const WalletScreen = () => {
           <Text style={[styles.tabText, activeTab === 'assets' && styles.activeTabText]}>Assets</Text>
         </TouchableOpacity>
         
-        <TouchableOpacity 
-          style={[styles.tab, activeTab === 'send' && styles.activeTab]}
-          onPress={() => {
-            setActiveTab('send');
-            setNodeStatus(null); // Reset node selection when leaving activate tab
-          }}
-        >
-          <Text style={[styles.tabText, activeTab === 'send' && styles.activeTabText]}>Send</Text>
-        </TouchableOpacity>
+        {/* Send tab hidden - use Assets to send tokens */}
         
         <TouchableOpacity 
           style={[styles.tab, activeTab === 'receive' && styles.activeTab]}
@@ -5737,6 +6013,214 @@ const styles = StyleSheet.create({
   tokenValue: {
     color: '#888',
     fontSize: 12,
+  },
+  tokenItemClickable: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#16213e',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.2)',
+  },
+  tokenSendHint: {
+    color: '#00d4ff',
+    fontSize: 24,
+    fontWeight: '300',
+    marginLeft: 8,
+  },
+  // Send Modal Styles
+  sendBalanceInfo: {
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 16,
+    alignItems: 'center',
+  },
+  sendBalanceLabel: {
+    color: '#888',
+    fontSize: 12,
+    marginBottom: 4,
+  },
+  sendBalanceAmount: {
+    color: '#00d4ff',
+    fontSize: 20,
+    fontWeight: '700',
+  },
+  percentageButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 10,
+    gap: 8,
+  },
+  percentButton: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 212, 255, 0.15)',
+    borderRadius: 6,
+    paddingVertical: 8,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.3)',
+  },
+  percentButtonText: {
+    color: '#00d4ff',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  sendFeeContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 12,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.1)',
+    marginTop: 8,
+    marginBottom: 16,
+  },
+  sendFeeLabel: {
+    color: '#888',
+    fontSize: 14,
+  },
+  sendFeeValue: {
+    color: '#ffaa00',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  sendTotalContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  sendTotalLabel: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  sendTotalValue: {
+    color: '#00d4ff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  // Send Screen Styles (inline, not modal)
+  sendScreenContainer: {
+    paddingTop: 0,
+  },
+  sendScreenHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 16,
+    paddingHorizontal: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.1)',
+    marginBottom: 20,
+  },
+  sendScreenTitle: {
+    color: '#00d4ff',
+    fontSize: 18,
+    fontWeight: '600',
+  },
+  backButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+  },
+  backButtonText: {
+    color: '#00d4ff',
+    fontSize: 16,
+  },
+  // Transaction Result Styles
+  txResultContainer: {
+    alignItems: 'center',
+    paddingVertical: 40,
+    paddingHorizontal: 20,
+  },
+  txSuccessIcon: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: 'rgba(0, 255, 136, 0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  txSuccessIconText: {
+    color: '#00ff88',
+    fontSize: 40,
+    fontWeight: '700',
+  },
+  txErrorIcon: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: 'rgba(255, 68, 68, 0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  txErrorIconText: {
+    color: '#ff4444',
+    fontSize: 40,
+    fontWeight: '700',
+  },
+  txResultTitle: {
+    color: '#ffffff',
+    fontSize: 24,
+    fontWeight: '700',
+    marginBottom: 16,
+  },
+  txResultAmount: {
+    color: '#00d4ff',
+    fontSize: 32,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  txResultTo: {
+    color: '#888',
+    fontSize: 14,
+    marginBottom: 24,
+  },
+  txHashContainer: {
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
+    borderRadius: 12,
+    padding: 16,
+    width: '100%',
+    marginBottom: 24,
+  },
+  txHashLabel: {
+    color: '#888',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  txHashValue: {
+    color: '#00d4ff',
+    fontSize: 14,
+    fontFamily: 'monospace',
+  },
+  txErrorMessage: {
+    color: '#ff6b6b',
+    fontSize: 14,
+    textAlign: 'center',
+    marginBottom: 24,
+    paddingHorizontal: 20,
+  },
+  txDoneButton: {
+    backgroundColor: '#00d4ff',
+    borderRadius: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 60,
+    marginTop: 20,
+  },
+  txDoneButtonText: {
+    color: '#0a0a1a',
+    fontSize: 16,
+    fontWeight: '700',
   },
   phaseCard: {
     backgroundColor: '#16213e',

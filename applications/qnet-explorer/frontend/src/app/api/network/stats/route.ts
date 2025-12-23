@@ -1,12 +1,18 @@
 import { NextResponse } from 'next/server';
 
-const QNET_API_URL = process.env.QNET_API_URL || 'http://localhost:8000';
+// PRODUCTION: Use Genesis Node 001 as primary API source
+// Fallback to localhost for local development
+const QNET_API_URL = process.env.QNET_API_URL || 'http://154.38.160.39:8001';
+
+// Disable caching for real-time data
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 
 export async function GET() {
   try {
-    // Fetch from correct backend endpoint
+    // Fetch from correct backend endpoint - NO CACHE for real-time data
     const res = await fetch(`${QNET_API_URL}/api/v1/public/stats`, {
-      next: { revalidate: 5 }
+      cache: 'no-store'
     });
     
     if (res.ok) {

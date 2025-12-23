@@ -5,6 +5,7 @@ import 'react-native-get-random-values'; // Must be imported first
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { derivePath } from 'ed25519-hd-key';
 import * as bip39 from 'bip39';
+import nacl from 'tweetnacl'; // Ed25519 signing for node operations
 
 export class WalletManager {
   constructor() {
@@ -4563,8 +4564,21 @@ export class WalletManager {
       
       // Load wallet for signing
       const walletData = await this.loadWallet(password);
-      if (!walletData || !walletData.secretKey) {
+      if (!walletData) {
         throw new Error('Failed to load wallet for signing');
+      }
+      
+      // Get keypair for signing (prefer qnetKeypair, fallback to secretKey)
+      const qnetKeypair = walletData.qnetKeypair;
+      const privateKeyBytes = qnetKeypair?.privateKey 
+        ? new Uint8Array(qnetKeypair.privateKey) 
+        : (walletData.secretKey ? new Uint8Array(walletData.secretKey) : null);
+      const publicKeyBytes = qnetKeypair?.publicKey 
+        ? new Uint8Array(qnetKeypair.publicKey) 
+        : (walletData.publicKey ? new Uint8Array(walletData.publicKey) : null);
+      
+      if (!privateKeyBytes || !publicKeyBytes) {
+        throw new Error('No signing key available in wallet');
       }
       
       // PRODUCTION: Create Ed25519 signature (clients use ONLY Ed25519)
@@ -4573,12 +4587,16 @@ export class WalletManager {
       const message = `claim_rewards:${nodeId}:${walletAddress}`;
       const messageBytes = new TextEncoder().encode(message);
       
-      // Ed25519 signature
-      const ed25519Sig = nacl.sign.detached(messageBytes, walletData.secretKey);
+      // Ed25519 signature (nacl needs 64-byte secret key = privateKey + publicKey)
+      const fullSecretKey = privateKeyBytes.length === 64 
+        ? privateKeyBytes 
+        : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
+      
+      const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
       const quantumSignature = Buffer.from(ed25519Sig).toString('hex');
       
       // Get public key for verification (32 bytes hex)
-      const publicKeyHex = Buffer.from(walletData.publicKey).toString('hex');
+      const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
       
       // Submit claim request to official API
       const claimResponse = await fetch(`${apiUrl}/api/v1/rewards/claim`, {
@@ -4603,6 +4621,14 @@ export class WalletManager {
         throw new Error('Invalid JSON response from server');
       });
       
+      // Check if claim was successful
+      if (!claimResult.success) {
+        throw new Error(claimResult.error || 'Claim failed on server');
+      }
+      
+      // Extract amount from server response (server returns reward.total_qnc in QNC, not nanoQNC)
+      const claimedAmount = claimResult.reward?.total_qnc || claimResult.amount || 0;
+      
       // Update local storage with claim time
       const storedRewardsStr = await AsyncStorage.getItem('qnet_node_rewards');
       let storedRewards = {};
@@ -4615,15 +4641,15 @@ export class WalletManager {
       }
       
       storedRewards.lastClaim = Date.now();
-      storedRewards.totalClaimed = (storedRewards.totalClaimed || 0) + claimResult.amount;
+      storedRewards.totalClaimed = (storedRewards.totalClaimed || 0) + claimedAmount;
       await AsyncStorage.setItem('qnet_node_rewards', JSON.stringify(storedRewards));
       
       return {
         success: true,
-        amount: claimResult.amount,
+        amount: claimedAmount,
         timestamp: Date.now(),
-        nextClaim: Date.now() + 24 * 60 * 60 * 1000,
-        txHash: claimResult.tx_hash || claimResult.txHash
+        nextClaim: claimResult.next_claim_time || (Date.now() + 24 * 60 * 60 * 1000),
+        txHash: claimResult.tx_hash
       };
     } catch (error) {
       // console.error('Error claiming rewards:', error);
@@ -4631,12 +4657,40 @@ export class WalletManager {
     }
   }
 
+  // Universal send transaction function (routes to appropriate network)
+  async sendTransaction(fromAddress, toAddress, amount, tokenSymbol, password) {
+    try {
+      // Route to appropriate network handler
+      if (tokenSymbol === 'QNC') {
+        return await this.sendQNC(toAddress, amount, password);
+      } else if (tokenSymbol === 'SOL') {
+        // Solana transactions not supported in this app
+        throw new Error('Solana transactions are not supported. Use a Solana wallet.');
+      } else {
+        throw new Error(`Unknown token: ${tokenSymbol}`);
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
   // Send QNC tokens to another address
   async sendQNC(toAddress, amount, password) {
     try {
-      // Validate inputs
-      if (!toAddress || toAddress.length !== 64) {
-        throw new Error('Invalid recipient address (must be 64 hex characters)');
+      // Validate inputs - EON address: {19 chars}eon{15 chars}{4 checksum} = 41 chars
+      if (!toAddress) {
+        throw new Error('Recipient address is required');
+      }
+      
+      // Accept EON format (41 chars with 'eon') or hex format (64 chars)
+      const isEonFormat = toAddress.includes('eon') && toAddress.length === 41;
+      const isHexFormat = /^[0-9a-fA-F]{64}$/.test(toAddress);
+      
+      if (!isEonFormat && !isHexFormat) {
+        throw new Error('Invalid address. EON (41 chars) or Hex (64 chars) required.');
       }
       
       if (!amount || amount <= 0) {
@@ -4649,64 +4703,80 @@ export class WalletManager {
         throw new Error('Failed to load wallet for signing');
       }
       
-      // Get sender address
-      const fromAddress = Buffer.from(walletData.publicKey).toString('hex');
+      // Get sender address (use QNet EON address from wallet)
+      const fromAddress = walletData.qnetAddress || walletData.address;
+      if (!fromAddress) {
+        throw new Error('Wallet has no QNet address');
+      }
+      
+      // Get QNet keypair for signing (Ed25519)
+      const qnetKeypair = walletData.qnetKeypair;
+      if (!qnetKeypair || !qnetKeypair.privateKey || !qnetKeypair.publicKey) {
+        // Fallback to legacy secretKey if available
+        if (!walletData.secretKey) {
+          throw new Error('No signing key available in wallet');
+        }
+      }
+      
+      // Get private key bytes (either from qnetKeypair or legacy secretKey)
+      const privateKeyBytes = qnetKeypair?.privateKey 
+        ? new Uint8Array(qnetKeypair.privateKey) 
+        : new Uint8Array(walletData.secretKey);
+      
+      // Get public key bytes
+      const publicKeyBytes = qnetKeypair?.publicKey 
+        ? new Uint8Array(qnetKeypair.publicKey) 
+        : new Uint8Array(walletData.publicKey);
       
       // PRODUCTION: Create Ed25519 signature for transaction
-      // Client signs BEFORE server sets nonce/timestamp
       // Format matches validator's create_client_signing_message: "transfer:from:to:amount:gas_price:gas_limit"
-      const amountSmallest = amount * 1_000_000_000; // Convert QNC to smallest unit (9 decimals)
+      const amountSmallest = Math.floor(amount * 1_000_000_000); // Convert QNC to smallest unit (9 decimals)
       const gasPrice = 1;
       const gasLimit = 10_000;
       const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${gasPrice}:${gasLimit}`;
       const messageBytes = new TextEncoder().encode(message);
       
-      // Sign with Ed25519
-      const ed25519Sig = nacl.sign.detached(messageBytes, walletData.secretKey);
+      // Sign with Ed25519 (nacl needs 64-byte secret key = privateKey + publicKey)
+      const fullSecretKey = privateKeyBytes.length === 64 
+        ? privateKeyBytes 
+        : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
+      
+      const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
       const signature = Buffer.from(ed25519Sig).toString('hex');
       
       // Get public key for verification (32 bytes hex)
-      const publicKeyHex = Buffer.from(walletData.publicKey).toString('hex');
+      const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
       
       // Get random bootstrap node
       const apiUrl = this.getRandomBootstrapNode();
       
-      // Submit transaction to RPC
-      const response = await fetch(`${apiUrl}/api/v1/rpc`, {
+      // Submit transaction to REST API (uses handle_transaction_submit endpoint)
+      const response = await fetch(`${apiUrl}/api/v1/transaction`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'tx_submit',
-          params: {
-            from: fromAddress,
-            to: toAddress,
-            amount: amountSmallest,
-            signature: signature,
-            public_key: publicKeyHex,
-            gas_price: gasPrice,
-            gas_limit: gasLimit
-          },
-          id: Date.now()
+          from: fromAddress,
+          to: toAddress,
+          amount: amountSmallest,
+          signature: signature,
+          public_key: publicKeyHex,
+          gas_price: gasPrice,
+          gas_limit: gasLimit,
+          nonce: 0 // Server will assign correct nonce from account state
         })
       });
       
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error?.message || 'Failed to send transaction');
-      }
-      
       const result = await response.json();
       
-      if (result.error) {
-        throw new Error(result.error.message || 'Transaction failed');
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || result.details || 'Failed to send transaction');
       }
       
       return {
         success: true,
-        txHash: result.result.hash,
+        txHash: result.tx_hash,
         from: fromAddress,
         to: toAddress,
         amount: amount,

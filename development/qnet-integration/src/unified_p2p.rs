@@ -2520,8 +2520,36 @@ impl SimplifiedP2P {
             if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
                 peer.last_seen = current_time;
                 if let Some(h) = height {
+                    // PRODUCTION v2.43: Height validation - don't trust blindly!
+                    // If peer claims huge height jump, it might be on a fork or malicious
+                    let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                    let height_jump = if h > peer.last_block_height { h - peer.last_block_height } else { 0 };
+                    
+                    // Allow reasonable jump (max 100 blocks = 100 seconds)
+                    // Beyond this, peer is either on fork or ahead - limit trust
+                    const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
+                    const MAX_AHEAD_OF_LOCAL: u64 = 50;
+                    
                     if h > peer.last_block_height {
-                        peer.last_block_height = h;
+                        if height_jump > MAX_TRUSTED_HEIGHT_JUMP {
+                            // Suspicious jump - cap at reasonable value
+                            println!("[WARN][P2P] Height jump too large from {}: {} → {} (jump={}), capping to +{}",
+                                peer_addr, peer.last_block_height, h, height_jump, MAX_TRUSTED_HEIGHT_JUMP);
+                            peer.last_block_height = peer.last_block_height.saturating_add(MAX_TRUSTED_HEIGHT_JUMP);
+                        } else if h > local_height + MAX_AHEAD_OF_LOCAL && local_height > 0 {
+                            // Peer claims to be far ahead of us - don't fully trust without verification
+                            let capped_height = local_height + MAX_AHEAD_OF_LOCAL;
+                            if capped_height > peer.last_block_height {
+                                peer.last_block_height = capped_height;
+                            }
+                            // Log only first time
+                            if peer.last_block_height < h {
+                                println!("[INFO][P2P] Peer {} claims height {} (local={}), capped to {} until verified",
+                                    peer_addr, h, local_height, peer.last_block_height);
+                            }
+                        } else {
+                            peer.last_block_height = h;
+                        }
                     }
                 }
                 return;
@@ -2533,8 +2561,23 @@ impl SimplifiedP2P {
                 if stored_ip == peer_ip {
                     entry.last_seen = current_time;
                     if let Some(h) = height {
+                        // PRODUCTION v2.43: Height validation (same as above)
+                        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                        const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
+                        const MAX_AHEAD_OF_LOCAL: u64 = 50;
+                        
                         if h > entry.last_block_height {
-                            entry.last_block_height = h;
+                            let height_jump = h - entry.last_block_height;
+                            if height_jump > MAX_TRUSTED_HEIGHT_JUMP {
+                                entry.last_block_height = entry.last_block_height.saturating_add(MAX_TRUSTED_HEIGHT_JUMP);
+                            } else if h > local_height + MAX_AHEAD_OF_LOCAL && local_height > 0 {
+                                let capped = local_height + MAX_AHEAD_OF_LOCAL;
+                                if capped > entry.last_block_height {
+                                    entry.last_block_height = capped;
+                                }
+                            } else {
+                                entry.last_block_height = h;
+                            }
                         }
                     }
                     return;
@@ -2544,12 +2587,27 @@ impl SimplifiedP2P {
         
         // Fallback to legacy
         if let Ok(mut peers) = self.connected_peers.write() {
+            // PRODUCTION v2.43: Height validation constants
+            let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
+            const MAX_AHEAD_OF_LOCAL: u64 = 50;
+            
             // v2.24.4: First try exact match
             if let Some(peer) = peers.get_mut(&peer_addr) {
                 peer.last_seen = current_time;
                 if let Some(h) = height {
                     if h > peer.last_block_height {
-                        peer.last_block_height = h;
+                        let height_jump = h - peer.last_block_height;
+                        if height_jump > MAX_TRUSTED_HEIGHT_JUMP {
+                            peer.last_block_height = peer.last_block_height.saturating_add(MAX_TRUSTED_HEIGHT_JUMP);
+                        } else if h > local_height + MAX_AHEAD_OF_LOCAL && local_height > 0 {
+                            let capped = local_height + MAX_AHEAD_OF_LOCAL;
+                            if capped > peer.last_block_height {
+                                peer.last_block_height = capped;
+                            }
+                        } else {
+                            peer.last_block_height = h;
+                        }
                     }
                 }
                 return;
@@ -2562,7 +2620,17 @@ impl SimplifiedP2P {
                     peer.last_seen = current_time;
                     if let Some(h) = height {
                         if h > peer.last_block_height {
-                            peer.last_block_height = h;
+                            let height_jump = h - peer.last_block_height;
+                            if height_jump > MAX_TRUSTED_HEIGHT_JUMP {
+                                peer.last_block_height = peer.last_block_height.saturating_add(MAX_TRUSTED_HEIGHT_JUMP);
+                            } else if h > local_height + MAX_AHEAD_OF_LOCAL && local_height > 0 {
+                                let capped = local_height + MAX_AHEAD_OF_LOCAL;
+                                if capped > peer.last_block_height {
+                                    peer.last_block_height = capped;
+                                }
+                            } else {
+                                peer.last_block_height = h;
+                            }
                         }
                     }
                     return;
@@ -11825,8 +11893,11 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Start heartbeat service for Full/Super nodes (TIME-based, not block-based)
     /// This is called by the node on startup
+    /// v2.42.2: FIXED - Now uses tokio::spawn instead of std::thread for proper gossip!
     /// Returns Arc<Self> for thread safety
-    pub fn start_heartbeat_service(self: Arc<Self>, blockchain_height_fn: impl Fn() -> u64 + Send + Sync + 'static) {
+    /// 
+    /// CRITICAL: blockchain_height must be a clone of Arc that can be moved into async context
+    pub fn start_heartbeat_service_with_height(self: Arc<Self>, get_height: Arc<dyn Fn() -> u64 + Send + Sync>) {
         let node_id = self.node_id.clone();
         let node_type = match self.node_type {
             NodeType::Super => "super",
@@ -11837,8 +11908,21 @@ impl SimplifiedP2P {
         let p2p = self.clone();
         let node_type_str = node_type.to_string();
         
-        std::thread::spawn(move || {
-            println!("[HEARTBEAT] 🕐 Starting heartbeat service for {} ({})", node_id, node_type_str);
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX v2.42.2: Use tokio::spawn instead of std::thread::spawn!
+        // PROBLEM: std::thread has no tokio runtime, so send_network_message fails silently
+        // SOLUTION: Capture tokio Handle and spawn async task for proper QUIC gossip
+        // ═══════════════════════════════════════════════════════════════════════════
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[HEARTBEAT] ❌ No tokio runtime available - heartbeat service NOT started!");
+                return;
+            }
+        };
+        
+        handle.spawn(async move {
+            println!("[HEARTBEAT] 🕐 Starting heartbeat service for {} ({}) [tokio v2.42.2]", node_id, node_type_str);
             
             loop {
                 let now = std::time::SystemTime::now()
@@ -11878,7 +11962,7 @@ impl SimplifiedP2P {
                                 continue; // Skip this heartbeat slot
                             }
                             
-                            let block_height = blockchain_height_fn();
+                            let block_height = get_height();
                             
                             // SECURITY v2.23: HYBRID signature for heartbeats (NIST/Cisco compliant)
                             // CRITICAL: Dilithium signs ephemeral Ed25519 key for EVERY heartbeat
@@ -11887,9 +11971,19 @@ impl SimplifiedP2P {
                             // - Dilithium signs: ephemeral_key || message_hash || timestamp
                             // - Full quantum resistance for heartbeat integrity
                             let heartbeat_message = format!("{}:{}:{}:{}", node_id, now, block_height, index);
-                            let signature = match p2p.sign_heartbeat_dilithium(&heartbeat_message, &node_id) {
-                                Some(sig) => sig,
-                                None => {
+                            
+                            // v2.42.3: CRITICAL FIX - Use spawn_blocking for sign_heartbeat_dilithium!
+                            // sign_heartbeat_dilithium creates new Runtime::new() + block_on()
+                            // which PANICS if called from tokio::spawn context
+                            // spawn_blocking runs in separate thread pool - safe!
+                            let p2p_for_sign = p2p.clone();
+                            let message_for_sign = heartbeat_message.clone();
+                            let node_id_for_sign = node_id.clone();
+                            let signature = match tokio::task::spawn_blocking(move || {
+                                p2p_for_sign.sign_heartbeat_dilithium(&message_for_sign, &node_id_for_sign)
+                            }).await {
+                                Ok(Some(sig)) => sig,
+                                Ok(None) | Err(_) => {
                                     println!("[HEARTBEAT] ⚠️ HYBRID signing failed for heartbeat #{} - skipping", index);
                                     continue; // Skip this heartbeat if signing fails
                                 }
@@ -11906,6 +12000,7 @@ impl SimplifiedP2P {
                                 gossip_hop: 0,
                             };
                             
+                            // v2.42.2: Now gossip works because we're in tokio context!
                             // OPTIMIZATION v2.19.19: Use Kademlia K-neighbors for heartbeat
                             // This sends to K closest peers by XOR distance (DHT routing)
                             // More efficient than random gossip for large networks
@@ -11924,7 +12019,7 @@ impl SimplifiedP2P {
                                 });
                             }
                             
-                            println!("[HEARTBEAT] 📡 Sent heartbeat #{} at height {}", index, block_height);
+                            println!("[HEARTBEAT] 📡 Sent heartbeat #{} at height {} [gossip OK]", index, block_height);
                         }
                     }
                 }
@@ -11932,10 +12027,17 @@ impl SimplifiedP2P {
                 // Cleanup old heartbeats (>24h)
                 p2p.cleanup_old_heartbeats();
                 
-                // Sleep for 30 seconds before next check
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                // v2.42.2: Use tokio::time::sleep instead of std::thread::sleep
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             }
         });
+    }
+    
+    /// Legacy wrapper for backwards compatibility
+    /// v2.42.2: Delegates to start_heartbeat_service_with_height
+    pub fn start_heartbeat_service(self: Arc<Self>, blockchain_height_fn: impl Fn() -> u64 + Send + Sync + 'static) {
+        let height_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(blockchain_height_fn);
+        self.start_heartbeat_service_with_height(height_fn);
     }
     
     /// Sign P2P message with HYBRID cryptography (ASYNC version) - NIST/Cisco compliant

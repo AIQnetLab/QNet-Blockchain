@@ -3,6 +3,10 @@ import { NextRequest, NextResponse } from 'next/server';
 // QNet Backend API URL
 const QNET_API_URL = process.env.QNET_API_URL || 'http://localhost:8000';
 
+// Disable caching for real-time activity data
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 export interface ActivityItem {
   hash: string;
   type: 'Transfer' | 'Node Activation' | 'Swap' | 'Reward' | 'Smart Contract' | 'Block';
@@ -20,7 +24,7 @@ async function fetchActivityFromBackend(limit: number): Promise<ActivityItem[] |
     // Try mempool transactions first (shows pending/recent)
     const mempoolRes = await fetch(`${QNET_API_URL}/api/v1/mempool/transactions`, {
       headers: { 'Content-Type': 'application/json' },
-      next: { revalidate: 3 },
+      cache: 'no-store',
     });
     
     if (mempoolRes.ok) {
