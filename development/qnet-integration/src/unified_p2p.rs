@@ -1223,8 +1223,9 @@ const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 // ShredProtocol block propagation constants
 const SHRED_PROTOCOL_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for Dilithium signatures)
 const SHRED_PROTOCOL_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
-const SHRED_PROTOCOL_MAX_CHUNKS: usize = 2048;      // Max chunks per block (2MB max for 50K TX support)
-                                                     // ADAPTIVE: Empty block ~1KB, full 50K TX block ~1.6MB
+const SHRED_PROTOCOL_MAX_CHUNKS: usize = 20480;     // Max chunks per block (20MB max for 100K+ TPS support)
+                                                     // v2.43.5: Increased from 2048 (2MB) to support large blocks
+                                                     // At 100K TPS: ~15MB compressed blocks are common
 const SHRED_CHUNK_TIMEOUT_SECS: u64 = 5;            // Timeout before requesting missing chunks (v2.31: increased from 3s for reliability)
 const SHRED_CHUNK_CACHE_SIZE: usize = 100;          // Cache last N blocks' chunks for retransmit (v2.21.3)
 const SHRED_CHUNK_MAX_RETRIES: u8 = 4;              // Max retransmit attempts per block (v2.31: increased from 2 for reliability)

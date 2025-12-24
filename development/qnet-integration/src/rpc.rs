@@ -4837,8 +4837,8 @@ async fn handle_shred_protocol_metrics(blockchain: Arc<BlockchainNode>) -> Resul
         "qualified_producers": producers,  // REAL-TIME: Producers with reputation >= 70%
         "average_latency_ms": latency,  // REAL-TIME: Network performance
         "redundancy_factor": 1.5,
-        "max_chunks": 2048,
-        "max_block_size": 4194304, // 4 MB for 100K TX support
+        "max_chunks": 20480,
+        "max_block_size": 20971520, // 20 MB for 100K+ TPS support (v2.43.5)
         "status": "active"
     });
     

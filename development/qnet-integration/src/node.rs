@@ -8795,10 +8795,13 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         if pending >= MAX_PENDING_BROADCASTS {
                             println!("[BACKPRESSURE] ⏳ Block #{} waiting - {} broadcasts pending (max={})",
                                     height_for_broadcast, pending, MAX_PENDING_BROADCASTS);
-                            // v2.43.2: Wait up to 1.5 seconds for broadcast slot
+                            // v2.43.5: Wait up to 10 seconds for broadcast slot
+                            // v2.43.4 had 1.5s which was too short for large blocks (5MB+) at 100K TPS
+                            // At 100 Mbps: 5MB block → ~400ms broadcast, but under load can be 2-5s
+                            // 10s timeout ensures producer waits for delivery before creating next block
                             let wait_start = std::time::Instant::now();
                             while PENDING_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed) >= MAX_PENDING_BROADCASTS 
-                                  && wait_start.elapsed().as_millis() < 1500 {
+                                  && wait_start.elapsed().as_millis() < 10_000 {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                             }
                             
