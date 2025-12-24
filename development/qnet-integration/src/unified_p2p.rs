@@ -2520,16 +2520,14 @@ impl SimplifiedP2P {
             if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
                 peer.last_seen = current_time;
                 if let Some(h) = height {
-                    // PRODUCTION v2.43.3: Height validation - don't trust blindly!
-                    // If peer claims huge height jump, it might be on a fork or malicious
+                    // PRODUCTION v2.43.4: Height validation - reasonable limits
+                    // v2.43.3 was TOO STRICT (15 blocks) - broke sync at startup!
                     let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                     let height_jump = if h > peer.last_block_height { h - peer.last_block_height } else { 0 };
                     
-                    // v2.43.3: STRICTER limits to prevent producer from getting too far ahead
-                    // MAX_TRUSTED_HEIGHT_JUMP: can't claim +30 blocks suddenly (was 100)
-                    // MAX_AHEAD_OF_LOCAL: can't claim 15+ ahead of our local (was 50)
-                    const MAX_TRUSTED_HEIGHT_JUMP: u64 = 30;
-                    const MAX_AHEAD_OF_LOCAL: u64 = 15;
+                    // BALANCED: Allow reasonable sync while preventing abuse
+                    const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
+                    const MAX_AHEAD_OF_LOCAL: u64 = 100; // v2.43.4: Back to 100 - 15 broke startup!
                     
                     if h > peer.last_block_height {
                         if height_jump > MAX_TRUSTED_HEIGHT_JUMP {
@@ -2562,10 +2560,10 @@ impl SimplifiedP2P {
                 if stored_ip == peer_ip {
                     entry.last_seen = current_time;
                     if let Some(h) = height {
-                        // PRODUCTION v2.43.3: Height validation (same as above)
+                        // PRODUCTION v2.43.4: Height validation (same as above)
                         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                        const MAX_TRUSTED_HEIGHT_JUMP: u64 = 30;
-                        const MAX_AHEAD_OF_LOCAL: u64 = 15;
+                        const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
+                        const MAX_AHEAD_OF_LOCAL: u64 = 100;
                         
                         if h > entry.last_block_height {
                             let height_jump = h - entry.last_block_height;
@@ -2588,10 +2586,10 @@ impl SimplifiedP2P {
         
         // Fallback to legacy
         if let Ok(mut peers) = self.connected_peers.write() {
-            // PRODUCTION v2.43.3: Height validation constants (stricter)
+            // PRODUCTION v2.43.4: Height validation constants
             let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-            const MAX_TRUSTED_HEIGHT_JUMP: u64 = 30;
-            const MAX_AHEAD_OF_LOCAL: u64 = 15;
+            const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
+            const MAX_AHEAD_OF_LOCAL: u64 = 100;
             
             // v2.24.4: First try exact match
             if let Some(peer) = peers.get_mut(&peer_addr) {

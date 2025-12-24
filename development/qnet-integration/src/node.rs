@@ -163,18 +163,12 @@ pub static NEW_CERTIFICATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MACROBLOCK_CHECK_TASKS: AtomicU64 = AtomicU64::new(0);
 const MAX_CONCURRENT_MACROBLOCK_CHECKS: u64 = 5;
 
-// PRODUCTION v2.43.2: Backpressure for block broadcasts
-// v2.43 had MAX=3, wait=500ms - insufficient for 64K TPS stress tests
-// v2.43.2: MAX=2, wait=1500ms - balanced: allows pipelining while ensuring delivery
-// CRITICAL FIX: Combined with height-based sync (peer heights now reflect ACTUAL received blocks,
-// not heartbeat claims) this prevents producer from getting ahead of network
+// PRODUCTION v2.43.4: Backpressure for block broadcasts
+// Limits concurrent broadcasts to prevent QUIC overload
+// v2.43.2-v2.43.3 had network-ahead check that caused deadlocks - REMOVED
+// Now using ONLY broadcast backpressure which naturally limits production speed
 pub static PENDING_BROADCAST_COUNT: AtomicU64 = AtomicU64::new(0);
-const MAX_PENDING_BROADCASTS: u64 = 2;  // v2.43.2: Allow 2 concurrent (was 3, too aggressive)
-
-// PRODUCTION v2.43.2: Max blocks producer can be ahead of network median
-// If local_height > network_median + MAX_AHEAD, producer PAUSES to let network catch up
-// NOW WORKS CORRECTLY because peer heights reflect ACTUALLY RECEIVED blocks (not heartbeat claims)
-const MAX_AHEAD_OF_NETWORK: u64 = 10;  // 10 blocks = 10 seconds buffer
+const MAX_PENDING_BROADCASTS: u64 = 2;  // Allow 2 concurrent broadcasts
 
 // ═══════════════════════════════════════════════════════════════════════════
 // QNET STRUCTURED LOGGING SYSTEM v2.32
@@ -7806,49 +7800,17 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             if is_warn() { println!("[WARN][PROD] not_synced expected={} stored={}", microblock_height, current_stored_height); }
                         }
                         
-                        // ═══════════════════════════════════════════════════════════════════════════
-                        // PRODUCTION v2.43.2: CRITICAL - Don't get too far ahead of network!
-                        // This prevents deadlock when blocks are created faster than propagated.
-                        // If local_height > network_median + MAX_AHEAD, we WAIT.
-                        // ═══════════════════════════════════════════════════════════════════════════
-                        let network_ok = if is_synchronized {
-                            if let Some(ref p2p) = unified_p2p {
-                                // Get peer heights (only peers with known heights)
-                                let peer_heights: Vec<u64> = p2p.get_validated_active_peers()
-                                    .iter()
-                                    .filter(|p| p.last_block_height > 0)
-                                    .map(|p| p.last_block_height)
-                                    .collect();
-                                
-                                if peer_heights.len() >= 2 {
-                                    // Calculate median peer height
-                                    let mut sorted = peer_heights.clone();
-                                    sorted.sort();
-                                    let median_idx = sorted.len() / 2;
-                                    let network_height = sorted[median_idx];
-                                    
-                                    // Check if we're too far ahead
-                                    if current_stored_height > network_height + MAX_AHEAD_OF_NETWORK {
-                                        println!("[BACKPRESSURE] ⏳ Producer ahead of network: local={} network_median={} max_ahead={}",
-                                                current_stored_height, network_height, MAX_AHEAD_OF_NETWORK);
-                                        println!("[BACKPRESSURE] 🔄 Waiting for network to catch up before producing block #{}",
-                                                next_block_height);
-                                        false // Don't produce - wait for network
-                                    } else {
-                                        true // OK to produce
-                                    }
-                                } else {
-                                    // Not enough peers - OK to produce (Genesis/startup)
-                                    true
-                                }
-                            } else {
-                                true // No P2P - OK to produce
-                            }
-                        } else {
-                            false // Not synchronized
-                        };
-                        
-                        network_ok
+                        // PRODUCTION v2.43.4: Removed network-ahead check
+                        // v2.43.2-v2.43.3 had a check that blocked production if local > network + MAX_AHEAD
+                        // This caused MORE problems than it solved:
+                        // - At startup, peer heights are 0 or low → check always triggered
+                        // - Heartbeats update peer heights, but capping was too aggressive
+                        // - Result: network deadlock even without stress test!
+                        //
+                        // CORRECT APPROACH: Use backpressure at broadcast level (PENDING_BROADCAST_COUNT)
+                        // This naturally limits how fast producer can create blocks
+                        // Emergency failover handles cases where producer gets too far ahead
+                        is_synchronized
                         }
                     };
                     
