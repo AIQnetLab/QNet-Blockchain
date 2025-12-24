@@ -1,4 +1,4 @@
-# QNet API Reference v2.43.1
+# QNet API Reference v2.44.0
 
 ## 📡 Base URL
 

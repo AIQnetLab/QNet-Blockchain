@@ -1,9 +1,9 @@
-# QNet Blockchain Architecture v2.40
+# QNet Blockchain Architecture v2.44
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: December 17, 2025  
-**Version**: 2.40.0  
-**Status**: Production Ready (Block-Based Consensus Phases + Zero Fork Guarantee)
+**Last Updated**: December 24, 2025  
+**Version**: 2.44.0  
+**Status**: Production Ready (Aggressive Recovery + Round Tolerance + 100K TPS)
 
 > ⚠️ **CONSENSUS UPDATED in v2.40.0**  
 > Phases now determined by block height (deterministic), not message counts.  
@@ -50,6 +50,9 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Batch Ed25519 Verification v2.25.2**: 3x faster signature verification
 - **Batch Mempool Operations v2.25.2**: 1 lock per 1000 TX (1000x reduction)
 - **TX Accumulator v2.25.2**: Batch 1000 TX with 100ms timeout
+- **Round Tolerance ±90 v2.44.0**: Fork recovery accepts messages within 1 epoch
+- **Aggressive Catch-up v2.44.0**: 15s/5 blocks threshold for fast resync (was 120s/50)
+- **100K TPS Recovery v2.44.0**: Network self-heals after high-load stress tests
 
 ---
 
@@ -114,6 +117,43 @@ pub struct EligibleProducer {
 | N-2 finalization | ✅ 90+ blocks buffer guarantees readiness |
 | Emergency failover | ✅ Uses same snapshot |
 | No gossip races | ✅ Blockchain is source of truth |
+
+---
+
+## Network Recovery (v2.44.0)
+
+### Problem: Round Mismatch Deadlock
+
+After high-TPS stress tests (100K+ TPS), nodes can desync:
+- Different nodes have different consensus round numbers
+- `Round Mismatch` error rejects ALL consensus messages
+- Emergency failover changes producer but NOT rounds
+- Network stalls indefinitely
+
+### Solution: 3 Key Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    NETWORK RECOVERY (v2.44)                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  1. ROUND TOLERANCE ±90:                                                │
+│     └── Accept consensus messages within 1 epoch difference            │
+│     └── commit_reveal.rs: diff ≤ 90 → ACCEPT with warning              │
+│     └── diff > 90 → REJECT (too far = attack or severe desync)         │
+│                                                                          │
+│  2. AGGRESSIVE CATCH-UP (15s/5 blocks):                                 │
+│     └── Stall detection: 15 seconds (was 120s)                          │
+│     └── Gap threshold: 5 blocks (was 50)                                │
+│     └── Force rollback to last macroblock boundary                     │
+│                                                                          │
+│  3. BYZANTINE MEDIAN HEIGHT:                                            │
+│     └── sync_blockchain_height() gets fresh median from peers           │
+│     └── HealthPing updates peer heights every 15 seconds               │
+│     └── Prevents stale cache issues                                     │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 

@@ -251,14 +251,41 @@ impl CommitRevealConsensus {
             return Err(ConsensusError::NoActiveRound);
         }
         
-        // CRITICAL FIX v2.48: Verify commit is for OUR EXACT round!
-        // block_height here is round_id from sender (after v2.48 fix in node.rs)
-        // This prevents commits being stored in wrong round's state!
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.44: Round Tolerance ±90 (1 epoch) for fork recovery
+        // ═══════════════════════════════════════════════════════════════════════════
+        // ARCHITECTURE: Strict EXACT match caused deadlocks after high-TPS tests
+        // When nodes desync, Round Mismatch rejects ALL messages → network stall
+        // 
+        // Solution (like Tendermint/HotStuff):
+        // - Accept commits within ±90 blocks (1 epoch) tolerance
+        // - Log warning for non-exact matches
+        // - Epoch validation (below) provides additional Byzantine protection
+        // 
+        // WHY ±90: One full epoch allows:
+        // - Late delivery of consensus messages
+        // - Recovery from temporary network partitions
+        // - Graceful handling of clock drift between nodes
+        // ═══════════════════════════════════════════════════════════════════════════
         let our_round_number = self.current_round.as_ref().unwrap().round_number;
-        if block_height != our_round_number {
+        let round_diff = if block_height > our_round_number {
+            block_height - our_round_number
+        } else {
+            our_round_number - block_height
+        };
+        
+        // CRITICAL: Reject if more than 1 epoch apart (too far = likely attack or severe desync)
+        if round_diff > 90 {
             return Err(ConsensusError::InvalidPhase(
-                format!("Round mismatch: message_round={} our_round={}", block_height, our_round_number)
+                format!("Round mismatch: message_round={} our_round={} diff={} (max 90)", 
+                        block_height, our_round_number, round_diff)
             ));
+        }
+        
+        // Log warning for non-exact matches (helps diagnose sync issues)
+        if round_diff > 0 {
+            println!("[WARN][CONS] round_tolerance_accept msg_round={} our_round={} diff={}", 
+                     block_height, our_round_number, round_diff);
         }
         
         // PRODUCTION v2.40.2: Proper EPOCH-based validation
@@ -356,18 +383,36 @@ impl CommitRevealConsensus {
     /// 2. Then check position - reveals accepted during ENTIRE consensus window (61-89)
     /// 3. Verify hybrid signature (Dilithium3 + Ed25519) - prevents impersonation attacks
     pub async fn submit_reveal(&mut self, reveal: Reveal, block_height: u64) -> Result<(), ConsensusError> {
-        // CRITICAL FIX v2.48: Verify reveal is for OUR EXACT round!
-        // block_height here is round_id from sender (after v2.48 fix in node.rs)
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.44: Round Tolerance ±90 (1 epoch) for fork recovery
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Same tolerance as process_commit - see comments there for rationale
+        // Reveals are even more critical - without them macroblock consensus fails!
+        // ═══════════════════════════════════════════════════════════════════════════
         let our_round_number = if let Some(state) = &self.current_round {
             state.round_number
         } else {
             return Err(ConsensusError::NoActiveRound);
         };
         
-        if block_height != our_round_number {
+        let round_diff = if block_height > our_round_number {
+            block_height - our_round_number
+        } else {
+            our_round_number - block_height
+        };
+        
+        // CRITICAL: Reject if more than 1 epoch apart
+        if round_diff > 90 {
             return Err(ConsensusError::InvalidPhase(
-                format!("Round mismatch for reveal: message_round={} our_round={}", block_height, our_round_number)
+                format!("Round mismatch for reveal: message_round={} our_round={} diff={} (max 90)", 
+                        block_height, our_round_number, round_diff)
             ));
+        }
+        
+        // Log warning for non-exact matches
+        if round_diff > 0 {
+            println!("[WARN][CONS] reveal_tolerance_accept msg_round={} our_round={} diff={}", 
+                     block_height, our_round_number, round_diff);
         }
         
         // PRODUCTION v2.40.2: Proper EPOCH-based validation

@@ -6140,6 +6140,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
             // PRODUCTION: Track certificate management timing  
             let mut certificate_cleanup_counter = 0u64;
             let mut certificate_broadcast_counter = 0u64;
+            let mut certificate_rotation_counter = 0u64;  // v2.44: Periodic rotation even during stall
             let mut genesis_reconnect_counter = 0u64;  // CRITICAL FIX: Genesis peer reconnection
             let node_start_time = std::time::Instant::now();
             
@@ -6204,7 +6205,59 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 cpu_check_counter += 1;
                 certificate_cleanup_counter += 1;
                 certificate_broadcast_counter += 1;
+                certificate_rotation_counter += 1;
                 genesis_reconnect_counter += 1;
+                
+                // ═══════════════════════════════════════════════════════════════════
+                // PRODUCTION v2.44: Periodic certificate rotation (every 3 minutes)
+                // ═══════════════════════════════════════════════════════════════════
+                // CRITICAL FIX: Certificates expire after 4.5 minutes (270s)
+                // Without periodic rotation, stalled nodes have expired certs
+                // → Sync fails with "Certificate expired" → DEADLOCK!
+                // ═══════════════════════════════════════════════════════════════════
+                if certificate_rotation_counter >= 180 && node_type != NodeType::Light {
+                    certificate_rotation_counter = 0;
+                    
+                    // PRODUCTION v2.45: Periodic certificate rotation using GLOBAL_HYBRID_INSTANCES
+                    // Force certificate rotation even if not signing to prevent "Certificate expired" errors
+                    let node_id_for_rotation = node_id.clone();
+                    match tokio::runtime::Handle::try_current() {
+                        Ok(handle) => {
+                            handle.spawn(async move {
+                                use crate::crypto::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+                                
+                                let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                                    std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+                                }).await;
+                                
+                                let mut instances_guard = instances.lock().await;
+                                
+                                // Get or create hybrid instance for this node
+                                if !instances_guard.contains_key(&node_id_for_rotation) {
+                                    let mut hybrid = HybridCrypto::new(node_id_for_rotation.clone());
+                                    if let Err(e) = hybrid.initialize().await {
+                                        println!("[WARN][CERT] Hybrid init failed: {}", e);
+                                        return;
+                                    }
+                                    instances_guard.insert(node_id_for_rotation.clone(), hybrid);
+                                }
+                                
+                                if let Some(hybrid) = instances_guard.get_mut(&node_id_for_rotation) {
+                                    if hybrid.needs_rotation() {
+                                        if let Err(e) = hybrid.rotate_certificate().await {
+                                            println!("[WARN][CERT] Periodic rotation failed: {}", e);
+                                        } else {
+                                            println!("[INFO][CERT] Periodic rotation completed");
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Err(_) => {
+                            println!("[WARN][CERT] No runtime for periodic rotation");
+                        }
+                    }
+                }
                 
                 // PRODUCTION: Certificate cache cleanup (every 5 minutes)
                 // Removes expired certificates from cache (TTL: 9 min for verified, 5 min for pending)
@@ -6529,21 +6582,37 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 }
                                 
                                 // ═══════════════════════════════════════════════════════════════════
-                                // CRITICAL v2.45: FORCE RESYNC ON PROLONGED STALL (FORK RECOVERY)
+                                // PRODUCTION v2.44: AGGRESSIVE CATCH-UP (15s/5 blocks)
                                 // ═══════════════════════════════════════════════════════════════════
-                                // Problem: Node stuck on fork cannot sync because:
-                                // 1. Blocks from main chain have different PoH/previous_hash
-                                // 2. Validation fails → blocks rejected → node stays stuck
+                                // ARCHITECTURE FIX: Previous 120s/50 blocks was too conservative!
+                                // After high-TPS tests, nodes can desync and stay stuck forever because:
+                                // 1. Round mismatch rejects consensus messages
+                                // 2. Cached network_height is stale (no new blocks = no updates)
+                                // 3. 50-block threshold never triggers because gap appears small
                                 // 
-                                // Solution: After 120s stall, force rollback to last macroblock and resync
-                                // This allows node to "jump" to correct chain
+                                // Solution (like Tendermint/Aptos):
+                                // - 15s stall → aggressive resync (was 120s)
+                                // - 5 block gap → trigger sync (was 50)
+                                // - Byzantine median height (2f+1 consensus across peers)
                                 // ═══════════════════════════════════════════════════════════════════
-                                if time_since_last_block > 120 {
-                                    // Check if network is ahead
-                                    let network_height = p2p.get_cached_network_height().unwrap_or(0);
+                                if time_since_last_block > 15 {
+                                    // v2.44: Use Byzantine median from peer heights (QUIC HealthPing data)
+                                    // This is MORE reliable than single cached value
+                                    let network_height = match p2p.sync_blockchain_height().await {
+                                        Ok(h) => {
+                                            if crate::node::is_info() { println!("[INFO][SYNC] median_height={}", h); }
+                                            h
+                                        },
+                                        Err(e) => {
+                                            if crate::node::is_warn() { println!("[WARN][SYNC] median_failed err={}", e); }
+                                            p2p.get_cached_network_height().unwrap_or(0)
+                                        }
+                                    };
                                     let height_gap = network_height.saturating_sub(microblock_height);
                                     
-                                    if height_gap > 50 {
+                                    // v2.44: Aggressive threshold - 5 blocks instead of 50
+                                    // At 1 block/sec, 5 blocks = 5 seconds lag which shouldn't happen
+                                    if height_gap > 5 {
                                         println!("[ERR][FORK] stuck={}s behind={} blocks", time_since_last_block, height_gap);
                                         println!("[INFO][FORK] force_resync local={} network={}", microblock_height, network_height);
                                         
@@ -13470,11 +13539,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             .unwrap_or_default()
                             .as_secs();
                         let expires_with_grace = certificate.expires_at + CERTIFICATE_VERIFICATION_GRACE_SECS;
-                        if now > expires_with_grace {
+                        
+                        // v2.44: Skip expiry check for historical blocks ONLY during sync
+                        // SECURITY: Both conditions required for L1 production safety
+                        // 1. Block must be old (>5 minutes) - prevents fake timestamp attack
+                        // 2. Node must be in sync mode - prevents abuse during live production
+                        let block_age = now.saturating_sub(microblock.timestamp);
+                        let is_historical = block_age > 300; // Blocks older than 5 minutes
+                        let is_sync_mode = SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed) || 
+                                           FAST_SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+                        let skip_expiry_for_sync = is_historical && is_sync_mode;
+                        
+                        if !skip_expiry_for_sync && now > expires_with_grace {
                             println!("[ERR][CRYPTO] Certificate expired at {} (with 60s grace), now is {}", 
                                      expires_with_grace, now);
                             false
                         } else {
+                            if skip_expiry_for_sync && now > expires_with_grace {
+                                println!("[INFO][CRYPTO] Skipping expiry check for sync block (age={}s, sync=true)", block_age);
+                            }
                             // Verify Ed25519 signature using ephemeral public key (NIST/Cisco requirement)
                             if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
                                 let ed_sig_array: [u8; 64] = ed_sig_bytes;

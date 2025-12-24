@@ -44,7 +44,15 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.41.1 - December 17, 2025)**
+### 🛡️ **LATEST UPDATES (v2.44.0 - December 24, 2025)**
+
+**🔄 Network Recovery v2.44 (Aggressive Catch-up + Round Tolerance):**
+- **Round Tolerance ±90**: Accept consensus messages within 1 epoch for fork recovery
+- **Aggressive Catch-up**: 15s/5 blocks threshold (was 120s/50) for fast stall recovery
+- **Byzantine Median Height**: Fresh network height from HealthPing peer data
+- **100K TPS Recovery**: Network self-heals after high-load stress tests
+
+### 🛡️ **Previous Updates (v2.41.1 - December 17, 2025)**
 
 **💓 Deterministic Reward Heartbeats v2.41:**
 - **On-Chain Recording**: Heartbeats stored in MacroBlock (not gossip)

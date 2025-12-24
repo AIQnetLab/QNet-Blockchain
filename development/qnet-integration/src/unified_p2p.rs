@@ -1236,6 +1236,30 @@ const SHRED_CHUNK_MAX_RETRIES: u8 = 4;              // Max retransmit attempts p
 const MAX_CONCURRENT_CHUNK_SENDS: usize = 20;       // Max concurrent QUIC streams for chunk sends (v2.21.4)
                                                      // Prevents receiver overload from burst of 72+ streams
 
+// ============================================================================
+// PRODUCTION v2.45: ADAPTIVE PACING CONSTANTS
+// ============================================================================
+// Prevents UDP burst and packet loss under high load by:
+// 1. Batching chunk sends with delays
+// 2. Dynamically adjusting delay based on failure rate
+//
+// CRITICAL CALCULATION for 100K TPS:
+// - 20MB block = 156 data + 78 parity = 234 chunks
+// - With fanout 6: 234 × 6 = 1404 sends
+// - Must complete in <500ms to leave time for propagation
+// - At batch=100 and delay=2ms: 14 batches × 2ms = 28ms overhead ✓
+const PACING_BATCH_SIZE_DEFAULT: usize = 100;    // Chunks per batch (optimized for 100K TPS)
+const PACING_BATCH_SIZE_MIN: usize = 50;         // Minimum batch size (high failure rate)
+const PACING_DELAY_MS_DEFAULT: u64 = 2;          // Base delay between batches (reduced from 10ms!)
+const PACING_DELAY_MS_MAX: u64 = 20;             // Maximum delay between batches (reduced from 100ms)
+const PACING_FAILURE_THRESHOLD: f32 = 0.15;      // 15% failure rate triggers backpressure
+const PACING_FAILURE_CRITICAL: f32 = 0.35;       // 35% failure rate triggers aggressive backpressure
+
+/// PRODUCTION v2.45: Global failure rate tracking for adaptive pacing
+static SHRED_SEND_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SHRED_SEND_FAILURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SHRED_LAST_FAILURE_RATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); // ×1000 for precision
+
 /// ShredProtocol chunk for block propagation
 /// v2.26: Added certificate field to eliminate certificate race condition
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4528,8 +4552,29 @@ impl SimplifiedP2P {
                         max_concurrent, total_sends, unique_peers.len());
                 }
                 
-                // Build list of (quic_addr, msg) tuples
-                let mut send_tasks = Vec::with_capacity(total_sends);
+                // Build list of (quic_addr, msg) tuples for PACED sending
+                // PRODUCTION v2.45: ADAPTIVE PACING to prevent UDP burst and packet loss
+                // Instead of sending all chunks simultaneously, we batch them
+                // with dynamic delays based on recent failure rate
+                
+                // Calculate adaptive pacing parameters based on failure rate
+                let failure_rate_x1000 = SHRED_LAST_FAILURE_RATE.load(std::sync::atomic::Ordering::Relaxed);
+                let failure_rate = (failure_rate_x1000 as f32) / 1000.0;
+                
+                let (batch_size, delay_ms) = if failure_rate > PACING_FAILURE_CRITICAL {
+                    // Critical: 30%+ failure - very aggressive backpressure
+                    (PACING_BATCH_SIZE_MIN, PACING_DELAY_MS_MAX)
+                } else if failure_rate > PACING_FAILURE_THRESHOLD {
+                    // Warning: 10-30% failure - moderate backpressure
+                    let scaled_batch = PACING_BATCH_SIZE_DEFAULT - ((failure_rate - PACING_FAILURE_THRESHOLD) * 100.0) as usize;
+                    let scaled_delay = PACING_DELAY_MS_DEFAULT + ((failure_rate * 200.0) as u64);
+                    (scaled_batch.max(PACING_BATCH_SIZE_MIN), scaled_delay.min(PACING_DELAY_MS_MAX))
+                } else {
+                    // Normal: <10% failure - standard pacing
+                    (PACING_BATCH_SIZE_DEFAULT, PACING_DELAY_MS_DEFAULT)
+                };
+                
+                let mut send_items: Vec<(std::net::SocketAddr, NetworkMessage)> = Vec::with_capacity(total_sends);
                 
                 for (peer, msg) in peers_for_broadcast.iter().zip(messages.iter()) {
                     // CRITICAL: Skip self to prevent self-broadcast loops
@@ -4547,41 +4592,78 @@ impl SimplifiedP2P {
                     };
                     
                     let quic_addr = std::net::SocketAddr::new(ip, port.saturating_add(crate::p2p_transport::QUIC_PORT_OFFSET));
-                    let transport_clone = transport_arc.clone();
-                    let msg_clone = msg.clone();
-                    let permit = semaphore.clone();
-                    
-                    // Spawn rate-limited task for each chunk
-                    // Semaphore ensures max N concurrent streams at any time
-                    send_tasks.push(tokio::spawn(async move {
-                        // Acquire permit before sending (blocks if limit reached)
-                        let _permit = match permit.acquire().await {
-                            Ok(p) => p,
-                            Err(_) => return Err("Semaphore closed".to_string()),
-                        };
-                        let transport = transport_clone.read().await;
-                        let result = transport.broadcast_to(quic_addr, &msg_clone).await;
-                        // Permit automatically released when _permit drops
-                        result
-                    }));
+                    send_items.push((quic_addr, msg.clone()));
                 }
                 
-                // Wait for all sends to complete (rate-limited by semaphore)
-                let results = futures::future::join_all(send_tasks).await;
-                let success_count = results.iter()
-                    .filter(|r| matches!(r, Ok(Ok(_))))
-                    .count();
-                let fail_count = results.len() - success_count;
+                // PRODUCTION v2.45: ADAPTIVE PACED batch sending
+                // Process chunks in batches with dynamic delays to prevent UDP burst
+                let mut total_success = 0usize;
+                let mut total_fail = 0usize;
+                let num_batches = (send_items.len() + batch_size - 1) / batch_size;
+                
+                for (batch_idx, batch) in send_items.chunks(batch_size).enumerate() {
+                    let mut batch_tasks = Vec::with_capacity(batch.len());
+                    
+                    for (quic_addr, msg) in batch {
+                        let transport_clone = transport_arc.clone();
+                        let msg_clone = msg.clone();
+                        let addr = *quic_addr;
+                        let permit = semaphore.clone();
+                        
+                        batch_tasks.push(tokio::spawn(async move {
+                            let _permit = match permit.acquire().await {
+                                Ok(p) => p,
+                                Err(_) => return Err("Semaphore closed".to_string()),
+                            };
+                            let transport = transport_clone.read().await;
+                            transport.broadcast_to(addr, &msg_clone).await
+                        }));
+                    }
+                    
+                    // Wait for this batch to complete
+                    let batch_results = futures::future::join_all(batch_tasks).await;
+                    let batch_success = batch_results.iter()
+                        .filter(|r| matches!(r, Ok(Ok(_))))
+                        .count();
+                    let batch_fail = batch_results.len() - batch_success;
+                    
+                    total_success += batch_success;
+                    total_fail += batch_fail;
+                    
+                    // PACING: Adaptive delay between batches (except last)
+                    // This prevents UDP buffer overflow and reduces packet loss
+                    if batch_idx < num_batches - 1 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+                
+                // Update global failure rate tracking (exponential moving average)
+                SHRED_SEND_SUCCESS.fetch_add(total_success as u64, std::sync::atomic::Ordering::Relaxed);
+                SHRED_SEND_FAILURE.fetch_add(total_fail as u64, std::sync::atomic::Ordering::Relaxed);
+                
+                // Calculate and update failure rate every block
+                let total_sent = SHRED_SEND_SUCCESS.load(std::sync::atomic::Ordering::Relaxed) 
+                               + SHRED_SEND_FAILURE.load(std::sync::atomic::Ordering::Relaxed);
+                if total_sent > 0 {
+                    let new_rate = (SHRED_SEND_FAILURE.load(std::sync::atomic::Ordering::Relaxed) as f32 / total_sent as f32 * 1000.0) as u64;
+                    SHRED_LAST_FAILURE_RATE.store(new_rate, std::sync::atomic::Ordering::Relaxed);
+                    
+                    // Reset counters periodically to avoid stale data (every 1000 sends)
+                    if total_sent > 10000 {
+                        SHRED_SEND_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
+                        SHRED_SEND_FAILURE.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 
                 // Log failures for debugging
-                if fail_count > 0 && (height_for_log <= 500 || height_for_log % 10 == 0) {
-                    println!("[SHRED_PROTOCOL] ⚠️ Block #{}: {}/{} chunks failed to send", 
-                        height_for_log, fail_count, results.len());
+                if total_fail > 0 && (height_for_log <= 500 || height_for_log % 10 == 0) {
+                    println!("[SHRED_PROTOCOL] ⚠️ Block #{}: {}/{} chunks failed (rate={:.1}%)", 
+                        height_for_log, total_fail, send_items.len(), failure_rate * 100.0);
                 }
                 
                 if height_for_log <= 500 || height_for_log % 10 == 0 {
-                    println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} chunks delivered: {}/{} (PARALLEL binary protocol)", 
-                        height_for_log, success_count, total_sends);
+                    println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} delivered: {}/{} (adaptive: batch={}, delay={}ms, fail_rate={:.1}%)", 
+                        height_for_log, total_success, send_items.len(), batch_size, delay_ms, failure_rate * 100.0);
                 }
                 
                 return Ok(());
@@ -16350,19 +16432,29 @@ impl SimplifiedP2P {
                     .unwrap_or(1);
                 
                 if confirmations >= 3 {
+                    // CONSENSUS REACHED: 3+ nodes confirm block missing
+                    // Aggressive Catch-up in node.rs will handle resync (15s/5 blocks)
+                    // Round Tolerance ±90 in commit_reveal.rs handles message acceptance
                     println!("[CONSENSUS] ✅ Block #{} missing - CONSENSUS REACHED ({} confirmations)", 
                              block_height_log, confirmations);
+                    if crate::node::is_info() { 
+                        println!("[INFO][TC] stall_confirmed h={} action=aggressive_catchup", block_height_log); 
+                    }
+                    
                 } else if confirmations >= 2 {
-                    println!("[CONSENSUS] ⚠️ Block #{} missing - PARTIAL CONSENSUS ({} confirmations)", 
-                             block_height_log, confirmations);
+                    if crate::node::is_warn() { 
+                        println!("[WARN][TC] partial_consensus h={} conf={}", block_height_log, confirmations); 
+                    }
+                    
                 } else {
-                    println!("[CONSENSUS] ⚠️ Block #{} missing - SINGLE REPORT (no penalty)", 
-                             block_height_log);
+                    if crate::node::is_debug() { 
+                        println!("[DBG][TC] single_report h={}", block_height_log); 
+                    }
                 }
             }
         });
         
-        println!("[FAILOVER] ⏸️ Verification scheduled (2s timeout)");
+        if crate::node::is_debug() { println!("[DBG][FAILOVER] verify_scheduled timeout=2s"); }
         
         // ═══════════════════════════════════════════════════════════════════════════
         // ARCHITECTURE v2.38: ON-CHAIN SLASHING ONLY

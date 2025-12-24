@@ -39,17 +39,18 @@ use crate::unified_p2p::{NetworkMessage, PeerInfo, get_privacy_id_for_addr};
 // RETRY CONSTANTS (v2.24 - improved reconnect logic)
 // ============================================================================
 
-/// Number of connection retry attempts (increased from 3 for better resilience)
-const CONNECT_RETRY_ATTEMPTS: u32 = 5;
+/// Number of connection retry attempts (v2.45: reduced from 5 to 3 for faster failover)
+/// With 2s timeout, max delay = 3 × 2s = 6s (was 5 × 5s = 25s)
+const CONNECT_RETRY_ATTEMPTS: u32 = 3;
 
 /// Extended retry for handshake failures (aborted by peer is common at startup)
-const HANDSHAKE_RETRY_ATTEMPTS: u32 = 7;
+const HANDSHAKE_RETRY_ATTEMPTS: u32 = 5;
 
-/// Delay between retry attempts (exponential backoff base, reduced for faster reconnect)
+/// Delay between retry attempts (exponential backoff base)
 const RETRY_DELAY_MS: u64 = 50;
 
-/// Maximum delay between retries (cap exponential backoff)
-const MAX_RETRY_DELAY_MS: u64 = 2000;
+/// Maximum delay between retries (v2.45: reduced from 2000ms to 500ms)
+const MAX_RETRY_DELAY_MS: u64 = 500;
 
 /// Health check interval for proactive reconnection
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
@@ -58,11 +59,13 @@ const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
 // CONSTANTS - ALIGNED WITH HTTP VALUES
 // ============================================================================
 
-/// Connection timeout (same as HTTP: 3s)
+/// Connection timeout (v2.45: kept at 3s for reliability)
 pub const CONNECT_TIMEOUT_SECS: u64 = 3;
 
-/// Send/receive timeout (same as HTTP: 5s for messages)
-pub const MESSAGE_TIMEOUT_SECS: u64 = 5;
+/// Send/receive timeout (v2.45: reduced from 5s to 3s - balanced)
+/// At 100Mbps: 21MB takes 1.68s, so 3s provides safety margin
+/// Combined with CONNECT_RETRY_ATTEMPTS=3: max 9s per send (was 25s)
+pub const MESSAGE_TIMEOUT_SECS: u64 = 3;
 
 /// Keep-alive interval (same as HTTP TCP keepalive: 30s)
 pub const KEEP_ALIVE_SECS: u64 = 30;
@@ -70,8 +73,9 @@ pub const KEEP_ALIVE_SECS: u64 = 30;
 /// Idle connection timeout (same as HTTP pool: 90s)
 pub const IDLE_TIMEOUT_SECS: u64 = 90;
 
-/// Maximum concurrent streams per connection
-pub const MAX_STREAMS_PER_CONN: u32 = 100;
+/// Maximum concurrent streams per connection (v2.45: increased from 100 to 500)
+/// High-throughput L1 requires many concurrent streams for block propagation
+pub const MAX_STREAMS_PER_CONN: u32 = 500;
 
 /// Fixed QUIC port - always use this port for QUIC connections
 /// Docker maps this port: -p 10876:10876/udp
@@ -217,12 +221,26 @@ impl QuicTransport {
                 .map_err(|e| format!("QUIC server config failed: {}", e))?
         ));
         
-        // Transport config - ALIGNED WITH HTTP
+        // Transport config - OPTIMIZED FOR HIGH-THROUGHPUT L1 (v2.45)
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
         transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
         transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().expect("Idle timeout must fit in IdleTimeout")));
         transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
+        
+        // PRODUCTION v2.45: High-throughput optimizations
+        // Faster initial RTT estimate for quicker congestion control convergence
+        transport.initial_rtt(Duration::from_millis(50));
+        
+        // Larger receive window for high-bandwidth block propagation (16MB)
+        transport.receive_window(VarInt::from_u32(16_777_216));
+        
+        // Larger send window for sustained throughput (16MB)
+        transport.send_window(16_777_216);
+        
+        // Increase datagram receive buffer for burst handling
+        transport.datagram_receive_buffer_size(Some(8_388_608)); // 8MB
+        
         server_config.transport_config(Arc::new(transport));
         
         // Create endpoint
@@ -233,8 +251,8 @@ impl QuicTransport {
         
         // PRIVACY: bind_addr is local, OK to show
         println!("[QUIC] ✅ Transport initialized on {}", bind_addr);
-        println!("[QUIC] 📊 Timeouts: connect={}s, idle={}s, keepalive={}s", 
-            CONNECT_TIMEOUT_SECS, IDLE_TIMEOUT_SECS, KEEP_ALIVE_SECS);
+        println!("[QUIC] 📊 Config: timeout={}s, streams={}, window=16MB, rtt=50ms", 
+            CONNECT_TIMEOUT_SECS, MAX_STREAMS_PER_CONN);
         
         Ok(())
     }
@@ -710,13 +728,20 @@ impl QuicTransport {
                 .map_err(|e| format!("Client config failed: {}", e))?
         ));
         
-        // Transport config - ALIGNED WITH HTTP
+        // Transport config - OPTIMIZED FOR HIGH-THROUGHPUT L1 (v2.45)
         // CRITICAL FIX: Must include uni_streams for receiving broadcasts!
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
         transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN)); // CRITICAL: Allow incoming uni streams!
         transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().expect("Idle timeout must fit in IdleTimeout")));
         transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
+        
+        // PRODUCTION v2.45: High-throughput optimizations (same as server)
+        transport.initial_rtt(Duration::from_millis(50));
+        transport.receive_window(VarInt::from_u32(16_777_216)); // 16MB
+        transport.send_window(16_777_216); // 16MB
+        transport.datagram_receive_buffer_size(Some(8_388_608)); // 8MB
+        
         client_config.transport_config(Arc::new(transport));
         
         // Connect with timeout

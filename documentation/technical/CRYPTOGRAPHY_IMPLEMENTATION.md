@@ -1,9 +1,9 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 2.7 (v2.31.0)  
-**Date:** December 13, 2025  
-**Status:** Production Ready (5-Layer Macroblock Protection + Proactive Fork Detection)  
+**Version:** 2.8 (v2.44.0)  
+**Date:** December 24, 2025  
+**Status:** Production Ready (Aggressive Recovery + Round Tolerance + 100K TPS)  
 
 ---
 
@@ -63,6 +63,12 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Graceful Shutdown** (tokio::signal::ctrl_c() saves certificates before exit)
 - ✅ **No Fallback Policy** (desynchronized nodes excluded from production)
 - ✅ **Certificate Persistence** (load_from_disk/persist_to_disk on startup/shutdown)
+
+### v2.44.0 Additions (Aggressive Recovery + Round Tolerance)
+- ✅ **Round Tolerance ±90** (accept consensus messages within 1 epoch for fork recovery)
+- ✅ **Aggressive Catch-up** (15s stall / 5 block gap threshold, was 120s/50)
+- ✅ **Byzantine Median Height** (fresh height from QUIC HealthPing peer data)
+- ✅ **100K TPS Stress Tested** (network recovery after high-load scenarios)
 
 ---
 

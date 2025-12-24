@@ -5,6 +5,32 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.44.0] - December 24, 2025 "Aggressive Recovery + Round Tolerance"
+
+### 🔄 Network Recovery After High-TPS Stress
+
+**Problem: Round Mismatch Deadlock after 100K TPS tests:**
+- Different nodes have different consensus round numbers after high-load stress
+- `Round Mismatch` error rejects ALL consensus messages
+- Emergency failover changes producer but NOT rounds
+- Network stalls indefinitely
+
+**Solution - 3 Key Changes:**
+
+| Component | Was | Now | Description |
+|-----------|-----|-----|-------------|
+| **Round Tolerance** | Exact match | **±90 blocks** | Accept consensus messages within 1 epoch |
+| **Stall Timeout** | 120 seconds | **15 seconds** | Faster stall detection |
+| **Gap Threshold** | 50 blocks | **5 blocks** | Lower threshold for force resync |
+| **Height Query** | Cached (stale) | **Byzantine median** | Fresh height from HealthPing data |
+
+### 🔧 Files Changed
+
+- `core/qnet-consensus/src/commit_reveal.rs` - Round Tolerance ±90
+- `development/qnet-integration/src/node.rs` - Aggressive Catch-up (15s/5 blocks), Fresh Height Query
+
+---
+
 ## [2.41.1] - December 17, 2025 "Emission MacroBlock Fix + Adaptive Sampling"
 
 ### 🎯 Critical Fix: Emission-Only Heartbeat Recording

@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.30.0-experimental  
-**Date**: December 13, 2025  
+**Version**: 2.44.0-experimental  
+**Date**: December 24, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -51,6 +51,10 @@ Experimental achievements:
 - ✅ **Real Reputation (v2.30.0)**: DeterministicReputationState instead of hardcoded values
 - ✅ **Graceful Shutdown (v2.30.0)**: Certificate persistence on Ctrl+C/SIGTERM
 - ✅ **No Fallback Policy (v2.30.0)**: Desynchronized nodes excluded from production
+- ✅ **Round Tolerance ±90 (v2.44.0)**: Fork recovery accepts consensus messages within 1 epoch
+- ✅ **Aggressive Catch-up (v2.44.0)**: 15s/5 blocks threshold (was 120s/50) for fast stall recovery
+- ✅ **Byzantine Median Height (v2.44.0)**: Fresh network height from HealthPing peer data
+- ✅ **100K+ TPS Stress Tested (v2.44.0)**: Network recovery after high-load scenarios
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 
