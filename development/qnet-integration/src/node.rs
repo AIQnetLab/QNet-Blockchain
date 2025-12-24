@@ -163,11 +163,18 @@ pub static NEW_CERTIFICATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_MACROBLOCK_CHECK_TASKS: AtomicU64 = AtomicU64::new(0);
 const MAX_CONCURRENT_MACROBLOCK_CHECKS: u64 = 5;
 
-// PRODUCTION v2.43: Backpressure for block broadcasts
-// Prevents producer from creating blocks faster than network can propagate
-// Critical during stress tests - ensures blocks are delivered before creating more
+// PRODUCTION v2.43.2: Backpressure for block broadcasts
+// v2.43 had MAX=3, wait=500ms - insufficient for 64K TPS stress tests
+// v2.43.2: MAX=2, wait=1500ms - balanced: allows pipelining while ensuring delivery
+// CRITICAL FIX: Combined with height-based sync (peer heights now reflect ACTUAL received blocks,
+// not heartbeat claims) this prevents producer from getting ahead of network
 pub static PENDING_BROADCAST_COUNT: AtomicU64 = AtomicU64::new(0);
-const MAX_PENDING_BROADCASTS: u64 = 3;  // Max concurrent broadcasts before waiting
+const MAX_PENDING_BROADCASTS: u64 = 2;  // v2.43.2: Allow 2 concurrent (was 3, too aggressive)
+
+// PRODUCTION v2.43.2: Max blocks producer can be ahead of network median
+// If local_height > network_median + MAX_AHEAD, producer PAUSES to let network catch up
+// NOW WORKS CORRECTLY because peer heights reflect ACTUALLY RECEIVED blocks (not heartbeat claims)
+const MAX_AHEAD_OF_NETWORK: u64 = 10;  // 10 blocks = 10 seconds buffer
 
 // ═══════════════════════════════════════════════════════════════════════════
 // QNET STRUCTURED LOGGING SYSTEM v2.32
@@ -1193,9 +1200,11 @@ impl BlockchainNode {
         self.adaptive_bft.clone()
     }
     
-    /// Process reward window (called by RPC system every 4 hours)
-    pub async fn process_reward_window(&self) -> Result<(), QNetError> {
-        if is_info() { println!("[INFO][REWARDS] processing_window"); }
+    /// Process reward window for emission block
+    /// PRODUCTION v2.43.1: Takes explicit emission_block_height parameter
+    /// This fixes off-by-one bug where window_end was current_height (N-1) instead of emission block (N)
+    pub async fn process_reward_window(&self, emission_block_height: u64) -> Result<(), QNetError> {
+        if is_info() { println!("[INFO][REWARDS] processing_window emission_block={}", emission_block_height); }
         
         let mut reward_manager = self.reward_manager.write().await;
         
@@ -1206,13 +1215,12 @@ impl BlockchainNode {
             .unwrap_or_default()
             .as_secs();
         let window_start = current_time - (current_time % (4 * 60 * 60)); // Start of current 4-hour window
-        let current_height = self.get_height().await;
         
-        // CRITICAL: Calculate blocks in this 4-hour window
-        // 1 block per second, 4 hours = 14400 blocks
-        let blocks_in_window = 4 * 60 * 60; // 14400 blocks
-        let window_start_height = current_height.saturating_sub(blocks_in_window);
-        let window_end_height = current_height;
+        // PRODUCTION v2.43.1: Use explicit emission_block_height instead of get_height()
+        // This ensures window_end matches the actual emission block being created
+        // FIX: Previously used current_height which was 1 block behind (14399 vs 14400)
+        let window_end_height = emission_block_height;
+        let window_start_height = emission_block_height.saturating_sub(EMISSION_INTERVAL_BLOCKS);
         
         if is_debug() { println!("[DBG][REWARDS] merkle_build window={}-{}", 
                  window_start_height, window_end_height); }
@@ -1230,7 +1238,8 @@ impl BlockchainNode {
             None => {
                 if is_warn() { println!("[WARN][REWARDS] p2p_unavailable fallback=local_storage"); }
                 // Fallback to local storage if P2P not available
-                return self.process_reward_window_local(&mut reward_manager, window_start, current_height).await;
+                // PRODUCTION v2.43.1: Use emission_block_height instead of current_height
+                return self.process_reward_window_local(&mut reward_manager, window_start, emission_block_height).await;
             }
         };
         
@@ -1250,6 +1259,10 @@ impl BlockchainNode {
             let all_pings_mutex = Mutex::new(&mut all_pings);
             let reward_manager_mutex = Mutex::new(&mut reward_manager);
             
+            // PRODUCTION v2.43.1: Global dedupe set for Light nodes across all chunks
+            let processed_light_nodes: Mutex<std::collections::HashSet<String>> = 
+                Mutex::new(std::collections::HashSet::with_capacity(attestation_count));
+            
             // Process Light node attestations in parallel chunks
             let chunks: Vec<_> = light_attestations.chunks(CHUNK_SIZE).collect();
             
@@ -1259,6 +1272,17 @@ impl BlockchainNode {
                 
                 // Process chunk (can be parallelized with rayon if needed)
                 for (light_node_id, _slot, pinger_id, timestamp) in chunk {
+                    // DEDUPE: Only process first attestation per Light node
+                    {
+                        let mut processed = match processed_light_nodes.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        if !processed.insert(light_node_id.clone()) {
+                            continue; // Already processed this node
+                        }
+                    }
+                    
                     let wallet_address = p2p.get_light_node_wallet(&light_node_id)
                         .unwrap_or_else(|| generate_eon_address_from_id(&light_node_id));
                     
@@ -1305,7 +1329,15 @@ impl BlockchainNode {
                      attestation_count, start_time.elapsed()); }
         } else {
             // Small dataset: process sequentially (no overhead)
+            // PRODUCTION v2.43.1: Dedupe by node_id to ensure 1 ping credit per Light node
+            let mut processed_light_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+            
             for (light_node_id, _slot, pinger_id, timestamp) in &light_attestations {
+                // DEDUPE: Only process first attestation per Light node
+                if !processed_light_nodes.insert(light_node_id.clone()) {
+                    continue; // Already processed this node
+                }
+                
                 let wallet_address = p2p.get_light_node_wallet(&light_node_id)
                     .unwrap_or_else(|| generate_eon_address_from_id(&light_node_id));
                 
@@ -1418,7 +1450,8 @@ impl BlockchainNode {
             
             // STEP 3: Deterministic sampling using FINALITY_WINDOW entropy
             // This ensures ALL nodes select the SAME samples
-            let entropy_height = current_height.saturating_sub(FINALITY_WINDOW);
+            // PRODUCTION v2.43.1: Use emission_block_height for consistent entropy calculation
+            let entropy_height = emission_block_height.saturating_sub(FINALITY_WINDOW);
             let entropy_block = self.storage.load_microblock(entropy_height)
                 .map_err(|e| QNetError::StorageError(format!("Failed to load entropy block: {}", e)))?
                 .ok_or_else(|| QNetError::StorageError("Entropy block not found".to_string()))?;
@@ -7773,7 +7806,49 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             if is_warn() { println!("[WARN][PROD] not_synced expected={} stored={}", microblock_height, current_stored_height); }
                         }
                         
-                        is_synchronized
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        // PRODUCTION v2.43.2: CRITICAL - Don't get too far ahead of network!
+                        // This prevents deadlock when blocks are created faster than propagated.
+                        // If local_height > network_median + MAX_AHEAD, we WAIT.
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        let network_ok = if is_synchronized {
+                            if let Some(ref p2p) = unified_p2p {
+                                // Get peer heights (only peers with known heights)
+                                let peer_heights: Vec<u64> = p2p.get_validated_active_peers()
+                                    .iter()
+                                    .filter(|p| p.last_block_height > 0)
+                                    .map(|p| p.last_block_height)
+                                    .collect();
+                                
+                                if peer_heights.len() >= 2 {
+                                    // Calculate median peer height
+                                    let mut sorted = peer_heights.clone();
+                                    sorted.sort();
+                                    let median_idx = sorted.len() / 2;
+                                    let network_height = sorted[median_idx];
+                                    
+                                    // Check if we're too far ahead
+                                    if current_stored_height > network_height + MAX_AHEAD_OF_NETWORK {
+                                        println!("[BACKPRESSURE] ⏳ Producer ahead of network: local={} network_median={} max_ahead={}",
+                                                current_stored_height, network_height, MAX_AHEAD_OF_NETWORK);
+                                        println!("[BACKPRESSURE] 🔄 Waiting for network to catch up before producing block #{}",
+                                                next_block_height);
+                                        false // Don't produce - wait for network
+                                    } else {
+                                        true // OK to produce
+                                    }
+                                } else {
+                                    // Not enough peers - OK to produce (Genesis/startup)
+                                    true
+                                }
+                            } else {
+                                true // No P2P - OK to produce
+                            }
+                        } else {
+                            false // Not synchronized
+                        };
+                        
+                        network_ok
                         }
                     };
                     
@@ -7840,7 +7915,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // Process reward window: calculate + emit + sign + add to mempool
                         // This EXISTING method does everything: sync pings, calculate rewards, 
                         // emit tokens, create transaction, sign with system key, add to mempool
-                        if let Err(e) = blockchain_for_emission.process_reward_window().await {
+                        // PRODUCTION v2.43.1: Pass explicit emission_block_height to fix off-by-one bug
+                        if let Err(e) = blockchain_for_emission.process_reward_window(next_block_height).await {
                             eprintln!("[EMISSION] ❌ Failed to process emission: {}", e);
                             // Continue with block production even if emission fails
                             // Emission will be retried in next window or by emergency producer
@@ -8748,15 +8824,27 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // PRODUCTION v2.43: BACKPRESSURE - Wait if too many broadcasts pending
                         // This prevents producer from overwhelming network during stress tests
                         // Ensures blocks are actually delivered before creating more
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        // PRODUCTION v2.43.2: BACKPRESSURE for block broadcasts
+                        // Combined with height-based sync (peer heights = actually received blocks)
+                        // this prevents producer from overwhelming network during stress tests
+                        // ═══════════════════════════════════════════════════════════════════════════
                         let pending = PENDING_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed);
                         if pending >= MAX_PENDING_BROADCASTS {
                             println!("[BACKPRESSURE] ⏳ Block #{} waiting - {} broadcasts pending (max={})",
                                     height_for_broadcast, pending, MAX_PENDING_BROADCASTS);
-                            // Wait for broadcasts to complete (max 500ms to not delay block production too much)
+                            // v2.43.2: Wait up to 1.5 seconds for broadcast slot
                             let wait_start = std::time::Instant::now();
                             while PENDING_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed) >= MAX_PENDING_BROADCASTS 
-                                  && wait_start.elapsed().as_millis() < 500 {
+                                  && wait_start.elapsed().as_millis() < 1500 {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                            }
+                            
+                            // Log if we had to wait
+                            let waited_ms = wait_start.elapsed().as_millis();
+                            if waited_ms > 200 {
+                                println!("[BACKPRESSURE] ⚠️ Block #{} waited {}ms for broadcast slot", 
+                                        height_for_broadcast, waited_ms);
                             }
                         }
                         

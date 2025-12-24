@@ -9784,46 +9784,55 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::HealthPing { from, timestamp: _, height } => {
-                // v2.25.1: Update last_seen AND height for the peer who sent the ping
-                // This keeps network_height accurate without waiting for blocks/heartbeats
-                self.update_peer_last_seen_with_height(&from, Some(height));
+                // PRODUCTION v2.43.2: CRITICAL FIX - Do NOT trust height from HealthPing!
+                // Problem: Producer creates block locally, updates local_height, sends HealthPing
+                // But the block hasn't propagated to other peers yet!
+                // If we trust HealthPing heights, we'd think peers are synchronized when they're not.
+                // 
+                // SOLUTION: Only update last_seen, not height.
+                // Heights should ONLY be updated when we receive actual Block messages.
+                self.update_peer_last_seen(&from);  // v2.43.2: NO height - only timestamp!
                 // Simple acknowledgment - no complex processing
                 // NOTE: This is P2P health check, NOT reward system ping!
-                if height > 0 {
-                    println!("[P2P] ← Health ping from {} at height {}", from, height);
+                if crate::node::is_debug() && height % 100 == 0 {
+                    println!("[DBG][P2P] health_ping from={} claimed_h={}", from, height);
                 }
             }
 
             NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, signature, timestamp } => {
                 // Update last_seen for the peer who sent the commit
                 self.update_peer_last_seen(&node_id);
-                println!("[CONSENSUS] ← Received commit from {} for round {} at {}", 
-                         node_id, round_id, timestamp);
+                if crate::node::is_debug() { 
+                    println!("[DBG][CONS] commit_recv round={} from={}", round_id, node_id); 
+                }
                 
                 // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)
                 // Microblocks use simple producer signatures, NOT Byzantine consensus
                 if self.is_macroblock_consensus_round(round_id) {
-                    println!("[MACROBLOCK] ✅ Processing commit for consensus round {}", round_id);
+                    if crate::node::is_info() { 
+                        println!("[INFO][MACRO] commit_process round={}", round_id); 
+                    }
                     self.handle_remote_consensus_commit(round_id, node_id, commit_hash, signature, timestamp);
-                } else {
-                    println!("[CONSENSUS] ⏭️ Ignoring commit for microblock - no consensus needed for round {}", round_id);
                 }
+                // Silently ignore microblock commits - they don't need consensus
             }
 
             NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp } => {
                 // Update last_seen for the peer who sent the reveal
                 self.update_peer_last_seen(&node_id);
-                println!("[CONSENSUS] ← Received reveal from {} for round {} at {}", 
-                         node_id, round_id, timestamp);
+                if crate::node::is_debug() { 
+                    println!("[DBG][CONS] reveal_recv round={} from={}", round_id, node_id); 
+                }
                 
                 // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)  
                 // Microblocks use simple producer signatures, NOT Byzantine consensus
                 if self.is_macroblock_consensus_round(round_id) {
-                    println!("[MACROBLOCK] ✅ Processing reveal for consensus round {}", round_id);
+                    if crate::node::is_info() { 
+                        println!("[INFO][MACRO] reveal_process round={}", round_id); 
+                    }
                     self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, nonce, timestamp);
-                } else {
-                    println!("[CONSENSUS] ⏭️ Ignoring reveal for microblock - no consensus needed for round {}", round_id);
                 }
+                // Silently ignore microblock reveals - they don't need consensus
             }
 
             NetworkMessage::ShredProtocolChunk { chunk } => {
@@ -10646,8 +10655,15 @@ impl SimplifiedP2P {
             NetworkMessage::NodeHeartbeat {
                 node_id, node_type, timestamp, block_height, signature, heartbeat_index, gossip_hop
             } => {
-                // v2.24.3: Update peer with height for QUIC-only sync (no HTTP height queries)
-                self.update_peer_last_seen_with_height(from_peer, Some(block_height));
+                // PRODUCTION v2.43.2: CRITICAL FIX - Do NOT update peer height from heartbeats!
+                // Problem: Producer sends heartbeat with height=33360, but blocks didn't propagate
+                // Other peers update their peer_height to 33360 based on heartbeat
+                // Producer checks peer heights → sees 33360 → thinks network is OK → DEADLOCK!
+                // 
+                // SOLUTION: Peer height should ONLY be updated when peer receives actual BLOCKS
+                // Heartbeats only update last_seen timestamp, not height
+                // This ensures peer_heights reflect ACTUALLY RECEIVED blocks, not just claims
+                self.update_peer_last_seen(from_peer);  // v2.43.2: NO height - only timestamp!
                 
                 // GOSSIP TTL: Max 3 hops
                 if gossip_hop >= 3 {
@@ -10740,8 +10756,12 @@ impl SimplifiedP2P {
                 // Update active nodes list (proves node is online)
                 self.update_active_nodes_from_heartbeat(&node_id, &node_type, timestamp);
                 
-                println!("[HEARTBEAT] ✅ {} ({}) heartbeat #{} verified at height {}", 
-                         node_id, node_type, heartbeat_index, block_height);
+                if crate::node::is_info() && heartbeat_index == 0 {
+                    // Log only first heartbeat of each 4h window to reduce spam
+                    println!("[INFO][HB] verified node={} type={} idx={}", node_id, node_type, heartbeat_index);
+                } else if crate::node::is_debug() {
+                    println!("[DBG][HB] verified node={} idx={} h={}", node_id, heartbeat_index, block_height);
+                }
                 
                 // RE-GOSSIP using Kademlia K-neighbors (v2.19.19)
                 // More efficient than random gossip for DHT-based networks

@@ -64,6 +64,25 @@ pub enum WsEvent {
         to: String,
         amount: u64,
     },
+    /// PRODUCTION v2.43.1: Reward update for node
+    RewardUpdate {
+        node_id: String,
+        epoch: u64,
+        pending_qnc: f64,
+        pool1_base: f64,
+        pool2_fees: f64,
+        pool3_activation: f64,
+        is_eligible: bool,
+        heartbeats: u8,
+    },
+    /// PRODUCTION v2.43.1: Reward claimed
+    RewardClaimed {
+        node_id: String,
+        wallet_address: String,
+        amount_qnc: f64,
+        tx_hash: String,
+        epoch: u64,
+    },
 }
 
 /// Global WebSocket event broadcaster
@@ -78,6 +97,37 @@ pub fn broadcast_ws_event(event: WsEvent) {
     // Ignore send errors (no subscribers)
     let _ = WS_BROADCASTER.send(event);
 }
+
+// ============================================================================
+// PRODUCTION v2.43.1: CACHING FOR REWARD STATS
+// ============================================================================
+
+/// Cache for Pool2/Pool3 accumulated stats (10 second TTL)
+/// Reduces load when multiple clients poll for epoch stats
+static REWARD_POOLS_CACHE: Lazy<std::sync::RwLock<(RewardPoolsCache, std::time::Instant)>> = 
+    Lazy::new(|| std::sync::RwLock::new((RewardPoolsCache::default(), std::time::Instant::now())));
+
+/// Cache for network-wide reward statistics (30 second TTL)
+static REWARD_NETWORK_STATS_CACHE: Lazy<std::sync::RwLock<(serde_json::Value, std::time::Instant)>> = 
+    Lazy::new(|| std::sync::RwLock::new((serde_json::json!({}), std::time::Instant::now())));
+
+/// Cache for node summary statistics (60 second TTL per node)
+/// Key: node_id, Value: (summary_json, last_update)
+static REWARD_SUMMARY_CACHE: Lazy<DashMap<String, (serde_json::Value, std::time::Instant)>> = 
+    Lazy::new(|| DashMap::new());
+
+const REWARD_SUMMARY_CACHE_TTL_SECS: u64 = 60;
+
+#[derive(Default, Clone)]
+struct RewardPoolsCache {
+    pool2_fees: u64,
+    pool3_activations: u64,
+    epoch: u64,
+    blocks_in_epoch: u64,
+}
+
+const REWARD_POOLS_CACHE_TTL_SECS: u64 = 10;
+const REWARD_NETWORK_STATS_CACHE_TTL_SECS: u64 = 30;
 
 // ============================================================================
 // SECURITY: IP-based Rate Limiting for REST API DDoS Protection
@@ -705,7 +755,7 @@ pub use crate::storage::StoredContractInfo as ContractInfo;
 // ============================================================================
 
 /// WebSocket subscription query parameters
-/// Example: ws://node:8001/ws/subscribe?channels=blocks,account:EON_ADDRESS,contract:EON_ADDRESS
+/// Example: ws://node:8001/ws/subscribe?channels=blocks,account:EON_ADDRESS,rewards:NODE_ID
 #[derive(Debug, Deserialize)]
 struct WsSubscribeQuery {
     /// Comma-separated list of channels to subscribe to
@@ -713,6 +763,7 @@ struct WsSubscribeQuery {
     ///   - "blocks" - all new blocks
     ///   - "account:ADDRESS" - balance updates for specific address
     ///   - "contract:ADDRESS" - events from specific contract
+    ///   - "rewards:NODE_ID" - reward updates for specific node (v2.43.1)
     ///   - "mempool" - pending transactions
     ///   - "tx:HASH" - specific transaction confirmation
     #[serde(default)]
@@ -732,6 +783,27 @@ enum WsChannel {
     Mempool,
     /// Subscribe to specific transaction confirmation
     Transaction(String),
+    /// PRODUCTION v2.43.1: Subscribe to reward updates for specific node
+    Rewards(String),
+}
+
+// ============================================================================
+// PRODUCTION v2.43.1: BATCH & PAGINATION STRUCTURES
+// ============================================================================
+
+/// Request body for batch pending rewards
+#[derive(Debug, Deserialize)]
+struct BatchPendingRewardsRequest {
+    node_ids: Vec<String>,
+}
+
+/// Query parameters for reward history with pagination
+#[derive(Debug, Deserialize)]
+struct RewardHistoryQuery {
+    #[serde(default)]
+    offset: Option<u32>,
+    #[serde(default)]
+    limit: Option<u32>,
 }
 
 /// Start comprehensive API server (JSON-RPC + REST)
@@ -1310,15 +1382,84 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_claim_rewards);
     
-    // Get pending rewards endpoint
+    // Get pending rewards endpoint (with rate limiting)
     let pending_rewards = api_v1
         .and(warp::path("rewards"))
         .and(warp::path("pending"))
         .and(warp::path::param::<String>()) // node_id
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_get_pending_rewards);
+    
+    // PRODUCTION v2.43.1: Get reward history by epochs (with rate limiting + pagination)
+    let reward_history = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("history"))
+        .and(warp::path::param::<String>()) // node_id
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<RewardHistoryQuery>()) // ?offset=0&limit=10
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_reward_history);
+    
+    // PRODUCTION v2.43.1: Get detailed pool breakdown (Pool1/Pool2/Pool3) (with rate limiting)
+    let reward_pools = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("pools"))
+        .and(warp::path::param::<String>()) // node_id
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_reward_pools);
+    
+    // PRODUCTION v2.43.1: Get all nodes for a wallet address
+    let rewards_by_wallet = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("by-wallet"))
+        .and(warp::path::param::<String>()) // wallet_address
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_rewards_by_wallet);
+    
+    // PRODUCTION v2.43.1: Batch get pending rewards for multiple nodes
+    let rewards_pending_batch = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("pending"))
+        .and(warp::path("batch"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_pending_rewards_batch);
+    
+    // PRODUCTION v2.43.1: Network-wide reward statistics
+    let rewards_network_stats = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("network"))
+        .and(warp::path("stats"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_reward_network_stats);
+    
+    // PRODUCTION v2.43.1: Node lifetime reward summary (aggregated stats)
+    let rewards_summary = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("summary"))
+        .and(warp::path::param::<String>()) // node_id
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_reward_summary);
     
     // Node registration endpoint
     let register_node = api_v1
@@ -1803,6 +1944,12 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(light_node_pending_challenge)
         .or(claim_rewards)
         .or(pending_rewards)
+        .or(reward_history)
+        .or(reward_pools)
+        .or(rewards_by_wallet)
+        .or(rewards_pending_batch)
+        .or(rewards_network_stats)
+        .or(rewards_summary)
         .or(register_node)
         .or(activations_by_wallet)
         .or(generate_activation_code)
@@ -6365,6 +6512,50 @@ async fn handle_claim_rewards(
                 reward_manager.claim_rewards(&claim_request.node_id, &claim_request.wallet_address)
             };
             
+            if let Some(ref reward) = claim_result.reward {
+                // PRODUCTION v2.43.1: Save claim history to storage for /rewards/history API
+                let current_height = blockchain.get_height().await;
+                let current_epoch = current_height / 14400;
+                let current_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                
+                let storage = blockchain.get_storage();
+                let epoch_key = format!("rewards:{}:epoch:{}", claim_request.node_id, current_epoch);
+                
+                // Write pool breakdown for history API
+                let _ = storage.save_contract_state(&epoch_key, "claimed", &reward.total_reward.to_string());
+                let _ = storage.save_contract_state(&epoch_key, "pool1", &reward.pool1_base_emission.to_string());
+                let _ = storage.save_contract_state(&epoch_key, "pool2", &reward.pool2_transaction_fees.to_string());
+                let _ = storage.save_contract_state(&epoch_key, "pool3", &reward.pool3_activation_bonus.to_string());
+                let _ = storage.save_contract_state(&epoch_key, "claim_time", &current_time.to_string());
+                let _ = storage.save_contract_state(&epoch_key, "tx_hash", &tx_hash);
+                
+                // Update last claim time
+                let _ = storage.save_contract_state(
+                    &format!("rewards:{}", claim_request.node_id), 
+                    "last_claim", 
+                    &current_time.to_string()
+                );
+                
+                println!("[REWARDS] 📊 History saved: epoch={} pool1={} pool2={} pool3={}", 
+                    current_epoch, 
+                    reward.pool1_base_emission,
+                    reward.pool2_transaction_fees,
+                    reward.pool3_activation_bonus
+                );
+                
+                // PRODUCTION v2.43.1: Broadcast RewardClaimed event via WebSocket
+                broadcast_ws_event(WsEvent::RewardClaimed {
+                    node_id: claim_request.node_id.clone(),
+                    wallet_address: claim_request.wallet_address.clone(),
+                    amount_qnc: reward.total_reward as f64 / 1_000_000_000.0,
+                    tx_hash: tx_hash.clone(),
+                    epoch: current_epoch,
+                });
+            }
+            
             if let Some(reward) = claim_result.reward {
                 Ok(warp::reply::json(&json!({
                     "success": true,
@@ -6400,8 +6591,14 @@ async fn handle_claim_rewards(
 // GET /api/v1/rewards/pending/{node_id} - Get pending rewards for a node
 async fn handle_get_pending_rewards(
     node_id: String,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // PRODUCTION v2.43.1: Rate limiting (300 req/min for read-only)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
     use qnet_consensus::lazy_rewards::NodeType;
     
     // Get pending rewards from reward manager
@@ -6410,10 +6607,22 @@ async fn handle_get_pending_rewards(
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
         
-        // Get pending reward amount
-        let pending_amount = reward_manager.get_pending_reward(&node_id)
-            .map(|r| r.total_reward)
-            .unwrap_or(0);
+        // PRODUCTION v2.43.1: Get FULL PhaseAwareReward with pool breakdown
+        // Pool1 = base emission (all nodes)
+        // Pool2 = transaction fees (Full: 30%, Super: 70%)
+        // Pool3 = activation payments Phase 2 only (equal share to ALL eligible nodes)
+        let pending_reward = reward_manager.get_pending_reward(&node_id).cloned();
+        let (pending_amount, pool1, pool2, pool3, phase) = if let Some(ref reward) = pending_reward {
+            (
+                reward.total_reward,
+                reward.pool1_base_emission,
+                reward.pool2_transaction_fees,
+                reward.pool3_activation_bonus,
+                format!("{:?}", reward.current_phase),
+            )
+        } else {
+            (0, 0, 0, 0, "Phase1".to_string())
+        };
         
         // Get ping history for performance stats
         let ping_history = reward_manager.get_ping_history(&node_id);
@@ -6465,22 +6674,664 @@ async fn handle_get_pending_rewards(
             .as_secs();
         let is_active = last_ping > 0 && (current_time - last_ping) < 14400; // 4 hours
         
+        // Convert to QNC (from nanoQNC)
+        let total_qnc = pending_amount as f64 / 1_000_000_000.0;
+        let pool1_qnc = pool1 as f64 / 1_000_000_000.0;
+        let pool2_qnc = pool2 as f64 / 1_000_000_000.0;
+        let pool3_qnc = pool3 as f64 / 1_000_000_000.0;
+        
+        // Calculate current epoch info
+        let current_height = blockchain.get_height().await;
+        let current_epoch = current_height / 14400;
+        let blocks_until_next = 14400 - (current_height % 14400);
+        let seconds_until_next = blocks_until_next; // 1 block = 1 second
+        
         json!({
             "node_id": node_id,
             "node_type": node_type,
-            "pending_rewards": pending_amount as f64 / 1_000_000_000.0,
-            "pool1_rewards": pending_amount as f64 / 1_000_000_000.0 * 0.7, // 70% from base
-            "pool2_rewards": pending_amount as f64 / 1_000_000_000.0 * 0.3, // 30% from fees
+            "phase": phase,
+            "pending_rewards": total_qnc,
+            "pools": {
+                // Pool 1: Base emission (dynamic with halving, ~251K QNC/4h at Year 0)
+                "pool1_base_emission": pool1_qnc,
+                // Pool 2: Transaction fees (70% Super, 30% Full, 0% Light)
+                "pool2_tx_fees": pool2_qnc,
+                // Pool 3: Activation payments Phase 2 (equal share to ALL eligible nodes)
+                // Phase 1: Always 0 (1DEV burn, Pool 3 disabled)
+                "pool3_activation_bonus": pool3_qnc
+            },
+            "current_epoch": current_epoch,
+            "blocks_until_next_epoch": blocks_until_next,
+            "seconds_until_next_epoch": seconds_until_next,
             "last_claim": last_claim,
             "last_ping": last_ping,
-            "successful_pings": successful_pings,
-            "total_pings": total_pings,
-            "uptime_percentage": uptime_percentage,
-            "is_active": is_active
+            "heartbeats": {
+                "successful": successful_pings,
+                "total": total_pings,
+                "required": if node_type == "Super" { 9 } else if node_type == "Full" { 8 } else { 1 },
+                "uptime_percentage": uptime_percentage
+            },
+            "is_active": is_active,
+            "is_eligible": if node_type == "Super" { successful_pings >= 9 } 
+                          else if node_type == "Full" { successful_pings >= 8 }
+                          else { successful_pings >= 1 }
         })
     };
     
     Ok(warp::reply::json(&reward_info))
+}
+
+// PRODUCTION v2.43.1: GET /api/v1/rewards/history/{node_id}?offset=0&limit=10 - Get reward history by epochs
+async fn handle_get_reward_history(
+    node_id: String,
+    query: RewardHistoryQuery,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // PRODUCTION v2.43.1: Rate limiting (300 req/min for read-only)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    let current_height = blockchain.get_height().await;
+    let current_epoch = current_height / 14400;
+    
+    // Pagination: default offset=0, limit=10, max limit=100
+    let offset = query.offset.unwrap_or(0) as u64;
+    let limit = query.limit.unwrap_or(10).min(100) as usize;
+    
+    // Get claimed rewards history from storage
+    let storage = blockchain.get_storage();
+    let mut epochs_history = Vec::new();
+    
+    // Calculate which epochs to scan based on offset
+    let total_epochs = current_epoch + 1;
+    let start_epoch = if offset < total_epochs { 
+        current_epoch.saturating_sub(offset) 
+    } else { 
+        0 
+    };
+    
+    // Scan epochs with pagination
+    let mut scanned = 0usize;
+    for epoch in (0..=start_epoch).rev() {
+        if scanned >= limit {
+            break;
+        }
+        
+        let epoch_start_block = epoch * 14400;
+        let epoch_end_block = (epoch + 1) * 14400;
+        
+        // Get claimed amount for this epoch from storage
+        let claimed_key = format!("rewards:{}:epoch:{}", node_id, epoch);
+        let claimed = storage.get_contract_state(&claimed_key, "claimed")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        
+        // Get pool breakdown for this epoch
+        let pool1 = storage.get_contract_state(&claimed_key, "pool1")
+            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let pool2 = storage.get_contract_state(&claimed_key, "pool2")
+            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let pool3 = storage.get_contract_state(&claimed_key, "pool3")
+            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        
+        let claim_time = storage.get_contract_state(&claimed_key, "claim_time")
+            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        
+        epochs_history.push(json!({
+            "epoch": epoch,
+            "block_range": format!("{}-{}", epoch_start_block, epoch_end_block),
+            "claimed_qnc": claimed as f64 / 1_000_000_000.0,
+            "pools": {
+                "pool1_base": pool1 as f64 / 1_000_000_000.0,
+                "pool2_fees": pool2 as f64 / 1_000_000_000.0,
+                "pool3_activation": pool3 as f64 / 1_000_000_000.0
+            },
+            "claim_time": claim_time,
+            "status": if claimed > 0 { "claimed" } else if epoch == current_epoch { "pending" } else { "missed" }
+        }));
+        
+        scanned += 1;
+    }
+    
+    Ok(warp::reply::json(&json!({
+        "node_id": node_id,
+        "current_epoch": current_epoch,
+        "current_height": current_height,
+        "pagination": {
+            "offset": offset,
+            "limit": limit,
+            "total_epochs": total_epochs,
+            "has_more": offset + limit as u64 <= total_epochs
+        },
+        "history": epochs_history
+    })))
+}
+
+// PRODUCTION v2.43.1: GET /api/v1/rewards/pools/{node_id} - Get detailed pool breakdown
+async fn handle_get_reward_pools(
+    node_id: String,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // PRODUCTION v2.43.1: Rate limiting (300 req/min for read-only)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Get current phase
+    let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+    let current_phase = if burn_percentage >= 90.0 { 2 } else { 1 };
+    
+    // Get pending rewards with pool breakdown
+    let reward_manager_arc = blockchain.get_reward_manager();
+    let reward_manager = reward_manager_arc.read().await;
+    let pending_reward = reward_manager.get_pending_reward(&node_id).cloned();
+    drop(reward_manager);
+    
+    let (pool1, pool2, pool3, total, phase_str) = if let Some(ref reward) = pending_reward {
+        (
+            reward.pool1_base_emission,
+            reward.pool2_transaction_fees,
+            reward.pool3_activation_bonus,
+            reward.total_reward,
+            format!("{:?}", reward.current_phase),
+        )
+    } else {
+        (0, 0, 0, 0, "Phase1".to_string())
+    };
+    
+    // Calculate current epoch info
+    let current_height = blockchain.get_height().await;
+    let current_epoch = current_height / 14400;
+    let blocks_in_epoch = current_height % 14400;
+    
+    // PRODUCTION v2.43.1: Use cached accumulated pools (10 sec TTL)
+    let (accumulated_pool2, accumulated_pool3) = {
+        // Check cache first
+        let cache_valid = {
+            let cache = REWARD_POOLS_CACHE.read().unwrap();
+            cache.1.elapsed().as_secs() < REWARD_POOLS_CACHE_TTL_SECS && cache.0.epoch == current_epoch
+        };
+        
+        if cache_valid {
+            let cache = REWARD_POOLS_CACHE.read().unwrap();
+            (cache.0.pool2_fees, cache.0.pool3_activations)
+        } else {
+            // Refresh cache
+            let (p2, p3) = if let Some(p2p) = blockchain.get_unified_p2p() {
+                (p2p.peek_pool2_fees(), p2p.peek_pool3_activations())
+            } else {
+                (0, 0)
+            };
+            
+            // Update cache
+            let mut cache = REWARD_POOLS_CACHE.write().unwrap();
+            cache.0 = RewardPoolsCache {
+                pool2_fees: p2,
+                pool3_activations: p3,
+                epoch: current_epoch,
+                blocks_in_epoch,
+            };
+            cache.1 = std::time::Instant::now();
+            
+            (p2, p3)
+        }
+    };
+    
+    let blocks_until_emission = 14400 - blocks_in_epoch;
+    
+    // Determine node type
+    let node_type = if node_id.starts_with("light_") {
+        "Light"
+    } else if node_id.starts_with("full_") {
+        "Full"
+    } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
+        "Super"
+    } else {
+        "Unknown"
+    };
+    
+    Ok(warp::reply::json(&json!({
+        "node_id": node_id,
+        "node_type": node_type,
+        "current_phase": current_phase,
+        "phase_description": if current_phase == 1 { 
+            "Phase 1: 1DEV burn (Pool3 disabled)" 
+        } else { 
+            "Phase 2: QNC payment (Pool3 active)" 
+        },
+        
+        // Node's pending rewards breakdown
+        "pending_rewards": {
+            "total_qnc": total as f64 / 1_000_000_000.0,
+            "pool1_base_emission": {
+                "amount_qnc": pool1 as f64 / 1_000_000_000.0,
+                "description": "Base emission (dynamic halving, ~251K QNC/4h at Year 0) - distributed to all eligible nodes"
+            },
+            "pool2_tx_fees": {
+                "amount_qnc": pool2 as f64 / 1_000_000_000.0,
+                "description": "Transaction fees - 70% Super, 30% Full, 0% Light",
+                "eligible": node_type == "Full" || node_type == "Super"
+            },
+            "pool3_activation_bonus": {
+                "amount_qnc": pool3 as f64 / 1_000_000_000.0,
+                "description": "Activation payments Phase 2 - equal share to ALL eligible nodes",
+                "phase2_only": true,
+                "active": current_phase == 2
+            }
+        },
+        
+        // Current epoch accumulated pools (network-wide)
+        "epoch_accumulated": {
+            "epoch": current_epoch,
+            "blocks_processed": blocks_in_epoch,
+            "blocks_until_emission": blocks_until_emission,
+            "seconds_until_emission": blocks_until_emission,
+            "pool2_total_fees_qnc": accumulated_pool2 as f64 / 1_000_000_000.0,
+            "pool3_total_activations_qnc": accumulated_pool3 as f64 / 1_000_000_000.0
+        }
+    })))
+}
+
+// PRODUCTION v2.43.1: GET /api/v1/rewards/by-wallet/{wallet_address} - Get all nodes for wallet
+async fn handle_get_rewards_by_wallet(
+    wallet_address: String,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting (300 req/min for read-only)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Get all nodes owned by this wallet from reward_manager
+    let reward_manager_arc = blockchain.get_reward_manager();
+    let reward_manager = reward_manager_arc.read().await;
+    
+    let nodes = reward_manager.get_nodes_by_owner(&wallet_address);
+    drop(reward_manager);
+    
+    let mut nodes_info = Vec::new();
+    let current_height = blockchain.get_height().await;
+    let current_epoch = current_height / 14400;
+    
+    for node_id in nodes {
+        // Get pending rewards for each node
+        let reward_manager = blockchain.get_reward_manager();
+        let rm = reward_manager.read().await;
+        let pending = rm.get_pending_reward(&node_id).cloned();
+        drop(rm);
+        
+        // Determine node type
+        let node_type = if node_id.starts_with("light_") {
+            "Light"
+        } else if node_id.starts_with("full_") {
+            "Full"
+        } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
+            "Super"
+        } else {
+            "Unknown"
+        };
+        
+        let (total, pool1, pool2, pool3, phase) = if let Some(ref reward) = pending {
+            (
+                reward.total_reward as f64 / 1_000_000_000.0,
+                reward.pool1_base_emission as f64 / 1_000_000_000.0,
+                reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
+                reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
+                format!("{:?}", reward.current_phase),
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0, "Phase1".to_string())
+        };
+        
+        // Get last claim time
+        let storage = blockchain.get_storage();
+        let last_claim = storage.get_contract_state(&format!("rewards:{}", node_id), "last_claim")
+            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        
+        nodes_info.push(json!({
+            "node_id": node_id,
+            "node_type": node_type,
+            "phase": phase,
+            "pending_rewards_qnc": total,
+            "pools": {
+                "pool1_base": pool1,
+                "pool2_fees": pool2,
+                "pool3_activation": pool3
+            },
+            "last_claim": last_claim
+        }));
+    }
+    
+    // Calculate totals
+    let total_pending: f64 = nodes_info.iter()
+        .map(|n| n["pending_rewards_qnc"].as_f64().unwrap_or(0.0))
+        .sum();
+    
+    Ok(warp::reply::json(&json!({
+        "wallet_address": wallet_address,
+        "total_nodes": nodes_info.len(),
+        "total_pending_qnc": total_pending,
+        "current_epoch": current_epoch,
+        "nodes": nodes_info
+    })))
+}
+
+// PRODUCTION v2.43.1: POST /api/v1/rewards/pending/batch - Batch get pending rewards
+async fn handle_get_pending_rewards_batch(
+    request: BatchPendingRewardsRequest,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Limit batch size to prevent abuse
+    const MAX_BATCH_SIZE: usize = 100;
+    if request.node_ids.len() > MAX_BATCH_SIZE {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": format!("Batch size exceeds maximum of {} nodes", MAX_BATCH_SIZE)
+        })));
+    }
+    
+    let reward_manager_arc = blockchain.get_reward_manager();
+    let reward_manager = reward_manager_arc.read().await;
+    
+    let current_height = blockchain.get_height().await;
+    let current_epoch = current_height / 14400;
+    
+    let mut results = Vec::new();
+    let mut total_pending = 0.0f64;
+    
+    for node_id in &request.node_ids {
+        let pending = reward_manager.get_pending_reward(node_id).cloned();
+        
+        let (total, pool1, pool2, pool3) = if let Some(ref reward) = pending {
+            let t = reward.total_reward as f64 / 1_000_000_000.0;
+            total_pending += t;
+            (
+                t,
+                reward.pool1_base_emission as f64 / 1_000_000_000.0,
+                reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
+                reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        
+        results.push(json!({
+            "node_id": node_id,
+            "pending_qnc": total,
+            "pools": {
+                "pool1_base": pool1,
+                "pool2_fees": pool2,
+                "pool3_activation": pool3
+            }
+        }));
+    }
+    
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "current_epoch": current_epoch,
+        "total_pending_qnc": total_pending,
+        "count": results.len(),
+        "nodes": results
+    })))
+}
+
+// PRODUCTION v2.43.1: GET /api/v1/rewards/network/stats - Network-wide statistics
+async fn handle_get_reward_network_stats(
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Check cache first (30 sec TTL)
+    {
+        let cache = REWARD_NETWORK_STATS_CACHE.read().unwrap();
+        if cache.1.elapsed().as_secs() < REWARD_NETWORK_STATS_CACHE_TTL_SECS {
+            return Ok(warp::reply::json(&cache.0));
+        }
+    }
+    
+    let current_height = blockchain.get_height().await;
+    let current_epoch = current_height / 14400;
+    let storage = blockchain.get_storage();
+    
+    // Get accumulated pools from P2P
+    let (pool2_accumulated, pool3_accumulated) = if let Some(p2p) = blockchain.get_unified_p2p() {
+        (p2p.peek_pool2_fees(), p2p.peek_pool3_activations())
+    } else {
+        (0, 0)
+    };
+    
+    // Count total claims from storage (scan last 10 epochs)
+    let mut total_claims = 0u64;
+    let mut total_distributed = 0u64;
+    
+    // Get reward manager stats
+    let reward_manager_arc = blockchain.get_reward_manager();
+    let reward_manager = reward_manager_arc.read().await;
+    let total_registered_nodes = reward_manager.get_nodes_by_owner("").len(); // Empty returns 0, but we count all
+    drop(reward_manager);
+    
+    // Scan storage for claim history
+    for epoch in (0..=current_epoch).rev().take(50) {
+        let epoch_claims_key = format!("rewards:network:epoch:{}:claims", epoch);
+        if let Ok(Some(claims_str)) = storage.get_contract_state(&epoch_claims_key, "count") {
+            if let Ok(claims) = claims_str.parse::<u64>() {
+                total_claims += claims;
+            }
+        }
+        let epoch_distributed_key = format!("rewards:network:epoch:{}:distributed", epoch);
+        if let Ok(Some(dist_str)) = storage.get_contract_state(&epoch_distributed_key, "amount") {
+            if let Ok(dist) = dist_str.parse::<u64>() {
+                total_distributed += dist;
+            }
+        }
+    }
+    
+    let blocks_until_next = 14400 - (current_height % 14400);
+    let avg_reward_per_epoch = if current_epoch > 0 {
+        total_distributed as f64 / 1_000_000_000.0 / current_epoch as f64
+    } else {
+        0.0
+    };
+    
+    let stats = json!({
+        "success": true,
+        "current_epoch": current_epoch,
+        "current_height": current_height,
+        "blocks_until_next_epoch": blocks_until_next,
+        "seconds_until_next_epoch": blocks_until_next,
+        
+        "epoch_accumulated": {
+            "pool2_tx_fees_qnc": pool2_accumulated as f64 / 1_000_000_000.0,
+            "pool3_activations_qnc": pool3_accumulated as f64 / 1_000_000_000.0
+        },
+        
+        "network_totals": {
+            "total_claims": total_claims,
+            "total_distributed_qnc": total_distributed as f64 / 1_000_000_000.0,
+            "avg_reward_per_epoch_qnc": avg_reward_per_epoch
+        },
+        
+        "emission_rate": {
+            // Dynamic halving: 251,432 QNC/epoch at Year 0, halving every 4 years
+            // Current value depends on years since genesis
+            "pool1_base_per_epoch_qnc": "dynamic - use /api/v1/rewards/pools for current value",
+            "initial_rate_qnc_per_epoch": 251_432.34,
+            "halving_period_years": 4,
+            "sharp_drop_at_year": 20,
+            "sharp_drop_multiplier": 10
+        },
+        
+        "cache_ttl_seconds": REWARD_NETWORK_STATS_CACHE_TTL_SECS
+    });
+    
+    // Update cache
+    {
+        let mut cache = REWARD_NETWORK_STATS_CACHE.write().unwrap();
+        *cache = (stats.clone(), std::time::Instant::now());
+    }
+    
+    Ok(warp::reply::json(&stats))
+}
+
+// PRODUCTION v2.43.1: GET /api/v1/rewards/summary/{node_id} - Lifetime aggregated stats
+async fn handle_get_reward_summary(
+    node_id: String,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Check cache first (60 sec TTL) - important for nodes with years of history
+    if let Some(cached) = REWARD_SUMMARY_CACHE.get(&node_id) {
+        if cached.1.elapsed().as_secs() < REWARD_SUMMARY_CACHE_TTL_SECS {
+            return Ok(warp::reply::json(&cached.0));
+        }
+    }
+    
+    let storage = blockchain.get_storage();
+    let current_height = blockchain.get_height().await;
+    let current_epoch = current_height / 14400;
+    
+    // Aggregated counters
+    let mut total_claimed: u64 = 0;
+    let mut total_pool1: u64 = 0;
+    let mut total_pool2: u64 = 0;
+    let mut total_pool3: u64 = 0;
+    let mut epochs_claimed: u64 = 0;
+    let mut epochs_missed: u64 = 0;
+    let mut first_claim_epoch: Option<u64> = None;
+    let mut last_claim_epoch: Option<u64> = None;
+    let mut first_claim_time: u64 = 0;
+    let mut last_claim_time: u64 = 0;
+    
+    // Scan ALL epochs for this node (from storage)
+    // This uses indexed keys so it's O(epochs) not O(all_data)
+    for epoch in 0..=current_epoch {
+        let epoch_key = format!("rewards:{}:epoch:{}", node_id, epoch);
+        
+        if let Ok(Some(claimed_str)) = storage.get_contract_state(&epoch_key, "claimed") {
+            if let Ok(claimed) = claimed_str.parse::<u64>() {
+                if claimed > 0 {
+                    total_claimed += claimed;
+                    epochs_claimed += 1;
+                    
+                    // Track first/last claim
+                    if first_claim_epoch.is_none() {
+                        first_claim_epoch = Some(epoch);
+                        if let Ok(Some(time_str)) = storage.get_contract_state(&epoch_key, "claim_time") {
+                            first_claim_time = time_str.parse().unwrap_or(0);
+                        }
+                    }
+                    last_claim_epoch = Some(epoch);
+                    if let Ok(Some(time_str)) = storage.get_contract_state(&epoch_key, "claim_time") {
+                        last_claim_time = time_str.parse().unwrap_or(0);
+                    }
+                    
+                    // Pool breakdown
+                    if let Ok(Some(p1)) = storage.get_contract_state(&epoch_key, "pool1") {
+                        total_pool1 += p1.parse::<u64>().unwrap_or(0);
+                    }
+                    if let Ok(Some(p2)) = storage.get_contract_state(&epoch_key, "pool2") {
+                        total_pool2 += p2.parse::<u64>().unwrap_or(0);
+                    }
+                    if let Ok(Some(p3)) = storage.get_contract_state(&epoch_key, "pool3") {
+                        total_pool3 += p3.parse::<u64>().unwrap_or(0);
+                    }
+                } else {
+                    epochs_missed += 1;
+                }
+            }
+        }
+    }
+    
+    // Get current pending rewards
+    let pending_qnc = {
+        let reward_manager = blockchain.get_reward_manager();
+        let rm = reward_manager.read().await;
+        rm.get_pending_reward(&node_id)
+            .map(|r| r.total_reward as f64 / 1_000_000_000.0)
+            .unwrap_or(0.0)
+    };
+    
+    // Calculate averages
+    let avg_reward = if epochs_claimed > 0 {
+        total_claimed as f64 / 1_000_000_000.0 / epochs_claimed as f64
+    } else {
+        0.0
+    };
+    
+    // Determine node type
+    let node_type = if node_id.starts_with("light_") {
+        "Light"
+    } else if node_id.starts_with("full_") {
+        "Full"
+    } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
+        "Super"
+    } else {
+        "Unknown"
+    };
+    
+    let summary = json!({
+        "node_id": node_id.clone(),
+        "node_type": node_type,
+        "current_epoch": current_epoch,
+        
+        "lifetime_totals": {
+            "total_claimed_qnc": total_claimed as f64 / 1_000_000_000.0,
+            "pool1_base_qnc": total_pool1 as f64 / 1_000_000_000.0,
+            "pool2_fees_qnc": total_pool2 as f64 / 1_000_000_000.0,
+            "pool3_activation_qnc": total_pool3 as f64 / 1_000_000_000.0
+        },
+        
+        "epochs": {
+            "total_epochs": current_epoch + 1,
+            "epochs_claimed": epochs_claimed,
+            "epochs_missed": epochs_missed,
+            "claim_rate_percent": if current_epoch > 0 { 
+                (epochs_claimed as f64 / (current_epoch + 1) as f64) * 100.0 
+            } else { 0.0 }
+        },
+        
+        "first_claim": {
+            "epoch": first_claim_epoch,
+            "timestamp": first_claim_time
+        },
+        "last_claim": {
+            "epoch": last_claim_epoch,
+            "timestamp": last_claim_time
+        },
+        
+        "averages": {
+            "avg_reward_per_epoch_qnc": avg_reward
+        },
+        
+        "current_pending_qnc": pending_qnc,
+        "cache_ttl_seconds": REWARD_SUMMARY_CACHE_TTL_SECS
+    });
+    
+    // Update cache
+    REWARD_SUMMARY_CACHE.insert(node_id, (summary.clone(), std::time::Instant::now()));
+    
+    Ok(warp::reply::json(&summary))
 }
 
 // POST /api/v1/nodes - Register a new node
@@ -9318,6 +10169,9 @@ fn parse_ws_channels(channels_str: &str) -> Vec<WsChannel> {
                 Some(WsChannel::Contract(ch[9..].to_string()))
             } else if ch.starts_with("tx:") {
                 Some(WsChannel::Transaction(ch[3..].to_string()))
+            } else if ch.starts_with("rewards:") {
+                // PRODUCTION v2.43.1: rewards:{node_id} channel
+                Some(WsChannel::Rewards(ch[8..].to_string()))
             } else {
                 None
             }
@@ -9343,6 +10197,17 @@ fn event_matches_channels(event: &WsEvent, channels: &[WsChannel]) -> bool {
             }
             (WsChannel::Transaction(hash), WsEvent::TxConfirmed { tx_hash, .. }) => {
                 if tx_hash == hash {
+                    return true;
+                }
+            }
+            // PRODUCTION v2.43.1: Match reward updates for subscribed node
+            (WsChannel::Rewards(node), WsEvent::RewardUpdate { node_id, .. }) => {
+                if node_id == node {
+                    return true;
+                }
+            }
+            (WsChannel::Rewards(node), WsEvent::RewardClaimed { node_id, .. }) => {
+                if node_id == node {
                     return true;
                 }
             }

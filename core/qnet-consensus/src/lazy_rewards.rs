@@ -112,8 +112,11 @@ impl NodePingHistory {
         
         match self.node_type {
             NodeType::Light => {
-                // Light nodes: binary success (1 ping, must succeed)
-                total_pings == 1 && successful_pings == 1
+                // Light nodes: at least 1 successful ping required
+                // Note: dedupe is enforced at attestation storage level (key = node_id:slot)
+                // Multiple attestations shouldn't occur in normal operation, but if they do,
+                // node should still be eligible as long as at least one succeeded
+                successful_pings >= 1
             },
             NodeType::Full | NodeType::Super => {
                 // Full/Super nodes: percentage success rate
@@ -165,6 +168,10 @@ pub struct PhaseAwareRewardManager {
     /// FIXED: Node ownership mapping - node_id -> wallet_address
     node_ownership: HashMap<String, String>,
     
+    /// PRODUCTION v2.43.1: Inverted index wallet_address -> Vec<node_id>
+    /// O(1) lookup for get_nodes_by_owner instead of O(n) scan
+    wallet_nodes_index: HashMap<String, Vec<String>>,
+    
     /// Pending rewards by node_id (in-memory cache, synced with RocksDB when available)
     pending_rewards: HashMap<String, PhaseAwareReward>,
     
@@ -215,6 +222,7 @@ impl PhaseAwareRewardManager {
             current_window_start,
             ping_histories: HashMap::new(),
             node_ownership: HashMap::new(),
+            wallet_nodes_index: HashMap::new(), // v2.43.1: Inverted index
             pending_rewards: HashMap::new(),
             last_claim_time: HashMap::new(),
             storage_path: None,
@@ -318,6 +326,12 @@ impl PhaseAwareRewardManager {
         
         // FIXED: Store wallet ownership for reward claims
         self.node_ownership.insert(node_id.clone(), wallet_address.clone());
+        
+        // PRODUCTION v2.43.1: Update inverted index for O(1) wallet->nodes lookup
+        self.wallet_nodes_index
+            .entry(wallet_address.clone())
+            .or_insert_with(Vec::new)
+            .push(node_id.clone());
         
         // Create ping history for this node
         let ping_history = NodePingHistory::new(node_id.clone(), node_type, window_start);
@@ -514,6 +528,16 @@ impl PhaseAwareRewardManager {
     /// Get the wallet address that owns a node (for claim verification)
     pub fn get_node_owner(&self, node_id: &str) -> Option<String> {
         self.node_ownership.get(node_id).cloned()
+    }
+    
+    /// PRODUCTION v2.43.1: Get all nodes owned by a wallet address
+    /// Uses inverted index for O(1) lookup instead of O(n) scan
+    /// Used for /api/v1/rewards/by-wallet/{wallet} endpoint
+    pub fn get_nodes_by_owner(&self, wallet_address: &str) -> Vec<String> {
+        self.wallet_nodes_index
+            .get(wallet_address)
+            .cloned()
+            .unwrap_or_default()
     }
     
     /// Get node's ping history for current window

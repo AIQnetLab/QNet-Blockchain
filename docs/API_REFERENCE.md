@@ -1,4 +1,4 @@
-# QNet API Reference v2.27.0
+# QNet API Reference v2.43.1
 
 ## 📡 Base URL
 
@@ -619,6 +619,44 @@ GET /api/v1/node/status?activation_code={code}&node_id={id}
 
 ## 💎 Rewards Endpoints
 
+### Reward System Overview (v2.43.1)
+
+**Reward Rounds (Epochs):**
+- 1 epoch = 14,400 blocks = 4 hours (at 1 block/second)
+- Rewards distributed at blocks 14400, 28800, 43200, etc.
+
+**Three Reward Pools:**
+| Pool | Source | Distribution | Phase |
+|------|--------|--------------|-------|
+| Pool 1 | Base Emission | Equal to ALL eligible nodes | Both |
+| Pool 2 | Transaction Fees | Full/Super nodes only (50% each) | Both |
+| Pool 3 | Activation Payments | Equal to ALL eligible nodes | Phase 2 only |
+
+**Dynamic Emission (Pool 1):**
+- Initial: ~251,432 QNC per epoch
+- Halving: every 4 years
+- Sharp drop: 10x reduction at year 20
+
+**Eligibility Requirements:**
+| Node Type | Pings Required | Timing |
+|-----------|----------------|--------|
+| Light | 1/1 attestation | Once per 4h window (sharded) |
+| Full | 8/10 heartbeats | Every ~24 min (deterministic) |
+| Super | 9/10 heartbeats | Every ~24 min (deterministic) |
+
+**Ping Window Calculation:**
+```
+window_start = timestamp - (timestamp % (4 * 60 * 60))
+window_end = window_start + (4 * 60 * 60)
+
+Heartbeat included if: timestamp >= window_start && timestamp < window_end
+```
+
+**⚠️ Nodes Joining Mid-Round:**
+Nodes that start in the middle of a 4-hour window will NOT be eligible for rewards in that round (not enough heartbeats). Rewards begin from the NEXT complete round.
+
+---
+
 ### Claim Rewards
 ```http
 POST /api/v1/rewards/claim
@@ -727,12 +765,267 @@ GET /api/v1/rewards/pending?node_id={node_id}
 {
   "success": true,
   "node_id": "node_abc123",
-  "pending_rewards": 1500000000,
-  "pool1_rewards": 1000000000,
-  "pool2_rewards": 500000000,
-  "pool3_rewards": 0,
-  "last_claim_time": 1699913600,
-  "next_distribution": 1700000000
+  "node_type": "Full",
+  "pending_rewards": 1.5,
+  "pools": {
+    "pool1_base_emission": 1.0,
+    "pool2_tx_fees": 0.5,
+    "pool3_activation_bonus": 0.0
+  },
+  "ping_status": {
+    "heartbeat_count": 10,
+    "required_heartbeats": 8,
+    "is_eligible": true
+  },
+  "current_phase": "Phase1",
+  "current_window_start": 1700000000,
+  "current_block_height": 14500,
+  "needs_attention": false
+}
+```
+
+---
+
+### Get Reward History (NEW v2.43.1)
+```http
+GET /api/v1/rewards/history/{node_id}?offset={offset}&limit={limit}
+```
+
+**Query Parameters:**
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| offset | u64 | 0 | Number of epochs to skip (for pagination) |
+| limit | u64 | 10 | Number of epochs to return (max 100) |
+
+**Response:**
+```json
+{
+  "success": true,
+  "node_id": "node_abc123",
+  "current_epoch": 25,
+  "history": [
+    {
+      "epoch": 24,
+      "status": "claimed",
+      "total_qnc": 1.5,
+      "pool1_qnc": 1.0,
+      "pool2_qnc": 0.5,
+      "pool3_qnc": 0.0,
+      "claim_time": 1700100000,
+      "tx_hash": "abc123..."
+    },
+    {
+      "epoch": 23,
+      "status": "unclaimed",
+      "estimated_qnc": 1.4
+    }
+  ],
+  "pagination": {
+    "offset": 0,
+    "limit": 10,
+    "has_more": true
+  }
+}
+```
+
+---
+
+### Get Reward Pools Detail (NEW v2.43.1)
+```http
+GET /api/v1/rewards/pools/{node_id}
+```
+
+**Description:** Returns detailed breakdown of all reward pools for a specific node, including dynamic emission rates with halving schedule.
+
+**Response:**
+```json
+{
+  "success": true,
+  "node_id": "node_abc123",
+  "pools": {
+    "pool1_base_emission": {
+      "current_epoch_qnc": 1.0,
+      "description": "Base emission divided equally among all eligible nodes"
+    },
+    "pool2_transaction_fees": {
+      "current_epoch_qnc": 0.5,
+      "description": "Share of transaction fees (Full/Super only)"
+    },
+    "pool3_activation_bonus": {
+      "current_epoch_qnc": 0.0,
+      "description": "Share of activation pool (Phase 2 only)"
+    }
+  },
+  "emission_rate": {
+    "pool1_base_per_epoch_qnc": 251432.34,
+    "pool1_base_per_year_qnc": 551643145.56,
+    "current_phase": "Phase1",
+    "phase_description": "Phase1: 1DEV burn for activation, Pool3 disabled",
+    "halving_schedule": {
+      "period_years": 4,
+      "sharp_drop_year": 20,
+      "sharp_drop_multiplier": 10
+    }
+  },
+  "eligibility": {
+    "is_eligible": true,
+    "heartbeats": 10,
+    "required": 8,
+    "node_type": "Full"
+  },
+  "cached_at": 1700000000,
+  "cache_ttl_seconds": 10
+}
+```
+
+---
+
+### Get Rewards by Wallet (NEW v2.43.1)
+```http
+GET /api/v1/rewards/by-wallet/{wallet_address}
+```
+
+**Description:** Returns all nodes owned by a specific wallet address with their pending rewards. Uses inverted index for O(1) lookup.
+
+**Response:**
+```json
+{
+  "success": true,
+  "wallet_address": "a1b2c3d4e5f6g7h8i9jeon...",
+  "nodes": [
+    {
+      "node_id": "full_node_001",
+      "node_type": "Full",
+      "pending_qnc": 1.5,
+      "is_eligible": true,
+      "heartbeats": 10
+    },
+    {
+      "node_id": "light_node_002",
+      "node_type": "Light",
+      "pending_qnc": 0.5,
+      "is_eligible": true,
+      "attestations": 1
+    }
+  ],
+  "total_pending_qnc": 2.0,
+  "node_count": 2
+}
+```
+
+---
+
+### Batch Get Pending Rewards (NEW v2.43.1)
+```http
+POST /api/v1/rewards/pending/batch
+Content-Type: application/json
+```
+
+**Description:** Get pending rewards for multiple nodes in a single request. Max 100 nodes per batch.
+
+**Request Body:**
+```json
+{
+  "node_ids": ["node_001", "node_002", "node_003"]
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "results": [
+    {
+      "node_id": "node_001",
+      "pending_qnc": 1.5,
+      "is_eligible": true
+    },
+    {
+      "node_id": "node_002",
+      "pending_qnc": 0.8,
+      "is_eligible": true
+    },
+    {
+      "node_id": "node_003",
+      "error": "Node not found"
+    }
+  ],
+  "total_pending_qnc": 2.3,
+  "successful": 2,
+  "failed": 1
+}
+```
+
+---
+
+### Get Network Reward Stats (NEW v2.43.1)
+```http
+GET /api/v1/rewards/network/stats
+```
+
+**Description:** Returns network-wide reward statistics. Cached for 30 seconds.
+
+**Response:**
+```json
+{
+  "success": true,
+  "network_stats": {
+    "total_claims_all_time": 15000,
+    "total_distributed_qnc": 1500000.0,
+    "recent_epochs_scanned": 50
+  },
+  "current_epoch": 25,
+  "current_block_height": 360000,
+  "emission_rate": {
+    "pool1_base_per_epoch_qnc": "dynamic - use /api/v1/rewards/pools for current value",
+    "initial_rate_qnc_per_epoch": 251432.34,
+    "halving_period_years": 4,
+    "sharp_drop_at_year": 20,
+    "sharp_drop_multiplier": 10
+  },
+  "phases": {
+    "current": "Phase1",
+    "phase1_description": "1DEV burn, Pool3=0",
+    "phase2_description": "QNC activation, Pool3 enabled"
+  },
+  "cached_at": 1700000000,
+  "cache_ttl_seconds": 30
+}
+```
+
+---
+
+### Get Reward Summary (NEW v2.43.1)
+```http
+GET /api/v1/rewards/summary/{node_id}
+```
+
+**Description:** Returns lifetime aggregated reward statistics for a node. Useful for displaying total earnings in wallet UI. Cached for 60 seconds.
+
+**Response:**
+```json
+{
+  "success": true,
+  "node_id": "node_abc123",
+  "lifetime_stats": {
+    "total_claimed_qnc": 150.5,
+    "total_pool1_qnc": 100.0,
+    "total_pool2_qnc": 45.0,
+    "total_pool3_qnc": 5.5,
+    "epochs_participated": 100,
+    "epochs_claimed": 95,
+    "epochs_missed": 5,
+    "first_claim_epoch": 1,
+    "last_claim_epoch": 95,
+    "average_per_epoch_qnc": 1.58
+  },
+  "current_pending": {
+    "pending_qnc": 1.5,
+    "is_eligible": true,
+    "current_epoch": 100
+  },
+  "cached_at": 1700000000,
+  "cache_ttl_seconds": 60
 }
 ```
 
@@ -1477,12 +1770,14 @@ Authorization: Bearer {admin_token}
 
 ## 📊 Rate Limits
 
-| Endpoint Type | Limit | Window |
-|---------------|-------|--------|
-| Public Read | 100 req | 1 min |
-| Transaction Submit | 30 req | 1 min |
-| Bundle Submit | 10 req | 1 min |
-| Admin | 10 req | 1 min |
+| Endpoint Type | Limit | Window | Block Duration |
+|---------------|-------|--------|----------------|
+| Public Read | 100 req | 1 min | 30 sec |
+| Transaction Submit | 30 req | 1 min | 60 sec |
+| Bundle Submit | 10 req | 1 min | 120 sec |
+| Reward Read | 300 req | 1 min | 30 sec |
+| Reward Claim | 60 req | 1 min | 60 sec |
+| Admin | 10 req | 1 min | 300 sec |
 
 ---
 
@@ -1512,6 +1807,7 @@ ws://{node_ip}:8001/ws/subscribe?channels=blocks,account:ADDRESS,contract:ADDRES
 | `contract` | `contract:EON_ADDRESS` | Events from specific contract |
 | `mempool` | `mempool` | Pending transactions |
 | `tx` | `tx:TX_HASH` | Specific transaction confirmation |
+| `rewards` | `rewards:NODE_ID` | Reward updates for specific node (NEW v2.43.1) |
 
 ### Example Connection
 ```javascript
@@ -1587,6 +1883,36 @@ ws.onmessage = (event) => {
     "from": "a1b2c3...",
     "to": "b2c3d4...",
     "amount": 1000000000
+  }
+}
+```
+
+**RewardClaimed (NEW v2.43.1):**
+```json
+{
+  "type": "RewardClaimed",
+  "data": {
+    "node_id": "node_abc123",
+    "wallet_address": "a1b2c3d4e5f6g7h8i9jeon...",
+    "amount_qnc": 1.5,
+    "tx_hash": "abc123...",
+    "epoch": 25
+  }
+}
+```
+
+**RewardUpdate (NEW v2.43.1):**
+```json
+{
+  "type": "RewardUpdate",
+  "data": {
+    "node_id": "node_abc123",
+    "pending_qnc": 1.5,
+    "pool1_qnc": 1.0,
+    "pool2_qnc": 0.5,
+    "pool3_qnc": 0.0,
+    "is_eligible": true,
+    "heartbeats": 10
   }
 }
 ```
@@ -1748,6 +2074,30 @@ GET /api/v1/snapshot/{height}
 ---
 
 ## 📝 Changelog
+
+### v2.43.1 (December 2025)
+
+**🎁 REWARDS API OVERHAUL**
+- **NEW**: `GET /api/v1/rewards/history/{node_id}` - Paginated reward history by epoch
+- **NEW**: `GET /api/v1/rewards/pools/{node_id}` - Detailed pool breakdown with dynamic emission
+- **NEW**: `GET /api/v1/rewards/by-wallet/{wallet}` - All nodes for a wallet (O(1) inverted index)
+- **NEW**: `POST /api/v1/rewards/pending/batch` - Batch pending rewards (max 100 nodes)
+- **NEW**: `GET /api/v1/rewards/network/stats` - Network-wide reward statistics
+- **NEW**: `GET /api/v1/rewards/summary/{node_id}` - Lifetime aggregated stats for node
+- **NEW**: WebSocket events: `RewardClaimed`, `RewardUpdate`
+- **NEW**: WebSocket channel: `rewards:NODE_ID`
+- **IMPROVED**: Rate limiting for all reward endpoints (300 req/min read, 60 req/min write)
+- **IMPROVED**: Caching: Pool data (10s), Network stats (30s), Summary (60s)
+- **FIX**: Off-by-one bug in reward window calculation (v2.43.1)
+- **FIX**: Pool 1 dynamic emission with halving schedule
+- **FIX**: Pool 3 correctly shows 0 in Phase 1, enabled in Phase 2
+
+**🔧 CONSENSUS IMPROVEMENTS**
+- **FIX**: `prev_hash_mismatch` now triggers `FORK_DETECTED` for proper reorg
+- **NEW**: Height validation in heartbeats (max +100 jump, +50 ahead of local)
+- **NEW**: Backpressure for block broadcasts (max 3 pending, 500ms wait)
+- **IMPROVED**: Heartbeat service now uses `tokio::spawn` (was `std::thread`)
+- **IMPROVED**: `sign_heartbeat_dilithium` uses `spawn_blocking` (no runtime panic)
 
 ### v2.19.20 (November 2025)
 - **OPTIMIZATION**: Fire-and-forget Shred Protocol broadcast (1 block/sec production guaranteed)
