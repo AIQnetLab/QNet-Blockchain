@@ -7647,20 +7647,25 @@ impl SimplifiedP2P {
     pub fn get_max_concurrent_chunk_sends(&self) -> usize {
         let peer_count = self.connected_peers_lockfree.len().max(1);
         
-        // Network-based limit (total concurrent streams in flight)
+        // v2.43.6: CRITICAL FIX for 100K TPS support
+        // Previous values (20 for genesis) caused 43+ second broadcast times
+        // for large blocks (14MB = 86K sends), while timeout was only 10 seconds
+        // 
+        // New values ensure broadcast completes within timeout:
+        // 86K sends / 200 concurrent = 430 batches × 10ms = 4.3 seconds
         let network_limit = match peer_count {
-            0..=10 => 20,        // Genesis: conservative
-            11..=100 => 50,      // Medium network
-            101..=1000 => 100,   // Large network
-            _ => 200,            // Huge network
+            0..=10 => 200,       // Genesis: 200 (was 20) for 100K TPS
+            11..=100 => 300,     // Medium network: increased
+            101..=1000 => 400,   // Large network: increased
+            _ => 500,            // Huge network
         };
         
-        // Per-peer limit: max 5 concurrent streams per receiving peer
-        // This prevents overloading any single receiver
-        let per_peer_limit = peer_count * 5;
+        // Per-peer limit: max 50 concurrent streams per receiving peer (was 5)
+        // Modern QUIC implementations handle this well
+        let per_peer_limit = peer_count * 50;
         
         // Use the smaller of the two limits
-        network_limit.min(per_peer_limit).max(10)  // minimum 10 for throughput
+        network_limit.min(per_peer_limit).max(100)  // minimum 100 for high TPS
     }
     
     /// Stop P2P network
