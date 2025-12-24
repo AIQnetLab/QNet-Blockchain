@@ -2520,15 +2520,16 @@ impl SimplifiedP2P {
             if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
                 peer.last_seen = current_time;
                 if let Some(h) = height {
-                    // PRODUCTION v2.43: Height validation - don't trust blindly!
+                    // PRODUCTION v2.43.3: Height validation - don't trust blindly!
                     // If peer claims huge height jump, it might be on a fork or malicious
                     let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                     let height_jump = if h > peer.last_block_height { h - peer.last_block_height } else { 0 };
                     
-                    // Allow reasonable jump (max 100 blocks = 100 seconds)
-                    // Beyond this, peer is either on fork or ahead - limit trust
-                    const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
-                    const MAX_AHEAD_OF_LOCAL: u64 = 50;
+                    // v2.43.3: STRICTER limits to prevent producer from getting too far ahead
+                    // MAX_TRUSTED_HEIGHT_JUMP: can't claim +30 blocks suddenly (was 100)
+                    // MAX_AHEAD_OF_LOCAL: can't claim 15+ ahead of our local (was 50)
+                    const MAX_TRUSTED_HEIGHT_JUMP: u64 = 30;
+                    const MAX_AHEAD_OF_LOCAL: u64 = 15;
                     
                     if h > peer.last_block_height {
                         if height_jump > MAX_TRUSTED_HEIGHT_JUMP {
@@ -2561,10 +2562,10 @@ impl SimplifiedP2P {
                 if stored_ip == peer_ip {
                     entry.last_seen = current_time;
                     if let Some(h) = height {
-                        // PRODUCTION v2.43: Height validation (same as above)
+                        // PRODUCTION v2.43.3: Height validation (same as above)
                         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                        const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
-                        const MAX_AHEAD_OF_LOCAL: u64 = 50;
+                        const MAX_TRUSTED_HEIGHT_JUMP: u64 = 30;
+                        const MAX_AHEAD_OF_LOCAL: u64 = 15;
                         
                         if h > entry.last_block_height {
                             let height_jump = h - entry.last_block_height;
@@ -2587,10 +2588,10 @@ impl SimplifiedP2P {
         
         // Fallback to legacy
         if let Ok(mut peers) = self.connected_peers.write() {
-            // PRODUCTION v2.43: Height validation constants
+            // PRODUCTION v2.43.3: Height validation constants (stricter)
             let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-            const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
-            const MAX_AHEAD_OF_LOCAL: u64 = 50;
+            const MAX_TRUSTED_HEIGHT_JUMP: u64 = 30;
+            const MAX_AHEAD_OF_LOCAL: u64 = 15;
             
             // v2.24.4: First try exact match
             if let Some(peer) = peers.get_mut(&peer_addr) {
@@ -9784,18 +9785,18 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::HealthPing { from, timestamp: _, height } => {
-                // PRODUCTION v2.43.2: CRITICAL FIX - Do NOT trust height from HealthPing!
-                // Problem: Producer creates block locally, updates local_height, sends HealthPing
-                // But the block hasn't propagated to other peers yet!
-                // If we trust HealthPing heights, we'd think peers are synchronized when they're not.
+                // PRODUCTION v2.43.3: Update height WITH VALIDATION
+                // v2.43.2 was WRONG - not updating heights caused backpressure check to fail
                 // 
-                // SOLUTION: Only update last_seen, not height.
-                // Heights should ONLY be updated when we receive actual Block messages.
-                self.update_peer_last_seen(&from);  // v2.43.2: NO height - only timestamp!
+                // update_peer_last_seen_with_height() has built-in validation:
+                // - MAX_TRUSTED_HEIGHT_JUMP = 100 (can't claim +100 blocks suddenly)
+                // - MAX_AHEAD_OF_LOCAL = 50 (can't be 50+ ahead of our local height)
+                // This prevents fake height claims while still tracking network state
+                self.update_peer_last_seen_with_height(&from, Some(height));
                 // Simple acknowledgment - no complex processing
                 // NOTE: This is P2P health check, NOT reward system ping!
                 if crate::node::is_debug() && height % 100 == 0 {
-                    println!("[DBG][P2P] health_ping from={} claimed_h={}", from, height);
+                    println!("[DBG][P2P] health_ping from={} h={}", from, height);
                 }
             }
 
@@ -10655,15 +10656,16 @@ impl SimplifiedP2P {
             NetworkMessage::NodeHeartbeat {
                 node_id, node_type, timestamp, block_height, signature, heartbeat_index, gossip_hop
             } => {
-                // PRODUCTION v2.43.2: CRITICAL FIX - Do NOT update peer height from heartbeats!
-                // Problem: Producer sends heartbeat with height=33360, but blocks didn't propagate
-                // Other peers update their peer_height to 33360 based on heartbeat
-                // Producer checks peer heights → sees 33360 → thinks network is OK → DEADLOCK!
+                // PRODUCTION v2.43.3: Update peer height WITH VALIDATION
+                // v2.43.2 was WRONG - removing height update entirely caused peer_heights = 0
+                // which made the backpressure check skip (peer_heights.len() < 2)
                 // 
-                // SOLUTION: Peer height should ONLY be updated when peer receives actual BLOCKS
-                // Heartbeats only update last_seen timestamp, not height
-                // This ensures peer_heights reflect ACTUALLY RECEIVED blocks, not just claims
-                self.update_peer_last_seen(from_peer);  // v2.43.2: NO height - only timestamp!
+                // CORRECT SOLUTION: Update height but with strict validation:
+                // - update_peer_last_seen_with_height() already has MAX_TRUSTED_HEIGHT_JUMP = 100
+                // - If peer claims height > local + 100, it's capped
+                // - This prevents producer from fooling network with inflated heights
+                // - But still allows network to track approximate peer heights
+                self.update_peer_last_seen_with_height(from_peer, Some(block_height));
                 
                 // GOSSIP TTL: Max 3 hops
                 if gossip_hop >= 3 {
