@@ -1221,11 +1221,15 @@ const KADEMLIA_ALPHA: usize = 3;     // Concurrent queries
 const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 
 // ShredProtocol block propagation constants
-const SHRED_PROTOCOL_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for Dilithium signatures)
-const SHRED_PROTOCOL_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
-const SHRED_PROTOCOL_MAX_CHUNKS: usize = 20480;     // Max chunks per block (20MB max for 100K+ TPS support)
-                                                     // v2.43.5: Increased from 2048 (2MB) to support large blocks
-                                                     // At 100K TPS: ~15MB compressed blocks are common
+// v2.43.7: CRITICAL FIX - Increased chunk size to avoid Reed-Solomon TooManyShards error
+// GF(2^8) Reed-Solomon supports max 255 shards (data + parity combined)
+// At 1KB chunks: 14MB block = 14000 chunks → TooManyShards FAILURE
+// At 128KB chunks: 20MB block = 156 chunks × 1.5 = 234 shards → OK!
+const SHRED_PROTOCOL_CHUNK_SIZE: usize = 128 * 1024;  // 128KB chunks (was 1KB - caused TooManyShards at 20K+ TPS)
+const SHRED_PROTOCOL_REDUNDANCY_FACTOR: f32 = 1.5;    // 50% redundancy for Reed-Solomon  
+const SHRED_PROTOCOL_MAX_CHUNKS: usize = 170;         // Max data chunks (170 + 85 parity = 255 ≤ GF(2^8) limit)
+                                                      // v2.43.7: 170 × 128KB = 21.76MB max block size
+                                                      // Supports 100K+ TPS with proper Reed-Solomon encoding
 const SHRED_CHUNK_TIMEOUT_SECS: u64 = 5;            // Timeout before requesting missing chunks (v2.31: increased from 3s for reliability)
 const SHRED_CHUNK_CACHE_SIZE: usize = 100;          // Cache last N blocks' chunks for retransmit (v2.21.3)
 const SHRED_CHUNK_MAX_RETRIES: u8 = 4;              // Max retransmit attempts per block (v2.31: increased from 2 for reliability)
@@ -7648,11 +7652,11 @@ impl SimplifiedP2P {
         let peer_count = self.connected_peers_lockfree.len().max(1);
         
         // v2.43.6: CRITICAL FIX for 100K TPS support
-        // Previous values (20 for genesis) caused 43+ second broadcast times
-        // for large blocks (14MB = 86K sends), while timeout was only 10 seconds
-        // 
-        // New values ensure broadcast completes within timeout:
-        // 86K sends / 200 concurrent = 430 batches × 10ms = 4.3 seconds
+        // v2.43.7: With 128KB chunks (was 1KB), broadcast is now MUCH faster:
+        // - 21MB block = 170 data + 85 parity = 255 chunks
+        // - 255 chunks × 4 peers = 1,020 sends total
+        // - 1,020 / 200 concurrent = 5 batches × 10ms = ~50ms broadcast time
+        // Old 1KB chunks: 14MB = 14K chunks = 86K sends = 43+ seconds (TooManyShards!)
         let network_limit = match peer_count {
             0..=10 => 200,       // Genesis: 200 (was 20) for 100K TPS
             11..=100 => 300,     // Medium network: increased
