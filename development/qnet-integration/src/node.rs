@@ -3753,10 +3753,11 @@ impl BlockchainNode {
                                                         // 3. The correct chain will be validated and accepted
                                                         // 4. Macroblock (every 90 blocks) will finalize the correct chain
                                                         
-                                                        // Count high-rep validators for logging
+                                                        // Count high-rep validators for logging (using cached reputation)
+                                                        use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
                                                         let peers = p2p.get_validated_active_peers();
                                                         let high_rep_count = peers.iter()
-                                                            .filter(|p| p.consensus_score >= 70.0)
+                                                            .filter(|p| p.reputation() >= MIN_CONSENSUS_REPUTATION)
                                                             .count();
                                                         
                                                         if is_debug() { println!("[DBG][REORG] high_rep_validators={}", high_rep_count); }
@@ -9658,9 +9659,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 p2p.set_node_reputation(&genesis_id, saved_reputation);
                 println!("[REPUTATION] 📂 Loaded saved reputation for {}: {:.1}%", genesis_id, saved_reputation);
             } else {
-                // If no saved reputation, initialize to default 70%
-                p2p.set_node_reputation(&genesis_id, 70.0);
-                println!("[REPUTATION] 🆕 Initialized default reputation for {}: 70.0%", genesis_id);
+                // If no saved reputation, initialize to INITIAL_REPUTATION
+                use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
+                p2p.set_node_reputation(&genesis_id, INITIAL_REPUTATION);
+                println!("[REPUTATION] 🆕 Initialized default reputation for {}: {:.1}%", genesis_id, INITIAL_REPUTATION);
             }
         }
         
@@ -9673,9 +9675,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 "001" | "002" | "003" | "004" | "005" => {
                     let own_genesis_id = format!("genesis_node_{}", bootstrap_id);
                     // Check if we need to update own reputation
+                    use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                     if p2p.load_reputation_from_storage(&own_genesis_id).is_none() {
-                        p2p.set_node_reputation(&own_genesis_id, 70.0);
-                        println!("[REPUTATION] ✅ Own Genesis {} initialized to consensus threshold (70%)", own_genesis_id);
+                        p2p.set_node_reputation(&own_genesis_id, INITIAL_REPUTATION);
+                        println!("[REPUTATION] ✅ Own Genesis {} initialized to INITIAL_REPUTATION ({:.0}%)", own_genesis_id, INITIAL_REPUTATION);
                     }
                 }
                 _ => {
@@ -10862,7 +10865,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                             .as_secs())
                                                 })
                                             })
-                                            .unwrap_or(70.0);
+                                            .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
                                         (id.clone(), rep / 100.0)
                                     })
                                     .collect();
@@ -12192,8 +12195,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 let producers: Vec<qnet_state::EligibleProducer> = participants.iter()
                     .map(|id| {
-                        // Get reputation from snapshot (0-100 scale) or use default
-                        let real_rep = reputation_map.get(id).copied().unwrap_or(70.0);
+                        // Get reputation from snapshot (0-100 scale) or use INITIAL_REPUTATION
+                        let real_rep = reputation_map.get(id).copied()
+                            .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
                         qnet_state::EligibleProducer {
                             node_id: id.clone(),
                             reputation: (real_rep / 100.0).clamp(0.70, 1.0),

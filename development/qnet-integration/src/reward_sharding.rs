@@ -150,10 +150,11 @@ impl ShardedRewardManager {
                 if let Some((node_type, _, reputation)) = self.storage.load_node_registration(node_id)? {
                     // Light nodes: ANY reputation (mobile-friendly)
                     // Full/Super/Genesis: reputation >= 70 (maintain network quality)
+                    use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
                     let eligible = match node_type.as_str() {
                         "light" => true, // Light nodes always eligible (just need to answer pings)
-                        "full" | "super" => reputation >= 70.0,
-                        _ => reputation >= 70.0,
+                        "full" | "super" => reputation >= MIN_CONSENSUS_REPUTATION,
+                        _ => reputation >= MIN_CONSENSUS_REPUTATION,
                     };
                     
                     if eligible {
@@ -313,11 +314,11 @@ impl ShardedRewardManager {
                     
                     // Reputation requirements by node type:
                     // Light: ANY reputation (mobile devices, don't participate in consensus)
-                    // Full/Super: >= 70 reputation (must maintain network quality)
+                    // Full/Super: >= MIN_CONSENSUS_REPUTATION (must maintain network quality)
                     let eligible_for_new_rewards = match node_type.as_str() {
                         "light" => true, // Light nodes: no reputation requirement
-                        "full" | "super" => reputation >= 70.0, // Full/Super: maintain standards
-                        _ => reputation >= 70.0, // Default: require good reputation
+                        "full" | "super" => reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION,
+                        _ => reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION,
                     };
                     
                     if meets_ping_requirements && eligible_for_new_rewards {

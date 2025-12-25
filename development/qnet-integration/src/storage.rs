@@ -4023,7 +4023,8 @@ impl Storage {
                     }
                 };
                 let wallet = parsed["wallet"].as_str().unwrap_or("").to_string();
-                let reputation = parsed["reputation"].as_f64().unwrap_or(70.0);
+                let reputation = parsed["reputation"].as_f64()
+                    .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
                 
                 Ok(Some((node_type, wallet, reputation)))
             },

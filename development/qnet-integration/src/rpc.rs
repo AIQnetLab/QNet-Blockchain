@@ -3643,12 +3643,13 @@ async fn handle_bundle_submit(
     
     // Get REAL reputation for bundle submitter
     // SECURITY: This is used for MEV bundle reputation check (min 80% required)
-    // ARCHITECTURE: Reputation = consensus_score ONLY (synced via blocks)
+    // ARCHITECTURE: Reputation from DeterministicReputationState (synced via blocks)
+    use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
     let submitter_node_id = hex::encode(&bundle.submitter_pubkey);
     let submitter_reputation = if let Some(p2p) = blockchain.get_p2p() {
         p2p.get_node_combined_reputation(&submitter_node_id)
     } else {
-        70.0 // Default if P2P not initialized (consensus threshold)
+        INITIAL_REPUTATION // Default if P2P not initialized
     };
     
     // Get current time
@@ -5096,10 +5097,11 @@ async fn handle_light_node_ping_response(
         });
         
         // Register and record ping
+        use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         let _ = reward_manager.register_node(node_id.clone(), RewardNodeType::Light, wallet_addr.clone());
         let _ = reward_manager.record_ping_attempt(&node_id, true, 50);
         let _ = blockchain.get_storage().save_ping_attempt(&node_id, now, true, 50);
-        let _ = blockchain.get_storage().save_node_registration(&node_id, "light", &wallet_addr, 70.0);
+        let _ = blockchain.get_storage().save_node_registration(&node_id, "light", &wallet_addr, INITIAL_REPUTATION);
     }
     
     // Mark node as successfully responding (resets failure counter, reactivates if inactive)
@@ -7396,7 +7398,8 @@ async fn handle_register_node(
         }
         
         // CRITICAL: Save node registration to storage (survive restarts)
-        if let Err(e) = blockchain.get_storage().save_node_registration(&node_id, node_type, &wallet_address, 70.0) {
+        use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
+        if let Err(e) = blockchain.get_storage().save_node_registration(&node_id, node_type, &wallet_address, INITIAL_REPUTATION) {
             println!("[STORAGE] ⚠️ Failed to save node registration: {}", e);
         }
     }

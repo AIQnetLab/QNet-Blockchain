@@ -335,18 +335,28 @@ pub struct PeerInfo {
     #[serde(default)]
     pub bucket_index: usize,    // K-bucket this peer belongs to
     
-    // CRITICAL: Split reputation for Byzantine-safe consensus
-    // consensus_score: Malicious behavior (invalid blocks, Byzantine attacks)
-    // network_score: Network reliability (timeouts, latency, availability)
-    #[serde(default = "default_consensus_score")]
-    pub consensus_score: f64,   // Byzantine behavior tracking (0-100, min 70 for consensus)
-    #[serde(default = "default_network_score")]
-    pub network_score: f64,     // Network performance tracking (0-100, used for prioritization)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REPUTATION v2.45.1: Cached from DeterministicReputationState
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Source of truth: DeterministicReputationState (in blockchain)
+    // This cached value is populated via get_node_reputation_from_blockchain()
+    // when PeerInfo is created. Used for P2P peer selection and consensus checks.
+    // ═══════════════════════════════════════════════════════════════════════════
+    #[serde(default = "default_reputation_70")]
+    pub reputation: f64,   // Cached blockchain reputation (70-100 scale)
     
-    // BACKWARD COMPATIBILITY: Keep old field for migration
-    // NOTE: No skip_serializing_if - bincode requires all fields to be serialized
-    #[serde(default = "default_reputation")]
-    pub reputation_score: Option<f64>,  // Legacy field (migrated to split scores)
+    // LEGACY FIELDS - kept for serde backward compatibility only
+    #[serde(default = "default_reputation_70")]
+    #[doc(hidden)]
+    pub consensus_score: f64,   // LEGACY: Use `reputation` field instead
+    
+    #[serde(default = "default_reputation_100")]
+    #[doc(hidden)]
+    pub network_score: f64,     // LEGACY: Not used anymore
+    
+    #[serde(default)]
+    #[doc(hidden)]
+    pub reputation_score: Option<f64>,  // LEGACY: Not used anymore
     
     #[serde(default)]
     pub successful_pings: u32,  // Successful interactions
@@ -359,21 +369,15 @@ pub struct PeerInfo {
     pub last_block_height: u64,
 }
 
-fn default_consensus_score() -> f64 {
-    // PRODUCTION: Start at Byzantine threshold (fair for all nodes)
-    // Decreases on invalid blocks, increases on valid blocks
-    70.0 // Minimum for consensus participation
+fn default_reputation_70() -> f64 {
+    // v2.45.1: Use INITIAL_REPUTATION from consensus module
+    // Real reputation loaded from DeterministicReputationState
+    qnet_consensus::deterministic_reputation::INITIAL_REPUTATION
 }
 
-fn default_network_score() -> f64 {
-    // PRODUCTION: Start at full network score
-    // Decreases on timeouts/latency, increases on successful responses
-    100.0 // Optimal network performance
-}
-
-fn default_reputation() -> Option<f64> {
-    // BACKWARD COMPATIBILITY: None for new nodes (uses split scores)
-    None
+fn default_reputation_100() -> f64 {
+    // v2.45.1: Legacy field default
+    100.0
 }
 
 /// Network event types for P2P routing optimization
@@ -417,44 +421,44 @@ pub enum ReputationEvent {
 }
 
 impl PeerInfo {
-    /// Get reputation score
+    /// Get cached reputation score (from blockchain)
     /// ═══════════════════════════════════════════════════════════════════════════
-    /// ARCHITECTURE v2.21: TEMPORARY - Returns consensus_score from PeerInfo
+    /// ARCHITECTURE v2.45.1: Returns cached blockchain reputation
     /// 
-    /// In production, reputation should be computed from blockchain via
-    /// DeterministicReputationState. This field is kept for backward compatibility
-    /// during migration but should not be relied upon for consensus decisions.
-    /// 
-    /// For P2P routing optimization, use network_score instead.
+    /// Get peer's cached blockchain reputation
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// This is cached from DeterministicReputationState when PeerInfo was created.
+    /// For authoritative value, use SimplifiedP2P::get_node_reputation_from_blockchain()
     /// ═══════════════════════════════════════════════════════════════════════════
     pub fn reputation(&self) -> f64 {
-        // Return consensus_score for backward compatibility
-        // Real reputation comes from DeterministicReputationState
-        self.consensus_score
+        self.reputation
     }
     
     /// Backward compatibility alias
     #[inline]
     pub fn combined_reputation(&self) -> f64 {
-        self.reputation()
+        self.reputation
     }
     
-    /// Check if peer is qualified for consensus (Byzantine threshold)
-    /// CRITICAL: Only consensus_score matters for Byzantine safety
-    /// SCALABILITY: Light nodes NEVER participate in consensus (millions of Light nodes in production)
+    /// Check if peer is qualified for consensus (cached check)
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// WARNING: For authoritative consensus check, use:
+    /// SimplifiedP2P::can_node_participate_in_consensus(&node_id)
+    /// ═══════════════════════════════════════════════════════════════════════════
     pub fn is_consensus_qualified(&self) -> bool {
-        // Light nodes are EXCLUDED from consensus participation (only Super and Full nodes)
+        // Light nodes are EXCLUDED from consensus (only Super and Full nodes)
         if self.node_type == NodeType::Light {
             return false;
         }
         // Super and Full nodes must meet Byzantine threshold (70%)
-        self.consensus_score >= 70.0
+        // This is CACHED - for authoritative check use can_node_participate_in_consensus()
+        self.consensus_score >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION
     }
     
-    /// Migrate legacy reputation_score to split scores
+    /// Migrate legacy reputation_score to cached reputation
     pub fn migrate_legacy_reputation(&mut self) {
         if let Some(legacy_score) = self.reputation_score {
-            // Migrate legacy score to both consensus and network scores
+            // Migrate legacy score to cached blockchain reputation
             self.consensus_score = legacy_score;
             self.network_score = legacy_score;
             self.reputation_score = None; // Clear legacy field
@@ -1385,20 +1389,22 @@ impl SimplifiedP2P {
                     match bootstrap_id.as_str() {
                         "001" | "002" | "003" | "004" | "005" => {
                             // Set reputation for ALL Genesis nodes (not just self)
-                            // CRITICAL: All nodes start at 70% reputation (consensus threshold)
+                            // CRITICAL: All nodes start at INITIAL_REPUTATION (consensus threshold)
+                            use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                             for i in 1..=5 {
                                 let genesis_id = format!("genesis_node_{:03}", i);
-                                reputation_sys.set_reputation(&genesis_id, 70.0); // Default consensus threshold
+                                reputation_sys.set_reputation(&genesis_id, INITIAL_REPUTATION);
                             }
-                            println!("[P2P] 🛡️ Genesis node {} initialized - all Genesis nodes set to 70% reputation", bootstrap_id);
+                            println!("[P2P] 🛡️ Genesis node {} initialized - all Genesis nodes set to {:.0}% reputation", bootstrap_id, INITIAL_REPUTATION);
                         }
                         _ => {}
                     }
                 } else if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
                     // Legacy Genesis nodes also initialize all peers
+                    use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                     for i in 1..=5 {
                         let genesis_id = format!("genesis_node_{:03}", i);
-                        reputation_sys.set_reputation(&genesis_id, 70.0);
+                        reputation_sys.set_reputation(&genesis_id, INITIAL_REPUTATION);
                     }
                     // PRIVACY: Show pseudonym instead of node_id
                     let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
@@ -2288,16 +2294,17 @@ impl SimplifiedP2P {
                     }
                     
                     // ═══════════════════════════════════════════════════════════
-                    // ACTIVE NETWORK EVENTS - For P2P routing only
+                    // NETWORK EVENTS - Track for statistics only
+                    // v2.45.1: network_score removed (useless legacy)
+                    // Real reputation: DeterministicReputationState
                     // ═══════════════════════════════════════════════════════════
                     ReputationEvent::TimeoutFailure => {
-                        // SOFT penalty: WAN latency is not malicious
                         peer.failed_pings += 1;
-                        peer.network_score = (peer.network_score - 2.0).max(0.0);
+                        // network_score removed - use blockchain reputation
                     }
                     ReputationEvent::ConnectionFailure => {
                         peer.failed_pings += 1;
-                        peer.network_score = (peer.network_score - 5.0).max(0.0);
+                        // network_score removed - use blockchain reputation
                     }
                 }
                 
@@ -2328,14 +2335,14 @@ impl SimplifiedP2P {
                     // IGNORED: Use DeterministicReputationState from blockchain
                 }
                 
-                // ACTIVE NETWORK EVENTS
+                // NETWORK EVENTS - Track for statistics only (v2.45.1)
                 ReputationEvent::TimeoutFailure => {
                     peer.failed_pings += 1;
-                    peer.network_score = (peer.network_score - 2.0).max(0.0);
+                    // network_score removed - use blockchain reputation
                 }
                 ReputationEvent::ConnectionFailure => {
                     peer.failed_pings += 1;
-                    peer.network_score = (peer.network_score - 5.0).max(0.0);
+                    // network_score removed - use blockchain reputation
                 }
             }
         }
@@ -2491,18 +2498,19 @@ impl SimplifiedP2P {
             node_type,
             region,
             last_seen: self.current_timestamp(),
-            is_stable: false, // Will be marked stable after successful pings
-            latency_ms: 0,    // Unknown - will be measured on first ping
+            is_stable: false,
+            latency_ms: 0,
             connection_count: 0,
             bandwidth_usage: 0,
-            node_id_hash: Vec::new(),  // Will be calculated in add_peer_safe_static
-            bucket_index: 0,           // Will be calculated in add_peer_safe_static
-            consensus_score,           // Real or default based on node type
-            network_score: 50.0,       // Start at 50%, will increase with successful interactions
-            reputation_score: Some(consensus_score),
+            node_id_hash: Vec::new(),
+            bucket_index: 0,
+            reputation: consensus_score,  // v2.45.1: From blockchain
+            consensus_score,              // Legacy
+            network_score: 100.0,         // Legacy
+            reputation_score: None,       // Legacy
             successful_pings: 0,
             failed_pings: 0,
-            last_block_height: 0,      // v2.24.3: Will be updated from heartbeats/blocks
+            last_block_height: 0,
         };
         
         // Add peer using existing safe method
@@ -3445,9 +3453,9 @@ impl SimplifiedP2P {
                                 _ => region.clone(), // EXISTING: Use current region as fallback
                             };
                             
-                            // v2.21.5: Default reputation for initial discovery
-                            // Real reputation will be obtained from blockchain once connected
-                            let real_rep = 70.0; // Initial reputation for Genesis peers
+                            // v2.45.1: Use INITIAL_REPUTATION from consensus
+                            // Real reputation will be loaded from blockchain after sync
+                            let real_rep = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                             
                             let peer_info = PeerInfo {
                                 id: format!("genesis_{}", target_addr.replace(":", "_")),
@@ -3458,15 +3466,16 @@ impl SimplifiedP2P {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
-                                is_stable: false,  // Will be verified
-                                latency_ms: 0,     // Unknown - will be measured
+                                is_stable: false,
+                                latency_ms: 0,
                                 connection_count: 0,
                                 bandwidth_usage: 0,
-                                node_id_hash: Vec::new(),  // Calculated in add_peer_safe
-                                bucket_index: 0,           // Calculated in add_peer_safe
-                                consensus_score: real_rep,
-                                network_score: 100.0,  // CRITICAL FIX: Start at 100% like default_network_score
-                                reputation_score: Some(real_rep),
+                                node_id_hash: Vec::new(),
+                                bucket_index: 0,
+                                reputation: real_rep,     // v2.45.1: From blockchain
+                                consensus_score: real_rep, // Legacy
+                                network_score: 100.0,      // Legacy
+                                reputation_score: None,    // Legacy
                                 successful_pings: 0,
                                 failed_pings: 0,
                                 last_block_height: 0,  // v2.24.3
@@ -4058,14 +4067,14 @@ impl SimplifiedP2P {
                              if let Ok(outer) = rep_result {
                                  if let Some(ref inner_arc) = *outer {
                                      if let Ok(state) = inner_arc.read() {
-                                         state.get_reputation(&peer.id, std::time::SystemTime::now()
-                                             .duration_since(std::time::UNIX_EPOCH)
-                                             .unwrap_or_default()
-                                             .as_secs())
-                                     } else { 70.0 }
-                                 } else { 70.0 }
-                             } else { 70.0 }
-                         };
+                                        state.get_reputation(&peer.id, std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs())
+                                    } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
+                                } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
+                            } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
+                        };
                          
                         // SECURITY FIX: Remove peers with very low reputation (Genesis nodes stay connected but penalized)
                          if reputation < 10.0 && !is_genesis_peer {
@@ -4077,10 +4086,11 @@ impl SimplifiedP2P {
                              if is_genesis_peer {
                                 // Genesis peers: Stay connected but can lose stability for bad behavior
                                 // Stability requires BOTH good reputation AND connectivity
-                                let has_good_reputation = reputation >= 70.0;
+                                use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
+                                let has_good_reputation = reputation >= MIN_CONSENSUS_REPUTATION;
                                 peer.is_stable = peer.is_stable && has_good_reputation; // AND with connectivity result
                                 
-                                if reputation < 70.0 {
+                                if reputation < MIN_CONSENSUS_REPUTATION {
                                     println!("[P2P] ⚠️ Genesis peer {} unstable due to low reputation: {:.1}%", peer.id, reputation);
                                 } else if reputation < 90.0 {
                                     println!("[P2P] 🔶 Genesis peer {} penalized but stable: {:.1}%", peer.id, reputation);
@@ -4090,7 +4100,7 @@ impl SimplifiedP2P {
                             } else {
                                 // Regular peers: Standard reputation handling
                                 // Stability requires BOTH good reputation AND connectivity
-                                let has_good_reputation = reputation >= 70.0;
+                                let has_good_reputation = reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
                                 peer.is_stable = peer.is_stable && has_good_reputation; // AND with connectivity result
                              }
                          }
@@ -4595,13 +4605,77 @@ impl SimplifiedP2P {
                     send_items.push((quic_addr, msg.clone()));
                 }
                 
-                // PRODUCTION v2.45: ADAPTIVE PACED batch sending
-                // Process chunks in batches with dynamic delays to prevent UDP burst
+                // ============================================================================
+                // PRODUCTION v2.45.1: PRIORITY CHUNK #0 DELIVERY
+                // ============================================================================
+                // Certificate is ONLY in chunk #0! If parity arrives first and reconstructs
+                // the block, chunk #0 gets discarded → block has NO certificate → INVALID!
+                //
+                // SOLUTION: Send chunk #0 FIRST, separately from other chunks
+                // This guarantees certificate arrives before any reconstruction can happen
+                // ============================================================================
+                
+                // Separate chunk #0 (with certificate) from other chunks
+                let (chunk0_sends, other_sends): (Vec<_>, Vec<_>) = send_items
+                    .into_iter()
+                    .partition(|(_, msg)| {
+                        if let NetworkMessage::ShredProtocolChunk { chunk } = msg {
+                            chunk.chunk_index == 0 && !chunk.is_parity
+                        } else {
+                            false
+                        }
+                    });
+                
                 let mut total_success = 0usize;
                 let mut total_fail = 0usize;
-                let num_batches = (send_items.len() + batch_size - 1) / batch_size;
                 
-                for (batch_idx, batch) in send_items.chunks(batch_size).enumerate() {
+                // STEP 1: Send chunk #0 FIRST (contains certificate!)
+                // No pacing needed - just send immediately to all targets
+                if !chunk0_sends.is_empty() {
+                    let mut chunk0_tasks = Vec::with_capacity(chunk0_sends.len());
+                    
+                    for (quic_addr, msg) in &chunk0_sends {
+                        let transport_clone = transport_arc.clone();
+                        let msg_clone = msg.clone();
+                        let addr = *quic_addr;
+                        let permit = semaphore.clone();
+                        
+                        chunk0_tasks.push(tokio::spawn(async move {
+                            let _permit = match permit.acquire().await {
+                                Ok(p) => p,
+                                Err(_) => return Err("Semaphore closed".to_string()),
+                            };
+                            let transport = transport_clone.read().await;
+                            transport.broadcast_to(addr, &msg_clone).await
+                        }));
+                    }
+                    
+                    // Wait for chunk #0 to be sent to all peers
+                    let chunk0_results = futures::future::join_all(chunk0_tasks).await;
+                    let chunk0_success = chunk0_results.iter()
+                        .filter(|r| matches!(r, Ok(Ok(_))))
+                        .count();
+                    let chunk0_fail = chunk0_results.len() - chunk0_success;
+                    
+                    total_success += chunk0_success;
+                    total_fail += chunk0_fail;
+                    
+                    if height_for_log <= 100 || height_for_log % 50 == 0 {
+                        println!("[SHRED_PROTOCOL] 🔐 Chunk #0 (certificate) sent FIRST: {}/{} success",
+                            chunk0_success, chunk0_sends.len());
+                    }
+                    
+                    // Small delay to ensure chunk #0 arrives before parity
+                    // This is critical to prevent race condition!
+                    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+                }
+                
+                // STEP 2: Send remaining chunks with adaptive pacing
+                let num_batches = if other_sends.is_empty() { 0 } else {
+                    (other_sends.len() + batch_size - 1) / batch_size
+                };
+                
+                for (batch_idx, batch) in other_sends.chunks(batch_size).enumerate() {
                     let mut batch_tasks = Vec::with_capacity(batch.len());
                     
                     for (quic_addr, msg) in batch {
@@ -4631,7 +4705,6 @@ impl SimplifiedP2P {
                     total_fail += batch_fail;
                     
                     // PACING: Adaptive delay between batches (except last)
-                    // This prevents UDP buffer overflow and reduces packet loss
                     if batch_idx < num_batches - 1 {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
@@ -4658,12 +4731,13 @@ impl SimplifiedP2P {
                 // Log failures for debugging
                 if total_fail > 0 && (height_for_log <= 500 || height_for_log % 10 == 0) {
                     println!("[SHRED_PROTOCOL] ⚠️ Block #{}: {}/{} chunks failed (rate={:.1}%)", 
-                        height_for_log, total_fail, send_items.len(), failure_rate * 100.0);
+                        height_for_log, total_fail, total_sends, failure_rate * 100.0);
                 }
                 
+                let total_sends = chunk0_sends.len() + other_sends.len();
                 if height_for_log <= 500 || height_for_log % 10 == 0 {
-                    println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} delivered: {}/{} (adaptive: batch={}, delay={}ms, fail_rate={:.1}%)", 
-                        height_for_log, total_success, send_items.len(), batch_size, delay_ms, failure_rate * 100.0);
+                    println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} delivered: {}/{} (chunk0_first, batch={}, delay={}ms, fail_rate={:.1}%)", 
+                        height_for_log, total_success, total_sends, batch_size, delay_ms, failure_rate * 100.0);
                 }
                 
                 return Ok(());
@@ -4867,75 +4941,127 @@ impl SimplifiedP2P {
             }
         } // DashMap lock released here!
         
-        // CRITICAL: Mark block as processed BEFORE forwarding if we have enough chunks
-        // This prevents forward loop where chunks keep circulating after block is ready
-        if should_reconstruct_all || should_reconstruct_parity {
+        // ============================================================================
+        // PRODUCTION v2.45.1: CHUNK #0 REQUIRED FOR PROCESSED STATUS
+        // ============================================================================
+        // Certificate is ONLY in chunk #0! Without it, block is INVALID!
+        // 
+        // PROBLEM: If parity arrives first and reconstructs block via Reed-Solomon,
+        // block gets marked as "processed" and chunk #0 is discarded when it arrives.
+        // Result: Block has no certificate → validation fails → network stalls!
+        //
+        // SOLUTION: Only mark as processed if chunk #0 is present
+        // ============================================================================
+        
+        // Check if chunk #0 (with certificate) has been received
+        let chunk0_received = if let Some(assembly) = self.shred_protocol_assemblies.get(&height) {
+            assembly.chunks_received.get(0).map(|c| c.is_some()).unwrap_or(false)
+        } else {
+            false
+        };
+        
+        // CRITICAL FIX: Only mark as processed if we can reconstruct AND have chunk #0!
+        // This prevents race condition where parity arrives before data chunk #0
+        if (should_reconstruct_all || should_reconstruct_parity) && chunk0_received {
             self.processed_shred_blocks.insert(height);
+        } else if should_reconstruct_parity && !chunk0_received {
+            // Can reconstruct from parity but missing chunk #0 - DON'T mark as processed!
+            // Keep waiting for chunk #0 to arrive with certificate
+            if height <= 500 || height % 100 == 0 {
+                println!("[SHRED_PROTOCOL] ⏳ Block #{} can reconstruct ({}/{} + {}/{} parity) but WAITING for chunk #0 (certificate)", 
+                    height, chunks_count, total_chunks, parity_count, 
+                    ((total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize);
+            }
         }
         
         // Forward chunk to other peers (ShredProtocol propagation)
-        // Only forward if block is NOT yet ready for reconstruction
-        if !should_reconstruct_all && !should_reconstruct_parity {
+        // Only forward if block is NOT yet ready for reconstruction OR waiting for chunk #0
+        let should_forward = !should_reconstruct_all && (!should_reconstruct_parity || !chunk0_received);
+        if should_forward {
             self.forward_shred_protocol_chunk(from_peer, chunk.clone());
             
-            // PRODUCTION v2.21.3: Check for timeout and request missing chunks
-            // If block is incomplete after SHRED_CHUNK_TIMEOUT_SECS, request missing chunks
+            // PRODUCTION v2.21.3 + v2.45.1: Check for timeout and request missing chunks
+            // PRIORITY: If chunk #0 is missing after 500ms, request it FIRST!
             if let Some(mut assembly) = self.shred_protocol_assemblies.get_mut(&height) {
-                let elapsed = assembly.started_at.elapsed().as_secs();
-                let can_request = assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
-                    && assembly.retransmit_requested_at
-                        .map(|t| t.elapsed().as_secs() > SHRED_CHUNK_TIMEOUT_SECS)
-                        .unwrap_or(true);
+                let elapsed_ms = assembly.started_at.elapsed().as_millis();
+                let elapsed_secs = assembly.started_at.elapsed().as_secs();
                 
-                if elapsed >= SHRED_CHUNK_TIMEOUT_SECS && can_request {
-                    // Find missing chunk indices
-                    let missing_data: Vec<usize> = assembly.chunks_received.iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.is_none())
-                        .map(|(i, _)| i)
-                        .collect();
+                // v2.45.1: PRIORITY REQUEST for chunk #0 after 500ms
+                // Certificate is critical - request it before other chunks!
+                let chunk0_missing = assembly.chunks_received.get(0).map(|c| c.is_none()).unwrap_or(true);
+                if chunk0_missing && elapsed_ms >= 500 && assembly.retransmit_attempts == 0 {
+                    assembly.retransmit_attempts += 1;
+                    assembly.retransmit_requested_at = Some(Instant::now());
+                    drop(assembly);
                     
-                    let missing_parity: Vec<usize> = assembly.parity_chunks.iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.is_none())
-                        .map(|(i, _)| assembly.total_chunks + i)
-                        .collect();
+                    println!("[SHRED_PROTOCOL] 🔐 PRIORITY: Requesting chunk #0 (certificate) for block #{} after {}ms", 
+                             height, elapsed_ms);
+                    self.request_missing_chunks(height, vec![0], from_peer);
+                }
+                // Standard timeout for other missing chunks
+                else {
+                    let can_request = assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
+                        && assembly.retransmit_requested_at
+                            .map(|t| t.elapsed().as_secs() > SHRED_CHUNK_TIMEOUT_SECS)
+                            .unwrap_or(true);
                     
-                    let total_missing = missing_data.len() + missing_parity.len();
-                    
-                    if total_missing > 0 {
-                        assembly.retransmit_attempts += 1;
-                        assembly.retransmit_requested_at = Some(Instant::now());
+                    if elapsed_secs >= SHRED_CHUNK_TIMEOUT_SECS && can_request {
+                        // Find missing chunk indices
+                        let missing_data: Vec<usize> = assembly.chunks_received.iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.is_none())
+                            .map(|(i, _)| i)
+                            .collect();
                         
-                        let mut missing_indices = missing_data;
-                        missing_indices.extend(missing_parity);
+                        let missing_parity: Vec<usize> = assembly.parity_chunks.iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.is_none())
+                            .map(|(i, _)| assembly.total_chunks + i)
+                            .collect();
                         
-                        // Drop the lock before requesting
-                        drop(assembly);
+                        let total_missing = missing_data.len() + missing_parity.len();
                         
-                        println!("[SHRED_PROTOCOL] 🔄 Requesting {} missing chunks for block #{} (attempt {})", 
-                                 total_missing, height, 
-                                 self.shred_protocol_assemblies.get(&height)
-                                     .map(|a| a.retransmit_attempts)
-                                     .unwrap_or(0));
+                        if total_missing > 0 {
+                            assembly.retransmit_attempts += 1;
+                            assembly.retransmit_requested_at = Some(Instant::now());
+                            
+                            let mut missing_indices = missing_data;
+                            missing_indices.extend(missing_parity);
+                            
+                            // Drop the lock before requesting
+                            drop(assembly);
+                            
+                            println!("[SHRED_PROTOCOL] 🔄 Requesting {} missing chunks for block #{} (attempt {})", 
+                                     total_missing, height, 
+                                     self.shred_protocol_assemblies.get(&height)
+                                         .map(|a| a.retransmit_attempts)
+                                         .unwrap_or(0));
                         
-                        self.request_missing_chunks(height, missing_indices, from_peer);
+                            self.request_missing_chunks(height, missing_indices, from_peer);
+                        }
                     }
                 }
             }
         }
         
         // Now safe to call reconstruct functions (they need remove() which needs DashMap lock)
-        if should_reconstruct_all {
-            // All data chunks received - reconstruct block
+        // CRITICAL v2.45.1: Only reconstruct if chunk #0 (certificate) is present!
+        if should_reconstruct_all && chunk0_received {
+            // All data chunks received including chunk #0 - reconstruct block
             self.reconstruct_block_from_shred_protocol(height);
-        } else if should_reconstruct_parity {
-            // Enough chunks + parity to reconstruct
+        } else if should_reconstruct_parity && chunk0_received {
+            // Enough chunks + parity to reconstruct AND have chunk #0 with certificate
             if height % 10 == 0 {
-                println!("[SHRED_PROTOCOL] 🔧 Reconstructing block #{} from {} data + {} parity chunks", 
+                println!("[SHRED_PROTOCOL] 🔧 Reconstructing block #{} from {} data + {} parity chunks (chunk #0 ✅)", 
                          height, chunks_count, parity_count);
             }
             self.reconstruct_block_with_parity(height);
+        } else if (should_reconstruct_all || should_reconstruct_parity) && !chunk0_received {
+            // Can reconstruct but missing chunk #0 - DON'T reconstruct yet!
+            // Wait for chunk #0 to arrive (it was requested via priority retry above)
+            if height <= 500 || height % 100 == 0 {
+                println!("[SHRED_PROTOCOL] ⏳ Block #{} ready to reconstruct but waiting for chunk #0 (certificate)", height);
+            }
         }
         
         // MEMORY CLEANUP: Remove old entries to prevent memory leak
@@ -6665,9 +6791,10 @@ impl SimplifiedP2P {
             bandwidth_usage: 0,
             node_id_hash: Vec::new(),
             bucket_index: 0,
-            consensus_score: reputation,
-            network_score: 50.0,
-            reputation_score: Some(reputation),
+            reputation,                 // v2.45.1: From blockchain
+            consensus_score: reputation, // Legacy
+            network_score: 100.0,        // Legacy
+            reputation_score: None,      // Legacy
             successful_pings: 0,
             failed_pings: 0,
             last_block_height: 0,  // v2.24.3
@@ -7269,18 +7396,19 @@ impl SimplifiedP2P {
                                     node_type,
                                     region,
                                     last_seen: active_info.last_seen,
-                                    is_stable: false,  // Will be verified
-                                    latency_ms: 0,     // Unknown - will be measured
+                                    is_stable: false,
+                                    latency_ms: 0,
                                     connection_count: 0,
                                     bandwidth_usage: 0,
-                                    node_id_hash: Vec::new(),  // Calculated later
-                                    bucket_index: 0,           // Calculated later
-                                    consensus_score: active_info.reputation,
-                                    network_score: 50.0,  // Start at 50%
-                                    reputation_score: Some(active_info.reputation),
+                                    node_id_hash: Vec::new(),
+                                    bucket_index: 0,
+                                    reputation: active_info.reputation,  // v2.45.1
+                                    consensus_score: active_info.reputation, // Legacy
+                                    network_score: 100.0,                    // Legacy
+                                    reputation_score: None,                  // Legacy
                                     successful_pings: 0,
                                     failed_pings: 0,
-                                    last_block_height: 0,  // v2.24.3
+                                    last_block_height: 0,
                                 };
                                 genesis_peers.push(peer_info);
                             } else {
@@ -7876,9 +8004,9 @@ impl SimplifiedP2P {
             NodeType::Full   // Default for regular nodes
         };
         
-        // Static method - default reputation is 70 for ALL nodes
-        // Reputation increases through consensus participation, not by node type
-        let default_rep = 70.0;
+        // v2.45.1: Use INITIAL_REPUTATION from consensus
+        // Real reputation loaded from blockchain in SimplifiedP2P methods
+        let default_rep = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         
         Ok(PeerInfo {
             id: peer_id,
@@ -7890,17 +8018,18 @@ impl SimplifiedP2P {
                 .unwrap_or_default()
                 .as_secs(),
             is_stable: false,
-            latency_ms: 0,     // Unknown - will be measured
+            latency_ms: 0,
             connection_count: 0,
             bandwidth_usage: 0,
-            node_id_hash: Vec::new(),  // Calculated in add_peer_safe
-            bucket_index: 0,           // Calculated in add_peer_safe
-            consensus_score: default_rep,
-            network_score: 50.0,  // Start at 50%, increases with interactions
-            reputation_score: None,  // Will be populated from reputation system
+            node_id_hash: Vec::new(),
+            bucket_index: 0,
+            reputation: default_rep,       // v2.45.1: From blockchain
+            consensus_score: default_rep,  // Legacy
+            network_score: 100.0,          // Legacy
+            reputation_score: None,        // Legacy
             successful_pings: 0,
             failed_pings: 0,
-            last_block_height: 0,  // v2.24.3
+            last_block_height: 0,
         })
     }
     
@@ -10024,9 +10153,10 @@ impl SimplifiedP2P {
                 
                 // CRITICAL: Ignore emergency messages from low-reputation nodes
                 // This naturally limits to ~1000 high-reputation nodes that can participate
-                if sender_reputation < 70.0 {
-                    println!("[SECURITY] ⚠️ Ignoring emergency from {} - reputation {:.1} < 70", 
-                             from_peer, sender_reputation);
+                use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
+                if sender_reputation < MIN_CONSENSUS_REPUTATION {
+                    println!("[SECURITY] ⚠️ Ignoring emergency from {} - reputation {:.1} < {:.0}", 
+                             from_peer, sender_reputation, MIN_CONSENSUS_REPUTATION);
                     println!("[SECURITY] 🚫 Low-reputation nodes cannot trigger emergency failover");
                     return; // Ignore message completely
                 }
@@ -10787,12 +10917,13 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // CRITICAL FIX v2.21.1: Check sender reputation >= 70% for QNC rewards!
+                // CRITICAL FIX v2.21.1: Check sender reputation >= MIN_CONSENSUS_REPUTATION for QNC rewards!
                 // Reject heartbeats from nodes with low reputation (v2.21.5: blockchain source)
+                use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
                 let sender_reputation = self.get_node_reputation_from_blockchain(&node_id);
-                if sender_reputation < 70.0 {
-                    println!("[HEARTBEAT] ⚠️ Rejecting heartbeat from {}: reputation {:.1}% < 70%", 
-                             node_id, sender_reputation);
+                if sender_reputation < MIN_CONSENSUS_REPUTATION {
+                    println!("[HEARTBEAT] ⚠️ Rejecting heartbeat from {}: reputation {:.1}% < {:.0}%", 
+                             node_id, sender_reputation, MIN_CONSENSUS_REPUTATION);
                     return;
                 }
                 
@@ -11060,15 +11191,16 @@ impl SimplifiedP2P {
                 // SECURITY FIX: Use REAL reputation from blockchain (v2.21.5)
                 // Don't trust the reputation value in the announcement - it could be faked!
                 let real_reputation = self.get_node_reputation_from_blockchain(&node_id);
+                use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                 
-                // REPUTATION FILTER: Only track nodes with rep >= 70
+                // REPUTATION FILTER: Only track nodes with rep >= INITIAL_REPUTATION
                 // Use REAL reputation, not the claimed one from announcement
-                if real_reputation < 70.0 {
-                    // If we don't know this node yet, give them benefit of doubt with default 70
-                    // New nodes start at 70, so this is fair
+                if real_reputation < INITIAL_REPUTATION {
+                    // If we don't know this node yet, give them benefit of doubt with INITIAL_REPUTATION
+                    // New nodes start at INITIAL_REPUTATION, so this is fair
                     if real_reputation == 0.0 {
                         // Unknown node - accept with default reputation
-                        println!("[ACTIVE] 🆕 New node {} - accepting with default reputation 70.0", node_id);
+                        println!("[ACTIVE] 🆕 New node {} - accepting with default reputation {:.1}", node_id, INITIAL_REPUTATION);
                     } else {
                         println!("[ACTIVE] ⚠️ Ignoring {} with low REAL reputation {:.1} (claimed: {:.1})", 
                                  node_id, real_reputation, reputation);
@@ -11107,8 +11239,12 @@ impl SimplifiedP2P {
                              node_id, reputation, real_reputation, reputation_diff);
                 }
                 
-                // Use the HIGHER of real or default (70) for new nodes
-                let effective_reputation = if real_reputation > 0.0 { real_reputation } else { 70.0 };
+                // v2.45.1: Use real blockchain reputation, fallback to INITIAL_REPUTATION
+                let effective_reputation = if real_reputation > 0.0 { 
+                    real_reputation 
+                } else { 
+                    qnet_consensus::deterministic_reputation::INITIAL_REPUTATION 
+                };
                 
                 // Update active nodes map
                 {
@@ -11150,7 +11286,7 @@ impl SimplifiedP2P {
                 let active_nodes: Vec<ActiveNodeInfo> = {
                     let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     nodes.values()
-                        .filter(|n| n.reputation >= 70.0)
+                        .filter(|n| n.reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION)
                         .cloned()
                         .collect()
                 };
@@ -11217,7 +11353,7 @@ impl SimplifiedP2P {
                     let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     for node in active_nodes {
                         // Only add if rep >= 70 and not stale (< 15 min old)
-                        if node.reputation >= 70.0 && node.last_seen > now.saturating_sub(15 * 60) {
+                        if node.reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION && node.last_seen > now.saturating_sub(15 * 60) {
                             if !nodes.contains_key(&node.node_id) {
                                 nodes.insert(node.node_id.clone(), node);
                                 added += 1;
@@ -12065,7 +12201,7 @@ impl SimplifiedP2P {
                             // CRITICAL FIX v2.21.1: Check reputation >= 70% before sending heartbeat
                             // Nodes with low reputation should NOT participate in reward pings (v2.21.5: blockchain)
                             let our_reputation = p2p.get_node_reputation_from_blockchain(&node_id);
-                            if our_reputation < 70.0 {
+                            if our_reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
                                 // Log once per window (first heartbeat only)
                                 if index == 0 {
                                     println!("[HEARTBEAT] ⚠️ Skipping heartbeats: reputation {:.1}% < 70%", 
@@ -12739,11 +12875,11 @@ impl SimplifiedP2P {
         
         let current_slot = Self::get_current_slot();
         
-        // Get sorted active Full/Super node IDs (only rep >= 70)
+        // Get sorted active Full/Super node IDs (only rep >= MIN_CONSENSUS_REPUTATION)
         let active_node_ids: Vec<String> = {
             let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
             let mut sorted: Vec<_> = nodes.values()
-                .filter(|n| n.reputation >= 70.0)
+                .filter(|n| n.reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION)
                 .map(|n| n.node_id.clone())
                 .collect();
             sorted.sort();
@@ -12940,9 +13076,9 @@ impl SimplifiedP2P {
         // Get reputation from blockchain (v2.21.5)
         let reputation = self.get_node_reputation_from_blockchain(&self.node_id);
         
-        // Only register if rep >= 70
-        if reputation < 70.0 {
-            println!("[ACTIVE] ⚠️ Cannot register: reputation {:.1} < 70", reputation);
+        // Only register if rep >= MIN_CONSENSUS_REPUTATION
+        if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
+            println!("[ACTIVE] ⚠️ Cannot register: reputation {:.1} < {:.0}", reputation, qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION);
             return;
         }
         
@@ -13001,9 +13137,9 @@ impl SimplifiedP2P {
         // Get reputation from blockchain (v2.21.5)
         let reputation = self.get_node_reputation_from_blockchain(&self.node_id);
         
-        // Only register if rep >= 70
-        if reputation < 70.0 {
-            println!("[ACTIVE] ⚠️ Cannot register: reputation {:.1} < 70", reputation);
+        // Only register if rep >= MIN_CONSENSUS_REPUTATION
+        if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
+            println!("[ACTIVE] ⚠️ Cannot register: reputation {:.1} < {:.0}", reputation, qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION);
             return;
         }
         
@@ -13059,8 +13195,8 @@ impl SimplifiedP2P {
         // Get reputation from blockchain (v2.21.5)
         let reputation = self.get_node_reputation_from_blockchain(node_id);
         
-        // Only track nodes with rep >= 70
-        if reputation < 70.0 {
+        // Only track nodes with rep >= MIN_CONSENSUS_REPUTATION
+        if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
             return;
         }
         
@@ -13259,12 +13395,13 @@ impl SimplifiedP2P {
                 Some((node_id, node_type, count))
             })
             .filter(|(node_id, node_type, count)| {
-                // CRITICAL FIX v2.21.1: Check reputation >= 70% for QNC rewards!
+                // CRITICAL FIX v2.21.1: Check reputation >= MIN_CONSENSUS_REPUTATION for QNC rewards!
                 // Nodes with low reputation should NOT receive monetary rewards (v2.21.5: blockchain)
+                use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
                 let reputation = self.get_node_reputation_from_blockchain(node_id);
-                if reputation < 70.0 {
-                    println!("[REWARDS] ⚠️ Node {} excluded from rewards: reputation {:.1}% < 70%", 
-                             node_id, reputation);
+                if reputation < MIN_CONSENSUS_REPUTATION {
+                    println!("[REWARDS] ⚠️ Node {} excluded from rewards: reputation {:.1}% < {:.0}%", 
+                             node_id, reputation, MIN_CONSENSUS_REPUTATION);
                     return false;
                 }
                 
@@ -13635,8 +13772,8 @@ impl SimplifiedP2P {
             .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for macroblock sync")?;
         
-        println!("[MACROBLOCK-SYNC] 📡 Requesting macroblocks from peer {} (consensus: {:.1}%, network: {:.1}%)", 
-                 best_peer.id, best_peer.consensus_score, best_peer.network_score);
+        println!("[MACROBLOCK-SYNC] 📡 Requesting macroblocks from peer {} (network_quality: {:.1}%)", 
+                 best_peer.id, best_peer.network_score);
         
         // Create request message
         let request = NetworkMessage::RequestMacroblocks {
@@ -13658,10 +13795,10 @@ impl SimplifiedP2P {
         // Estimate from peer heights using last_seen as proxy for activity
         // Peers with recent activity likely have current height
         if let Ok(peers) = self.connected_peers.read() {
-            // Use reputation as proxy for reliable height reporting
+            // Use cached reputation as proxy for reliable height reporting
             let max_height_peer = peers.values()
-                .filter(|p| p.consensus_score >= 50.0)  // Only trust peers with decent reputation
-                .max_by(|a, b| a.consensus_score.partial_cmp(&b.consensus_score).unwrap_or(std::cmp::Ordering::Equal));
+                .filter(|p| p.reputation() >= 50.0)  // Only trust peers with decent cached reputation
+                .max_by(|a, b| a.reputation().partial_cmp(&b.reputation()).unwrap_or(std::cmp::Ordering::Equal));
             
             // If we have reliable peers, estimate from network consensus
             // Otherwise return 0 (will sync from scratch)
@@ -13782,8 +13919,8 @@ impl SimplifiedP2P {
             .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for sync")?;
         
-        println!("[SYNC] 📡 Requesting blocks from peer {} (consensus: {:.1}%, network: {:.1}%)", 
-                 best_peer.id, best_peer.consensus_score, best_peer.network_score);
+        println!("[SYNC] 📡 Requesting blocks from peer {} (network_quality: {:.1}%)", 
+                 best_peer.id, best_peer.network_score);
         
         // Create request message
         let request = NetworkMessage::RequestBlocks {
@@ -13830,13 +13967,13 @@ impl SimplifiedP2P {
             return Err("No peers available for consensus sync".to_string());
         }
         
-        // Select peer with highest consensus score (Byzantine safety)
+        // Select peer with highest cached reputation (for P2P selection)
         let best_peer = peers.iter()
-            .max_by(|a, b| a.consensus_score.partial_cmp(&b.consensus_score).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.reputation().partial_cmp(&b.reputation()).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for consensus sync")?;
         
-        println!("[CONSENSUS] 📡 Requesting from peer {} (consensus: {:.1}%, network: {:.1}%)", 
-                 best_peer.id, best_peer.consensus_score, best_peer.network_score);
+        println!("[CONSENSUS] 📡 Requesting from peer {} (network_quality: {:.1}%)",
+                 best_peer.id, best_peer.network_score);
         
         // Create request message
         let request = NetworkMessage::RequestConsensusState {
@@ -14233,13 +14370,13 @@ impl SimplifiedP2P {
             }
         }
         
-        // 2. Fallback to initial reputation (70%) if blockchain not ready
-        70.0
+        // 2. Fallback to INITIAL_REPUTATION if blockchain not ready
+        qnet_consensus::deterministic_reputation::INITIAL_REPUTATION
     }
     
-    /// Check if node can participate in consensus (reputation >= 70%)
+    /// Check if node can participate in consensus (reputation >= MIN_CONSENSUS_REPUTATION)
     pub fn can_node_participate_in_consensus(&self, node_id: &str) -> bool {
-        self.get_node_reputation_from_blockchain(node_id) >= 70.0
+        self.get_node_reputation_from_blockchain(node_id) >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION
     }
     
     /// PRODUCTION: Get deterministic reputation state (blockchain-based)
@@ -14335,11 +14472,12 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION: Set absolute reputation (for Genesis initialization)
-    /// WHITEPAPER: Light nodes have FIXED reputation of 70 - only allow setting to 70
+    /// WHITEPAPER: Light nodes have FIXED reputation of INITIAL_REPUTATION
     pub fn set_node_reputation(&self, node_id: &str, reputation: f64) {
-        // CRITICAL: Light nodes have fixed reputation of 70
+        // CRITICAL: Light nodes have fixed reputation of INITIAL_REPUTATION
+        use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         let final_reputation = if node_id.starts_with("light_") {
-            70.0 // Light nodes: always 70, ignore requested value
+            INITIAL_REPUTATION // Light nodes: always INITIAL_REPUTATION, ignore requested value
         } else {
             reputation
         };
@@ -14356,7 +14494,7 @@ impl SimplifiedP2P {
     
     /// Get reputation score for a node (ONLY consensus_score - synced via blocks)
     /// MEV PROTECTION: Used for bundle submission reputation checks
-    /// Returns 70.0 (default consensus threshold) if peer not found
+    /// Returns INITIAL_REPUTATION (default consensus threshold) if peer not found
     pub fn get_node_combined_reputation(&self, node_id: &str) -> f64 {
         // First check peer_id_to_addr index for O(1) lookup
         if let Some(addr_entry) = self.peer_id_to_addr.get(node_id) {
@@ -14376,8 +14514,8 @@ impl SimplifiedP2P {
             }
         }
         
-        // Not found: return default consensus threshold
-        70.0
+        // Not found: return INITIAL_REPUTATION
+        qnet_consensus::deterministic_reputation::INITIAL_REPUTATION
     }
     
     /// PRODUCTION: Check if node is banned
@@ -14823,7 +14961,7 @@ impl SimplifiedP2P {
         let current_reputation = self.get_node_reputation_from_blockchain(node_id);
         
         // Calculate severity of tampering
-        let severity = if attempted_reputation >= 90.0 && current_reputation < 70.0 {
+        let severity = if attempted_reputation >= 90.0 && current_reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
             // Attempted to jump from low to high reputation
             "CRITICAL"
         } else if attempted_reputation - current_reputation > 30.0 {
@@ -17350,15 +17488,15 @@ impl SimplifiedP2P {
             })
             .collect();
         
-        // Sort by priority: 1) network_score (latency), 2) consensus_score (reliability)
+        // Sort by priority: 1) network_score (latency), 2) cached reputation (reliability)
         eligible_peers.sort_by(|a, b| {
             // Primary: network_score (higher = better latency)
             let network_cmp = b.network_score.partial_cmp(&a.network_score).unwrap_or(std::cmp::Ordering::Equal);
             if network_cmp != std::cmp::Ordering::Equal {
                 return network_cmp;
             }
-            // Secondary: consensus_score (higher = more reliable)
-            b.consensus_score.partial_cmp(&a.consensus_score).unwrap_or(std::cmp::Ordering::Equal)
+            // Secondary: cached reputation (higher = more reliable)
+            b.reputation().partial_cmp(&a.reputation()).unwrap_or(std::cmp::Ordering::Equal)
         });
         
         // Return top-N peers
