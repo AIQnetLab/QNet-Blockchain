@@ -9441,6 +9441,7 @@ pub enum NetworkMessage {
         reveal_data: String,
         nonce: String,  // CRITICAL: Include nonce for reveal verification
         timestamp: u64,
+        signature: String,  // v2.48: Dilithium signature for Byzantine safety
     },
 
     /// Emergency producer change notification
@@ -9729,12 +9730,14 @@ pub enum ConsensusMessage {
         timestamp: u64,
     },
     /// Remote reveal received from peer
+    /// v2.48: Added signature for quantum-resistant authentication
     RemoteReveal {
         round_id: u64,
         node_id: String,
         reveal_data: String,
         nonce: String,  // CRITICAL: Include nonce for reveal verification
         timestamp: u64,
+        signature: String,  // v2.48: Dilithium signature for Byzantine safety
     },
 }
 
@@ -10037,11 +10040,11 @@ impl SimplifiedP2P {
                 // Silently ignore microblock commits - they don't need consensus
             }
 
-            NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp } => {
+            NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp, signature } => {
                 // Update last_seen for the peer who sent the reveal
                 self.update_peer_last_seen(&node_id);
                 if crate::node::is_debug() { 
-                    println!("[DBG][CONS] reveal_recv round={} from={}", round_id, node_id); 
+                    println!("[DBG][CONS] reveal_recv round={} from={} sig_len={}", round_id, node_id, signature.len()); 
                 }
                 
                 // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)  
@@ -10050,7 +10053,7 @@ impl SimplifiedP2P {
                     if crate::node::is_info() { 
                         println!("[INFO][MACRO] reveal_process round={}", round_id); 
                     }
-                    self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, nonce, timestamp);
+                    self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, nonce, timestamp, signature);
                 }
                 // Silently ignore microblock reveals - they don't need consensus
             }
@@ -11879,6 +11882,13 @@ impl SimplifiedP2P {
                 false
             }
         }
+    }
+    
+    /// v2.48: Verify consensus signature (commit/reveal) using Dilithium
+    /// Wrapper around verify_dilithium_heartbeat_signature for consistent API
+    fn verify_consensus_signature(&self, node_id: &str, message: &str, signature: &str) -> bool {
+        // Use the same verification logic as heartbeat (supports all formats)
+        self.verify_dilithium_heartbeat_signature(message, signature, node_id)
     }
     
     /// OPTIMIZED v2.24: Verify HYBRID P2P BINARY signature (SYNC version)
@@ -15719,7 +15729,7 @@ impl SimplifiedP2P {
     /// PRODUCTION FIX v2.30: Byzantine threshold verification for reveals
     /// CRITICAL: Reveals are even more important than commits - without enough reveals
     /// macroblock consensus will fail and the network will stall!
-    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
+    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64, signature: String, participants: &[String]) -> Result<(), String> {
         // SAFE: Check if Tokio runtime is available to prevent panic
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
@@ -15775,6 +15785,7 @@ impl SimplifiedP2P {
             reveal_data: reveal_data.clone(),
             nonce: nonce.clone(),
             timestamp,
+            signature: signature.clone(),  // v2.48: Dilithium signature
         };
         
         let total = peer_addresses.len();
@@ -15995,9 +16006,12 @@ impl SimplifiedP2P {
     }
 
     /// Handle incoming consensus commit from remote peer
+    /// v2.48: Full Dilithium signature verification for quantum-resistant security
     fn handle_remote_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64) {
-        println!("[CONSENSUS] 🏛️ Processing remote commit: round={}, node={}, hash={}", 
-                round_id, node_id, commit_hash);
+        if crate::node::is_info() {
+            println!("[INFO][CONS] commit_recv round={} node={} hash_len={} sig_len={}", 
+                     round_id, node_id, commit_hash.len(), signature.len());
+        }
         
         // ═══════════════════════════════════════════════════════════════════════════
         // SECURITY FIX: Timestamp validation (prevents replay attacks)
@@ -16011,18 +16025,18 @@ impl SimplifiedP2P {
         const MAX_TIMESTAMP_DRIFT: u64 = 300; // 5 minutes
         
         if timestamp > now + MAX_TIMESTAMP_DRIFT {
-            println!("[CONSENSUS] ❌ Rejecting commit with FUTURE timestamp from {}: {} > {} + {}", 
-                     node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
-            // Report future timestamp attack
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] commit_future_ts node={} ts={} now={}", node_id, timestamp, now);
+            }
             let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             self.report_invalid_block(&node_id, current_height, [0u8; 32], "Future timestamp in commit");
             return;
         }
         
         if timestamp < now.saturating_sub(MAX_TIMESTAMP_DRIFT) {
-            println!("[CONSENSUS] ❌ Rejecting commit with STALE timestamp from {}: {} < {} - {}", 
-                     node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
-            // No penalty for stale (could be network delay) - just reject
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] commit_stale_ts node={} ts={} now={}", node_id, timestamp, now);
+            }
             return;
         }
         
@@ -16032,25 +16046,38 @@ impl SimplifiedP2P {
         let reputation_score = self.get_node_reputation_from_blockchain(&node_id) / 100.0;
         
         if reputation_score < 0.70 {
-            println!("[CONSENSUS] ❌ Rejecting commit from jailed node: {} (reputation: {:.1}%)", 
-                     node_id, reputation_score * 100.0);
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] commit_low_rep node={} rep={:.1}", node_id, reputation_score * 100.0);
+            }
             return;
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // SECURITY: Basic signature format validation (full verification in consensus engine)
+        // SECURITY v2.48: Full Dilithium signature verification (quantum-resistant)
+        // commit_hash is already SHA3-256 hex - use it directly for verification
         // ═══════════════════════════════════════════════════════════════════════════
         if signature.is_empty() || signature.len() < 100 {
-            println!("[CONSENSUS] ❌ Rejecting commit with invalid signature format from {}: len={}", 
-                     node_id, signature.len());
-            // Report invalid signature
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] commit_sig_short node={} len={}", node_id, signature.len());
+            }
             let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid signature format in commit");
             return;
         }
         
-        println!("[CONSENSUS] ✅ Pre-validation passed: {} (rep: {:.1}%, ts: valid, sig: {}B)", 
-                 node_id, reputation_score * 100.0, signature.len());
+        // v2.48: Full cryptographic verification of commit signature
+        if !self.verify_consensus_signature(&node_id, &commit_hash, &signature) {
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] commit_sig_invalid node={} rejecting", node_id);
+            }
+            let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid commit signature");
+            return;
+        }
+        
+        if crate::node::is_debug() {
+            println!("[DBG][CONS] commit_sig_verified node={} rep={:.1}", node_id, reputation_score * 100.0);
+        }
         
         // PRODUCTION: Send to consensus engine through channel
         if let Some(ref consensus_tx) = self.consensus_tx {
@@ -16076,9 +16103,44 @@ impl SimplifiedP2P {
     }
 
     /// Handle incoming consensus reveal from remote peer
-    fn handle_remote_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64) {
-        println!("[CONSENSUS] 🏛️ Processing remote reveal: round={}, node={}, reveal_length={}, nonce_length={}", 
-                round_id, node_id, reveal_data.len(), nonce.len());
+    /// v2.48: Added signature verification for quantum-resistant security
+    fn handle_remote_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64, signature: String) {
+        if crate::node::is_info() {
+            println!("[INFO][CONS] reveal_recv round={} node={} data_len={} sig_len={}", 
+                     round_id, node_id, reveal_data.len(), signature.len());
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SECURITY v2.48: Dilithium signature verification (quantum-resistant)
+        // Format: SHA3-256(node_id:reveal_data:nonce:timestamp) → verify signature
+        // ═══════════════════════════════════════════════════════════════════════════
+        if signature.is_empty() {
+            // Legacy mode - accept without signature but log warning
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] reveal_no_signature node={} accepting_legacy", node_id);
+            }
+        } else {
+            // v2.48: Verify Dilithium signature
+            // CRITICAL: Must use SAME format as signing: SHA3-256(message) 
+            use sha3::{Sha3_256, Digest};
+            let message_to_hash = format!("{}:{}:{}:{}", node_id, reveal_data, nonce, timestamp);
+            let mut hasher = Sha3_256::new();
+            hasher.update(message_to_hash.as_bytes());
+            let message_hash = hex::encode(hasher.finalize());
+            
+            if !self.verify_consensus_signature(&node_id, &message_hash, &signature) {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] reveal_sig_invalid node={} rejecting", node_id);
+                }
+                let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid reveal signature");
+                return;
+            }
+            
+            if crate::node::is_debug() {
+                println!("[DBG][CONS] reveal_sig_verified node={}", node_id);
+            }
+        }
         
         // ═══════════════════════════════════════════════════════════════════════════
         // SECURITY FIX: Timestamp validation (prevents replay attacks)
@@ -16149,6 +16211,7 @@ impl SimplifiedP2P {
                 reveal_data,
                 nonce,  // CRITICAL: Pass nonce for reveal verification
                 timestamp,
+                signature,  // v2.48: Dilithium signature for Byzantine safety
             };
             
             if let Err(e) = consensus_tx.send(consensus_msg) {

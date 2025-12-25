@@ -147,6 +147,11 @@ lazy_static::lazy_static! {
 pub static LAST_BLOCK_PRODUCED_TIME: AtomicU64 = AtomicU64::new(0);
 pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
+// CRITICAL FIX v2.48: Track ACTUALLY FINALIZED consensus round
+// Updated ONLY when MacroBlock is SAVED in storage (not at spawn!)
+// This prevents round mismatch between nodes
+pub static LAST_FINALIZED_CONSENSUS_ROUND: AtomicU64 = AtomicU64::new(0);
+
 // METRICS: Track retry statistics for monitoring certificate race condition
 // Used to tune retry interval and detect systemic issues
 static RETRY_TOTAL: AtomicU64 = AtomicU64::new(0);           // Total retry attempts
@@ -3917,8 +3922,21 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             }
                             
                             // save_macroblock IS async
-                            storage.save_macroblock(macroblock.height, &macroblock).await
-                                .map_err(|e| format!("Storage error: {:?}", e))
+                            let mb_height = macroblock.height;
+                            let save_result = storage.save_macroblock(mb_height, &macroblock).await
+                                .map_err(|e| format!("Storage error: {:?}", e));
+                            
+                            // v2.48 FIX: Update global finalized round after successful P2P save
+                            if save_result.is_ok() {
+                                let round = mb_height * 90;
+                                let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
+                                if round > prev_round {
+                                    LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
+                                    if is_debug() { println!("[DBG][MB-P2P] finalized_round={} mb={}", round, mb_height); }
+                                }
+                            }
+                            
+                            save_result
                         },
                         Err(e) => {
                             Err(format!("Failed to deserialize macroblock: {}", e))
@@ -5428,8 +5446,11 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 }
             }
             
-            ConsensusMessage::RemoteReveal { round_id, node_id, reveal_data, nonce, timestamp } => {
-                if is_debug() { println!("[DBG][CONS] remote_reveal node={} round={} h={}", node_id, round_id, block_height); }
+            ConsensusMessage::RemoteReveal { round_id, node_id, reveal_data, nonce, timestamp, signature } => {
+                if is_debug() { 
+                    println!("[DBG][CONS] remote_reveal node={} round={} h={} sig_len={}", 
+                             node_id, round_id, block_height, signature.len()); 
+                }
                 
                 // Create reveal from remote node data  
                 let reveal_bytes = hex::decode(&reveal_data)
@@ -5449,19 +5470,20 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     })
                     .unwrap_or([0u8; 32]);
                 
+                // v2.48: Use received signature from P2P (verified by unified_p2p already)
                 let remote_reveal = Reveal {
                     node_id: node_id.clone(),
                     reveal_data: reveal_bytes,
                     nonce: nonce_bytes,
                     timestamp,
-                    signature: String::new(), // v2.40.3: Legacy support - P2P reveals don't have signature yet
+                    signature: signature.clone(), // v2.48: Pass through verified signature
                 };
                 
                 // CRITICAL FIX v2.48: Use round_id (sender's intended round) for phase validation
                 // NOT block_height (receiver's current height) - ensures commit/reveal match!
                 match consensus_engine.submit_reveal(remote_reveal, round_id).await {
                     Ok(_) => {
-                        if is_info() { println!("[INFO][CONS] reveal from={} h={}", node_id, block_height); }
+                        if is_info() { println!("[INFO][CONS] reveal from={} h={} signed={}", node_id, block_height, !signature.is_empty()); }
                         (node_id, true, None)
                     }
                     Err(e) => {
@@ -6477,11 +6499,22 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                     };
                                     let height_gap = network_height.saturating_sub(microblock_height);
                                     
-                                    // v2.44: Aggressive threshold - 5 blocks instead of 50
-                                    // At 1 block/sec, 5 blocks = 5 seconds lag which shouldn't happen
-                                    if height_gap > 5 {
-                                        println!("[ERR][FORK] stuck={}s behind={} blocks", time_since_last_block, height_gap);
-                                        println!("[INFO][FORK] force_resync local={} network={}", microblock_height, network_height);
+                                    // v2.48: DYNAMIC threshold based on network size
+                                    // Small networks (≤10 nodes): 5 blocks - fast detection
+                                    // Medium networks (11-100): 10 blocks - account for latency
+                                    // Large networks (100+): 20 blocks - high latency tolerance
+                                    let network_size = p2p.get_active_full_super_nodes().len();
+                                    let dynamic_threshold = match network_size {
+                                        0..=10 => 5,      // Genesis/small: aggressive
+                                        11..=100 => 10,   // Medium: balanced
+                                        _ => 20,          // Large: conservative (network latency)
+                                    };
+                                    
+                                    if height_gap > dynamic_threshold {
+                                        println!("[ERR][FORK] stuck={}s behind={} blocks threshold={}", 
+                                                 time_since_last_block, height_gap, dynamic_threshold);
+                                        println!("[INFO][FORK] force_resync local={} network={} nodes={}", 
+                                                 microblock_height, network_height, network_size);
                                         
                                         // Calculate rollback point: last confirmed macroblock boundary
                                         // Macroblocks are Byzantine-finalized, safe to trust
@@ -11412,7 +11445,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // CRITICAL FIX v2.26.8: Initialize last_consensus_round from storage!
             // Without this, restarted nodes try to create macroblocks that already exist
-            let mut last_consensus_round = {
+            // v2.48: Also initialize global LAST_FINALIZED_CONSENSUS_ROUND
+            {
                 // Find the highest existing macroblock using chain height
                 let chain_height = storage.get_chain_height().unwrap_or(0);
                 let max_possible_macroblock = chain_height / 90 + 1;  // +1 for safety margin
@@ -11426,10 +11460,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
                 if highest > 0 {
-                    println!("[CONSENSUS-LISTENER] 📊 Initialized from storage: last macroblock #{} (chain height: {})", highest, chain_height);
+                    // v2.48: Initialize global atomic with round number (mb_index * 90)
+                    let round = highest * 90;
+                    LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
+                    println!("[CONSENSUS-LISTENER] 📊 Initialized from storage: last macroblock #{} round={} (chain height: {})", 
+                             highest, round, chain_height);
                 }
-                highest
-            };
+            }
             
             loop {
                 // EVENT-BASED OPTIMIZATION: Wait for block events instead of polling
@@ -11473,8 +11510,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Height 180: ((180-1)/90)+1 = 1+1 = 2 ✅
                     let macroblock_index = ((current_height - 1) / 90) + 1;
                     
+                    // v2.48 FIX: Check against GLOBAL finalized round, not local variable!
+                    // This ensures all nodes use same source of truth for last finalized MB
+                    let last_finalized_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
+                    let last_finalized_mb = last_finalized_round / 90;
+                    
                     // Check if this is a new consensus round
-                    if macroblock_index > last_consensus_round {
+                    if macroblock_index > last_finalized_mb {
                         // Check if node is synchronized before participating
                         let is_synchronized = NODE_IS_SYNCHRONIZED.load(std::sync::atomic::Ordering::Relaxed);
                         if !is_synchronized {
@@ -11507,8 +11549,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 });
                             }
                             
-                            // Mark as processed to avoid spam, but sync is running in background
-                            last_consensus_round = macroblock_index;
+                            // v2.48 FIX: Do NOT update last_consensus_round here!
+                            // Sync is running in background - round will be updated when MB is saved
+                            // Just continue to avoid spam (sync task will update LAST_FINALIZED_CONSENSUS_ROUND)
                             continue;
                         }
                         
@@ -11595,19 +11638,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 .map(|mb| mb.is_some())
                                                 .unwrap_or(false);
                                             if mb_saved {
+                                                // v2.48 FIX: Update global round ONLY when MB is SAVED!
+                                                let round = mb_idx * 90;
+                                                LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
                                                 if is_info() { 
-                                                    println!("[INFO][ASYNC-CONS] mb={} result=ok saved=true time={:?}", 
-                                                             mb_idx, cons_time); 
+                                                    println!("[INFO][ASYNC-CONS] mb={} result=ok saved=true round={} time={:?}", 
+                                                             mb_idx, round, cons_time); 
                                                 }
                                             } else {
+                                                // MB not saved - DO NOT update round, will retry!
                                                 if is_warn() { 
-                                                    println!("[WARN][ASYNC-CONS] mb={} result=ok saved=false time={:?}", 
+                                                    println!("[WARN][ASYNC-CONS] mb={} result=ok saved=false time={:?} retry=pending", 
                                                              mb_idx, cons_time); 
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            // Consensus failed - NOT FATAL! Production continues, retry next round
+                                            // Consensus failed - DO NOT update round, will retry!
                                             if is_warn() { 
                                                 println!("[WARN][ASYNC-CONS] mb={} result=fail err={} time={:?} retry=next_round", 
                                                          mb_idx, e, cons_time); 
@@ -11616,9 +11663,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     }
                                 });
                                 
-                                // v2.46: Mark as processed IMMEDIATELY to prevent duplicate spawns
-                                // Actual success is tracked in async task above
-                                last_consensus_round = macroblock_index;
+                                // v2.48 FIX: Do NOT update last_consensus_round here!
+                                // Round is updated INSIDE async task ONLY when MB is saved
+                                // This prevents round mismatch between nodes
                                 
                                 // v2.47.1: MULTI-RETRY MISSING MACROBLOCKS
                                 // If previous MB failed to create, retry consensus!
@@ -11763,7 +11810,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     if is_debug() { 
                                         println!("[DBG][CONS] rate_limited tasks={}", current_tasks); 
                                     }
-                                    last_consensus_round = macroblock_index;
+                                    // v2.48 FIX: Do NOT update round when rate limited!
+                                    // Let the task complete and update LAST_FINALIZED_CONSENSUS_ROUND
                                     continue;
                                 }
                                 
@@ -11819,7 +11867,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     }
                                 });
                                 
-                                last_consensus_round = macroblock_index;
+                                // v2.48 FIX: Do NOT update last_consensus_round here!
+                                // Round is updated INSIDE async task when MB is actually received
                             }
                         }
                     }
@@ -12352,9 +12401,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         storage.save_macroblock(macroblock.height, &macroblock).await
             .map_err(|e| format!("Failed to save macroblock: {:?}", e))?;
         
+        // v2.48 FIX: Update global finalized round after successful save
+        let round = macroblock.height * 90;
+        LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
+        
         if is_info() { 
-            println!("[INFO][PFP] saved mb={} type={} blocks={} participants={}", 
-                     macroblock.height, finalization_type, microblock_count, participants.len()); 
+            println!("[INFO][PFP] saved mb={} type={} blocks={} participants={} round={}", 
+                     macroblock.height, finalization_type, microblock_count, participants.len(), round); 
         }
         
         Ok(())
@@ -12692,18 +12745,43 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             };
             
-            // Create OWN reveal for broadcast
-            // v2.40.3: OWN reveals don't need signature (we trust ourselves)
-            // Remote reveals will be verified when signature field is added to P2P
+            // v2.48: Create timestamp BEFORE signature to ensure consistency
+            let reveal_timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            
+            // v2.48: Generate Dilithium signature for reveal (quantum-resistant security)
+            // Message format matches verification: node_id:reveal_data:nonce:timestamp
+            let reveal_data_hex = hex::encode(&reveal_data);
+            let nonce_hex = hex::encode(&nonce);
+            let reveal_message = format!("{}:{}:{}:{}", our_id, reveal_data_hex, nonce_hex, reveal_timestamp);
+            
+            // Use SHA3-256 hash of message for signing (consistent with commit)
+            use sha3::{Sha3_256, Digest};
+            let mut hasher = Sha3_256::new();
+            hasher.update(reveal_message.as_bytes());
+            let reveal_hash = hex::encode(hasher.finalize());
+            
+            // Generate signature using hybrid crypto (Ed25519 + Dilithium per NIST/Cisco)
+            let reveal_signature = Self::generate_consensus_signature(
+                &our_id,
+                &reveal_hash,
+                true,  // Macroblock consensus - use full signature
+                unified_p2p.as_ref()
+            ).await;
+            
+            if is_debug() {
+                println!("[DBG][CONS] reveal_sig_generated node={} sig_len={}", our_id, reveal_signature.len());
+            }
+            
+            // Create OWN reveal with signature
             let reveal = Reveal {
                 node_id: our_id.clone(),
                 reveal_data: reveal_data.clone(),
                 nonce,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                signature: String::new(), // OWN reveal - no need to verify ourselves
+                timestamp: reveal_timestamp,
+                signature: reveal_signature.clone(),
             };
             
             // CRITICAL FIX v2.48: Use round_id (NOT local block_height) for OWN reveals
@@ -12720,9 +12798,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         match p2p.broadcast_consensus_reveal(
                             round_id,
                             our_id.clone(),
-                            hex::encode(&reveal.reveal_data), // Convert Vec<u8> to String
-                            hex::encode(&reveal.nonce),        // CRITICAL: Include nonce for verification
+                            reveal_data_hex.clone(),  // Already hex-encoded above
+                            nonce_hex.clone(),        // Already hex-encoded above
                             reveal.timestamp,
+                            reveal_signature.clone(), // v2.48: Include Dilithium signature!
                             participants  // CRITICAL FIX: Only broadcast to consensus participants (max 1000)
                         ) {
                             Ok(_) => {
@@ -14260,21 +14339,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if is_info() { println!("[INFO][MB_PART] round={} leader={} we={}", 
                                     current_round, leader_id, node_id == leader_id); }
             
-            // Check if WE are the leader for this round
+            // v2.48 FIX: Do NOT call trigger_macroblock_consensus here!
+            // The role (INITIATOR vs PARTICIPANT) is decided ONCE at the start.
+            // If we were PARTICIPANT, we MUST stay PARTICIPANT and wait for leader.
+            // Calling trigger_macroblock_consensus would RESET consensus engine and lose all reveals!
+            //
+            // Previous bug: node005 had 4 reveals, then trigger_macroblock_consensus reset engine to 2.
             if node_id == leader_id {
-                // WE are the leader - create MacroBlock!
-                println!("[INFO][MB_PART] round={} role=LEADER → trigger_consensus", current_round);
-                
-                return Self::trigger_macroblock_consensus(
-                    storage.clone(),
-                    consensus.clone(),
-                    start_height,
-                    end_height,
-                    p2p,
-                    node_id,
-                    node_type,
-                    consensus_rx,
-                ).await;
+                // We WERE selected as leader for this failover round,
+                // BUT we already participated in commit/reveal as PARTICIPANT.
+                // The ACTUAL leader (from should_initiate_consensus) will create MB.
+                // We just wait - don't try to become leader mid-consensus!
+                println!("[INFO][MB_PART] round={} we_are_leader_but_was_participant → wait_not_trigger", current_round);
             }
             
             // NOT leader - wait for MacroBlock from leader
@@ -14967,8 +15043,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // PRODUCTION: Save macroblock to storage only after REAL consensus
         match storage.save_macroblock(macroblock.height, &macroblock).await {
             Ok(_) => {
+                // v2.48 FIX: Update global finalized round IMMEDIATELY after save!
+                let round = macroblock.height * 90;
+                LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
+                
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                if is_info() { println!("[INFO][MB] created h={}", macroblock.height); }
+                if is_info() { println!("[INFO][MB] created h={} round={}", macroblock.height, round); }
                 println!("[INFO][MB] aggregated={} h={}-{} leader={} bft={}", 
                          end_height - start_height + 1, start_height, end_height,
                          consensus_data.leader_id, consensus_data.participants.len());
@@ -16313,6 +16393,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // Save macroblock to storage
         self.storage.save_macroblock(index, &macroblock).await?;
+        
+        // v2.48 FIX: Update global finalized round after successful save
+        let round = index * 90;
+        let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
+        if round > prev_round {
+            LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
+            println!("[INFO][MB-SYNC] finalized_round_updated mb={} round={}", index, round);
+        }
         
         // v2.24: Apply reputation snapshot from macroblock
         // This ensures ALL nodes have IDENTICAL reputation after syncing

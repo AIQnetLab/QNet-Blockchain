@@ -10788,41 +10788,46 @@ async fn run_benchmark_generator(
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc as StdArc;
     
-    // v2.41.2: ADAPTIVE workers based on target TPS
-    // Low TPS = few workers, High TPS = more workers
+    // v2.47: ADAPTIVE workers based on target TPS
+    // Balanced for stability - more workers at high TPS but with rate limiting
     let num_workers = match target_tps {
         0..=10_000 => 2,           // 5K-10K TPS: 2 workers
         10_001..=30_000 => 4,      // 10K-30K TPS: 4 workers
         30_001..=60_000 => 8,      // 30K-60K TPS: 8 workers
-        _ => 16,                    // 60K+ TPS: 16 workers (dangerous!)
+        60_001..=100_000 => 12,    // v2.47: 60K-100K TPS: 12 workers (balanced)
+        _ => 16,                    // v2.47: 100K+ TPS: 16 workers (with delay!)
     };
     
-    // v2.41.2: ADAPTIVE batch size based on target TPS
+    // v2.47: ADAPTIVE batch size based on target TPS
+    // Optimized for stability at ALL TPS levels
     let batch_size = match target_tps {
         0..=10_000 => 500,          // Low TPS: small batches
         10_001..=30_000 => 1_000,   // Medium TPS: medium batches
         30_001..=60_000 => 2_000,   // High TPS: larger batches
-        _ => 5_000,                  // Very high TPS: max batches (dangerous!)
+        60_001..=100_000 => 3_000,  // v2.47: Very high TPS: controlled batches
+        _ => 4_000,                  // v2.47: Extreme TPS: still limited!
     };
     
-    // v2.41.2: RATE LIMITING delay between batches
-    // This prevents overwhelming the mempool!
+    // v2.47: RATE LIMITING delay between batches
+    // CRITICAL: Always have SOME delay to prevent network saturation!
+    // This prevents overwhelming the mempool and QUIC transport!
     let batch_delay_ms = match target_tps {
         0..=10_000 => 50,           // 50ms delay = controlled flow
         10_001..=30_000 => 20,      // 20ms delay
         30_001..=60_000 => 10,      // 10ms delay
-        _ => 0,                      // No delay (dangerous!)
+        60_001..=100_000 => 5,      // v2.47: 5ms delay for 100K TPS
+        _ => 2,                      // v2.47: 2ms minimum (NEVER 0!)
     };
     
-    println!("[BENCHMARK] 🔧 ADAPTIVE MODE v2.41.2 - target: {} TPS", target_tps);
-    println!("[BENCHMARK] 🛡️ Early backpressure + rate limiting = STABLE!");
-    println!("[BENCHMARK] ⚙️ Workers: {}, Batch: {}, Delay: {}ms", num_workers, batch_size, batch_delay_ms);
+    println!("[BENCHMARK] 🔧 ADAPTIVE MODE v2.47 - target: {} TPS", target_tps);
+    println!("[BENCHMARK] 🛡️ Early backpressure + rate limiting + ALWAYS delay = STABLE!");
+    println!("[BENCHMARK] ⚙️ Workers: {}, Batch: {}, Delay: {}ms (NEVER 0!)", num_workers, batch_size, batch_delay_ms);
     
     let tx_per_worker = total_transactions / num_workers as u64;
     // Yield every N transactions to allow block production
     let yield_interval = 50usize;
     
-    println!("[BENCHMARK] 🚀 STABLE generator v2.41.2: {} tx at {} TPS target", total_transactions, target_tps);
+    println!("[BENCHMARK] 🚀 STABLE generator v2.47: {} tx at {} TPS target", total_transactions, target_tps);
     println!("[BENCHMARK] ⚡ Workers: {}, TX/worker: {}, Batch: {}, Yield every: {} TX", 
              num_workers, tx_per_worker, batch_size, yield_interval);
     
