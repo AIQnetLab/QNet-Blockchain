@@ -1,18 +1,19 @@
 use std::path::{Path, PathBuf};
 use std::fs;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, OnceLock};
 use anyhow::{Result, anyhow};
 use pqcrypto_dilithium::dilithium3;
 use pqcrypto_traits::sign::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait, SignedMessage as SignedMessageTrait};
 use serde::{Serialize, Deserialize};
 use sha3::{Sha3_256, Sha3_512, Digest};
-use lazy_static::lazy_static;
 
-// PRODUCTION: Cache writable directory to avoid repeated filesystem checks
-// This is safe as filesystem paths don't change during runtime
-lazy_static! {
-    static ref CACHED_KEY_DIR: Arc<RwLock<Option<PathBuf>>> = Arc::new(RwLock::new(None));
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRODUCTION v2.50: Lock-free key directory cache with OnceLock
+// Set once at first use, then zero-cost reads forever
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cached writable key directory - set once, read forever (lock-free after init)
+static CACHED_KEY_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Manages Dilithium keys for the node
 pub struct DilithiumKeyManager {
@@ -42,15 +43,13 @@ impl DilithiumKeyManager {
     }
     
     /// PRODUCTION-SAFE: Find and create writable directory with fallback paths
+    /// v2.50: Uses OnceLock for lock-free caching after first initialization
     fn ensure_writable_directory(preferred: &Path) -> Result<PathBuf> {
-        // Check cache first to avoid repeated filesystem operations
-        {
-            let cache = match CACHED_KEY_DIR.read() { Ok(g) => g, Err(p) => p.into_inner() };
-            if let Some(cached_dir) = &*cache {
-                // Verify cached directory still exists and is writable
-                if cached_dir.exists() && cached_dir.is_dir() {
-                    return Ok(cached_dir.clone());
-                }
+        // PRODUCTION v2.50: Lock-free cache check (instant after first init)
+        if let Some(cached_dir) = CACHED_KEY_DIR.get() {
+            // Verify cached directory still exists and is writable
+            if cached_dir.exists() && cached_dir.is_dir() {
+                return Ok(cached_dir.clone());
             }
         }
         
@@ -85,9 +84,8 @@ impl DilithiumKeyManager {
                             let _ = fs::remove_file(&test_file); // Cleanup
                             println!("[KEY_MANAGER] ✅ Selected writable directory: {:?}", path);
                             
-                            // Cache the successful directory for future use
-                            let mut cache = match CACHED_KEY_DIR.write() { Ok(g) => g, Err(p) => p.into_inner() };
-                            *cache = Some(path.clone());
+                            // PRODUCTION v2.50: Cache with OnceLock (lock-free after this)
+                            let _ = CACHED_KEY_DIR.set(path.clone());
                             
                             return Ok(path.clone());
                         }

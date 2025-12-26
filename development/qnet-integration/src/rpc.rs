@@ -4391,14 +4391,17 @@ async fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &
         return false;
     }
     
-    // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
-    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-    if crypto_guard.is_none() {
-        let mut crypto = QNetQuantumCrypto::new();
-        let _ = crypto.initialize().await;
-        *crypto_guard = Some(crypto);
-    }
-    let crypto = crypto_guard.as_mut().expect("Crypto initialized above");
+    // PRODUCTION v2.50: Lock-free quantum crypto
+    use crate::node::try_get_quantum_crypto;
+    let crypto = match try_get_quantum_crypto() {
+        Some(c) => c,
+        None => {
+            if crate::node::is_warn() {
+                println!("[WARN][RPC] dilithium_verify_skip reason=crypto_not_initialized");
+            }
+            return false;
+        }
+    };
     
     // Create DilithiumSignature struct from string signature
     let dilithium_sig = crate::quantum_crypto::DilithiumSignature {

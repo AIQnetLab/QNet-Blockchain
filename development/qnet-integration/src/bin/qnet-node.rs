@@ -57,17 +57,12 @@ async fn decode_activation_code_quantum_secure(
     code: &str, 
     selected_node_type: NodeType
 ) -> Result<ActivationCodeData, String> {
-    // Use GLOBAL quantum crypto instance to avoid multiple initializations
-    use qnet_integration::node::GLOBAL_QUANTUM_CRYPTO;
+    // PRODUCTION v2.50: Lock-free quantum crypto
+    use qnet_integration::node::{init_global_quantum_crypto, get_quantum_crypto};
     
-    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-    if crypto_guard.is_none() {
-        let mut crypto = QNetQuantumCrypto::new();
-        crypto.initialize().await
-            .map_err(|e| format!("Failed to initialize quantum crypto: {}", e))?;
-        *crypto_guard = Some(crypto);
-    }
-    let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+    init_global_quantum_crypto().await
+        .map_err(|e| format!("Failed to initialize quantum crypto: {}", e))?;
+    let quantum_crypto = get_quantum_crypto();
 
     // 1. Decrypt activation code using quantum-resistant decryption
     println!("🔓 Decrypting quantum-secure activation code...");
@@ -2578,16 +2573,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
         println!("🔐 Recording quantum-secure activation in QNet blockchain...");
         
-        // Use GLOBAL quantum crypto instance
-        use qnet_integration::node::GLOBAL_QUANTUM_CRYPTO;
-        
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = qnet_integration::quantum_crypto::QNetQuantumCrypto::new();
-            crypto.initialize().await?;
-            *crypto_guard = Some(crypto);
-        }
-        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        // PRODUCTION v2.50: Lock-free quantum crypto
+        use qnet_integration::node::get_quantum_crypto;
+        let quantum_crypto = get_quantum_crypto();
         
         // Decrypt activation code to get payload
         let payload = quantum_crypto.decrypt_activation_code(&activation_code).await?;

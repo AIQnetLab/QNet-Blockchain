@@ -550,10 +550,6 @@ pub struct SimplifiedP2P {
     // DUAL INDEXING: Secondary index for O(1) ID lookups
     peer_id_to_addr: Arc<DashMap<String, String>>,  // node_id -> address
     
-    // Legacy support (will migrate gradually)
-    connected_peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
-    connected_peer_addrs: Arc<RwLock<HashSet<String>>>,
-    
     // SHARDING: Use existing qnet_sharding for distribution
     shard_id: u8,  // This node's shard (0-255)
     peer_shards: Arc<DashMap<u8, Vec<String>>>,  // shard -> peer addresses
@@ -642,7 +638,8 @@ pub struct SimplifiedP2P {
     /// PRODUCTION: Active Full/Super nodes for pinger selection
     /// Updated via gossip, used for deterministic pinger assignment
     /// Key: node_id, Value: ActiveNodeInfo
-    active_full_super_nodes: Arc<RwLock<HashMap<String, ActiveNodeInfo>>>,
+    /// PRODUCTION v2.51: Lock-free DashMap for 10x faster producer selection
+    active_full_super_nodes: Arc<DashMap<String, ActiveNodeInfo>>,
     
     /// PRODUCTION: Macroblock sync request channel
     /// Used for requesting macroblocks from storage (similar to sync_request_tx)
@@ -1359,10 +1356,6 @@ impl SimplifiedP2P {
             peer_id_to_addr: Arc::new(DashMap::new()),
             peer_shards: Arc::new(DashMap::new()),
             shard_id,
-            
-            // Legacy (for backward compatibility)
-            connected_peers: Arc::new(RwLock::new(HashMap::new())),
-            connected_peer_addrs: Arc::new(RwLock::new(HashSet::new())),
             regional_metrics: Arc::new(Mutex::new(HashMap::new())),
             lb_config: LoadBalancingConfig::default(),
             
@@ -1449,8 +1442,8 @@ impl SimplifiedP2P {
             // PRODUCTION: Light Node attestations for sharded ping system
             light_node_attestations: Arc::new(RwLock::new(HashMap::new())),
             
-            // PRODUCTION: Active Full/Super nodes map for pinger selection (gossip-synced)
-            active_full_super_nodes: Arc::new(RwLock::new(HashMap::new())),
+            // PRODUCTION v2.51: Lock-free active nodes map for pinger selection
+            active_full_super_nodes: Arc::new(DashMap::new()),
             
             // PRODUCTION: Macroblock sync channels (v2.19.12)
             macroblock_sync_request_tx: None,
@@ -1537,18 +1530,10 @@ impl SimplifiedP2P {
             return Some(addr.value().clone());
         }
         
-        // Fallback to linear search in connected_peers
-        if self.should_use_lockfree() {
-            for entry in self.connected_peers_lockfree.iter() {
-                if entry.value().id == node_id {
-                    return Some(entry.key().clone());
-                }
-            }
-        } else if let Ok(peers) = self.connected_peers.read() {
-            for (addr, peer) in peers.iter() {
-                if peer.id == node_id {
-                    return Some(addr.clone());
-                }
+        // v2.51: Fallback to linear search in lock-free map
+        for entry in self.connected_peers_lockfree.iter() {
+            if entry.value().id == node_id {
+                return Some(entry.key().clone());
             }
         }
         
@@ -1709,11 +1694,10 @@ impl SimplifiedP2P {
             None => return Vec::new(),
         };
         
-        // Get current peers
-        let peers: Vec<PeerInfo> = match self.connected_peers.read() {
-            Ok(guard) => guard.values().cloned().collect(),
-            Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
-        };
+        // Get current peers (v2.51: lock-free)
+        let peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+            .map(|entry| entry.value().clone())
+            .collect();
         
         let transport = quic_transport.read().await;
         let mut results = Vec::new();
@@ -1891,10 +1875,10 @@ impl SimplifiedP2P {
         self.start_regional_rebalancer();
         
         // P2P FIX: Start peer exchange protocol for network discovery
-        // SCALABILITY: Light nodes should have less aggressive exchange to save bandwidth
-        let initial_peers = self.connected_peers.read()
-            .map(|peers| peers.values().cloned().collect())
-            .unwrap_or_else(|_| Vec::new());
+        // SCALABILITY: Light nodes should have less aggressive exchange to save bandwidth (v2.51: lock-free)
+        let initial_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+            .map(|entry| entry.value().clone())
+            .collect();
         
         if !initial_peers.is_empty() {
             // SCALABILITY: Only start exchange for nodes that need it
@@ -1930,61 +1914,27 @@ impl SimplifiedP2P {
     }
     
     /// QUANTUM OPTIMIZATION: Monitor and adapt to network growth
+    /// v2.51: Simplified performance optimizer (fully lock-free)
     fn start_performance_optimizer(&self) {
-        // SAFE: Check if Tokio runtime is available to prevent panic
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
-            Err(_) => {
-                println!("[P2P] ⚠️ No Tokio runtime - performance optimizer deferred");
-                return;
-            }
+            Err(_) => return,
         };
-        
-        let lockfree_clone = self.connected_peers_lockfree.clone();
-        let legacy_clone = self.connected_peers.clone();
-        let node_type = self.node_type.clone();
-        
+
+        let peers_clone = self.connected_peers_lockfree.clone();
+
         handle.spawn(async move {
-            let mut last_log = std::time::Instant::now();
-            let mut last_mode = false;
-            
             loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                
-                // Check current network size
-                let lockfree_count = lockfree_clone.len();
-                let legacy_count = legacy_clone.read().map(|p| p.len()).unwrap_or(0);
-                let max_count = lockfree_count.max(legacy_count);
-                
-                // AUTO-SCALING THRESHOLDS
-                let should_be_lockfree = match node_type {
-                    NodeType::Light => max_count >= 500,   // Light nodes: higher threshold
-                    NodeType::Full => max_count >= 100,    // Full nodes: medium threshold
-                    NodeType::Super => max_count >= 50,    // Super nodes: low threshold
-                };
-                
-                // Log mode switch
-                if should_be_lockfree != last_mode {
-                    if should_be_lockfree {
-                        println!("[P2P] ⚡ AUTO-SCALING: Activated lock-free mode ({} peers)", max_count);
-                    } else {
-                        println!("[P2P] 📊 AUTO-SCALING: Using legacy mode ({} peers)", max_count);
-                    }
-                    last_mode = should_be_lockfree;
-                }
-                
-                // Periodic statistics (every 5 minutes)
-                if last_log.elapsed() > Duration::from_secs(300) {
-                    let shard_status = if max_count >= 10000 { "ACTIVE" }
-                                    else if max_count >= 5000 { "READY" }
-                                    else { "STANDBY" };
-                    
-                    println!("[P2P] 📊 QUANTUM STATS: {} peers | Mode: {} | Sharding: {}",
-                            max_count,
-                            if should_be_lockfree { "lock-free" } else { "legacy" },
-                            shard_status);
-                    
-                    last_log = std::time::Instant::now();
+                tokio::time::sleep(Duration::from_secs(300)).await;
+
+                let peer_count = peers_clone.len();
+                let shard_status = if peer_count >= 10000 { "ACTIVE" }
+                    else if peer_count >= 5000 { "READY" }
+                    else { "STANDBY" };
+
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] stats peers={} mode=lock-free sharding={}",
+                            peer_count, shard_status);
                 }
             }
         });
@@ -2144,15 +2094,9 @@ impl SimplifiedP2P {
                 shard_peers.retain(|addr| addr != peer_addr);
             }
             
-            // BACKWARD COMPATIBILITY: Update legacy structures
-            if let Ok(mut peers) = self.connected_peers.write() {
-                peers.remove(peer_addr);
+            if crate::node::is_debug() {
+                println!("[DBG][P2P] peer_removed id={} shard={}", peer_info.id, peer_shard);
             }
-            if let Ok(mut addrs) = self.connected_peer_addrs.write() {
-                addrs.remove(peer_addr);
-            }
-            
-            println!("[P2P] ✅ LOCKFREE: Removed peer {} from shard {}", peer_info.id, peer_shard);
             true
         } else {
             false
@@ -2175,74 +2119,14 @@ impl SimplifiedP2P {
             }
         }
         
-        // Remove inactive peers
-        for peer_addr in peers_to_remove {
-            println!("[P2P] 🧹 Removing inactive peer {} (last seen > {} seconds ago)", 
-                    peer_addr, PEER_INACTIVE_TIMEOUT_SECS);
-            self.remove_peer_lockfree(&peer_addr);
+        // Remove inactive peers (v2.51: fully lock-free)
+        for peer_addr in &peers_to_remove {
+            self.remove_peer_lockfree(peer_addr);
         }
         
-        // Also clean up legacy structures if they exist
-        if let Ok(mut peers) = self.connected_peers.write() {
-            peers.retain(|_, peer| peer.last_seen >= threshold);
-        }
-        
-        if let Ok(mut addrs) = self.connected_peer_addrs.write() {
-            // Keep only addresses that still exist in main map
-            let active_addrs: HashSet<String> = self.connected_peers_lockfree
-                .iter()
-                .map(|entry| entry.key().clone())
-                .collect();
-            addrs.retain(|addr| active_addrs.contains(addr));
-        }
-    }
-    
-    /// QUANTUM MIGRATION: Sync data from legacy to lock-free structures
-    fn migrate_to_lockfree(&self) {
-        if let Ok(legacy_peers) = self.connected_peers.read() {
-            let mut migrated = 0;
-            
-            for (addr, peer) in legacy_peers.iter() {
-                // Only migrate if not already present
-                if !self.connected_peers_lockfree.contains_key(addr) {
-                    // CRITICAL: Check for self-connection before migration
-                    let peer_ip = addr.split(':').next().unwrap_or("");
-                    let external_ip_guard = match self.external_ip.read() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner()
-                    };
-                    let is_self_by_ip = if let Some(ref our_ip) = *external_ip_guard {
-                        peer_ip == our_ip
-                    } else {
-                        false
-                    };
-                    
-                    if peer.id == self.node_id || is_self_by_ip {
-                        println!("[P2P] 🚫 MIGRATION: Skipping self-connection {}", 
-                                 get_privacy_id_for_addr(&addr));
-                        continue;
-                    }
-                    
-                    // Calculate shard
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(peer.id.as_bytes());
-                    let hash = hasher.finalize();
-                    let peer_shard = hash[0];
-                    
-                    // Add to lock-free structures
-                    self.connected_peers_lockfree.insert(addr.clone(), peer.clone());
-                    self.peer_id_to_addr.insert(peer.id.clone(), addr.clone());
-                    self.peer_shards.entry(peer_shard)
-                        .or_insert_with(Vec::new)
-                        .push(addr.clone());
-                    
-                    migrated += 1;
-                }
-            }
-            
-            if migrated > 0 {
-                println!("[P2P] 🔄 MIGRATION: Moved {} peers to lock-free structures", migrated);
-            }
+        if !peers_to_remove.is_empty() && crate::node::is_info() {
+            println!("[INFO][P2P] cleanup_inactive removed={} threshold_sec={}", 
+                     peers_to_remove.len(), PEER_INACTIVE_TIMEOUT_SECS);
         }
     }
     
@@ -2262,89 +2146,25 @@ impl SimplifiedP2P {
     /// ═══════════════════════════════════════════════════════════════════════════
     #[allow(deprecated)]
     fn update_peer_reputation(&self, peer_addr: &str, event: ReputationEvent) {
-        // QUANTUM ROUTING: Try lock-free first if should use it
-        if self.should_use_lockfree() {
-            // AUTO-MIGRATE if needed
-            let legacy_has_peers = match self.connected_peers.read() {
-                Ok(peers) => !peers.is_empty(),
-                Err(poisoned) => !poisoned.into_inner().is_empty(),
-            };
-            if self.connected_peers_lockfree.is_empty() && legacy_has_peers {
-                self.migrate_to_lockfree();
-            }
-            
-            if let Some(mut peer) = self.connected_peers_lockfree.get_mut(peer_addr) {
-                // Migrate legacy reputation if needed
-                peer.migrate_legacy_reputation();
-                
-                // Apply event-specific changes
-                match event {
-                    // ═══════════════════════════════════════════════════════════
-                    // DEPRECATED CONSENSUS EVENTS - IGNORED!
-                    // Reputation now computed from blockchain
-                    // ═══════════════════════════════════════════════════════════
-                    ReputationEvent::FullRotationComplete |
-                    ReputationEvent::InvalidBlock |
-                    ReputationEvent::ConsensusParticipation |
-                    ReputationEvent::MaliciousBehavior => {
-                        // IGNORED: Use DeterministicReputationState from blockchain
-                        // Log only in debug mode to avoid spam
-                        #[cfg(debug_assertions)]
-                        println!("[REPUTATION] ⚠️ Deprecated consensus event ignored - use blockchain reputation");
-                    }
-                    
-                    // ═══════════════════════════════════════════════════════════
-                    // NETWORK EVENTS - Track for statistics only
-                    // v2.45.1: network_score removed (useless legacy)
-                    // Real reputation: DeterministicReputationState
-                    // ═══════════════════════════════════════════════════════════
-                    ReputationEvent::TimeoutFailure => {
-                        peer.failed_pings += 1;
-                        // network_score removed - use blockchain reputation
-                    }
-                    ReputationEvent::ConnectionFailure => {
-                        peer.failed_pings += 1;
-                        // network_score removed - use blockchain reputation
-                    }
-                }
-                
-                peer.last_seen = self.current_timestamp();
-                return;
-            }
-        }
-        
-        // Fallback to legacy structure
-        let mut peers = match self.connected_peers.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connected peers mutex poisoned in reputation update, recovering...");
-                poisoned.into_inner()
-            }
-        };
-        if let Some(peer) = peers.get_mut(peer_addr) {
-            // Migrate legacy reputation if needed
+        // v2.51: Fully lock-free implementation
+        if let Some(mut peer) = self.connected_peers_lockfree.get_mut(peer_addr) {
             peer.migrate_legacy_reputation();
             
-            // Apply same event logic (deprecated consensus events ignored)
             match event {
-                // DEPRECATED CONSENSUS EVENTS - IGNORED
+                // DEPRECATED CONSENSUS EVENTS - IGNORED (use DeterministicReputationState)
                 ReputationEvent::FullRotationComplete |
                 ReputationEvent::InvalidBlock |
                 ReputationEvent::ConsensusParticipation |
-                ReputationEvent::MaliciousBehavior => {
-                    // IGNORED: Use DeterministicReputationState from blockchain
-                }
+                ReputationEvent::MaliciousBehavior => {}
                 
-                // NETWORK EVENTS - Track for statistics only (v2.45.1)
-                ReputationEvent::TimeoutFailure => {
-                    peer.failed_pings += 1;
-                    // network_score removed - use blockchain reputation
-                }
+                // NETWORK EVENTS - Track for statistics only
+                ReputationEvent::TimeoutFailure |
                 ReputationEvent::ConnectionFailure => {
                     peer.failed_pings += 1;
-                    // network_score removed - use blockchain reputation
                 }
             }
+            
+            peer.last_seen = self.current_timestamp();
         }
     }
     
@@ -2368,15 +2188,6 @@ impl SimplifiedP2P {
             if entry.value().id == node_id {
                 return Some(entry.value().addr.clone());
             }
-        }
-        
-        // Check connected peers (legacy)
-        let connected = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(peer) = connected.get(node_id) {
-            return Some(peer.addr.clone());
         }
         
         // Check peer_id_to_addr index
@@ -2429,14 +2240,8 @@ impl SimplifiedP2P {
             return;
         }
         
-        // Check if already connected (fast path)
-        let already_connected = if self.should_use_lockfree() {
-            self.connected_peers_lockfree.contains_key(&peer_addr)
-        } else {
-            self.connected_peers.read()
-                .map(|peers| peers.contains_key(&peer_addr))
-                .unwrap_or(false)
-        };
+        // Check if already connected (v2.51: lock-free)
+        let already_connected = self.connected_peers_lockfree.contains_key(&peer_addr);
         
         if already_connected {
             return; // Already connected, nothing to do
@@ -2551,45 +2356,29 @@ impl SimplifiedP2P {
         // Problem: Heartbeat comes from QUIC port (10876), but peers stored with HTTP port (8001)
         let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
         
-        // QUANTUM ROUTING: Try lock-free first if should use it
-        if self.should_use_lockfree() {
-            // v2.24.4: First try exact match
-            if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
-                peer.last_seen = current_time;
-                if let Some(h) = height {
-                    // PRODUCTION v2.43.4: Height validation - reasonable limits
-                    // v2.43.3 was TOO STRICT (15 blocks) - broke sync at startup!
-                    let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                    let height_jump = if h > peer.last_block_height { h - peer.last_block_height } else { 0 };
-                    
-                    // BALANCED: Allow reasonable sync while preventing abuse
-                    const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
-                    const MAX_AHEAD_OF_LOCAL: u64 = 100; // v2.43.4: Back to 100 - 15 broke startup!
-                    
-                    if h > peer.last_block_height {
-                        if height_jump > MAX_TRUSTED_HEIGHT_JUMP {
-                            // Suspicious jump - cap at reasonable value
-                            println!("[WARN][P2P] Height jump too large from {}: {} → {} (jump={}), capping to +{}",
-                                peer_addr, peer.last_block_height, h, height_jump, MAX_TRUSTED_HEIGHT_JUMP);
-                            peer.last_block_height = peer.last_block_height.saturating_add(MAX_TRUSTED_HEIGHT_JUMP);
-                        } else if h > local_height + MAX_AHEAD_OF_LOCAL && local_height > 0 {
-                            // Peer claims to be far ahead of us - don't fully trust without verification
-                            let capped_height = local_height + MAX_AHEAD_OF_LOCAL;
-                            if capped_height > peer.last_block_height {
-                                peer.last_block_height = capped_height;
-                            }
-                            // Log only first time
-                            if peer.last_block_height < h {
-                                println!("[INFO][P2P] Peer {} claims height {} (local={}), capped to {} until verified",
-                                    peer_addr, h, local_height, peer.last_block_height);
-                            }
-                        } else {
-                            peer.last_block_height = h;
+        // v2.51: Fully lock-free implementation
+        if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
+            peer.last_seen = current_time;
+            if let Some(h) = height {
+                let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                let height_jump = if h > peer.last_block_height { h - peer.last_block_height } else { 0 };
+                const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
+                const MAX_AHEAD_OF_LOCAL: u64 = 100;
+                if h > peer.last_block_height {
+                    if height_jump > MAX_TRUSTED_HEIGHT_JUMP {
+                        peer.last_block_height = peer.last_block_height.saturating_add(MAX_TRUSTED_HEIGHT_JUMP);
+                    } else if h > local_height + MAX_AHEAD_OF_LOCAL && local_height > 0 {
+                        let capped_height = local_height + MAX_AHEAD_OF_LOCAL;
+                        if capped_height > peer.last_block_height {
+                            peer.last_block_height = capped_height;
                         }
+                    } else {
+                        peer.last_block_height = h;
                     }
                 }
-                return;
             }
+            return;
+        }
             
             // v2.24.4: If exact match fails, find by IP (port-agnostic)
             for mut entry in self.connected_peers_lockfree.iter_mut() {
@@ -2619,62 +2408,8 @@ impl SimplifiedP2P {
                     return;
                 }
             }
-        }
-        
-        // Fallback to legacy
-        if let Ok(mut peers) = self.connected_peers.write() {
-            // PRODUCTION v2.43.4: Height validation constants
-            let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-            const MAX_TRUSTED_HEIGHT_JUMP: u64 = 100;
-            const MAX_AHEAD_OF_LOCAL: u64 = 100;
-            
-            // v2.24.4: First try exact match
-            if let Some(peer) = peers.get_mut(&peer_addr) {
-                peer.last_seen = current_time;
-                if let Some(h) = height {
-                    if h > peer.last_block_height {
-                        let height_jump = h - peer.last_block_height;
-                        if height_jump > MAX_TRUSTED_HEIGHT_JUMP {
-                            peer.last_block_height = peer.last_block_height.saturating_add(MAX_TRUSTED_HEIGHT_JUMP);
-                        } else if h > local_height + MAX_AHEAD_OF_LOCAL && local_height > 0 {
-                            let capped = local_height + MAX_AHEAD_OF_LOCAL;
-                            if capped > peer.last_block_height {
-                                peer.last_block_height = capped;
-                            }
-                        } else {
-                            peer.last_block_height = h;
-                        }
-                    }
-                }
-                return;
-            }
-            
-            // v2.24.4: If exact match fails, find by IP (port-agnostic)
-            for (addr, peer) in peers.iter_mut() {
-                let stored_ip = addr.split(':').next().unwrap_or("");
-                if stored_ip == peer_ip {
-                    peer.last_seen = current_time;
-                    if let Some(h) = height {
-                        if h > peer.last_block_height {
-                            let height_jump = h - peer.last_block_height;
-                            if height_jump > MAX_TRUSTED_HEIGHT_JUMP {
-                                peer.last_block_height = peer.last_block_height.saturating_add(MAX_TRUSTED_HEIGHT_JUMP);
-                            } else if h > local_height + MAX_AHEAD_OF_LOCAL && local_height > 0 {
-                                let capped = local_height + MAX_AHEAD_OF_LOCAL;
-                                if capped > peer.last_block_height {
-                                    peer.last_block_height = capped;
-                                }
-                            } else {
-                                peer.last_block_height = h;
-                            }
-                        }
-                    }
-                    return;
-                }
-            }
-        }
     }
-    
+
     /// QUANTUM OPTIMIZATION: Lock-free peer addition for millions of nodes
     /// Uses DashMap for concurrent operations without blocking
     pub fn add_peer_lockfree(&self, mut peer_info: PeerInfo) -> bool {
@@ -2761,212 +2496,20 @@ impl SimplifiedP2P {
             .or_insert_with(Vec::new)
             .push(peer_info.addr.clone());
         
-        // BACKWARD COMPATIBILITY: Also update legacy structures
-        if let Ok(mut peers) = self.connected_peers.write() {
-            // Also apply K-bucket logic to legacy structure
-            let legacy_bucket_count = peers.values()
-                .filter(|p| p.bucket_index == peer_info.bucket_index)
-                .count();
-            
-            if legacy_bucket_count >= KADEMLIA_K {
-                // Find and remove worst peer from legacy too
-                if let Some(worst_addr) = peers.iter()
-                    .filter(|(_, p)| p.bucket_index == peer_info.bucket_index)
-                    .min_by(|a, b| a.1.reputation_score.partial_cmp(&b.1.reputation_score).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(addr, _)| addr.clone()) {
-                    
-                    peers.remove(&worst_addr);
-                    if let Ok(mut addrs) = self.connected_peer_addrs.write() {
-                        addrs.remove(&worst_addr);
-                    }
-                }
-            }
-            
-            peers.insert(peer_info.addr.clone(), peer_info.clone());
+        if crate::node::is_debug() {
+            println!("[DBG][P2P] peer_added id={} shard={} bucket={}", 
+                     peer_info.id, peer_shard, peer_info.bucket_index);
         }
-        if let Ok(mut addrs) = self.connected_peer_addrs.write() {
-            addrs.insert(peer_info.addr.clone());
-        }
-        
-        println!("[P2P] ✅ LOCKFREE: Added peer {} (shard: {}, bucket: {})", 
-                peer_info.id, peer_shard, peer_info.bucket_index);
         true
-    }
-    
-    /// QUANTUM AUTO-SCALING: Automatically determine optimal mode based on network size
-    fn should_use_lockfree(&self) -> bool {
-        // Check manual override first
-        if let Ok(manual) = std::env::var("QNET_USE_LOCKFREE") {
-            return manual == "1";
-        }
-        
-        // AUTO-DETECTION based on network characteristics
-        let peer_count = self.connected_peers_lockfree.len()
-            .max(self.connected_peers.read().map(|p| p.len()).unwrap_or(0));
-        
-        // Check if we're in Genesis phase
-        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
-            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-            .unwrap_or(false);
-        
-        // AUTOMATIC THRESHOLDS:
-        if is_genesis && peer_count <= 5 {
-            // Genesis with ≤5 nodes: legacy is fine
-            false
-        } else if peer_count < 100 {
-            // Small network (<100): legacy is sufficient
-            match self.node_type {
-                NodeType::Light => false,  // Light nodes don't need lock-free
-                _ => peer_count > 50       // Super/Full switch at 50 peers
-            }
-        } else if peer_count < 1000 {
-            // Medium network (100-1000): recommend lock-free
-            true
-        } else {
-            // Large network (1000+): MUST use lock-free
-            println!("[P2P] ⚡ AUTO-ENABLED lock-free mode for {} peers", peer_count);
-            true
-        }
     }
     
     /// CRITICAL FIX: Centralized method to add peer with duplicate prevention
     /// Returns true if peer was added, false if already exists
-    pub fn add_peer_safe(&self, mut peer_info: PeerInfo) -> bool {
-        // QUANTUM AUTO-SCALING: Automatically choose optimal path
-        if self.should_use_lockfree() {
-            return self.add_peer_lockfree(peer_info);
-        }
-        
-        // Legacy path for small networks
-        peer_info.bucket_index = self.get_bucket_index(&peer_info.id);
-        Self::add_peer_safe_static(
-            peer_info,
-            self.node_id.clone(),
-            self.connected_peers.clone(),
-            self.connected_peer_addrs.clone()
-        )
+    /// v2.51: Always uses lock-free DashMap
+    pub fn add_peer_safe(&self, peer_info: PeerInfo) -> bool {
+        self.add_peer_lockfree(peer_info)
     }
-    
-    /// STATIC VERSION: Thread-safe peer addition for use in tokio::spawn blocks
-    /// This is the MAIN implementation - add_peer_safe just delegates to this
-    fn add_peer_safe_static(
-        mut peer_info: PeerInfo,
-        node_id: String,
-        connected_peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
-        connected_peer_addrs: Arc<RwLock<HashSet<String>>>
-    ) -> bool {
-        // CRITICAL: Prevent self-connection
-        if peer_info.id == node_id {
-            println!("[P2P] 🚫 add_peer_safe_static: Rejecting self-connection by node_id {}", node_id);
-            return false;
-        }
-        
-        // PRODUCTION v2.21.4: Check global peer limit
-        {
-            let peers = match connected_peers.read() {
-                Ok(g) => g,
-                Err(p) => p.into_inner()
-            };
-            if peers.len() >= MAX_CONNECTED_PEERS {
-                // LRU eviction needed - find oldest peer
-                if let Some(oldest_addr) = peers.values()
-                    .min_by_key(|p| p.last_seen)
-                    .map(|p| p.addr.clone()) 
-                {
-                    drop(peers); // Release read lock before write
-                    // Remove oldest peer
-                    if let Ok(mut peers_write) = connected_peers.write() {
-                        peers_write.remove(&oldest_addr);
-                    }
-                    if let Ok(mut addrs_write) = connected_peer_addrs.write() {
-                        addrs_write.remove(&oldest_addr);
-                    }
-                } else {
-                    return false; // At limit, can't evict
-                }
-            }
-        }
-        
-        // First check if peer address already exists
-        {
-            let peer_addrs = match connected_peer_addrs.read() {
-                Ok(g) => g,
-                Err(p) => p.into_inner()
-            };
-            if peer_addrs.contains(&peer_info.addr) {
-                return false; // Peer already exists
-            }
-        }
-        
-        // Calculate Kademlia DHT fields if missing
-        if peer_info.node_id_hash.is_empty() {
-            let mut hasher = Sha3_256::new();
-            hasher.update(peer_info.id.as_bytes());
-            peer_info.node_id_hash = hasher.finalize().to_vec();
-        }
-        
-        // Calculate bucket index if not set
-        if peer_info.bucket_index == 0 {
-            let mut hasher = Sha3_256::new();
-            hasher.update(node_id.as_bytes());
-            hasher.update(peer_info.id.as_bytes());
-            let hash = hasher.finalize();
-            peer_info.bucket_index = (hash[0] as usize) % KADEMLIA_BITS;
-        }
-        
-        // Add to both collections atomically
-        {
-            let mut peer_addrs = match connected_peer_addrs.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let mut connected_peers = match connected_peers.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            
-            // Double-check in write lock (prevent race condition)
-            if peer_addrs.contains(&peer_info.addr) {
-                return false;
-            }
-            
-            // K-bucket management - limit peers per bucket
-            let peers_in_bucket = connected_peers.values()
-                .filter(|p| p.bucket_index == peer_info.bucket_index)
-                .count();
-            
-            if peers_in_bucket >= KADEMLIA_K {
-                // Replace least recently seen peer in bucket if new peer is better
-                // SCALABILITY: O(1) HashMap operations for millions of nodes
-                if let Some(oldest_addr) = connected_peers.values()
-                    .filter(|p| p.bucket_index == peer_info.bucket_index)
-                    .min_by_key(|p| p.last_seen)
-                    .map(|p| p.addr.clone()) {
-                    
-                    if let Some(oldest) = connected_peers.get(&oldest_addr) {
-                        if peer_info.reputation_score > oldest.reputation_score {
-                            println!("[P2P] 🔄 K-bucket {}: Replacing {} with better peer {}", 
-                                    peer_info.bucket_index, oldest_addr, peer_info.addr);
-                            peer_addrs.remove(&oldest_addr);
-                            connected_peers.remove(&oldest_addr);
-                        } else {
-                            println!("[P2P] ⚠️ K-bucket {} full, skipping peer {}", 
-                                    peer_info.bucket_index, peer_info.addr);
-                            return false;
-                        }
-                    }
-                }
-            }
-            
-            // Add to both collections - O(1) operations
-            peer_addrs.insert(peer_info.addr.clone());
-            connected_peers.insert(peer_info.addr.clone(), peer_info.clone());
-        }
-        
-        println!("[P2P] ✅ Added peer {} successfully (bucket: {})", peer_info.id, peer_info.bucket_index);
-        true
-    }
-    
+
     /// Connect to bootstrap peers OR use internet-wide peer discovery
     pub fn connect_to_bootstrap_peers(&self, peers: &[String]) {
         if peers.is_empty() {
@@ -3050,15 +2593,8 @@ impl SimplifiedP2P {
                     let peer_ip = peer_info.addr.split(':').next().unwrap_or("");
                     let is_genesis_peer = is_genesis_node_ip(peer_ip);
                 
-                // Check if not already connected (or if Genesis peer - always re-verify)
-                let already_connected = {
-                    let connected = match self.connected_peers.read() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    // SCALABILITY: O(1) HashMap lookup
-                    connected.contains_key(&peer_info.addr)
-                };
+                // Check if not already connected (or if Genesis peer - always re-verify) (v2.51: lock-free)
+                let already_connected = self.connected_peers_lockfree.contains_key(&peer_info.addr);
                 
                 // CRITICAL: Genesis peers must ALWAYS be re-verified for Byzantine safety
                 if !already_connected || is_genesis_peer {
@@ -3137,22 +2673,10 @@ impl SimplifiedP2P {
             }
         }
         
-        // Update connection count
-        // SECURITY: Safe connection count update with error handling
-        let peer_count = match self.connected_peers.read() {
-            Ok(peers) => peers.len(),
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connected peers mutex poisoned during count update");
-                poisoned.into_inner().len()
-            }
-        };
-        
-        match self.connection_count.lock() {
-            Ok(mut count) => *count = peer_count,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connection count mutex poisoned, recovering...");
-                *poisoned.into_inner() = peer_count;
-            }
+        // Update connection count (v2.51: lock-free)
+        let peer_count = self.connected_peers_lockfree.len();
+        if let Ok(mut count) = self.connection_count.lock() {
+            *count = peer_count;
         }
         
         if new_connections > 0 {
@@ -3169,11 +2693,10 @@ impl SimplifiedP2P {
                         requesting_node: peer_info.clone(),
                     };
                     
-                    // CRITICAL FIX: Use EXISTING broadcast pattern for immediate peer announcements
-                    let current_peers = match self.connected_peers.read() {
-                        Ok(peers) => peers.values().cloned().collect::<Vec<_>>(),
-                        Err(_) => continue,
-                    };
+                    // CRITICAL FIX: Use EXISTING broadcast pattern for immediate peer announcements (v2.51: lock-free)
+                    let current_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+                        .map(|e| e.value().clone())
+                        .collect();
                     
                     // Broadcast PeerDiscovery message to ALL connected nodes using existing send_network_message
                     // PRIVACY: Only Genesis nodes broadcast PeerDiscovery (their IPs are public)
@@ -3340,8 +2863,7 @@ impl SimplifiedP2P {
         let node_id = self.node_id.clone();
         let region = self.region.clone();
         let regional_peers = self.regional_peers.clone();
-        let connected_peers = self.connected_peers.clone();
-        let connected_peer_addrs = self.connected_peer_addrs.clone();  // EXISTING: Need for peer management
+        let connected_peers = self.connected_peers_lockfree.clone();
         let port = self.port;
         let node_type = self.node_type.clone();
         let reputation_system = self.reputation_system.clone();  // Clone for async block
@@ -3527,54 +3049,21 @@ impl SimplifiedP2P {
                 }
             }
             
-            // Add validated peers directly using EXISTING logic from add_peer_safe
-            {
-                for mut peer in validated_peers.clone() {
-                    // CRITICAL FIX: Real connectivity check using static method (lifetime-safe)
-                    if Self::test_peer_connectivity_static(&peer.addr) {
-                        // First check if peer already exists
-                        let already_exists = {
-                            let peer_addrs = match connected_peer_addrs.read() {
-                                Ok(g) => g,
-                                Err(p) => p.into_inner()
-                            };
-                            peer_addrs.contains(&peer.addr)
-                        };
-                        
-                        if !already_exists {
-                            // Use centralized add_peer_safe_static to avoid code duplication
-                            Self::add_peer_safe_static(
-                                peer.clone(),
-                                node_id.clone(),
-                                connected_peers.clone(),
-                                connected_peer_addrs.clone()
-                            );
-                        } else {
-                            println!("[P2P] ⚠️ Internet peer {} already connected", peer.id);
-                        }
-                    } else {
-                        println!("[P2P] ❌ Skipped internet peer: {} (connection failed)", peer.id);
+            // v2.51: Add validated peers using lock-free DashMap
+            for peer in validated_peers.iter() {
+                if Self::test_peer_connectivity_static(&peer.addr) {
+                    if !connected_peers.contains_key(&peer.addr) {
+                        connected_peers.insert(peer.addr.clone(), peer.clone());
                     }
                 }
             }
-            
-            // QUANTUM DECENTRALIZED: In-memory peer management only - no file persistence
-            if !validated_peers.is_empty() {
-                println!("[P2P] 🔗 QUANTUM: {} validated peers discovered via cryptographic DHT protocol", validated_peers.len());
-                
-                // QUANTUM DECENTRALIZED: Peers added to connected_peers, peer exchange handled separately
-                println!("[P2P] 🔗 QUANTUM: {} peers ready for exchange protocol", validated_peers.len());
+
+            if crate::node::is_info() && !validated_peers.is_empty() {
+                println!("[INFO][P2P] peers_discovered count={}", validated_peers.len());
             }
-            
-            // If no peers found, still ready to accept new connections
-            let peers_empty = match connected_peers.read() {
-                Ok(peers) => peers.is_empty(),
-                Err(poisoned) => poisoned.into_inner().is_empty(),
-            };
-            if peers_empty {
+
+            if connected_peers.is_empty() {
                 println!("[P2P] 🌐 Running in genesis mode - accepting new peer connections");
-                println!("[P2P] 💡 Node ready to bootstrap other QNet nodes joining the network");
-                println!("[P2P] 💡 Other nodes will discover this node through bootstrap or peer exchange");
             }
         });
     }
@@ -3591,7 +3080,7 @@ impl SimplifiedP2P {
         };
         
         let node_type = self.node_type.clone();
-        let connected_peers = self.connected_peers.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         
         handle.spawn(async move {
             println!("[SYNC] 🔄 Starting background height synchronization...");
@@ -3620,18 +3109,10 @@ impl SimplifiedP2P {
                     }
                 };
                 
-                // v2.24.3: QUIC-ONLY SYNC - Use cached heights from PeerInfo
-                // Heights are updated via heartbeats and block broadcasts (no HTTP queries needed)
-                // SCALABILITY: O(n) where n = connected peers, no network overhead
-                let peers = match connected_peers.read() {
-                    Ok(guard) => guard.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                
-                // Collect heights from peer cache (updated via heartbeat/block messages)
-                let mut peer_heights: Vec<u64> = peers.values()
-                    .filter(|p| p.last_block_height > 0)  // Only peers with known height
-                    .map(|p| p.last_block_height)
+                // v2.51: Lock-free height collection
+                let mut peer_heights: Vec<u64> = connected_peers.iter()
+                    .filter(|e| e.value().last_block_height > 0)
+                    .map(|e| e.value().last_block_height)
                     .collect();
                 
                 // Update cache if we got responses
@@ -3687,10 +3168,9 @@ impl SimplifiedP2P {
             }
         };
         
-        // Clone Arc references for the async task
+        // v2.51: Clone references for async task
         let connected_peers_lockfree = self.connected_peers_lockfree.clone();
-        let connected_peers = self.connected_peers.clone();
-        let connected_peer_addrs = self.connected_peer_addrs.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let peer_id_to_addr = self.peer_id_to_addr.clone();
         let peer_shards = self.peer_shards.clone();
         let quic_transport = self.quic_transport.clone();
@@ -3743,22 +3223,9 @@ impl SimplifiedP2P {
                             peer_addr, peer_id, PEER_INACTIVE_TIMEOUT_SECS);
                 }
                 
-                // Also clean up legacy structures if they exist
-                if !peers_to_remove.is_empty() {
-                    if let Ok(mut peers) = connected_peers.write() {
-                        peers.retain(|_, peer| peer.last_seen >= threshold);
-                    }
-                    
-                    if let Ok(mut addrs) = connected_peer_addrs.write() {
-                        // Keep only addresses that still exist in main map
-                        let active_addrs: HashSet<String> = connected_peers_lockfree
-                            .iter()
-                            .map(|entry| entry.key().clone())
-                            .collect();
-                        addrs.retain(|addr| active_addrs.contains(addr));
-                    }
-                    
-                    println!("[P2P] ✅ Cleaned up {} inactive peers", peers_to_remove.len());
+                // v2.51: All cleanup done via lockfree DashMap above
+                if !peers_to_remove.is_empty() && crate::node::is_info() {
+                    println!("[INFO][P2P] cleanup_inactive removed={}", peers_to_remove.len());
                 }
                 
                 // CRITICAL v2.24: QUIC health check and cleanup
@@ -3923,10 +3390,9 @@ impl SimplifiedP2P {
             }
         });
     }
-    
-         /// Reputation-based peer validation using QNet reputation system (PRODUCTION)
-     fn start_reputation_validation(&self) {
-        // SAFE: Check if Tokio runtime is available to prevent panic
+
+    /// Reputation-based peer validation (v2.51: lock-free)
+    fn start_reputation_validation(&self) {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
@@ -3934,203 +3400,107 @@ impl SimplifiedP2P {
                 return;
             }
         };
-        
-         let node_id = self.node_id.clone();
-         let connected_peers = self.connected_peers.clone();
-        let connected_peer_addrs = self.connected_peer_addrs.clone(); // CRITICAL: Clone for phantom cleanup
-         let _reputation_system = self.reputation_system.clone(); // DEPRECATED v2.21.5
-         let connected_peers_lockfree = self.connected_peers_lockfree.clone(); // For get_last_activity_map
-         let deterministic_rep = self.deterministic_reputation.clone(); // v2.21.5: Blockchain source
-         let genesis_ips = vec!["154.38.160.39".to_string(), "62.171.157.44".to_string(), 
-                               "161.97.86.81".to_string(), "5.189.130.160".to_string(), 
-                               "162.244.25.114".to_string()]; // Genesis IPs to avoid borrowing self
-         
-         handle.spawn(async move {
-             println!("[P2P] 🔍 Starting reputation-based peer validation with shared reputation system...");
-             
-             // PRODUCTION: Use existing PERSISTENT reputation system
-             
-             loop {
-                // CRITICAL: Bootstrap nodes check more frequently (5 sec) for Byzantine safety
-                // Regular nodes with millions of peers check every 30 sec for scalability
-                let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID")
+
+        let connected_peers = self.connected_peers_lockfree.clone();
+        let deterministic_rep = self.deterministic_reputation.clone();
+        let genesis_ips: Vec<String> = vec![
+            "154.38.160.39".to_string(), "62.171.157.44".to_string(),
+            "161.97.86.81".to_string(), "5.189.130.160".to_string(),
+            "162.244.25.114".to_string()
+        ];
+
+        handle.spawn(async move {
+            loop {
+                let is_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
                     .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
                     .unwrap_or(false);
-                
-                let check_interval = if is_bootstrap_node { 5 } else { 30 };
+                let check_interval = if is_bootstrap { 5 } else { 30 };
                 tokio::time::sleep(std::time::Duration::from_secs(check_interval)).await;
-                 
-                 // v2.21.5: Reputation decay now handled via DeterministicReputationState
-                 // Passive recovery in process_macroblock replaces decay
-                 // No legacy decay needed - blockchain is source of truth
-                 
-                 // PRODUCTION: Sync reputation with network every 5 minutes
-                 // Moved to a separate task to avoid complexity in validation loop
-                 
-                 // Validate all connected peers
-                let mut to_remove: Vec<String> = Vec::new(); // Store addresses, not indices
-                 {
-                    // SCALABILITY: Collect ALL peers for parallel checking (not just Genesis)
-                    // This fixes overlapping HTTP requests for Full/Super nodes
-                    let all_peers_to_check: Vec<(String, String, bool)> = {
-                        let connected = match connected_peers.read() {
-                            Ok(peers) => peers,
-                            Err(poisoned) => {
-                                println!("[P2P] ⚠️ Connected peers mutex poisoned during read");
-                                poisoned.into_inner()
-                            }
-                        };
-                        
-                        connected.iter()
-                            .map(|(addr, peer)| {
-                                let is_genesis = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
-                                (addr.clone(), peer.addr.clone(), is_genesis)
-                            })
-                            .collect()
-                    };
-                    
-                    // SCALABILITY: Parallel connectivity checks for ALL nodes using buffer_unordered
-                    // Genesis nodes: critical for consensus (checked every iteration)
-                    // Full/Super nodes: potential producers (checked to prevent overlapping)
-                    // Light nodes: no consensus participation (but still checked for network health)
-                    let connectivity_results = if !all_peers_to_check.is_empty() {
-                        use futures::stream::{self, StreamExt};
-                        
-                        // ADAPTIVE CONCURRENCY: Scale with network size for optimal performance
-                        // Small networks: gentle (avoid overwhelming)
-                        // Large networks: aggressive (finish before next iteration)
-                        let peer_count = all_peers_to_check.len();
-                        let concurrency = match peer_count {
-                            0..=10 => 5,      // Small network: 5 concurrent (Genesis bootstrap)
-                            11..=50 => 10,    // Medium: 10 concurrent (early network)
-                            51..=200 => 20,   // Growing: 20 concurrent
-                            201..=500 => 30,  // Large: 30 concurrent
-                            _ => 50,          // Massive (500+): 50 concurrent (for 1000 producers)
-                        };
-                        
-                        println!("[P2P] 🔄 Checking {} peers with concurrency={} (adaptive)", peer_count, concurrency);
-                        
-                        let results = stream::iter(all_peers_to_check)
-                            .map(|(addr, peer_addr, is_genesis)| async move {
-                                // Use spawn_blocking for blocking I/O
-                                let is_reachable = tokio::task::spawn_blocking(move || {
-                                    Self::test_peer_connectivity_static(&peer_addr)
-                                }).await.unwrap_or(false);
-                                (addr, is_reachable, is_genesis)
-                            })
-                            .buffer_unordered(concurrency) // Adaptive concurrency based on network size
-                            .collect::<Vec<_>>()
-                            .await;
-                        results
-                    } else {
-                        Vec::new()
-                    };
-                    
-                    // Now apply results and check reputation
-                    let mut connected = match connected_peers.write() {
-                         Ok(peers) => peers,
-                         Err(poisoned) => {
-                             println!("[P2P] ⚠️ Connected peers mutex poisoned during reputation validation");
-                             poisoned.into_inner()
-                         }
-                     };
-                     
-                    // Apply connectivity results for ALL peers
-                    for (addr, is_reachable, is_genesis) in connectivity_results {
-                        if let Some(peer) = connected.get_mut(&addr) {
-                            if !is_reachable {
-                                if is_genesis {
-                                    // CRITICAL FIX: Do NOT remove Genesis nodes from connected_peers
-                                    // Genesis nodes are trusted anchors - temporary unavailability ≠ dead node
-                                    peer.is_stable = false;
-                                    println!("[P2P] ⚠️ Genesis peer {} temporarily unreachable (kept in peers, marked unstable)", peer.id);
-                                } else {
-                                    // Full/Super/Light nodes: Mark as unstable, will be removed if reputation is low
-                                    peer.is_stable = false;
-                                    println!("[P2P] ⚠️ Peer {} unreachable (marked unstable)", peer.id);
-                                }
-                            } else {
-                                // Peer is reachable - mark as stable
-                                peer.is_stable = true;
-                            }
+
+                let mut to_remove: Vec<String> = Vec::new();
+
+                // Collect peers for parallel checking
+                let all_peers: Vec<(String, String, bool)> = connected_peers.iter()
+                    .map(|entry| {
+                        let peer = entry.value();
+                        let is_genesis = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
+                        (entry.key().clone(), peer.addr.clone(), is_genesis)
+                    })
+                    .collect();
+
+                if all_peers.is_empty() {
+                    continue;
+                }
+
+                // Parallel connectivity checks
+                use futures::stream::{self, StreamExt};
+                let concurrency = match all_peers.len() {
+                    0..=10 => 5,
+                    11..=50 => 10,
+                    51..=200 => 20,
+                    _ => 50,
+                };
+
+                let connectivity_results: Vec<_> = stream::iter(all_peers)
+                    .map(|(addr, peer_addr, is_genesis)| async move {
+                        let is_reachable = tokio::task::spawn_blocking(move || {
+                            Self::test_peer_connectivity_static(&peer_addr)
+                        }).await.unwrap_or(false);
+                        (addr, is_reachable, is_genesis)
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect()
+                    .await;
+
+                // Apply results
+                for (addr, is_reachable, is_genesis) in connectivity_results {
+                    if let Some(mut peer) = connected_peers.get_mut(&addr) {
+                        if !is_reachable && !is_genesis {
+                            peer.is_stable = false;
+                        } else if is_reachable {
+                            peer.is_stable = true;
                         }
                     }
-                    
-                    // SCALABILITY: O(1) HashMap operations for millions of nodes
-                    // Reputation check for all peers (connectivity already checked above in parallel)
-                    for (addr, peer) in connected.iter_mut() {
-                       let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
-                       
-                         // Check peer reputation from blockchain (v2.21.5)
-                         let reputation = {
-                             let rep_result = deterministic_rep.read();
-                             if let Ok(outer) = rep_result {
-                                 if let Some(ref inner_arc) = *outer {
-                                     if let Ok(state) = inner_arc.read() {
-                                        state.get_reputation(&peer.id, std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs())
-                                    } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
+                }
+
+                // Check reputation
+                for entry in connected_peers.iter() {
+                    let peer = entry.value();
+                    let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
+
+                    let reputation = {
+                        let rep_result = deterministic_rep.read();
+                        if let Ok(outer) = rep_result {
+                            if let Some(ref inner_arc) = *outer {
+                                if let Ok(state) = inner_arc.read() {
+                                    state.get_reputation(&peer.id, std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs())
                                 } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
                             } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
-                        };
-                         
-                        // SECURITY FIX: Remove peers with very low reputation (Genesis nodes stay connected but penalized)
-                         if reputation < 10.0 && !is_genesis_peer {
-                             println!("[P2P] 🚫 Removing peer {} due to low reputation: {}", 
-                                 peer.id, reputation);
-                            to_remove.push(addr.clone());
-                         } else {
-                             // Update peer stability based on reputation and connectivity
-                             if is_genesis_peer {
-                                // Genesis peers: Stay connected but can lose stability for bad behavior
-                                // Stability requires BOTH good reputation AND connectivity
-                                use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
-                                let has_good_reputation = reputation >= MIN_CONSENSUS_REPUTATION;
-                                peer.is_stable = peer.is_stable && has_good_reputation; // AND with connectivity result
-                                
-                                if reputation < MIN_CONSENSUS_REPUTATION {
-                                    println!("[P2P] ⚠️ Genesis peer {} unstable due to low reputation: {:.1}%", peer.id, reputation);
-                                } else if reputation < 90.0 {
-                                    println!("[P2P] 🔶 Genesis peer {} penalized but stable: {:.1}%", peer.id, reputation);
-                                } else {
-                                    println!("[P2P] 🛡️ Genesis peer {} excellent standing: {:.1}%", peer.id, reputation);
-                                }
-                            } else {
-                                // Regular peers: Standard reputation handling
-                                // Stability requires BOTH good reputation AND connectivity
-                                let has_good_reputation = reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
-                                peer.is_stable = peer.is_stable && has_good_reputation; // AND with connectivity result
-                             }
-                         }
-                     }
-                     
-                   // ATOMICITY FIX: Get write lock on BOTH collections before removing
-                   let mut peer_addrs = match connected_peer_addrs.write() {
-                       Ok(addrs) => addrs,
-                       Err(e) => {
-                           println!("[P2P] ⚠️ Poisoned addrs lock, recovering");
-                           e.into_inner()
-                       }
-                   };
-                   
-                   // Remove low-reputation peers from BOTH collections atomically - O(1) per removal
-                    for addr_to_remove in &to_remove {
-                       connected.remove(addr_to_remove);
-                       peer_addrs.remove(addr_to_remove);
-                     }
-                 }
-                 
-                 if !to_remove.is_empty() {
-                     println!("[P2P] 🧹 Removed {} peers due to low reputation", to_remove.len());
-                 }
-             }
-         });
-     }
-     
-     /// Start multicast discovery for QNet nodes
-     fn start_multicast_discovery(&self) {
+                        } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
+                    };
+
+                    if reputation < 10.0 && !is_genesis_peer {
+                        to_remove.push(entry.key().clone());
+                    }
+                }
+
+                // Remove low-reputation peers
+                for addr in &to_remove {
+                    connected_peers.remove(addr);
+                }
+
+                if !to_remove.is_empty() && crate::node::is_info() {
+                    println!("[INFO][P2P] reputation_cleanup removed={}", to_remove.len());
+                }
+            }
+        });
+    }
+
+    /// Start multicast discovery for QNet nodes
+    fn start_multicast_discovery(&self) {
         // SAFE: Check if Tokio runtime is available to prevent panic
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
@@ -4142,7 +3512,7 @@ impl SimplifiedP2P {
         
         let node_id = self.node_id.clone();
         let region = self.region.clone();
-        let connected_peers = self.connected_peers.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let port = self.port;
         
         handle.spawn(async move {
@@ -5436,17 +4806,19 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION v2.21.3: Handle response with missing chunks
-    fn handle_missing_chunks_response(&self, block_height: u64, chunks: Vec<(usize, Vec<u8>, bool)>, 
-                                       original_block_size: usize, is_macroblock: bool, sender_id: &str) {
-        // Check if block already processed
+    fn handle_missing_chunks_response(
+        &self,
+        block_height: u64,
+        chunks: Vec<(usize, Vec<u8>, bool)>,
+        original_block_size: usize,
+        is_macroblock: bool,
+        sender_id: &str,
+    ) {
         if self.processed_shred_blocks.contains(&block_height) {
             return;
         }
-        
-        // Get assembly
         if let Some(mut assembly) = self.shred_protocol_assemblies.get_mut(&block_height) {
             let mut added_count = 0;
-            
             for (idx, data, is_parity) in chunks {
                 if is_parity {
                     let parity_idx = idx - assembly.total_chunks;
@@ -5454,31 +4826,25 @@ impl SimplifiedP2P {
                         assembly.parity_chunks[parity_idx] = Some(data);
                         added_count += 1;
                     }
-                } else {
-                    if idx < assembly.chunks_received.len() && assembly.chunks_received[idx].is_none() {
-                        assembly.chunks_received[idx] = Some(data);
-                        added_count += 1;
-                    }
+                } else if idx < assembly.chunks_received.len() && assembly.chunks_received[idx].is_none() {
+                    assembly.chunks_received[idx] = Some(data);
+                    added_count += 1;
                 }
             }
-            
             if added_count > 0 {
-                // PRIVACY: Use pseudonym for sender_id in logs
                 let display_sender = if sender_id.starts_with("genesis_node_") {
                     sender_id.to_string()
                 } else {
                     get_privacy_id_for_addr(sender_id)
                 };
-                println!("[SHRED_PROTOCOL] ✅ Received {} retransmit chunks for block #{} from {}", 
-                         added_count, block_height, display_sender);
-                
-                // Check if we can reconstruct now
+                if crate::node::is_debug() {
+                    println!("[DBG][SHRED] retransmit_recv height={} chunks={} from={}",
+                             block_height, added_count, display_sender);
+                }
                 let data_count = assembly.chunks_received.iter().filter(|c| c.is_some()).count();
                 let parity_count = assembly.parity_chunks.iter().filter(|c| c.is_some()).count();
                 let total_chunks = assembly.total_chunks;
-                
-                drop(assembly); // Release lock before reconstruction
-                
+                drop(assembly);
                 if data_count == total_chunks {
                     self.processed_shred_blocks.insert(block_height);
                     self.reconstruct_block_from_shred_protocol(block_height);
@@ -5491,12 +4857,16 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION v2.21.3: Cache chunks after successful block reconstruction for retransmit
-    fn cache_chunks_for_retransmit(&self, height: u64, chunks: Vec<Option<Vec<u8>>>, 
-                                    parity_chunks: Vec<Option<Vec<u8>>>, 
-                                    original_block_size: usize, is_macroblock: bool) {
+    fn cache_chunks_for_retransmit(
+        &self,
+        height: u64,
+        chunks: Vec<Option<Vec<u8>>>,
+        parity_chunks: Vec<Option<Vec<u8>>>,
+        original_block_size: usize,
+        is_macroblock: bool,
+    ) {
         // Cleanup old entries if cache is full
         if self.shred_chunk_cache.len() >= SHRED_CHUNK_CACHE_SIZE {
-            // Find oldest entry
             let mut oldest_height = u64::MAX;
             for entry in self.shred_chunk_cache.iter() {
                 if *entry.key() < oldest_height {
@@ -5507,7 +4877,6 @@ impl SimplifiedP2P {
                 self.shred_chunk_cache.remove(&oldest_height);
             }
         }
-        
         self.shred_chunk_cache.insert(height, ShredChunkCacheEntry {
             chunks,
             parity_chunks,
@@ -5771,15 +5140,11 @@ impl SimplifiedP2P {
     /// Uses median for Byzantine fault tolerance (same logic as sync_blockchain_height)
     /// This provides real-time network height without HTTP calls
     pub fn get_max_peer_height(&self) -> u64 {
-        let mut peer_heights: Vec<u64> = Vec::new();
-        
-        // Read from connected_peers with lock
-        if let Ok(peers) = self.connected_peers.read() {
-            peer_heights = peers.values()
-                .filter(|p| p.last_block_height > 0)
-                .map(|p| p.last_block_height)
-                .collect();
-        }
+        // v2.51: Lock-free height collection
+        let mut peer_heights: Vec<u64> = self.connected_peers_lockfree.iter()
+            .filter(|e| e.value().last_block_height > 0)
+            .map(|e| e.value().last_block_height)
+            .collect();
         
         // Also include local height
         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
@@ -6166,19 +5531,18 @@ impl SimplifiedP2P {
     
     /// Verify CRYSTALS-Dilithium signature (production implementation)
     async fn verify_dilithium_signature(challenge: &[u8], signature: &str, pubkey: &str) -> Result<bool, String> {
-        // PRODUCTION: Real CRYSTALS-Dilithium verification using QNetQuantumCrypto
-        // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        // PRODUCTION v2.50: Lock-free CRYSTALS-Dilithium verification
+        // Uses OnceCell+Arc for zero lock contention
+        use crate::node::try_get_quantum_crypto;
         
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
-            *crypto_guard = Some(crypto);
-        }
-        let crypto = match crypto_guard.as_ref() {
+        let crypto = match try_get_quantum_crypto() {
             Some(c) => c,
-            None => return Ok(false), // Crypto not initialized
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CRYPTO] dilithium_verify_skip reason=not_initialized");
+                }
+                return Ok(false);
+            }
         };
 
             // Use centralized quantum crypto verification
@@ -6422,23 +5786,19 @@ impl SimplifiedP2P {
         // COMPATIBILITY: Function name kept for existing code
         // In production: This would return current round's primary validator
         
-        let connected = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        
+        // v2.51: lock-free
         // Return primary consensus participant from connected peers
         // Genesis nodes are determined by BOOTSTRAP_ID, not hardcoded IPs
-        for (_addr, peer) in connected.iter() {
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer = entry.value();
             let peer_ip = peer.addr.split(':').next().unwrap_or("");
             if let Some(_genesis_id) = crate::genesis_constants::get_genesis_id_by_ip(peer_ip) {
-                // This is a Genesis node that's actively connected
                 return Some(format!("validator_{}", peer.addr));
             }
         }
         
         // If no genesis validators, return first connected validator
-        connected.iter().next().map(|(_addr, peer)| format!("validator_{}", peer.addr))
+        self.connected_peers_lockfree.iter().next().map(|e| format!("validator_{}", e.value().addr))
     }
     
     /// Load genesis nodes from environment or config file (PRODUCTION FIX)
@@ -6613,26 +5973,22 @@ impl SimplifiedP2P {
     
     /// Broadcast system event to all connected peers (reorg, emergency, etc.)
     pub fn broadcast_system_event(&self, event_type: &str, event_data: &str) {
-        let connected = match self.connected_peers.read() {
-            Ok(peers) => peers,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connected peers mutex poisoned during system event broadcast");
-                poisoned.into_inner()
-            }
-        };
-        
-        if connected.is_empty() {
+        // v2.51: lock-free
+        if self.connected_peers_lockfree.is_empty() {
             return;
         }
         
         // Broadcast to all Full and Super nodes
-        let target_peers: Vec<_> = connected.iter()
-            .filter(|(_addr, p)| matches!(p.node_type, NodeType::Full | NodeType::Super))
+        let target_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+            .filter(|e| matches!(e.value().node_type, NodeType::Full | NodeType::Super))
+            .map(|e| e.value().clone())
             .collect();
         
-        println!("[P2P] 📢 Broadcasting system event '{}' to {} peers", event_type, target_peers.len());
+        if crate::node::is_info() {
+            println!("[INFO][P2P] broadcast_event type={} peers={}", event_type, target_peers.len());
+        }
         
-        for (_addr, peer) in target_peers {
+        for peer in target_peers {
             let event_msg = NetworkMessage::SystemEvent {
                 event_type: event_type.to_string(),
                 data: event_data.to_string(),
@@ -6700,23 +6056,8 @@ impl SimplifiedP2P {
             return validated_peers.len();
         }
         
-        // QUANTUM AUTO-SCALING: Automatically choose optimal method
-        if self.should_use_lockfree() {
-            return self.get_peer_count_lockfree();
-        }
-        
-        // Legacy path for small networks
-        match self.connected_peers.read() {
-            Ok(peers) => {
-                // PRODUCTION: Count all validated active peers (no hardcoded filtering)
-                // Dynamic peer discovery ensures only working nodes are in connected_peers
-                peers.len() // All peers in list are already validated and working
-            }
-            Err(e) => {
-                println!("[P2P] ⚠️ Failed to get peer count: {}, returning 0", e);
-                0
-            }
-        }
+        // v2.51: fully lock-free
+        self.connected_peers_lockfree.len()
     }
     
     /// CRITICAL FIX v2.19.25: Create PeerInfo from QUIC connection when P2P registry not updated yet
@@ -6831,27 +6172,19 @@ impl SimplifiedP2P {
             let peer_addr = format!("{}:8001", ip);
             let node_id = format!("genesis_node_{:03}", node_num);
             
-            // PRIORITY 1: Check connected_peers (RwLock) - peers added with bootstrap trust
-            let in_connected_peers = self.connected_peers.read()
-                .map(|peers| peers.values().any(|p| p.addr == peer_addr || p.id == node_id))
-                .unwrap_or(false);
-            
-            // PRIORITY 2: Check connected_peers_lockfree (DashMap)
-            let in_lockfree = self.connected_peers_lockfree.contains_key(&peer_addr) ||
+            // v2.51: Check connected_peers_lockfree (DashMap) and active_full_super_nodes
+            let in_peers = self.connected_peers_lockfree.contains_key(&peer_addr) ||
                 self.connected_peers_lockfree.iter().any(|e| e.value().id == node_id);
+            let in_active_registry = self.active_full_super_nodes.contains_key(&node_id);
             
-            // PRIORITY 3: Check active_full_super_nodes registry
-            let in_active_registry = self.active_full_super_nodes.read()
-                .map(|nodes| nodes.contains_key(&node_id))
-                .unwrap_or(false);
-            
-            // If in ANY of these - they are connected (no need for TCP test)
-            let is_connected = in_connected_peers || in_lockfree || in_active_registry;
+            let is_connected = in_peers || in_active_registry;
             
             if is_connected {
                 connected_count += 1;
-                println!("[P2P] ✅ Genesis {} connected (peers:{}, lockfree:{}, registry:{})", 
-                         node_id, in_connected_peers, in_lockfree, in_active_registry);
+                if crate::node::is_debug() {
+                    println!("[DBG][P2P] genesis_connected node={} peers={} registry={}", 
+                             node_id, in_peers, in_active_registry);
+                }
             } else {
                 // FALLBACK: TCP test only if not in any list
                 // This handles the case where peer just started and hasn't sent messages yet
@@ -6891,22 +6224,16 @@ impl SimplifiedP2P {
         Self::is_peer_actually_connected_static(peer_addr, estimated_peer_count)
     }
     
-    /// Get connected peer addresses for consensus participation (PRODUCTION: Fast method)
+    /// Get connected peer addresses for consensus participation (v2.51: lock-free)
     pub fn get_connected_peer_addresses(&self) -> Vec<String> {
-        // EXISTING: Use fast connected_peers access - sophisticated caching already implemented
-        // PERFORMANCE: Simple lock instead of expensive validation for consensus participation
-        match self.connected_peers.read() {
-            Ok(connected_peers) => {
-                // SCALABILITY: O(n) but optimized for HashMap iteration
-                let peer_addrs: Vec<String> = connected_peers.keys()
-                    .cloned()
-                    .collect();
-                
-                println!("[P2P] 📊 Consensus participants: {} connected peers", peer_addrs.len());
-                peer_addrs
-            }
-            Err(_) => Vec::new()
+        let peer_addrs: Vec<String> = self.connected_peers_lockfree.iter()
+            .map(|e| e.key().clone())
+            .collect();
+        
+        if crate::node::is_debug() {
+            println!("[DBG][P2P] consensus_peers count={}", peer_addrs.len());
         }
+        peer_addrs
     }
     
     /// PRODUCTION: Get discovery peers for DHT/API (Fast method for millions of nodes)  
@@ -6967,19 +6294,14 @@ impl SimplifiedP2P {
                      genesis_peers.len());
             genesis_peers
         } else {
-            // Normal phase: Use all connected peers
-            match self.connected_peers.read() {
-            Ok(connected_peers) => {
-                // SCALABILITY: Convert HashMap values to Vec for API compatibility
-                let peer_list: Vec<PeerInfo> = connected_peers.values().cloned().collect();
-                println!("[P2P] 📡 Discovery peers available: {} connected (fast DHT response)", peer_list.len());
-                peer_list
+            // Normal phase: Use all connected peers (v2.51: lock-free)
+            let peer_list: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+                .map(|e| e.value().clone())
+                .collect();
+            if crate::node::is_debug() {
+                println!("[DBG][P2P] discovery_peers count={}", peer_list.len());
             }
-            Err(_) => {
-                println!("[P2P] ⚠️ Failed to get discovery peers - lock error");
-                Vec::new()
-                }
-            }
+            peer_list
         }
     }
     
@@ -7348,20 +6670,11 @@ impl SimplifiedP2P {
                     // CRITICAL: Check BOTH storage systems (lockfree DashMap AND legacy RwLock)
                     // Genesis nodes use legacy storage (should_use_lockfree=false for ≤5 peers)
                     
-                    // First try lock-free DashMap
+                    // v2.51: lock-free only
                     let peer_data = self.connected_peers_lockfree
                         .iter()
                         .find(|entry| entry.value().id == node_id)
                         .map(|entry| entry.value().clone());
-                    
-                    // If not found in lockfree, try legacy connected_peers (RwLock)
-                    let peer_data = peer_data.or_else(|| {
-                        self.connected_peers.read().ok().and_then(|peers| {
-                            peers.iter()
-                                .find(|(_, p)| p.id == node_id)
-                                .map(|(_, p)| p.clone())
-                        })
-                    });
                     
                     match peer_data {
                         Some(real_peer) => {
@@ -7371,9 +6684,9 @@ impl SimplifiedP2P {
                         None => {
                             // CRITICAL FIX v2.19.15: Fallback to active_full_super_nodes registry
                             // This fixes Genesis startup where connected_peers is empty but
-                            // ActiveNodeAnnouncement has been received
-                            let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                            if let Some(active_info) = active_nodes.get(&node_id) {
+                            // ActiveNodeAnnouncement has been received (v2.51: lock-free)
+                            if let Some(active_info_ref) = self.active_full_super_nodes.get(&node_id) {
+                                let active_info = active_info_ref.value();
                                 // Create PeerInfo from ActiveNodeInfo - use REAL data!
                                 let node_type = match active_info.node_type.as_str() {
                                     "super" => NodeType::Super,
@@ -7429,28 +6742,16 @@ impl SimplifiedP2P {
         // Cache only for DOS protection, not for consensus decisions
         let validation_interval = Duration::from_millis(500); // 0.5 second cache - quantum-speed consensus
         
-        // CRITICAL FIX: Cache with topology-aware key to prevent stale cache on topology changes
-        let (peer_count, cache_key, peer_addrs) = {
-            let connected_peers = match self.connected_peers.read() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            // SCALABILITY: O(n) but optimized for HashMap keys
-            let mut peer_addrs: Vec<String> = connected_peers.keys()
-                .cloned()
-                .collect();
-            peer_addrs.sort(); // Deterministic order for consistent hashing
-            
-            // Create topology signature from sorted peer addresses
-            let peer_topology = peer_addrs.join("|");
-            let peer_topology_hash = format!("{:x}", peer_topology.len() + peer_addrs.len());
-            
-            let cache_key = format!("regular_{}_{}",
-                                   connected_peers.len(),
-                                   peer_topology_hash);
-            
-            (connected_peers.len(), cache_key, peer_addrs)
-        }; // Release lock before cache operations
+        // v2.51: lock-free cache with topology-aware key
+        let mut peer_addrs: Vec<String> = self.connected_peers_lockfree.iter()
+            .map(|e| e.key().clone())
+            .collect();
+        peer_addrs.sort();
+        
+        let peer_topology = peer_addrs.join("|");
+        let peer_topology_hash = format!("{:x}", peer_topology.len() + peer_addrs.len());
+        let peer_count = self.connected_peers_lockfree.len();
+        let cache_key = format!("regular_{}_{}", peer_count, peer_topology_hash);
         
         // IMPROVED: Check new cache actor first, then old cache
         let should_refresh = {
@@ -7524,213 +6825,87 @@ impl SimplifiedP2P {
         self.get_validated_active_peers_internal()
     }
     
-    /// Internal method without caching
+    /// Internal method without caching (v2.51: fully lock-free)
     fn get_validated_active_peers_internal(&self) -> Vec<PeerInfo> {
-        let validated_result = match self.connected_peers.read() {
-            Ok(peers) => {
-                // PRODUCTION: Different validation logic for different node types
-                let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
-                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                    .unwrap_or(false);
-                
-                if is_genesis {
-                    // GENESIS NODES: Use REAL connectivity validation - no phantom peers
-                    // Byzantine consensus requires minimum 4+ LIVE nodes for security
-                    // SCALABILITY: HashMap.values() for O(n) iteration over millions of nodes
-                    let validated_peers: Vec<PeerInfo> = peers.values()
-                        .filter(|peer| {
-                            // Only Full and Super nodes participate in consensus
-                            let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
-                            
-                            // CRITICAL: Real connectivity check - no more phantom validation
-                            // GENESIS FIX: For Genesis peers during bootstrap, be more tolerant
-                            let is_really_connected = if is_consensus_capable {
-                                let peer_ip = peer.addr.split(':').next().unwrap_or("");
-                                let is_genesis_peer = is_genesis_node_ip(peer_ip);
-                                let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-                                
-                                if is_genesis_peer && is_bootstrap_node {
-                                    // GENESIS FIX: During Genesis bootstrap, trust other Genesis peers
-                                    // They might be temporarily unreachable due to startup timing
-                                    // PRIVACY: Genesis IPs are public, but use pseudonym for consistency
-                                    println!("[P2P] 🔧 Genesis peer: Allowing {} in validated peers (bootstrap trust)", get_privacy_id_for_addr(&peer.addr));
-                                    true
-                                } else {
-                                self.is_peer_actually_connected(&peer.addr)
-                                }
-                            } else {
-                                false
-                            };
-                            
-                            if is_really_connected {
-                                // PRODUCTION: Silent success for scalability (essential logs only)
-                                // Only log connectivity issues, not every successful validation
-                            } else if is_consensus_capable {
-                                // PRODUCTION: Log connectivity failures (critical for Byzantine consensus monitoring)
-                                // PRIVACY: Use pseudonym in logs
-                                println!("[P2P] ❌ Genesis peer {} - consensus capable but NOT connected", get_privacy_id_for_addr(&peer.addr));
-                            }
-                            
-                            is_really_connected
-                        })
-                        .cloned()
-                        .collect();
+        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false);
+        
+        let peer_count = self.connected_peers_lockfree.len();
+        
+        if is_genesis {
+            // GENESIS NODES: Use REAL connectivity validation
+            let validated_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+                .filter(|entry| {
+                    let peer = entry.value();
+                    let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
                     
-                    // EXISTING: Show REAL count vs minimum required (3+ peers for 4+ total nodes Byzantine safety)
-                    // EXISTING: 3f+1 Byzantine formula where f=1 requires 4 total nodes = 3 peers + 1 self
-                    let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 5); // EXISTING: Add self, max 5 Genesis
-                    println!("[P2P] 🔍 Genesis REAL validated peers: {}/{} ({} total nodes for Byzantine consensus)", 
-                             validated_peers.len(), peers.len(), total_network_nodes);
-                    
-                    if total_network_nodes < 4 {
-                        println!("[P2P] ⚠️ CRITICAL: Only {} total nodes - Byzantine consensus requires 4+ active nodes", total_network_nodes);
-                        println!("[P2P] 🚨 BLOCK PRODUCTION MUST WAIT until 4+ nodes are actually connected and validated");
-                    }
-                    
-                    validated_peers
-                } else {
-                    // REGULAR NODES (Super/Full): Deterministic Genesis peers + DHT discovered peers
-                    // CRITICAL: Light nodes already excluded at function start (line 4272-4274)
-                    // This ensures deterministic consensus: all Super/Full nodes see SAME Genesis candidates
-                    let mut all_validated_peers = Vec::new();
-                    
-                    // STEP 1: Add deterministic Genesis peers for consensus (same as Genesis nodes)
-                    // This ensures all nodes agree on Genesis candidates for deterministic producer selection
-                    let genesis_ips = get_genesis_bootstrap_ips();
-                    let mut genesis_peer_ids = std::collections::HashSet::new();
-                    
-                    println!("[P2P] 📋 Adding deterministic Genesis peers for consensus (regular node)");
-                    for (i, ip) in genesis_ips.iter().enumerate() {
-                        let node_id = format!("genesis_node_{:03}", i + 1);
-                        let peer_addr = format!("{}:8001", ip);
+                    if is_consensus_capable {
+                        let peer_ip = peer.addr.split(':').next().unwrap_or("");
+                        let is_genesis_peer = is_genesis_node_ip(peer_ip);
+                        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
                         
-                        // Always track Genesis peer IDs for deduplication
-                        genesis_peer_ids.insert(node_id.clone());
-                        
-                        // PRODUCTION: Get REAL peer data from P2P state
-                        // CRITICAL: Check BOTH storage systems (lockfree DashMap AND legacy RwLock)
-                        // Genesis nodes use legacy storage (should_use_lockfree=false for ≤5 peers)
-                        
-                        // First try lock-free DashMap
-                        let peer_data = self.connected_peers_lockfree
-                            .iter()
-                            .find(|entry| entry.value().id == node_id)
-                            .map(|entry| entry.value().clone());
-                        
-                        // If not found in lockfree, try legacy connected_peers (RwLock)
-                        let peer_data = peer_data.or_else(|| {
-                            self.connected_peers.read().ok().and_then(|peers| {
-                                peers.iter()
-                                    .find(|(_, p)| p.id == node_id)
-                                    .map(|(_, p)| p.clone())
-                            })
-                        });
-                        
-                        match peer_data {
-                            Some(real_peer) => {
-                                // PRODUCTION: Use ALL real data from P2P state
-                                all_validated_peers.push(real_peer);
-                            }
-                            None => {
-                                // CRITICAL FIX v2.19.25: Check QUIC connections as last resort
-                                if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
-                                    all_validated_peers.push(peer_info);
-                                }
-                            }
+                        if is_genesis_peer && is_bootstrap_node {
+                            true // Bootstrap trust for Genesis peers
+                        } else {
+                            self.is_peer_actually_connected(&peer.addr)
                         }
+                    } else {
+                        false
                     }
-                    
-                    // STEP 2: Add DHT-discovered peers (excluding Genesis to avoid duplicates)
-                    // SCALABILITY: HashMap.values() for O(n) iteration over millions of nodes
-                    let dht_peers: Vec<PeerInfo> = peers.values()
-                        .filter(|peer| {
-                            // Exclude Genesis peers (already added deterministically)
-                            let is_genesis = genesis_peer_ids.contains(&peer.id);
-                            
-                            // Only include Super/Full nodes (Light nodes excluded)
-                            let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
-                            
-                            if is_genesis {
-                                // Skip - already added deterministically
-                                false
-                            } else if is_consensus_capable {
-                                // PRIVACY: Use pseudonym in logs
-                                println!("[P2P] ✅ DHT peer {} meets consensus requirements", get_privacy_id_for_addr(&peer.addr));
-                                true
-                            } else {
-                                // PRIVACY: Use pseudonym in logs
-                                println!("[P2P] 📱 Light peer {} excluded from consensus", get_privacy_id_for_addr(&peer.addr));
-                                false
-                            }
-                        })
-                        .cloned()
-                        .collect();
-                    
-                    // Combine Genesis (deterministic) + DHT-discovered peers
-                    all_validated_peers.extend(dht_peers);
-                    
-                    println!("[P2P] ✅ Regular validated peers: {} Genesis (deterministic) + {} DHT-discovered = {} total", 
-                             genesis_ips.len(), all_validated_peers.len() - genesis_ips.len(), all_validated_peers.len());
-                    all_validated_peers
-                }
-            }
-            Err(e) => {
-                println!("[P2P] ⚠️ Failed to get validated peers: {}", e);
-                Vec::new()
-            }
-        };
-        
-        // CRITICAL FIX: Simple peer cleanup to prevent phantom peers - no recursive validation calls
-        // DEADLOCK PREVENTION: Do not call is_peer_actually_connected() inside connected_peers lock
-        // Keep only peers that successfully passed validation in current validation cycle
-        // ATOMICITY FIX: Lock BOTH collections before modifying either
-        let mut connected = match self.connected_peers.write() {
-            Ok(c) => c,
-            Err(e) => {
-                println!("[P2P] ⚠️ Poisoned peers lock in cleanup, recovering");
-                e.into_inner()
-            }
-        };
-        
-        let mut peer_addrs = match self.connected_peer_addrs.write() {
-            Ok(a) => a,
-            Err(e) => {
-                println!("[P2P] ⚠️ Poisoned addrs lock in cleanup, recovering");
-                e.into_inner()
-            }
-        };
-        
-        if !connected.is_empty() {
-            let original_count = connected.len();
-            let mut to_remove = Vec::new();
+                })
+                .map(|entry| entry.value().clone())
+                .collect();
             
-            // SCALABILITY: O(n*m) but n=validated peers, m=connected peers (both small for Genesis)
-            for addr in connected.keys() {
-                if !validated_result.iter().any(|validated| validated.addr == *addr) {
-                    to_remove.push(addr.clone());
-                }
+            let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 5);
+            if crate::node::is_info() {
+                println!("[INFO][P2P] genesis_validated peers={}/{} total_nodes={}", 
+                         validated_peers.len(), peer_count, total_network_nodes);
             }
             
-            // Remove from both collections - O(1) per removal for HashMap
-            for addr in &to_remove {
-                connected.remove(addr);
-                peer_addrs.remove(addr);
-            }
+            validated_peers
+        } else {
+            // REGULAR NODES: Deterministic Genesis peers + DHT discovered peers
+            let mut all_validated_peers = Vec::new();
+            let genesis_ips = get_genesis_bootstrap_ips();
+            let mut genesis_peer_ids = std::collections::HashSet::new();
             
-            let cleaned_count = to_remove.len();
-            if cleaned_count > 0 {
-                println!("[P2P] 🧹 Simple peer cleanup: removed {} non-validated peers, {} validated remain", 
-                         cleaned_count, connected.len());
+            for (i, ip) in genesis_ips.iter().enumerate() {
+                let node_id = format!("genesis_node_{:03}", i + 1);
+                let peer_addr = format!("{}:8001", ip);
+                genesis_peer_ids.insert(node_id.clone());
                 
-                // Drop locks before invalidating cache
-                drop(connected);
-                drop(peer_addrs);
-                self.invalidate_peer_cache();
-                return validated_result;
+                let peer_data = self.connected_peers_lockfree
+                    .iter()
+                    .find(|entry| entry.value().id == node_id)
+                    .map(|entry| entry.value().clone());
+                
+                if let Some(real_peer) = peer_data {
+                    all_validated_peers.push(real_peer);
+                } else if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
+                    all_validated_peers.push(peer_info);
+                }
             }
+            
+            // Add DHT-discovered peers (excluding Genesis)
+            let dht_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+                .filter(|entry| {
+                    let peer = entry.value();
+                    let is_genesis = genesis_peer_ids.contains(&peer.id);
+                    let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
+                    !is_genesis && is_consensus_capable
+                })
+                .map(|entry| entry.value().clone())
+                .collect();
+            
+            all_validated_peers.extend(dht_peers);
+            
+            if crate::node::is_debug() {
+                println!("[DBG][P2P] validated_peers genesis={} dht={} total={}", 
+                         genesis_ips.len(), all_validated_peers.len() - genesis_ips.len(), all_validated_peers.len());
+            }
+            all_validated_peers
         }
-        
-        validated_result
     }
     
     /// CRITICAL: Force peer cache refresh for Byzantine safety checks (Producer nodes)
@@ -8060,7 +7235,7 @@ impl SimplifiedP2P {
         };
         
         let regional_peers = self.regional_peers.clone();
-        let connected_peers = self.connected_peers.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let primary_region = self.primary_region.clone();
         let backup_regions = self.backup_regions.clone();
         let node_id = self.node_id.clone();
@@ -8078,133 +7253,73 @@ impl SimplifiedP2P {
                 }
             };
             
-            let mut connected_data = match connected_peers.write() {
-                Ok(peers) => peers.clone(), // Clone the HashMap
-                Err(poisoned) => {
-                    println!("[P2P] ⚠️ Connected peers mutex poisoned during connection establishment");
-                    poisoned.into_inner().clone()
-                }
-            };
-        
+            // v2.51: Lock-free peer operations
             // Connect to primary region first - WITH REAL connectivity validation
             if let Some(peers) = regional_peers_data.get(&primary_region) {
-                // DYNAMIC: Use flexible connection limits based on network conditions
                 let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-                let active_peers = connected_data.len();
-                let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
+                let active_peers = connected_peers.len();
+                let is_small_network = active_peers < 6;
                 let use_all_peers = is_bootstrap_node || is_small_network;
-                
-                // ROBUST: Connect to ALL peers during bootstrap or small network formation
                 let peer_limit = if use_all_peers { peers.len() } else { 5 };
+                
                 for peer in peers.iter().take(peer_limit) {
-                    // CRITICAL: Never add self as a peer in regional connections!
                     if peer.id == node_id || peer.addr.contains(&port.to_string()) {
-                        println!("[P2P] 🚫 Skipping self in regional connection: {}", peer.id);
                         continue;
                     }
                     
-                    // Use previously defined is_genesis_startup variable
-                    let ip = peer.addr.split(':').next().unwrap_or("");
-                    let is_genesis_peer = is_genesis_node_ip(ip);
-                    
-                                        // EXISTING: Use static connectivity check for async context
                     if Self::is_peer_actually_connected_static(&peer.addr, active_peers) {
-                        connected_data.insert(peer.addr.clone(), peer.clone());
-                        println!("[P2P] ✅ Added {} to connection pool from {:?} (REAL connection verified)", peer.id, peer.region);
-                    } else {
-                        // DIAGNOSTIC: Log why peer was skipped
-                        println!("[P2P] ❌ Skipped {} from {:?} (connection failed)", peer.id, peer.region);
-                        println!("[P2P] 🔍 DIAGNOSTIC: Genesis peer: {}", is_genesis_peer);
+                        connected_peers.insert(peer.addr.clone(), peer.clone());
+                        if crate::node::is_debug() {
+                            println!("[DBG][P2P] regional_added peer={}", peer.id);
+                        }
                     }
                 }
         }
         
-            // DYNAMIC: For bootstrap nodes or small networks, connect to ALL Genesis nodes regardless of region
+            // v2.51: Genesis mode - connect to all Genesis peers
             let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-            let active_peers = connected_data.len();
-            let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
-            let should_connect_all_genesis = is_bootstrap_node || is_small_network;
+            let active_peers = connected_peers.len();
+            let is_small_network = active_peers < 6;
             
-            if should_connect_all_genesis {
-                println!("[P2P] 🌟 GENESIS MODE: Attempting to connect to all Genesis peers regardless of region");
-                
-                // Try all regions for Genesis peers
-                for (region, peers_in_region) in regional_peers_data.iter() {
+            if is_bootstrap_node || is_small_network {
+                for (_region, peers_in_region) in regional_peers_data.iter() {
                     for peer in peers_in_region.iter().take(5) {
-                        // CRITICAL: Never add self as a peer!
                         if peer.id == node_id || peer.addr.contains(&port.to_string()) {
-                            println!("[P2P] 🚫 Skipping self in Genesis all-region scan: {}", peer.id);
                             continue;
                         }
-                        
                         let ip = peer.addr.split(':').next().unwrap_or("");
-                        let is_genesis_peer = is_genesis_node_ip(ip);
-                        
-                        if is_genesis_peer {
-                            // Skip if already connected
-                            let already_connected = connected_data.iter().any(|(_addr, p)| p.addr == peer.addr);
-                            if !already_connected {
-                                // EXISTING: Use FAST connectivity check for Genesis startup
-                                if Self::is_peer_actually_connected_static(&peer.addr, active_peers) {
-                                connected_data.insert(peer.addr.clone(), peer.clone());
-                                    // PRIVACY: Genesis IPs are public, but use pseudonym for consistency
-                                    println!("[P2P] 🌟 Added Genesis peer {} from region {:?} (verified)", get_privacy_id_for_addr(&peer.addr), region);
-                                } else {
-                                    println!("[P2P] ❌ Skipped Genesis peer {} from region {:?} (not reachable)", get_privacy_id_for_addr(&peer.addr), region);
+                        if is_genesis_node_ip(ip) && !connected_peers.contains_key(&peer.addr) {
+                            if Self::is_peer_actually_connected_static(&peer.addr, active_peers) {
+                                connected_peers.insert(peer.addr.clone(), peer.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // v2.51: Backup regions if needed
+            if connected_peers.len() < 3 {
+                let current_peers = connected_peers.len();
+                for backup_region in &backup_regions {
+                    if let Some(peers) = regional_peers_data.get(backup_region) {
+                        for peer in peers.iter().take(5) {
+                            if connected_peers.len() >= 5 { break; }
+                            if !connected_peers.contains_key(&peer.addr) {
+                                if Self::is_peer_actually_connected_static(&peer.addr, current_peers) {
+                                    connected_peers.insert(peer.addr.clone(), peer.clone());
                                 }
                             }
                         }
                     }
                 }
             }
-        
-            // If not enough peers, try backup regions - WITH REAL connectivity validation
-            if connected_data.len() < 3 {
-                // DYNAMIC: For backup regions, use flexible limits based on network conditions
-                let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-                let current_peers = connected_data.len();
-                let is_small_network = current_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
-                let use_all_backup_peers = is_bootstrap_node || is_small_network;
-            
-                for backup_region in &backup_regions {
-                    if let Some(peers) = regional_peers_data.get(backup_region) {
-                    // ROBUST: Connect to ALL backup peers during bootstrap or small network formation
-                    let backup_limit = if use_all_backup_peers { peers.len() } else { 2 };
-                    for peer in peers.iter().take(backup_limit) {
-                            // DYNAMIC: Remove connection limit for small networks or bootstrap nodes
-                            let should_connect = if use_all_backup_peers { true } else { connected_data.len() < 5 };
-                        if should_connect {
-                            let ip = peer.addr.split(':').next().unwrap_or("");
-                            let is_genesis_peer = is_genesis_node_ip(ip);
-                            
-                                    // FIXED: Genesis peers use FAST connectivity check for bootstrap trust
-                                    if is_genesis_peer {
-                                        if Self::is_peer_actually_connected_static(&peer.addr, current_peers) {
-                                        connected_data.insert(peer.addr.clone(), peer.clone());
-                                            // PRIVACY: Use pseudonym in logs
-                                            println!("[P2P] ✅ Added Genesis backup {} (verified)", get_privacy_id_for_addr(&peer.addr));
-                                        } else {
-                                            println!("[P2P] ❌ Skipped Genesis backup {} (not reachable)", get_privacy_id_for_addr(&peer.addr));
-                                        }
-                                    } else if Self::is_peer_actually_connected_static(&peer.addr, current_peers) {
-                                        connected_data.insert(peer.addr.clone(), peer.clone());
-                                        println!("[P2P] ✅ Added {} to backup pool from {:?} (REAL connection verified)", 
-                                                 peer.id, peer.region);
-                                    } else {
-                                        println!("[P2P] ❌ Skipped backup peer {} from {:?} (connection failed)", 
-                                     peer.id, peer.region);
-                                    }
-                        }
-                    }
-                }
+
+            if crate::node::is_info() {
+                println!("[INFO][P2P] regional_connect peers={}", connected_peers.len());
             }
-        }
-        
-            // Update real connected_peers with results from background establishment
-            if let Ok(mut connected) = connected_peers.write() {
-                *connected = connected_data;
-                println!("[P2P] 📋 Regional connection establishment completed: {} peers connected", connected.len());
-            } else {
+            
+            // v2.51: No need to copy back - already using DashMap directly
+            {
                 println!("[P2P] ⚠️ Failed to update connected_peers after establishment");
             }
         });
@@ -8348,31 +7463,15 @@ impl SimplifiedP2P {
         (latency_score * 0.6) + (stability_score * 0.4)
     }
     
-    /// Update peer metrics
+    /// Update peer metrics (v2.51: lock-free)
     pub fn update_peer_metrics(&self, peer_id: &str, latency_ms: u32, bandwidth_usage: u64) {
-        // PRODUCTION: Use dual indexing for O(1) lookup by ID (already implemented)
-        // First check if we should use lock-free mode
-        if self.should_use_lockfree() {
-            // Lock-free mode: Use DashMap with dual indexing for O(1) operations
-            if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id) {
-                let addr = addr_entry.clone();
-                if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&addr) {
-                    peer.latency_ms = latency_ms;
-                    peer.bandwidth_usage = bandwidth_usage;
-                    peer.last_seen = self.current_timestamp();
-                }
-            }
-        } else {
-            // Legacy mode: Still O(1) using dual index
-            if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id) {
-                let addr = addr_entry.clone();
-                if let Ok(mut connected) = self.connected_peers.write() {
-                    if let Some(peer) = connected.get_mut(&addr) {
-                        peer.latency_ms = latency_ms;
-                        peer.bandwidth_usage = bandwidth_usage;
-                        peer.last_seen = self.current_timestamp();
-                    }
-                }
+        // Use dual indexing for O(1) lookup by ID
+        if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id) {
+            let addr = addr_entry.clone();
+            if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&addr) {
+                peer.latency_ms = latency_ms;
+                peer.bandwidth_usage = bandwidth_usage;
+                peer.last_seen = self.current_timestamp();
             }
         }
         
@@ -8380,22 +7479,18 @@ impl SimplifiedP2P {
         self.update_regional_metrics();
     }
     
-    /// Update regional load balancing metrics
+    /// Update regional load balancing metrics (v2.51: lock-free)
     fn update_regional_metrics(&self) {
-        let connected = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
         let mut metrics = match self.regional_metrics.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         
         for region in &[Region::NorthAmerica, Region::Europe, Region::Asia, Region::SouthAmerica, Region::Africa, Region::Oceania] {
-            let region_peers: Vec<&PeerInfo> = connected
+            let region_peers: Vec<PeerInfo> = self.connected_peers_lockfree
                 .iter()
-                .filter(|(_addr, p)| p.region == *region)
-                .map(|(_addr, p)| p)
+                .filter(|e| e.value().region == *region)
+                .map(|e| e.value().clone())
                 .collect();
             
             if !region_peers.is_empty() {
@@ -8448,47 +7543,27 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // Drop connections from overloaded regions
-        let mut connected = match self.connected_peers.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let initial_count = connected.len();
-        
-        // SCALABILITY: Collect addresses to remove (can't modify HashMap while iterating)
-        let to_remove: Vec<String> = connected.values()
-            .filter(|peer| {
+        // v2.51: Lock-free overloaded peer removal
+        let initial_count = self.connected_peers_lockfree.len();
+        let to_remove: Vec<String> = self.connected_peers_lockfree.iter()
+            .filter(|entry| {
+                let peer = entry.value();
                 overloaded_regions.contains(&peer.region) && 
                 peer.latency_ms > self.lb_config.max_latency_threshold
             })
-            .map(|peer| {
-                println!("[P2P] 🔻 Dropping overloaded peer {} from {:?} (Latency: {}ms)", 
-                         peer.id, peer.region, peer.latency_ms);
-                peer.addr.clone()
-            })
+            .map(|entry| entry.key().clone())
             .collect();
         
-        // Remove peers - O(1) per removal for HashMap
-        for addr in to_remove {
-            connected.remove(&addr);
+        for addr in &to_remove {
+            self.connected_peers_lockfree.remove(addr);
         }
         
-        let dropped_count = initial_count - connected.len();
-        drop(connected);
+        let dropped_count = to_remove.len();
         
         if dropped_count > 0 {
-            // Reconnect to better peers
             let optimal_peers = self.select_optimal_peers(dropped_count);
-            let mut connected = match self.connected_peers.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            
             for peer in optimal_peers {
-                println!("[P2P] 🔺 Connecting to optimal peer {} from {:?} (Latency: {}ms)", 
-                         peer.id, peer.region, peer.latency_ms);
-                // SCALABILITY: O(1) insertion for HashMap
-                connected.insert(peer.addr.clone(), peer);
+                self.connected_peers_lockfree.insert(peer.addr.clone(), peer);
             }
             
             println!("[P2P] ✅ Rebalancing complete: dropped {}, reconnected to optimal peers", dropped_count);
@@ -8502,7 +7577,7 @@ impl SimplifiedP2P {
     fn start_load_balancing_monitor(&self) {
         let is_running = self.is_running.clone();
         let last_check = self.last_health_check.clone();
-        let connected_peers = self.connected_peers.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let regional_metrics = self.regional_metrics.clone();
         
         thread::spawn(move || {
@@ -8511,25 +7586,14 @@ impl SimplifiedP2P {
                 
                 *match last_check.lock() { Ok(g) => g, Err(p) => p.into_inner() } = Instant::now();
                 
-                // PRODUCTION: Collect real metrics from connected peers via HTTP
-                {
-                    let mut connected = match connected_peers.write() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    // SCALABILITY: Iterate over HashMap values for O(n)
-                    for peer in connected.values_mut() {
-                        // PRODUCTION: Query peer's /api/v1/node/health endpoint for real metrics
-                        if let Ok(metrics) = Self::query_peer_metrics(&peer.addr) {
-                            peer.latency_ms = metrics.latency_ms;
-                        peer.last_seen = std::time::SystemTime::now()
+                // PRODUCTION: Collect real metrics from connected peers via HTTP (v2.51: lock-free)
+                for mut entry in connected_peers.iter_mut() {
+                    if let Ok(metrics) = Self::query_peer_metrics(&entry.value().addr) {
+                        entry.latency_ms = metrics.latency_ms;
+                        entry.last_seen = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_else(|_| {
-                                    println!("[P2P] ⚠️ System time error, using fallback");
-                                    std::time::Duration::from_secs(0)
-                                })
+                            .unwrap_or_default()
                             .as_secs();
-                        }
                     }
                 }
                 
@@ -8557,10 +7621,6 @@ impl SimplifiedP2P {
     
     /// Get load balancing statistics
     pub fn get_load_balancing_stats(&self) -> HashMap<String, serde_json::Value> {
-        let connected = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
         let metrics = match self.regional_metrics.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -8568,8 +7628,8 @@ impl SimplifiedP2P {
         
         let mut stats = HashMap::new();
         
-        // Overall statistics
-        stats.insert("total_peers".to_string(), serde_json::Value::Number(connected.len().into()));
+        // v2.51: Lock-free peer count
+        stats.insert("total_peers".to_string(), serde_json::Value::Number(self.connected_peers_lockfree.len().into()));
         stats.insert("total_bytes_sent".to_string(), serde_json::Value::Number((*match self.total_bytes_sent.lock() { Ok(g) => g, Err(p) => p.into_inner() }).into()));
         stats.insert("total_bytes_received".to_string(), serde_json::Value::Number((*match self.total_bytes_received.lock() { Ok(g) => g, Err(p) => p.into_inner() }).into()));
         
@@ -8707,7 +7767,7 @@ impl SimplifiedP2P {
         let node_id = self.node_id.clone();
         let region = self.region.clone();
         let regional_peers = self.regional_peers.clone();
-        let connected_peers = self.connected_peers.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let is_running = self.is_running.clone();
         
         handle.spawn(async move {
@@ -8720,14 +7780,9 @@ impl SimplifiedP2P {
                 // Rebalance regional connections
                 let mut regional_counts = std::collections::HashMap::new();
                 
-                {
-                    let connected = match connected_peers.read() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    for (_addr, peer) in connected.iter() {
-                        *regional_counts.entry(peer.region.clone()).or_insert(0) += 1;
-                    }
+                // v2.51: Lock-free regional counting
+                for entry in connected_peers.iter() {
+                    *regional_counts.entry(entry.value().region.clone()).or_insert(0) += 1;
                 }
                 
                 // Ensure we have peers in our region
@@ -10268,36 +9323,30 @@ impl SimplifiedP2P {
                 // Before: just logged, never responded -> "no_entropy_responses" fallback always
                 // After: calculate entropy hash and send response back
                 
-                // Get storage from global instance
-                let entropy_hash = if let Ok(storage_guard) = crate::node::GLOBAL_STORAGE_INSTANCE.lock() {
-                    if let Some(ref storage) = *storage_guard {
-                        match storage.load_microblock(block_height) {
-                            Ok(Some(block_data)) => {
-                                // Calculate entropy hash (same as node.rs get_previous_microblock_hash)
-                                use sha3::{Sha3_256, Digest};
-                                let mut hasher = Sha3_256::new();
-                                hasher.update(&block_data);
-                                let result = hasher.finalize();
-                                let mut hash = [0u8; 32];
-                                hash.copy_from_slice(&result);
-                                hash
-                            },
-                            Ok(None) => {
-                                // Block not found - we don't have it yet (lagging)
-                                // Return zero = "I don't have this block"
-                                [0u8; 32]
-                            },
-                            Err(e) => {
-                                println!("[CONSENSUS] ❌ Error loading block {}: {}", block_height, e);
-                                [0u8; 32]
-                            }
+                // PRODUCTION v2.50: Lock-free storage access
+                let entropy_hash = if let Some(storage) = crate::node::try_get_storage() {
+                    match storage.load_microblock(block_height) {
+                        Ok(Some(block_data)) => {
+                            // Calculate entropy hash (same as node.rs get_previous_microblock_hash)
+                            use sha3::{Sha3_256, Digest};
+                            let mut hasher = Sha3_256::new();
+                            hasher.update(&block_data);
+                            let result = hasher.finalize();
+                            let mut hash = [0u8; 32];
+                            hash.copy_from_slice(&result);
+                            hash
+                        },
+                        Ok(None) => {
+                            // Block not found - we don't have it yet (lagging)
+                            [0u8; 32]
+                        },
+                        Err(e) => {
+                            println!("[CONSENSUS] ❌ Error loading block {}: {}", block_height, e);
+                            [0u8; 32]
                         }
-                    } else {
-                        // Storage not initialized yet
-                        [0u8; 32]
                     }
                 } else {
-                    // Lock failed
+                    // Storage not initialized yet
                     [0u8; 32]
                 };
                 
@@ -10524,17 +9573,16 @@ impl SimplifiedP2P {
                     encapsulated_data.extend_from_slice(&cert.issued_at.to_le_bytes());
                     let encapsulated_hex = hex::encode(&encapsulated_data);
                     
-                    // Verify Dilithium signature using GLOBAL_QUANTUM_CRYPTO
-                    use crate::node::GLOBAL_QUANTUM_CRYPTO;
-                    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-                    if crypto_guard.is_none() {
-                        let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-                        let _ = crypto.initialize().await;
-                        *crypto_guard = Some(crypto);
-                    }
-                    let quantum_crypto = match crypto_guard.as_ref() {
+                    // PRODUCTION v2.50: Lock-free Dilithium verification
+                    use crate::node::try_get_quantum_crypto;
+                    let quantum_crypto = match try_get_quantum_crypto() {
                         Some(c) => c,
-                        None => return, // Crypto not initialized
+                        None => {
+                            if crate::node::is_warn() {
+                                println!("[WARN][CRYPTO] cert_verify_skip reason=not_initialized");
+                            }
+                            return;
+                        }
                     };
                     
                     let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
@@ -10937,10 +9985,8 @@ impl SimplifiedP2P {
                 // - CPU cost: ~5ms per heartbeat (acceptable for 10 heartbeats per 4 hours)
                 
                 // VERIFY: Node must be registered (first registration uses Dilithium)
-                let is_known_node = {
-                    let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                    active_nodes.contains_key(&node_id)
-                };
+                // v2.51: Lock-free check
+                let is_known_node = self.active_full_super_nodes.contains_key(&node_id);
                 
                 // For Genesis nodes, always accept (hardcoded IPs)
                 let is_genesis = node_id.starts_with("genesis_node_");
@@ -11089,12 +10135,10 @@ impl SimplifiedP2P {
                 }
                 
                 // VERIFY: Pinger must be in active Full/Super nodes list
-                {
-                    let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                    if !active_nodes.contains_key(&pinger_id) && !pinger_id.starts_with("genesis_node_") {
-                        println!("[ATTESTATION] ❌ Unknown pinger {} for Light node {}", pinger_id, light_node_id);
-                        return;
-                    }
+                // v2.51: Lock-free check
+                if !self.active_full_super_nodes.contains_key(&pinger_id) && !pinger_id.starts_with("genesis_node_") {
+                    println!("[ATTESTATION] ❌ Unknown pinger {} for Light node {}", pinger_id, light_node_id);
+                    return;
                 }
                 
                 // VERIFY: Light node must be in registry
@@ -11187,7 +10231,9 @@ impl SimplifiedP2P {
                 let announcement_data = format!("active:{}:{}:{}:{}:{}", 
                     node_id, node_type, shard_id, reputation as u64, timestamp);
                 if !self.verify_dilithium_heartbeat_signature(&announcement_data, &signature, &node_id) {
-                    println!("[ACTIVE] ❌ Invalid signature from {}", node_id);
+                    if crate::node::is_warn() {
+                        println!("[WARN][ACTIVE] sig_invalid node={}", node_id);
+                    }
                     return;
                 }
                 
@@ -11203,10 +10249,14 @@ impl SimplifiedP2P {
                     // New nodes start at INITIAL_REPUTATION, so this is fair
                     if real_reputation == 0.0 {
                         // Unknown node - accept with default reputation
-                        println!("[ACTIVE] 🆕 New node {} - accepting with default reputation {:.1}", node_id, INITIAL_REPUTATION);
+                        if crate::node::is_info() {
+                            println!("[INFO][ACTIVE] new_node node={} default_rep={:.1}", node_id, INITIAL_REPUTATION);
+                        }
                     } else {
-                        println!("[ACTIVE] ⚠️ Ignoring {} with low REAL reputation {:.1} (claimed: {:.1})", 
-                                 node_id, real_reputation, reputation);
+                        if crate::node::is_warn() {
+                            println!("[WARN][ACTIVE] reject_low_rep node={} real={:.1} claimed={:.1}", 
+                                     node_id, real_reputation, reputation);
+                        }
                         return;
                     }
                 }
@@ -11238,8 +10288,10 @@ impl SimplifiedP2P {
                 // MONITORING ONLY: Log significant differences for debugging
                 let reputation_diff = (reputation - real_reputation).abs();
                 if reputation_diff > 5.0 && real_reputation > 0.0 {
-                    println!("[ACTIVE] ℹ️ Reputation diff for {} (monitoring): claimed {:.1}, local {:.1}, diff {:.1}", 
-                             node_id, reputation, real_reputation, reputation_diff);
+                    if crate::node::is_debug() {
+                        println!("[DBG][ACTIVE] rep_diff node={} claimed={:.1} local={:.1} diff={:.1}", 
+                                 node_id, reputation, real_reputation, reputation_diff);
+                    }
                 }
                 
                 // v2.45.1: Use real blockchain reputation, fallback to INITIAL_REPUTATION
@@ -11249,21 +10301,21 @@ impl SimplifiedP2P {
                     qnet_consensus::deterministic_reputation::INITIAL_REPUTATION 
                 };
                 
-                // Update active nodes map
-                {
-                    let mut active_nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-                    let existing = active_nodes.get(&node_id);
+                // Update active nodes map (v2.51: lock-free)
+                let should_update = self.active_full_super_nodes.get(&node_id)
+                    .map(|e| e.last_seen < timestamp)
+                    .unwrap_or(true);
                     
-                    // Only update if newer timestamp
-                    if existing.map(|e| e.last_seen < timestamp).unwrap_or(true) {
-                        active_nodes.insert(node_id.clone(), ActiveNodeInfo {
-                            node_id: node_id.clone(),
-                            node_type: node_type.clone(),
-                            shard_id,
-                            reputation: effective_reputation, // Use REAL reputation!
-                            last_seen: timestamp,
-                        });
-                        println!("[ACTIVE] ✅ {} ({}) registered/updated, shard {}, rep {:.1} (real)", 
+                if should_update {
+                    self.active_full_super_nodes.insert(node_id.clone(), ActiveNodeInfo {
+                        node_id: node_id.clone(),
+                        node_type: node_type.clone(),
+                        shard_id,
+                        reputation: effective_reputation, // Use REAL reputation!
+                        last_seen: timestamp,
+                    });
+                    if crate::node::is_info() {
+                        println!("[INFO][ACTIVE] updated node={} type={} shard={} rep={:.1}", 
                                  node_id, node_type, shard_id, effective_reputation);
                     }
                 }
@@ -11285,14 +10337,11 @@ impl SimplifiedP2P {
             NetworkMessage::ActiveNodesRequest { requester_id } => {
                 self.update_peer_last_seen(from_peer);
                 
-                // Collect active nodes with rep >= 70
-                let active_nodes: Vec<ActiveNodeInfo> = {
-                    let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                    nodes.values()
-                        .filter(|n| n.reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION)
-                        .cloned()
-                        .collect()
-                };
+                // Collect active nodes with rep >= 70 (v2.51: lock-free)
+                let active_nodes: Vec<ActiveNodeInfo> = self.active_full_super_nodes.iter()
+                    .filter(|entry| entry.value().reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION)
+                    .map(|entry| entry.value().clone())
+                    .collect();
                 
                 // Send response
                 let response = NetworkMessage::ActiveNodesResponse {
@@ -11308,7 +10357,9 @@ impl SimplifiedP2P {
             // PRODUCTION: Response with active nodes list
             NetworkMessage::ActiveNodesResponse { sender_id, active_nodes } => {
                 self.update_peer_last_seen(from_peer);
-                println!("[ACTIVE] 📥 Received {} active nodes from {}", active_nodes.len(), sender_id);
+                if crate::node::is_info() {
+                    println!("[INFO][ACTIVE] sync_received count={} from={}", active_nodes.len(), sender_id);
+                }
                 
                 // SECURITY: Track nodes that return suspiciously empty lists
                 // This could indicate an attack or node with corrupted state
@@ -11351,22 +10402,20 @@ impl SimplifiedP2P {
                 EMPTY_RESPONSE_TRACKER.remove(&sender_id);
                 
                 // Merge into local map (ADDITIVE - never replace or delete existing!)
+                // v2.51: Lock-free insert
                 let mut added = 0;
-                {
-                    let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-                    for node in active_nodes {
-                        // Only add if rep >= 70 and not stale (< 15 min old)
-                        if node.reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION && node.last_seen > now.saturating_sub(15 * 60) {
-                            if !nodes.contains_key(&node.node_id) {
-                                nodes.insert(node.node_id.clone(), node);
-                                added += 1;
-                            }
+                for node in active_nodes {
+                    // Only add if rep >= 70 and not stale (< 15 min old)
+                    if node.reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION && node.last_seen > now.saturating_sub(15 * 60) {
+                        if !self.active_full_super_nodes.contains_key(&node.node_id) {
+                            self.active_full_super_nodes.insert(node.node_id.clone(), node);
+                            added += 1;
                         }
                     }
                 }
                 
-                if added > 0 {
-                    println!("[ACTIVE] ✅ Added {} new active nodes", added);
+                if added > 0 && crate::node::is_info() {
+                    println!("[INFO][ACTIVE] sync_added count={}", added);
                 }
             }
             
@@ -11410,17 +10459,11 @@ impl SimplifiedP2P {
         // CRITICAL FIX v2.19.15: Check BOTH connected_peers_lockfree AND connected_peers
         // Genesis nodes use legacy connected_peers (should_use_lockfree=false for ≤5 peers)
         // This was causing gossip to fail for Genesis nodes!
-        let peers: Vec<_> = if self.should_use_lockfree() {
-            self.connected_peers_lockfree
-                .iter()
-                .map(|r| r.value().clone())
-                .collect()
-        } else {
-            // Fallback to legacy connected_peers for Genesis nodes
-            self.connected_peers.read()
-                .map(|p| p.values().cloned().collect())
-                .unwrap_or_default()
-        };
+        // v2.51: lock-free
+        let peers: Vec<_> = self.connected_peers_lockfree
+            .iter()
+            .map(|r| r.value().clone())
+            .collect();
         
         if peers.is_empty() {
             return;
@@ -11434,24 +10477,12 @@ impl SimplifiedP2P {
         }
     }
     
-    /// OPTIMIZATION v2.19.19: Gossip to K closest neighbors using Kademlia distance
-    /// This reduces network traffic while maintaining reliable propagation
-    /// Used for: heartbeats, peer announcements (non-critical messages)
-    /// NOT used for: blocks, certificates (use broadcast_block or gossip_to_random_peers)
+    /// OPTIMIZATION v2.19.19: Gossip to K closest neighbors using Kademlia distance (v2.51: lock-free)
     pub fn gossip_to_k_neighbors(&self, message: NetworkMessage, k: usize) {
-        // CRITICAL: Check BOTH connected_peers_lockfree AND connected_peers
-        // Genesis nodes use legacy connected_peers (should_use_lockfree=false for ≤5 peers)
-        let mut peers: Vec<_> = if self.should_use_lockfree() {
-            self.connected_peers_lockfree
-                .iter()
-                .map(|r| r.value().clone())
-                .collect()
-        } else {
-            // Fallback to legacy connected_peers for Genesis nodes
-            self.connected_peers.read()
-                .map(|p| p.values().cloned().collect())
-                .unwrap_or_default()
-        };
+        let mut peers: Vec<_> = self.connected_peers_lockfree
+            .iter()
+            .map(|r| r.value().clone())
+            .collect();
         
         if peers.is_empty() {
             return;
@@ -11537,20 +10568,16 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // Use global crypto instance
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = QNetQuantumCrypto::new();
-            if let Err(e) = crypto.initialize().await {
-                println!("[HEARTBEAT] ❌ Crypto init failed: {}", e);
+        // PRODUCTION v2.50: Lock-free heartbeat verification
+        use crate::node::try_get_quantum_crypto;
+        let crypto = match try_get_quantum_crypto() {
+            Some(c) => c,
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][HEARTBEAT] verify_skip reason=crypto_not_initialized");
+                }
                 return false;
             }
-            *crypto_guard = Some(crypto);
-        }
-        
-        let crypto = match crypto_guard.as_ref() {
-            Some(c) => c,
-            None => return false, // Crypto not initialized
         };
         
         // Create DilithiumSignature struct
@@ -11647,16 +10674,16 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // Get quantum crypto
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
-            *crypto_guard = Some(crypto);
-        }
-        let crypto = match crypto_guard.as_ref() {
+        // PRODUCTION v2.50: Lock-free quantum crypto
+        use crate::node::try_get_quantum_crypto;
+        let crypto = match try_get_quantum_crypto() {
             Some(c) => c,
-            None => return false, // Crypto not initialized
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] hybrid_p2p_bin_verify_skip reason=crypto_not_initialized");
+                }
+                return false;
+            }
         };
         
         // Verify Dilithium key signature (encapsulated_data = ephemeral_key || message_hash || timestamp)
@@ -11749,16 +10776,16 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // Get quantum crypto
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
-            *crypto_guard = Some(crypto);
-        }
-        let crypto = match crypto_guard.as_ref() {
+        // PRODUCTION v2.50: Lock-free quantum crypto
+        use crate::node::try_get_quantum_crypto;
+        let crypto = match try_get_quantum_crypto() {
             Some(c) => c,
-            None => return false, // Crypto not initialized
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CRYPTO] verify_skip reason=not_initialized");
+                }
+                return false;
+            }
         };
         
         // Verify Dilithium key signature (encapsulated_data = ephemeral_key || message_hash || timestamp)
@@ -11848,19 +10875,19 @@ impl SimplifiedP2P {
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => {
                     rt.block_on(async move {
-                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-                        
-                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-                        if crypto_guard.is_none() {
-                            let mut crypto = QNetQuantumCrypto::new();
-                            if let Err(e) = crypto.initialize().await {
-                                println!("[HEARTBEAT] ❌ Crypto init failed: {}", e);
+                        // PRODUCTION v2.50: Lock-free quantum crypto in isolated thread
+                        use crate::node::try_get_quantum_crypto;
+                        let crypto = match try_get_quantum_crypto() {
+                            Some(c) => c,
+                            None => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][HEARTBEAT] verify_skip reason=crypto_not_initialized");
+                                }
                                 return false;
                             }
-                            *crypto_guard = Some(crypto);
-                        }
+                        };
                         
-                        let crypto = match crypto_guard.as_ref() {
+                        let crypto = match Some(crypto.as_ref()) {
             Some(c) => c,
             None => return false, // Crypto not initialized
         };
@@ -11974,17 +11001,12 @@ impl SimplifiedP2P {
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => {
                     rt.block_on(async {
-                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-                        if crypto_guard.is_none() {
-                            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-                            let _ = crypto.initialize().await;
-                            *crypto_guard = Some(crypto);
-                        }
-                        let crypto = match crypto_guard.as_ref() {
-            Some(c) => c,
-            None => return false, // Crypto not initialized
-        };
+                        // PRODUCTION v2.50: Lock-free quantum crypto
+                        use crate::node::try_get_quantum_crypto;
+                        let crypto = match try_get_quantum_crypto() {
+                            Some(c) => c.as_ref(),
+                            None => return false,
+                        };
                         
                         let mut encapsulated_data = Vec::new();
                         encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
@@ -12055,8 +11077,7 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // Use isolated thread for async verification
-        // CRITICAL v2.49.2: commit_hash is HEX string, must decode to bytes for verification
+        // CRITICAL v2.49.3: commit_hash is HEX string, must decode to bytes for verification
         // Signature was created on decoded bytes, not on HEX string!
         let message_bytes: Vec<u8> = match hex::decode(message) {
             Ok(bytes) => bytes,
@@ -12065,31 +11086,39 @@ impl SimplifiedP2P {
                 message.as_bytes().to_vec()
             }
         };
-        let handle = std::thread::spawn(move || {
-            match tokio::runtime::Runtime::new() {
+        
+        // v2.49.3: Use thread with TIMEOUT to prevent deadlock
+        // Previous version caused deadlock when all tokio workers blocked on join()
+        let (tx, rx) = std::sync::mpsc::channel();
+        let node_id_clone = hybrid_sig.certificate.node_id.clone();
+        let serial_clone = hybrid_sig.certificate.serial_number.clone();
+        
+        std::thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build() 
+            {
                 Ok(rt) => {
                     rt.block_on(async move {
-                        let verifier = HybridCrypto::new(hybrid_sig.certificate.node_id.clone());
+                        let verifier = HybridCrypto::new(node_id_clone.clone());
                         match verifier.verify_signature(&message_bytes, &hybrid_sig).await {
                             Ok(true) => {
                                 if crate::node::is_debug() {
                                     println!("[DBG][CONS] hybrid_bin_verified node={} cert={}", 
-                                             hybrid_sig.certificate.node_id,
-                                             &hybrid_sig.certificate.serial_number[..8]);
+                                             node_id_clone,
+                                             &serial_clone[..8.min(serial_clone.len())]);
                                 }
                                 true
                             }
                             Ok(false) => {
                                 if crate::node::is_warn() {
-                                    println!("[WARN][CONS] hybrid_bin_invalid node={}", 
-                                             hybrid_sig.certificate.node_id);
+                                    println!("[WARN][CONS] hybrid_bin_invalid node={}", node_id_clone);
                                 }
                                 false
                             }
                             Err(e) => {
                                 if crate::node::is_warn() {
-                                    println!("[WARN][CONS] hybrid_bin_error node={} err={}", 
-                                             hybrid_sig.certificate.node_id, e);
+                                    println!("[WARN][CONS] hybrid_bin_error node={} err={}", node_id_clone, e);
                                 }
                                 false
                             }
@@ -12097,10 +11126,20 @@ impl SimplifiedP2P {
                     })
                 }
                 Err(_) => false
-            }
+            };
+            let _ = tx.send(result);
         });
         
-        handle.join().unwrap_or(false)
+        // v2.49.3: Wait with 10 second timeout to prevent deadlock
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(_) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] hybrid_bin verification timeout for node={}", node_id);
+                }
+                false
+            }
+        }
     }
     
     /// v2.49.2: Verify COMPACT hybrid binary signature (requires pre-shared certificate)
@@ -12175,21 +11214,21 @@ impl SimplifiedP2P {
             }
         }
         
-        // Verify Dilithium signature on ephemeral key
+        // v2.49.3: Verify Dilithium signature on ephemeral key with TIMEOUT to prevent deadlock
         let node_id_clone = node_id.to_string();
-        let handle = std::thread::spawn(move || {
-            match tokio::runtime::Runtime::new() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        
+        std::thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build() 
+            {
                 Ok(rt) => {
                     rt.block_on(async move {
-                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-                        if crypto_guard.is_none() {
-                            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-                            let _ = crypto.initialize().await;
-                            *crypto_guard = Some(crypto);
-                        }
-                        let crypto = match crypto_guard.as_ref() {
-                            Some(c) => c,
+                        // PRODUCTION v2.50: Lock-free quantum crypto
+                        use crate::node::try_get_quantum_crypto;
+                        let crypto = match try_get_quantum_crypto() {
+                            Some(c) => c.as_ref(),
                             None => return false,
                         };
                         
@@ -12232,10 +11271,20 @@ impl SimplifiedP2P {
                     })
                 }
                 Err(_) => false
-            }
+            };
+            let _ = tx.send(result);
         });
         
-        handle.join().unwrap_or(false)
+        // v2.49.3: Wait with 10 second timeout to prevent deadlock
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(_) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] compact_bin verification timeout for node={}", node_id);
+                }
+                false
+            }
+        }
     }
     
     /// LEGACY: Verify HYBRID P2P JSON signature (SYNC version) - NIST/Cisco compliant
@@ -12293,18 +11342,12 @@ impl SimplifiedP2P {
                             }
                         }
                         
-                        // Get quantum crypto for Dilithium verification
-                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-                        if crypto_guard.is_none() {
-                            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-                            let _ = crypto.initialize().await;
-                            *crypto_guard = Some(crypto);
-                        }
-                        let crypto = match crypto_guard.as_ref() {
-            Some(c) => c,
-            None => return false, // Crypto not initialized
-        };
+                        // PRODUCTION v2.50: Lock-free quantum crypto for Dilithium verification
+                        use crate::node::try_get_quantum_crypto;
+                        let crypto = match try_get_quantum_crypto() {
+                            Some(c) => c.as_ref(),
+                            None => return false,
+                        };
                         
                         // Verify Dilithium key signature
                         let mut encapsulated_data = Vec::new();
@@ -13129,12 +12172,11 @@ impl SimplifiedP2P {
         
         let current_slot = Self::get_current_slot();
         
-        // Get sorted active Full/Super node IDs (only rep >= MIN_CONSENSUS_REPUTATION)
+        // Get sorted active Full/Super node IDs (v2.51: lock-free)
         let active_node_ids: Vec<String> = {
-            let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-            let mut sorted: Vec<_> = nodes.values()
-                .filter(|n| n.reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION)
-                .map(|n| n.node_id.clone())
+            let mut sorted: Vec<_> = self.active_full_super_nodes.iter()
+                .filter(|entry| entry.value().reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION)
+                .map(|entry| entry.value().node_id.clone())
                 .collect();
             sorted.sort();
             sorted
@@ -13332,21 +12374,24 @@ impl SimplifiedP2P {
         
         // Only register if rep >= MIN_CONSENSUS_REPUTATION
         if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
-            println!("[ACTIVE] ⚠️ Cannot register: reputation {:.1} < {:.0}", reputation, qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION);
+            if crate::node::is_warn() {
+                println!("[WARN][ACTIVE] register_skip reason=low_rep rep={:.1} min={:.0}", 
+                         reputation, qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION);
+            }
             return;
         }
         
-        // Register locally
-        {
-            let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-            nodes.insert(self.node_id.clone(), ActiveNodeInfo {
-                node_id: self.node_id.clone(),
-                node_type: node_type_str.to_string(),
-                shard_id: self.shard_id,
-                reputation,
-                last_seen: now,
-            });
-            println!("[ACTIVE] 📡 Registered as active {} node ({} total)", node_type_str, nodes.len());
+        // Register locally (v2.51: lock-free)
+        self.active_full_super_nodes.insert(self.node_id.clone(), ActiveNodeInfo {
+            node_id: self.node_id.clone(),
+            node_type: node_type_str.to_string(),
+            shard_id: self.shard_id,
+            reputation,
+            last_seen: now,
+        });
+        if crate::node::is_info() {
+            println!("[INFO][ACTIVE] registered_async node={} type={} total={}", 
+                     self.node_id, node_type_str, self.active_full_super_nodes.len());
         }
         
         // Sign with ASYNC Dilithium (proper quantum-resistant signature)
@@ -13355,7 +12400,9 @@ impl SimplifiedP2P {
         let signature = match self.sign_dilithium_async(&announcement_data, &self.node_id).await {
             Some(sig) => sig,
             None => {
-                println!("[ACTIVE] ⚠️ Skipping announcement - Dilithium unavailable");
+                if crate::node::is_warn() {
+                    println!("[WARN][ACTIVE] announce_skip reason=dilithium_unavailable");
+                }
                 return; // Skip announcement if signing fails
             }
         };
@@ -13393,21 +12440,24 @@ impl SimplifiedP2P {
         
         // Only register if rep >= MIN_CONSENSUS_REPUTATION
         if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
-            println!("[ACTIVE] ⚠️ Cannot register: reputation {:.1} < {:.0}", reputation, qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION);
+            if crate::node::is_warn() {
+                println!("[WARN][ACTIVE] register_skip reason=low_rep rep={:.1} min={:.0}", 
+                         reputation, qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION);
+            }
             return;
         }
         
-        // Register locally
-        {
-            let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-            nodes.insert(self.node_id.clone(), ActiveNodeInfo {
-                node_id: self.node_id.clone(),
-                node_type: node_type_str.to_string(),
-                shard_id: self.shard_id,
-                reputation,
-                last_seen: now,
-            });
-            println!("[ACTIVE] 📡 Registered as active {} node ({} total)", node_type_str, nodes.len());
+        // Register locally (v2.51: lock-free)
+        self.active_full_super_nodes.insert(self.node_id.clone(), ActiveNodeInfo {
+            node_id: self.node_id.clone(),
+            node_type: node_type_str.to_string(),
+            shard_id: self.shard_id,
+            reputation,
+            last_seen: now,
+        });
+        if crate::node::is_info() {
+            println!("[INFO][ACTIVE] registered node={} type={} total={}", 
+                     self.node_id, node_type_str, self.active_full_super_nodes.len());
         }
         
         // Sign with SYNC Dilithium (creates new runtime - safe in std::thread::spawn)
@@ -13416,7 +12466,9 @@ impl SimplifiedP2P {
         let signature = match self.sign_heartbeat_dilithium(&announcement_data, &self.node_id) {
             Some(sig) => sig,
             None => {
-                println!("[ACTIVE] ⚠️ Skipping announcement - Dilithium unavailable");
+                if crate::node::is_warn() {
+                    println!("[WARN][ACTIVE] announce_skip reason=dilithium_unavailable");
+                }
                 return; // Skip announcement if signing fails
             }
         };
@@ -13440,7 +12492,9 @@ impl SimplifiedP2P {
             requester_id: self.node_id.clone(),
         };
         self.gossip_to_random_peers(request, 3);
-        println!("[ACTIVE] 📡 Requested active nodes sync");
+        if crate::node::is_info() {
+            println!("[INFO][ACTIVE] sync_request sent_to=3_peers");
+        }
     }
     
     /// Update active nodes from heartbeat (proves node is online)
@@ -13457,9 +12511,8 @@ impl SimplifiedP2P {
         // Calculate shard from node_id
         let shard_id = Self::calculate_light_node_shard(node_id);
         
-        // Update active nodes map
-        let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-        nodes.insert(node_id.to_string(), ActiveNodeInfo {
+        // Update active nodes map (v2.51: lock-free)
+        self.active_full_super_nodes.insert(node_id.to_string(), ActiveNodeInfo {
             node_id: node_id.to_string(),
             node_type: node_type.to_string(),
             shard_id,
@@ -13477,28 +12530,26 @@ impl SimplifiedP2P {
         
         let cutoff = now - (15 * 60);  // 15 minutes ago
         
-        let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-        let before = nodes.len();
-        nodes.retain(|_, v| v.last_seen > cutoff);
-        let removed = before - nodes.len();
+        // v2.51: Lock-free cleanup
+        let before = self.active_full_super_nodes.len();
+        self.active_full_super_nodes.retain(|_, v| v.last_seen > cutoff);
+        let removed = before - self.active_full_super_nodes.len();
         
         if removed > 0 {
             println!("[CLEANUP] 🧹 Removed {} stale active nodes (>15min)", removed);
         }
     }
     
-    /// Get count of active Full/Super nodes
+    /// Get count of active Full/Super nodes (v2.51: lock-free)
     pub fn get_active_node_count(&self) -> usize {
-        let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-        nodes.len()
+        self.active_full_super_nodes.len()
     }
     
-    /// Get list of active Full/Super nodes with their status
+    /// Get list of active Full/Super nodes with their status (v2.51: lock-free)
     /// Returns Vec<(node_id, node_type, last_seen)>
     pub fn get_active_full_super_nodes(&self) -> Vec<(String, String, u64)> {
-        let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-        nodes.values()
-            .map(|n| (n.node_id.clone(), n.node_type.clone(), n.last_seen))
+        self.active_full_super_nodes.iter()
+            .map(|entry| (entry.value().node_id.clone(), entry.value().node_type.clone(), entry.value().last_seen))
             .collect()
     }
     
@@ -13629,15 +12680,14 @@ impl SimplifiedP2P {
             entry.1 += 1;
         }
         
-        // Get node types from active_full_super_nodes
-        let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        // Get node types from active_full_super_nodes (v2.51: lock-free via DashMap)
         
         counts.into_iter()
             .filter_map(|(node_id, (_, count))| {
                 // PRODUCTION v2.41.1: Strict node type - NO DEFAULTS!
                 // Node must be in active registry OR be a genesis node
-                let node_type = if let Some(n) = active_nodes.get(&node_id) {
-                    n.node_type.clone()
+                let node_type = if let Some(n) = self.active_full_super_nodes.get(&node_id) {
+                    n.value().node_type.clone()
                 } else if node_id.starts_with("genesis_node_") {
                     // Genesis nodes are always Super
                     "super".to_string()
@@ -14046,29 +13096,19 @@ impl SimplifiedP2P {
     /// PRODUCTION: Macroblock index = (height / 90), rounded up for partial
     /// PRODUCTION v2.19.21: Now async (uses async sync_blockchain_height)
     pub async fn get_current_macroblock_index(&self) -> u64 {
-        // Estimate from peer heights using last_seen as proxy for activity
-        // Peers with recent activity likely have current height
-        if let Ok(peers) = self.connected_peers.read() {
-            // Use cached reputation as proxy for reliable height reporting
-            let max_height_peer = peers.values()
-                .filter(|p| p.reputation() >= 50.0)  // Only trust peers with decent cached reputation
-                .max_by(|a, b| a.reputation().partial_cmp(&b.reputation()).unwrap_or(std::cmp::Ordering::Equal));
-            
-            // If we have reliable peers, estimate from network consensus
-            // Otherwise return 0 (will sync from scratch)
-            if max_height_peer.is_some() {
-                // Get height from sync_blockchain_height instead
-                if let Ok(network_height) = self.sync_blockchain_height().await {
-                    if network_height == 0 {
-                        0
-                    } else {
-                        (network_height + 89) / 90  // Round up to get current macroblock index
-                    }
-                } else {
-                    0
-                }
-            } else {
+        // v2.51: Lock-free height estimation
+        let has_reliable_peer = self.connected_peers_lockfree.iter()
+            .any(|entry| entry.value().reputation() >= 50.0);
+        
+        if !has_reliable_peer {
+            return 0;
+        }
+        
+        if let Ok(network_height) = self.sync_blockchain_height().await {
+            if network_height == 0 {
                 0
+            } else {
+                (network_height + 89) / 90
             }
         } else {
             0
@@ -14080,16 +13120,13 @@ impl SimplifiedP2P {
     // =========================================================================
     
     /// Handle sync status update from peer
-    pub fn handle_sync_status(&self, node_id: String, current_height: u64, target_height: u64, syncing: bool) {
-        // Update peer's sync status for network awareness
-        if let Ok(mut peers) = self.connected_peers.write() {
-            if let Some(peer) = peers.get_mut(&node_id) {
-                // Store sync status in peer info (could add sync_status field to PeerInfo)
-                peer.last_seen = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-            }
+    pub fn handle_sync_status(&self, node_id: String, _current_height: u64, _target_height: u64, _syncing: bool) {
+        // v2.51: Lock-free sync status update
+        if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&node_id) {
+            peer.last_seen = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
         }
     }
     
@@ -14393,8 +13430,7 @@ impl SimplifiedP2P {
             }
         };
         
-        let connected_peers = self.connected_peers.clone();
-        let connected_peer_addrs = self.connected_peer_addrs.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let node_id = self.node_id.clone();
         let node_type = self.node_type.clone();  // EXISTING: Need for peer addition
         let region = self.region.clone();          // EXISTING: Need for peer addition
@@ -14471,13 +13507,8 @@ impl SimplifiedP2P {
                                 validated_count += 1;
                             }
                             
-                            // EXISTING: Same duplicate check as add_peer_safe
-                            let already_exists = {
-                                let peer_addrs = match connected_peer_addrs.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                                peer_addrs.contains(&new_peer.addr)
-                            };
-                            
-                            if !already_exists {
+                            // v2.51: Lock-free duplicate check
+                            if !connected_peers.contains_key(&new_peer.addr) {
                                 // EXISTING: Calculate Kademlia fields (from add_peer_safe)
                                 if new_peer.node_id_hash.is_empty() {
                                     let mut hasher = Sha3_256::new();
@@ -14493,16 +13524,13 @@ impl SimplifiedP2P {
                                     (hash[0] as usize) % 256
                                 };
                                 
-                                // Use centralized add_peer_safe_static to avoid code duplication
-                                if Self::add_peer_safe_static(
-                                    new_peer.clone(),
-                                    node_id.clone(),
-                                    connected_peers.clone(),
-                                    connected_peer_addrs.clone()
-                                ) {
-                                added_count += 1;
-                                    // PRIVACY: Use pseudonym in logs
-                                    println!("[P2P] ✅ EXCHANGE: Added peer {} via peer exchange", get_privacy_id_for_addr(&new_peer.addr));
+                                // v2.51: Direct lock-free insertion
+                                if !connected_peers.contains_key(&new_peer.addr) && new_peer.id != node_id {
+                                    connected_peers.insert(new_peer.addr.clone(), new_peer.clone());
+                                    added_count += 1;
+                                    if crate::node::is_debug() {
+                                        println!("[DBG][P2P] exchange_added peer={}", get_privacy_id_for_addr(&new_peer.addr));
+                                    }
                                 }
                             }
                         }
@@ -15327,20 +14355,15 @@ impl SimplifiedP2P {
             "action_taken": "PENALTY_APPLIED"
         });
         
-        // SCALABILITY: Only notify Super nodes and random sample of peers
-        // For millions of nodes, broadcasting to all would cause network storm
-        let peers = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        // v2.51: Lock-free peer collection
         let mut broadcasted = 0;
-        
-        // Collect Super nodes and sample of other peers
         let mut super_nodes = Vec::new();
         let mut other_peers = Vec::new();
         
-        for (peer_id, peer_info) in peers.iter() {
-            if peer_id != node_id {  // Don't send to the violator
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer_id = entry.key();
+            let peer_info = entry.value();
+            if peer_id != node_id {
                 match peer_info.node_type {
                     NodeType::Super => super_nodes.push((peer_id.clone(), peer_info.clone())),
                     _ => other_peers.push((peer_id.clone(), peer_info.clone())),
@@ -15690,17 +14713,14 @@ impl SimplifiedP2P {
             }
         };
         
-        // Send to at least 3 random peers for redundancy
-        let peers = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let peer_list: Vec<_> = peers.keys().cloned().collect();
+        // v2.51: Lock-free audit broadcast
+        let peer_list: Vec<String> = self.connected_peers_lockfree.iter()
+            .map(|e| e.key().clone())
+            .collect();
         
         let selected_peers = if peer_list.len() <= 3 {
             peer_list
         } else {
-            // Select 3 random peers
             use rand::seq::SliceRandom;
             let mut rng = rand::thread_rng();
             peer_list.choose_multiple(&mut rng, 3).cloned().collect()
@@ -15708,7 +14728,7 @@ impl SimplifiedP2P {
         
         for peer_id in selected_peers {
             let audit_data = audit_block.clone();
-            let peer_info = peers.get(&peer_id).cloned();
+            let peer_info = self.connected_peers_lockfree.get(&peer_id).map(|e| e.value().clone());
             
             if let Some(info) = peer_info {
                 let peer_port = 8001; // Standard QNet port
@@ -15775,23 +14795,10 @@ impl SimplifiedP2P {
     
     /// Get last activity map for all peers
     pub fn get_last_activity_map(&self) -> HashMap<String, u64> {
-        let mut activity_map = HashMap::new();
-        
-        // Collect from connected peers
-        if let Ok(peers) = self.connected_peers.read() {
-            for (_, peer) in peers.iter() {
-                activity_map.insert(peer.id.clone(), peer.last_seen);
-            }
-        }
-        
-        // Also check lock-free peers if enabled
-        if self.should_use_lockfree() {
-            for entry in self.connected_peers_lockfree.iter() {
-                activity_map.insert(entry.value().id.clone(), entry.value().last_seen);
-            }
-        }
-        
-        activity_map
+        // v2.51: Lock-free only
+        self.connected_peers_lockfree.iter()
+            .map(|entry| (entry.value().id.clone(), entry.value().last_seen))
+            .collect()
     }
     
     /// PRODUCTION: Apply reputation decay periodically with activity check
@@ -17141,19 +16148,16 @@ impl SimplifiedP2P {
             signature,
         };
         
-        // Send to all connected peers
-        let peers = match self.connected_peers.read() {
-            Ok(peers) => peers.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        
+        // v2.51: Lock-free broadcast
         let mut successful = 0;
-        for (_addr, peer) in peers {
-            self.send_network_message(&peer.addr, sync_msg.clone());
+        for entry in self.connected_peers_lockfree.iter() {
+            self.send_network_message(&entry.value().addr, sync_msg.clone());
             successful += 1;
         }
         
-        println!("[REPUTATION] 📤 Broadcasted reputation sync to {} peers", successful);
+        if crate::node::is_info() {
+            println!("[INFO][REP] sync_broadcast peers={}", successful);
+        }
         Ok(())
     }
     
@@ -17161,8 +16165,7 @@ impl SimplifiedP2P {
     fn start_reputation_sync_task(&self) {
         let node_id = self.node_id.clone();
         let reputation_system = self.reputation_system.clone();
-        let connected_peers = self.connected_peers.clone();
-        let connected_peer_addrs = self.connected_peer_addrs.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let connected_peers_lockfree = self.connected_peers_lockfree.clone();
         let peer_id_to_addr = self.peer_id_to_addr.clone();
         let peer_shards = self.peer_shards.clone();
@@ -17244,19 +16247,13 @@ impl SimplifiedP2P {
                     }
                 };
                 
-                // GOSSIP PROTOCOL: Send to RANDOM subset of peers (NOT broadcast!)
-                // ARCHITECTURE: O(log n) complexity vs O(n) broadcast
-                // SCALABILITY: Supports millions of nodes with exponential propagation
-                let peers = match connected_peers.read() {
-                    Ok(peers) => peers.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                
-                // Filter qualified Super/Full nodes (Light nodes excluded)
-                let qualified_peers: Vec<_> = peers.iter()
-                    .filter(|(_, peer)| {
+                // v2.51: Lock-free gossip peer selection
+                let qualified_peers: Vec<PeerInfo> = connected_peers.iter()
+                    .filter(|entry| {
+                        let peer = entry.value();
                         peer.node_type != NodeType::Light && peer.is_consensus_qualified()
                     })
+                    .map(|entry| entry.value().clone())
                     .collect();
                 
                 if qualified_peers.is_empty() {
@@ -17292,11 +16289,10 @@ impl SimplifiedP2P {
                 selection_hasher.update(b"QNET_GOSSIP_REPUTATION_V1");
                 let selection_seed = selection_hasher.finalize();
                 
-                let mut sorted_peers: Vec<_> = qualified_peers.into_iter().collect();
-                sorted_peers.sort_by_key(|(addr, _)| {
-                    // XOR distance from selection_seed (Kademlia-like)
+                let mut sorted_peers: Vec<PeerInfo> = qualified_peers.into_iter().collect();
+                sorted_peers.sort_by_key(|peer| {
                     let mut peer_hasher = Sha3_256::new();
-                    peer_hasher.update(addr.as_bytes());
+                    peer_hasher.update(peer.addr.as_bytes());
                     peer_hasher.update(&selection_seed);
                     let peer_hash = peer_hasher.finalize();
                     u64::from_le_bytes([
@@ -17305,19 +16301,16 @@ impl SimplifiedP2P {
                     ])
                 });
                 
-                // Select top-N peers by Kademlia distance
-                let gossip_targets: Vec<_> = sorted_peers.into_iter()
+                let gossip_targets: Vec<PeerInfo> = sorted_peers.into_iter()
                     .take(gossip_fanout)
                     .collect();
                 
-                // Send gossip messages to selected peers via QUIC
                 let mut successful = 0;
                 
-                // Create tokio runtime for async operations in this thread
                 if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build() {
-                    for (_addr, peer) in gossip_targets {
+                    for peer in gossip_targets {
                         let peer_addr_str = peer.addr.clone();
                         let sync_msg_clone = sync_msg.clone();
                         
@@ -17585,11 +16578,9 @@ impl SimplifiedP2P {
         let macroblock_index = if height <= 90 { 0 } else { (height - 1) / 90 };
         
         // Try to get from macroblock snapshot first
+        // PRODUCTION v2.50: Lock-free storage access
         if macroblock_index > 0 {
-            if let Some(storage) = crate::node::GLOBAL_STORAGE_INSTANCE.lock()
-                .ok()
-                .and_then(|g| g.clone()) 
-            {
+            if let Some(storage) = crate::node::try_get_storage() {
                 if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(macroblock_index) {
                     if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
                         if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
@@ -17636,40 +16627,33 @@ impl SimplifiedP2P {
     ) -> Result<(), String> {
         println!("[FAILOVER] 📢 Broadcasting emergency {} producer change to network", change_type);
         
-        let peers = match self.connected_peers.read() {
-            Ok(peers) => peers.clone(),
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Mutex poisoned during emergency broadcast, recovering...");
-                poisoned.into_inner().clone()
-            }
-        };
-        
+        // v2.51: Lock-free emergency broadcast
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         
         let mut successful_broadcasts = 0;
-        let total_peers = peers.len();
+        let total_peers = self.connected_peers_lockfree.len();
         
-        for (_addr, peer) in peers {
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer = entry.value();
             let emergency_msg = NetworkMessage::EmergencyProducerChange {
                 failed_producer: failed_producer.to_string(),
                 new_producer: new_producer.to_string(),
                 block_height,
                 change_type: change_type.to_string(),
                 timestamp,
-                sender_node_id: Some(self.node_id.clone()), // PRODUCTION: Explicit sender for Docker/NAT
+                sender_node_id: Some(self.node_id.clone()),
             };
             
-            // CRITICAL: Send emergency message to peer
             self.send_network_message(&peer.addr, emergency_msg);
             successful_broadcasts += 1;
-            println!("[FAILOVER] 📤 Emergency notification sent to peer: {}", get_privacy_id_for_addr(&peer.addr));
         }
         
-        println!("[FAILOVER] 📊 Emergency broadcast completed: {}/{} peers notified", 
-                 successful_broadcasts, total_peers);
+        if crate::node::is_info() {
+            println!("[INFO][FAIL] emergency_broadcast success={}/{}", successful_broadcasts, total_peers);
+        }
         
         Ok(())
     }
