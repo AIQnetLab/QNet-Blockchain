@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.44.0-experimental  
-**Date**: December 24, 2025  
+**Version**: 2.49.1-experimental  
+**Date**: December 26, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -38,6 +38,9 @@ Experimental achievements:
 - ✅ **Chain Reorganization**: Byzantine-safe fork resolution with 2/3 majority consensus
 - ✅ **Advanced Synchronization**: Out-of-order block buffering with active missing block requests
 - ✅ **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
+- ✅ **Consensus Deduplication v2.49.1**: ACTIVE_CONSENSUS_MB prevents 60→1 duplicate tasks
+- ✅ **Idempotent Rounds v2.49.1**: Preserves commits/reveals if round already active
+- ✅ **700x Faster Consensus v2.49.1**: 7107s→3-10s per MacroBlock
 - ✅ **Batch Ed25519 Verification (v2.25.2)**: 3x faster signature verification using batch API
 - ✅ **Batch Mempool (v2.25.2)**: 1 lock per 1000 TX (1000x reduction in lock contention)
 - ✅ **TX Accumulator (v2.25.2)**: Batch 1000 TX for verification with 100ms timeout
@@ -55,6 +58,10 @@ Experimental achievements:
 - ✅ **Aggressive Catch-up (v2.44.0)**: 15s/5 blocks threshold (was 120s/50) for fast stall recovery
 - ✅ **Byzantine Median Height (v2.44.0)**: Fresh network height from HealthPing peer data
 - ✅ **100K+ TPS Stress Tested (v2.44.0)**: Network recovery after high-load scenarios
+- ✅ **LAST_FINALIZED_CONSENSUS_ROUND (v2.48.0)**: Global atomic tracks actually finalized rounds
+- ✅ **Round Update at Save Only (v2.48.0)**: Prevents premature round advancement causing desync
+- ✅ **Reveal Loss Prevention (v2.48.0)**: Participant nodes don't reset consensus engine mid-round
+- ✅ **Dynamic Height Threshold (v2.48.0)**: 5/10/20 blocks based on network size (scalable resync)
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 

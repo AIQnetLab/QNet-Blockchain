@@ -44,7 +44,16 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.44.0 - December 24, 2025)**
+### 🛡️ **LATEST UPDATES (v2.48.0 - December 25, 2025)**
+
+**🔧 Consensus Stability v2.48 (Round Mismatch Fix + Reveal Loss Prevention):**
+- **LAST_FINALIZED_CONSENSUS_ROUND**: Global atomic tracks ONLY successfully saved MacroBlocks
+- **Round Update at Save Only**: Prevents premature round advancement causing desync
+- **Reveal Loss Prevention**: Participant nodes don't reset consensus engine mid-round
+- **Dynamic Height Threshold**: 5/10/20 blocks based on network size (scalable resync)
+- **Signed Reveal Messages**: SHA3-256 + Dilithium hybrid signatures for reveals
+
+### 🛡️ **Previous Updates (v2.44.0 - December 24, 2025)**
 
 **🔄 Network Recovery v2.44 (Aggressive Catch-up + Round Tolerance):**
 - **Round Tolerance ±90**: Accept consensus messages within 1 epoch for fork recovery

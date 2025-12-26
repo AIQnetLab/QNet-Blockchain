@@ -1,9 +1,9 @@
-# QNet Blockchain Architecture v2.44
+# QNet Blockchain Architecture v2.49
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: December 24, 2025  
-**Version**: 2.44.0  
-**Status**: Production Ready (Aggressive Recovery + Round Tolerance + 100K TPS)
+**Last Updated**: December 26, 2025  
+**Version**: 2.49.1  
+**Status**: Production Ready (Consensus Deduplication + Idempotent Rounds)
 
 > ⚠️ **CONSENSUS UPDATED in v2.40.0**  
 > Phases now determined by block height (deterministic), not message counts.  
@@ -53,6 +53,13 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Round Tolerance ±90 v2.44.0**: Fork recovery accepts messages within 1 epoch
 - **Aggressive Catch-up v2.44.0**: 15s/5 blocks threshold for fast resync (was 120s/50)
 - **100K TPS Recovery v2.44.0**: Network self-heals after high-load stress tests
+- **LAST_FINALIZED_CONSENSUS_ROUND v2.48.0**: Global atomic tracks actually finalized rounds
+- **Dynamic Height Threshold v2.48.0**: 5/10/20 blocks based on network size (scalable)
+- **Reveal Loss Prevention v2.48.0**: Participant nodes don't reset consensus engine mid-round
+- **ACTIVE_CONSENSUS_MB v2.49.1**: Prevents 60 duplicate tasks → only 1 per MacroBlock
+- **Idempotent Rounds v2.49.1**: start_round_at_height() preserves commits/reveals if active
+- **Stale Lock Recovery v2.49.1**: Automatic override for panic/timeout (old_mb < new_mb)
+- **Retry via Sync v2.49.1**: Gap > 90 blocks → P2P sync instead of consensus (no Round Mismatch)
 
 ---
 

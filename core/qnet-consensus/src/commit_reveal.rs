@@ -191,6 +191,9 @@ impl CommitRevealConsensus {
     
     /// PRODUCTION v2.40.2: Start round with explicit block height
     /// round_number = macroblock_height (90, 180, 270...) for correct epoch calculation
+    /// 
+    /// v2.49 FIX: IDEMPOTENT - if round already active for same round_number, 
+    /// do NOT reset commits/reveals! This prevents parallel tasks from destroying each other's work.
     pub fn start_round_at_height(&mut self, participants: Vec<String>, macroblock_height: u64) -> Result<u64, ConsensusError> {
         if participants.len() < self.config.min_participants {
             return Err(ConsensusError::InsufficientNodes);
@@ -208,6 +211,26 @@ impl CommitRevealConsensus {
                 .unwrap_or(90)
         };
         
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v2.49 FIX: IDEMPOTENT ROUND START
+        // If round is already active for this round_number, preserve commits/reveals!
+        // This prevents race condition where multiple tasks reset each other's work.
+        // ═══════════════════════════════════════════════════════════════════════════
+        if let Some(ref current) = self.current_round {
+            if current.round_number == round_number {
+                // Round already active for same round_number - DO NOT RESET!
+                // Just return success, commits/reveals are preserved
+                println!("[INFO][CONS] round_already_active round={} commits={} reveals={} idempotent=true",
+                         round_number, current.commits.len(), current.reveals.len());
+                return Ok(round_number);
+            }
+            // Different round_number - this is unusual but can happen during recovery
+            // Log warning but proceed with new round
+            println!("[WARN][CONS] round_override old_round={} new_round={} old_commits={} old_reveals={}",
+                     current.round_number, round_number, current.commits.len(), current.reveals.len());
+        }
+        
+        // No active round or different round_number - create new round state
         let round_state = RoundState {
             phase: ConsensusPhase::Commit,
             round_number,

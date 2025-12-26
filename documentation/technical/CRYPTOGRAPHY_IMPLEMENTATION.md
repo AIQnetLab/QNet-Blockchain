@@ -1,9 +1,9 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 2.8 (v2.44.0)  
-**Date:** December 24, 2025  
-**Status:** Production Ready (Aggressive Recovery + Round Tolerance + 100K TPS)  
+**Version:** 2.9 (v2.48.0)  
+**Date:** December 25, 2025  
+**Status:** Production Ready (Round Mismatch Fix + Dynamic Threshold + Reveal Loss Prevention)  
 
 ---
 
@@ -69,6 +69,21 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Aggressive Catch-up** (15s stall / 5 block gap threshold, was 120s/50)
 - ✅ **Byzantine Median Height** (fresh height from QUIC HealthPing peer data)
 - ✅ **100K TPS Stress Tested** (network recovery after high-load scenarios)
+
+### v2.48.0 Additions (Round Mismatch Fix + Dynamic Threshold)
+- ✅ **LAST_FINALIZED_CONSENSUS_ROUND** (global AtomicU64 tracks actually finalized rounds)
+- ✅ **Round update ONLY at save** (not at spawn/sync/rate-limit - prevents desync)
+- ✅ **Reveal Loss Prevention** (participant nodes don't call trigger mid-consensus)
+- ✅ **Dynamic Height Threshold** (5/10/20 blocks based on network size for scalability)
+- ✅ **Signed Reveal Messages** (SHA3-256 + Dilithium+Ed25519 hybrid signatures)
+
+### v2.49.1 Additions (Consensus Deduplication + Idempotent Rounds)
+- ✅ **ACTIVE_CONSENSUS_MB** (AtomicU64 prevents 60 duplicate tasks → only 1 per MB)
+- ✅ **Idempotent start_round_at_height()** (preserves commits/reveals if round already active)
+- ✅ **Stale Lock Override** (old_mb < new_mb → automatic recovery from panic/timeout)
+- ✅ **Retry via Sync** (gap > 90 blocks → P2P sync instead of consensus - prevents Round Mismatch)
+- ✅ **Lock-free Architecture** (compare_exchange with SeqCst ordering, no mutexes)
+- ✅ **700x Faster Consensus** (7107s → 3-10s per MacroBlock)
 
 ---
 

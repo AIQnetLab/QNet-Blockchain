@@ -152,6 +152,12 @@ pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 // This prevents round mismatch between nodes
 pub static LAST_FINALIZED_CONSENSUS_ROUND: AtomicU64 = AtomicU64::new(0);
 
+// CRITICAL FIX v2.49: Prevent duplicate consensus tasks for same MacroBlock
+// Only ONE consensus task can be active per MacroBlock index at any time
+// Uses compare_exchange to atomically check-and-set
+// Value 0 = no active consensus, Value N = consensus active for MB#N
+pub static ACTIVE_CONSENSUS_MB: AtomicU64 = AtomicU64::new(0);
+
 // METRICS: Track retry statistics for monitoring certificate race condition
 // Used to tune retry interval and detect systemic issues
 static RETRY_TOTAL: AtomicU64 = AtomicU64::new(0);           // Total retry attempts
@@ -11566,8 +11572,55 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             let is_validator = qualified.iter().any(|(id, _)| id == &node_id);
                             
                             if is_validator {
+                                // ═══════════════════════════════════════════════════════════════════
+                                // v2.49.1 FIX: PREVENT DUPLICATE CONSENSUS TASKS FOR SAME MB
+                                // Use compare_exchange with CURRENT MB check, not just 0
+                                // Logic: Allow new MB if (active == 0) OR (active < current_mb)
+                                // This prevents duplicates for SAME MB but allows NEXT MB to start
+                                // ═══════════════════════════════════════════════════════════════════
+                                let current_active = ACTIVE_CONSENSUS_MB.load(std::sync::atomic::Ordering::SeqCst);
+                                
+                                // Case 1: Same MB already active → skip duplicate
+                                if current_active == macroblock_index {
+                                    if is_debug() { 
+                                        println!("[DBG][CONS] skip_duplicate mb={} already_active", macroblock_index); 
+                                    }
+                                    continue;
+                                }
+                                
+                                // Case 2: Old MB still "active" (stale lock from previous epoch)
+                                // If current_active < macroblock_index, the old task is stale - override it
+                                // This handles: panic in old task, timeout, stuck consensus
+                                if current_active > 0 && current_active < macroblock_index {
+                                    println!("[WARN][CONS] stale_lock_override old_mb={} new_mb={}", 
+                                             current_active, macroblock_index);
+                                    // Force override - old consensus is stale
+                                    ACTIVE_CONSENSUS_MB.store(macroblock_index, std::sync::atomic::Ordering::SeqCst);
+                                } else if current_active == 0 {
+                                    // Case 3: No active consensus - try to acquire lock
+                                    let active_result = ACTIVE_CONSENSUS_MB.compare_exchange(
+                                        0,                                          // Expected: no active
+                                        macroblock_index,                           // Set to current MB
+                                        std::sync::atomic::Ordering::SeqCst,
+                                        std::sync::atomic::Ordering::SeqCst
+                                    );
+                                    
+                                    if active_result.is_err() {
+                                        // Race condition - another thread got it first, retry next block
+                                        if is_debug() { 
+                                            println!("[DBG][CONS] lock_race mb={}", macroblock_index); 
+                                        }
+                                        continue;
+                                    }
+                                } else {
+                                    // Case 4: Future MB active (shouldn't happen) - skip
+                                    println!("[WARN][CONS] future_mb_active active={} requested={}", 
+                                             current_active, macroblock_index);
+                                    continue;
+                                }
+                                
                                 if is_info() { 
-                                    println!("[INFO][CONS] validator=true mb={} participating", macroblock_index); 
+                                    println!("[INFO][CONS] validator=true mb={} participating active_lock=acquired", macroblock_index); 
                                 }
                                 
                                 // Calculate block range for this macroblock
@@ -11661,6 +11714,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             }
                                         }
                                     }
+                                    
+                                    // v2.49.1 FIX: Release lock - but don't force to 0!
+                                    // If a newer MB already took over (stale_lock_override), don't reset it
+                                    // Only clear if we still own the lock
+                                    let current = ACTIVE_CONSENSUS_MB.load(std::sync::atomic::Ordering::SeqCst);
+                                    if current == mb_idx {
+                                        ACTIVE_CONSENSUS_MB.store(0, std::sync::atomic::Ordering::SeqCst);
+                                        if is_debug() { 
+                                            println!("[DBG][CONS] active_lock_released mb={}", mb_idx); 
+                                        }
+                                    } else {
+                                        // Lock was taken by newer MB - don't interfere
+                                        if is_debug() { 
+                                            println!("[DBG][CONS] lock_already_transferred mb={} current={}", mb_idx, current); 
+                                        }
+                                    }
                                 });
                                 
                                 // v2.48 FIX: Do NOT update last_consensus_round here!
@@ -11726,75 +11795,128 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                     println!("[WARN][RETRY] mb={} missing retry={}/{}", prev_mb_idx, current_retry, MAX_MB_RETRIES); 
                                                 }
                                                 
-                                                let storage_retry = storage.clone();
-                                                let consensus_retry = consensus.clone();
-                                                let p2p_retry = p2p_ref.clone();
-                                                let node_id_retry = node_id.clone();
-                                                let consensus_rx_retry = consensus_rx.clone();
+                                                // ═══════════════════════════════════════════════════════════════════
+                                                // v2.49 FIX: RETRY VIA SYNC FOR OLD MACROBLOCKS
+                                                // If MB is more than 1 epoch behind, consensus will fail with Round Mismatch!
+                                                // Solution: Use direct sync (download ready MB) instead of consensus
+                                                // 
+                                                // WHY: Consensus engine has tolerance of ±90 blocks (1 epoch)
+                                                // If prev_mb_idx * 90 is more than 90 blocks behind current height,
+                                                // all commit/reveal messages will be rejected with Round Mismatch
+                                                // ═══════════════════════════════════════════════════════════════════
+                                                let mb_round = prev_mb_idx * 90;
+                                                let current_round = macroblock_index * 90;
+                                                let round_gap = current_round.saturating_sub(mb_round);
                                                 
-                                                tokio::spawn(async move {
-                                                    // Small delay to not overload
-                                                    tokio::time::sleep(Duration::from_secs(5)).await;
-                                                    
-                                                    let retry_start = (prev_mb_idx - 1) * 90 + 1;
-                                                    let retry_end = prev_mb_idx * 90;
-                                                    
+                                                // If gap > 90 blocks (1 epoch), use sync instead of consensus
+                                                const MAX_CONSENSUS_GAP: u64 = 90;
+                                                let use_sync = round_gap > MAX_CONSENSUS_GAP;
+                                                
+                                                if use_sync {
+                                                    // TOO OLD for consensus - use direct sync!
                                                     if is_info() { 
-                                                        println!("[INFO][RETRY] mb={} blocks={}-{} attempt={}/{}", 
-                                                                 prev_mb_idx, retry_start, retry_end, current_retry, MAX_MB_RETRIES); 
+                                                        println!("[INFO][RETRY] mb={} via_sync gap={} (consensus_max={})", 
+                                                                 prev_mb_idx, round_gap, MAX_CONSENSUS_GAP); 
                                                     }
                                                     
-                                                    let should_init = Self::should_initiate_consensus(
-                                                        &p2p_retry,
-                                                        &node_id_retry,
-                                                        node_type,
-                                                        &storage_retry,
-                                                        retry_end
-                                                    ).await;
+                                                    let p2p_sync = p2p_ref.clone();
+                                                    let mb_to_sync = prev_mb_idx;
                                                     
-                                                    let result = if should_init {
-                                                        if is_info() { 
-                                                            println!("[INFO][RETRY] mb={} role=initiator", prev_mb_idx); 
+                                                    tokio::spawn(async move {
+                                                        // Small delay to not overload
+                                                        tokio::time::sleep(Duration::from_secs(2)).await;
+                                                        
+                                                        // v2.49: Sync directly from peers who have this MB
+                                                        for attempt in 1..=3 {
+                                                            match p2p_sync.sync_macroblocks(mb_to_sync, mb_to_sync).await {
+                                                                Ok(_) => {
+                                                                    if is_info() { 
+                                                                        println!("[INFO][RETRY] mb={} sync=ok attempt={}", mb_to_sync, attempt); 
+                                                                    }
+                                                                    break;
+                                                                }
+                                                                Err(e) => {
+                                                                    if is_warn() { 
+                                                                        println!("[WARN][RETRY] mb={} sync=fail attempt={} err={}", 
+                                                                                 mb_to_sync, attempt, e); 
+                                                                    }
+                                                                    tokio::time::sleep(Duration::from_secs(3)).await;
+                                                                }
+                                                            }
                                                         }
-                                                        Self::trigger_macroblock_consensus(
-                                                            storage_retry.clone(),
-                                                            consensus_retry,
-                                                            retry_start,
-                                                            retry_end,
+                                                    });
+                                                } else {
+                                                    // CLOSE ENOUGH - can use consensus (within tolerance)
+                                                    let storage_retry = storage.clone();
+                                                    let consensus_retry = consensus.clone();
+                                                    let p2p_retry = p2p_ref.clone();
+                                                    let node_id_retry = node_id.clone();
+                                                    let consensus_rx_retry = consensus_rx.clone();
+                                                    
+                                                    tokio::spawn(async move {
+                                                        // Small delay to not overload
+                                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                                                        
+                                                        let retry_start = (prev_mb_idx - 1) * 90 + 1;
+                                                        let retry_end = prev_mb_idx * 90;
+                                                        
+                                                        if is_info() { 
+                                                            println!("[INFO][RETRY] mb={} blocks={}-{} attempt={}/{} via_consensus", 
+                                                                     prev_mb_idx, retry_start, retry_end, current_retry, MAX_MB_RETRIES); 
+                                                        }
+                                                        
+                                                        let should_init = Self::should_initiate_consensus(
                                                             &p2p_retry,
                                                             &node_id_retry,
                                                             node_type,
-                                                            &consensus_rx_retry,
-                                                        ).await
-                                                    } else {
-                                                        if is_info() { 
-                                                            println!("[INFO][RETRY] mb={} role=participant", prev_mb_idx); 
-                                                        }
-                                                        Self::participate_in_macroblock_consensus(
-                                                            storage_retry.clone(),
-                                                            consensus_retry,
-                                                            retry_start,
-                                                            retry_end,
-                                                            &p2p_retry,
-                                                            &node_id_retry,
-                                                            node_type,
-                                                            &consensus_rx_retry,
-                                                        ).await
-                                                    };
-                                                    
-                                                    match result {
-                                                        Ok(_) => {
+                                                            &storage_retry,
+                                                            retry_end
+                                                        ).await;
+                                                        
+                                                        let result = if should_init {
                                                             if is_info() { 
-                                                                println!("[INFO][RETRY] mb={} result=ok", prev_mb_idx); 
+                                                                println!("[INFO][RETRY] mb={} role=initiator", prev_mb_idx); 
+                                                            }
+                                                            Self::trigger_macroblock_consensus(
+                                                                storage_retry.clone(),
+                                                                consensus_retry,
+                                                                retry_start,
+                                                                retry_end,
+                                                                &p2p_retry,
+                                                                &node_id_retry,
+                                                                node_type,
+                                                                &consensus_rx_retry,
+                                                            ).await
+                                                        } else {
+                                                            if is_info() { 
+                                                                println!("[INFO][RETRY] mb={} role=participant", prev_mb_idx); 
+                                                            }
+                                                            Self::participate_in_macroblock_consensus(
+                                                                storage_retry.clone(),
+                                                                consensus_retry,
+                                                                retry_start,
+                                                                retry_end,
+                                                                &p2p_retry,
+                                                                &node_id_retry,
+                                                                node_type,
+                                                                &consensus_rx_retry,
+                                                            ).await
+                                                        };
+                                                        
+                                                        match result {
+                                                            Ok(_) => {
+                                                                if is_info() { 
+                                                                    println!("[INFO][RETRY] mb={} result=ok", prev_mb_idx); 
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                if is_warn() { 
+                                                                    println!("[WARN][RETRY] mb={} result=fail err={}", prev_mb_idx, e); 
+                                                                }
                                                             }
                                                         }
-                                                        Err(e) => {
-                                                            if is_warn() { 
-                                                                println!("[WARN][RETRY] mb={} result=fail err={}", prev_mb_idx, e); 
-                                                            }
-                                                        }
-                                                    }
-                                                });
+                                                    });
+                                                }
                                             }
                                         }
                                     }
