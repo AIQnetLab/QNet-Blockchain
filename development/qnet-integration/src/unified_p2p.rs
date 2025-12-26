@@ -11520,9 +11520,20 @@ impl SimplifiedP2P {
             return self.verify_hybrid_p2p_signature_async(message, signature, node_id).await;
         }
         
+        // v2.49.2: FULL hybrid binary signature (used for MACROBLOCK consensus)
+        if signature.starts_with("hybrid_bin:") {
+            return self.verify_hybrid_bin_signature_sync(message, signature, node_id);
+        }
+        
+        // v2.49.2: COMPACT hybrid binary signature
+        if signature.starts_with("compact_bin:") {
+            return self.verify_compact_bin_signature_sync(message, signature, node_id);
+        }
+        
         // LEGACY FORMAT: Pure Dilithium signature (for backward compatibility)
         if !signature.starts_with("dilithium_sig_") {
-            println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix");
+            println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix (got: {}...)", 
+                     &signature[..signature.len().min(20)]);
             return false;
         }
         
@@ -11806,9 +11817,22 @@ impl SimplifiedP2P {
             return self.verify_hybrid_p2p_signature_sync(message, signature, node_id);
         }
         
+        // v2.49.2: FULL hybrid binary signature (used for MACROBLOCK consensus)
+        // Format: "hybrid_bin:<base64_bincode_zstd>" with embedded certificate
+        if signature.starts_with("hybrid_bin:") {
+            return self.verify_hybrid_bin_signature_sync(message, signature, node_id);
+        }
+        
+        // v2.49.2: COMPACT hybrid binary signature  
+        // Format: "compact_bin:<base64_bincode_zstd>" requires pre-shared certificate
+        if signature.starts_with("compact_bin:") {
+            return self.verify_compact_bin_signature_sync(message, signature, node_id);
+        }
+        
         // LEGACY FORMAT: Pure Dilithium signature
         if !signature.starts_with("dilithium_sig_") {
-            println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix");
+            println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix (got: {}...)", 
+                     &signature[..signature.len().min(20)]);
             return false;
         }
         
@@ -11984,6 +12008,226 @@ impl SimplifiedP2P {
                                 true
                             }
                             _ => false
+                        }
+                    })
+                }
+                Err(_) => false
+            }
+        });
+        
+        handle.join().unwrap_or(false)
+    }
+    
+    /// v2.49.2: Verify FULL hybrid binary signature (with embedded certificate)
+    /// Format: "hybrid_bin:<base64_bincode_zstd>" - used for MACROBLOCK consensus
+    fn verify_hybrid_bin_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        use crate::hybrid_crypto::{HybridSignature, HybridCrypto};
+        use base64::{Engine as _, engine::general_purpose};
+        
+        // Parse binary signature: "hybrid_bin:<base64_bincode_zstd>"
+        let base64_data = &signature[11..]; // Skip "hybrid_bin:" prefix
+        let binary_data = match general_purpose::STANDARD.decode(base64_data) {
+            Ok(data) => data,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] hybrid_bin base64 decode failed: {}", e);
+                }
+                return false;
+            }
+        };
+        
+        let hybrid_sig: HybridSignature = match HybridSignature::from_binary_compressed(&binary_data) {
+            Ok(sig) => sig,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] hybrid_bin signature parse failed: {}", e);
+                }
+                return false;
+            }
+        };
+        
+        // Verify node_id matches certificate
+        if hybrid_sig.certificate.node_id != node_id {
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] hybrid_bin node_id mismatch: {} vs {}", 
+                         hybrid_sig.certificate.node_id, node_id);
+            }
+            return false;
+        }
+        
+        // Use isolated thread for async verification
+        // CRITICAL v2.49.2: commit_hash is HEX string, must decode to bytes for verification
+        // Signature was created on decoded bytes, not on HEX string!
+        let message_bytes: Vec<u8> = match hex::decode(message) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // Fallback: if not valid hex, use as-is (for non-commit messages)
+                message.as_bytes().to_vec()
+            }
+        };
+        let handle = std::thread::spawn(move || {
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => {
+                    rt.block_on(async move {
+                        let verifier = HybridCrypto::new(hybrid_sig.certificate.node_id.clone());
+                        match verifier.verify_signature(&message_bytes, &hybrid_sig).await {
+                            Ok(true) => {
+                                if crate::node::is_debug() {
+                                    println!("[DBG][CONS] hybrid_bin_verified node={} cert={}", 
+                                             hybrid_sig.certificate.node_id,
+                                             &hybrid_sig.certificate.serial_number[..8]);
+                                }
+                                true
+                            }
+                            Ok(false) => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][CONS] hybrid_bin_invalid node={}", 
+                                             hybrid_sig.certificate.node_id);
+                                }
+                                false
+                            }
+                            Err(e) => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][CONS] hybrid_bin_error node={} err={}", 
+                                             hybrid_sig.certificate.node_id, e);
+                                }
+                                false
+                            }
+                        }
+                    })
+                }
+                Err(_) => false
+            }
+        });
+        
+        handle.join().unwrap_or(false)
+    }
+    
+    /// v2.49.2: Verify COMPACT hybrid binary signature (requires pre-shared certificate)
+    /// Format: "compact_bin:<base64_bincode_zstd>" - used for microblock signatures
+    fn verify_compact_bin_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+        use crate::quantum_crypto::DilithiumSignature;
+        use sha3::{Sha3_256, Digest};
+        use base64::{Engine as _, engine::general_purpose};
+        
+        // Parse binary signature: "compact_bin:<base64_bincode_zstd>"
+        let base64_data = &signature[12..]; // Skip "compact_bin:" prefix
+        let binary_data = match general_purpose::STANDARD.decode(base64_data) {
+            Ok(data) => data,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] compact_bin base64 decode failed: {}", e);
+                }
+                return false;
+            }
+        };
+        
+        let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
+            Ok(sig) => sig,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] compact_bin signature parse failed: {}", e);
+                }
+                return false;
+            }
+        };
+        
+        // Verify node_id matches
+        if compact_sig.node_id != node_id {
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] compact_bin node_id mismatch: {} vs {}", 
+                         compact_sig.node_id, node_id);
+            }
+            return false;
+        }
+        
+        // CRITICAL v2.49.2: message is HEX string, must decode to bytes for verification
+        // Signature was created on decoded bytes, not on HEX string!
+        let message_bytes: Vec<u8> = match hex::decode(message) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // Fallback: if not valid hex, use as-is (for non-commit messages)
+                message.as_bytes().to_vec()
+            }
+        };
+        
+        // Verify Ed25519 signature on message hash
+        let mut hasher = Sha3_256::new();
+        hasher.update(&message_bytes);
+        let message_hash = hasher.finalize();
+        
+        match HybridCrypto::verify_ed25519_signature(
+            &message_hash,
+            &compact_sig.message_signature,
+            &compact_sig.ephemeral_public_key
+        ) {
+            Ok(true) => {
+                if crate::node::is_debug() {
+                    println!("[DBG][CONS] compact_bin Ed25519 verified");
+                }
+            }
+            _ => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] compact_bin Ed25519 signature INVALID");
+                }
+                return false;
+            }
+        }
+        
+        // Verify Dilithium signature on ephemeral key
+        let node_id_clone = node_id.to_string();
+        let handle = std::thread::spawn(move || {
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => {
+                    rt.block_on(async move {
+                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+                        if crypto_guard.is_none() {
+                            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+                            let _ = crypto.initialize().await;
+                            *crypto_guard = Some(crypto);
+                        }
+                        let crypto = match crypto_guard.as_ref() {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        
+                        let mut encapsulated_data = Vec::new();
+                        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
+                        encapsulated_data.extend_from_slice(&message_hash);
+                        encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
+                        let encapsulated_hex = hex::encode(&encapsulated_data);
+                        
+                        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+                        let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
+                        
+                        let dilithium_key_sig = DilithiumSignature {
+                            signature: signature_string,
+                            algorithm: "CRYSTALS-Dilithium3".to_string(),
+                            timestamp: compact_sig.signed_at,
+                            strength: "quantum-resistant".to_string(),
+                        };
+                        
+                        match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &node_id_clone).await {
+                            Ok(true) => {
+                                if crate::node::is_debug() {
+                                    println!("[DBG][CONS] compact_bin_verified node={}", node_id_clone);
+                                }
+                                true
+                            }
+                            Ok(false) => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][CONS] compact_bin_invalid node={}", node_id_clone);
+                                }
+                                false
+                            }
+                            Err(e) => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][CONS] compact_bin_error node={} err={:?}", node_id_clone, e);
+                                }
+                                false
+                            }
                         }
                     })
                 }
