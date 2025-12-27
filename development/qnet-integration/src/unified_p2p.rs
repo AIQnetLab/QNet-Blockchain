@@ -3834,10 +3834,55 @@ impl SimplifiedP2P {
         // Split block into chunks
         let chunks = self.split_into_chunks(&block_data);
         let total_chunks = chunks.len();
-        let parity_count = ((total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize;
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.55: ADAPTIVE REDUNDANCY for large blocks
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.55: ADAPTIVE REDUNDANCY
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Problem: Fixed 1.5x redundancy insufficient for large blocks
+        // Solution: Scale redundancy with block size for optimal reliability
+        // ═══════════════════════════════════════════════════════════════════════════
+        let adaptive_redundancy = if original_block_size < 100_000 {
+            SHRED_PROTOCOL_REDUNDANCY_FACTOR  // 1.5x for small blocks
+        } else if original_block_size < 500_000 {
+            1.75  // Medium blocks
+        } else if original_block_size < 2_000_000 {
+            2.0   // Large blocks - 100% redundancy
+        } else {
+            2.5   // Very large blocks - extra safety
+        };
+        
+        let parity_count = ((total_chunks as f32) * (adaptive_redundancy - 1.0)).ceil() as usize;
         
         // Generate Reed-Solomon parity chunks
         let parity_chunks = self.generate_parity_chunks(&chunks, parity_count);
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.55: PRODUCER CACHE - Cache chunks IMMEDIATELY for repair
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Problem: Producer didn't cache chunks → repair requests returned nothing!
+        // Solution: Cache chunks at broadcast time so repair can find them
+        // ═══════════════════════════════════════════════════════════════════════════
+        let chunks_for_cache: Vec<Option<Vec<u8>>> = chunks.iter()
+            .map(|c| Some(c.clone()))
+            .collect();
+        let parity_for_cache: Vec<Option<Vec<u8>>> = parity_chunks.iter()
+            .map(|c| Some(c.clone()))
+            .collect();
+        
+        self.cache_chunks_for_retransmit(
+            height,
+            chunks_for_cache,
+            parity_for_cache,
+            original_block_size,
+            is_macroblock,
+        );
+        
+        if height <= 100 || height % 50 == 0 {
+            println!("[INFO][CACHE] producer_cache h={} data={} parity={} redundancy={:.1}x", 
+                     height, total_chunks, parity_count, adaptive_redundancy);
+        }
         
         // ADAPTIVE FANOUT: Calculate optimal fanout based on network size and latency
         let shred_protocol_fanout = self.get_shred_protocol_fanout();
@@ -4073,13 +4118,15 @@ impl SimplifiedP2P {
                 };
                 
                 // ═══════════════════════════════════════════════════════════════════════════
-                // PRODUCTION v2.54: FIRE-AND-FORGET BROADCAST
+                // PRODUCTION v2.55: ASYNC BROADCAST + CHUNK REPAIR
                 // ═══════════════════════════════════════════════════════════════════════════
-                // Problem: join_all waits for SLOWEST peer in each batch (caused 64s delays!)
-                // Solution: Fire-and-forget with Reed-Solomon redundancy guarantees delivery
-                // - Spawn tasks without waiting for completion
-                // - Track success/failure via atomic counters (async callback)
-                // - Pacing still applied between batches to prevent UDP burst
+                // Architecture:
+                // 1. Async broadcast (non-blocking, ~50ms for any block size)
+                // 2. Producer caches chunks (for repair requests)
+                // 3. Receiver caches chunks (can serve repair to other nodes)
+                // 4. Missing chunks after 500ms → automatic repair request
+                // 5. Adaptive redundancy (2x-2.5x for large blocks)
+                // 6. QUIC provides implicit ACK (connection-level reliability)
                 // ═══════════════════════════════════════════════════════════════════════════
                 
                 let sends_count = other_sends.len();
@@ -4092,7 +4139,7 @@ impl SimplifiedP2P {
                         let permit = semaphore.clone();
                         
                         // FIRE-AND-FORGET: Spawn without awaiting result
-                        // Reed-Solomon redundancy (1.5x) ensures block delivery even if some fail
+                        // Repair mechanism handles lost chunks (receiver-side)
                         tokio::spawn(async move {
                             let _permit = match permit.acquire().await {
                                 Ok(p) => p,
@@ -4120,8 +4167,7 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // Estimate success for immediate return (actual tracking via atomic counters in spawned tasks)
-                // Fire-and-forget: we assume all sends will succeed (Reed-Solomon handles failures)
+                // Fire-and-forget: assume success, repair handles failures
                 total_success = sends_count;
                 
                 // Calculate and update failure rate periodically (from atomic counters)
@@ -4138,9 +4184,9 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // Log fire-and-forget dispatch (success tracked asynchronously)
+                // Log async broadcast dispatch
                 if height_for_log <= 100 || height_for_log % 50 == 0 {
-                    println!("[INFO][SHRED] fire_and_forget block={} chunks={} peers={}", 
+                    println!("[INFO][SHRED] broadcast h={} sends={} batches={}", 
                         height_for_log, sends_count, num_batches);
                 }
                 
@@ -4390,6 +4436,45 @@ impl SimplifiedP2P {
             }
         } // DashMap lock released here!
         
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.55: RECEIVER CACHE - Cache chunks IMMEDIATELY for repair
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Problem: Receivers only cached after reconstruction → repair returned nothing!
+        // Solution: Cache each chunk as it arrives so we can respond to repair requests
+        // This enables ANY node that received chunks to serve repair, not just producer
+        // ═══════════════════════════════════════════════════════════════════════════
+        {
+            // Update or create cache entry with this chunk
+            let mut cache_entry = self.shred_chunk_cache.entry(height)
+                .or_insert_with(|| {
+                    // Estimate parity count based on adaptive redundancy
+                    let estimated_parity = ((total_chunks as f32) * 1.5).ceil() as usize; // Conservative estimate
+                    ShredChunkCacheEntry {
+                        chunks: vec![None; total_chunks],
+                        parity_chunks: vec![None; estimated_parity],
+                        original_block_size: chunk.original_block_size,
+                        is_macroblock: chunk.is_macroblock,
+                        cached_at: Instant::now(),
+                    }
+                });
+            
+            // Store this chunk in cache
+            if chunk.is_parity {
+                let parity_idx = chunk.chunk_index.saturating_sub(total_chunks);
+                // Expand parity vec if needed
+                if parity_idx >= cache_entry.parity_chunks.len() {
+                    cache_entry.parity_chunks.resize(parity_idx + 1, None);
+                }
+                if parity_idx < cache_entry.parity_chunks.len() {
+                    cache_entry.parity_chunks[parity_idx] = Some(chunk.data.clone());
+                }
+            } else {
+                if chunk.chunk_index < cache_entry.chunks.len() {
+                    cache_entry.chunks[chunk.chunk_index] = Some(chunk.data.clone());
+                }
+            }
+        }
+        
         // ============================================================================
         // PRODUCTION v2.45.1: CHUNK #0 REQUIRED FOR PROCESSED STATUS
         // ============================================================================
@@ -4443,8 +4528,7 @@ impl SimplifiedP2P {
                     assembly.retransmit_requested_at = Some(Instant::now());
                     drop(assembly);
                     
-                    println!("[SHRED_PROTOCOL] 🔐 PRIORITY: Requesting chunk #0 (certificate) for block #{} after {}ms", 
-                             height, elapsed_ms);
+                    println!("[INFO][REPAIR] priority_request h={} chunk=0 elapsed={}ms", height, elapsed_ms);
                     self.request_missing_chunks(height, vec![0], from_peer);
                 }
                 // Standard timeout for other missing chunks
@@ -4480,11 +4564,11 @@ impl SimplifiedP2P {
                             // Drop the lock before requesting
                             drop(assembly);
                             
-                            println!("[SHRED_PROTOCOL] 🔄 Requesting {} missing chunks for block #{} (attempt {})", 
-                                     total_missing, height, 
-                                     self.shred_protocol_assemblies.get(&height)
-                                         .map(|a| a.retransmit_attempts)
-                                         .unwrap_or(0));
+                            let attempt = self.shred_protocol_assemblies.get(&height)
+                                .map(|a| a.retransmit_attempts)
+                                .unwrap_or(0);
+                            println!("[INFO][REPAIR] chunk_request h={} missing={} attempt={}", 
+                                     height, total_missing, attempt);
                         
                             self.request_missing_chunks(height, missing_indices, from_peer);
                         }
@@ -13303,6 +13387,48 @@ impl SimplifiedP2P {
         self.send_network_message(&best_peer.addr, request);
         
         Ok(())
+    }
+    
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// PRODUCTION v2.55: REQUEST BLOCK REPAIR
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// Request specific block from multiple peers with timeout
+    /// Used by anti-fork protection to get missing blocks before producing
+    /// ═══════════════════════════════════════════════════════════════════════════
+    pub async fn request_block_repair(&self, height: u64) -> Result<(), String> {
+        println!("[REPAIR] 🔧 Requesting repair for block #{}", height);
+        
+        let peers = self.get_validated_active_peers();
+        if peers.is_empty() {
+            return Err("No peers available for repair".to_string());
+        }
+        
+        // Request from top 3 peers by reputation (redundancy for reliability)
+        let mut sorted_peers = peers.clone();
+        sorted_peers.sort_by(|a, b| 
+            b.combined_reputation().partial_cmp(&a.combined_reputation())
+                .unwrap_or(std::cmp::Ordering::Equal));
+        
+        let request = NetworkMessage::RequestBlocks {
+            from_height: height,
+            to_height: height,
+            requester_id: self.node_id.clone(),
+        };
+        
+        let mut sent = 0;
+        for peer in sorted_peers.iter().take(3) {
+            if peer.id != self.node_id {
+                self.send_network_message(&peer.addr, request.clone());
+                sent += 1;
+            }
+        }
+        
+        if sent > 0 {
+            println!("[REPAIR] 📡 Requested block #{} from {} peers", height, sent);
+            Ok(())
+        } else {
+            Err("No peers to request from".to_string())
+        }
     }
     
     /// Batch sync for catch-up - request blocks in batches

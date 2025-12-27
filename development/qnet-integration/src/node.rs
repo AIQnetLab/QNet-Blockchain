@@ -8327,17 +8327,70 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static PREV_HASH_RETRY_COUNTER: AtomicU32 = AtomicU32::new(0);
                     
-                    // CRITICAL: Don't create block if we don't have previous block (except block #1)
-                    // ARCHITECTURE FIX: Add retry limit to prevent infinite loop
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // PRODUCTION v2.55: ANTI-FORK PROTECTION
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // Problem: Creating block without prev_block causes FORK!
+                    // Solution: NEVER create block if prev_block missing - wait for sync instead
+                    // 
+                    // Flow:
+                    // 1. Wait for prev_block with retries (up to 10 seconds)
+                    // 2. If still missing - request sync from peers
+                    // 3. Wait for sync to complete (up to 5 more seconds)
+                    // 4. ONLY if network consensus confirms gap - allow emergency (rare case)
+                    // ═══════════════════════════════════════════════════════════════════════════
                     if next_block_height > 1 && prev_hash == [0u8; 32] {
                         // Use atomic counter for thread safety
                         let retry_count = PREV_HASH_RETRY_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
                         
-                        if retry_count >= 10 {  // Max 5 seconds wait (10 * 500ms)
-                            eprintln!("[ERR][PROD] prev_hash_timeout h={} retries={}", next_block_height, retry_count);
+                        // PHASE 1: Wait for prev_block (up to 10 seconds = 20 retries)
+                        if retry_count < 20 {
+                            // Request missing block via sync
+                            if retry_count == 1 || retry_count == 10 {
+                                println!("[INFO][SYNC] prev_block_wait h={} retry={}", next_block_height - 1, retry_count);
+                                
+                                // Trigger sync request
+                                if let Some(p2p) = &unified_p2p {
+                                    let _ = p2p.request_block_repair(next_block_height - 1).await;
+                                }
+                            }
+                            
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;  // Retry without producing
+                        }
+                        
+                        // PHASE 2: Sync timeout - check network consensus
+                        if retry_count >= 20 && retry_count < 30 {
+                            println!("[INFO][SYNC] consensus_check h={} elapsed=10s", next_block_height - 1);
+                            
+                            // Query peers for their height
+                            if let Some(p2p) = &unified_p2p {
+                                let peers = p2p.get_validated_active_peers();
+                                let peer_heights: Vec<u64> = peers.iter()
+                                    .filter(|p| p.last_block_height > 0)
+                                    .map(|p| p.last_block_height)
+                                    .collect();
+                                
+                                // If majority of peers are ahead of us - they have the block, keep waiting
+                                let peers_with_block = peer_heights.iter().filter(|&&h| h >= next_block_height - 1).count();
+                                let total_peers = peer_heights.len();
+                                
+                                if total_peers > 0 && peers_with_block > total_peers / 2 {
+                                    println!("[INFO][SYNC] peers_have_block h={} count={}/{}", 
+                                             next_block_height - 1, peers_with_block, total_peers);
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                    continue;  // Keep waiting - block exists on network
+                                }
+                            }
+                        }
+                        
+                        // PHASE 3: Final timeout (15+ seconds) - network likely has no block
+                        if retry_count >= 30 {
+                            eprintln!("[ERR][PROD] prev_hash_timeout h={} retries={} (15s)", next_block_height, retry_count);
                             PREV_HASH_RETRY_COUNTER.store(0, Ordering::SeqCst);  // Reset counter
                             
-                            // Trigger emergency producer selection
+                            // CRITICAL: Still don't produce block with missing prev!
+                            // Instead, trigger emergency producer who may have the block
                             if let Some(p2p) = &unified_p2p {
                                 let emergency_producer = Self::select_emergency_producer(
                                     &node_id,
@@ -8348,15 +8401,19 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                     Some(storage.clone()),
                                 ).await;
                                 
-                                // Broadcast emergency change
-                                let _ = p2p.broadcast_emergency_producer_change(
-                                    &node_id,
-                                    &emergency_producer,
-                                    next_block_height,
-                                    "microblock"
-                                );
+                                // Only broadcast if different producer (we can't help if we're chosen)
+                                if emergency_producer != node_id {
+                                    println!("[INFO][FAILOVER] delegate h={} to={}", 
+                                             next_block_height, emergency_producer);
+                                    let _ = p2p.broadcast_emergency_producer_change(
+                                        &node_id,
+                                        &emergency_producer,
+                                        next_block_height,
+                                        "microblock"
+                                    );
+                                }
                             }
-                            // Skip this production round
+                            // Skip this production round - prevent fork creation!
                             tokio::time::sleep(microblock_interval).await;
                             continue;
                         }
