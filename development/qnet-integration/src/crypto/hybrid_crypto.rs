@@ -450,9 +450,10 @@ impl HybridCrypto {
         let encapsulated_hex = hex::encode(&encapsulated_data);
         
         // Sign with Dilithium (using quantum_crypto module)
-        // PRODUCTION v2.50: Lock-free quantum crypto
-        use crate::node::get_quantum_crypto;
-        let quantum_crypto = get_quantum_crypto();
+        // PRODUCTION v2.51: Safe quantum crypto access
+        use crate::node::try_get_quantum_crypto;
+        let quantum_crypto = try_get_quantum_crypto()
+            .ok_or_else(|| anyhow!("Quantum crypto not initialized"))?;
         
         let dilithium_sig = quantum_crypto
             .create_consensus_signature(&self.node_id, &encapsulated_hex)
@@ -569,12 +570,12 @@ impl HybridCrypto {
         let encapsulated_hex = hex::encode(&encapsulated_data);
         
         // Step 6: Sign encapsulated_data with Dilithium (NIST/Cisco requirement)
-        // PRODUCTION v2.50: Lock-free quantum crypto
-        use crate::node::get_quantum_crypto;
-        let quantum_crypto = get_quantum_crypto();
+        // PRODUCTION v2.51: Safe quantum crypto access
+        use crate::node::try_get_quantum_crypto;
+        let quantum_crypto = try_get_quantum_crypto()
+            .ok_or_else(|| anyhow!("Quantum crypto not initialized"))?;
         
         // Sign encapsulated_data with Dilithium (signs the ephemeral key + message_hash)
-        // OPTIMIZED v2.23: RAW bytes - no base64 overhead!
         let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
             .map_err(|e| anyhow!("Failed to create Dilithium key signature: {}", e))?;
         
@@ -636,12 +637,12 @@ impl HybridCrypto {
         let encapsulated_hex = hex::encode(&encapsulated_data);
         
         // Step 6: Sign encapsulated_data with Dilithium (NIST/Cisco requirement)
-        // PRODUCTION v2.50: Lock-free quantum crypto
-        use crate::node::get_quantum_crypto;
-        let quantum_crypto = get_quantum_crypto();
+        // PRODUCTION v2.51: Safe quantum crypto access
+        use crate::node::try_get_quantum_crypto;
+        let quantum_crypto = try_get_quantum_crypto()
+            .ok_or_else(|| anyhow!("Quantum crypto not initialized"))?;
         
         // Sign encapsulated_data with Dilithium (signs ephemeral key + message_hash)
-        // OPTIMIZED v2.23: RAW bytes - no base64 overhead!
         let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
             .map_err(|e| anyhow!("Failed to create Dilithium key signature: {}", e))?;
         
@@ -705,12 +706,12 @@ impl HybridCrypto {
         
         // Step 6: Sign encapsulated_data with Dilithium (NIST/Cisco requirement)
         // This cryptographically binds the ephemeral Ed25519 key to this specific message
-        // PRODUCTION v2.50: Lock-free quantum crypto
-        use crate::node::get_quantum_crypto;
-        let quantum_crypto = get_quantum_crypto();
+        // PRODUCTION v2.51: Safe quantum crypto access
+        use crate::node::try_get_quantum_crypto;
+        let quantum_crypto = try_get_quantum_crypto()
+            .ok_or_else(|| anyhow!("Quantum crypto not initialized"))?;
         
         // Sign encapsulated_data with Dilithium (signs ephemeral key + message_hash)
-        // OPTIMIZED v2.23: RAW bytes - no base64 overhead!
         let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
             .map_err(|e| anyhow!("Failed to create Dilithium key signature: {}", e))?;
         

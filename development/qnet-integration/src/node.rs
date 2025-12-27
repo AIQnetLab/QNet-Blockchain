@@ -14103,9 +14103,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // NIST/Cisco requirement: Verify BOTH Dilithium signatures
         // 1. Dilithium signature of encapsulated_data (ephemeral key)
         // 2. Dilithium signature of message
-        // PRODUCTION v2.50: Lock-free quantum crypto
+        // PRODUCTION v2.51: Safe quantum crypto access
         use crate::quantum_crypto::DilithiumSignature;
-        let crypto = get_quantum_crypto();
+        let crypto = match try_get_quantum_crypto() {
+            Some(c) => c,
+            None => {
+                println!("[ERR][CRYPTO] Quantum crypto not initialized");
+                return Ok(false);
+            }
+        };
         
         // SECURITY: Dilithium key signature is MANDATORY - no bypass!
         // OPTIMIZED v2.23: RAW bytes format
@@ -17317,8 +17323,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// Decrypt activation code and return full payload (wallet, burn_tx, node_type, etc.)
     /// CRITICAL: This is the single source of truth for activation data extraction
     pub async fn decrypt_activation_code_full(&self, code: &str) -> Result<crate::quantum_crypto::ActivationPayload, QNetError> {
-        // PRODUCTION v2.50: Lock-free quantum crypto
-        let quantum_crypto = get_quantum_crypto();
+        // PRODUCTION v2.51: Safe quantum crypto access
+        let quantum_crypto = try_get_quantum_crypto()
+            .ok_or_else(|| QNetError::ValidationError("Quantum crypto not initialized".to_string()))?;
             
         // SECURITY: NO FALLBACK ALLOWED - quantum decryption MUST work
         match quantum_crypto.decrypt_activation_code(code).await {
