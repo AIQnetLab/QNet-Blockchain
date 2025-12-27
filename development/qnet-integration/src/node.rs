@@ -3129,7 +3129,32 @@ impl BlockchainNode {
                             });
                             if is_info() { println!("[INFO][SYNC] fork_resolved"); }
                             
-                        } else if network_height > local_height + 10 {
+                        } else {
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            // PRODUCTION v2.54: Check for pending gap sync from fire-and-forget broadcast
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            // Gap detection in handle_shred_protocol_chunk sets these atomics
+                            // Process immediately without waiting for 10-block threshold
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            let gap_from = crate::unified_p2p::PENDING_GAP_SYNC.load(std::sync::atomic::Ordering::Relaxed);
+                            let gap_to = crate::unified_p2p::PENDING_GAP_SYNC_TO.load(std::sync::atomic::Ordering::Relaxed);
+                            
+                            if gap_from > 0 && gap_to >= gap_from && gap_from > local_height {
+                                // Clear pending gap
+                                crate::unified_p2p::PENDING_GAP_SYNC.store(0, std::sync::atomic::Ordering::Relaxed);
+                                crate::unified_p2p::PENDING_GAP_SYNC_TO.store(0, std::sync::atomic::Ordering::Relaxed);
+                                
+                                println!("[INFO][GAP_SYNC] processing from={} to={}", gap_from, gap_to);
+                                
+                                if let Err(e) = p2p.sync_blocks(gap_from, gap_to).await {
+                                    println!("[WARN][GAP_SYNC] failed from={} to={} err={}", gap_from, gap_to, e);
+                                } else {
+                                    println!("[INFO][GAP_SYNC] completed from={} to={}", gap_from, gap_to);
+                                }
+                            }
+                        }
+                        
+                        if network_height > local_height + 10 {
                             if is_info() { println!("[INFO][SYNC] net={} local={} syncing", 
                                     network_height, local_height); }
                             
@@ -7587,9 +7612,54 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 };
                                 
                                 if synchronized_candidates.is_empty() {
-                                    println!("[WARN][PROD] No synchronized candidates found - waiting for network sync");
-                                    // Skip this round - network needs to synchronize
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    // ═══════════════════════════════════════════════════════════════════════════
+                                    // PRODUCTION v2.54: AGGRESSIVE SYNC on desync detection
+                                    // ═══════════════════════════════════════════════════════════════════════════
+                                    // Problem: Network can deadlock when all producers are desynchronized
+                                    // Solution: Trigger immediate sync instead of passive waiting
+                                    // - Check network height vs local height
+                                    // - If behind: trigger macroblock sync (fastest recovery)
+                                    // - Continue after short delay to allow sync to progress
+                                    // ═══════════════════════════════════════════════════════════════════════════
+                                    println!("[WARN][PROD] no_sync_candidates - triggering aggressive sync");
+                                    
+                                    if let Some(ref p2p) = unified_p2p {
+                                        let local_height = *height.read().await;
+                                        let network_height = p2p.get_cached_network_height().unwrap_or(local_height);
+                                        
+                                        if network_height > local_height + 5 {
+                                            let gap = network_height - local_height;
+                                            println!("[INFO][SYNC] aggressive_sync local={} network={} gap={}", 
+                                                    local_height, network_height, gap);
+                                            
+                                            // STATE MACHINE: Switch to Syncing
+                                            let progress = ((local_height as f64 / network_height as f64) * 100.0) as u8;
+                                            set_node_state(NodeState::Syncing {
+                                                local_height,
+                                                target_height: network_height,
+                                                progress_percent: progress,
+                                            });
+                                            
+                                            // Trigger macroblock sync for fastest recovery
+                                            let current_epoch = (local_height / 90) + 1;
+                                            let safe_macroblock = current_epoch.saturating_sub(1);
+                                            if safe_macroblock > 0 {
+                                                let p2p_clone = p2p.clone();
+                                                tokio::spawn(async move {
+                                                    println!("[INFO][SYNC] aggressive_mb_sync target={}", safe_macroblock);
+                                                    if let Err(e) = p2p_clone.sync_macroblocks(1, safe_macroblock).await {
+                                                        println!("[WARN][SYNC] mb_sync_err: {}", e);
+                                                    }
+                                                });
+                                            }
+                                        } else {
+                                            println!("[INFO][PROD] local_height={} network={} - awaiting peer sync", 
+                                                    local_height, network_height);
+                                        }
+                                    }
+                                    
+                                    // Short wait then retry (sync happens in background)
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
                                     continue;
                                 }
                                 
@@ -8880,32 +8950,46 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // Increment pending count BEFORE spawning
                         PENDING_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         
-                        // ASYNC: Spawn broadcast in background with backpressure tracking
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        // PRODUCTION v2.54: ASYNC BROADCAST WITH TIMEOUT
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        // Problem: Broadcast could take 60+ seconds with slow/unresponsive peers
+                        // Solution: Hard timeout of 5 seconds - fire-and-forget with Reed-Solomon
+                        // - If timeout: rely on Reed-Solomon redundancy for delivery
+                        // - Producer NEVER blocks more than 5 seconds per block
+                        // ═══════════════════════════════════════════════════════════════════════════
                         tokio::spawn(async move {
-                            // TIMING: Measure broadcast time
                             let broadcast_start = std::time::Instant::now();
                             
-                            // PRODUCTION: Use ShredProtocol for ALL block broadcasts
-                            // ShredProtocol provides Reed-Solomon redundancy and O(log n) complexity
-                            // Works for ANY network size (5 nodes to millions)
-                            // Deadlock fix in unified_p2p.rs handle_shred_protocol_chunk() makes this safe
-                            let result = p2p_clone.broadcast_block_shred_protocol(height_for_broadcast, broadcast_data).await;
+                            // PRODUCTION v2.54: 5 second hard timeout on broadcast
+                            // Fire-and-forget with Reed-Solomon redundancy (1.5x) ensures delivery
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                p2p_clone.broadcast_block_shred_protocol(height_for_broadcast, broadcast_data)
+                            ).await;
                             
-                            // PRODUCTION v2.43: Decrement pending count AFTER broadcast complete
+                            // Decrement pending count AFTER broadcast/timeout
                             PENDING_BROADCAST_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             
                             let broadcast_time = broadcast_start.elapsed();
                             
-                            // Log timing and result
-                            if result.is_err() || height_for_broadcast % 10 == 0 || broadcast_time.as_millis() > 500 {
-                                println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes | {:?}ms",
-                                        height_for_broadcast, result.is_ok(), peer_count, broadcast_size, broadcast_time.as_millis());
-                            }
-                            
-                            // CRITICAL: If broadcast is too slow, log warning
-                            if broadcast_time.as_millis() > 1000 {
-                                println!("[WARN][P2P] SLOW BROADCAST: Block #{} took {:?}ms (target: <500ms)", 
-                                        height_for_broadcast, broadcast_time.as_millis());
+                            // Log result with timeout detection
+                            match result {
+                                Ok(Ok(_)) => {
+                                    if height_for_broadcast % 50 == 0 || broadcast_time.as_millis() > 1000 {
+                                        println!("[INFO][P2P] broadcast_ok block={} peers={} bytes={} ms={}",
+                                                height_for_broadcast, peer_count, broadcast_size, broadcast_time.as_millis());
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    println!("[WARN][P2P] broadcast_err block={} err={} ms={}",
+                                            height_for_broadcast, e, broadcast_time.as_millis());
+                                }
+                                Err(_) => {
+                                    // Timeout - not critical, Reed-Solomon redundancy ensures delivery
+                                    println!("[WARN][P2P] broadcast_timeout block={} ms=5000 (fire_and_forget)",
+                                            height_for_broadcast);
+                                }
                             }
                         });
                         

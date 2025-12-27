@@ -845,8 +845,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             
             if let Some(p2p) = blockchain.get_unified_p2p() {
                 // API DEADLOCK FIX: Get cached height without network calls
+                // PRODUCTION v2.53: Use max(local, cached) to prevent stale cache showing lower height
                 if let Some(cached_height) = p2p.get_cached_network_height() {
-                    network_height = cached_height;
+                    network_height = std::cmp::max(height, cached_height);
                 } else {
                     // No cache available - check if we're bootstrap node
                     if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 

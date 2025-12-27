@@ -121,6 +121,12 @@ static CACHED_BLOCKCHAIN_HEIGHT: Lazy<Arc<Mutex<(u64, Instant)>>> =
 pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> = 
     Lazy::new(|| Arc::new(AtomicU64::new(0)));
 
+// PRODUCTION v2.54: Gap detection pending sync queue
+// When gap detected in handle_shred_protocol_chunk, store here for background sync
+// node.rs sync loop will pick up and process these gaps
+pub static PENDING_GAP_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PENDING_GAP_SYNC_TO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // CRITICAL FIX: Deduplicate failover messages to prevent spam
 // Store processed failover events: (block_height, failed_producer, new_producer)
 // SCALABILITY: Use DashSet for lock-free concurrent access with millions of nodes
@@ -3996,8 +4002,8 @@ impl SimplifiedP2P {
                         }
                     });
                 
+                #[allow(unused_assignments)]
                 let mut total_success = 0usize;
-                let mut total_fail = 0usize;
                 
                 // STEP 1: Send chunk #0 FIRST (contains certificate!)
                 // No pacing needed - just send immediately to all targets
@@ -4020,19 +4026,40 @@ impl SimplifiedP2P {
                         }));
                     }
                     
-                    // Wait for chunk #0 to be sent to all peers
-                    let chunk0_results = futures::future::join_all(chunk0_tasks).await;
-                    let chunk0_success = chunk0_results.iter()
-                        .filter(|r| matches!(r, Ok(Ok(_))))
-                        .count();
-                    let chunk0_fail = chunk0_results.len() - chunk0_success;
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // PRODUCTION v2.54: Wait for chunk #0 with timeout (certificate is critical!)
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // - QUIC RTT ~50-100ms, 4 peers parallel ~100-200ms normal
+                    // - 500ms = 2.5x margin for jitter/congestion
+                    // - If timeout: slow peers recover via gap detection + sync_blocks()
+                    // - At least 1 peer with chunk0 = block is in network
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    let chunk0_result = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        futures::future::join_all(chunk0_tasks)
+                    ).await;
                     
-                    total_success += chunk0_success;
-                    total_fail += chunk0_fail;
+                    let (chunk0_success, chunk0_timeout) = match chunk0_result {
+                        Ok(results) => {
+                            let success = results.iter()
+                                .filter(|r| matches!(r, Ok(Ok(_))))
+                                .count();
+                            (success, false)
+                        }
+                        Err(_) => {
+                            // Timeout - some peers slow, continue anyway
+                            // Reed-Solomon + gap detection will handle recovery
+                            (0, true)
+                        }
+                    };
                     
-                    if height_for_log <= 100 || height_for_log % 50 == 0 {
-                        println!("[SHRED_PROTOCOL] 🔐 Chunk #0 (certificate) sent FIRST: {}/{} success",
-                            chunk0_success, chunk0_sends.len());
+                    if height_for_log <= 100 || height_for_log % 50 == 0 || chunk0_timeout {
+                        if chunk0_timeout {
+                            println!("[WARN][SHRED] chunk0_timeout block={} (continuing)", height_for_log);
+                        } else {
+                            println!("[INFO][SHRED] chunk0_sent block={} ok={}/{}", 
+                                height_for_log, chunk0_success, chunk0_sends.len());
+                        }
                     }
                     
                     // Small delay to ensure chunk #0 arrives before parity
@@ -4045,63 +4072,76 @@ impl SimplifiedP2P {
                     (other_sends.len() + batch_size - 1) / batch_size
                 };
                 
+                // ═══════════════════════════════════════════════════════════════════════════
+                // PRODUCTION v2.54: FIRE-AND-FORGET BROADCAST
+                // ═══════════════════════════════════════════════════════════════════════════
+                // Problem: join_all waits for SLOWEST peer in each batch (caused 64s delays!)
+                // Solution: Fire-and-forget with Reed-Solomon redundancy guarantees delivery
+                // - Spawn tasks without waiting for completion
+                // - Track success/failure via atomic counters (async callback)
+                // - Pacing still applied between batches to prevent UDP burst
+                // ═══════════════════════════════════════════════════════════════════════════
+                
+                let sends_count = other_sends.len();
+                
                 for (batch_idx, batch) in other_sends.chunks(batch_size).enumerate() {
-                    let mut batch_tasks = Vec::with_capacity(batch.len());
-                    
                     for (quic_addr, msg) in batch {
                         let transport_clone = transport_arc.clone();
                         let msg_clone = msg.clone();
                         let addr = *quic_addr;
                         let permit = semaphore.clone();
                         
-                        batch_tasks.push(tokio::spawn(async move {
+                        // FIRE-AND-FORGET: Spawn without awaiting result
+                        // Reed-Solomon redundancy (1.5x) ensures block delivery even if some fail
+                        tokio::spawn(async move {
                             let _permit = match permit.acquire().await {
                                 Ok(p) => p,
-                                Err(_) => return Err("Semaphore closed".to_string()),
+                                Err(_) => {
+                                    SHRED_SEND_FAILURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    return;
+                                }
                             };
                             let transport = transport_clone.read().await;
-                            transport.broadcast_to(addr, &msg_clone).await
-                        }));
+                            match transport.broadcast_to(addr, &msg_clone).await {
+                                Ok(_) => {
+                                    SHRED_SEND_SUCCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(_) => {
+                                    SHRED_SEND_FAILURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        });
                     }
                     
-                    // Wait for this batch to complete
-                    let batch_results = futures::future::join_all(batch_tasks).await;
-                    let batch_success = batch_results.iter()
-                        .filter(|r| matches!(r, Ok(Ok(_))))
-                        .count();
-                    let batch_fail = batch_results.len() - batch_success;
-                    
-                    total_success += batch_success;
-                    total_fail += batch_fail;
-                    
-                    // PACING: Adaptive delay between batches (except last)
+                    // PACING: Small delay between batches to prevent UDP burst (except last)
+                    // This is async-friendly and doesn't block producer
                     if batch_idx < num_batches - 1 {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                 }
                 
-                // Update global failure rate tracking (exponential moving average)
-                SHRED_SEND_SUCCESS.fetch_add(total_success as u64, std::sync::atomic::Ordering::Relaxed);
-                SHRED_SEND_FAILURE.fetch_add(total_fail as u64, std::sync::atomic::Ordering::Relaxed);
+                // Estimate success for immediate return (actual tracking via atomic counters in spawned tasks)
+                // Fire-and-forget: we assume all sends will succeed (Reed-Solomon handles failures)
+                total_success = sends_count;
                 
-                // Calculate and update failure rate every block
+                // Calculate and update failure rate periodically (from atomic counters)
                 let total_sent = SHRED_SEND_SUCCESS.load(std::sync::atomic::Ordering::Relaxed) 
                                + SHRED_SEND_FAILURE.load(std::sync::atomic::Ordering::Relaxed);
                 if total_sent > 0 {
                     let new_rate = (SHRED_SEND_FAILURE.load(std::sync::atomic::Ordering::Relaxed) as f32 / total_sent as f32 * 1000.0) as u64;
                     SHRED_LAST_FAILURE_RATE.store(new_rate, std::sync::atomic::Ordering::Relaxed);
                     
-                    // Reset counters periodically to avoid stale data (every 1000 sends)
+                    // Reset counters periodically to avoid stale data (every 10000 sends)
                     if total_sent > 10000 {
                         SHRED_SEND_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
                         SHRED_SEND_FAILURE.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 
-                // Log failures for debugging
-                if total_fail > 0 && (height_for_log <= 500 || height_for_log % 10 == 0) {
-                    println!("[SHRED_PROTOCOL] ⚠️ Block #{}: {}/{} chunks failed (rate={:.1}%)", 
-                        height_for_log, total_fail, total_sends, failure_rate * 100.0);
+                // Log fire-and-forget dispatch (success tracked asynchronously)
+                if height_for_log <= 100 || height_for_log % 50 == 0 {
+                    println!("[INFO][SHRED] fire_and_forget block={} chunks={} peers={}", 
+                        height_for_log, sends_count, num_batches);
                 }
                 
                 let total_sends = chunk0_sends.len() + other_sends.len();
@@ -4222,6 +4262,45 @@ impl SimplifiedP2P {
         if height <= local_height {
             // Block already in blockchain, ignore stale chunks
             return;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.54: GAP DETECTION - Signal missing blocks for sync
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Problem: Fire-and-forget broadcast may lose blocks → nodes desync
+        // Solution: Detect gaps and store in global queue for background sync
+        // Main sync loop in node.rs will pick up and process these gaps
+        // ═══════════════════════════════════════════════════════════════════════════
+        let gap = height.saturating_sub(local_height + 1);
+        if gap > 0 && gap <= 50 {
+            // GAP DETECTED: Missing blocks between local_height and incoming block
+            static GAP_SYNC_COOLDOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let last_log = GAP_SYNC_COOLDOWN.load(std::sync::atomic::Ordering::Relaxed);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            
+            // Log at most once per 2 seconds to avoid spam
+            if now > last_log + 2 {
+                GAP_SYNC_COOLDOWN.store(now, std::sync::atomic::Ordering::Relaxed);
+                
+                let from_height = local_height + 1;
+                let to_height = height - 1;
+                
+                // Signal gap to global pending queue (processed by node.rs sync loop)
+                PENDING_GAP_SYNC.store(from_height, std::sync::atomic::Ordering::Relaxed);
+                PENDING_GAP_SYNC_TO.store(to_height, std::sync::atomic::Ordering::Relaxed);
+                
+                println!("[INFO][GAP] detected local={} incoming={} gap={} pending_sync={}-{}", 
+                        local_height, height, gap, from_height, to_height);
+            }
+        } else if gap > 50 {
+            // Large gap - log warning, regular sync will handle
+            if height % 10 == 0 {
+                println!("[WARN][GAP] large_gap local={} incoming={} gap={} (regular_sync)", 
+                        local_height, height, gap);
+            }
         }
         
         // CRITICAL FIX v2.19.24: Skip chunks for already processed blocks
