@@ -479,22 +479,31 @@ impl CommitRevealConsensus {
             ));
         }
         
-        // PRODUCTION v2.40.3: Verify hybrid reveal signature (Dilithium3 + Ed25519 + ephemeral)
+        // PRODUCTION v2.52: Verify hybrid reveal signature (Dilithium3 + Ed25519 + ephemeral)
         // This prevents impersonation attacks where attacker sends reveal as another node
         // Uses same hybrid verification as commits for NIST FIPS 204 / CNSA 2.0 compliance
         // NOTE: If signature is empty (legacy), skip verification but log warning
         if !reveal.signature.is_empty() {
-            // Create message to verify: node_id + reveal_data_hash + nonce
-            let reveal_message = format!("{}:{}:{}", 
+            // CRITICAL FIX v2.52: Message format MUST match generation in node.rs
+            // Format: node_id:reveal_data_hex:nonce_hex:timestamp (4 fields)
+            // Then SHA3-256 hash before verification (same as signing)
+            let reveal_message = format!("{}:{}:{}:{}", 
                 reveal.node_id, 
                 hex::encode(&reveal.reveal_data),
-                hex::encode(&reveal.nonce)
+                hex::encode(&reveal.nonce),
+                reveal.timestamp  // v2.52: Include timestamp to match generation
             );
             
-            // Use same verify_signature as commits for consistency
+            // SHA3-256 hash (same as generation in node.rs:12947-12950)
+            use sha3::{Sha3_256, Digest};
+            let mut hasher = Sha3_256::new();
+            hasher.update(reveal_message.as_bytes());
+            let reveal_hash = hex::encode(hasher.finalize());
+            
+            // Verify the HASH (not plain message) for L1-grade security
             let signature_valid = self.verify_signature(
                 &reveal.node_id, 
-                &reveal_message, 
+                &reveal_hash, 
                 &reveal.signature
             ).await;
             
