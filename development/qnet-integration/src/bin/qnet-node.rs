@@ -2573,8 +2573,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
         println!("🔐 Recording quantum-secure activation in QNet blockchain...");
         
-        // PRODUCTION v2.51: Safe quantum crypto access
-        use qnet_integration::node::try_get_quantum_crypto;
+        // PRODUCTION v2.51: Initialize crypto if not yet done (Genesis nodes skip decode_activation_code)
+        use qnet_integration::node::{init_global_quantum_crypto, try_get_quantum_crypto};
+        init_global_quantum_crypto().await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize quantum crypto: {}", e))?;
+        
         let quantum_crypto = try_get_quantum_crypto()
             .ok_or_else(|| anyhow::anyhow!("Quantum crypto not initialized"))?;
         
