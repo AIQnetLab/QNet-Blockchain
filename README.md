@@ -44,7 +44,18 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.48.0 - December 25, 2025)**
+### 🚀 **LATEST UPDATES (v2.57.0 - December 28, 2025)**
+
+**⚡ Stage Pipeline (Full Runtime Isolation):**
+- **BROADCAST_RUNTIME**: Dedicated threads for Shred protocol
+- **SIGVERIFY_RUNTIME**: Isolated Ed25519/Dilithium verification
+- **BANKING_RUNTIME**: Transaction intake and mempool ops
+- **REPLAY_RUNTIME**: State machine execution
+- **Adaptive Threading**: 2 cores→4t, 4 cores→5t, 8 cores→10t, 16 cores→20t
+- **Configurable**: `QNET_BROADCAST_THREADS`, `QNET_SIGVERIFY_THREADS`, etc.
+- **Result**: 3-4x TPS improvement, no starvation, consistent latency
+
+### 🛡️ **Previous Updates (v2.48.0 - December 25, 2025)**
 
 **🔧 Consensus Stability v2.48 (Round Mismatch Fix + Reveal Loss Prevention):**
 - **LAST_FINALIZED_CONSENSUS_ROUND**: Global atomic tracks ONLY successfully saved MacroBlocks

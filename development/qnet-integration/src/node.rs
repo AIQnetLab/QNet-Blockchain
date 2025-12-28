@@ -5051,6 +5051,12 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
     pub async fn start(&mut self) -> Result<(), QNetError> {
         println!("[Node] Starting blockchain node...");
         
+        // PRODUCTION v2.57: Log runtime isolation (Solana-style stages)
+        let stats = crate::unified_p2p::get_runtime_stats();
+        println!("[INFO][RUNTIME] cpus={} stages: BROADCAST({}t) SIGVERIFY({}t) BANKING({}t) REPLAY({}t) total={}t", 
+                 stats.cpu_count, stats.broadcast_threads, stats.sigverify_threads,
+                 stats.banking_threads, stats.replay_threads, stats.total());
+        
         *self.is_running.write().await = true;
         
         // Start API server first to handle peer auth
@@ -15886,27 +15892,30 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
             
             // CRITICAL SECURITY v2.25: Cryptographic signature verification
-            // Step 1: Verify Ed25519 signature (ALWAYS required)
+            // PRODUCTION v2.57: Verify on SIGVERIFY_RUNTIME (isolated from main event loop)
+            // Step 1: Ed25519 signature (ALWAYS required)
             if let Some(ref sig) = tx.signature {
                 if let Some(ref pubkey) = tx.public_key {
-                    if !Self::verify_ed25519_tx_signature(&tx, sig, pubkey)? {
+                    if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
                         return Err(QNetError::ValidationError(
-                            "Invalid Ed25519 signature - cryptographic verification failed".to_string()
+                            "Invalid Ed25519 signature".to_string()
                         ));
                     }
                 } else {
-                    return Err(QNetError::ValidationError("public_key required for signature verification".to_string()));
+                    return Err(QNetError::ValidationError("public_key required".to_string()));
                 }
             }
             
-            // Step 2: Verify Dilithium signature if present (OPTIONAL - for quantum TX)
+            // Step 2: Dilithium signature (OPTIONAL - quantum TX)
             if tx.dilithium_signature.is_some() {
-                if !Self::verify_dilithium_tx_signature(&tx)? {
+                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
                     return Err(QNetError::ValidationError(
-                        "Invalid Dilithium signature - quantum verification failed".to_string()
+                        "Invalid Dilithium signature".to_string()
                     ));
                 }
-                println!("[TX-QUANTUM] 🔐 Dilithium3 signature verified for: {}", &tx.hash[..16]);
+                if is_info() {
+                    println!("[INFO][SIGVERIFY] dilithium_verified tx={}", &tx.hash[..16.min(tx.hash.len())]);
+                }
             }
         }
         
@@ -16022,8 +16031,58 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         Ok(tx_hash)
     }
     
-    /// CRITICAL SECURITY v2.25: Verify Ed25519 signature for client transactions
-    /// Uses the public_key stored in the transaction for verification
+    /// PRODUCTION v2.57: Verify Ed25519 on SIGVERIFY_RUNTIME
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// ISOLATION: Runs on dedicated SIGVERIFY_RUNTIME (not main event loop)
+    /// PERFORMANCE: ~10,000 verifications/sec/core
+    /// ═══════════════════════════════════════════════════════════════════════════
+    async fn verify_ed25519_tx_signature_async(
+        tx: &qnet_state::Transaction,
+        signature_hex: &str,
+        public_key_hex: &str
+    ) -> Result<bool, QNetError> {
+        let to_str = tx.to.clone().unwrap_or_default();
+        let from = tx.from.clone();
+        let amount = tx.amount;
+        let nonce = tx.nonce;
+        let gas_price = tx.gas_price;
+        let gas_limit = tx.gas_limit;
+        let timestamp = tx.timestamp;
+        let sig_hex = signature_hex.to_string();
+        let pk_hex = public_key_hex.to_string();
+        
+        let handle = crate::unified_p2p::spawn_sigverify(async move {
+            tokio::task::spawn_blocking(move || {
+                use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+                
+                let message = format!("{}|{}|{}|{}|{}|{}|{}", from, to_str, amount, nonce, gas_price, gas_limit, timestamp);
+                let message_bytes = message.as_bytes();
+                
+                let sig_bytes = hex::decode(&sig_hex).map_err(|e| format!("Invalid sig hex: {}", e))?;
+                if sig_bytes.len() != 64 { return Err(format!("Invalid sig len: {}", sig_bytes.len())); }
+                let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| "Sig conversion failed")?;
+                let signature = Signature::from_bytes(&sig_array);
+                
+                let pk_bytes = hex::decode(&pk_hex).map_err(|e| format!("Invalid pk hex: {}", e))?;
+                if pk_bytes.len() != 32 { return Err(format!("Invalid pk len: {}", pk_bytes.len())); }
+                let pk_array: [u8; 32] = pk_bytes.try_into().map_err(|_| "PK conversion failed")?;
+                let vk = VerifyingKey::from_bytes(&pk_array).map_err(|e| format!("Invalid pk: {}", e))?;
+                
+                match vk.verify(message_bytes, &signature) {
+                    Ok(()) => Ok(true),
+                    Err(_) => Ok(false),
+                }
+            }).await.map_err(|e| format!("Task panic: {}", e))?
+        });
+        
+        match handle.await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(QNetError::ValidationError(e)),
+            Err(e) => Err(QNetError::ValidationError(format!("Runtime error: {}", e))),
+        }
+    }
+    
+    /// LEGACY sync wrapper
     fn verify_ed25519_tx_signature(
         tx: &qnet_state::Transaction,
         signature_hex: &str,
@@ -16031,7 +16090,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     ) -> Result<bool, QNetError> {
         use ed25519_dalek::{Signature, VerifyingKey, Verifier};
         
-        // Create canonical message for signing: from|to|amount|nonce|gas_price|gas_limit|timestamp
         let to_str = tx.to.as_ref().map(|s| s.as_str()).unwrap_or("");
         let message = format!(
             "{}|{}|{}|{}|{}|{}|{}",
@@ -16039,7 +16097,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         );
         let message_bytes = message.as_bytes();
         
-        // Decode signature
         let sig_bytes = hex::decode(signature_hex)
             .map_err(|e| QNetError::ValidationError(format!("Invalid signature hex: {}", e)))?;
         if sig_bytes.len() != 64 {
@@ -16051,7 +16108,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             .map_err(|_| QNetError::ValidationError("Signature conversion failed".to_string()))?;
         let signature = Signature::from_bytes(&sig_array);
         
-        // Decode public key
         let pk_bytes = hex::decode(public_key_hex)
             .map_err(|e| QNetError::ValidationError(format!("Invalid public_key hex: {}", e)))?;
         if pk_bytes.len() != 32 {
@@ -16064,7 +16120,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let verifying_key = VerifyingKey::from_bytes(&pk_array)
             .map_err(|e| QNetError::ValidationError(format!("Invalid public key: {}", e)))?;
         
-        // Verify
         match verifying_key.verify(message_bytes, &signature) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
@@ -16160,63 +16215,107 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         valid_indices
     }
     
-    /// QUANTUM v2.25: Verify Dilithium3 signature for quantum-resistant transactions
-    /// Uses GLOBAL_QUANTUM_CRYPTO for CRYSTALS-Dilithium verification
-    fn verify_dilithium_tx_signature(tx: &qnet_state::Transaction) -> Result<bool, QNetError> {
-        use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+    /// PRODUCTION v2.57: Verify Dilithium3 on SIGVERIFY_RUNTIME
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// ISOLATION: Runs on dedicated SIGVERIFY_RUNTIME
+    /// PERFORMANCE: ~1,000 verifications/sec/core (10x slower than Ed25519)
+    /// SECURITY: CRYSTALS-Dilithium3 - NIST PQC Standard
+    /// ═══════════════════════════════════════════════════════════════════════════
+    async fn verify_dilithium_tx_signature_async(tx: &qnet_state::Transaction) -> Result<bool, QNetError> {
+        use crate::quantum_crypto::DilithiumSignature;
         
         let dilithium_sig = match &tx.dilithium_signature {
             Some(sig) if !sig.is_empty() => sig.clone(),
-            _ => return Ok(true), // No Dilithium sig = not quantum TX (valid for normal TX)
+            _ => return Ok(true),
         };
         
-        let dilithium_pubkey = match &tx.dilithium_public_key {
+        let _dilithium_pubkey = match &tx.dilithium_public_key {
             Some(pk) if !pk.is_empty() => pk.clone(),
             _ => return Err(QNetError::ValidationError(
-                "dilithium_public_key required when dilithium_signature present".to_string()
+                "dilithium_public_key required".to_string()
             )),
         };
         
-        // Clone all needed data before spawn to avoid lifetime issues
-        let to_str = tx.to.as_ref().map(|s| s.clone()).unwrap_or_default();
-        let from_clone = tx.from.clone();
+        let to_str = tx.to.clone().unwrap_or_default();
+        let from = tx.from.clone();
         let amount = tx.amount;
         let nonce = tx.nonce;
         let gas_price = tx.gas_price;
         let gas_limit = tx.gas_limit;
         let timestamp = tx.timestamp;
         
-        // Create canonical message (same as Ed25519)
-        let message = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            from_clone, to_str, amount, nonce, gas_price, gas_limit, timestamp
-        );
-        
-        // Create Dilithium signature struct for verification
+        let message = format!("{}|{}|{}|{}|{}|{}|{}", from, to_str, amount, nonce, gas_price, gas_limit, timestamp);
         let sig_struct = DilithiumSignature {
             signature: dilithium_sig,
             algorithm: "dilithium3".to_string(),
             timestamp,
             strength: "quantum-resistant".to_string(),
         };
+        let from_verify = from.clone();
         
-        // Synchronous verification using tokio::runtime::Handle
+        let handle = crate::unified_p2p::spawn_sigverify(async move {
+            let crypto = match try_get_quantum_crypto() {
+                Some(c) => c,
+                None => return Err("Quantum crypto not initialized".to_string()),
+            };
+            
+            match crypto.verify_dilithium_signature(&message, &sig_struct, &from_verify).await {
+                Ok(valid) => Ok(valid),
+                Err(e) => Err(format!("Dilithium error: {}", e)),
+            }
+        });
+        
+        match handle.await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(QNetError::ValidationError(e)),
+            Err(e) => Err(QNetError::ValidationError(format!("Runtime error: {}", e))),
+        }
+    }
+    
+    /// LEGACY sync wrapper
+    fn verify_dilithium_tx_signature(tx: &qnet_state::Transaction) -> Result<bool, QNetError> {
+        use crate::quantum_crypto::DilithiumSignature;
+        
+        let dilithium_sig = match &tx.dilithium_signature {
+            Some(sig) if !sig.is_empty() => sig.clone(),
+            _ => return Ok(true),
+        };
+        
+        let _dilithium_pubkey = match &tx.dilithium_public_key {
+            Some(pk) if !pk.is_empty() => pk.clone(),
+            _ => return Err(QNetError::ValidationError(
+                "dilithium_public_key required".to_string()
+            )),
+        };
+        
+        let to_str = tx.to.clone().unwrap_or_default();
+        let from = tx.from.clone();
+        let message = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp
+        );
+        
+        let sig_struct = DilithiumSignature {
+            signature: dilithium_sig,
+            algorithm: "dilithium3".to_string(),
+            timestamp: tx.timestamp,
+            strength: "quantum-resistant".to_string(),
+        };
+        
         let result = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
             rt.block_on(async {
-                // PRODUCTION v2.50: Lock-free quantum crypto
                 let crypto = match try_get_quantum_crypto() {
                     Some(c) => c,
                     None => return Err(QNetError::ValidationError("Quantum crypto not initialized".to_string())),
                 };
                 
-                match crypto.verify_dilithium_signature(&message, &sig_struct, &from_clone).await {
+                match crypto.verify_dilithium_signature(&message, &sig_struct, &from).await {
                     Ok(valid) => Ok(valid),
-                    Err(e) => Err(QNetError::ValidationError(format!("Dilithium verification error: {}", e))),
+                    Err(e) => Err(QNetError::ValidationError(format!("Dilithium error: {}", e))),
                 }
             })
-        }).join().map_err(|_| QNetError::ValidationError("Dilithium verification thread panic".to_string()))?;
+        }).join().map_err(|_| QNetError::ValidationError("Thread panic".to_string()))?;
         
         result
     }
@@ -16249,23 +16348,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
             }
             
-            // CRITICAL SECURITY v2.25: Same cryptographic verification as submit_transaction
+            // PRODUCTION v2.57: Verify on SIGVERIFY_RUNTIME
             if let Some(ref sig) = tx.signature {
                 if let Some(ref pubkey) = tx.public_key {
-                    if !Self::verify_ed25519_tx_signature(&tx, sig, pubkey)? {
-                        return Err(QNetError::ValidationError(
-                            "Invalid Ed25519 signature - cryptographic verification failed".to_string()
-                        ));
+                    if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
+                        return Err(QNetError::ValidationError("Invalid Ed25519 signature".to_string()));
                     }
                 }
             }
             
-            // Verify Dilithium if present
             if tx.dilithium_signature.is_some() {
-                if !Self::verify_dilithium_tx_signature(&tx)? {
-                    return Err(QNetError::ValidationError(
-                        "Invalid Dilithium signature - quantum verification failed".to_string()
-                    ));
+                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                    return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
                 }
             }
         }

@@ -1,9 +1,9 @@
-# QNet Blockchain Architecture v2.49
+# QNet Blockchain Architecture v2.57
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: December 26, 2025  
-**Version**: 2.49.1  
-**Status**: Production Ready (Consensus Deduplication + Idempotent Rounds)
+**Last Updated**: December 28, 2025  
+**Version**: 2.57.0  
+**Status**: Production Ready (Solana-Style Stage Pipeline + Runtime Isolation)
 
 > ⚠️ **CONSENSUS UPDATED in v2.40.0**  
 > Phases now determined by block height (deterministic), not message counts.  
@@ -41,6 +41,7 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Macroblocks**: Created every 90 seconds (consensus finalization)
 
 ### Key Innovations
+- **Solana-Style Stage Pipeline v2.57.0**: 4 isolated runtimes (BROADCAST, SIGVERIFY, BANKING, REPLAY)
 - **Zero Fork Guarantee v2.27.1**: No fallbacks, 100% deterministic producer selection
 - **Epoch-Based Validator Set v2.27.0**: Deterministic producer selection from blockchain snapshots
 - **Compact Hybrid Signatures v2.23**: 88% bandwidth reduction (~2.6KB RAW bytes)
@@ -48,6 +49,35 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
 - **NIST Post-Quantum Compliant**: CRYSTALS-Dilithium + Ed25519 hybrid
 - **Batch Ed25519 Verification v2.25.2**: 3x faster signature verification
+
+### v2.57.0: Stage Pipeline (Adaptive Threading)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    ISOLATED STAGE PIPELINE (v2.57.0)                     │
+├─────────────────┬─────────────────┬─────────────────┬───────────────────┤
+│  MAIN RUNTIME   │ SIGVERIFY_RT    │ BROADCAST_RT    │ BANKING/REPLAY    │
+│  (Heartbeat,    │ (adaptive)      │ (adaptive)      │ (adaptive)        │
+│   P2P, API)     │                 │                 │                   │
+│                 │ Ed25519 verify  │ Shred protocol  │ TX validation     │
+│                 │ Dilithium verify│ Block propagate │ State updates     │
+└─────────────────┴─────────────────┴─────────────────┴───────────────────┘
+```
+
+**Adaptive Thread Distribution:**
+
+| CPU Cores | BROADCAST | SIGVERIFY | BANKING | REPLAY | TOTAL |
+|-----------|-----------|-----------|---------|--------|-------|
+| 2 cores   | 1t        | 1t        | 1t      | 1t     | **4t** |
+| 4 cores   | 2t        | 1t        | 1t      | 1t     | **5t** |
+| 8 cores   | 4t        | 2t        | 2t      | 2t     | **10t** |
+| 16 cores  | 8t        | 4t        | 4t      | 4t     | **20t** |
+
+**Environment Variables (override defaults):**
+- `QNET_BROADCAST_THREADS`: Shred protocol threads
+- `QNET_SIGVERIFY_THREADS`: Crypto verification threads
+- `QNET_BANKING_THREADS`: Transaction processing threads
+- `QNET_REPLAY_THREADS`: State machine threads
 - **Batch Mempool Operations v2.25.2**: 1 lock per 1000 TX (1000x reduction)
 - **TX Accumulator v2.25.2**: Batch 1000 TX with 100ms timeout
 - **Round Tolerance ±90 v2.44.0**: Fork recovery accepts messages within 1 epoch

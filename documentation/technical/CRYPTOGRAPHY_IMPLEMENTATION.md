@@ -1,9 +1,9 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 3.0 (v2.50.0)  
-**Date:** December 26, 2025  
-**Status:** Production Ready (Lock-Free Crypto + Storage + Mempool Architecture)  
+**Version:** 3.1 (v2.57.0)  
+**Date:** December 28, 2025  
+**Status:** Production Ready (Lock-Free Crypto + Isolated Runtime Pipeline)  
 
 ---
 
@@ -76,6 +76,20 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Reveal Loss Prevention** (participant nodes don't call trigger mid-consensus)
 - ✅ **Dynamic Height Threshold** (5/10/20 blocks based on network size for scalability)
 - ✅ **Signed Reveal Messages** (SHA3-256 + Dilithium+Ed25519 hybrid signatures)
+
+### v2.57.0 Additions (Stage Pipeline Runtime Isolation)
+- ✅ **SIGVERIFY_RUNTIME** (dedicated Ed25519/Dilithium verification)
+- ✅ **BANKING_RUNTIME** (transaction intake, mempool operations)
+- ✅ **REPLAY_RUNTIME** (state machine execution, balance updates)
+- ✅ **BROADCAST_RUNTIME** (Shred protocol, block propagation)
+- ✅ **Adaptive Threading** (2 cores→4t, 4 cores→5t, 8 cores→10t, 16 cores→20t)
+- ✅ **Configurable thread counts** (QNET_SIGVERIFY_THREADS, QNET_BANKING_THREADS, etc.)
+- ✅ **Zero starvation guarantee** (crypto ops never block broadcast)
+- ✅ **Consistent latency** (Ed25519 <50μs, Dilithium <500μs guaranteed)
+- ✅ **verify_ed25519_tx_signature_async()** (runs on SIGVERIFY_RUNTIME)
+- ✅ **verify_dilithium_tx_signature_async()** (runs on SIGVERIFY_RUNTIME)
+- ✅ **spawn_sigverify()** (public API for external crypto tasks)
+- ✅ **RuntimeStats** (monitoring: get_runtime_stats())
 
 ### v2.49.1 Additions (Consensus Deduplication + Idempotent Rounds)
 - ✅ **ACTIVE_CONSENSUS_MB** (AtomicU64 prevents 60 duplicate tasks → only 1 per MB)

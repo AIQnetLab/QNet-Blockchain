@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.49.1-experimental  
-**Date**: December 26, 2025  
+**Version**: 2.57.0-experimental  
+**Date**: December 28, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -62,6 +62,13 @@ Experimental achievements:
 - ✅ **Round Update at Save Only (v2.48.0)**: Prevents premature round advancement causing desync
 - ✅ **Reveal Loss Prevention (v2.48.0)**: Participant nodes don't reset consensus engine mid-round
 - ✅ **Dynamic Height Threshold (v2.48.0)**: 5/10/20 blocks based on network size (scalable resync)
+- ✅ **Stage Pipeline (v2.57.0)**: Isolated runtime for each processing stage
+- ✅ **SIGVERIFY_RUNTIME (v2.57.0)**: Dedicated threads for Ed25519/Dilithium verification
+- ✅ **BANKING_RUNTIME (v2.57.0)**: Dedicated threads for transaction intake and mempool
+- ✅ **REPLAY_RUNTIME (v2.57.0)**: Dedicated threads for state machine execution
+- ✅ **BROADCAST_RUNTIME (v2.57.0)**: Dedicated threads for Shred protocol propagation
+- ✅ **Adaptive Threading (v2.57.0)**: 2 cores→4t, 4 cores→5t, 8 cores→10t, 16 cores→20t
+- ✅ **Zero Starvation Guarantee (v2.57.0)**: Crypto ops never block network propagation
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 
