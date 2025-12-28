@@ -179,6 +179,42 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("Failed to create global HTTP client")
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════════
+// PRODUCTION v2.56: DEDICATED BROADCAST RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════════
+// WHY: Main Tokio runtime handles heartbeats, peer discovery, API requests, consensus.
+//      During high load, broadcast tasks get starved → chunks not sent → emergency failover.
+// SOLUTION: Dedicated runtime ONLY for Shred Protocol broadcast (like Solana's broadcast_stage).
+// GUARANTEE: Broadcast always has dedicated threads, never competes with main loop.
+// ADAPTIVE: Default = CPU cores / 2 (min 2), configurable via QNET_BROADCAST_THREADS
+// ENV: QNET_BROADCAST_THREADS - can increase up to 100% cores, cannot go below 50%
+// ═══════════════════════════════════════════════════════════════════════════════════
+static BROADCAST_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    
+    // Minimum = 50% of cores (at least 2)
+    let min_threads = (cpu_count / 2).max(2);
+    
+    // Check env override - can increase but not decrease below 50%
+    let broadcast_threads = std::env::var("QNET_BROADCAST_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|env_val| env_val.max(min_threads).min(cpu_count)) // clamp to [50%, 100%] of cores
+        .unwrap_or(min_threads);
+    
+    println!("[INFO][BROADCAST] runtime_init cpus={} min_threads={} broadcast_threads={} (env=QNET_BROADCAST_THREADS)", 
+             cpu_count, min_threads, broadcast_threads);
+    
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(broadcast_threads)
+        .thread_name("qnet-broadcast")
+        .enable_all()
+        .build()
+        .expect("Failed to create dedicated broadcast runtime")
+});
+
 // PRODUCTION v2.19.21: QUIC-only mode
 // HTTP fallback has been removed for maximum performance
 // All nodes MUST support QUIC (port 10876 = P2P port + 1000)
@@ -3257,6 +3293,10 @@ impl SimplifiedP2P {
         
         // v2.25: Start TX cache cleanup task (prevents memory leak)
         self.start_tx_cache_cleanup_task();
+        
+        // PRODUCTION v2.56: Start background repair task for incomplete block assemblies
+        // CRITICAL: Ensures repair happens independently of chunk arrival
+        self.start_background_repair_task();
     }
     
     /// v2.25: Periodic cleanup of seen_tx_hashes to prevent memory leak
@@ -3282,6 +3322,177 @@ impl SimplifiedP2P {
                 }
             }
         });
+    }
+    
+    /// PRODUCTION v2.56: Background repair task for incomplete block assemblies
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// PROBLEM: Repair was only triggered when receiving chunks
+    ///          If no chunks arrive → repair never triggers → emergency failover
+    /// SOLUTION: Background task checks incomplete assemblies every 500ms
+    ///           Requests missing chunks proactively before emergency timeout
+    /// ARCHITECTURE: Uses BROADCAST_RUNTIME to avoid main loop contention
+    /// ═══════════════════════════════════════════════════════════════════════════
+    fn start_background_repair_task(&self) {
+        let shred_protocol_assemblies = self.shred_protocol_assemblies.clone();
+        let shred_chunk_cache = self.shred_chunk_cache.clone();
+        let connected_peers_lockfree = self.connected_peers_lockfree.clone();
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.clone();
+        let node_id = self.node_id.clone();
+        
+        // CRITICAL: Use BROADCAST_RUNTIME, not main Tokio runtime
+        // This ensures repair never competes with heartbeats, peer discovery, API
+        BROADCAST_RUNTIME.spawn(async move {
+            // Check every 500ms - gives 10 checks before 5s emergency timeout
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+            let mut repair_stats_log_counter = 0u64;
+            
+            loop {
+                interval.tick().await;
+                repair_stats_log_counter += 1;
+                
+                // Collect assemblies that need repair
+                let mut assemblies_to_repair: Vec<(u64, Vec<usize>, usize, usize)> = Vec::new();
+                
+                for entry in shred_protocol_assemblies.iter() {
+                    let height = *entry.key();
+                    let assembly = entry.value();
+                    
+                    let elapsed_ms = assembly.started_at.elapsed().as_millis() as u64;
+                    
+                    // Skip if too fresh (< 500ms) or already reconstructed
+                    if elapsed_ms < 500 {
+                        continue;
+                    }
+                    
+                    // Count received chunks
+                    let data_received: usize = assembly.chunks_received.iter()
+                        .filter(|c| c.is_some())
+                        .count();
+                    let parity_received: usize = assembly.parity_chunks.iter()
+                        .filter(|c| c.is_some())
+                        .count();
+                    let total_received = data_received + parity_received;
+                    
+                    // Calculate required for Reed-Solomon (67%)
+                    let total_chunks = assembly.total_chunks;
+                    let required = ((total_chunks as f32) * 0.67).ceil() as usize;
+                    
+                    // If we have enough - reconstruction should happen, skip
+                    if total_received >= required {
+                        continue;
+                    }
+                    
+                    // Check if we should request repair (every 2 seconds, max 4 attempts)
+                    let should_request = assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
+                        && assembly.retransmit_requested_at
+                            .map(|t| t.elapsed().as_secs() >= 2)
+                            .unwrap_or(true);
+                    
+                    if should_request {
+                        // Find missing chunk indices
+                        let mut missing_indices: Vec<usize> = assembly.chunks_received.iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.is_none())
+                            .map(|(i, _)| i)
+                            .collect();
+                        
+                        // Add missing parity indices
+                        let parity_missing: Vec<usize> = assembly.parity_chunks.iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.is_none())
+                            .map(|(i, _)| total_chunks + i)
+                            .collect();
+                        missing_indices.extend(parity_missing);
+                        
+                        if !missing_indices.is_empty() {
+                            assemblies_to_repair.push((height, missing_indices, total_received, required));
+                        }
+                    }
+                }
+                
+                // Process repairs
+                for (height, missing_indices, received, required) in assemblies_to_repair {
+                    // Update assembly state
+                    if let Some(mut assembly) = shred_protocol_assemblies.get_mut(&height) {
+                        assembly.retransmit_attempts += 1;
+                        assembly.retransmit_requested_at = Some(std::time::Instant::now());
+                    }
+                    
+                    let missing_count = missing_indices.len();
+                    println!("[INFO][REPAIR] background_request h={} missing={} received={}/{} attempt={}",
+                        height, missing_count, received, required,
+                        shred_protocol_assemblies.get(&height).map(|a| a.retransmit_attempts).unwrap_or(0));
+                    
+                    // Find peers who might have the chunks (from cache or producers)
+                    let repair_targets: Vec<String> = connected_peers_lockfree.iter()
+                        .filter(|e| e.value().is_consensus_qualified())
+                        .take(3) // Ask up to 3 peers
+                        .map(|e| e.value().addr.clone())
+                        .collect();
+                    
+                    if repair_targets.is_empty() {
+                        println!("[WARN][REPAIR] no_qualified_peers h={}", height);
+                        continue;
+                    }
+                    
+                    // Send repair requests via QUIC
+                    if quic_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(ref transport) = quic_transport {
+                            let transport_guard = transport.read().await;
+                            
+                            for peer_addr in &repair_targets {
+                                // Build repair request message
+                                let request = NetworkMessage::RequestMissingChunks {
+                                    block_height: height,
+                                    missing_indices: missing_indices.clone(),
+                                    requester_id: node_id.clone(),
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                };
+                                
+                                // Parse peer address
+                                let parts: Vec<&str> = peer_addr.split(':').collect();
+                                if parts.len() == 2 {
+                                    if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
+                                        let quic_port = port.saturating_add(crate::quic_transport::QUIC_PORT_OFFSET);
+                                        let quic_addr = std::net::SocketAddr::new(ip, quic_port);
+                                        
+                                        let _ = transport_guard.broadcast_to(quic_addr, &request).await;
+                                    }
+                                }
+                            }
+                            
+                            println!("[INFO][REPAIR] requests_sent h={} peers={} chunks={}",
+                                height, repair_targets.len(), missing_count);
+                        }
+                    }
+                }
+                
+                // Log repair stats periodically (every 60 seconds = 120 ticks)
+                if repair_stats_log_counter % 120 == 0 {
+                    let active_assemblies = shred_protocol_assemblies.len();
+                    if active_assemblies > 0 {
+                        println!("[INFO][REPAIR] background_stats active_assemblies={}", active_assemblies);
+                    }
+                }
+                
+                // Cleanup old assemblies (> 30 seconds = definitely timed out)
+                let mut expired: Vec<u64> = Vec::new();
+                for entry in shred_protocol_assemblies.iter() {
+                    if entry.value().started_at.elapsed().as_secs() > 30 {
+                        expired.push(*entry.key());
+                    }
+                }
+                for height in expired {
+                    shred_protocol_assemblies.remove(&height);
+                }
+            }
+        });
+        
+        println!("[INFO][REPAIR] background_task_started interval=500ms runtime=broadcast");
     }
     
     /// v2.24.2: Frequent QUIC health check with ACTIVE HealthPing probing
@@ -4061,7 +4272,9 @@ impl SimplifiedP2P {
                         let addr = *quic_addr;
                         let permit = semaphore.clone();
                         
-                        chunk0_tasks.push(tokio::spawn(async move {
+                        // PRODUCTION v2.56: Use dedicated broadcast runtime (like Solana's broadcast_stage)
+                        // Prevents main Tokio runtime contention from starving broadcast tasks
+                        chunk0_tasks.push(BROADCAST_RUNTIME.spawn(async move {
                             let _permit = match permit.acquire().await {
                                 Ok(p) => p,
                                 Err(_) => return Err("Semaphore closed".to_string()),
@@ -4131,29 +4344,30 @@ impl SimplifiedP2P {
                 
                 let sends_count = other_sends.len();
                 
-                for (batch_idx, batch) in other_sends.chunks(batch_size).enumerate() {
-                    for (quic_addr, msg) in batch {
-                        let transport_clone = transport_arc.clone();
-                        let msg_clone = msg.clone();
-                        let addr = *quic_addr;
-                        let permit = semaphore.clone();
-                        
-                        // FIRE-AND-FORGET: Spawn without awaiting result
-                        // Repair mechanism handles lost chunks (receiver-side)
-                        tokio::spawn(async move {
-                            let _permit = match permit.acquire().await {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    SHRED_SEND_FAILURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    return;
-                                }
-                            };
-                            let transport = transport_clone.read().await;
-                            match transport.broadcast_to(addr, &msg_clone).await {
-                                Ok(_) => {
-                                    SHRED_SEND_SUCCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                Err(_) => {
+                    for (batch_idx, batch) in other_sends.chunks(batch_size).enumerate() {
+                        for (quic_addr, msg) in batch {
+                            let transport_clone = transport_arc.clone();
+                            let msg_clone = msg.clone();
+                            let addr = *quic_addr;
+                            let permit = semaphore.clone();
+                            
+                            // PRODUCTION v2.56: FIRE-AND-FORGET on dedicated broadcast runtime
+                            // Ensures broadcast never gets starved by main loop tasks
+                            // Like Solana's broadcast_stage - isolated thread pool for chunks
+                            BROADCAST_RUNTIME.spawn(async move {
+                                let _permit = match permit.acquire().await {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        SHRED_SEND_FAILURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        return;
+                                    }
+                                };
+                                let transport = transport_clone.read().await;
+                                match transport.broadcast_to(addr, &msg_clone).await {
+                                    Ok(_) => {
+                                        SHRED_SEND_SUCCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Err(_) => {
                                     SHRED_SEND_FAILURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
@@ -4671,13 +4885,27 @@ impl SimplifiedP2P {
         let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
         let quic_transport = self.quic_transport.clone();
         
+        // PRODUCTION v2.56: Log forward operations for debugging
+        let height = chunk.block_height;
+        let chunk_idx = chunk.chunk_index;
+        let is_parity = chunk.is_parity;
+        let forward_count = forward_targets.len();
+        
+        // Log every forward (critical for debugging large block issues)
+        if forward_count > 0 && (height <= 100 || height % 100 == 0 || forward_count > 2) {
+            println!("[INFO][FORWARD] h={} chunk={} parity={} targets={}", 
+                     height, chunk_idx, is_parity, forward_count);
+        }
+        
         for peer in forward_targets {
             let peer_addr = peer.addr.clone();
             let chunk_clone = chunk.clone();
             let quic_transport_clone = quic_transport.clone();
+            let peer_id = peer.id.clone();
             
-            // PRODUCTION v2.19.22: Use QUIC for chunk forwarding (unidirectional, no response)
-            handle.spawn(async move {
+            // PRODUCTION v2.56: Use dedicated BROADCAST_RUNTIME for chunk forwarding
+            // Ensures forward operations never compete with main loop
+            BROADCAST_RUNTIME.spawn(async move {
                 let message = NetworkMessage::ShredProtocolChunk { chunk: chunk_clone };
                 
                 // Extract IP and calculate QUIC port
@@ -4690,7 +4918,17 @@ impl SimplifiedP2P {
                         if quic_enabled {
                             if let Some(ref transport) = quic_transport_clone {
                                 let transport_guard = transport.read().await;
-                                let _ = transport_guard.broadcast_to(quic_addr, &message).await;
+                                match transport_guard.broadcast_to(quic_addr, &message).await {
+                                    Ok(_) => {
+                                        // Success - chunk forwarded
+                                    }
+                                    Err(e) => {
+                                        // Log forward failures for production debugging
+                                        if height <= 100 {
+                                            println!("[WARN][FORWARD] failed h={} to={} err={}", height, peer_id, e);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -4810,6 +5048,100 @@ impl SimplifiedP2P {
         }
         
         Ok(())
+    }
+    
+    /// PRODUCTION v2.56: Check if we have partial assembly for a block
+    /// Used by failover logic to determine repair strategy
+    pub fn has_partial_assembly(&self, block_height: u64) -> bool {
+        self.shred_protocol_assemblies.contains_key(&block_height)
+    }
+    
+    /// PRODUCTION v2.56: Check if block exists on network (prevents false emergency)
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// CRITICAL: Before triggering emergency, check if OTHER nodes have the block.
+    /// If 2/3+ peers have the block → it's OUR problem (sync issue), not producer failure.
+    /// This prevents FALSE EMERGENCY that causes FORKS.
+    /// 
+    /// SECURITY: Uses PeerInfo.last_block_height from SIGNED heartbeats (Dilithium)
+    /// ZERO network overhead - instant local check
+    /// ═══════════════════════════════════════════════════════════════════════════
+    pub async fn check_block_exists_on_network(&self, block_height: u64) -> (usize, usize) {
+        // Use already-verified peer heights from Dilithium-signed heartbeats
+        // NO HTTP requests needed - data is in connected_peers_lockfree
+        let mut total_peers = 0usize;
+        let mut peers_with_block = 0usize;
+        
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer = entry.value();
+            
+            // Skip self
+            if peer.id == self.node_id {
+                continue;
+            }
+            
+            // Only count consensus-qualified peers (validated nodes)
+            if !peer.is_consensus_qualified() {
+                continue;
+            }
+            
+            total_peers += 1;
+            
+            // Check if peer's last known height >= our target
+            // This height comes from Dilithium-signed heartbeats - VERIFIED!
+            if peer.last_block_height >= block_height {
+                peers_with_block += 1;
+            }
+        }
+        
+        if total_peers > 0 {
+            let ratio = (peers_with_block as f64 / total_peers as f64 * 100.0) as u32;
+            println!("[INFO][CONSENSUS] block_check h={} peers_with_block={}/{} ({}%)", 
+                     block_height, peers_with_block, total_peers, ratio);
+        }
+        
+        (peers_with_block, total_peers)
+    }
+    
+    /// PRODUCTION v2.56: Trigger chunk repair for a block
+    /// Called by failover logic before emergency to attempt chunk-based reconstruction
+    pub fn trigger_chunk_repair(&self, block_height: u64) {
+        // Get assembly to find missing chunks
+        if let Some(assembly) = self.shred_protocol_assemblies.get(&block_height) {
+            let total_chunks = assembly.total_chunks;
+            
+            // Find missing data chunk indices
+            let mut missing_indices: Vec<usize> = assembly.chunks_received.iter()
+                .enumerate()
+                .filter(|(_, c)| c.is_none())
+                .map(|(i, _)| i)
+                .collect();
+            
+            // Add missing parity indices
+            let parity_missing: Vec<usize> = assembly.parity_chunks.iter()
+                .enumerate()
+                .filter(|(_, c)| c.is_none())
+                .map(|(i, _)| total_chunks + i)
+                .collect();
+            missing_indices.extend(parity_missing);
+            
+            if missing_indices.is_empty() {
+                println!("[INFO][REPAIR] trigger_repair h={} no_missing_chunks", block_height);
+                return;
+            }
+            
+            let received = assembly.chunks_received.iter().filter(|c| c.is_some()).count()
+                + assembly.parity_chunks.iter().filter(|c| c.is_some()).count();
+            
+            println!("[INFO][REPAIR] trigger_repair h={} missing={} received={}", 
+                     block_height, missing_indices.len(), received);
+            
+            drop(assembly); // Release lock before calling request
+            
+            // Request missing chunks from multiple peers (parallel)
+            self.request_missing_chunks(block_height, missing_indices, "");
+        } else {
+            println!("[WARN][REPAIR] trigger_repair h={} no_assembly_found", block_height);
+        }
     }
     
     /// PRODUCTION v2.21.3: Request missing chunks from peers

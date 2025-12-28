@@ -358,7 +358,17 @@ impl CommitRevealConsensus {
         // Get active round (guaranteed to exist - checked at function start)
         let state = self.current_round.as_mut().unwrap();
         
-        // Store commit
+        // CRITICAL FIX v2.53: Reject duplicate commits from same node
+        // Without this check, a node could send multiple commits with different hashes
+        // causing "Reveal doesn't match commit" when reveal matches only one hash
+        if state.commits.contains_key(&commit.node_id) {
+            // Already have commit from this node - ignore duplicate (idempotent)
+            println!("[INFO][CONS] duplicate_commit_ignored node={} round={}", 
+                     commit.node_id, state.round_number);
+            return Ok(());
+        }
+        
+        // Store commit (first one only)
         state.commits.insert(commit.node_id.clone(), commit);
         
         // PRODUCTION v2.40: Log progress but do NOT change local phase!

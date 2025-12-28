@@ -1160,7 +1160,8 @@ impl BlockchainNode {
     /// Process reward window for emission block
     /// PRODUCTION v2.43.1: Takes explicit emission_block_height parameter
     /// This fixes off-by-one bug where window_end was current_height (N-1) instead of emission block (N)
-    pub async fn process_reward_window(&self, emission_block_height: u64) -> Result<(), QNetError> {
+    /// v2.53: Returns Result<bool, Error> - true if emission created, false if no eligible nodes
+    pub async fn process_reward_window(&self, emission_block_height: u64) -> Result<bool, QNetError> {
         if is_info() { println!("[INFO][REWARDS] processing_window emission_block={}", emission_block_height); }
         
         let mut reward_manager = self.reward_manager.write().await;
@@ -1196,7 +1197,8 @@ impl BlockchainNode {
                 if is_warn() { println!("[WARN][REWARDS] p2p_unavailable fallback=local_storage"); }
                 // Fallback to local storage if P2P not available
                 // PRODUCTION v2.43.1: Use emission_block_height instead of current_height
-                return self.process_reward_window_local(&mut reward_manager, window_start, emission_block_height).await;
+                self.process_reward_window_local(&mut reward_manager, window_start, emission_block_height).await?;
+                return Ok(true); // Fallback completed successfully
             }
         };
         
@@ -1526,7 +1528,7 @@ impl BlockchainNode {
         
         if pending_rewards.is_empty() {
             if is_warn() { println!("[WARN][REWARDS] no_eligible_nodes_in_window"); }
-            return Ok(());
+            return Ok(false); // v2.53: No emission created
         }
         
         // Calculate total emission for this window
@@ -1609,7 +1611,7 @@ impl BlockchainNode {
         
         // Rewards are now in pending_rewards - users can claim them anytime
         if is_info() { println!("[INFO][REWARDS] available_for_claim"); }
-        Ok(())
+        Ok(true) // v2.53: Emission created successfully
     }
     
     /// Fallback: Process reward window using local storage (when P2P unavailable)
@@ -7998,12 +8000,20 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // This EXISTING method does everything: sync pings, calculate rewards, 
                         // emit tokens, create transaction, sign with system key, add to mempool
                         // PRODUCTION v2.43.1: Pass explicit emission_block_height to fix off-by-one bug
-                        if let Err(e) = blockchain_for_emission.process_reward_window(next_block_height).await {
-                            eprintln!("[EMISSION] ❌ Failed to process emission: {}", e);
-                            // Continue with block production even if emission fails
-                            // Emission will be retried in next window or by emergency producer
-                        } else {
-                            println!("[EMISSION] ✅ Emission transaction created and added to mempool");
+                        // v2.53: process_reward_window returns Ok(true) if emission created, Ok(false) if no eligible nodes
+                        match blockchain_for_emission.process_reward_window(next_block_height).await {
+                            Ok(emission_created) => {
+                                if emission_created {
+                                    println!("[EMISSION] ✅ Emission transaction created and added to mempool");
+                                } else {
+                                    println!("[EMISSION] ⚠️ No eligible nodes in window - emission skipped");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[EMISSION] ❌ Failed to process emission: {}", e);
+                                // Continue with block production even if emission fails
+                                // Emission will be retried in next window or by emergency producer
+                            }
                         }
                     }
                     
@@ -9530,9 +9540,41 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 };
                                 
                                 if !block_exists {
-                                    // REMOVED: PROCESSED_FAILOVERS check that was blocking legitimate failovers
-                                    // Each failover attempt should be evaluated independently
-                                    // The P2P layer already has deduplication for network messages
+                                    // ═══════════════════════════════════════════════════════════════════════════
+                                    // PRODUCTION v2.56: CONSENSUS CHECK BEFORE EMERGENCY
+                                    // ═══════════════════════════════════════════════════════════════════════════
+                                    // CRITICAL: Check if OTHER nodes have the block before triggering emergency.
+                                    // If 2/3+ peers have the block → it's OUR sync problem, not producer failure.
+                                    // This prevents FALSE EMERGENCY that causes FORKS.
+                                    // ═══════════════════════════════════════════════════════════════════════════
+                                    
+                                    let (peers_with_block, total_peers) = p2p_timeout
+                                        .check_block_exists_on_network(expected_height_timeout).await;
+                                    
+                                    // If 2/3+ peers have the block, it's OUR problem - sync instead of emergency
+                                    let network_has_block = total_peers > 0 && 
+                                        peers_with_block * 3 >= total_peers * 2;
+                                    
+                                    if network_has_block {
+                                        println!("[WARN][SYNC] block_on_network h={} peers={}/{} - syncing instead of emergency", 
+                                                 expected_height_timeout, peers_with_block, total_peers);
+                                        
+                                        // Try to sync the block from network
+                                        if let Err(e) = p2p_timeout.sync_blocks(expected_height_timeout, expected_height_timeout).await {
+                                            println!("[WARN][SYNC] sync_failed h={} err={}", expected_height_timeout, e);
+                                        }
+                                        
+                                        // Clear failover flag - no emergency needed
+                                        FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);
+                                        return; // Exit - sync instead of emergency
+                                    }
+                                    
+                                    // ═══════════════════════════════════════════════════════════════════════════
+                                    // Network does NOT have the block - proceed with emergency
+                                    // ═══════════════════════════════════════════════════════════════════════════
+                                    
+                                    println!("[INFO][FAIL] network_missing_block h={} peers={}/{} - proceeding with emergency", 
+                                             expected_height_timeout, peers_with_block, total_peers);
                                     
                                     // Use the actual timeout duration for logging (calculated above)
                                     let timeout_duration = actual_timeout.as_secs();
@@ -12813,10 +12855,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let commit_hash = hex::encode(consensus_engine.calculate_commit_hash(&reveal_data, &nonce));
             
             // Store nonce and reveal_data for OUR node only
+            // CRITICAL FIX v2.53: Key MUST include round_id to prevent race condition!
+            // Without round_id: new round overwrites old nonce → "Reveal doesn't match commit"
             {
                 let mut storage = nonce_storage.write().await;
-                storage.insert(our_id.clone(), (nonce, reveal_data.clone()));
-                println!("[INFO][CONS] stored_nonce node={}", our_id);
+                let storage_key = format!("{}-{}", round_id, our_id);
+                storage.insert(storage_key.clone(), (nonce, reveal_data.clone()));
+                println!("[INFO][CONS] stored_nonce round={} node={} key={}", round_id, our_id, storage_key);
             }
             
             // Generate REAL signature for OUR node only
@@ -13050,23 +13095,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let our_node_id = Some(node_id.to_string());
         
         if let Some(our_id) = our_node_id {
-            println!("[INFO][CONS] generate_reveal node={}", our_id);
+            println!("[INFO][CONS] generate_reveal round={} node={}", round_id, our_id);
             
             // Retrieve ONLY our own stored data
+            // CRITICAL FIX v2.53: Key MUST include round_id to match commit phase!
+            let storage_key = format!("{}-{}", round_id, our_id);
             let (nonce, reveal_data) = {
                 let storage = nonce_storage.read().await;
-                match storage.get(&our_id) {
+                match storage.get(&storage_key) {
                     Some((stored_nonce, stored_reveal)) => {
-                        println!("[INFO][CONS] retrieved_commit data_len={} nonce={}...", 
-                                 our_id, hex::encode(&stored_nonce[..8]));
+                        println!("[INFO][CONS] retrieved_commit round={} node={} nonce={}...", 
+                                 round_id, our_id, hex::encode(&stored_nonce[..8]));
                         (*stored_nonce, stored_reveal.clone())
                     }
                     None => {
-                        // CRITICAL: If we don't have commit data, we CANNOT participate in reveal
+                        // CRITICAL: If we don't have commit data for THIS ROUND, we CANNOT participate
                         // This is CORRECT Byzantine behavior - nodes that didn't commit can't reveal
-                        // Otherwise malicious nodes could manipulate consensus by skipping commit
-                        println!("[ERR][CONS] No OWN commit data found - cannot reveal (Byzantine safety)");
-                        println!("[WARN][CONS] no_commit_data - skipping round");
+                        // v2.53: Now correctly identifies missing data per-round
+                        println!("[ERR][CONS] No commit data for round={} key={} - cannot reveal", round_id, storage_key);
+                        println!("[WARN][CONS] no_commit_data_for_round - skipping reveal");
                         return; // Exit reveal phase for this node
                     }
                 }
@@ -15810,14 +15857,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
         }
         
-        // DECENTRALIZED: RewardDistribution transactions don't need signature
+        // DECENTRALIZED: System transactions don't need signature
         // Bitcoin-style: validated through deterministic consensus rules, not crypto signature
-        if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) {
-            // System emission transactions (from="system_emission") are allowed without signature
-            // They are validated through consensus: all nodes independently verify amount
+        // v2.53: Added PingCommitmentWithSampling to system transactions
+        let is_system_transaction = matches!(tx.tx_type, 
+            qnet_state::TransactionType::RewardDistribution | 
+            qnet_state::TransactionType::PingCommitmentWithSampling { .. }
+        );
+        
+        if is_system_transaction {
+            // System transactions are validated through consensus, not signatures
             if tx.from == "system_emission" {
                 println!("[EMISSION] 📝 System emission transaction accepted (validated through consensus)");
-            } else {
+            } else if tx.from == "system_ping_commitment" {
+                // v2.53: Ping commitments are system transactions, validated by merkle proofs
+                if is_info() { println!("[INFO][REWARDS] ping_commitment_accepted system_tx"); }
+            } else if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) {
                 // User reward claims - these SHOULD have user signature
                 if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
                     return Err(QNetError::ValidationError("Reward claim must be signed by user".to_string()));
@@ -16175,12 +16230,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // Signature validation with cryptographic verification
-        if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) {
-            if tx.from != "system_emission" {
+        // v2.53: System transactions (RewardDistribution, PingCommitmentWithSampling) don't need signature
+        let is_system_tx = matches!(tx.tx_type, 
+            qnet_state::TransactionType::RewardDistribution | 
+            qnet_state::TransactionType::PingCommitmentWithSampling { .. }
+        );
+        
+        if is_system_tx {
+            // System transactions validated through consensus, not signatures
+            if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) && tx.from != "system_emission" {
                 if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
                     return Err(QNetError::ValidationError("Reward claim must be signed".to_string()));
                 }
             }
+            // PingCommitmentWithSampling from system_ping_commitment - no signature needed
         } else {
             if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
                 return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
