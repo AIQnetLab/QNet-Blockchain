@@ -5803,6 +5803,150 @@ impl SimplifiedP2P {
     /// Send a single ShredProtocol chunk to a peer
     // REMOVED v2.19.21: send_shred_protocol_chunk replaced by async QUIC broadcast in broadcast_block_shred_protocol
     
+    /// CRITICAL FIX v2.61: Send large block to specific peer via ShredProtocol (unicast)
+    /// Used by sync to reliably deliver blocks >1MB that would fail as single QUIC message
+    /// 
+    /// ARCHITECTURE: Same chunking as broadcast_block_shred_protocol but targeted to one peer
+    /// - Splits block into 128KB chunks with Reed-Solomon parity
+    /// - Sends chunks sequentially with pacing to prevent congestion
+    /// - Receiver uses existing handle_shred_protocol_chunk to reassemble
+    pub async fn send_block_via_shred_to_peer(&self, peer_addr: &str, height: u64, block_data: Vec<u8>, is_macroblock: bool) {
+        use crate::quic_transport::QUIC_PORT_OFFSET;
+        use crate::node::{is_info, is_debug};
+        
+        let start_time = std::time::Instant::now();
+        let block_size = block_data.len();
+        let block_type = if is_macroblock { "macro" } else { "micro" };
+        
+        if is_info() {
+            println!("[INFO][SHRED_SYNC] start h={} type={} size_kb={} peer={}", 
+                     height, block_type, block_size / 1024, peer_addr);
+        }
+        
+        // Check size limit
+        if block_size > SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE {
+            println!("[ERR][SHRED_SYNC] block_too_large h={} size_mb={} max_mb={}", 
+                     height, block_size / 1024 / 1024, 
+                     SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE / 1024 / 1024);
+            return;
+        }
+        
+        // Get QUIC transport
+        let quic_transport = match GLOBAL_QUIC_TRANSPORT.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        
+        let Some(ref transport_arc) = quic_transport else {
+            if is_debug() { println!("[DBG][SHRED_SYNC] no_quic_transport h={}", height); }
+            return;
+        };
+        
+        // Parse peer address to QUIC address
+        let parts: Vec<&str> = peer_addr.split(':').collect();
+        if parts.len() != 2 { return; }
+        
+        let ip = match parts[0].parse::<std::net::IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => return,
+        };
+        let port = match parts[1].parse::<u16>() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let quic_port = port.saturating_add(QUIC_PORT_OFFSET);
+        let quic_addr = std::net::SocketAddr::new(ip, quic_port);
+        
+        // Split block into chunks (same logic as broadcast_block_shred_protocol)
+        let original_block_size = block_size;
+        let data_chunk_count = (block_size + SHRED_PROTOCOL_CHUNK_SIZE - 1) / SHRED_PROTOCOL_CHUNK_SIZE;
+        let parity_chunk_count = (data_chunk_count + 1) / 2; // 50% redundancy
+        let total_chunks = data_chunk_count + parity_chunk_count;
+        
+        // Pad data to exact chunk boundaries
+        let mut padded_data = block_data.clone();
+        let target_size = data_chunk_count * SHRED_PROTOCOL_CHUNK_SIZE;
+        padded_data.resize(target_size, 0);
+        
+        // Split into data chunks
+        let mut data_chunks: Vec<Vec<u8>> = Vec::with_capacity(data_chunk_count);
+        for i in 0..data_chunk_count {
+            let start = i * SHRED_PROTOCOL_CHUNK_SIZE;
+            let end = start + SHRED_PROTOCOL_CHUNK_SIZE;
+            data_chunks.push(padded_data[start..end].to_vec());
+        }
+        
+        // Generate Reed-Solomon parity chunks
+        let parity_data = self.generate_parity_chunks(&data_chunks, parity_chunk_count);
+        let chunk_time = start_time.elapsed();
+        
+        if is_debug() {
+            println!("[DBG][SHRED_SYNC] chunked h={} data={} parity={} ms={}", 
+                     height, data_chunk_count, parity_chunk_count, chunk_time.as_millis());
+        }
+        
+        // Send chunks with pacing (5ms between chunks)
+        const CHUNK_PACING_MS: u64 = 5;
+        let mut sent_count = 0;
+        
+        let transport = transport_arc.read().await;
+        
+        // Send data chunks
+        for (i, chunk_data) in data_chunks.into_iter().enumerate() {
+            let chunk = ShredProtocolChunk {
+                block_height: height,
+                chunk_index: i,
+                total_chunks: data_chunk_count,
+                data: chunk_data,
+                is_parity: false,
+                original_block_size,
+                is_macroblock,
+                certificate: None,
+            };
+            
+            let msg = NetworkMessage::ShredProtocolChunk { chunk };
+            
+            if transport.broadcast_to(quic_addr, &msg).await.is_ok() {
+                sent_count += 1;
+            }
+            
+            tokio::time::sleep(std::time::Duration::from_millis(CHUNK_PACING_MS)).await;
+        }
+        
+        // Send parity chunks
+        for (i, parity_chunk_data) in parity_data.into_iter().enumerate() {
+            let chunk = ShredProtocolChunk {
+                block_height: height,
+                chunk_index: data_chunk_count + i,
+                total_chunks: data_chunk_count,
+                data: parity_chunk_data,
+                is_parity: true,
+                original_block_size,
+                is_macroblock,
+                certificate: None,
+            };
+            
+            let msg = NetworkMessage::ShredProtocolChunk { chunk };
+            
+            if transport.broadcast_to(quic_addr, &msg).await.is_ok() {
+                sent_count += 1;
+            }
+            
+            tokio::time::sleep(std::time::Duration::from_millis(CHUNK_PACING_MS)).await;
+        }
+        
+        let total_time = start_time.elapsed();
+        let throughput_kbps = if total_time.as_millis() > 0 {
+            (block_size as u64 * 8) / total_time.as_millis() as u64  // kbit/s
+        } else { 0 };
+        
+        if is_info() {
+            println!("[INFO][SHRED_SYNC] done h={} sent={}/{} size_kb={} ms={} kbps={}", 
+                     height, sent_count, total_chunks, block_size / 1024, 
+                     total_time.as_millis(), throughput_kbps);
+        }
+    }
+    
     /// API DEADLOCK FIX: Get cached network height WITHOUT triggering sync
     /// This method NEVER makes network calls - only reads cache
     /// v2.26.1: Added fallback to max(peer.last_block_height) from HealthPing data
@@ -7529,6 +7673,33 @@ impl SimplifiedP2P {
         
         // Fallback if cache lock fails
         self.get_validated_active_peers_internal()
+    }
+    
+    /// CRITICAL FIX v2.61: Get peer heights from signed heartbeats
+    /// Used for emergency producer selection to ensure only SYNCHRONIZED nodes are candidates
+    /// Returns HashMap<node_id, last_block_height> from Dilithium-signed HealthPing data
+    pub fn get_peer_heights(&self) -> std::collections::HashMap<String, u64> {
+        let mut heights = std::collections::HashMap::new();
+        
+        // Collect heights from connected peers (lock-free)
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer = entry.value();
+            if peer.last_block_height > 0 {
+                heights.insert(peer.id.clone(), peer.last_block_height);
+            }
+        }
+        
+        // Also check validated active peers (may have fresher data)
+        let validated = self.get_validated_active_peers();
+        for peer in validated {
+            if peer.last_block_height > 0 {
+                heights.entry(peer.id.clone())
+                    .and_modify(|h| *h = (*h).max(peer.last_block_height))
+                    .or_insert(peer.last_block_height);
+            }
+        }
+        
+        heights
     }
     
     /// Internal method without caching (v2.51: fully lock-free)

@@ -10494,36 +10494,37 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if own_node_id != failed_producer && can_participate_emergency {
                 let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
                 
-                // CRITICAL FIX v2.51: Check if own node is synchronized for emergency production
-                // EXCLUDE unsynchronized nodes from candidates, not just log them!
+                // CRITICAL FIX v2.61: Strict sync check for emergency production
+                // Emergency producer MUST have prev block to create next block!
+                // To create block N, node MUST have block N-1
+                // No time for sync during emergency - need immediate production
+                // If no synced nodes → Progressive Degradation fallback
                 let is_synchronized = if let Some(ref store) = storage {
                     let stored_height = store.get_chain_height().unwrap_or(0);
-                    // Allow max 10 blocks behind for emergency producer
-                    stored_height + 10 >= current_height
+                    // Strict: must have prev block (current_height - 1)
+                    stored_height >= current_height.saturating_sub(1)
                 } else {
                     true // If no storage, assume synced (shouldn't happen)
                 };
                 
                 // CRITICAL FIX v2.51: Only add SYNCHRONIZED nodes as candidates!
                 // This prevents selecting lagging nodes that cannot produce blocks
-                // Before: all nodes were added, then lagging ones would timeout (slow!)
-                // After: only synchronized nodes are candidates (fast selection!)
                 if is_synchronized {
                     candidates.push((own_node_id.to_string(), own_reputation));
-                    println!("[EMERGENCY_SELECTION] ✅ Own node {} SYNCHRONIZED and added to candidates (reputation: {:.1}%)", 
+                    println!("[INFO][EMERGENCY] own_node={} status=synced reputation={:.1}", 
                              own_node_id, own_reputation * 100.0);
                 } else {
                     // EXCLUDED: Node is behind, cannot produce blocks for this height
                     let stored_height = storage.as_ref()
                         .map(|s| s.get_chain_height().unwrap_or(0))
                         .unwrap_or(0);
-                    println!("[EMERGENCY_SELECTION] ❌ Own node {} EXCLUDED - NOT SYNCHRONIZED (height: {} vs expected: {}, behind: {} blocks)", 
+                    println!("[INFO][EMERGENCY] own_node={} status=excluded reason=not_synced local_h={} need_h={} lag={}", 
                              own_node_id, stored_height, current_height, current_height.saturating_sub(stored_height));
                 }
             } else if own_node_id == failed_producer {
-                println!("[EMERGENCY_SELECTION] 💀 Own node {} is the failed producer - excluding", own_node_id);
+                println!("[INFO][EMERGENCY] own_node={} status=excluded reason=failed_producer", own_node_id);
             } else {
-                println!("[EMERGENCY_SELECTION] 📱 Own node {} excluded from emergency production (type: {:?})", 
+                println!("[INFO][EMERGENCY] own_node={} status=excluded reason=node_type type={:?}", 
                          own_node_id, own_node_type);
             };
             
@@ -10567,17 +10568,37 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     return failed_producer.to_string();
                 }
                 
+                // CRITICAL FIX v2.61: Strict sync check for emergency candidates
+                // To create block N, node MUST have block N-1
+                // Strict threshold: peer_height >= current_height - 1
+                // No time for sync during emergency - need immediate production
+                let peer_heights = p2p.get_peer_heights();
+                let sync_threshold = current_height.saturating_sub(1); // Must have prev block!
+                
                 for (node_id, reputation) in qualified {
                     // Exclude the CORRECT producer (not the stale failed_producer)
-                    // All nodes will recalculate same correct_producer → same exclusion → deterministic!
                     if node_id == correct_producer {
-                        println!("[EMERGENCY_SELECTION] 💀 Excluding actual producer {} from emergency candidates", node_id);
+                        println!("[INFO][EMERGENCY] peer={} status=excluded reason=actual_producer", node_id);
+                        continue;
+                    }
+                    
+                    // CRITICAL FIX v2.61: Check if peer is synchronized before adding as candidate
+                    // Uses height from Dilithium-signed HealthPing (Byzantine-resistant)
+                    if let Some(&peer_height) = peer_heights.get(&node_id) {
+                        if peer_height < sync_threshold {
+                            println!("[INFO][EMERGENCY] peer={} status=excluded reason=not_synced h={} need={}", 
+                                     node_id, peer_height, sync_threshold);
+                            continue;
+                        }
+                        println!("[INFO][EMERGENCY] peer={} status=synced h={} rep={:.1}", 
+                                 node_id, peer_height, reputation * 100.0);
+                    } else {
+                        // No height info - node might be unresponsive, exclude for safety
+                        println!("[INFO][EMERGENCY] peer={} status=excluded reason=no_height_info", node_id);
                         continue;
                     }
                     
                     candidates.push((node_id.clone(), reputation));
-                    println!("[EMERGENCY_SELECTION] ✅ Emergency candidate {} added (reputation: {:.1}%)", 
-                             node_id, reputation * 100.0);
                 }
             }
             
@@ -10596,12 +10617,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 })
                 .collect();
             
-            println!("[EMERGENCY_SELECTION] 🔍 Emergency candidates: {} valid (excluded: {})", 
+            println!("[INFO][EMERGENCY] candidates={} excluded={}", 
                      valid_candidates.len(), correct_producer);
-            println!("[EMERGENCY_SELECTION] ℹ️  Reported failed: '{}' (may be stale)", failed_producer);
+            println!("[INFO][EMERGENCY] reported_failed={}", failed_producer);
             
             if valid_candidates.is_empty() {
-                println!("[FAILOVER] 💀 CRITICAL: No valid backup producers available!");
+                println!("[WARN][EMERGENCY] no_valid_candidates=true");
                 
                 // EMERGENCY MODE: Use existing Progressive Degradation Protocol
                 if false { // Deprecated - no longer using phases
@@ -16747,46 +16768,164 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Handle incoming sync request from peer
+    /// CRITICAL FIX v2.61: Size-based batched sync to prevent QUIC message loss
     pub async fn handle_sync_request(&self, from_height: u64, to_height: u64, requester_id: String) -> Result<(), QNetError> {
-        println!("[SYNC] 📥 Processing sync request from {} for microblocks {}-{}", 
-                 requester_id, from_height, to_height);
-        
-        // CRITICAL DEBUG: Check if Genesis exists before sending
-        if from_height == 0 {
-            let genesis_check = self.storage.load_microblock(0);
-            println!("[SYNC] 🔍 DEBUG: Genesis block check for sync: {:?}", 
-                     genesis_check.as_ref().map(|opt| opt.as_ref().map(|data| data.len())));
+        if is_info() { 
+            println!("[INFO][SYNC] request from={} heights={}-{}", requester_id, from_height, to_height); 
         }
         
         // Get microblocks from storage (already in network format)
         let blocks_data = self.storage.get_microblocks_range(from_height, to_height).await?;
         
-        if is_trace() { println!("[TRC][SYNC] get_microblocks_range({}, {}) blocks={}", 
-                 from_height, to_height, blocks_data.len()); }
+        if is_trace() { 
+            println!("[TRC][SYNC] get_range({}, {}) blocks={}", from_height, to_height, blocks_data.len()); 
+        }
+        
+        if blocks_data.is_empty() {
+            if is_debug() { println!("[DBG][SYNC] empty_response heights={}-{}", from_height, to_height); }
+            return Ok(());
+        }
         
         if let Some(ref p2p) = self.unified_p2p {
-            // Send blocks batch to requester
-            let response = NetworkMessage::BlocksBatch {
-                blocks: blocks_data.clone(),
-                from_height,
-                to_height,
-                sender_id: self.node_id.clone(),
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL FIX v2.61: SIZE-BASED BATCHING for intercontinental reliability
+            // ═══════════════════════════════════════════════════════════════════════════
+            // Problem: Sending large messages via QUIC = fragmentation = packet loss = failure
+            // Root cause: 101 blocks with 50K TX each = ~10MB, any UDP packet loss = "Message too short"
+            // Solution: Batch by SIZE (not count) - max 1MB per message (safe for QUIC/UDP)
+            // 
+            // Why SIZE matters more than COUNT:
+            // - Empty block: ~20KB
+            // - Block with 50K TX: ~12MB!
+            // - 10 empty blocks: 200KB (OK)
+            // - 1 block with 50K TX: 12MB (FAIL)
+            // ═══════════════════════════════════════════════════════════════════════════
+            const MAX_BATCH_SIZE_BYTES: usize = 1_000_000;  // 1MB max per QUIC message
+            const SYNC_BATCH_DELAY_MS: u64 = 5;  // 5ms pacing between batches
+            
+            // Find peer address
+            let peer_addr = p2p.get_peer_address_by_id(&requester_id)
+                .or_else(|| {
+                    let peers = p2p.get_validated_active_peers();
+                    peers.iter().find(|p| p.id == requester_id).map(|p| p.addr.clone())
+                });
+            
+            let Some(addr) = peer_addr else {
+                if is_info() { println!("[WARN][SYNC] peer_not_found id={}", requester_id); }
+                return Ok(());
             };
             
-            // SCALABILITY: Try O(1) lookup first, then fallback to O(n) for Genesis
-            let peer_addr = if let Some(addr) = p2p.get_peer_address_by_id(&requester_id) {
-                Some(addr)
-            } else {
-                // Fallback for Genesis nodes
-            let peers = p2p.get_validated_active_peers();
-                peers.iter().find(|p| p.id == requester_id).map(|p| p.addr.clone())
-            };
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL FIX v2.61: Large blocks (>1MB) use ShredProtocol for reliability
+            // Small blocks use batched BlocksBatch messages
+            // blocks_data is Vec<(u64, Vec<u8>)> - already (height, data) pairs
+            // ═══════════════════════════════════════════════════════════════════════════
+            const SHRED_THRESHOLD_BYTES: usize = 1_000_000;  // Blocks >1MB use ShredProtocol
             
-            if let Some(addr) = peer_addr {
+            // Separate large blocks (ShredProtocol) from small blocks (BatchSync)
+            let mut large_blocks: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut small_blocks: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut total_size: usize = 0;
+            
+            for (height, block_data) in &blocks_data {
+                let block_size = block_data.len();
+                total_size += block_size;
+                
+                if block_size > SHRED_THRESHOLD_BYTES {
+                    large_blocks.push((*height, block_data.clone()));
+                } else {
+                    small_blocks.push((*height, block_data.clone()));
+                }
+            }
+            
+            // Send large blocks via ShredProtocol (reliable for 20MB+)
+            if !large_blocks.is_empty() {
+                if is_info() {
+                    println!("[INFO][SYNC] sending {} large blocks via ShredProtocol to={}", 
+                             large_blocks.len(), requester_id);
+                }
+                for (height, block_data) in large_blocks {
+                    p2p.send_block_via_shred_to_peer(&addr, height, block_data, false).await;
+                }
+            }
+            
+            // Build size-based batches for small blocks
+            // BlocksBatch.blocks is Vec<(u64, Vec<u8>)> - (height, data) pairs
+            let mut batches: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
+            let mut batch_heights: Vec<(u64, u64)> = Vec::new();  // (from, to) for each batch
+            let mut current_batch: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut current_batch_size: usize = 0;
+            let mut batch_start_height: Option<u64> = None;
+            let mut last_height: u64 = 0;
+            
+            for (height, block) in &small_blocks {
+                let block_size = block.len();
+                
+                // If adding this block exceeds limit, start new batch
+                if current_batch_size + block_size > MAX_BATCH_SIZE_BYTES && !current_batch.is_empty() {
+                    batches.push(current_batch);
+                    batch_heights.push((batch_start_height.unwrap_or(*height), last_height));
+                    current_batch = Vec::new();
+                    current_batch_size = 0;
+                    batch_start_height = None;
+                }
+                
+                if batch_start_height.is_none() {
+                    batch_start_height = Some(*height);
+                }
+                last_height = *height;
+                
+                current_batch.push((*height, block.clone()));
+                current_batch_size += block_size;
+            }
+            
+            // Don't forget last batch
+            if !current_batch.is_empty() {
+                batches.push(current_batch);
+                batch_heights.push((batch_start_height.unwrap_or(from_height), last_height));
+            }
+            
+            let num_batches = batches.len();
+            let total_blocks = blocks_data.len();
+            let small_blocks_count = small_blocks.len();
+            let large_blocks_count = total_blocks - small_blocks_count;
+            
+            if is_info() { 
+                println!("[INFO][SYNC] sending blocks={} (small={} large={}) size={}KB batches={} to={}", 
+                         total_blocks, small_blocks_count, large_blocks_count, 
+                         total_size / 1024, num_batches, requester_id); 
+            }
+            
+            // Send small blocks batches with pacing
+            for (batch_idx, batch) in batches.iter().enumerate() {
+                let (batch_from, batch_to) = batch_heights.get(batch_idx)
+                    .copied()
+                    .unwrap_or((from_height, from_height));
+                
+                let response = NetworkMessage::BlocksBatch {
+                    blocks: batch.clone(),
+                    from_height: batch_from,
+                    to_height: batch_to,
+                    sender_id: self.node_id.clone(),
+                };
+                
                 p2p.send_network_message(&addr, response);
-                println!("[SYNC] 📤 Sent {} microblocks to {}", blocks_data.len(), requester_id);
-            } else {
-                println!("[WARN][SYNC] Requester {} not found in peers", requester_id);
+                
+                if is_debug() { 
+                    let batch_size: usize = batch.iter().map(|(_, b)| b.len()).sum();
+                    println!("[DBG][SYNC] batch={}/{} heights={}-{} size={}KB", 
+                             batch_idx + 1, num_batches, batch_from, batch_to, batch_size / 1024); 
+                }
+                
+                // Pacing delay between batches (except last)
+                if batch_idx < num_batches - 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(SYNC_BATCH_DELAY_MS)).await;
+                }
+            }
+            
+            if is_info() { 
+                println!("[INFO][SYNC] sent blocks={} (shred={} batch={}) to={}", 
+                         total_blocks, large_blocks_count, small_blocks_count, requester_id); 
             }
         }
         
@@ -16799,39 +16938,117 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Handle incoming macroblock sync request from peer
     /// PRODUCTION: Full macroblock sync support for new nodes joining network
+    /// CRITICAL FIX v2.61: Size-based batched sync to prevent QUIC message loss
     pub async fn handle_macroblock_sync_request(&self, from_index: u64, to_index: u64, requester_id: String) -> Result<(), QNetError> {
-        println!("[MACROBLOCK-SYNC] 📥 Processing sync request from {} for macroblocks {}-{}", 
-                 requester_id, from_index, to_index);
+        if is_info() { 
+            println!("[INFO][MB-SYNC] request from={} indices={}-{}", requester_id, from_index, to_index); 
+        }
         
         // Get macroblocks from storage
         let macroblocks_data = self.storage.get_macroblocks_range(from_index, to_index).await?;
         
-        println!("[MACROBLOCK-SYNC] 📊 get_macroblocks_range({}, {}) returned {} macroblocks", 
-                 from_index, to_index, macroblocks_data.len());
+        if is_trace() { 
+            println!("[TRC][MB-SYNC] get_range({}, {}) macroblocks={}", from_index, to_index, macroblocks_data.len()); 
+        }
+        
+        if macroblocks_data.is_empty() {
+            if is_debug() { println!("[DBG][MB-SYNC] empty_response indices={}-{}", from_index, to_index); }
+            return Ok(());
+        }
         
         if let Some(ref p2p) = self.unified_p2p {
-            // Send macroblocks batch to requester
-            let response = NetworkMessage::MacroblocksBatch {
-                macroblocks: macroblocks_data.clone(),
-                from_index,
-                to_index,
-                sender_id: self.node_id.clone(),
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL FIX v2.61: SIZE-BASED BATCHING for macroblocks
+            // Macroblocks are typically larger, use conservative limit
+            // ═══════════════════════════════════════════════════════════════════════════
+            const MAX_BATCH_SIZE_BYTES: usize = 500_000;  // 500KB max per message (macroblocks are bigger)
+            const MB_SYNC_BATCH_DELAY_MS: u64 = 10;  // 10ms pacing between batches
+            
+            // Find peer address
+            let peer_addr = p2p.get_peer_address_by_id(&requester_id)
+                .or_else(|| {
+                    let peers = p2p.get_validated_active_peers();
+                    peers.iter().find(|p| p.id == requester_id).map(|p| p.addr.clone())
+                });
+            
+            let Some(addr) = peer_addr else {
+                if is_info() { println!("[WARN][MB-SYNC] peer_not_found id={}", requester_id); }
+                return Ok(());
             };
             
-            // SCALABILITY: Try O(1) lookup first, then fallback to O(n) for Genesis
-            let peer_addr = if let Some(addr) = p2p.get_peer_address_by_id(&requester_id) {
-                Some(addr)
-            } else {
-                // Fallback for Genesis nodes
-                let peers = p2p.get_validated_active_peers();
-                peers.iter().find(|p| p.id == requester_id).map(|p| p.addr.clone())
-            };
+            // Build size-based batches
+            // macroblocks_data is already Vec<(u64, Vec<u8>)> - (index, data) pairs
+            let mut batches: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
+            let mut current_batch: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut current_batch_size: usize = 0;
+            let mut total_size: usize = 0;
             
-            if let Some(addr) = peer_addr {
+            for (mb_index, mb_data) in &macroblocks_data {
+                let mb_size = mb_data.len();
+                total_size += mb_size;
+                
+                // If single macroblock exceeds limit, send it alone
+                if mb_size > MAX_BATCH_SIZE_BYTES {
+                    if !current_batch.is_empty() {
+                        batches.push(current_batch);
+                        current_batch = Vec::new();
+                        current_batch_size = 0;
+                    }
+                    batches.push(vec![(*mb_index, mb_data.clone())]);
+                    continue;
+                }
+                
+                // If adding this macroblock exceeds limit, start new batch
+                if current_batch_size + mb_size > MAX_BATCH_SIZE_BYTES && !current_batch.is_empty() {
+                    batches.push(current_batch);
+                    current_batch = Vec::new();
+                    current_batch_size = 0;
+                }
+                
+                current_batch.push((*mb_index, mb_data.clone()));
+                current_batch_size += mb_size;
+            }
+            
+            if !current_batch.is_empty() {
+                batches.push(current_batch);
+            }
+            
+            let num_batches = batches.len();
+            let total_macroblocks = macroblocks_data.len();
+            
+            if is_info() { 
+                println!("[INFO][MB-SYNC] sending macroblocks={} size={}KB batches={} to={}", 
+                         total_macroblocks, total_size / 1024, num_batches, requester_id); 
+            }
+            
+            // Send batches with pacing
+            for (batch_idx, batch) in batches.iter().enumerate() {
+                // Get from/to from actual batch content
+                let batch_from = batch.first().map(|(idx, _)| *idx).unwrap_or(from_index);
+                let batch_to = batch.last().map(|(idx, _)| *idx).unwrap_or(batch_from);
+                
+                let response = NetworkMessage::MacroblocksBatch {
+                    macroblocks: batch.clone(),
+                    from_index: batch_from,
+                    to_index: batch_to,
+                    sender_id: self.node_id.clone(),
+                };
+                
                 p2p.send_network_message(&addr, response);
-                println!("[MACROBLOCK-SYNC] 📤 Sent {} macroblocks to {}", macroblocks_data.len(), requester_id);
-            } else {
-                println!("[MACROBLOCK-SYNC] ⚠️ Requester {} not found in peers", requester_id);
+                
+                if is_debug() { 
+                    let batch_size: usize = batch.iter().map(|(_, b)| b.len()).sum();
+                    println!("[DBG][MB-SYNC] batch={}/{} indices={}-{} size={}KB", 
+                             batch_idx + 1, num_batches, batch_from, batch_to, batch_size / 1024); 
+                }
+                
+                if batch_idx < num_batches - 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(MB_SYNC_BATCH_DELAY_MS)).await;
+                }
+            }
+            
+            if is_info() { 
+                println!("[INFO][MB-SYNC] sent macroblocks={} batches={} to={}", total_macroblocks, num_batches, requester_id); 
             }
         }
         
