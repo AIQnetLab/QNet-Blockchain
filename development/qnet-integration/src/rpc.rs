@@ -5048,6 +5048,8 @@ async fn handle_light_node_ping_response(
         };
         
         // Create attestation with Light node's signature
+        // v2.59: Include block_height for epoch-based reward filtering
+        let current_block_height = blockchain.get_height().await;
         let attestation = LightNodeAttestation {
             light_node_id: node_id.clone(),
             pinger_id: our_node_id.clone(),
@@ -5056,6 +5058,7 @@ async fn handle_light_node_ping_response(
             light_node_signature: signature.clone(), // Light node's actual signature!
             pinger_signature,
             challenge: challenge.clone(),
+            block_height: current_block_height, // v2.59: For epoch filtering
         };
         
         // Gossip attestation to all nodes

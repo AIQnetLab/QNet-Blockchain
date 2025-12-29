@@ -12844,6 +12844,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let our_node_id = Some(node_id.to_string());
         
         if let Some(our_id) = our_node_id {
+            // CRITICAL FIX v2.58: Prevent duplicate commit generation for same round
+            // Problem: generate_commit can be called multiple times for same round
+            // If we already generated commit for this round, skip (idempotent)
+            // This prevents "Reveal doesn't match commit" errors
+            let storage_key = format!("{}-{}", round_id, our_id);
+            {
+                let storage = nonce_storage.read().await;
+                if storage.contains_key(&storage_key) {
+                    println!("[INFO][CONS] commit_already_generated round={} node={} - skipping duplicate", round_id, our_id);
+                    return;
+                }
+            }
+            
             println!("[INFO][CONS] generate_commit node={}", our_id);
             
             // Generate ONLY our own commit (not for other participants)
@@ -12863,9 +12876,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Store nonce and reveal_data for OUR node only
             // CRITICAL FIX v2.53: Key MUST include round_id to prevent race condition!
             // Without round_id: new round overwrites old nonce → "Reveal doesn't match commit"
+            // v2.58: storage_key already defined above (duplicate check)
             {
                 let mut storage = nonce_storage.write().await;
-                let storage_key = format!("{}-{}", round_id, our_id);
                 storage.insert(storage_key.clone(), (nonce, reveal_data.clone()));
                 println!("[INFO][CONS] stored_nonce round={} node={} key={}", round_id, our_id, storage_key);
             }

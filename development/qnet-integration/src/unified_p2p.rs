@@ -4745,7 +4745,8 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: Track state OUTSIDE DashMap lock to prevent deadlock
         // DashMap entry() holds a lock that would block remove() in reconstruct functions
-        let (should_reconstruct_all, should_reconstruct_parity, total_chunks, chunks_count, parity_count);
+        // v2.60: Added is_new_chunk to prevent infinite forwarding loops
+        let (should_reconstruct_all, should_reconstruct_parity, total_chunks, chunks_count, parity_count, is_new_chunk);
         
         {
             // Scoped block to release DashMap lock before calling reconstruct
@@ -4788,15 +4789,34 @@ impl SimplifiedP2P {
                 }
             }
             
-            // Store chunk
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL FIX v2.60: CHECK IF CHUNK IS NEW BEFORE STORING
+            // ═══════════════════════════════════════════════════════════════════════════
+            // Problem: Duplicate chunks were forwarded infinitely (292x for chunk 56!)
+            // Root cause: No check if chunk already received → forward every time
+            // Solution: Track is_new_chunk and ONLY forward new chunks
+            // This eliminates infinite forwarding loops on high-latency networks
+            // ═══════════════════════════════════════════════════════════════════════════
+            
+            // Store chunk (only if slot is empty)
             if chunk.is_parity {
-                let parity_index = chunk.chunk_index - chunk.total_chunks;
+                let parity_index = chunk.chunk_index.saturating_sub(chunk.total_chunks);
                 if parity_index < assembly.parity_chunks.len() {
-                    assembly.parity_chunks[parity_index] = Some(chunk.data.clone());
+                    is_new_chunk = assembly.parity_chunks[parity_index].is_none();
+                    if is_new_chunk {
+                        assembly.parity_chunks[parity_index] = Some(chunk.data.clone());
+                    }
+                } else {
+                    is_new_chunk = false;
                 }
             } else {
                 if chunk.chunk_index < assembly.chunks_received.len() {
-                    assembly.chunks_received[chunk.chunk_index] = Some(chunk.data.clone());
+                    is_new_chunk = assembly.chunks_received[chunk.chunk_index].is_none();
+                    if is_new_chunk {
+                        assembly.chunks_received[chunk.chunk_index] = Some(chunk.data.clone());
+                    }
+                } else {
+                    is_new_chunk = false;
                 }
             }
             
@@ -4888,8 +4908,10 @@ impl SimplifiedP2P {
         }
         
         // Forward chunk to other peers (ShredProtocol propagation)
-        // Only forward if block is NOT yet ready for reconstruction OR waiting for chunk #0
-        let should_forward = !should_reconstruct_all && (!should_reconstruct_parity || !chunk0_received);
+        // v2.60: CRITICAL FIX - Only forward NEW chunks to prevent infinite loops!
+        // Problem: Without is_new_chunk check, duplicates forwarded 292x causing network storm
+        // Solution: Forward ONLY if chunk is new AND block not ready for reconstruction
+        let should_forward = is_new_chunk && !should_reconstruct_all && (!should_reconstruct_parity || !chunk0_received);
         if should_forward {
             self.forward_shred_protocol_chunk(from_peer, chunk.clone());
             
@@ -5429,21 +5451,29 @@ impl SimplifiedP2P {
             }
             
             if !chunks_to_send.is_empty() {
-                println!("[SHRED_PROTOCOL] 📤 Sending {} cached chunks for block #{} to {}", 
-                         chunks_to_send.len(), block_height, get_privacy_id_for_addr(from_peer));
+                // ═══════════════════════════════════════════════════════════════════════════
+                // CRITICAL FIX v2.60: REPAIR BATCHING for intercontinental reliability
+                // ═══════════════════════════════════════════════════════════════════════════
+                // Problem: 54 chunks = 7MB in one message → lost on high-latency routes!
+                // Solution: Send in batches of 10 chunks with 5ms delay between batches
+                // This matches broadcast pacing strategy and prevents UDP burst loss
+                // ═══════════════════════════════════════════════════════════════════════════
+                const REPAIR_BATCH_SIZE: usize = 10;  // 10 chunks × 128KB = 1.28MB per batch
+                const REPAIR_BATCH_DELAY_MS: u64 = 5; // 5ms between batches for pacing
                 
-                let response = NetworkMessage::MissingChunksResponse {
-                    block_height,
-                    chunks: chunks_to_send,
-                    original_block_size: cache_entry.original_block_size,
-                    is_macroblock: cache_entry.is_macroblock,
-                    sender_id: self.node_id.clone(),
-                };
+                let total_chunks = chunks_to_send.len();
+                let num_batches = (total_chunks + REPAIR_BATCH_SIZE - 1) / REPAIR_BATCH_SIZE;
                 
-                // Send response via QUIC
+                println!("[SHRED_PROTOCOL] 📤 Sending {} cached chunks for block #{} to {} in {} batches", 
+                         total_chunks, block_height, get_privacy_id_for_addr(from_peer), num_batches);
+                
+                // Send response via QUIC in batches
                 let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
                 let quic_transport = self.quic_transport.clone();
                 let peer_addr = from_peer.to_string();
+                let original_block_size = cache_entry.original_block_size;
+                let is_macroblock = cache_entry.is_macroblock;
+                let sender_id = self.node_id.clone();
                 
                 handle.spawn(async move {
                     let parts: Vec<&str> = peer_addr.split(':').collect();
@@ -5454,8 +5484,24 @@ impl SimplifiedP2P {
                             
                             if quic_enabled {
                                 if let Some(ref transport) = quic_transport {
-                                    let transport_guard = transport.read().await;
-                                    let _ = transport_guard.broadcast_to(quic_addr, &response).await;
+                                    // Send chunks in batches with pacing
+                                    for (batch_idx, batch) in chunks_to_send.chunks(REPAIR_BATCH_SIZE).enumerate() {
+                                        let response = NetworkMessage::MissingChunksResponse {
+                                            block_height,
+                                            chunks: batch.to_vec(),
+                                            original_block_size,
+                                            is_macroblock,
+                                            sender_id: sender_id.clone(),
+                                        };
+                                        
+                                        let transport_guard = transport.read().await;
+                                        let _ = transport_guard.broadcast_to(quic_addr, &response).await;
+                                        
+                                        // Pacing delay between batches (except last)
+                                        if batch_idx < num_batches - 1 {
+                                            tokio::time::sleep(std::time::Duration::from_millis(REPAIR_BATCH_DELAY_MS)).await;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -7640,22 +7686,33 @@ impl SimplifiedP2P {
     /// CRITICAL: Ensures blocks propagate within 50% of block time (500ms for 1s blocks)
     /// 
     /// Formula rationale:
-    /// - Genesis (5-50 producers): fanout=4 → 2 hops × latency
+    /// - Genesis (5-50 producers, LAN <50ms): fanout=4 → direct to all peers ✅
+    /// - Genesis (5-50 producers, WAN >50ms): fanout=ALL → no hops needed for intercontinental ✅
     /// - Small (51-200 producers, LAN <50ms): fanout=8 → 3 hops × latency = ~150ms ✅
     /// - Small (51-200 producers, WAN >50ms): fanout=16 → 2 hops × latency = ~400ms ✅
-    /// - Medium (201-1000 producers, LAN <50ms): fanout=8 → 4 hops × latency = ~200ms ✅
-    /// - Medium (201-1000 producers, WAN >50ms): fanout=16 → 3 hops × latency = ~600ms ✅
+    /// - Medium (201-1000 producers, LAN <50ms): fanout=8 → 4 hops = ~200ms ✅
+    /// - Medium (201-1000 producers, WAN >50ms): fanout=16 → 3 hops = ~600ms ✅
     /// - Large (>1000 producers): fanout=32 → 3 hops for 32K nodes
+    /// 
+    /// v2.60: CRITICAL FIX - Genesis with high latency now broadcasts to ALL peers
+    /// This ensures intercontinental nodes (USA vs Europe) receive all chunks directly
+    /// Without this, high-latency nodes miss chunks and can't reconstruct blocks
     pub fn get_shred_protocol_fanout(&self) -> usize {
         let producers = self.get_qualified_producers_count();
         let latency = self.get_average_peer_latency();
         
         // ARCHITECTURE: Adaptive fanout ensures < 50% block time propagation
         match (producers, latency) {
+            // ═══════════════════════════════════════════════════════════════════════════
             // GENESIS PHASE (5-50 producers):
-            // fanout=4 provides 2 hops for 16 nodes, 3 hops for 64 nodes
-            // Latency impact: 2-3 hops × latency < 500ms for any latency
-            (0..=50, _) => 4,
+            // v2.60 FIX: High latency (>50ms) = intercontinental network
+            // Send directly to ALL peers to prevent chunk loss on high-latency routes
+            // ═══════════════════════════════════════════════════════════════════════════
+            // LAN (<50ms): fanout=4 → 2 hops for 16 nodes, works well
+            (0..=50, 0..=50) => 4,
+            // WAN (>50ms): fanout=producers → send to ALL peers directly!
+            // This ensures USA node gets chunks from Germany producer without relay hops
+            (0..=50, _) => producers.max(4),
             
             // SMALL NETWORK (51-200 producers):
             // LAN (<50ms): fanout=8 → 3 hops = 150ms ✅
@@ -9066,6 +9123,7 @@ pub struct HeartbeatRecord {
     pub heartbeat_index: u8,          // 0-9 within 4h window
     pub signature: String,
     pub verified: bool,               // Signature verified
+    pub block_height: u64,            // v2.59: Block height when heartbeat was sent (for epoch filtering)
 }
 
 /// PRODUCTION: Light Node Attestation - proof that Light node responded to ping
@@ -9079,6 +9137,7 @@ pub struct LightNodeAttestation {
     pub light_node_signature: String, // Light node's signature on challenge
     pub pinger_signature: String,     // Pinger's signature on attestation
     pub challenge: String,            // Original challenge (for verification)
+    pub block_height: u64,            // v2.59: Block height for epoch-based filtering
 }
 
 /// Pinger role for Light node ping responsibility
@@ -9345,6 +9404,7 @@ pub enum NetworkMessage {
         pinger_signature: String,     // Pinger's signature on attestation
         challenge: String,            // Original challenge
         gossip_hop: u8,               // Hop count for gossip TTL (max 3)
+        block_height: u64,            // v2.59: Block height for epoch-based filtering
     },
     
     /// PRODUCTION: Active Full/Super node announcement for pinger selection sync
@@ -10663,6 +10723,7 @@ impl SimplifiedP2P {
                 println!("[HEARTBEAT] ✅ HYBRID signature verified for {} (quantum-resistant)", node_id);
                 
                 // Store heartbeat in RAM
+                // v2.59: Include block_height for reliable epoch-based filtering
                 {
                     let mut heartbeats = match self.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     heartbeats.insert(heartbeat_key, HeartbeatRecord {
@@ -10671,6 +10732,7 @@ impl SimplifiedP2P {
                         heartbeat_index,
                         signature: signature.clone(),
                         verified: true,
+                        block_height, // v2.59: From NetworkMessage for epoch filtering
                     });
                 }
                 
@@ -10758,7 +10820,7 @@ impl SimplifiedP2P {
             // PRODUCTION: Light Node attestation - proof of ping response
             NetworkMessage::LightNodeAttestation {
                 light_node_id, pinger_id, slot, timestamp, 
-                light_node_signature, pinger_signature, challenge, gossip_hop
+                light_node_signature, pinger_signature, challenge, gossip_hop, block_height
             } => {
                 self.update_peer_last_seen(from_peer);
                 
@@ -10835,14 +10897,15 @@ impl SimplifiedP2P {
                         light_node_signature: light_node_signature.clone(),
                         pinger_signature: pinger_signature.clone(),
                         challenge: challenge.clone(),
+                        block_height, // v2.59: For epoch-based filtering
                     });
                 }
                 
                 // WHITEPAPER: Light nodes have FIXED reputation of 70
                 // NO reputation changes for Light nodes - they are always eligible if attested
                 
-                println!("[ATTESTATION] ✅ Light node {} attested by {} in slot {}", 
-                         light_node_id, pinger_id, slot);
+                println!("[ATTESTATION] ✅ Light node {} attested by {} in slot {} height={}", 
+                         light_node_id, pinger_id, slot, block_height);
                 
                 // RE-GOSSIP
                 let forward_msg = NetworkMessage::LightNodeAttestation {
@@ -10854,6 +10917,7 @@ impl SimplifiedP2P {
                     pinger_signature,
                     challenge,
                     gossip_hop: gossip_hop + 1,
+                    block_height, // v2.59: Propagate height for all nodes
                 };
                 self.gossip_to_random_peers(forward_msg, 3);
             }
@@ -12207,6 +12271,7 @@ impl SimplifiedP2P {
                             p2p.gossip_to_k_neighbors(heartbeat_msg, 3);
                             
                             // Record locally
+                            // v2.59: Include block_height for reliable epoch-based filtering
                             {
                                 let mut history = match p2p.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
                                 history.insert(heartbeat_key, HeartbeatRecord {
@@ -12215,6 +12280,7 @@ impl SimplifiedP2P {
                                     heartbeat_index: index as u8,
                                     signature,
                                     verified: true,
+                                    block_height, // v2.59: Current height for epoch filtering
                                 });
                             }
                             
@@ -12426,15 +12492,27 @@ impl SimplifiedP2P {
     
     /// Get heartbeat summaries for MacroBlock inclusion
     /// Called during MacroBlock creation to record heartbeats on-chain
-    /// Returns Vec<HeartbeatSummary> for all nodes that sent heartbeats in current epoch
+    /// Returns Vec<HeartbeatSummary> for all nodes that sent heartbeats in completed epoch
+    /// 
+    /// CRITICAL FIX v2.59: Use block_height for 100% reliable epoch filtering
+    /// Previously used timestamp-based 4h windows which failed when:
+    /// - Network didn't start on 4h UTC boundary
+    /// - Clock drift between nodes
+    /// - Emission delayed across window boundaries
+    /// 
+    /// Now uses block_height stored in HeartbeatRecord for deterministic filtering:
+    /// - epoch_start_height = 14400 → heartbeats from blocks 0-14399
+    /// - epoch_start_height = 28800 → heartbeats from blocks 14400-28799
     pub fn get_heartbeat_summaries_for_macroblock(&self, epoch_start_height: u64) -> Vec<qnet_state::HeartbeatSummary> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        const BLOCKS_PER_EPOCH: u64 = 14400;    // 1 block per second, 4 hours
         
-        // Calculate 4-hour window start for current epoch
-        let current_4h_window = now - (now % (4 * 60 * 60));
+        // Calculate epoch boundaries based on block height (100% deterministic)
+        let epoch_number = epoch_start_height / BLOCKS_PER_EPOCH;
+        let window_start_height = epoch_start_height.saturating_sub(BLOCKS_PER_EPOCH);
+        let window_end_height = epoch_start_height;
+        
+        println!("[INFO][HEARTBEAT] epoch_window epoch={} blocks={}-{} (height-based filtering v2.59)", 
+                 epoch_number, window_start_height, window_end_height);
         
         // Get heartbeat history
         let history = match self.heartbeat_history.read() { 
@@ -12447,15 +12525,27 @@ impl SimplifiedP2P {
             std::collections::HashMap::new();
         
         for (_, record) in history.iter() {
-            // Only include heartbeats from current 4h window
-            let record_4h = record.timestamp - (record.timestamp % (4 * 60 * 60));
-            if record_4h == current_4h_window && record.verified {
+            // CRITICAL FIX v2.59: Filter by block_height instead of timestamp
+            // This is 100% deterministic and doesn't depend on:
+            // - Network start time alignment with UTC
+            // - Clock synchronization between nodes
+            // - Emission timing relative to window boundaries
+            if record.block_height >= window_start_height 
+                && record.block_height < window_end_height 
+                && record.verified 
+            {
                 node_heartbeats
                     .entry(record.node_id.clone())
                     .or_insert_with(Vec::new)
                     .push(record);
             }
         }
+        
+        // Log heartbeat collection stats
+        let total_heartbeats: usize = node_heartbeats.values().map(|v| v.len()).sum();
+        println!("[INFO][HEARTBEAT] collected nodes={} heartbeats={} epoch={} range={}-{}", 
+                 node_heartbeats.len(), total_heartbeats, epoch_number,
+                 window_start_height, window_end_height);
         
         // Create summaries
         let mut summaries = Vec::new();
@@ -12524,9 +12614,65 @@ impl SimplifiedP2P {
             });
         }
         
-        println!("[INFO][HEARTBEAT] collected_for_macroblock nodes={} eligible={}", 
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v2.59: LIGHT NODES - Collect from attestations (separate storage)
+        // Light nodes don't send heartbeats themselves; Full/Super nodes ping them
+        // and create attestations. Attestations are stored in light_node_attestations.
+        // Light nodes need only 1 attestation per epoch to be eligible for rewards.
+        // ═══════════════════════════════════════════════════════════════════════════
+        {
+            let attestations = match self.light_node_attestations.read() { 
+                Ok(g) => g, 
+                Err(p) => p.into_inner() 
+            };
+            
+            // Group attestations by light_node_id, filtered by block_height
+            let mut light_node_attestations_map: std::collections::HashMap<String, Vec<u64>> = 
+                std::collections::HashMap::new();
+            
+            for (_, attestation) in attestations.iter() {
+                // v2.59: Filter by block_height for reliable epoch matching
+                if attestation.block_height >= window_start_height 
+                    && attestation.block_height < window_end_height 
+                {
+                    light_node_attestations_map
+                        .entry(attestation.light_node_id.clone())
+                        .or_insert_with(Vec::new)
+                        .push(attestation.timestamp);
+                }
+            }
+            
+            // Create summaries for Light nodes
+            for (light_node_id, timestamps) in light_node_attestations_map {
+                let attestation_count = timestamps.len() as u8;
+                // Light nodes: 1 attestation per epoch = eligible (100%)
+                let is_eligible = attestation_count >= 1;
+                
+                let first_heartbeat = timestamps.iter().min().copied().unwrap_or(0);
+                let last_heartbeat = timestamps.iter().max().copied().unwrap_or(0);
+                
+                summaries.push(qnet_state::HeartbeatSummary {
+                    node_id: light_node_id,
+                    node_type: 0, // Light node
+                    heartbeat_count: attestation_count,
+                    first_heartbeat,
+                    last_heartbeat,
+                    is_eligible,
+                });
+            }
+            
+            let light_count = summaries.iter().filter(|s| s.node_type == 0).count();
+            if light_count > 0 {
+                println!("[INFO][HEARTBEAT] light_nodes_collected count={} for_epoch={}", 
+                         light_count, epoch_number);
+            }
+        }
+        
+        println!("[INFO][HEARTBEAT] collected_for_macroblock total={} eligible={} (full_super={} light={})", 
                  summaries.len(),
-                 summaries.iter().filter(|s| s.is_eligible).count());
+                 summaries.iter().filter(|s| s.is_eligible).count(),
+                 summaries.iter().filter(|s| s.node_type != 0).count(),
+                 summaries.iter().filter(|s| s.node_type == 0).count());
         
         summaries
     }
@@ -12995,6 +13141,7 @@ impl SimplifiedP2P {
             pinger_signature: attestation.pinger_signature.clone(),
             challenge: attestation.challenge.clone(),
             gossip_hop: 0,
+            block_height: attestation.block_height, // v2.59: For epoch-based filtering
         };
         
         // Store locally first
@@ -16966,9 +17113,11 @@ impl SimplifiedP2P {
                         .map(|e| e.value().latency_ms as u64)
                         .sum::<u64>() / qualified_peers.len().max(1) as u64;
                     
-                    // Same logic as get_shred_protocol_fanout() (unified_p2p.rs:10715-10731)
+                    // v2.60: Updated to match get_shred_protocol_fanout() with genesis latency fix
                     match (producers, avg_latency) {
-                        (0..=50, _) => 4,
+                        // Genesis: LAN uses fanout=4, WAN sends to ALL peers
+                        (0..=50, 0..=50) => 4,
+                        (0..=50, _) => producers.max(4),  // v2.60: All peers for high latency
                         (51..=200, 0..=50) => 8,
                         (51..=200, _) => 16,
                         (201..=1000, 0..=50) => 8,
