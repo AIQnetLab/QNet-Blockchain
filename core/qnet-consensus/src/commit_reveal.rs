@@ -604,11 +604,14 @@ impl CommitRevealConsensus {
         
         // Verify reveal matches commit if commit exists in THIS round
         if let Some(commit) = round_data.commits.get(&reveal.node_id) {
-            // Verify: SHA3(nonce || reveal_data) == commit_hash
+            // CRITICAL FIX v2.63: Correct hash format matching calculate_commit_hash()
+            // Format: SHA3-256(reveal_data || nonce || "qnet-commit-hash-v1")
+            // This matches the commit generation in node.rs
             use sha3::{Sha3_256, Digest};
             let mut hasher = Sha3_256::new();
-            hasher.update(&reveal.nonce);
-            hasher.update(&reveal.reveal_data);
+            hasher.update(&reveal.reveal_data);  // reveal_data FIRST
+            hasher.update(&reveal.nonce);        // nonce SECOND
+            hasher.update(b"qnet-commit-hash-v1"); // QNet domain separation salt
             let calculated_hash = hex::encode(hasher.finalize());
             
             if calculated_hash != commit.commit_hash {
@@ -721,11 +724,14 @@ impl CommitRevealConsensus {
         
         for (node_id, reveal) in &round_data.reveals {
             if let Some(commit) = round_data.commits.get(node_id) {
-                // Verify: SHA3(nonce || reveal_data) == commit_hash
+                // CRITICAL FIX v2.63: Correct hash format matching calculate_commit_hash()
+                // Format: SHA3-256(reveal_data || nonce || "qnet-commit-hash-v1")
+                // This matches the commit generation in node.rs
                 use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
-                hasher.update(&reveal.nonce);
-                hasher.update(&reveal.reveal_data);
+                hasher.update(&reveal.reveal_data);  // reveal_data FIRST
+                hasher.update(&reveal.nonce);        // nonce SECOND
+                hasher.update(b"qnet-commit-hash-v1"); // QNet domain separation salt
                 let calculated_hash = hex::encode(hasher.finalize());
                 
                 if calculated_hash == commit.commit_hash {
