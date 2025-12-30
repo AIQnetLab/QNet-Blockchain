@@ -1454,10 +1454,11 @@ const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 // GF(2^8) Reed-Solomon supports max 255 shards (data + parity combined)
 // At 1KB chunks: 14MB block = 14000 chunks → TooManyShards FAILURE
 // At 128KB chunks: 20MB block = 156 chunks × 1.5 = 234 shards → OK!
-const SHRED_PROTOCOL_CHUNK_SIZE: usize = 128 * 1024;  // 128KB chunks (was 1KB - caused TooManyShards at 20K+ TPS)
+// v2.63: Increased to 256KB for 100K+ TPS support (170 × 256KB = 43.5MB max)
+const SHRED_PROTOCOL_CHUNK_SIZE: usize = 256 * 1024;  // 256KB chunks (was 128KB - increased for 100K TPS)
 const SHRED_PROTOCOL_REDUNDANCY_FACTOR: f32 = 1.5;    // 50% redundancy for Reed-Solomon  
 const SHRED_PROTOCOL_MAX_CHUNKS: usize = 170;         // Max data chunks (170 + 85 parity = 255 ≤ GF(2^8) limit)
-                                                      // v2.43.7: 170 × 128KB = 21.76MB max block size
+                                                      // v2.63: 170 × 256KB = 43.5MB max block size
                                                       // Supports 100K+ TPS with proper Reed-Solomon encoding
 const SHRED_CHUNK_TIMEOUT_SECS: u64 = 5;            // Timeout before requesting missing chunks (v2.31: increased from 3s for reliability)
 const SHRED_CHUNK_CACHE_SIZE: usize = 100;          // Cache last N blocks' chunks for retransmit (v2.21.3)
@@ -4166,9 +4167,20 @@ impl SimplifiedP2P {
         use futures::future::join_all;
         use crate::p2p_transport::P2PTransport;
         
-        // Check if block is too large for ShredProtocol
-        if block_data.len() > SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE {
-            return Err(format!("Block too large for ShredProtocol: {} bytes", block_data.len()));
+        let max_shred_size = SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE;
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.63: Block size validation
+        // ═══════════════════════════════════════════════════════════════════════════
+        // With Level 1 (40MB block size limit at creation) and Level 2 (43.5MB ShredProtocol max),
+        // blocks should NEVER exceed the limit. If they do, log error and reject.
+        if block_data.len() > max_shred_size {
+            println!("[ERR][SHRED] block_rejected h={} size_mb={:.2} max_mb={:.2} reason=exceeds_shred_limit",
+                     height, 
+                     block_data.len() as f64 / 1_000_000.0,
+                     max_shred_size as f64 / 1_000_000.0);
+            return Err(format!("Block {} exceeds ShredProtocol limit: {:.2}MB > {:.2}MB. This should never happen with Level 1 protection.",
+                              height, block_data.len() as f64 / 1_000_000.0, max_shred_size as f64 / 1_000_000.0));
         }
         
         // Get validated peers using existing method
@@ -5458,7 +5470,7 @@ impl SimplifiedP2P {
                 // Solution: Send in batches of 10 chunks with 5ms delay between batches
                 // This matches broadcast pacing strategy and prevents UDP burst loss
                 // ═══════════════════════════════════════════════════════════════════════════
-                const REPAIR_BATCH_SIZE: usize = 10;  // 10 chunks × 128KB = 1.28MB per batch
+                const REPAIR_BATCH_SIZE: usize = 10;  // 10 chunks × 256KB = 2.56MB per batch (v2.63)
                 const REPAIR_BATCH_DELAY_MS: u64 = 5; // 5ms between batches for pacing
                 
                 let total_chunks = chunks_to_send.len();
@@ -5807,7 +5819,7 @@ impl SimplifiedP2P {
     /// Used by sync to reliably deliver blocks >1MB that would fail as single QUIC message
     /// 
     /// ARCHITECTURE: Same chunking as broadcast_block_shred_protocol but targeted to one peer
-    /// - Splits block into 128KB chunks with Reed-Solomon parity
+    /// - Splits block into 256KB chunks with Reed-Solomon parity (v2.63)
     /// - Sends chunks sequentially with pacing to prevent congestion
     /// - Receiver uses existing handle_shred_protocol_chunk to reassemble
     pub async fn send_block_via_shred_to_peer(&self, peer_addr: &str, height: u64, block_data: Vec<u8>, is_macroblock: bool) {
@@ -7925,8 +7937,8 @@ impl SimplifiedP2P {
         let peer_count = self.connected_peers_lockfree.len().max(1);
         
         // v2.43.6: CRITICAL FIX for 100K TPS support
-        // v2.43.7: With 128KB chunks (was 1KB), broadcast is now MUCH faster:
-        // - 21MB block = 170 data + 85 parity = 255 chunks
+        // v2.63: With 256KB chunks (was 128KB), broadcast supports larger blocks:
+        // - 43.5MB block = 170 data + 85 parity = 255 chunks
         // - 255 chunks × 4 peers = 1,020 sends total
         // - 1,020 / 200 concurrent = 5 batches × 10ms = ~50ms broadcast time
         // Old 1KB chunks: 14MB = 14K chunks = 86K sends = 43+ seconds (TooManyShards!)

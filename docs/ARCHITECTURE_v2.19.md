@@ -226,9 +226,10 @@ Problem Chain:
 │                                                                          │
 │  2. SHREDPROTOCOL UNICAST (blocks >1MB):                                │
 │     └── send_block_via_shred_to_peer() for large blocks                 │
-│     └── 128KB chunks + Reed-Solomon parity (50% redundancy)             │
+│     └── 256KB chunks + Reed-Solomon parity (50% redundancy)             │
 │     └── 5ms pacing between chunks                                       │
 │     └── Same receiver logic as broadcast (handle_shred_protocol_chunk)  │
+│     └── v2.63: Max block size 43.5MB (170 × 256KB) for 100K+ TPS        │
 │                                                                          │
 │  3. REPAIR BATCHING:                                                    │
 │     └── MissingChunksResponse: 10 chunks per batch                      │

@@ -1924,7 +1924,8 @@ pub struct Shred ProtocolChunk {
 ```
 
 **Performance metrics:**
-- Maximum block size: 64KB (64 chunks)
+- Maximum block size: 43.5MB (170 × 256KB chunks) - supports 100K+ TPS (v2.63)
+- Block creation limit: 40MB (defense against network deadlock)
 - Propagation time: O(log₃(N)) where N = network size
 - Packet loss tolerance: Up to 33% with full recovery
 

@@ -4837,14 +4837,14 @@ async fn handle_shred_protocol_metrics(blockchain: Arc<BlockchainNode>) -> Resul
     
     let metrics = json!({
         "enabled": true,
-        "chunk_size": 131072,  // v2.43.7: 128KB (was 1KB)
+        "chunk_size": 262144,  // v2.63: 256KB (was 128KB - increased for 100K TPS)
         "fanout": fanout,  // REAL-TIME: Adaptive fanout (4-32)
         "qualified_producers": producers,  // REAL-TIME: Producers with reputation >= 70%
         "average_latency_ms": latency,  // REAL-TIME: Network performance
         "redundancy_factor": 1.5,
-        "max_chunks": 170,           // v2.43.7: 170 data chunks (GF(2^8) limit: 170+85=255)
-        "chunk_size_kb": 128,        // v2.43.7: 128KB chunks (was 1KB)
-        "max_block_size": 21757952,  // v2.43.7: 170 × 128KB = 21.76 MB
+        "max_chunks": 170,           // v2.63: 170 data chunks (GF(2^8) limit: 170+85=255)
+        "chunk_size_kb": 256,        // v2.63: 256KB chunks (was 128KB - increased for 100K TPS)
+        "max_block_size": 43515904,  // v2.63: 170 × 256KB = 43.5 MB (supports 100K+ TPS)
         "status": "active"
     });
     

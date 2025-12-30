@@ -8104,6 +8104,35 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         mempool.get_pending_transactions_with_hashes(max_tx_per_microblock)
                     };
                     
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // PRODUCTION v2.63: Block size limit to prevent ShredProtocol overflow
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // DEFENSE LEVEL 1: Limit block size at creation time
+                    // MAX_BLOCK_SIZE = 40MB (less than ShredProtocol max of 43.5MB for safety margin)
+                    // This prevents deadlock where block is created but cannot be transmitted
+                    const MAX_BLOCK_SIZE_BYTES: usize = 40_000_000; // 40MB hard limit
+                    
+                    let mut accumulated_size: usize = 0;
+                    let original_tx_count = tx_bytes_list.len();
+                    let tx_bytes_list: Vec<(String, Vec<u8>)> = tx_bytes_list
+                        .into_iter()
+                        .take_while(|(_, tx_bytes)| {
+                            let new_size = accumulated_size + tx_bytes.len();
+                            if new_size > MAX_BLOCK_SIZE_BYTES {
+                                false // Stop taking TX - block is full
+                            } else {
+                                accumulated_size = new_size;
+                                true
+                            }
+                        })
+                        .collect();
+                    
+                    if tx_bytes_list.len() < original_tx_count {
+                        println!("[INFO][BLOCK] size_limit_applied original_tx={} included_tx={} size_mb={:.2} max_mb=40",
+                                 original_tx_count, tx_bytes_list.len(), 
+                                 accumulated_size as f64 / 1_000_000.0);
+                    }
+                    
                     // CRITICAL v2.26: Track TX hashes for mempool cleanup after block
                     // IMPORTANT: Use the SAME hash from mempool, not recalculated!
                     let mut included_tx_hashes: Vec<String> = Vec::new();
