@@ -1,9 +1,11 @@
-# QNET Deterministic Reputation System v2.40
+# QNET Deterministic Reputation System v2.61
 
 ## Overview
 
 QNET uses a **deterministic blockchain-based reputation system** that eliminates P2P gossip vulnerabilities.
 All nodes compute identical reputation scores from on-chain data.
+
+**NEW in v2.61:** Strict sync check (N-1) for emergency producer selection!
 
 **NEW in v2.40:** Block-based consensus phases eliminate cascade jailing!
 

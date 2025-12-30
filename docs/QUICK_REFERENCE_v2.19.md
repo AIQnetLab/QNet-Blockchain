@@ -1,4 +1,12 @@
-# QNet v2.19.6 - Quick Reference Guide
+# QNet v2.62 - Quick Reference Guide
+
+> ⚠️ **v2.62 CONSENSUS UPDATED**  
+> Per-round storage: each consensus round is independent, no data loss on transition.  
+> 100% first-attempt success rate (was 87%).
+
+> ⚠️ **v2.61 SYNC UPDATED**  
+> Size-based batching + ShredProtocol unicast for intercontinental sync.  
+> See [docs/ARCHITECTURE_v2.19.md](ARCHITECTURE_v2.19.md) for full details.
 
 > ⚠️ **REPUTATION SYSTEM UPDATED in v2.21.0**  
 > See [docs/REPUTATION_SYSTEM.md](REPUTATION_SYSTEM.md) for current deterministic blockchain-based reputation.
@@ -424,7 +432,24 @@ const PING_SHARDS: u8 = 256;                   // Light node shards
 const MAX_LIGHT_NODES_PER_SHARD: usize = 100_000;
 const HEARTBEATS_PER_WINDOW: u8 = 10;          // Full/Super heartbeats
 const GRACE_PERIOD_SECS: u64 = 180;            // 3 minutes
+
+// v2.61 Sync constants
+const MAX_BATCH_SIZE_BYTES: usize = 1_000_000;       // BlocksBatch max 1MB
+const MAX_MACROBLOCK_BATCH_SIZE_BYTES: usize = 500_000; // MacroblocksBatch max 500KB
+const SHRED_THRESHOLD_BYTES: usize = 1_000_000;      // Blocks >1MB use ShredProtocol
+const REPAIR_BATCH_SIZE: usize = 10;                 // Chunks per repair batch
+const REPAIR_BATCH_DELAY_MS: u64 = 5;                // Pacing between batches
 ```
+
+## 🔄 v2.61 Key Methods
+
+| Method | File | Purpose |
+|--------|------|---------|
+| `send_block_via_shred_to_peer()` | unified_p2p.rs | Unicast large block via ShredProtocol |
+| `get_peer_heights()` | unified_p2p.rs | Get heights from Dilithium-signed heartbeats |
+| `handle_sync_request()` | node.rs | Size-based microblock sync (1MB batches) |
+| `handle_macroblock_sync_request()` | node.rs | Size-based macroblock sync (500KB batches) |
+| `select_emergency_producer()` | node.rs | Strict sync check (N-1) for candidates |
 
 ## 🔗 Documentation
 

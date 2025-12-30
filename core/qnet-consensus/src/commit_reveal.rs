@@ -104,7 +104,7 @@ pub struct ValidatorSet {
     pub selection_seed: [u8; 32],
 }
 
-/// Round state
+/// Round state (legacy - for backwards compatibility)
 #[derive(Debug, Clone)]
 pub struct RoundState {
     pub phase: ConsensusPhase,
@@ -112,11 +112,43 @@ pub struct RoundState {
     pub phase_start: Instant,
     pub phase_duration: Duration,
     pub commits: HashMap<String, Commit>,
-    pub reveals: HashMap<String, Reveal>,  // FIXED: Store full Reveal with nonce
+    pub reveals: HashMap<String, Reveal>,
     pub participants: Vec<String>,
-    /// Randomness beacon from MacroBlock N-2 for unpredictable leader selection
-    /// None for first 2 epochs (use Genesis seed fallback)
     pub prev_randomness_beacon: Option<[u8; 32]>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRODUCTION v2.62: PER-ROUND STORAGE (Like Ethereum 2.0 / Tendermint / Aptos)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Each round has its own independent storage for commits/reveals.
+// This prevents race conditions and data loss during round transitions.
+// Rounds are kept for MAX_ROUNDS_TO_KEEP epochs, then cleaned up.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Maximum number of rounds to keep in memory (cleanup older ones)
+pub const MAX_ROUNDS_TO_KEEP: usize = 5;
+
+/// Per-round data storage (independent of other rounds)
+#[derive(Debug, Clone)]
+pub struct RoundData {
+    /// Round number (= macroblock_height, e.g., 90, 180, 270...)
+    pub round_number: u64,
+    /// Epoch number (round_number / 90)
+    pub epoch: u64,
+    /// Participants for this round
+    pub participants: Vec<String>,
+    /// Commits indexed by node_id
+    pub commits: HashMap<String, Commit>,
+    /// Reveals indexed by node_id
+    pub reveals: HashMap<String, Reveal>,
+    /// Randomness beacon from MacroBlock N-2
+    pub randomness_beacon: Option<[u8; 32]>,
+    /// Round creation timestamp
+    pub created_at: Instant,
+    /// Is round finalized?
+    pub is_finalized: bool,
+    /// Finalization result (leader_id if finalized)
+    pub finalized_leader: Option<String>,
 }
 
 /// Reveal structure
@@ -162,75 +194,189 @@ impl Default for ConsensusConfig {
 }
 
 /// Main commit-reveal consensus engine
+/// PRODUCTION v2.62: Per-round storage like Ethereum 2.0 / Tendermint / Aptos
 pub struct CommitRevealConsensus {
     config: ConsensusConfig,
     reputation: NodeReputation,
-    current_round: Option<RoundState>,
     node_id: String,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v2.62: PER-ROUND STORAGE - Each round is independent!
+    // ═══════════════════════════════════════════════════════════════════════════
+    /// All rounds data indexed by round_number
+    /// Keeps last MAX_ROUNDS_TO_KEEP rounds, cleans up older ones
+    rounds: HashMap<u64, RoundData>,
+    
+    /// Currently active round number (for backwards compatibility)
+    active_round: Option<u64>,
+    
+    // Legacy field for backwards compatibility (will be removed in v3.0)
+    current_round: Option<RoundState>,
 }
 
 impl CommitRevealConsensus {
     /// Create new consensus instance
+    /// PRODUCTION v2.62: Initializes per-round storage
     pub fn new(node_id: String, config: ConsensusConfig) -> Self {
         let reputation = NodeReputation::new(ReputationConfig::default());
+        
+        println!("[INFO][CONS] init node_id={} per_round_storage=true max_rounds={}", 
+                 node_id, MAX_ROUNDS_TO_KEEP);
         
         Self {
             config,
             reputation,
-            current_round: None,
             node_id,
+            rounds: HashMap::new(),
+            active_round: None,
+            current_round: None, // Legacy compatibility
         }
     }
     
-    /// Start new consensus round
-    /// PRODUCTION v2.40.2: round_number = macroblock_height for epoch validation
-    /// This ensures our_epoch = round_number / 90 matches message epochs
-    pub fn start_round(&mut self, participants: Vec<String>) -> Result<u64, ConsensusError> {
-        self.start_round_at_height(participants, 0) // Legacy: use sequential numbering
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v2.62: PER-ROUND STORAGE API
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Get or create round data for specific round number
+    /// PRODUCTION: Rounds are independent - no data loss on transition!
+    pub fn get_or_create_round(&mut self, round_number: u64, participants: Vec<String>) -> &mut RoundData {
+        let epoch = round_number / 90;
+        
+        if !self.rounds.contains_key(&round_number) {
+            println!("[INFO][CONS] round_create round={} epoch={} participants={}", 
+                     round_number, epoch, participants.len());
+            
+            let round_data = RoundData {
+                round_number,
+                epoch,
+                participants: participants.clone(),
+                commits: HashMap::new(),
+                reveals: HashMap::new(),
+                randomness_beacon: None,
+                created_at: Instant::now(),
+                is_finalized: false,
+                finalized_leader: None,
+            };
+            
+            self.rounds.insert(round_number, round_data);
+            self.cleanup_old_rounds(round_number);
+        }
+        
+        self.rounds.get_mut(&round_number).unwrap()
     }
     
-    /// PRODUCTION v2.40.2: Start round with explicit block height
-    /// round_number = macroblock_height (90, 180, 270...) for correct epoch calculation
-    /// 
-    /// v2.49 FIX: IDEMPOTENT - if round already active for same round_number, 
-    /// do NOT reset commits/reveals! This prevents parallel tasks from destroying each other's work.
+    /// Get round data (immutable) for specific round
+    pub fn get_round(&self, round_number: u64) -> Option<&RoundData> {
+        self.rounds.get(&round_number)
+    }
+    
+    /// Get round data (mutable) for specific round
+    pub fn get_round_mut(&mut self, round_number: u64) -> Option<&mut RoundData> {
+        self.rounds.get_mut(&round_number)
+    }
+    
+    /// Check if round exists
+    pub fn has_round(&self, round_number: u64) -> bool {
+        self.rounds.contains_key(&round_number)
+    }
+    
+    /// Cleanup old rounds (keep only last MAX_ROUNDS_TO_KEEP)
+    fn cleanup_old_rounds(&mut self, current_round: u64) {
+        let min_round_to_keep = if current_round > (MAX_ROUNDS_TO_KEEP as u64 * 90) {
+            current_round - (MAX_ROUNDS_TO_KEEP as u64 * 90)
+        } else {
+            0
+        };
+        
+        let rounds_before = self.rounds.len();
+        self.rounds.retain(|&round, _| round >= min_round_to_keep);
+        let rounds_after = self.rounds.len();
+        
+        if rounds_before != rounds_after {
+            println!("[INFO][CONS] rounds_cleanup removed={} kept={} min_round={}", 
+                     rounds_before - rounds_after, rounds_after, min_round_to_keep);
+        }
+    }
+    
+    /// Set randomness beacon for specific round
+    pub fn set_round_beacon(&mut self, round_number: u64, beacon: [u8; 32]) {
+        if let Some(round) = self.rounds.get_mut(&round_number) {
+            round.randomness_beacon = Some(beacon);
+            println!("[INFO][CONS] beacon_set round={} hash={}", 
+                     round_number, hex::encode(&beacon[..8]));
+        }
+    }
+    
+    /// Get round statistics
+    pub fn get_round_stats(&self, round_number: u64) -> Option<(usize, usize, usize)> {
+        self.rounds.get(&round_number).map(|r| {
+            (r.participants.len(), r.commits.len(), r.reveals.len())
+        })
+    }
+    
+    /// Start new consensus round (legacy wrapper)
+    pub fn start_round(&mut self, participants: Vec<String>) -> Result<u64, ConsensusError> {
+        self.start_round_at_height(participants, 0)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PRODUCTION v2.62: PER-ROUND STORAGE - Start round with explicit height
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // KEY DIFFERENCE FROM PREVIOUS VERSIONS:
+    // - Each round has its OWN storage (commits/reveals)
+    // - Starting new round does NOT delete data from other rounds
+    // - Multiple rounds can be active simultaneously
+    // - No more "round_override" data loss!
+    // ═══════════════════════════════════════════════════════════════════════════════
     pub fn start_round_at_height(&mut self, participants: Vec<String>, macroblock_height: u64) -> Result<u64, ConsensusError> {
         if participants.len() < self.config.min_participants {
             return Err(ConsensusError::InsufficientNodes);
         }
         
-        // CRITICAL v2.40.2: Use macroblock_height as round_number for epoch validation
-        // This ensures: our_epoch = round_number / 90 = macroblock_height / 90 = correct epoch!
-        // Fallback to sequential if height not provided (legacy compatibility)
+        // Calculate round number
         let round_number = if macroblock_height > 0 {
             macroblock_height
         } else {
-            self.current_round
-                .as_ref()
-                .map(|r| r.round_number + 90) // Sequential: 90, 180, 270...
-                .unwrap_or(90)
+            self.active_round.map(|r| r + 90).unwrap_or(90)
         };
         
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v2.49 FIX: IDEMPOTENT ROUND START
-        // If round is already active for this round_number, preserve commits/reveals!
-        // This prevents race condition where multiple tasks reset each other's work.
-        // ═══════════════════════════════════════════════════════════════════════════
-        if let Some(ref current) = self.current_round {
-            if current.round_number == round_number {
-                // Round already active for same round_number - DO NOT RESET!
-                // Just return success, commits/reveals are preserved
-                println!("[INFO][CONS] round_already_active round={} commits={} reveals={} idempotent=true",
-                         round_number, current.commits.len(), current.reveals.len());
-                return Ok(round_number);
-            }
-            // Different round_number - this is unusual but can happen during recovery
-            // Log warning but proceed with new round
-            println!("[WARN][CONS] round_override old_round={} new_round={} old_commits={} old_reveals={}",
-                     current.round_number, round_number, current.commits.len(), current.reveals.len());
+        let epoch = round_number / 90;
+        
+        // v2.62: Check if round already exists in per-round storage
+        if let Some(existing) = self.rounds.get(&round_number) {
+            // Round exists - IDEMPOTENT! Don't reset, just return
+            println!("[INFO][CONS] round_exists round={} epoch={} commits={} reveals={} finalized={}", 
+                     round_number, epoch, existing.commits.len(), existing.reveals.len(), existing.is_finalized);
+            
+            // Update active round pointer
+            self.active_round = Some(round_number);
+            
+            // Legacy compatibility: sync to current_round
+            self.sync_legacy_round(round_number);
+            
+            return Ok(round_number);
         }
         
-        // No active round or different round_number - create new round state
+        // Create new round in per-round storage
+        let round_data = RoundData {
+            round_number,
+            epoch,
+            participants: participants.clone(),
+            commits: HashMap::new(),
+            reveals: HashMap::new(),
+            randomness_beacon: None,
+            created_at: Instant::now(),
+            is_finalized: false,
+            finalized_leader: None,
+        };
+        
+        self.rounds.insert(round_number, round_data);
+        self.active_round = Some(round_number);
+        
+        // Cleanup old rounds
+        self.cleanup_old_rounds(round_number);
+        
+        // Legacy compatibility: create RoundState for old API
         let round_state = RoundState {
             phase: ConsensusPhase::Commit,
             round_number,
@@ -239,12 +385,28 @@ impl CommitRevealConsensus {
             commits: HashMap::new(),
             reveals: HashMap::new(),
             participants,
-            prev_randomness_beacon: None, // Set via set_randomness_beacon() before finalize
+            prev_randomness_beacon: None,
         };
-        
         self.current_round = Some(round_state);
-        println!("[INFO][CONS] round_started round={} epoch={}", round_number, round_number / 90);
+        
+        println!("[INFO][CONS] round_started round={} epoch={} storage=per_round", round_number, epoch);
         Ok(round_number)
+    }
+    
+    /// Sync per-round storage to legacy current_round (for backwards compatibility)
+    fn sync_legacy_round(&mut self, round_number: u64) {
+        if let Some(round_data) = self.rounds.get(&round_number) {
+            self.current_round = Some(RoundState {
+                phase: if round_data.is_finalized { ConsensusPhase::Finalize } else { ConsensusPhase::Commit },
+                round_number,
+                phase_start: round_data.created_at,
+                phase_duration: self.config.commit_phase_duration,
+                commits: round_data.commits.clone(),
+                reveals: round_data.reveals.clone(),
+                participants: round_data.participants.clone(),
+                prev_randomness_beacon: round_data.randomness_beacon,
+            });
+        }
     }
     
     /// Set randomness beacon from MacroBlock N-2 for unpredictable leader selection
@@ -263,121 +425,75 @@ impl CommitRevealConsensus {
         }
     }
     
-    /// PRODUCTION v2.40.2: Process commit with EPOCH-based validation
-    /// ARCHITECTURE: Validate by EPOCH match, not by local phase
-    /// 1. Check active round exists (FIRST - saves CPU on signature verification)
-    /// 2. Check message_epoch matches our_epoch (±1 grace for network latency)
-    /// 3. Then check position is in consensus window
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PRODUCTION v2.62: PER-ROUND COMMIT PROCESSING
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Commits are stored in the SPECIFIC round they belong to (block_height).
+    // This allows multiple rounds to coexist without data loss.
+    // No more "round_override" problems!
+    // ═══════════════════════════════════════════════════════════════════════════════
     pub async fn process_commit(&mut self, commit: Commit, block_height: u64) -> Result<(), ConsensusError> {
-        // STEP 0: Check active round FIRST (saves CPU if no round)
-        if self.current_round.is_none() {
-            return Err(ConsensusError::NoActiveRound);
+        let epoch = block_height / 90;
+        
+        // v2.62: Check if round exists in per-round storage
+        // If not, we can still accept commits for rounds within ±1 epoch
+        if !self.rounds.contains_key(&block_height) {
+            // Check if round is within acceptable range
+            let active_epoch = self.active_round.map(|r| r / 90).unwrap_or(0);
+            let epoch_diff = if epoch > active_epoch { epoch - active_epoch } else { active_epoch - epoch };
+            
+            if epoch_diff > 1 {
+                println!("[INFO][CONS] commit_no_round round={} epoch={} active_epoch={}", 
+                         block_height, epoch, active_epoch);
+                return Err(ConsensusError::NoActiveRound);
+            }
+            
+            // Auto-create round for valid epoch range
+            println!("[INFO][CONS] commit_auto_create_round round={} epoch={}", block_height, epoch);
+            let _ = self.get_or_create_round(block_height, vec![commit.node_id.clone()]);
         }
         
-        // ═══════════════════════════════════════════════════════════════════════════
-        // PRODUCTION v2.44: Round Tolerance ±90 (1 epoch) for fork recovery
-        // ═══════════════════════════════════════════════════════════════════════════
-        // ARCHITECTURE: Strict EXACT match caused deadlocks after high-TPS tests
-        // When nodes desync, Round Mismatch rejects ALL messages → network stall
-        // 
-        // Solution (like Tendermint/HotStuff):
-        // - Accept commits within ±90 blocks (1 epoch) tolerance
-        // - Log warning for non-exact matches
-        // - Epoch validation (below) provides additional Byzantine protection
-        // 
-        // WHY ±90: One full epoch allows:
-        // - Late delivery of consensus messages
-        // - Recovery from temporary network partitions
-        // - Graceful handling of clock drift between nodes
-        // ═══════════════════════════════════════════════════════════════════════════
-        let our_round_number = self.current_round.as_ref().unwrap().round_number;
-        let round_diff = if block_height > our_round_number {
-            block_height - our_round_number
-        } else {
-            our_round_number - block_height
-        };
-        
-        // CRITICAL: Reject if more than 1 epoch apart (too far = likely attack or severe desync)
-        if round_diff > 90 {
-            return Err(ConsensusError::InvalidPhase(
-                format!("Round mismatch: message_round={} our_round={} diff={} (max 90)", 
-                        block_height, our_round_number, round_diff)
-            ));
-        }
-        
-        // Log warning for non-exact matches (helps diagnose sync issues)
-        if round_diff > 0 {
-            println!("[WARN][CONS] round_tolerance_accept msg_round={} our_round={} diff={}", 
-                     block_height, our_round_number, round_diff);
-        }
-        
-        // PRODUCTION v2.40.2: Proper EPOCH-based validation
-        let message_epoch = block_height / 90;
-        let position_in_epoch = block_height % 90;
-        
-        // CRITICAL: Get OUR current epoch from active round (guaranteed to exist)
-        let our_epoch = our_round_number / 90;
-        
-        // STEP 1: Verify EPOCH match (±1 grace for network timing)
-        let epoch_diff = if message_epoch > our_epoch {
-            message_epoch - our_epoch
-        } else {
-            our_epoch - message_epoch
-        };
-        
-        if epoch_diff > 1 {
-            return Err(ConsensusError::InvalidPhase(
-                format!("Epoch mismatch: message_epoch={} our_epoch={} diff={}", 
-                        message_epoch, our_epoch, epoch_diff)
-            ));
-        }
-        
-        // STEP 2: Verify position is in consensus window (61-89) OR grace
-        // Grace: epoch boundary (pos=0) or same epoch (late delivery)
-        
-        if position_in_epoch >= 61 {
-            // Normal consensus window (61-89) - always accept
-        } else if position_in_epoch == 0 {
-            // Epoch boundary block - accept for finalization
-        } else if epoch_diff == 0 {
-            // Grace: same epoch, active round exists (checked above) - accept late delivery
-            println!("[INFO][CONS] same_epoch_grace_commit node={} epoch={} pos={}", 
-                     commit.node_id, message_epoch, position_in_epoch);
-        } else {
-            return Err(ConsensusError::InvalidPhase(
-                format!("Commit outside consensus window: epoch={} pos={}", message_epoch, position_in_epoch)
-            ));
-        }
-        
-        // Validate signature - do this after phase check to save CPU
+        // Validate signature
         let signature_valid = self.verify_signature(&commit.node_id, &commit.commit_hash, &commit.signature).await;
         if !signature_valid {
-            return Err(ConsensusError::InvalidSignature(format!("Invalid signature for validator {}", commit.node_id)));
+            return Err(ConsensusError::InvalidSignature(
+                format!("Invalid signature for validator {}", commit.node_id)
+            ));
         }
         
-        // Get active round (guaranteed to exist - checked at function start)
-        let state = self.current_round.as_mut().unwrap();
+        // Get round data (guaranteed to exist now)
+        let round_data = self.rounds.get_mut(&block_height).unwrap();
         
-        // CRITICAL FIX v2.53: Reject duplicate commits from same node
-        // Without this check, a node could send multiple commits with different hashes
-        // causing "Reveal doesn't match commit" when reveal matches only one hash
-        if state.commits.contains_key(&commit.node_id) {
-            // Already have commit from this node - ignore duplicate (idempotent)
-            println!("[INFO][CONS] duplicate_commit_ignored node={} round={}", 
-                     commit.node_id, state.round_number);
+        // Check if already finalized
+        if round_data.is_finalized {
+            println!("[INFO][CONS] commit_round_finalized round={} node={}", block_height, commit.node_id);
             return Ok(());
         }
         
-        // Store commit (first one only)
-        state.commits.insert(commit.node_id.clone(), commit);
+        // Check for duplicate
+        if round_data.commits.contains_key(&commit.node_id) {
+            println!("[INFO][CONS] commit_duplicate node={} round={}", commit.node_id, block_height);
+            return Ok(());
+        }
         
-        // PRODUCTION v2.40: Log progress but do NOT change local phase!
-        // Phase transitions are determined ONLY by block_height
-        let total_participants = state.participants.len();
+        // Store commit in per-round storage
+        round_data.commits.insert(commit.node_id.clone(), commit.clone());
+        
+        // Calculate Byzantine threshold
+        let total_participants = round_data.participants.len().max(round_data.commits.len());
         let byzantine_threshold = (total_participants * 2 + 2) / 3;
-        if state.commits.len() >= byzantine_threshold && state.commits.len() == byzantine_threshold {
-            // Log only once when threshold is reached
-            println!("[INFO][CONS] bft_threshold commits={}/{}", state.commits.len(), byzantine_threshold);
+        
+        // Log progress
+        if round_data.commits.len() == byzantine_threshold {
+            println!("[INFO][CONS] commit_threshold round={} commits={} threshold={}", 
+                     block_height, round_data.commits.len(), byzantine_threshold);
+        }
+        
+        // Legacy compatibility: sync to current_round if this is active round
+        if self.active_round == Some(block_height) {
+            if let Some(ref mut legacy) = self.current_round {
+                legacy.commits.insert(commit.node_id.clone(), commit);
+            }
         }
         
         Ok(())
@@ -410,89 +526,34 @@ impl CommitRevealConsensus {
         valid
     }
     
-    /// PRODUCTION v2.40.3: Submit reveal with EPOCH-based validation
-    /// ARCHITECTURE: Validate by EPOCH match, not by local phase
-    /// 1. Check message round matches our round EXACTLY (v2.48 strict validation)
-    /// 2. Then check position - reveals accepted during ENTIRE consensus window (61-89)
-    /// 3. Verify hybrid signature (Dilithium3 + Ed25519) - prevents impersonation attacks
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PRODUCTION v2.62: PER-ROUND REVEAL PROCESSING
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Reveals are stored in the SPECIFIC round they belong to (block_height).
+    // This allows multiple rounds to coexist without data loss.
+    // No more "round_override" data loss!
+    // ═══════════════════════════════════════════════════════════════════════════════
     pub async fn submit_reveal(&mut self, reveal: Reveal, block_height: u64) -> Result<(), ConsensusError> {
-        // ═══════════════════════════════════════════════════════════════════════════
-        // PRODUCTION v2.44: Round Tolerance ±90 (1 epoch) for fork recovery
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Same tolerance as process_commit - see comments there for rationale
-        // Reveals are even more critical - without them macroblock consensus fails!
-        // ═══════════════════════════════════════════════════════════════════════════
-        let our_round_number = if let Some(state) = &self.current_round {
-            state.round_number
-        } else {
-            return Err(ConsensusError::NoActiveRound);
-        };
+        let epoch = block_height / 90;
         
-        let round_diff = if block_height > our_round_number {
-            block_height - our_round_number
-        } else {
-            our_round_number - block_height
-        };
-        
-        // CRITICAL: Reject if more than 1 epoch apart
-        if round_diff > 90 {
-            return Err(ConsensusError::InvalidPhase(
-                format!("Round mismatch for reveal: message_round={} our_round={} diff={} (max 90)", 
-                        block_height, our_round_number, round_diff)
-            ));
+        // v2.62: Check if round exists in per-round storage
+        if !self.rounds.contains_key(&block_height) {
+            // Check if round is within acceptable range
+            let active_epoch = self.active_round.map(|r| r / 90).unwrap_or(0);
+            let epoch_diff = if epoch > active_epoch { epoch - active_epoch } else { active_epoch - epoch };
+            
+            if epoch_diff > 1 {
+                println!("[INFO][CONS] reveal_no_round round={} epoch={} active_epoch={}", 
+                         block_height, epoch, active_epoch);
+                return Err(ConsensusError::NoActiveRound);
+            }
+            
+            // Auto-create round for valid epoch range
+            println!("[INFO][CONS] reveal_auto_create_round round={} epoch={}", block_height, epoch);
+            let _ = self.get_or_create_round(block_height, vec![reveal.node_id.clone()]);
         }
         
-        // Log warning for non-exact matches
-        if round_diff > 0 {
-            println!("[WARN][CONS] reveal_tolerance_accept msg_round={} our_round={} diff={}", 
-                     block_height, our_round_number, round_diff);
-        }
-        
-        // PRODUCTION v2.40.2: Proper EPOCH-based validation
-        let message_epoch = block_height / 90;
-        let position_in_epoch = block_height % 90;
-        
-        // CRITICAL: Get OUR current epoch from active round
-        let our_epoch = our_round_number / 90;
-        
-        // STEP 1: Verify EPOCH match (±1 grace for network timing)
-        let epoch_diff = if message_epoch > our_epoch {
-            message_epoch - our_epoch
-        } else {
-            our_epoch - message_epoch
-        };
-        
-        if epoch_diff > 1 {
-            return Err(ConsensusError::InvalidPhase(
-                format!("Epoch mismatch for reveal: message_epoch={} our_epoch={} diff={}", 
-                        message_epoch, our_epoch, epoch_diff)
-            ));
-        }
-        
-        // STEP 2: Verify position is in consensus window (61-89) OR grace
-        // Reveals accepted during ENTIRE consensus window because:
-        // - Sender at pos=73 (reveal phase) sends reveal
-        // - Receiver at pos=65 (commit phase) receives it
-        // - SAME EPOCH → ACCEPT! Cryptographic verification in finalize_round
-        if position_in_epoch >= 61 {
-            // Consensus window (61-89) - always accept
-        } else if position_in_epoch == 0 {
-            // Epoch boundary - accept for finalization
-        } else if epoch_diff == 0 {
-            // Same epoch, production phase (1-60) - accept late delivery
-            // This handles: consensus finished, receiver moved to production
-            println!("[INFO][CONS] same_epoch_grace_reveal node={} epoch={} pos={}", 
-                     reveal.node_id, message_epoch, position_in_epoch);
-        } else {
-            return Err(ConsensusError::InvalidPhase(
-                format!("Reveal outside consensus window: epoch={} pos={}", message_epoch, position_in_epoch)
-            ));
-        }
-        
-        // PRODUCTION v2.52: Verify hybrid reveal signature (Dilithium3 + Ed25519 + ephemeral)
-        // This prevents impersonation attacks where attacker sends reveal as another node
-        // Uses same hybrid verification as commits for NIST FIPS 204 / CNSA 2.0 compliance
-        // NOTE: If signature is empty (legacy), skip verification but log warning
+        // Verify hybrid signature if present
         if !reveal.signature.is_empty() {
             // CRITICAL FIX v2.52: Message format MUST match generation in node.rs
             // Format: node_id:reveal_data_hex:nonce_hex:timestamp (4 fields)
@@ -523,37 +584,61 @@ impl CommitRevealConsensus {
                 ));
             }
         } else {
-            // Legacy reveal without signature - accept but log warning
             println!("[WARN][CONS] reveal_no_signature node={} accepting_legacy", reveal.node_id);
         }
         
-        // Check if we have an active round
-        let state = self.current_round.as_ref().ok_or(ConsensusError::NoActiveRound)?;
+        // Get round data (guaranteed to exist now)
+        let round_data = self.rounds.get_mut(&block_height).unwrap();
         
-        // Clone commits for verification (avoids borrow issues)
-        let commits_clone = state.commits.clone();
-        
-        // Verify reveal matches commit if commit exists
-        // If commit not found, store anyway - will verify in finalize_round
-        if let Err(e) = self.verify_reveal(&reveal, &commits_clone) {
-            if e.to_string().contains("No matching commit") {
-                println!("[INFO][CONS] reveal_before_commit node={} storing_for_later", reveal.node_id);
-                // Continue to store - will verify in finalize_round
-            } else {
-                // Other verification error
-                return Err(e);
-            }
+        // Check if already finalized
+        if round_data.is_finalized {
+            println!("[INFO][CONS] reveal_round_finalized round={} node={}", block_height, reveal.node_id);
+            return Ok(());
         }
         
-        // Now get mutable reference to store reveal
-        let state = self.current_round.as_mut().ok_or(ConsensusError::NoActiveRound)?;
-        state.reveals.insert(reveal.node_id.clone(), reveal);
+        // Check for duplicate
+        if round_data.reveals.contains_key(&reveal.node_id) {
+            println!("[INFO][CONS] reveal_duplicate node={} round={}", reveal.node_id, block_height);
+            return Ok(());
+        }
+        
+        // Verify reveal matches commit if commit exists in THIS round
+        if let Some(commit) = round_data.commits.get(&reveal.node_id) {
+            // Verify: SHA3(nonce || reveal_data) == commit_hash
+            use sha3::{Sha3_256, Digest};
+            let mut hasher = Sha3_256::new();
+            hasher.update(&reveal.nonce);
+            hasher.update(&reveal.reveal_data);
+            let calculated_hash = hex::encode(hasher.finalize());
+            
+            if calculated_hash != commit.commit_hash {
+                println!("[WARN][CONS] reveal_mismatch node={} round={} expected={} got={}", 
+                         reveal.node_id, block_height, 
+                         &commit.commit_hash[..16], &calculated_hash[..16]);
+                // Still store - will verify in finalize_round with proper error handling
+            }
+        } else {
+            println!("[INFO][CONS] reveal_before_commit node={} round={}", reveal.node_id, block_height);
+        }
+        
+        // Store reveal in per-round storage
+        round_data.reveals.insert(reveal.node_id.clone(), reveal.clone());
+        
+        // Calculate Byzantine threshold
+        let total_participants = round_data.participants.len().max(round_data.commits.len());
+        let byzantine_threshold = (total_participants * 2 + 2) / 3;
         
         // Log progress
-        let total_participants = state.participants.len();
-        let byzantine_threshold = (total_participants * 2 + 2) / 3;
-        if state.reveals.len() >= byzantine_threshold && state.reveals.len() == byzantine_threshold {
-            println!("[INFO][CONS] bft_threshold reveals={}/{}", state.reveals.len(), byzantine_threshold);
+        if round_data.reveals.len() == byzantine_threshold {
+            println!("[INFO][CONS] reveal_threshold round={} reveals={} threshold={}", 
+                     block_height, round_data.reveals.len(), byzantine_threshold);
+        }
+        
+        // Legacy compatibility: sync to current_round if this is active round
+        if self.active_round == Some(block_height) {
+            if let Some(ref mut legacy) = self.current_round {
+                legacy.reveals.insert(reveal.node_id.clone(), reveal);
+            }
         }
         
         Ok(())
@@ -595,68 +680,158 @@ impl CommitRevealConsensus {
         }
     }
     
-    /// PRODUCTION v2.40.1: Finalize round with Byzantine safety requirements
-    /// ARCHITECTURE: No local phase check - epoch-based validation ensures correctness
-    /// By the time finalize is called, commits and reveals have been collected via epoch validation
-    pub fn finalize_round(&mut self) -> Result<String, ConsensusError> {
-        // First get the leader without mutable borrow
-        let leader = {
-            let state = self.current_round.as_ref().ok_or(ConsensusError::NoActiveRound)?;
-            
-            // PRODUCTION v2.40.1: Removed local phase check
-            // Phase validation is now epoch-based in process_commit/submit_reveal
-            // Local phase may not match block_height due to network timing differences
-            // What matters: we have enough commits AND reveals (Byzantine threshold)
-            
-            // PRODUCTION: Check Byzantine threshold for reveals (2f+1)
-            // CRITICAL: Use INITIAL participants count, NOT current reveals count
-            // Threshold must be based on total participants, not who revealed
-            // Otherwise malicious nodes could reduce threshold by not revealing!
-            let total_participants = state.participants.len();
-            let byzantine_threshold = (total_participants * 2 + 2) / 3;
-            if state.reveals.len() < byzantine_threshold {
-                return Err(ConsensusError::InvalidCommit(
-                    format!("Insufficient reveals for Byzantine safety: {}/{}", 
-                           state.reveals.len(), byzantine_threshold)
-                ));
-            }
-            
-            // CRITICAL FIX: Verify ALL reveals match their commits
-            // This catches any reveals that were stored during grace period without verification
-            let mut valid_reveals = 0;
-            for (node_id, reveal) in &state.reveals {
-                if let Some(_commit) = state.commits.get(node_id) {
-                    // Verify reveal matches commit
-                    if let Err(e) = self.verify_reveal(reveal, &state.commits) {
-                        println!("[WARN][CONS] invalid_reveal node={} err={}", node_id, e);
-                        continue;
-                    }
-                    valid_reveals += 1;
-                } else {
-                    println!("[WARN][CONS] reveal_no_commit node={}", node_id);
-                }
-            }
-            
-            // Re-check Byzantine threshold with valid reveals only
-            if valid_reveals < byzantine_threshold {
-                return Err(ConsensusError::InvalidCommit(
-                    format!("Insufficient VALID reveals for Byzantine safety: {}/{} (had {} total reveals)", 
-                           valid_reveals, byzantine_threshold, state.reveals.len())
-                ));
-            }
-            
-            println!("[INFO][CONS] finalize_ok valid={}/{}", valid_reveals, byzantine_threshold);
-            
-            // Byzantine-safe leader selection
-            self.select_leader(&state.reveals)
-                .ok_or(ConsensusError::LeaderSelectionFailed)?
-        };
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PRODUCTION v2.62: PER-ROUND FINALIZATION
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Finalize specific round by round_number. Returns leader_id.
+    // Round data is preserved in per-round storage even after finalization.
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Finalize specific round (v2.62 per-round storage)
+    pub fn finalize_round_by_number(&mut self, round_number: u64) -> Result<String, ConsensusError> {
+        // Get round data
+        let round_data = self.rounds.get(&round_number)
+            .ok_or(ConsensusError::NoActiveRound)?;
         
-        // Now modify state
-        let state = self.current_round.as_mut().ok_or(ConsensusError::NoActiveRound)?;
-        state.phase = ConsensusPhase::Finalize;
+        // Check if already finalized
+        if round_data.is_finalized {
+            if let Some(ref leader) = round_data.finalized_leader {
+                println!("[INFO][CONS] round_already_finalized round={} leader={}", round_number, leader);
+                return Ok(leader.clone());
+            }
+        }
+        
+        let epoch = round_number / 90;
+        
+        // Calculate Byzantine threshold
+        let total_participants = round_data.participants.len().max(round_data.commits.len());
+        let byzantine_threshold = (total_participants * 2 + 2) / 3;
+        
+        // Check if we have enough reveals
+        if round_data.reveals.len() < byzantine_threshold {
+            return Err(ConsensusError::InvalidCommit(
+                format!("Insufficient reveals for Byzantine safety: {}/{} round={}", 
+                       round_data.reveals.len(), byzantine_threshold, round_number)
+            ));
+        }
+        
+        // Verify all reveals match their commits
+        let mut valid_reveals = 0;
+        let mut valid_reveal_data: Vec<(&String, &Reveal)> = Vec::new();
+        
+        for (node_id, reveal) in &round_data.reveals {
+            if let Some(commit) = round_data.commits.get(node_id) {
+                // Verify: SHA3(nonce || reveal_data) == commit_hash
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(&reveal.nonce);
+                hasher.update(&reveal.reveal_data);
+                let calculated_hash = hex::encode(hasher.finalize());
+                
+                if calculated_hash == commit.commit_hash {
+                    valid_reveals += 1;
+                    valid_reveal_data.push((node_id, reveal));
+                } else {
+                    println!("[WARN][CONS] invalid_reveal round={} node={} reason=hash_mismatch", 
+                             round_number, node_id);
+                }
+            } else {
+                println!("[WARN][CONS] reveal_no_commit round={} node={}", round_number, node_id);
+            }
+        }
+        
+        // Re-check Byzantine threshold with valid reveals only
+        if valid_reveals < byzantine_threshold {
+            return Err(ConsensusError::InvalidCommit(
+                format!("Insufficient VALID reveals for Byzantine safety: {}/{} (had {} total) round={}", 
+                       valid_reveals, byzantine_threshold, round_data.reveals.len(), round_number)
+            ));
+        }
+        
+        // Leader selection using valid reveals
+        let leader = self.select_leader_from_reveals(&valid_reveal_data, round_data.randomness_beacon)
+            .ok_or(ConsensusError::LeaderSelectionFailed)?;
+        
+        println!("[INFO][CONS] finalize_ok round={} epoch={} valid={}/{} leader={}", 
+                 round_number, epoch, valid_reveals, byzantine_threshold, leader);
+        
+        // Mark round as finalized
+        if let Some(round) = self.rounds.get_mut(&round_number) {
+            round.is_finalized = true;
+            round.finalized_leader = Some(leader.clone());
+        }
+        
+        // Legacy compatibility: update current_round if needed
+        if self.active_round == Some(round_number) {
+            if let Some(ref mut legacy) = self.current_round {
+                legacy.phase = ConsensusPhase::Finalize;
+            }
+        }
         
         Ok(leader)
+    }
+    
+    /// Helper: Select leader from valid reveals
+    fn select_leader_from_reveals(&self, reveals: &[(&String, &Reveal)], beacon: Option<[u8; 32]>) -> Option<String> {
+        if reveals.is_empty() {
+            return None;
+        }
+        
+        // Combine all reveal data for entropy
+        use sha3::{Sha3_512, Digest};
+        let mut hasher = Sha3_512::new();
+        
+        // Add beacon if available
+        if let Some(b) = beacon {
+            hasher.update(&b);
+        }
+        
+        // Add all reveals (sorted for determinism)
+        let mut sorted_reveals: Vec<_> = reveals.iter().collect();
+        sorted_reveals.sort_by(|a, b| a.0.cmp(b.0));
+        
+        for (node_id, reveal) in &sorted_reveals {
+            hasher.update(node_id.as_bytes());
+            hasher.update(&reveal.reveal_data);
+            hasher.update(&reveal.nonce);
+        }
+        
+        let hash = hasher.finalize();
+        let index = u64::from_le_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]]) as usize;
+        let leader_idx = index % sorted_reveals.len();
+        
+        Some(sorted_reveals[leader_idx].0.clone())
+    }
+    
+    /// Legacy finalize_round (uses active round)
+    pub fn finalize_round(&mut self) -> Result<String, ConsensusError> {
+        // Use active round or fall back to current_round
+        if let Some(round_number) = self.active_round {
+            return self.finalize_round_by_number(round_number);
+        }
+        
+        // Legacy path: use current_round
+        let state = self.current_round.as_ref().ok_or(ConsensusError::NoActiveRound)?;
+        let round_number = state.round_number;
+        
+        // Ensure round exists in per-round storage
+        if !self.rounds.contains_key(&round_number) {
+            // Migrate from legacy
+            let round_data = RoundData {
+                round_number,
+                epoch: round_number / 90,
+                participants: state.participants.clone(),
+                commits: state.commits.clone(),
+                reveals: state.reveals.clone(),
+                randomness_beacon: state.prev_randomness_beacon,
+                created_at: state.phase_start,
+                is_finalized: false,
+                finalized_leader: None,
+            };
+            self.rounds.insert(round_number, round_data);
+        }
+        
+        self.finalize_round_by_number(round_number)
     }
     
     /// Get current round status
@@ -1152,12 +1327,49 @@ impl CommitRevealConsensus {
     // PRODUCTION v2.35: Methods for MacroBlock consensus
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Get commits for MacroBlock storage (REAL data, not fake strings!)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PRODUCTION v2.62: Per-round data access
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Get commits for specific round
+    pub fn get_commits_for_round(&self, round_number: u64) -> HashMap<String, Vec<u8>> {
+        if let Some(round_data) = self.rounds.get(&round_number) {
+            round_data.commits.iter()
+                .map(|(node_id, commit)| {
+                    let commit_bytes = bincode::serialize(commit).unwrap_or_default();
+                    (node_id.clone(), commit_bytes)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    }
+    
+    /// Get reveals for specific round
+    pub fn get_reveals_for_round(&self, round_number: u64) -> HashMap<String, Vec<u8>> {
+        if let Some(round_data) = self.rounds.get(&round_number) {
+            round_data.reveals.iter()
+                .map(|(node_id, reveal)| {
+                    let reveal_bytes = bincode::serialize(reveal).unwrap_or_default();
+                    (node_id.clone(), reveal_bytes)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    }
+    
+    /// Get commits for MacroBlock storage (uses active round or legacy)
     pub fn get_commits_for_macroblock(&self) -> HashMap<String, Vec<u8>> {
+        // First try per-round storage
+        if let Some(round_number) = self.active_round {
+            return self.get_commits_for_round(round_number);
+        }
+        
+        // Legacy fallback
         if let Some(state) = &self.current_round {
             state.commits.iter()
                 .map(|(node_id, commit)| {
-                    // Serialize commit to bytes
                     let commit_bytes = bincode::serialize(commit).unwrap_or_default();
                     (node_id.clone(), commit_bytes)
                 })
@@ -1167,12 +1379,17 @@ impl CommitRevealConsensus {
         }
     }
 
-    /// Get reveals for MacroBlock storage (REAL data, not fake strings!)
+    /// Get reveals for MacroBlock storage (uses active round or legacy)
     pub fn get_reveals_for_macroblock(&self) -> HashMap<String, Vec<u8>> {
+        // First try per-round storage
+        if let Some(round_number) = self.active_round {
+            return self.get_reveals_for_round(round_number);
+        }
+        
+        // Legacy fallback
         if let Some(state) = &self.current_round {
             state.reveals.iter()
                 .map(|(node_id, reveal)| {
-                    // Serialize reveal to bytes
                     let reveal_bytes = bincode::serialize(reveal).unwrap_or_default();
                     (node_id.clone(), reveal_bytes)
                 })

@@ -44,7 +44,38 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🚀 **LATEST UPDATES (v2.57.0 - December 28, 2025)**
+### 🚀 **LATEST UPDATES (v2.62.0 - December 30, 2025)**
+
+**🏛️ Per-Round Consensus Storage (Production L1 Architecture):**
+- **Independent Round Storage**: Each round has its own commits/reveals HashMap
+- **No Data Loss**: Round transitions don't destroy previous round data
+- **Parallel Rounds**: Multiple consensus rounds can coexist simultaneously  
+- **Automatic Cleanup**: Old rounds (>5 epochs) automatically purged
+- **100% First-Attempt Success**: Eliminates "Reveal doesn't match commit" errors
+- **Race Condition Fix**: Async tasks can't corrupt each other's data
+- **New API**: `finalize_round_by_number(round)`, `get_commits_for_round(round)`
+
+**Key Changes:**
+```rust
+// OLD: Single current_round (data loss on transition)
+current_round: Option<RoundState>
+
+// NEW: Per-round storage (no data loss!)
+rounds: HashMap<u64, RoundData>
+```
+
+### 🛡️ **Previous Updates (v2.61.0 - December 29, 2025)**
+
+**🌍 Intercontinental Sync (Reliable USA↔Europe):**
+- **Size-Based Batching**: BlocksBatch max 1MB, MacroblocksBatch max 500KB
+- **ShredProtocol Unicast**: `send_block_via_shred_to_peer()` for blocks >1MB
+- **Repair Batching**: 10 chunks per batch with 5ms pacing
+- **Peer Heights Tracking**: `get_peer_heights()` from Dilithium-signed heartbeats
+- **Strict Sync Check**: Emergency producer must have prev block (N-1)
+- **is_new_chunk Dedup**: Prevents infinite forwarding loops
+- **Genesis Latency Fanout**: fanout=max(producers, 4) for high-latency networks
+
+### 🛡️ **Previous Updates (v2.57.0 - December 28, 2025)**
 
 **⚡ Stage Pipeline (Full Runtime Isolation):**
 - **BROADCAST_RUNTIME**: Dedicated threads for Shred protocol

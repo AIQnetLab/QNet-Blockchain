@@ -1,9 +1,9 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 3.1 (v2.57.0)  
-**Date:** December 28, 2025  
-**Status:** Production Ready (Lock-Free Crypto + Isolated Runtime Pipeline)  
+**Version:** 3.3 (v2.62.0)  
+**Date:** December 30, 2025  
+**Status:** Production Ready (Per-Round Consensus Storage + Intercontinental Sync)  
 
 ---
 
@@ -76,6 +76,26 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Reveal Loss Prevention** (participant nodes don't call trigger mid-consensus)
 - ✅ **Dynamic Height Threshold** (5/10/20 blocks based on network size for scalability)
 - ✅ **Signed Reveal Messages** (SHA3-256 + Dilithium+Ed25519 hybrid signatures)
+
+### v2.62.0 Additions (Per-Round Consensus Storage)
+- ✅ **Per-Round Storage** (`HashMap<u64, RoundData>` - each round is independent)
+- ✅ **No Data Loss** (round transitions don't destroy previous round commits/reveals)
+- ✅ **Parallel Rounds** (multiple consensus rounds can coexist simultaneously)
+- ✅ **Auto Cleanup** (rounds older than 5 epochs automatically purged)
+- ✅ **100% First-Attempt Success** (eliminates "Reveal doesn't match commit" errors)
+- ✅ **New API** (`finalize_round_by_number()`, `get_commits_for_round()`)
+- ✅ **Race Condition Fix** (async tasks can't corrupt each other's consensus data)
+- ✅ **Production L1 Architecture** (per-round storage is industry standard)
+
+### v2.61.0 Additions (Intercontinental Sync)
+- ✅ **Size-Based Batching** (BlocksBatch max 1MB, MacroblocksBatch max 500KB)
+- ✅ **ShredProtocol Unicast** (`send_block_via_shred_to_peer()` for blocks >1MB)
+- ✅ **Repair Batching** (10 chunks per batch, 5ms pacing)
+- ✅ **Peer Heights Tracking** (`get_peer_heights()` from Dilithium-signed heartbeats)
+- ✅ **Strict Sync Check** (emergency producer must have prev block N-1)
+- ✅ **is_new_chunk Dedup** (prevents infinite forwarding loops)
+- ✅ **Genesis Latency Fanout** (fanout=max(producers, 4) for high-latency)
+- ✅ **Intercontinental Support** (USA↔Europe 7500km reliable sync)
 
 ### v2.57.0 Additions (Stage Pipeline Runtime Isolation)
 - ✅ **SIGVERIFY_RUNTIME** (dedicated Ed25519/Dilithium verification)

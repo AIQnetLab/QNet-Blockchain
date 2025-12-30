@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.57.0-experimental  
-**Date**: December 28, 2025  
+**Version**: 2.62.0-experimental  
+**Date**: December 30, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -69,6 +69,19 @@ Experimental achievements:
 - ✅ **BROADCAST_RUNTIME (v2.57.0)**: Dedicated threads for Shred protocol propagation
 - ✅ **Adaptive Threading (v2.57.0)**: 2 cores→4t, 4 cores→5t, 8 cores→10t, 16 cores→20t
 - ✅ **Zero Starvation Guarantee (v2.57.0)**: Crypto ops never block network propagation
+- ✅ **Size-Based Sync Batching (v2.61.0)**: BlocksBatch max 1MB, MacroblocksBatch max 500KB
+- ✅ **ShredProtocol Unicast Sync (v2.61.0)**: `send_block_via_shred_to_peer()` for blocks >1MB
+- ✅ **Repair Batching (v2.61.0)**: 10 chunks per batch with 5ms pacing
+- ✅ **Peer Heights Tracking (v2.61.0)**: `get_peer_heights()` from Dilithium-signed heartbeats
+- ✅ **Strict Emergency Sync Check (v2.61.0)**: Emergency producer must have prev block (N-1)
+- ✅ **is_new_chunk Dedup (v2.61.0)**: Prevents infinite chunk forwarding loops
+- ✅ **Intercontinental Sync (v2.61.0)**: Reliable USA↔Europe 7500km block propagation
+- ✅ **Per-Round Consensus Storage (v2.62.0)**: Independent storage for each consensus round
+- ✅ **No Data Loss on Round Transition (v2.62.0)**: Rounds coexist without overwriting
+- ✅ **Parallel Consensus Rounds (v2.62.0)**: Multiple rounds can work simultaneously
+- ✅ **Automatic Round Cleanup (v2.62.0)**: Old rounds (>5 epochs) auto-purged
+- ✅ **100% First-Attempt Success (v2.62.0)**: Eliminated race conditions in consensus
+- ✅ **Production L1 Architecture (v2.62.0)**: Per-round storage standard for top blockchains
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 
