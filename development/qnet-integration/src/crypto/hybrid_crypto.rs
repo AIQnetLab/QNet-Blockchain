@@ -755,9 +755,11 @@ impl HybridCrypto {
     ) -> Result<bool> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         
-        // Step 1: Check certificate expiration
-        if now > signature.certificate.expires_at {
-            println!("❌ Certificate expired");
+        // Step 1: Check certificate expiration with GRACE PERIOD
+        // v2.64: 60 second grace period for network propagation delays
+        const CERTIFICATE_GRACE_PERIOD_SECS: u64 = 60;
+        if now > signature.certificate.expires_at + CERTIFICATE_GRACE_PERIOD_SECS {
+            println!("❌ Certificate expired (beyond {}s grace period)", CERTIFICATE_GRACE_PERIOD_SECS);
             return Ok(false);
         }
         
@@ -767,8 +769,9 @@ impl HybridCrypto {
             signature.certificate.serial_number);
         
         // PRODUCTION v2.51: Lock-free cache check
+        // v2.64: Use grace period for cache check too
         let cert_is_valid = if let Some(cached) = CERTIFICATE_CACHE.get(&cache_key) {
-            if cached.is_valid && now <= signature.certificate.expires_at {
+            if cached.is_valid && now <= signature.certificate.expires_at + CERTIFICATE_GRACE_PERIOD_SECS {
                 println!("✅ Certificate verified from cache (O(1) performance)");
                 true // Certificate is valid from cache
             } else if !cached.is_valid {

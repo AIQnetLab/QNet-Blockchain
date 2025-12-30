@@ -558,13 +558,15 @@ async fn verify_hybrid_binary_signature(
         return false;
     }
     
-    // Check certificate expiration
+    // Check certificate expiration with GRACE PERIOD
+    // v2.64: 60 second grace period for network propagation delays (intercontinental latency)
+    const CERTIFICATE_GRACE_PERIOD_SECS: u64 = 60;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if now > sig.certificate.expires_at {
-        println!("[CONSENSUS] ❌ Certificate expired");
+    if now > sig.certificate.expires_at + CERTIFICATE_GRACE_PERIOD_SECS {
+        println!("[CONSENSUS] ❌ Certificate expired (beyond {}s grace period)", CERTIFICATE_GRACE_PERIOD_SECS);
         return false;
     }
     

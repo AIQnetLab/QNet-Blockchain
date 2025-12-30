@@ -362,17 +362,18 @@ impl ShardedRewardManager {
                         // Convert to nanoQNC (9 decimals)
                         let total_emission_nano = (base_emission_qnc * 1_000_000_000.0) as u64;
                         
-                        // Divide emission by total eligible nodes
+                        // v2.64: Divide emission by total eligible nodes (NO FALLBACK!)
+                        // If node_counts is None, node is not eligible for rewards
                         let base_reward = if let Some(ref counts) = node_counts {
-                            // Proper division: total emission divided by all eligible nodes
                             if counts.total > 0 {
                                 total_emission_nano / counts.total as u64
                             } else {
-                                0 // No eligible nodes
+                                0 // No eligible nodes - no reward
                             }
                         } else {
-                            // Fallback: assume 5 genesis nodes for now
-                            total_emission_nano / 5
+                            // v2.64: No fallback! If we don't know eligible count, reward is 0
+                            println!("[WARN][SHARDING] node_counts=None, cannot calculate reward for node");
+                            0
                         };
                         // Get Pool #2 transaction fees for distribution
                         let pool2_share = {
@@ -383,6 +384,7 @@ impl ShardedRewardManager {
                             // Super: 70% divided by ONLY super nodes
                             // Full: 30% divided by ONLY full nodes
                             // Light: 0% (don't process transactions)
+                            // v2.64: No fallbacks - must have real eligible counts
                             match node_type.as_str() {
                                 "super" => {
                                     let super_pool = (total_fees * 70) / 100;
@@ -390,7 +392,7 @@ impl ShardedRewardManager {
                                         if counts.super_nodes > 0 {
                                             super_pool / counts.super_nodes as u64
                                         } else { 0 }
-                                    } else { super_pool / 5 } // Fallback: assume 5 genesis
+                                    } else { 0 } // v2.64: No fallback
                                 },
                                 "full" => {
                                     let full_pool = (total_fees * 30) / 100;
@@ -398,7 +400,7 @@ impl ShardedRewardManager {
                                         if counts.full_nodes > 0 {
                                             full_pool / counts.full_nodes as u64
                                         } else { 0 }
-                                    } else { 0 } // No full nodes in genesis
+                                    } else { 0 } // v2.64: No fallback
                                 },
                                 "light" => 0, // Light nodes get 0% of transaction fees
                                 _ => 0,

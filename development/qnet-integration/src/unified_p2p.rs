@@ -10409,10 +10409,12 @@ impl SimplifiedP2P {
                     return;
                 }
                 
-                // SECURITY: Check certificate has not expired
-                if now > cert.expires_at {
-                    println!("[P2P] ❌ Certificate expired at {}, current time: {}", 
-                             cert.expires_at, now);
+                // SECURITY: Check certificate has not expired (with grace period)
+                // v2.64: 60 second grace period for network propagation delays
+                const CERTIFICATE_GRACE_PERIOD_SECS: u64 = 60;
+                if now > cert.expires_at + CERTIFICATE_GRACE_PERIOD_SECS {
+                    println!("[P2P] ❌ Certificate expired at {}, current time: {} (beyond {}s grace)", 
+                             cert.expires_at, now, CERTIFICATE_GRACE_PERIOD_SECS);
                     return;
                 }
                 
@@ -12690,11 +12692,11 @@ impl SimplifiedP2P {
         const BLOCKS_PER_EPOCH: u64 = 14400;    // 1 block per second, 4 hours
         
         // Calculate epoch boundaries based on block height (100% deterministic)
-        let epoch_number = epoch_start_height / BLOCKS_PER_EPOCH;
+        let epoch_number = (epoch_start_height / BLOCKS_PER_EPOCH) + 1;
         let window_start_height = epoch_start_height.saturating_sub(BLOCKS_PER_EPOCH);
         let window_end_height = epoch_start_height;
         
-        println!("[INFO][HEARTBEAT] epoch_window epoch={} blocks={}-{} (height-based filtering v2.59)", 
+        println!("[INFO][HEARTBEAT] epoch_window epoch={} blocks={}-{} (height-based filtering v2.63)", 
                  epoch_number, window_start_height, window_end_height);
         
         // Get heartbeat history
@@ -13607,6 +13609,7 @@ impl SimplifiedP2P {
     
     /// Get all Light node attestations for a 4h window (for Merkle commitment)
     /// Returns Vec<(light_node_id, slot, pinger_id, timestamp)>
+    /// DEPRECATED: Use get_attestations_for_block_range for deterministic emission
     pub fn get_attestations_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u64, String, u64)> {
         let window_end = window_start_timestamp + (4 * 60 * 60);
         
@@ -13617,8 +13620,25 @@ impl SimplifiedP2P {
             .collect()
     }
     
+    /// v2.64: Get Light node attestations filtered by BLOCK HEIGHT (deterministic!)
+    /// Returns Vec<(light_node_id, slot, pinger_id, timestamp, block_height)>
+    pub fn get_attestations_for_block_range(&self, start_height: u64, end_height: u64) -> Vec<(String, u64, String, u64, u64)> {
+        let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        
+        let result: Vec<_> = attestations.values()
+            .filter(|a| a.block_height >= start_height && a.block_height < end_height)
+            .map(|a| (a.light_node_id.clone(), a.slot, a.pinger_id.clone(), a.timestamp, a.block_height))
+            .collect();
+        
+        println!("[INFO][ATTESTATION] block_range_filter start={} end={} found={}", 
+                 start_height, end_height, result.len());
+        
+        result
+    }
+    
     /// Get all Full/Super node heartbeats for a 4h window (for Merkle commitment)
     /// Returns Vec<(node_id, heartbeat_index, timestamp)>
+    /// DEPRECATED: Use get_heartbeats_for_block_range for deterministic emission
     pub fn get_heartbeats_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u8, u64)> {
         let window_end = window_start_timestamp + (4 * 60 * 60);
         
@@ -13629,8 +13649,79 @@ impl SimplifiedP2P {
             .collect()
     }
     
+    /// v2.64: Get heartbeats filtered by BLOCK HEIGHT (deterministic!)
+    /// This ensures all nodes see the same heartbeats regardless of when they process the emission
+    /// Block height epoch is deterministic, unlike UTC timestamps which depend on network start time
+    pub fn get_heartbeats_for_block_range(&self, start_height: u64, end_height: u64) -> Vec<(String, u8, u64, u64)> {
+        let heartbeats = match self.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        
+        let result: Vec<_> = heartbeats.values()
+            .filter(|h| h.block_height >= start_height && h.block_height < end_height && h.verified)
+            .map(|h| (h.node_id.clone(), h.heartbeat_index, h.timestamp, h.block_height))
+            .collect();
+        
+        println!("[INFO][HEARTBEAT] block_range_filter start={} end={} found={}", 
+                 start_height, end_height, result.len());
+        
+        result
+    }
+    
+    /// v2.64: Get eligible Full/Super nodes filtered by BLOCK HEIGHT
+    /// Returns Vec<(node_id, node_type, heartbeat_count)>
+    pub fn get_eligible_full_super_nodes_by_height(&self, start_height: u64, end_height: u64) -> Vec<(String, String, u8)> {
+        let heartbeats = self.get_heartbeats_for_block_range(start_height, end_height);
+        
+        // Count heartbeats per node
+        let mut counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+        
+        for (node_id, _, _, _) in heartbeats {
+            *counts.entry(node_id).or_insert(0) += 1;
+        }
+        
+        // Get node types and filter by eligibility
+        use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
+        
+        counts.into_iter()
+            .filter_map(|(node_id, count)| {
+                // Get node type
+                let node_type = if let Some(n) = self.active_full_super_nodes.get(&node_id) {
+                    n.value().node_type.clone()
+                } else if node_id.starts_with("genesis_node_") {
+                    "super".to_string()
+                } else {
+                    println!("[WARN][REWARDS] unknown_node id={} skipping", node_id);
+                    return None;
+                };
+                
+                // Check reputation
+                let reputation = self.get_node_reputation_from_blockchain(&node_id);
+                if reputation < MIN_CONSENSUS_REPUTATION {
+                    println!("[WARN][REWARDS] low_rep node={} rep={:.1}% min={:.0}%", 
+                             node_id, reputation, MIN_CONSENSUS_REPUTATION);
+                    return None;
+                }
+                
+                // Check eligibility threshold
+                let required = match node_type.as_str() {
+                    "super" => 9,
+                    "full" => 8,
+                    _ => 10,
+                };
+                
+                if count >= required {
+                    Some((node_id, node_type, count))
+                } else {
+                    println!("[INFO][REWARDS] not_eligible node={} count={} required={}", 
+                             node_id, count, required);
+                    None
+                }
+            })
+            .collect()
+    }
+    
     /// Get eligible Light nodes for rewards in current window
     /// Returns Vec<(node_id, wallet_address)> for nodes with at least 1 attestation
+    /// DEPRECATED: Use get_eligible_light_nodes_by_height for deterministic emission
     pub fn get_eligible_light_nodes(&self, window_start_timestamp: u64) -> Vec<(String, String)> {
         let attestations = self.get_attestations_for_window(window_start_timestamp);
         let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
@@ -13650,9 +13741,32 @@ impl SimplifiedP2P {
         eligible
     }
     
+    /// v2.64: Get eligible Light nodes by BLOCK HEIGHT (deterministic!)
+    pub fn get_eligible_light_nodes_by_height(&self, start_height: u64, end_height: u64) -> Vec<(String, String)> {
+        let attestations = self.get_attestations_for_block_range(start_height, end_height);
+        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut eligible = Vec::new();
+        
+        for (node_id, _, _, _, _) in attestations {
+            if seen.insert(node_id.clone()) {
+                if let Some(reg) = registry.get(&node_id) {
+                    eligible.push((node_id.clone(), reg.wallet_address.clone()));
+                }
+            }
+        }
+        
+        println!("[INFO][LIGHT_ELIGIBILITY] block_range h={}-{} eligible={}", 
+                 start_height, end_height, eligible.len());
+        
+        eligible
+    }
+    
     /// Get eligible Full/Super nodes for rewards in current window
     /// Returns Vec<(node_id, node_type, heartbeat_count)>
     /// CRITICAL: Only nodes with reputation >= 70% are eligible for QNC rewards!
+    /// DEPRECATED: Use get_eligible_full_super_nodes_by_height for deterministic emission
     pub fn get_eligible_full_super_nodes(&self, window_start_timestamp: u64) -> Vec<(String, String, u8)> {
         let heartbeats = self.get_heartbeats_for_window(window_start_timestamp);
         
@@ -13704,6 +13818,7 @@ impl SimplifiedP2P {
     }
     
     /// Get total counts for Merkle commitment
+    /// DEPRECATED: Use block height based methods for deterministic counting
     pub fn get_ping_counts_for_window(&self, window_start_timestamp: u64) -> (u64, u64) {
         let attestations = self.get_attestations_for_window(window_start_timestamp);
         let heartbeats = self.get_heartbeats_for_window(window_start_timestamp);
@@ -13712,6 +13827,15 @@ impl SimplifiedP2P {
         let successful = total; // All stored attestations/heartbeats are verified
         
         (total, successful)
+    }
+    
+    /// v2.64: Get total counts by BLOCK HEIGHT (deterministic!)
+    pub fn get_ping_counts_for_block_range(&self, start_height: u64, end_height: u64) -> (u64, u64) {
+        let attestations = self.get_attestations_for_block_range(start_height, end_height);
+        let heartbeats = self.get_heartbeats_for_block_range(start_height, end_height);
+        
+        let total = attestations.len() as u64 + heartbeats.len() as u64;
+        (total, total) // All stored are verified
     }
     
     /// Get Light node wallet address from registry

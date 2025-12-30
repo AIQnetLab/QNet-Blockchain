@@ -6525,7 +6525,7 @@ async fn handle_claim_rewards(
             if let Some(ref reward) = claim_result.reward {
                 // PRODUCTION v2.43.1: Save claim history to storage for /rewards/history API
                 let current_height = blockchain.get_height().await;
-                let current_epoch = current_height / 14400;
+                let current_epoch = (current_height / 14400) + 1;
                 let current_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -6599,6 +6599,7 @@ async fn handle_claim_rewards(
 }
 
 // GET /api/v1/rewards/pending/{node_id} - Get pending rewards for a node
+// v2.64: Uses REAL heartbeat data from P2P, not fallback values
 async fn handle_get_pending_rewards(
     node_id: String,
     remote_addr: Option<std::net::SocketAddr>,
@@ -6609,20 +6610,55 @@ async fn handle_get_pending_rewards(
         return Ok(rate_limit_response);
     }
     
-    use qnet_consensus::lazy_rewards::NodeType;
+    // Calculate current epoch boundaries
+    let current_height = blockchain.get_height().await;
+    let current_epoch = (current_height / 14400) + 1;
+    let epoch_start = (current_epoch - 1) * 14400;
+    let epoch_end = current_epoch * 14400;
+    let blocks_until_next = epoch_end.saturating_sub(current_height);
     
-    // Get pending rewards from reward manager
-    let reward_info = {
-        // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
+    // Determine node type from ID
+    let node_type = if node_id.starts_with("light_") {
+        "Light"
+    } else if node_id.starts_with("full_") {
+        "Full"
+    } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
+        "Super"
+    } else {
+        "Unknown"
+    };
+    
+    // v2.64: Get REAL heartbeat count from P2P using block height filtering
+    let (heartbeat_count, last_heartbeat_time) = if let Some(p2p) = blockchain.get_unified_p2p() {
+        let heartbeats = p2p.get_heartbeats_for_block_range(epoch_start, current_height);
+        let node_heartbeats: Vec<_> = heartbeats.iter()
+            .filter(|(nid, _, _, _)| nid == &node_id)
+            .collect();
+        let count = node_heartbeats.len();
+        let last_time = node_heartbeats.iter()
+            .map(|(_, _, ts, _)| *ts)
+            .max()
+            .unwrap_or(0);
+        (count, last_time)
+    } else {
+        (0, 0)
+    };
+    
+    // Calculate eligibility based on REAL heartbeat count
+    let required_heartbeats = match node_type {
+        "Super" => 9,
+        "Full" => 8,
+        "Light" => 1,
+        _ => 10, // Unknown nodes can never be eligible
+    };
+    let is_eligible = heartbeat_count >= required_heartbeats;
+    
+    // v2.64: Get pending rewards ONLY if eligible, otherwise show 0
+    let (pending_amount, pool1, pool2, pool3, phase) = if is_eligible {
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
         
-        // PRODUCTION v2.43.1: Get FULL PhaseAwareReward with pool breakdown
-        // Pool1 = base emission (all nodes)
-        // Pool2 = transaction fees (Full: 30%, Super: 70%)
-        // Pool3 = activation payments Phase 2 only (equal share to ALL eligible nodes)
-        let pending_reward = reward_manager.get_pending_reward(&node_id).cloned();
-        let (pending_amount, pool1, pool2, pool3, phase) = if let Some(ref reward) = pending_reward {
+        if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
             (
                 reward.total_reward,
                 reward.pool1_base_emission,
@@ -6631,102 +6667,110 @@ async fn handle_get_pending_rewards(
                 format!("{:?}", reward.current_phase),
             )
         } else {
-            (0, 0, 0, 0, "Phase1".to_string())
-        };
-        
-        // Get ping history for performance stats
-        let ping_history = reward_manager.get_ping_history(&node_id);
-        
-        // Calculate stats
-        let (successful_pings, total_pings, last_ping, uptime_percentage) = if let Some(history) = ping_history {
-            let total = history.attempts.len();
-            let successful = history.attempts.iter()
-                .filter(|p| p.success)
-                .count();
-            let last = history.attempts.last()
-                .map(|p| p.timestamp)
-                .unwrap_or(0);
-            let uptime = if total > 0 {
-                (successful as f64 / total as f64) * 100.0
+            // Eligible but no pending reward yet (emission not processed)
+            // v2.64: Calculate estimated reward using REAL emission with halving
+            let reward_manager_arc = blockchain.get_reward_manager();
+            let reward_manager = reward_manager_arc.read().await;
+            let stats = reward_manager.get_reward_stats();
+            
+            // Get current phase and Pool1 emission (with halving applied!)
+            let current_phase = stats.current_phase.clone();
+            let pool1_base_emission = stats.pool1_current_emission; // Already has halving!
+            
+            // Count eligible nodes from P2P
+            let eligible_count = if let Some(p2p) = blockchain.get_unified_p2p() {
+                let all_heartbeats = p2p.get_heartbeats_for_block_range(epoch_start, current_height);
+                let mut node_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                for (nid, _, _, _) in &all_heartbeats {
+                    *node_counts.entry(nid.clone()).or_insert(0) += 1;
+                }
+                // Count nodes that meet eligibility (9 for genesis/super, 8 for full)
+                node_counts.iter()
+                    .filter(|(nid, count)| {
+                        let req = if nid.starts_with("genesis_") || nid.starts_with("super_") { 9 } else { 8 };
+                        **count >= req
+                    })
+                    .count() as u64
             } else {
-                0.0
+                0
             };
-            (successful, total, last, uptime)
-        } else {
-            (0, 0, 0, 0.0)
-        };
-        
-        // Get last claim time from storage
-        let last_claim = {
-            let storage = blockchain.get_storage();
-            storage.get_contract_state(&format!("rewards:{}", node_id), "last_claim")
-                .ok()
-                .flatten()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
-        };
-        
-        // Determine node type from ID
-        let node_type = if node_id.starts_with("light_") {
-            "Light"
-        } else if node_id.starts_with("full_") {
-            "Full"
-        } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
-            "Super"
-        } else {
-            "Unknown"
-        };
-        
-        // Check if node is active (had ping in last 4 hours)
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let is_active = last_ping > 0 && (current_time - last_ping) < 14400; // 4 hours
-        
-        // Convert to QNC (from nanoQNC)
-        let total_qnc = pending_amount as f64 / 1_000_000_000.0;
-        let pool1_qnc = pool1 as f64 / 1_000_000_000.0;
-        let pool2_qnc = pool2 as f64 / 1_000_000_000.0;
-        let pool3_qnc = pool3 as f64 / 1_000_000_000.0;
-        
-        // Calculate current epoch info
-        let current_height = blockchain.get_height().await;
-        let current_epoch = current_height / 14400;
-        let blocks_until_next = 14400 - (current_height % 14400);
-        let seconds_until_next = blocks_until_next; // 1 block = 1 second
-        
-        json!({
-            "node_id": node_id,
-            "node_type": node_type,
-            "phase": phase,
-            "pending_rewards": total_qnc,
-            "pools": {
-                // Pool 1: Base emission (dynamic with halving, ~251K QNC/4h at Year 0)
-                "pool1_base_emission": pool1_qnc,
-                // Pool 2: Transaction fees (70% Super, 30% Full, 0% Light)
-                "pool2_tx_fees": pool2_qnc,
-                // Pool 3: Activation payments Phase 2 (equal share to ALL eligible nodes)
-                // Phase 1: Always 0 (1DEV burn, Pool 3 disabled)
-                "pool3_activation_bonus": pool3_qnc
-            },
-            "current_epoch": current_epoch,
-            "blocks_until_next_epoch": blocks_until_next,
-            "seconds_until_next_epoch": seconds_until_next,
-            "last_claim": last_claim,
-            "last_ping": last_ping,
-            "heartbeats": {
-                "successful": successful_pings,
-                "total": total_pings,
-                "required": if node_type == "Super" { 9 } else if node_type == "Full" { 8 } else { 1 },
-                "uptime_percentage": uptime_percentage
-            },
-            "is_active": is_active,
-            "is_eligible": if node_type == "Super" { successful_pings >= 9 } 
-                          else if node_type == "Full" { successful_pings >= 8 }
-                          else { successful_pings >= 1 }
-        })
+            
+            if eligible_count > 0 {
+                // Pool1: base emission divided equally among ALL eligible nodes
+                let pool1_share = pool1_base_emission / eligible_count;
+                
+                // Pool2: Transaction fees (70% Super, 30% Full)
+                // For estimation, we don't know pool2 yet, show 0
+                let pool2_share = 0u64;
+                
+                // Pool3: Only in Phase2 (activation bonuses)
+                let pool3_share = match current_phase {
+                    qnet_consensus::lazy_rewards::QNetPhase::Phase1 => 0,
+                    qnet_consensus::lazy_rewards::QNetPhase::Phase2 => {
+                        // In Phase2, Pool3 is distributed equally
+                        stats.pool3_activation_pool / eligible_count
+                    },
+                };
+                
+                let phase_str = format!("{:?}", current_phase);
+                (pool1_share + pool2_share + pool3_share, pool1_share, pool2_share, pool3_share, phase_str)
+            } else {
+                let phase_str = format!("{:?}", current_phase);
+                (0, 0, 0, 0, phase_str)
+            }
+        }
+    } else {
+        // NOT eligible - show 0 rewards
+        (0, 0, 0, 0, "Phase1".to_string())
     };
+    
+    // Get last claim time from storage
+    let last_claim = {
+        let storage = blockchain.get_storage();
+        storage.get_contract_state(&format!("rewards:{}", node_id), "last_claim")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    
+    // Check if node is active (had heartbeat in current epoch)
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let is_active = last_heartbeat_time > 0 && (current_time - last_heartbeat_time) < 14400;
+    
+    // Convert to QNC (from nanoQNC)
+    let total_qnc = pending_amount as f64 / 1_000_000_000.0;
+    let pool1_qnc = pool1 as f64 / 1_000_000_000.0;
+    let pool2_qnc = pool2 as f64 / 1_000_000_000.0;
+    let pool3_qnc = pool3 as f64 / 1_000_000_000.0;
+    
+    let reward_info = json!({
+        "node_id": node_id,
+        "node_type": node_type,
+        "phase": phase,
+        "pending_rewards": total_qnc,
+        "pools": {
+            "pool1_base_emission": pool1_qnc,
+            "pool2_tx_fees": pool2_qnc,
+            "pool3_activation_bonus": pool3_qnc
+        },
+        "current_epoch": current_epoch,
+        "epoch_block_range": format!("{}-{}", epoch_start, epoch_end),
+        "blocks_until_next_epoch": blocks_until_next,
+        "seconds_until_next_epoch": blocks_until_next,
+        "last_claim": last_claim,
+        "last_heartbeat": last_heartbeat_time,
+        "heartbeats": {
+            "current": heartbeat_count,
+            "required": required_heartbeats,
+            "remaining": if heartbeat_count < required_heartbeats { required_heartbeats - heartbeat_count } else { 0 }
+        },
+        "is_active": is_active,
+        "is_eligible": is_eligible
+    });
     
     Ok(warp::reply::json(&reward_info))
 }
@@ -6744,7 +6788,7 @@ async fn handle_get_reward_history(
     }
     
     let current_height = blockchain.get_height().await;
-    let current_epoch = current_height / 14400;
+    let current_epoch = (current_height / 14400) + 1;
     
     // Pagination: default offset=0, limit=10, max limit=100
     let offset = query.offset.unwrap_or(0) as u64;
@@ -6755,22 +6799,23 @@ async fn handle_get_reward_history(
     let mut epochs_history = Vec::new();
     
     // Calculate which epochs to scan based on offset
-    let total_epochs = current_epoch + 1;
+    let total_epochs = current_epoch;  // v2.63: 1-based epochs
     let start_epoch = if offset < total_epochs { 
         current_epoch.saturating_sub(offset) 
     } else { 
-        0 
+        1  // v2.63: minimum epoch is 1
     };
     
-    // Scan epochs with pagination
+    // Scan epochs with pagination (v2.63: epochs start from 1)
     let mut scanned = 0usize;
-    for epoch in (0..=start_epoch).rev() {
+    for epoch in (1..=start_epoch).rev() {
         if scanned >= limit {
             break;
         }
         
-        let epoch_start_block = epoch * 14400;
-        let epoch_end_block = (epoch + 1) * 14400;
+        // v2.63: Convert 1-based epoch to block range
+        let epoch_start_block = (epoch - 1) * 14400;
+        let epoch_end_block = epoch * 14400;
         
         // Get claimed amount for this epoch from storage
         let claimed_key = format!("rewards:{}:epoch:{}", node_id, epoch);
@@ -6856,7 +6901,7 @@ async fn handle_get_reward_pools(
     
     // Calculate current epoch info
     let current_height = blockchain.get_height().await;
-    let current_epoch = current_height / 14400;
+    let current_epoch = (current_height / 14400) + 1;
     let blocks_in_epoch = current_height % 14400;
     
     // PRODUCTION v2.43.1: Use cached accumulated pools (10 sec TTL)
@@ -6967,7 +7012,7 @@ async fn handle_get_rewards_by_wallet(
     
     let mut nodes_info = Vec::new();
     let current_height = blockchain.get_height().await;
-    let current_epoch = current_height / 14400;
+    let current_epoch = (current_height / 14400) + 1;
     
     for node_id in nodes {
         // Get pending rewards for each node
@@ -7056,7 +7101,7 @@ async fn handle_get_pending_rewards_batch(
     let reward_manager = reward_manager_arc.read().await;
     
     let current_height = blockchain.get_height().await;
-    let current_epoch = current_height / 14400;
+    let current_epoch = (current_height / 14400) + 1;
     
     let mut results = Vec::new();
     let mut total_pending = 0.0f64;
@@ -7116,7 +7161,7 @@ async fn handle_get_reward_network_stats(
     }
     
     let current_height = blockchain.get_height().await;
-    let current_epoch = current_height / 14400;
+    let current_epoch = (current_height / 14400) + 1;
     let storage = blockchain.get_storage();
     
     // Get accumulated pools from P2P
@@ -7219,7 +7264,7 @@ async fn handle_get_reward_summary(
     
     let storage = blockchain.get_storage();
     let current_height = blockchain.get_height().await;
-    let current_epoch = current_height / 14400;
+    let current_epoch = (current_height / 14400) + 1;
     
     // Aggregated counters
     let mut total_claimed: u64 = 0;

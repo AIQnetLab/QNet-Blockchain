@@ -1204,9 +1204,11 @@ impl BlockchainNode {
         
         // STEP 1A: Collect Light node attestations from gossip-synced registry
         // OPTIMIZED: Parallel processing for 1M+ nodes
-        let light_attestations = p2p.get_attestations_for_window(window_start);
+        // v2.64: Use BLOCK HEIGHT filtering for deterministic emission
+        let light_attestations = p2p.get_attestations_for_block_range(window_start_height, window_end_height);
         let attestation_count = light_attestations.len();
-        if is_debug() { println!("[DBG][REWARDS] light_attestations={}", attestation_count); }
+        if is_debug() { println!("[DBG][REWARDS] light_attestations={} h={}-{}", 
+                                 attestation_count, window_start_height, window_end_height); }
         
         // PARALLEL: Process attestations in chunks for better CPU utilization
         const CHUNK_SIZE: usize = 10_000;
@@ -1230,7 +1232,7 @@ impl BlockchainNode {
                 let mut chunk_registrations: Vec<(String, String)> = Vec::with_capacity(chunk.len());
                 
                 // Process chunk (can be parallelized with rayon if needed)
-                for (light_node_id, _slot, pinger_id, timestamp) in chunk {
+                for (light_node_id, _slot, pinger_id, timestamp, _block_height) in chunk {
                     // DEDUPE: Only process first attestation per Light node
                     {
                         let mut processed = match processed_light_nodes.lock() {
@@ -1291,7 +1293,7 @@ impl BlockchainNode {
             // PRODUCTION v2.43.1: Dedupe by node_id to ensure 1 ping credit per Light node
             let mut processed_light_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
             
-            for (light_node_id, _slot, pinger_id, timestamp) in &light_attestations {
+            for (light_node_id, _slot, pinger_id, timestamp, _block_height) in &light_attestations {
                 // DEDUPE: Only process first attestation per Light node
                 if !processed_light_nodes.insert(light_node_id.clone()) {
                     continue; // Already processed this node
@@ -1318,16 +1320,19 @@ impl BlockchainNode {
         }
         
         // STEP 1B: Collect Full/Super node heartbeats from gossip-synced registry
-        let heartbeats = p2p.get_heartbeats_for_window(window_start);
+        // v2.64: Use BLOCK HEIGHT filtering for deterministic emission (not UTC timestamp!)
+        // This ensures all nodes see the same heartbeats regardless of network start time
+        let heartbeats = p2p.get_heartbeats_for_block_range(window_start_height, window_end_height);
         let heartbeat_count = heartbeats.len();
-        if is_info() { println!("[INFO][REWARDS] heartbeats_found n={} source=gossip", heartbeat_count); }
+        if is_info() { println!("[INFO][REWARDS] heartbeats_found n={} source=block_range h={}-{}", 
+                                 heartbeat_count, window_start_height, window_end_height); }
         
         // Count heartbeats per node (HashMap is efficient for this)
         let mut heartbeat_counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
         let our_node_id = self.get_node_id().clone();
         
         // OPTIMIZED: Single pass for counting and ping data creation
-        for (node_id, _, timestamp) in &heartbeats {
+        for (node_id, _, timestamp, _block_height) in &heartbeats {
             *heartbeat_counts.entry(node_id.clone()).or_insert(0) += 1;
             
             all_pings.push(PingData {
@@ -1340,7 +1345,8 @@ impl BlockchainNode {
         }
         
         // Register eligible Full/Super nodes
-        let eligible_full_super = p2p.get_eligible_full_super_nodes(window_start);
+        // v2.64: Use block height filtering for deterministic eligibility
+        let eligible_full_super = p2p.get_eligible_full_super_nodes_by_height(window_start_height, window_end_height);
         let eligible_count = eligible_full_super.len();
         
         for (node_id, node_type, count) in eligible_full_super {
@@ -7998,8 +8004,9 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     let is_emission_block = next_block_height % EMISSION_INTERVAL_BLOCKS == 0 && next_block_height > 0;
                     
                     if is_emission_block {
+                        // v2.63: Windows are 1-based (Window 1 = blocks 0-14399)
                         println!("[EMISSION] 🎯 Block #{} is EMISSION BLOCK (window #{})", 
-                                next_block_height, next_block_height / EMISSION_INTERVAL_BLOCKS);
+                                next_block_height, (next_block_height / EMISSION_INTERVAL_BLOCKS) + 1);
                         println!("[EMISSION] 💰 Processing reward window as block producer...");
                         
                         // Process reward window: calculate + emit + sign + add to mempool
@@ -17211,8 +17218,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         ) {
                             Ok(_) => {
                                 let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
+                                // v2.63: Windows are 1-based
                                 println!("[INFO][REWARDS] EMISSION_MACROBLOCK mb={} window={} nodes={} eligible={} pool2={:?} pool3={:?}", 
-                                         index, index / EMISSION_MACROBLOCK_INTERVAL, 
+                                         index, (index / EMISSION_MACROBLOCK_INTERVAL) + 1, 
                                          heartbeat_summaries.len(), eligible,
                                          pool2_total, pool3_total);
                             }
