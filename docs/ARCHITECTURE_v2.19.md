@@ -2335,8 +2335,8 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 | **Macroblock Interval** | 90 seconds | Every 90 microblocks |
 | **Transactions per Microblock** | ~1,000 | Configurable batch size |
 | **Base TPS** | 1,000 TPS | 1 microblock/sec × 1000 tx |
-| **With Sharding (10 shards)** | 10,000 TPS | 10 shards × 1000 tx/sec |
-| **Theoretical Max (100 shards)** | 100,000+ TPS | With optimizations |
+| **With Sharding (10 shards)** | 1,000,000 TPS | 10 shards × 100K tx/sec |
+| **Theoretical Max (256 shards)** | 25,600,000 TPS | v2.64: 100K per shard |
 
 ### Latency
 
@@ -2446,7 +2446,7 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 │                                                                  │
 │  SHARDING = Parallel transaction PROCESSING (CPU cores)         │
 │  - Transactions distributed across shards for parallel execution│
-│  - 1 shard ≈ 10,000 TPS                                         │
+│  - 1 shard ≈ 100,000 TPS (v2.64: increased from 10K)            │
 │  - Dynamic scaling: 1-256 shards based on network size          │
 │                                                                  │
 │  STORAGE = Tiered by node type (Light/Full/Super)               │

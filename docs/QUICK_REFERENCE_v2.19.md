@@ -323,9 +323,9 @@ Total: 100% block utilization
 
 ### Throughput
 ```
-Base:           1,000 TPS (1 microblock/sec × 1000 tx)
-With Sharding:  10,000 TPS (10 shards)
-Max Theoretical: 100,000+ TPS (100 shards)
+Base:           100,000 TPS (1 microblock/sec × 100K tx)
+With Sharding:  1,000,000 TPS (10 shards × 100K)
+Max Theoretical: 25,600,000 TPS (256 shards × 100K) v2.64
 ```
 
 ### Latency

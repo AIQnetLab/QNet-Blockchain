@@ -1484,6 +1484,7 @@ impl BlockchainNode {
         };
         
         // STEP 4: Create PingCommitmentWithSampling transaction
+        // v2.65: System TX get MAX priority to ensure inclusion
         if total_pings > 0 {
             let mut commitment_tx = qnet_state::Transaction {
                 from: "system_ping_commitment".to_string(),
@@ -1502,7 +1503,7 @@ impl BlockchainNode {
                 hash: String::new(),
                 signature: None, // No signature - system operation
                 public_key: None, // Not needed for system transactions
-                gas_price: 0,
+                gas_price: u64::MAX, // MAX priority - system TX MUST be first in block
                 gas_limit: 0,
                 nonce: 0,
                 data: Some(format!("Ping Commitment: {} total, {} successful, root: {}",
@@ -1567,6 +1568,7 @@ impl BlockchainNode {
                     
                     // DECENTRALIZED: No signature needed - all nodes validate emission amount independently
                     // Bitcoin-style: validation through consensus rules, not cryptographic signature
+                    // v2.65: System TX get MAX priority (u64::MAX) to ensure inclusion in block
                     let mut emission_tx = qnet_state::Transaction {
                         from: "system_emission".to_string(),
                         to: Some("system_rewards_pool".to_string()),
@@ -1576,7 +1578,7 @@ impl BlockchainNode {
                         hash: String::new(),
                         signature: None, // No signature - validated through deterministic rules
                         public_key: None, // Not needed for system transactions
-                        gas_price: 0,
+                        gas_price: u64::MAX, // MAX priority - system TX MUST be first in block
                         gas_limit: 0,
                         nonce: 0,
                         data: Some(format!("Emission: {} QNC, Window: {}, Total Supply: {} QNC", 
@@ -1591,10 +1593,15 @@ impl BlockchainNode {
                     emission_tx.hash = emission_tx.calculate_hash();
                     
                     // Add emission transaction to mempool for blockchain record
+                    // v2.65: CRITICAL - if TX fails to add, return error (not just warning)
+                    // This prevents "emission created" log when TX actually failed
                     if let Err(e) = self.add_transaction_to_mempool(emission_tx).await {
-                        eprintln!("[WARN][REWARDS] emission_tx_mempool_fail err={}", e);
+                        eprintln!("[ERR][REWARDS] emission_tx_mempool_fail err={}", e);
+                        return Err(QNetError::ConsensusError(format!(
+                            "Emission TX failed to add to mempool: {}", e
+                        )));
                     } else {
-                        if is_debug() { println!("[DBG][REWARDS] emission_tx_added"); }
+                        if is_info() { println!("[INFO][REWARDS] emission_tx_added_to_mempool"); }
                     }
                 }
             }
@@ -8004,9 +8011,9 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     let is_emission_block = next_block_height % EMISSION_INTERVAL_BLOCKS == 0 && next_block_height > 0;
                     
                     if is_emission_block {
-                        // v2.63: Windows are 1-based (Window 1 = blocks 0-14399)
-                        println!("[EMISSION] 🎯 Block #{} is EMISSION BLOCK (window #{})", 
-                                next_block_height, (next_block_height / EMISSION_INTERVAL_BLOCKS) + 1);
+                        // v2.65: Epoch = block / 14400 (epoch 1 = blocks 0-14399, epoch 2 = 14400-28799)
+                        println!("[EMISSION] 🎯 Block #{} is EMISSION BLOCK (epoch #{})", 
+                                next_block_height, next_block_height / EMISSION_INTERVAL_BLOCKS);
                         println!("[EMISSION] 💰 Processing reward window as block producer...");
                         
                         // Process reward window: calculate + emit + sign + add to mempool
@@ -15949,11 +15956,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // v2.53: Ping commitments are system transactions, validated by merkle proofs
                 if is_info() { println!("[INFO][REWARDS] ping_commitment_accepted system_tx"); }
             } else if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) {
-                // User reward claims - these SHOULD have user signature
+                // User reward claims - MUST have valid user signature (not just non-empty!)
+                // v2.65: Full cryptographic verification to prevent P2P bypass attacks
                 if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
                     return Err(QNetError::ValidationError("Reward claim must be signed by user".to_string()));
                 }
-                if is_info() { println!("[INFO][REWARDS] claim_signed"); }
+                if tx.public_key.as_ref().map_or(true, |k| k.is_empty()) {
+                    return Err(QNetError::ValidationError("Reward claim requires public_key".to_string()));
+                }
+                
+                if let Some(ref sig) = tx.signature {
+                    if let Some(ref pubkey) = tx.public_key {
+                        if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
+                            return Err(QNetError::ValidationError(
+                                "Invalid Ed25519 signature for reward claim".to_string()
+                            ));
+                        }
+                    }
+                }
+                if is_info() { println!("[INFO][REWARDS] claim_signature_verified"); }
             }
         } else {
             // Regular transactions MUST have signature
@@ -16029,10 +16050,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // CRITICAL SECURITY: Check nonce BEFORE adding to mempool
         // This prevents DoS attacks where attacker floods mempool with invalid nonces
-        {
+        // v2.65: System transactions bypass nonce check (like Ethereum coinbase, Solana system program)
+        let is_system_tx = tx.from == "system_emission" 
+            || tx.from == "system_ping_commitment"
+            || tx.from.starts_with("system_");
+        
+        if !is_system_tx {
             let state = self.state.read().await;
             
-            // Check nonce
+            // Check nonce (only for user transactions)
             if let Some(account) = state.get_account(&tx.from) {
                 let expected_nonce = account.nonce + 1;
                 if tx.nonce != expected_nonce {
@@ -16051,7 +16077,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             
-            // Check balance
+            // Check balance (only for user transactions)
             let sender_balance = state.get_balance(&tx.from);
             
             // SECURITY: Use checked arithmetic to prevent overflow attacks
@@ -16073,6 +16099,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     sender_balance, required_balance, quantum_note
                 )));
             }
+        } else {
+            // v2.65: System transactions bypass nonce AND balance checks
+            // Like Ethereum coinbase TX, Solana system program, Cosmos genesis TX
+            if is_info() { println!("[INFO][TX] system_tx_bypass_validation from={}", tx.from); }
         }
         
         // PRODUCTION v2.26: Use bincode for 10-20x faster serialization
@@ -17218,9 +17248,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         ) {
                             Ok(_) => {
                                 let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
-                                // v2.63: Windows are 1-based
-                                println!("[INFO][REWARDS] EMISSION_MACROBLOCK mb={} window={} nodes={} eligible={} pool2={:?} pool3={:?}", 
-                                         index, (index / EMISSION_MACROBLOCK_INTERVAL) + 1, 
+                                // v2.65: Windows are 1-based: mb=160 → epoch=1, mb=320 → epoch=2
+                                println!("[INFO][REWARDS] EMISSION_MACROBLOCK mb={} epoch={} nodes={} eligible={} pool2={:?} pool3={:?}", 
+                                         index, index / EMISSION_MACROBLOCK_INTERVAL, 
                                          heartbeat_summaries.len(), eligible,
                                          pool2_total, pool3_total);
                             }

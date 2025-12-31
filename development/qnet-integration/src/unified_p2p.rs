@@ -12688,16 +12688,20 @@ impl SimplifiedP2P {
     /// Now uses block_height stored in HeartbeatRecord for deterministic filtering:
     /// - epoch_start_height = 14400 → heartbeats from blocks 0-14399
     /// - epoch_start_height = 28800 → heartbeats from blocks 14400-28799
-    pub fn get_heartbeat_summaries_for_macroblock(&self, epoch_start_height: u64) -> Vec<qnet_state::HeartbeatSummary> {
+    pub fn get_heartbeat_summaries_for_macroblock(&self, consensus_start_height: u64) -> Vec<qnet_state::HeartbeatSummary> {
         const BLOCKS_PER_EPOCH: u64 = 14400;    // 1 block per second, 4 hours
         
-        // Calculate epoch boundaries based on block height (100% deterministic)
-        let epoch_number = (epoch_start_height / BLOCKS_PER_EPOCH) + 1;
-        let window_start_height = epoch_start_height.saturating_sub(BLOCKS_PER_EPOCH);
-        let window_end_height = epoch_start_height;
+        // FIX v2.65: Calculate correct epoch boundaries based on ANY height within the epoch
+        // The caller passes consensus_start_height (e.g., 14311 for mb=160)
+        // We need to find the EPOCH that this height belongs to:
+        // - height 14311 belongs to epoch 1 (blocks 0-14399)
+        // - height 28711 belongs to epoch 2 (blocks 14400-28799)
+        let epoch_number = (consensus_start_height / BLOCKS_PER_EPOCH) + 1;  // 1-based
+        let window_end_height = epoch_number * BLOCKS_PER_EPOCH;  // 14400, 28800, etc.
+        let window_start_height = window_end_height - BLOCKS_PER_EPOCH;  // 0, 14400, etc.
         
-        println!("[INFO][HEARTBEAT] epoch_window epoch={} blocks={}-{} (height-based filtering v2.63)", 
-                 epoch_number, window_start_height, window_end_height);
+        println!("[INFO][HEARTBEAT] epoch_window epoch={} blocks={}-{} input_h={} (v2.65 fix)", 
+                 epoch_number, window_start_height, window_end_height, consensus_start_height);
         
         // Get heartbeat history
         let history = match self.heartbeat_history.read() { 
