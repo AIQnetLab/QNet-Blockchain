@@ -1161,7 +1161,19 @@ impl BlockchainNode {
     /// PRODUCTION v2.43.1: Takes explicit emission_block_height parameter
     /// This fixes off-by-one bug where window_end was current_height (N-1) instead of emission block (N)
     /// v2.53: Returns Result<bool, Error> - true if emission created, false if no eligible nodes
+    /// OLD function - kept for backward compatibility
+    /// v2.68: Now delegates to process_reward_window_internal with add_to_mempool=true
     pub async fn process_reward_window(&self, emission_block_height: u64) -> Result<bool, QNetError> {
+        // v2.68: Use internal function with OLD behavior (add TX to mempool)
+        match self.process_reward_window_internal(emission_block_height, true).await {
+            Ok(amount) => Ok(amount > 0),
+            Err(e) => Err(e),
+        }
+    }
+    
+    /// DEPRECATED: Old implementation - keeping for reference during transition
+    #[allow(dead_code)]
+    async fn process_reward_window_legacy(&self, emission_block_height: u64) -> Result<bool, QNetError> {
         if is_info() { println!("[INFO][REWARDS] processing_window emission_block={}", emission_block_height); }
         
         let mut reward_manager = self.reward_manager.write().await;
@@ -1627,30 +1639,24 @@ impl BlockchainNode {
         Ok(true) // v2.53: Emission created successfully
     }
     
-    /// v2.67: Process reward window and RETURN emission TX (don't add to mempool)
-    /// This follows Bitcoin/Ethereum pattern: coinbase TX goes directly into block
-    /// NOTE: Heartbeats are already synced via process_reward_window - this just creates TX
+    /// v2.68: Process reward window and RETURN emission TX (don't add to mempool)
+    /// 
+    /// Uses process_reward_window_internal() which does all the heavy lifting:
+    /// - Collects heartbeats/attestations from gossip-synced data
+    /// - Calculates rewards for eligible nodes  
+    /// - Calls emit_rewards() to update total_supply
+    /// - Saves pending_rewards for lazy claiming
+    /// 
+    /// This function just creates TX WITHOUT adding to mempool (direct to block)
     pub async fn process_reward_window_v2(&self, emission_block_height: u64) -> Result<Option<qnet_state::Transaction>, QNetError> {
         if is_info() { println!("[INFO][REWARDS] v2_processing h={}", emission_block_height); }
         
-        // First, run the original process_reward_window to sync heartbeats and calculate rewards
-        // It will try to add TX to mempool (which may fail), but we'll create our own TX
-        // v2.67: Ignore result - we create TX regardless (mempool add may fail but rewards are calculated)
-        let _ = self.process_reward_window(emission_block_height).await;
+        // v2.68: Use internal function that does NOT add TX to mempool
+        // This reuses ALL existing reward calculation logic (no duplication!)
+        let emission_amount = self.process_reward_window_internal(emission_block_height, false).await?;
         
-        // Check if there were eligible nodes
-        let reward_manager = self.reward_manager.read().await;
-        let pending_rewards = reward_manager.get_all_pending_rewards();
-        
-        if pending_rewards.is_empty() {
-            if is_warn() { println!("[WARN][REWARDS] v2_no_eligible_nodes"); }
-            return Ok(None);
-        }
-        
-        // Calculate total emission
-        let total_emission: u64 = pending_rewards.iter().map(|(_, amount)| amount).sum();
-        
-        if total_emission == 0 {
+        if emission_amount == 0 {
+            if is_warn() { println!("[WARN][REWARDS] v2_no_emission amount=0"); }
             return Ok(None);
         }
         
@@ -1666,17 +1672,17 @@ impl BlockchainNode {
         let mut emission_tx = qnet_state::Transaction {
             from: "system_emission".to_string(),
             to: Some("system_rewards_pool".to_string()),
-            amount: total_emission,
+            amount: emission_amount,
             tx_type: qnet_state::TransactionType::RewardDistribution,
             timestamp: current_time,
             hash: String::new(),
             signature: None,
             public_key: None,
-            gas_price: 0, // v2.67: No gas for system TX (direct to block)
+            gas_price: 0, // v2.68: No gas for system TX (direct to block)
             gas_limit: 0,
             nonce: 0,
             data: Some(format!("Emission: {} QNC, Epoch: {}, Total Supply: {} QNC", 
-                             total_emission / 1_000_000_000, 
+                             emission_amount / 1_000_000_000, 
                              emission_block_height / EMISSION_INTERVAL_BLOCKS, 
                              total_supply / 1_000_000_000)),
             dilithium_signature: None,
@@ -1687,10 +1693,221 @@ impl BlockchainNode {
         
         if is_info() { 
             println!("[INFO][REWARDS] v2_emission_tx_created amount={} (direct to block)", 
-                    total_emission / 1_000_000_000); 
+                    emission_amount / 1_000_000_000); 
         }
         
         Ok(Some(emission_tx))
+    }
+    
+    /// v2.68: Internal reward processing - shared by process_reward_window and process_reward_window_v2
+    /// Returns emission amount (0 if no eligible nodes)
+    /// 
+    /// add_to_mempool: 
+    ///   - true = OLD behavior (add TX to mempool) - for backward compatibility
+    ///   - false = NEW behavior (just calculate, caller creates TX) - for v2
+    async fn process_reward_window_internal(&self, emission_block_height: u64, add_to_mempool: bool) -> Result<u64, QNetError> {
+        if is_info() { println!("[INFO][REWARDS] processing_window emission_block={} add_mempool={}", emission_block_height, add_to_mempool); }
+        
+        let mut reward_manager = self.reward_manager.write().await;
+        
+        // CRITICAL: Build Merkle commitment with sampling for scalable deterministic emission
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let window_start = current_time - (current_time % (4 * 60 * 60));
+        
+        let window_end_height = emission_block_height;
+        let window_start_height = emission_block_height.saturating_sub(EMISSION_INTERVAL_BLOCKS);
+        
+        if is_debug() { println!("[DBG][REWARDS] merkle_build window={}-{}", window_start_height, window_end_height); }
+        
+        // Get P2P for gossip-synced data
+        let p2p = match self.get_unified_p2p() {
+            Some(p2p) => p2p,
+            None => {
+                if is_warn() { println!("[WARN][REWARDS] p2p_unavailable fallback=local_storage"); }
+                self.process_reward_window_local(&mut reward_manager, window_start, emission_block_height).await?;
+                
+                // Get pending rewards after local processing
+                let pending_rewards = reward_manager.get_all_pending_rewards();
+                let total_emission: u64 = pending_rewards.iter().map(|(_, amount)| amount).sum();
+                return Ok(total_emission);
+            }
+        };
+        
+        // STEP 1A: Collect Light node attestations
+        let light_attestations = p2p.get_attestations_for_block_range(window_start_height, window_end_height);
+        if is_info() { println!("[INFO][ATTESTATION] block_range_filter start={} end={} found={}", 
+                                window_start_height, window_end_height, light_attestations.len()); }
+        
+        // Process Light node attestations  
+        // Light nodes are ALWAYS Light type (they only submit attestations, not heartbeats)
+        for (light_node_id, _slot, _pinger_id, _timestamp, _block_height) in &light_attestations {
+            // Get wallet from storage registration, fallback to generated
+            let wallet = self.storage.load_node_registration(light_node_id)
+                .ok()
+                .flatten()
+                .map(|(_, w, _)| w)
+                .unwrap_or_else(|| generate_eon_address_from_id(light_node_id));
+            
+            let _ = reward_manager.register_node(light_node_id.clone(), qnet_consensus::NodeType::Light, wallet);
+            // Light nodes: attestation = 1 successful ping, latency not measured (use 0)
+            let _ = reward_manager.record_ping_attempt(light_node_id, true, 0);
+        }
+        
+        // STEP 1B: Collect Full/Super node heartbeats
+        let heartbeats = p2p.get_heartbeats_for_block_range(window_start_height, window_end_height);
+        if is_info() { println!("[INFO][HEARTBEAT] block_range_filter start={} end={} found={}", 
+                                window_start_height, window_end_height, heartbeats.len()); }
+        
+        // Count heartbeats per node
+        let mut heartbeat_counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+        for (node_id, _, _, _) in &heartbeats {
+            *heartbeat_counts.entry(node_id.clone()).or_insert(0) += 1;
+        }
+        
+        // Register Full/Super nodes from heartbeats
+        for (node_id, count) in &heartbeat_counts {
+            // Get node type from STORAGE registration (REQUIRED - no defaults!)
+            // Storage has: (node_type_str, wallet, reputation)
+            let registration = match self.storage.load_node_registration(node_id) {
+                Ok(Some((type_str, wallet, _reputation))) => {
+                    let nt = match type_str.to_lowercase().as_str() {
+                        "super" => qnet_consensus::NodeType::Super,
+                        "full" => qnet_consensus::NodeType::Full,
+                        "light" => qnet_consensus::NodeType::Light,
+                        unknown => {
+                            eprintln!("[ERR][REWARDS] invalid_node_type node={} type={} SKIPPING", node_id, unknown);
+                            continue; // Skip this node - invalid type!
+                        }
+                    };
+                    Some((nt, wallet))
+                }
+                Ok(None) => {
+                    // Node not registered - check if genesis (they're pre-registered)
+                    if node_id.starts_with("genesis_node_") {
+                        // Genesis nodes are hardcoded Super nodes
+                        Some((qnet_consensus::NodeType::Super, generate_eon_address_from_id(node_id)))
+                    } else {
+                        eprintln!("[ERR][REWARDS] node_not_registered node={} SKIPPING", node_id);
+                        continue; // Skip - node must be registered to receive rewards!
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[ERR][REWARDS] storage_error node={} err={} SKIPPING", node_id, e);
+                    continue;
+                }
+            };
+            
+            let (node_type, wallet) = match registration {
+                Some(r) => r,
+                None => continue,
+            };
+            
+            let _ = reward_manager.register_node(node_id.clone(), node_type, wallet);
+            
+            // Record heartbeats as successful pings
+            // Heartbeat latency is not stored in current format, use 0 (not measured)
+            for _ in 0..*count {
+                let _ = reward_manager.record_ping_attempt(node_id, true, 0);
+            }
+        }
+        
+        if is_info() { 
+            println!("[INFO][REWARDS] heartbeats_found n={} source=block_range h={}-{}", 
+                    heartbeats.len(), window_start_height, window_end_height); 
+        }
+        
+        // Force process window to calculate rewards
+        if let Err(e) = reward_manager.force_process_window() {
+            eprintln!("[ERR][REWARDS] force_process_fail err={}", e);
+        }
+        
+        // Get pending rewards
+        let pending_rewards = reward_manager.get_all_pending_rewards();
+        
+        if pending_rewards.is_empty() {
+            return Ok(0);
+        }
+        
+        // Calculate total emission
+        let total_emission: u64 = pending_rewards.iter().map(|(_, amount)| amount).sum();
+        
+        if total_emission == 0 {
+            return Ok(0);
+        }
+        
+        // CRITICAL: Update total supply
+        let state = self.state.read().await;
+        let emission_result = (*state).emit_rewards(total_emission);
+        drop(state);
+        
+        let actual_emission = match emission_result {
+            Ok(amount) => {
+                if is_info() { println!("[INFO][REWARDS] EMISSION_COMPLETE amount={} eligible={}", 
+                         amount / 1_000_000_000, pending_rewards.len()); }
+                amount
+            }
+            Err(e) => {
+                eprintln!("[ERR][REWARDS] emission_failed err={}", e);
+                return Err(QNetError::ConsensusError(format!("Failed to emit rewards: {}", e)));
+            }
+        };
+        
+        // Save pending rewards to storage
+        for (node_id, _amount) in &pending_rewards {
+            if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
+                if let Err(e) = self.storage.save_pending_reward(&node_id, reward) {
+                    eprintln!("[WARN][REWARDS] pending_reward_save_fail node={} err={}", node_id, e);
+                }
+            }
+        }
+        
+        // v2.68: Only add TX to mempool if requested (OLD behavior)
+        if add_to_mempool && actual_emission > 0 {
+            drop(reward_manager); // Release lock before async call
+            
+            let current_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            
+            let state = self.state.read().await;
+            let total_supply = (*state).get_total_supply();
+            drop(state);
+            
+            let mut emission_tx = qnet_state::Transaction {
+                from: "system_emission".to_string(),
+                to: Some("system_rewards_pool".to_string()),
+                amount: actual_emission,
+                tx_type: qnet_state::TransactionType::RewardDistribution,
+                timestamp: current_time,
+                hash: String::new(),
+                signature: None,
+                public_key: None,
+                gas_price: u64::MAX, // MAX priority for OLD behavior
+                gas_limit: 0,
+                nonce: 0,
+                data: Some(format!("Emission: {} QNC, Window: {}, Total Supply: {} QNC", 
+                                 actual_emission / 1_000_000_000, 
+                                 current_time / (4 * 60 * 60), 
+                                 total_supply / 1_000_000_000)),
+                dilithium_signature: None,
+                dilithium_public_key: None,
+            };
+            
+            emission_tx.hash = emission_tx.calculate_hash();
+            
+            if let Err(e) = self.add_transaction_to_mempool(emission_tx).await {
+                eprintln!("[ERR][REWARDS] emission_tx_mempool_fail err={}", e);
+                return Err(QNetError::ConsensusError(format!("Emission TX failed to add to mempool: {}", e)));
+            } else {
+                if is_info() { println!("[INFO][REWARDS] emission_tx_added_to_mempool"); }
+            }
+        }
+        
+        Ok(actual_emission)
     }
     
     /// Fallback: Process reward window using local storage (when P2P unavailable)
@@ -8317,11 +8534,23 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         println!("[DBG][PARALLEL] valid_time={:?} tx_count={}", valid_time, validated.len());
                     }
                     
-                    // STEP 3: Collect results (sequential, but fast)
-                    let mut txs = Vec::with_capacity(validated.len());
+                    // STEP 3: Collect results and SEPARATE system TX from user TX
+                    // v2.68: System TX bypass ParallelExecutor (it doesn't support them!)
+                    let mut system_txs: Vec<qnet_state::Transaction> = Vec::new();
+                    let mut user_txs: Vec<qnet_state::Transaction> = Vec::new();
+                    
                     for (hash, tx, is_valid) in validated {
                         if is_valid {
-                            txs.push(tx);
+                            // v2.68: Separate system TX from user TX
+                            let is_system = tx.from == "system_emission" 
+                                || tx.from == "system_ping_commitment"
+                                || tx.from.starts_with("system_");
+                            
+                            if is_system {
+                                system_txs.push(tx);
+                            } else {
+                                user_txs.push(tx);
+                            }
                             included_tx_hashes.push(hash);
                         } else {
                             invalid_tx_hashes.push(hash);
@@ -8331,28 +8560,41 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     drop(state_snapshot);  // Release read lock
                     
                     // CRITICAL v2.26: Remove invalid transactions from mempool immediately!
-                    // This prevents them from blocking block production forever
-                    // v2.26: Direct access - SimpleMempool is already thread-safe
                     if !invalid_tx_hashes.is_empty() {
                         mempool.batch_remove_transactions(&invalid_tx_hashes);
                         println!("[MEMPOOL] 🗑️ Removed {} invalid TX (bad nonce/balance)", invalid_tx_hashes.len());
                     }
                     
-                    // PARALLEL EXECUTOR: Process transactions in parallel if available
+                    // v2.68: Log separation
+                    if !system_txs.is_empty() || !user_txs.is_empty() {
+                        println!("[INFO][BLOCK] tx_separation system={} user={}", system_txs.len(), user_txs.len());
+                    }
+                    
+                    // PARALLEL EXECUTOR: Process ONLY USER transactions (not system!)
+                    // v2.68: ParallelExecutor doesn't support system TX (returns empty for them)
+                    let mut processed_user_txs = user_txs.clone();
                     if let Some(ref executor) = parallel_executor {
-                        if !txs.is_empty() {
-                            match executor.process_transactions(txs.clone()).await {
-                                Ok(processed_txs) => {
-                                    println!("[ParallelExecutor] ✅ Processed {} transactions in parallel", processed_txs.len());
-                                    txs = processed_txs;
+                        if !user_txs.is_empty() {
+                            match executor.process_transactions(user_txs).await {
+                                Ok(processed) => {
+                                    println!("[ParallelExecutor] ✅ Processed {} user transactions in parallel", processed.len());
+                                    processed_user_txs = processed;
                                 },
                                 Err(e) => {
                                     println!("[ParallelExecutor] ⚠️ Parallel processing failed: {}, using fallback", e);
-                                    // Continue with original transactions
+                                    // Continue with original user transactions
                                 }
                             }
                         }
                     }
+                    
+                    // v2.68: Combine: system TX first (already validated), then processed user TX
+                    // Order: [system_emission, system_ping, ..., user_tx_1, user_tx_2, ...]
+                    let mut txs: Vec<qnet_state::Transaction> = Vec::with_capacity(
+                        system_txs.len() + processed_user_txs.len()
+                    );
+                    txs.extend(system_txs);
+                    txs.extend(processed_user_txs);
                     
                     // PRE-EXECUTION: Update leader schedule and pre-execute if we're a future leader
                     {
