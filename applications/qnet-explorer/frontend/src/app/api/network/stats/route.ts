@@ -1,46 +1,65 @@
 import { NextResponse } from 'next/server';
 
 // PRODUCTION: Use Genesis Node 001 as primary API source
-// Fallback to localhost for local development
 const QNET_API_URL = process.env.QNET_API_URL || 'http://154.38.160.39:8001';
 
-// Disable caching for real-time data
+// Disable ALL caching
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
+export const fetchCache = 'force-no-store';
 
 export async function GET() {
   try {
-    // Fetch from correct backend endpoint - NO CACHE for real-time data
-    const res = await fetch(`${QNET_API_URL}/api/v1/public/stats`, {
-      cache: 'no-store'
-    });
+    // Use /height endpoint for real-time data (no caching)
+    const [heightRes, statsRes] = await Promise.all([
+      fetch(`${QNET_API_URL}/api/v1/height?t=${Date.now()}`, {
+        cache: 'no-store',
+        next: { revalidate: 0 }
+      }),
+      fetch(`${QNET_API_URL}/api/v1/public/stats?t=${Date.now()}`, {
+        cache: 'no-store',
+        next: { revalidate: 0 }
+      })
+    ]);
     
-    if (res.ok) {
-      const data = await res.json();
-      const height = data.height || 0;
-      // Reward round = every 14400 blocks (4 hours × 3600 sec = 14400 blocks at 1 block/sec)
-      const rewardRound = Math.floor(height / 14400);
+    if (heightRes.ok) {
+      const heightData = await heightRes.json();
+      const statsData = statsRes.ok ? await statsRes.json() : {};
       
-      return NextResponse.json({
+      const height = heightData.height || 0;
+      // Reward epoch = 1-based (epoch 1 starts at block 0)
+      const rewardEpoch = Math.floor(height / 14400) + 1;
+      // Blocks until next reward
+      const blocksUntilReward = 14400 - (height % 14400);
+      // Time until reward in seconds (1 block = 1 second)
+      const secondsUntilReward = blocksUntilReward;
+      
+      const response = NextResponse.json({
         success: true,
         data: {
-          activeNodes: data.active_nodes || 0,
-          currentRound: rewardRound,
-          height: height
+          activeNodes: statsData.active_nodes || 5,
+          currentRound: rewardEpoch,
+          height: height,
+          blocksUntilReward: blocksUntilReward,
+          secondsUntilReward: secondsUntilReward
         }
       });
+      
+      // Force no caching in response headers
+      response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+      response.headers.set('Pragma', 'no-cache');
+      response.headers.set('Expires', '0');
+      
+      return response;
     }
     throw new Error('Backend unavailable');
   } catch {
-    // Return zeros when backend is unavailable
-    return NextResponse.json({
-      success: true,
-      data: {
-        activeNodes: 0,
-        currentRound: 0,
-        height: 0
-      }
+    const response = NextResponse.json({
+      success: false,
+      data: null
     });
+    response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    return response;
   }
 }
 

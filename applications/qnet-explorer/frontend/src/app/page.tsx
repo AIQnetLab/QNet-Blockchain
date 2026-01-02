@@ -7,19 +7,30 @@ interface NetworkStats {
   activeNodes: number;
   currentRound: number;
   height: number;
+  blocksUntilReward: number;
+  secondsUntilReward: number;
 }
 
 export default function HomePage() {
-  const [stats, setStats] = useState<NetworkStats>({
-    activeNodes: 0,
-    currentRound: 0,
-    height: 0
-  });
+  const [stats, setStats] = useState<NetworkStats | null>(null);
+
+  // Helper to format time remaining
+  const formatTimeRemaining = (seconds: number): string => {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (hours > 0) {
+      return `~${hours}h ${minutes}m`;
+    }
+    return `~${minutes}m`;
+  };
 
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const res = await fetch('/api/network/stats');
+        // Add timestamp to bypass browser cache
+        const res = await fetch(`/api/network/stats?t=${Date.now()}`, {
+          cache: 'no-store'
+        });
         const data = await res.json();
         if (data.success && data.data) {
           setStats(data.data);
@@ -29,7 +40,7 @@ export default function HomePage() {
       }
     };
     fetchStats();
-    const interval = setInterval(fetchStats, 10000);
+    const interval = setInterval(fetchStats, 5000); // Update every 5 seconds
     return () => clearInterval(interval);
   }, []);
   
@@ -58,7 +69,7 @@ export default function HomePage() {
           
           <div className="hero-stats">
             <div className="stat-card">
-              <div className="stat-number">{stats.activeNodes || '—'}</div>
+              <div className="stat-number">{stats?.activeNodes || '—'}</div>
               <div className="stat-label">ACTIVE NODES</div>
               <div className="stat-trend">Live data</div>
             </div>
@@ -68,9 +79,11 @@ export default function HomePage() {
               <div className="stat-trend">256 shards available</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">{stats.currentRound || '—'}</div>
+              <div className="stat-number">{stats?.currentRound || '—'}</div>
               <div className="stat-label">REWARD EPOCH</div>
-              <div className="stat-trend">Every 4 hours</div>
+              <div className="stat-trend">
+                {stats ? `Next: ${stats.blocksUntilReward.toLocaleString()} blocks (${formatTimeRemaining(stats.secondsUntilReward)})` : 'Loading...'}
+              </div>
             </div>
             <div className="stat-card">
               <div className="stat-number">4.29B</div>

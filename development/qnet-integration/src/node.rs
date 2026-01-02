@@ -1627,6 +1627,72 @@ impl BlockchainNode {
         Ok(true) // v2.53: Emission created successfully
     }
     
+    /// v2.67: Process reward window and RETURN emission TX (don't add to mempool)
+    /// This follows Bitcoin/Ethereum pattern: coinbase TX goes directly into block
+    /// NOTE: Heartbeats are already synced via process_reward_window - this just creates TX
+    pub async fn process_reward_window_v2(&self, emission_block_height: u64) -> Result<Option<qnet_state::Transaction>, QNetError> {
+        if is_info() { println!("[INFO][REWARDS] v2_processing h={}", emission_block_height); }
+        
+        // First, run the original process_reward_window to sync heartbeats and calculate rewards
+        // It will try to add TX to mempool (which may fail), but we'll create our own TX
+        // v2.67: Ignore result - we create TX regardless (mempool add may fail but rewards are calculated)
+        let _ = self.process_reward_window(emission_block_height).await;
+        
+        // Check if there were eligible nodes
+        let reward_manager = self.reward_manager.read().await;
+        let pending_rewards = reward_manager.get_all_pending_rewards();
+        
+        if pending_rewards.is_empty() {
+            if is_warn() { println!("[WARN][REWARDS] v2_no_eligible_nodes"); }
+            return Ok(None);
+        }
+        
+        // Calculate total emission
+        let total_emission: u64 = pending_rewards.iter().map(|(_, amount)| amount).sum();
+        
+        if total_emission == 0 {
+            return Ok(None);
+        }
+        
+        // Create emission TX (DON'T add to mempool - will be added directly to block)
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let state = self.state.read().await;
+        let total_supply = (*state).get_total_supply();
+        
+        let mut emission_tx = qnet_state::Transaction {
+            from: "system_emission".to_string(),
+            to: Some("system_rewards_pool".to_string()),
+            amount: total_emission,
+            tx_type: qnet_state::TransactionType::RewardDistribution,
+            timestamp: current_time,
+            hash: String::new(),
+            signature: None,
+            public_key: None,
+            gas_price: 0, // v2.67: No gas for system TX (direct to block)
+            gas_limit: 0,
+            nonce: 0,
+            data: Some(format!("Emission: {} QNC, Epoch: {}, Total Supply: {} QNC", 
+                             total_emission / 1_000_000_000, 
+                             emission_block_height / EMISSION_INTERVAL_BLOCKS, 
+                             total_supply / 1_000_000_000)),
+            dilithium_signature: None,
+            dilithium_public_key: None,
+        };
+        
+        emission_tx.hash = emission_tx.calculate_hash();
+        
+        if is_info() { 
+            println!("[INFO][REWARDS] v2_emission_tx_created amount={} (direct to block)", 
+                    total_emission / 1_000_000_000); 
+        }
+        
+        Ok(Some(emission_tx))
+    }
+    
     /// Fallback: Process reward window using local storage (when P2P unavailable)
     async fn process_reward_window_local(
         &self, 
@@ -8011,38 +8077,35 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // CRITICAL: Only producer of emission block creates emission transaction
                     let is_emission_block = next_block_height % EMISSION_INTERVAL_BLOCKS == 0 && next_block_height > 0;
                     
+                    // v2.67: Store emission TX to add DIRECTLY to block (bypass mempool!)
+                    let mut direct_emission_tx: Option<qnet_state::Transaction> = None;
+                    
                     if is_emission_block {
                         // v2.65: Epoch = block / 14400 (epoch 1 = blocks 0-14399, epoch 2 = 14400-28799)
                         println!("[EMISSION] 🎯 Block #{} is EMISSION BLOCK (epoch #{})", 
                                 next_block_height, next_block_height / EMISSION_INTERVAL_BLOCKS);
                         println!("[EMISSION] 💰 Processing reward window as block producer...");
                         
-                        // Process reward window: calculate + emit + sign + add to mempool
-                        // This EXISTING method does everything: sync pings, calculate rewards, 
-                        // emit tokens, create transaction, sign with system key, add to mempool
-                        // PRODUCTION v2.43.1: Pass explicit emission_block_height to fix off-by-one bug
-                        // v2.53: process_reward_window returns Ok(true) if emission created, Ok(false) if no eligible nodes
-                        match blockchain_for_emission.process_reward_window(next_block_height).await {
-                            Ok(emission_created) => {
-                                if emission_created {
-                                    println!("[EMISSION] ✅ Emission transaction created and added to mempool");
-                                } else {
-                                    println!("[EMISSION] ⚠️ No eligible nodes in window - emission skipped");
-                                }
+                        // v2.67: process_reward_window now RETURNS emission TX instead of adding to mempool
+                        match blockchain_for_emission.process_reward_window_v2(next_block_height).await {
+                            Ok(Some(emission_tx)) => {
+                                println!("[EMISSION] ✅ Emission TX created (will add directly to block)");
+                                direct_emission_tx = Some(emission_tx);
+                            }
+                            Ok(None) => {
+                                println!("[EMISSION] ⚠️ No eligible nodes in window - emission skipped");
                             }
                             Err(e) => {
                                 eprintln!("[EMISSION] ❌ Failed to process emission: {}", e);
-                                // Continue with block production even if emission fails
-                                // Emission will be retried in next window or by emergency producer
                             }
                         }
                     }
                     
                     // MEV PROTECTION: Get transactions with bundle priority
                     // ARCHITECTURE: Dynamic 0-20% allocation for bundles, 80-100% for public TXs
-                    // NOTE: If emission block, mempool contains emission transaction as FIRST tx
+                    // v2.67: Renamed to mempool_txs - emission TX added separately
                     // PRODUCTION v2.26: All paths use (hash, bytes) format for proper mempool cleanup
-                    let tx_bytes_list: Vec<(String, Vec<u8>)> = if let Some(ref mev_pool) = mev_mempool {
+                    let mempool_txs: Vec<(String, Vec<u8>)> = if let Some(ref mev_pool) = mev_mempool {
                         // MEV-AWARE BLOCK BUILDING
                         let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                         let mut block_txs: Vec<(String, Vec<u8>)> = Vec::new();
@@ -8117,13 +8180,31 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // NO MEV PROTECTION: Use public mempool only
                         // v2.26: Direct access - SimpleMempool is already thread-safe
                         
-                        // v2.66: Diagnostic log for emission blocks or when mempool has TX
+                        // v2.67: Get transactions from mempool
                         let mempool_size = mempool.size();
-                        if mempool_size > 0 || next_block_height % EMISSION_INTERVAL_BLOCKS == 0 {
+                        if mempool_size > 0 {
                             println!("[INFO][MEMPOOL] pre_fetch h={} size={}", next_block_height, mempool_size);
                         }
                         
                         mempool.get_pending_transactions_with_hashes(max_tx_per_microblock)
+                    };
+                    
+                    // v2.67: CRITICAL - Add emission TX DIRECTLY to block (bypass mempool!)
+                    // This is how top L1s work: Bitcoin coinbase, Ethereum block reward
+                    let tx_bytes_list: Vec<(String, Vec<u8>)> = if let Some(emission_tx) = direct_emission_tx {
+                        // Serialize emission TX
+                        let tx_bytes = bincode::serialize(&emission_tx).unwrap_or_default();
+                        let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
+                        
+                        println!("[EMISSION] 📦 Adding emission TX directly to block (hash={})", 
+                                &tx_hash[..16.min(tx_hash.len())]);
+                        
+                        // Emission TX FIRST, then mempool TX
+                        let mut all_txs = vec![(tx_hash, tx_bytes)];
+                        all_txs.extend(mempool_txs);  // v2.67: Use renamed variable
+                        all_txs
+                    } else {
+                        mempool_txs  // v2.67: Use renamed variable
                     };
                     
                     // ═══════════════════════════════════════════════════════════════════════════

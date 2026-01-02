@@ -829,7 +829,25 @@ impl PhaseAwareRewardManager {
                     total_reward,
                 };
                 
-                self.pending_rewards.insert(summary.node_id.clone(), reward);
+                // v2.67: CRITICAL FIX - Accumulate rewards instead of overwriting!
+                // This ensures unclaimed rewards from previous epochs are preserved
+                self.pending_rewards
+                    .entry(summary.node_id.clone())
+                    .and_modify(|existing| {
+                        // Accumulate all pools
+                        existing.pool1_base_emission += reward.pool1_base_emission;
+                        existing.pool2_transaction_fees += reward.pool2_transaction_fees;
+                        existing.pool3_activation_bonus += reward.pool3_activation_bonus;
+                        existing.total_reward += reward.total_reward;
+                        // Update phase to current (rewards span multiple phases)
+                        existing.current_phase = reward.current_phase.clone();
+                        
+                        println!("[INFO][REWARDS] accumulated node={} new={} total={}", 
+                                &summary.node_id[..16.min(summary.node_id.len())],
+                                total_reward / 1_000_000_000,
+                                existing.total_reward / 1_000_000_000);
+                    })
+                    .or_insert(reward);
             }
         }
         
