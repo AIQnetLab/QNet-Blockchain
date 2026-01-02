@@ -219,12 +219,13 @@ impl SecurityValidator {
     /// Check if validator is a bootstrap node
     fn is_bootstrap_validator(&self, validator: &str) -> bool {
         // Bootstrap validators (format: 19+3+15+4=41 chars)
+        // v2.66: Updated to Ed25519-based addresses
         matches!(validator,
-            "7bc83500fd08525250feonff5503d0dce4dbdede8" |
-            "714a0f700a4dbcc0d88eonf635ace76ed2eb9a186" |
-            "357842d58e86cc300cfeon0203e16eef3e7044db1" |
-            "4f710f9b3152659c56aeond4c05f2731a1890aedf" |
-            "8fa8ebe9e85dee95080eond0a7365096572f03e1c"
+            "f36ff465a0944fd06cdeonfca0ad004ff9db46743" |
+            "0bac6225a082de1f659eond0c96f1706cf19c35eb" |
+            "d216bb23fbe7f853636eon3f16b378b91922701a6" |
+            "e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e" |
+            "02af45d56bd1f5d9002eon0eb1c522f96a2f440b8"
         )
     }
 }

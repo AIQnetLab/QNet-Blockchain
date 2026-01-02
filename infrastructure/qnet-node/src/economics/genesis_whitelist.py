@@ -60,33 +60,34 @@ class GenesisWhitelist:
     def _create_default_whitelist(self):
         """Create default whitelist for genesis"""
         # Genesis validators - 5 bootstrap nodes (format: 19+3+15+4=41 chars)
+        # v2.66: Updated to Ed25519-based addresses
         genesis_validators = [
             {
-                "address": "7bc83500fd08525250feonff5503d0dce4dbdede8",
+                "address": "f36ff465a0944fd06cdeonfca0ad004ff9db46743",
                 "description": "Genesis Bootstrap Node 1 - Primary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "714a0f700a4dbcc0d88eonf635ace76ed2eb9a186", 
+                "address": "0bac6225a082de1f659eond0c96f1706cf19c35eb", 
                 "description": "Genesis Bootstrap Node 2 - Secondary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "357842d58e86cc300cfeon0203e16eef3e7044db1",
+                "address": "d216bb23fbe7f853636eon3f16b378b91922701a6",
                 "description": "Genesis Bootstrap Node 3 - Tertiary", 
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "4f710f9b3152659c56aeond4c05f2731a1890aedf",
+                "address": "e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e",
                 "description": "Genesis Bootstrap Node 4 - Quaternary", 
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "8fa8ebe9e85dee95080eond0a7365096572f03e1c",
+                "address": "02af45d56bd1f5d9002eon0eb1c522f96a2f440b8",
                 "description": "Genesis Bootstrap Node 5 - Quinary",
                 "free_activations": 1,
                 "priority_access": True

@@ -4301,12 +4301,17 @@ async fn handle_network_ping(
 /// - Reward claims: "claim_rewards:{node_id}:{wallet}"
 /// - Batch transfers: "batch_transfer:{from}:{total}:{count}:{batch_id}"
 async fn verify_ed25519_client_signature(
-    _context: &str,        // For logging only (e.g., "from", "node_id")
+    context: &str,         // For logging only (e.g., "from", "node_id")
     message: &str,         // ACTUAL message that was signed by client
     signature_hex: &str,
     public_key_hex: &str
 ) -> bool {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    
+    // v2.66: Detailed logging for debugging signature issues
+    println!("[CRYPTO] Ed25519 verify for context={}", context);
+    println!("[CRYPTO]   message={}", message);
+    println!("[CRYPTO]   sig_len={} pubkey_len={}", signature_hex.len(), public_key_hex.len());
     
     // Basic validation
     if signature_hex.len() != 128 {  // 64 bytes = 128 hex chars
@@ -6378,6 +6383,15 @@ async fn handle_claim_rewards(
     // PRODUCTION: Verify Ed25519 signature from client (NOT Dilithium - that's for node consensus only)
     // Client signs: "claim_rewards:{node_id}:{wallet_address}"
     let claim_message = format!("claim_rewards:{}:{}", claim_request.node_id, claim_request.wallet_address);
+    
+    // v2.66: Diagnostic logging for signature verification
+    println!("[CLAIM] Verifying Ed25519 signature:");
+    println!("[CLAIM]   node_id: {}", claim_request.node_id);
+    println!("[CLAIM]   wallet: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
+    println!("[CLAIM]   message: {}", claim_message);
+    println!("[CLAIM]   sig_len: {}, pubkey_len: {}", 
+             claim_request.quantum_signature.len(), claim_request.public_key.len());
+    
     let signature_valid = verify_ed25519_client_signature(
         &claim_request.node_id,  // context for logging
         &claim_message,          // actual signed message
@@ -6386,12 +6400,21 @@ async fn handle_claim_rewards(
     ).await;
     
     if !signature_valid {
+        println!("[CLAIM] ❌ Ed25519 signature verification FAILED");
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "Invalid Ed25519 signature for reward claim",
-            "message_format": "claim_rewards:{node_id}:{wallet_address}"
+            "message_format": "claim_rewards:{node_id}:{wallet_address}",
+            "debug": {
+                "node_id": claim_request.node_id,
+                "wallet_preview": &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())],
+                "sig_len": claim_request.quantum_signature.len(),
+                "pubkey_len": claim_request.public_key.len()
+            }
         })));
     }
+    
+    println!("[CLAIM] ✅ Ed25519 signature verified successfully");
     
     // CRITICAL FIX: Get the ACTUAL wallet address from node_ownership in reward_manager
     // The wallet was registered during node activation - we MUST use that, not generate a new one!
@@ -9703,7 +9726,7 @@ async fn handle_contract_deploy(
     // Submit to mempool
     match blockchain.add_transaction_to_mempool(tx).await {
         Ok(_) => {
-            println!("📜 Contract deployment submitted: {}", &contract_address[..16]);
+            println!("📜 Contract deployment submitted: {}", &contract_address[..16.min(contract_address.len())]);
             println!("   Security: Ed25519 ✅ | Dilithium: {}", if is_quantum_secure { "✅" } else { "N/A" });
             Ok(warp::reply::json(&json!({
                 "success": true,
@@ -9997,7 +10020,7 @@ async fn handle_contract_call(
     match blockchain.add_transaction_to_mempool(tx).await {
         Ok(_) => {
             println!("📜 Contract call submitted: {}::{}", 
-                     &request.contract_address[..16], request.method);
+                     &request.contract_address[..16.min(request.contract_address.len())], request.method);
             
             Ok(warp::reply::json(&json!({
                 "success": true,
@@ -10584,7 +10607,7 @@ async fn handle_token_deploy(
     ) {
         Ok(token) => {
             println!("[TOKEN] 🪙 QRC-20 deployed: {} ({}) by {}", 
-                     token.name, token.symbol, &request.from[..16]);
+                     token.name, token.symbol, &request.from[..16.min(request.from.len())]);
             
             Ok(warp::reply::json(&json!({
                 "success": true,

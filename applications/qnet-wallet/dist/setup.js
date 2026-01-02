@@ -1893,9 +1893,17 @@ async function generateEONAddress(seedPhrase) {
         // Generate keypair from derived seed
         const privateKey = derivedSeed.slice(0, 32);
         
-        // Generate public key from private key
-        const publicKeyMaterial = await crypto.subtle.digest('SHA-256', privateKey);
-        const publicKey = new Uint8Array(publicKeyMaterial);
+        // CRITICAL v2.66: Generate Ed25519 public key (NOT SHA-256!)
+        // SHA256(privateKey) was cryptographically WRONG - signatures didn't work
+        // Must use Ed25519 curve: publicKey = privateKey * G
+        let publicKey;
+        if (typeof nacl !== 'undefined' && nacl.sign && nacl.sign.keyPair) {
+            const keypair = nacl.sign.keyPair.fromSeed(privateKey);
+            publicKey = keypair.publicKey;
+        } else {
+            // Fallback to background.js ProductionCrypto if nacl not available
+            throw new Error('tweetnacl not available for Ed25519 keypair generation');
+        }
         
         // Generate address from public key
         const addressData = await crypto.subtle.digest('SHA-512', publicKey);

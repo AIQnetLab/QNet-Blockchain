@@ -2322,34 +2322,10 @@ class ProductionCrypto {
             
             keypairSeed = currentKey;
             
-            // Try standard Ed25519 generation with error handling
-            let keypair;
-            try {
-                keypair = await this.ed25519GenerateKeypair(keypairSeed);
-            } catch (edError) {
-                // console.warn('[Solana Keypair] Ed25519 failed, using fallback:', edError.message);
-                
-                // Fallback: Use tweetnacl if available or simple generation
-                if (typeof nacl !== 'undefined' && nacl.sign && nacl.sign.keyPair) {
-                    // Use tweetnacl library if available
-                    const naclKeypair = nacl.sign.keyPair.fromSeed(keypairSeed);
-                    keypair = {
-                        publicKey: naclKeypair.publicKey,
-                        secretKey: naclKeypair.secretKey
-                    };
-                } else {
-                    // Ultimate fallback: generate deterministic keys
-                    const hashData = await crypto.subtle.digest('SHA-512', keypairSeed);
-                    const hashBytes = new Uint8Array(hashData);
-                    
-                    keypair = {
-                        publicKey: hashBytes.slice(32, 64),
-                        secretKey: new Uint8Array(64)
-                    };
-                    keypair.secretKey.set(keypairSeed, 0);
-                    keypair.secretKey.set(keypair.publicKey, 32);
-                }
-            }
+            // Generate Ed25519 keypair (Solana uses Ed25519)
+            // CRITICAL v2.66: Removed SHA-512 fallback - was cryptographically WRONG!
+            // Ed25519 keypair MUST be generated via nacl.sign.keyPair.fromSeed()
+            const keypair = await this.ed25519GenerateKeypair(keypairSeed);
             
             // Generate Solana address from public key
             const address = this.publicKeyToAddress(keypair.publicKey);
@@ -2537,18 +2513,11 @@ class ProductionCrypto {
                 currentChainCode = derivedBytes.slice(32, 64);
             }
             
-            // Step 4: Generate public key from private key
-            // For Ed25519, we need proper key generation
-            let publicKey;
-            try {
-                // Try to use Ed25519 if available
-                const keypair = await this.ed25519GenerateKeypair(currentKey);
-                publicKey = keypair.publicKey;
-            } catch (e) {
-                // Fallback: SHA-256 hash of private key
-                const publicKeyMaterial = await crypto.subtle.digest('SHA-256', currentKey);
-                publicKey = new Uint8Array(publicKeyMaterial);
-            }
+            // Step 4: Generate public key from private key using Ed25519
+            // CRITICAL v2.66: MUST use Ed25519 - SHA-256 fallback was cryptographically WRONG!
+            // SHA256(privateKey) is NOT a valid Ed25519 public key and signatures will fail
+            const keypair = await this.ed25519GenerateKeypair(currentKey);
+            const publicKey = keypair.publicKey;
             
             return {
                 privateKey: currentKey,

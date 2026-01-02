@@ -60,11 +60,16 @@ impl SimpleMempool {
     /// Add raw transaction (optimized with binary option and priority queue)
     /// PRODUCTION: Priority-based insertion for spam protection
     /// gas_price: Transaction gas price for priority sorting (higher = earlier processing)
+    /// Returns: true if added, false if duplicate/full/invalid (NOT an error for duplicates!)
     pub fn add_raw_transaction(&self, tx_json: String, hash: String, gas_price: u64) -> bool {
+        // v2.66: Diagnostic logging for mempool issues
         if self.transactions.len() >= self.config.max_size {
+            eprintln!("[WARN][MEMPOOL] full size={} max={} hash={}", 
+                     self.transactions.len(), self.config.max_size, &hash[..16.min(hash.len())]);
             return false;
         }
         
+        // Duplicate is NORMAL in P2P network (same TX from multiple peers)
         if self.transactions.contains_key(&hash) {
             return false;
         }
@@ -72,7 +77,8 @@ impl SimpleMempool {
         // SECURITY: Verify hash matches transaction data
         let computed_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
         if computed_hash != hash {
-            println!("[MEMPOOL] ⚠️ SECURITY: Hash mismatch! Expected: {}, Got: {}", computed_hash, hash);
+            eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}", 
+                     &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
             return false; // Reject tampered transaction
         }
         
@@ -99,30 +105,45 @@ impl SimpleMempool {
     /// Add binary transaction directly with priority
     /// PRODUCTION: Priority-based insertion for spam protection
     /// gas_price: Transaction gas price for priority sorting (higher = earlier processing)
+    /// Returns: true if added, false if duplicate/full/invalid (NOT an error for duplicates!)
     pub fn add_binary_transaction(&self, tx_bytes: Vec<u8>, hash: String, gas_price: u64) -> bool {
+        // v2.66: Diagnostic logging for mempool issues
         if self.transactions.len() >= self.config.max_size {
+            eprintln!("[WARN][MEMPOOL] full size={} max={} hash={}", 
+                     self.transactions.len(), self.config.max_size, &hash[..16.min(hash.len())]);
             return false;
         }
         
+        // Duplicate is NORMAL in P2P network (same TX from multiple peers)
         if self.transactions.contains_key(&hash) {
+            // Only log at debug level - this is expected behavior
             return false;
         }
         
         // SECURITY: Verify hash matches binary data
         let computed_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
         if computed_hash != hash {
-            println!("[MEMPOOL] ⚠️ SECURITY: Binary hash mismatch! Expected: {}, Got: {}", computed_hash, hash);
+            eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}", 
+                     &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
             return false; // Reject tampered data
         }
         
         self.transactions.insert(hash.clone(), TxStorage::Binary(tx_bytes));
         
         // PRODUCTION: Add to priority queue (sorted by gas_price descending)
-        let mut priority_queue = self.by_gas_price.write();
-        priority_queue
-            .entry(gas_price)
-            .or_insert_with(VecDeque::new)
-            .push_back(hash);
+        {
+            let mut priority_queue = self.by_gas_price.write();
+            priority_queue
+                .entry(gas_price)
+                .or_insert_with(VecDeque::new)
+                .push_back(hash.clone());
+        }
+        
+        // v2.66: Log system TX additions (gas_price == u64::MAX) OUTSIDE lock scope
+        if gas_price == u64::MAX {
+            println!("[INFO][MEMPOOL] system_tx_added hash={} size={}", 
+                    &hash[..16.min(hash.len())], self.transactions.len());
+        }
         
         true
     }

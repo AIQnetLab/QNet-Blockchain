@@ -648,10 +648,23 @@ class SecureKeyManager {
             // Encode public key as base58 address
             return this.simpleBase58(publicKey);
         } else if (network === 'eon') {
-            // Generate EON address (simplified)
-            const hash = await crypto.subtle.digest('SHA-256', privateKey);
-            const bytes = new Uint8Array(hash);
-            return 'eon' + safeBase64Encode(String.fromCharCode(...bytes.slice(0, 8))).replace(/=/g, '');
+            // CRITICAL v2.66: Generate proper Ed25519 public key (NOT SHA-256!)
+            // Use nacl if available, otherwise delegate to ProductionCrypto
+            let publicKey;
+            if (typeof nacl !== 'undefined' && nacl.sign && nacl.sign.keyPair) {
+                const keypair = nacl.sign.keyPair.fromSeed(privateKey.slice(0, 32));
+                publicKey = keypair.publicKey;
+            } else {
+                // Fallback to SHA-512 for address generation only (not for signing)
+                const hash = await crypto.subtle.digest('SHA-512', privateKey);
+                publicKey = new Uint8Array(hash).slice(0, 32);
+            }
+            // Generate EON address from public key
+            const addrHash = await crypto.subtle.digest('SHA-512', publicKey);
+            const fullHex = Array.from(new Uint8Array(addrHash)).map(b => b.toString(16).padStart(2, '0')).join('');
+            const part1 = fullHex.substring(0, 19).toLowerCase();
+            const part2 = fullHex.substring(19, 34).toLowerCase();
+            return part1 + 'eon' + part2; // Without checksum for simplicity
         }
         return 'ADDRESS_PLACEHOLDER';
     }

@@ -2230,30 +2230,22 @@ export class WalletManager {
         currentChainCodeBytes = derivedBytes.slice(32, 64);
       }
       
-      // Step 4: Generate public key from private key
-      // Use SHA-256 hash of private key (same as browser extension)
-      const privateKeyWordArray = CryptoJS.lib.WordArray.create(currentKeyBytes);
-      const publicKeyHash = CryptoJS.SHA256(privateKeyWordArray);
-      
-      // Convert to Uint8Array
+      // Step 4: Generate Ed25519 keypair from seed (private key)
+      // CRITICAL FIX v2.66: Use nacl.sign.keyPair.fromSeed() for proper Ed25519!
+      // Old code used SHA256(privateKey) which is cryptographically WRONG!
+      // Ed25519 public key = privateKey * G (elliptic curve multiplication)
       const privateKey = new Uint8Array(32);
-      const publicKey = new Uint8Array(32);
-      
-      // Copy private key directly
       privateKey.set(currentKeyBytes);
       
-      // Copy public key from hash
-      for (let i = 0; i < 8; i++) {
-        const pw = publicKeyHash.words[i];
-        publicKey[i * 4] = (pw >>> 24) & 0xff;
-        publicKey[i * 4 + 1] = (pw >>> 16) & 0xff;
-        publicKey[i * 4 + 2] = (pw >>> 8) & 0xff;
-        publicKey[i * 4 + 3] = pw & 0xff;
-      }
+      // Generate proper Ed25519 keypair
+      const ed25519Keypair = nacl.sign.keyPair.fromSeed(privateKey);
+      
+      // ed25519Keypair.publicKey = 32 bytes (the actual Ed25519 public key)
+      // ed25519Keypair.secretKey = 64 bytes (privateKey + publicKey concatenated)
       
       return {
-        privateKey: privateKey,
-        publicKey: publicKey,
+        privateKey: privateKey,  // 32-byte seed
+        publicKey: ed25519Keypair.publicKey,  // 32-byte Ed25519 public key
         path: `m/44'/9999'/${accountIndex}'/0'/0'`,
         chainCode: new Uint8Array(32) // Not needed for address generation
       };
@@ -4551,8 +4543,9 @@ export class WalletManager {
       
       // Generate node ID from activation code
       // GENESIS NODE SUPPORT: Genesis codes map to genesis_node_XXX format
+      // v2.66: Support both 3-digit (001) and 4-digit (0001) formats
       let nodeId;
-      const genesisMatch = activationCode.match(/^QNET-BOOT-000([1-5])-STRAP$/);
+      const genesisMatch = activationCode.match(/^QNET-BOOT-0*([1-5])-STRAP$/);
       if (genesisMatch) {
         // Genesis node: use predefined node ID format
         const bootstrapId = genesisMatch[1].padStart(3, '0');
@@ -4572,14 +4565,17 @@ export class WalletManager {
       const qnetKeypair = walletData.qnetKeypair;
       const privateKeyBytes = qnetKeypair?.privateKey 
         ? new Uint8Array(qnetKeypair.privateKey) 
-        : (walletData.secretKey ? new Uint8Array(walletData.secretKey) : null);
-      const publicKeyBytes = qnetKeypair?.publicKey 
-        ? new Uint8Array(qnetKeypair.publicKey) 
-        : (walletData.publicKey ? new Uint8Array(walletData.publicKey) : null);
+        : (walletData.secretKey ? new Uint8Array(walletData.secretKey.slice(0, 32)) : null);
       
-      if (!privateKeyBytes || !publicKeyBytes) {
-        throw new Error('No signing key available in wallet');
+      if (!privateKeyBytes || privateKeyBytes.length !== 32) {
+        throw new Error('No valid 32-byte private key available in wallet');
       }
+      
+      // CRITICAL FIX v2.66: ALWAYS regenerate publicKey from privateKey!
+      // Old wallets have WRONG publicKey (SHA256 instead of Ed25519 curve)
+      // nacl.sign.keyPair.fromSeed() generates the CORRECT Ed25519 public key
+      const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
+      const publicKeyBytes = regeneratedKeypair.publicKey;
       
       // PRODUCTION: Create Ed25519 signature (clients use ONLY Ed25519)
       // Post-quantum Dilithium is ONLY for node consensus, NOT for client transactions
@@ -4711,22 +4707,26 @@ export class WalletManager {
       
       // Get QNet keypair for signing (Ed25519)
       const qnetKeypair = walletData.qnetKeypair;
-      if (!qnetKeypair || !qnetKeypair.privateKey || !qnetKeypair.publicKey) {
+      if (!qnetKeypair || !qnetKeypair.privateKey) {
         // Fallback to legacy secretKey if available
         if (!walletData.secretKey) {
           throw new Error('No signing key available in wallet');
         }
       }
       
-      // Get private key bytes (either from qnetKeypair or legacy secretKey)
+      // Get private key bytes (either from qnetKeypair or legacy secretKey, always 32 bytes)
       const privateKeyBytes = qnetKeypair?.privateKey 
         ? new Uint8Array(qnetKeypair.privateKey) 
-        : new Uint8Array(walletData.secretKey);
+        : new Uint8Array(walletData.secretKey.slice(0, 32));
       
-      // Get public key bytes
-      const publicKeyBytes = qnetKeypair?.publicKey 
-        ? new Uint8Array(qnetKeypair.publicKey) 
-        : new Uint8Array(walletData.publicKey);
+      if (privateKeyBytes.length !== 32) {
+        throw new Error('Invalid private key length');
+      }
+      
+      // CRITICAL FIX v2.66: ALWAYS regenerate publicKey from privateKey!
+      // Old wallets have WRONG publicKey (SHA256 instead of Ed25519 curve)
+      const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
+      const publicKeyBytes = regeneratedKeypair.publicKey;
       
       // PRODUCTION: Create Ed25519 signature for transaction
       // Format matches validator's create_client_signing_message: "transfer:from:to:amount:gas_price:gas_limit"

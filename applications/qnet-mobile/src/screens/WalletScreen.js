@@ -1104,12 +1104,13 @@ const WalletScreen = () => {
         
         // AUTO-LINK: Also check if wallet matches Genesis wallet (even if not in API response)
         if (!activatedNodeType && wallet) {
+          // v2.66: Updated to Ed25519-based addresses
           const GENESIS_WALLETS = {
-            '001': '7bc83500fd08525250feonff5503d0dce4dbdede8',
-            '002': '714a0f700a4dbcc0d88eonf635ace76ed2eb9a186',
-            '003': '357842d58e86cc300cfeon0203e16eef3e7044db1',
-            '004': '4f710f9b3152659c56aeond4c05f2731a1890aedf',
-            '005': '8fa8ebe9e85dee95080eond0a7365096572f03e1c',
+            '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db46743',
+            '002': '0bac6225a082de1f659eond0c96f1706cf19c35eb',
+            '003': 'd216bb23fbe7f853636eon3f16b378b91922701a6',
+            '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e',
+            '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f440b8',
           };
           
           const userQNetAddress = (wallet.qnetAddress || wallet.address || '').toLowerCase();
@@ -1271,8 +1272,9 @@ const WalletScreen = () => {
       const code = activationInputCode.trim();
       
       // GENESIS NODE SUPPORT: Check if this is a Genesis bootstrap code
-      // Format: QNET-BOOT-000X-STRAP (X = 1-5)
-      const genesisPattern = /^QNET-BOOT-000([1-5])-STRAP$/;
+      // Format: QNET-BOOT-XXX-STRAP or QNET-BOOT-0XXX-STRAP (X = 1-5)
+      // v2.66: Support both 3-digit (001) and 4-digit (0001) formats
+      const genesisPattern = /^QNET-BOOT-0*([1-5])-STRAP$/;
       const genesisMatch = code.match(genesisPattern);
       
       if (genesisMatch) {
@@ -1282,12 +1284,13 @@ const WalletScreen = () => {
         // SECURITY: Genesis nodes have PREDEFINED wallets
         // User's wallet MUST match the hardcoded wallet for this Genesis node
         // PRODUCTION: Genesis wallet addresses (format: 19+3+15+4=41 chars)
+        // v2.66: Updated to Ed25519-based addresses
         const GENESIS_WALLETS = {
-          '001': '7bc83500fd08525250feonff5503d0dce4dbdede8',
-          '002': '714a0f700a4dbcc0d88eonf635ace76ed2eb9a186',
-          '003': '357842d58e86cc300cfeon0203e16eef3e7044db1',
-          '004': '4f710f9b3152659c56aeond4c05f2731a1890aedf',
-          '005': '8fa8ebe9e85dee95080eond0a7365096572f03e1c',
+          '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db46743',
+          '002': '0bac6225a082de1f659eond0c96f1706cf19c35eb',
+          '003': 'd216bb23fbe7f853636eon3f16b378b91922701a6',
+          '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e',
+          '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f440b8',
         };
         
         const expectedWallet = GENESIS_WALLETS[bootstrapId];
@@ -1316,8 +1319,8 @@ const WalletScreen = () => {
         // with your actual QNet wallet addresses from the mobile app!
         if (normalizedUser !== normalizedExpected) {
           // Check if formats are different but base parts match
-          // Legacy: 7bc83500fd08525250feonff5503d0dce4dbdede8 (19+3+19=41)
-          // New:    7bc83500fd08525250feonff5503d0dce4dbXXXX (19+3+15+4=41)
+          // Format: 19 hex + "eon" + 15 hex + 4 checksum = 41 chars
+          // Example: f36ff465a0944fd06cdeonfca0ad004ff9db46743
           const userPart1 = normalizedUser.substring(0, 19);
           const userEon = normalizedUser.substring(19, 22);
           const expectedPart1 = normalizedExpected.substring(0, 19);
@@ -1454,8 +1457,9 @@ const WalletScreen = () => {
   const getWalletAddressForClaim = async () => {
     try {
       // GENESIS NODES: Always use QNet address (hardcoded in genesis_constants.rs)
-      // Genesis codes format: QNET-BOOT-000X-STRAP
-      if (activationCode && /^QNET-BOOT-000[1-5]-STRAP$/.test(activationCode)) {
+      // Genesis codes format: QNET-BOOT-XXX-STRAP (supports 001-005 or 0001-0005)
+      // v2.66: Support both 3-digit and 4-digit formats
+      if (activationCode && /^QNET-BOOT-0*[1-5]-STRAP$/.test(activationCode)) {
         const qnetAddr = wallet.qnetAddress;
         if (!qnetAddr) {
           throw new Error('QNet address required for Genesis node claims');

@@ -3272,9 +3272,10 @@ impl BlockchainNode {
                 
                 // OPTIMIZATION: Only check last 10 macroblocks + any gaps since last verification
                 // This makes the check O(1) instead of O(n) for high block counts
+                // v2.66: Ensure check_from is always >= 1 (MacroBlock #0 doesn't exist)
                 let check_from = if last_verified_macroblock > 0 {
                     // Check from last verified (to catch any gaps) but at least last 10
-                    std::cmp::min(last_verified_macroblock, expected_macroblocks.saturating_sub(10))
+                    std::cmp::min(last_verified_macroblock, expected_macroblocks.saturating_sub(10)).max(1)
                 } else {
                     // First run: check last 10 macroblocks
                     expected_macroblocks.saturating_sub(10).max(1)
@@ -8115,6 +8116,13 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     } else {
                         // NO MEV PROTECTION: Use public mempool only
                         // v2.26: Direct access - SimpleMempool is already thread-safe
+                        
+                        // v2.66: Diagnostic log for emission blocks or when mempool has TX
+                        let mempool_size = mempool.size();
+                        if mempool_size > 0 || next_block_height % EMISSION_INTERVAL_BLOCKS == 0 {
+                            println!("[INFO][MEMPOOL] pre_fetch h={} size={}", next_block_height, mempool_size);
+                        }
+                        
                         mempool.get_pending_transactions_with_hashes(max_tx_per_microblock)
                     };
                     
@@ -8191,8 +8199,14 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         .map(|(hash, tx)| {
                             let is_benchmark = benchmark_mode_enabled && tx.from.starts_with("EON1benchmark");
                             
-                            let is_valid = if is_benchmark {
-                                // Benchmark: skip balance/nonce (signatures already verified!)
+                            // v2.66: System TX bypass nonce/balance validation (like submit_transaction)
+                            let is_system_tx = tx.from == "system_emission" 
+                                || tx.from == "system_ping_commitment"
+                                || tx.from.starts_with("system_");
+                            
+                            let is_valid = if is_benchmark || is_system_tx {
+                                // Benchmark OR System TX: skip balance/nonce validation
+                                // System TX are validated through consensus rules, not account state
                                 tx.validate().is_ok()
                             } else {
                                 // Production: full state validation (thread-safe read)
@@ -16050,7 +16064,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // CRITICAL SECURITY: Check nonce BEFORE adding to mempool
         // This prevents DoS attacks where attacker floods mempool with invalid nonces
-        // v2.65: System transactions bypass nonce check (like Ethereum coinbase, Solana system program)
+        // v2.65: System transactions bypass nonce check
         let is_system_tx = tx.from == "system_emission" 
             || tx.from == "system_ping_commitment"
             || tx.from.starts_with("system_");
@@ -16101,7 +16115,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         } else {
             // v2.65: System transactions bypass nonce AND balance checks
-            // Like Ethereum coinbase TX, Solana system program, Cosmos genesis TX
             if is_info() { println!("[INFO][TX] system_tx_bypass_validation from={}", tx.from); }
         }
         
@@ -16113,7 +16126,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // v2.26: Direct access - SimpleMempool is already thread-safe
         // No external lock needed - eliminates 100K TPS bottleneck!
-        self.mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), tx.gas_price);
+        // v2.66: Log if not added, but DON'T return Err (duplicate is OK in P2P)
+        let added = self.mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), tx.gas_price);
+        if !added {
+            // This is NORMAL for P2P: same TX received from multiple peers
+            // Only log for system TX (gas_price == u64::MAX) as those are important
+            if tx.gas_price == u64::MAX {
+                println!("[WARN][TX] system_tx_not_added hash={} (likely duplicate)", &tx_hash[..16.min(tx_hash.len())]);
+            }
+            // DON'T return Err! TX might already be in mempool from another peer
+        }
         
         // Broadcast to network only after successful validation
         // PRODUCTION v2.25: bincode for network (10-20x faster than JSON)
@@ -16125,7 +16147,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let effective_gas = tx.effective_gas_price() * tx.gas_limit;
         let quantum_flag = if tx.is_quantum_signed() { " 🔐QUANTUM" } else { "" };
         println!("[Transaction] ✅ Validated and submitted: {} (amount: {}, gas: {}{})", 
-                 &tx_hash[..16], tx.amount, effective_gas, quantum_flag);
+                 &tx_hash[..16.min(tx_hash.len())], tx.amount, effective_gas, quantum_flag);
         
         // PRODUCTION v2.26: Return SHA3(bincode) hash - same as stored in mempool
         Ok(tx_hash)
