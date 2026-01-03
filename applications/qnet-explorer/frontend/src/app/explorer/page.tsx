@@ -1,8 +1,7 @@
 'use client';
 
-import { memo, useState, useEffect, useCallback } from 'react';
+import { memo, useState, useEffect } from 'react';
 import Link from 'next/link';
-import { RealTimeStatus } from '../../components/RealTimeStatus';
 
 interface ActivityItem {
   hash: string;
@@ -117,31 +116,9 @@ export default function ExplorerPage() {
     }
   };
 
-  // Handle new block from WebSocket - trigger refresh
-  const handleNewBlock = useCallback(() => {
-    // Trigger activity refresh on new block
-    const fetchActivity = async () => {
-      try {
-        const res = await fetch('/api/activity?limit=20&t=' + Date.now());
-        const data = await res.json();
-        if (data.success && data.data) {
-          setActivity(data.data);
-        }
-      } catch (err) {
-        console.error('Failed to fetch activity:', err);
-      }
-    };
-    fetchActivity();
-  }, []);
 
   return (
     <div className="explorer-page">
-      {/* Real-time WebSocket status */}
-      <RealTimeStatus 
-        backendUrl={process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8001'}
-        onNewBlock={handleNewBlock}
-      />
-      
       <div className="explorer-header">
         <h1>Quantum Blockchain Explorer</h1>
         <p>Real-time network data and blockchain analytics</p>

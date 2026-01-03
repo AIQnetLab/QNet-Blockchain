@@ -1,24 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 // ============================================================================
-// PRODUCTION v2.72: Use PostgreSQL Indexer with Node RPC fallback
+// PRODUCTION v2.74: Direct Node RPC with RocksDB
 // ============================================================================
 
-// Indexer API (primary - fast SQL queries)
-const INDEXER_API_URL = process.env.INDEXER_API_URL || 'http://localhost:9000';
-const INDEXER_API_KEY = process.env.INDEXER_API_KEY || '';
-
-// Node RPC (fallback - direct blockchain access)
+// Node RPC (direct blockchain access via RocksDB)
 const NODE_RPC_URL = process.env.QNET_API_URL || 'http://localhost:8001';
-
-// Helper: Get headers for Indexer requests
-function getIndexerHeaders(): HeadersInit {
-  const headers: HeadersInit = { 'Content-Type': 'application/json' };
-  if (INDEXER_API_KEY) {
-    headers['X-API-Key'] = INDEXER_API_KEY;
-  }
-  return headers;
-}
 
 // System addresses
 const SYSTEM_ADDRESSES = ['system_rewards_pool', 'system_emission', 'genesis'];
@@ -51,46 +38,8 @@ export interface AddressData {
   }>;
 }
 
-// Fetch from Indexer (primary)
-async function fetchFromIndexer(address: string): Promise<AddressData | null> {
-  try {
-    const res = await fetch(`${INDEXER_API_URL}/api/v1/addresses/${address}`, {
-      headers: getIndexerHeaders(),
-      cache: 'no-store',
-      signal: AbortSignal.timeout(5000),
-    });
-    
-    if (!res.ok) return null;
-    
-    const data = await res.json();
-    
-    // Transform indexer response to AddressData
-    return {
-      address: data.address,
-      balance: data.balance || '0',
-      txCount: data.tx_count || 0,
-      firstSeen: data.first_seen || 0,
-      lastActive: data.last_active || 0,
-      tokens: [],
-      transactions: (data.transactions || []).map((tx: Record<string, unknown>) => ({
-        hash: tx.hash as string,
-        type: tx.tx_type as string,
-        from: tx.from_address as string,
-        to: (tx.to_address || 'N/A') as string,
-        amount: formatAmount(tx.amount as number),
-        fee: formatAmount(tx.gas_price as number),
-        timestamp: tx.timestamp as number,
-        block: tx.block_height as number,
-        status: 'confirmed' as const,
-      })),
-    };
-  } catch {
-    return null;
-  }
-}
-
-// Fetch from Node RPC (fallback)
-async function fetchFromNodeRPC(address: string): Promise<AddressData | null> {
+// Fetch address data from Node RPC
+async function fetchAddressData(address: string): Promise<AddressData | null> {
   try {
     const res = await fetch(`${NODE_RPC_URL}/api/v1/account/${address}`, {
       cache: 'no-store',
@@ -152,16 +101,8 @@ export async function GET(
     return NextResponse.json({ success: false, error: 'Invalid EON address' }, { status: 400 });
   }
   
-  // 1. Try Indexer first
-  let data = await fetchFromIndexer(address);
-  let source = 'indexer';
-  
-  // 2. Fallback to Node RPC
-  if (!data) {
-    console.warn('[ADDR] Indexer miss, falling back to Node RPC');
-    data = await fetchFromNodeRPC(address);
-    source = 'node_rpc';
-  }
+  // Fetch from Node RPC
+  const data = await fetchAddressData(address);
   
   if (!data) {
     // Return empty address (may exist but have no transactions)
@@ -182,7 +123,7 @@ export async function GET(
   
   return NextResponse.json({
     success: true,
-    source,
+    source: 'rocksdb',
     data,
   });
 }

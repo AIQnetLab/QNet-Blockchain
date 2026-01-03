@@ -1,24 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 // ============================================================================
-// PRODUCTION v2.72: Use PostgreSQL Indexer with Node RPC fallback
+// PRODUCTION v2.74: Direct Node RPC with RocksDB
 // ============================================================================
 
-// Indexer API (primary - fast SQL queries)
-const INDEXER_API_URL = process.env.INDEXER_API_URL || 'http://localhost:9000';
-const INDEXER_API_KEY = process.env.INDEXER_API_KEY || '';
-
-// Node RPC (fallback - direct blockchain access)
+// Node RPC (direct blockchain access via RocksDB)
 const NODE_RPC_URL = process.env.QNET_API_URL || 'http://localhost:8001';
-
-// Helper: Get headers for Indexer requests
-function getIndexerHeaders(): HeadersInit {
-  const headers: HeadersInit = { 'Content-Type': 'application/json' };
-  if (INDEXER_API_KEY) {
-    headers['X-API-Key'] = INDEXER_API_KEY;
-  }
-  return headers;
-}
 
 // Map Rust TransactionType enum to display string
 function mapTxType(type: string | object | undefined): string {
@@ -53,24 +40,8 @@ function formatAmount(amount: number | string | undefined): string {
   return num.toLocaleString('en-US', { maximumFractionDigits: 6 }) + ' QNC';
 }
 
-// Fetch from Indexer (primary - O(1) SQL query)
-async function fetchFromIndexer(hash: string): Promise<Record<string, unknown> | null> {
-  try {
-    const res = await fetch(`${INDEXER_API_URL}/api/v1/transactions/${hash}`, {
-      headers: getIndexerHeaders(),
-      cache: 'no-store',
-      signal: AbortSignal.timeout(5000),
-    });
-    
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-// Fetch from Node RPC (fallback)
-async function fetchFromNodeRPC(hash: string): Promise<Record<string, unknown> | null> {
+// Fetch TX from Node RPC (tx_index in RocksDB)
+async function fetchTransaction(hash: string): Promise<Record<string, unknown> | null> {
   try {
     const res = await fetch(`${NODE_RPC_URL}/api/v1/transaction/${hash}`, {
       cache: 'no-store',
@@ -89,6 +60,35 @@ async function fetchFromNodeRPC(hash: string): Promise<Record<string, unknown> |
   }
 }
 
+// Fallback: Search in emission blocks if TX not in index
+async function searchInEmissionBlocks(hash: string): Promise<Record<string, unknown> | null> {
+  const emissionBlocks = [14400, 28800, 43200, 57600, 72000];
+  
+  for (const height of emissionBlocks) {
+    try {
+      const res = await fetch(`${NODE_RPC_URL}/api/v1/block/${height}`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(3000),
+      });
+      
+      if (!res.ok) continue;
+      
+      const block = await res.json();
+      const transactions = block.transactions || [];
+      
+      for (const tx of transactions) {
+        if (tx.hash === hash) {
+          return { ...tx, block_height: height, timestamp: tx.timestamp || block.timestamp };
+        }
+      }
+    } catch {
+      // Skip failed block fetch
+    }
+  }
+  
+  return null;
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ hash: string }> }
@@ -103,15 +103,12 @@ export async function GET(
   }
   
   try {
-    // 1. Try Indexer first (fast SQL query)
-    let tx = await fetchFromIndexer(hash);
-    let source = 'indexer';
+    // 1. Try tx_index (RocksDB)
+    let tx = await fetchTransaction(hash);
     
-    // 2. Fallback to Node RPC
+    // 2. Fallback: Search in emission blocks
     if (!tx) {
-      console.warn('[TX] Indexer miss, falling back to Node RPC');
-      tx = await fetchFromNodeRPC(hash);
-      source = 'node_rpc';
+      tx = await searchInEmissionBlocks(hash);
     }
     
     if (!tx) {
@@ -131,7 +128,7 @@ export async function GET(
     
     return NextResponse.json({
       success: true,
-      source,
+      source: 'rocksdb',
       data: {
         hash: tx.hash as string,
         type: mapTxType((tx.tx_type || tx.type) as string),

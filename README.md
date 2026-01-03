@@ -44,24 +44,25 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🚀 **LATEST UPDATES (v2.73.0 - January 3, 2026)**
+### 🚀 **LATEST UPDATES (v2.74.0 - January 3, 2026)**
 
-**🔍 PostgreSQL Indexer & Explorer Infrastructure:**
-- **PostgreSQL Indexer**: High-performance blockchain indexing service (`qnet-indexer`)
-- **WebSocket Real-time**: Live block and transaction events via WebSocket
+**🔍 Embedded RocksDB Indexing:**
+- **Built-in TX Index**: Fast O(1) transaction lookup via `tx_index` column family
+- **Address Index**: Fast O(1) address transaction history via `tx_by_address` column family
+- **No External Database**: All indexing in RocksDB (no PostgreSQL required)
 - **On-chain Node Registration**: `NodeRegistration` TX type for immutable wallet-to-node binding
 - **Explorer API**: Full block/transaction/address data with clickable hashes
-- **API Security**: Rate limiting (100 req/min), API key auth, configurable CORS
 - **System TX Support**: Emission, reward distribution indexed correctly
 - **Dilithium Claim Option**: Post-quantum signatures for reward claims (free gas)
 
 **Key Architecture:**
 ```
-Explorer → Indexer (PostgreSQL) → Node RPC (fallback)
-                ↓
-    - O(1) queries via SQL indexes
-    - Real-time WebSocket subscription
-    - 100% data coverage (all TX types)
+Explorer → Node RPC (RocksDB)
+              ↓
+    - tx_index: hash → block_height (O(1))
+    - tx_by_address: address → [tx_hashes] (O(1))
+    - Single container deployment
+    - 100% data coverage
 ```
 
 ### 🛡️ **Previous Updates (v2.62.0 - December 30, 2025)**

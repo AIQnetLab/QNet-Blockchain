@@ -82,12 +82,11 @@ Experimental achievements:
 - ✅ **Automatic Round Cleanup (v2.62.0)**: Old rounds (>5 epochs) auto-purged
 - ✅ **100% First-Attempt Success (v2.62.0)**: Eliminated race conditions in consensus
 - ✅ **Production L1 Architecture (v2.62.0)**: Per-round storage standard for top blockchains
-- ✅ **PostgreSQL Indexer (v2.73.0)**: High-performance blockchain indexing for explorer
-- ✅ **WebSocket Real-time (v2.73.0)**: Live block/transaction streaming
-- ✅ **On-chain Node Registration (v2.73.0)**: Immutable wallet-to-node binding via `NodeRegistration` TX
-- ✅ **Explorer API Security (v2.73.0)**: Rate limiting, API keys, configurable CORS
-- ✅ **System TX Indexing (v2.73.0)**: Emission and reward transactions fully indexed
-- ✅ **Dilithium Claim Option (v2.73.0)**: Post-quantum signatures for reward claims (free gas)
+- ✅ **Embedded RocksDB Indexing (v2.74.0)**: Built-in tx_index (like Cosmos/Tendermint)
+- ✅ **On-chain Node Registration (v2.74.0)**: Immutable wallet-to-node binding via `NodeRegistration` TX
+- ✅ **System TX Indexing (v2.74.0)**: Emission and reward transactions fully indexed
+- ✅ **Dilithium Claim Option (v2.74.0)**: Post-quantum signatures for reward claims (free gas)
+- ✅ **Single Container Deployment (v2.74.0)**: No external PostgreSQL, simplified ops
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 

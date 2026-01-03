@@ -2,24 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import type { Block, BlockTransaction } from '@/lib/types';
 
 // ============================================================================
-// PRODUCTION v2.72: Use PostgreSQL Indexer with Node RPC fallback
+// PRODUCTION v2.74: Direct Node RPC with RocksDB
 // ============================================================================
 
-// Indexer API (primary - fast SQL queries)
-const INDEXER_API_URL = process.env.INDEXER_API_URL || 'http://localhost:9000';
-const INDEXER_API_KEY = process.env.INDEXER_API_KEY || '';
-
-// Node RPC (fallback - direct blockchain access)
+// Node RPC (direct blockchain access via RocksDB)
 const NODE_RPC_URL = process.env.QNET_API_URL || 'http://localhost:8001';
-
-// Helper: Get headers for Indexer requests
-function getIndexerHeaders(): HeadersInit {
-  const headers: HeadersInit = { 'Content-Type': 'application/json' };
-  if (INDEXER_API_KEY) {
-    headers['X-API-Key'] = INDEXER_API_KEY;
-  }
-  return headers;
-}
 
 // Map transaction type to display name
 function getTransactionType(txType: unknown): string {
@@ -79,7 +66,6 @@ function transformBlock(raw: Record<string, unknown>): Block | null {
     poh_hash: bytesToHex(raw.poh_hash) || undefined,
     poh_count: (raw.poh_count as number) || 0,
     // Block signatures are always Dilithium3 (quantum-resistant)
-    // TX signatures can be: Ed25519, Dilithium3, or Ed25519+Dilithium3 (hybrid)
     signature_type: (raw.signature_type as string) || 'Dilithium3',
     signature: (raw.signature as string) || undefined,
     transactions: transactions.map((tx: unknown): BlockTransaction => {
@@ -99,29 +85,8 @@ function transformBlock(raw: Record<string, unknown>): Block | null {
   };
 }
 
-// Fetch from Indexer (primary)
-async function fetchFromIndexer(identifier: string): Promise<Block | null> {
-  try {
-    // Indexer uses /api/v1/blocks/:height_or_hash
-    const endpoint = `${INDEXER_API_URL}/api/v1/blocks/${identifier}`;
-    
-    const response = await fetch(endpoint, {
-      headers: getIndexerHeaders(),
-      cache: 'no-store',
-      signal: AbortSignal.timeout(5000),
-    });
-    
-    if (!response.ok) return null;
-    
-    const data = await response.json();
-    return transformBlock(data);
-  } catch {
-    return null;
-  }
-}
-
-// Fetch from Node RPC (fallback)
-async function fetchFromNodeRPC(identifier: string): Promise<Block | null> {
+// Fetch block from Node RPC (RocksDB indexed)
+async function fetchBlock(identifier: string): Promise<Block | null> {
   try {
     const isHeight = /^\d+$/.test(identifier);
     const endpoint = isHeight 
@@ -145,20 +110,9 @@ async function fetchFromNodeRPC(identifier: string): Promise<Block | null> {
     const block = (data.block || data) as Record<string, unknown>;
     return transformBlock(block);
   } catch (err) {
-    console.error(`[BLOCK] Node RPC error:`, err);
+    console.error(`[BLOCK] Error:`, err);
     return null;
   }
-}
-
-// Fetch block with Indexer → Node RPC fallback
-async function fetchBlockFromBackend(identifier: string): Promise<Block | null> {
-  // Try Indexer first
-  const indexerBlock = await fetchFromIndexer(identifier);
-  if (indexerBlock) return indexerBlock;
-  
-  // Fallback to Node RPC
-  console.warn('[BLOCK] Indexer miss, falling back to Node RPC');
-  return fetchFromNodeRPC(identifier);
 }
 
 export async function GET(
@@ -174,7 +128,7 @@ export async function GET(
     );
   }
   
-  const block = await fetchBlockFromBackend(hash);
+  const block = await fetchBlock(hash);
   
   if (!block) {
     return NextResponse.json({
@@ -185,7 +139,7 @@ export async function GET(
   
   return NextResponse.json({
     success: true,
+    source: 'rocksdb',
     data: block,
   });
 }
-
