@@ -1157,6 +1157,190 @@ impl BlockchainNode {
         self.adaptive_bft.clone()
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v2.71: ON-CHAIN NODE REGISTRATION
+    // All nodes must register on-chain to receive rewards
+    // This ensures wallet→node binding is cryptographically verified and immutable
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Create NodeRegistration transaction for on-chain binding
+    /// This TX is included in blocks and visible to all nodes
+    /// For genesis TXs: use fixed_timestamp=Some(0) for deterministic hashes across all nodes
+    /// For runtime TXs: use fixed_timestamp=None for current time
+    pub fn create_node_registration_tx_with_timestamp(
+        node_id: &str,
+        node_type: qnet_state::NodeType,
+        wallet_address: &str,
+        registration_proof: &str,
+        fixed_timestamp: Option<u64>,
+    ) -> qnet_state::Transaction {
+        use qnet_state::TransactionType;
+        
+        let timestamp = fixed_timestamp.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        });
+        
+        let mut tx = qnet_state::Transaction {
+            hash: String::new(),
+            from: wallet_address.to_string(),
+            to: None,
+            amount: 0,
+            nonce: 0,
+            gas_price: 0, // Registration is FREE
+            gas_limit: 0,
+            timestamp,
+            signature: None, // Will be signed by system for genesis, by user for others
+            public_key: None,
+            tx_type: TransactionType::NodeRegistration {
+                node_id: node_id.to_string(),
+                node_type,
+                wallet_address: wallet_address.to_string(),
+                registration_proof: registration_proof.to_string(),
+            },
+            data: Some(format!("node_registration:{}:{}:{}", node_id, wallet_address, registration_proof)),
+            dilithium_signature: None,
+            dilithium_public_key: None,
+        };
+        
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+    
+    /// Create NodeRegistration TX for runtime (uses current timestamp)
+    pub fn create_node_registration_tx(
+        node_id: &str,
+        node_type: qnet_state::NodeType,
+        wallet_address: &str,
+        registration_proof: &str,
+    ) -> qnet_state::Transaction {
+        Self::create_node_registration_tx_with_timestamp(node_id, node_type, wallet_address, registration_proof, None)
+    }
+    
+    /// Find node registration in blockchain (searches all blocks)
+    /// Returns (node_type, wallet_address) if found
+    pub async fn find_node_registration(&self, node_id: &str) -> Option<(qnet_state::NodeType, String)> {
+        use qnet_state::TransactionType;
+        
+        // First check cache (in-memory for performance)
+        if let Some(cached) = self.get_cached_node_registration(node_id).await {
+            return Some(cached);
+        }
+        
+        // Search blockchain from genesis block
+        let current_height = self.get_height().await;
+        
+        // Optimization: Search backwards (recent registrations more likely to be queried)
+        for height in (0..=current_height).rev() {
+            if let Ok(Some(block)) = self.storage.load_microblock_auto_format(height) {
+                for tx in &block.transactions {
+                    if let TransactionType::NodeRegistration { 
+                        node_id: reg_node_id, 
+                        node_type, 
+                        wallet_address, 
+                        .. 
+                    } = &tx.tx_type {
+                        if reg_node_id == node_id {
+                            // Cache for future lookups
+                            self.cache_node_registration(node_id, node_type.clone(), wallet_address.clone()).await;
+                            if is_debug() { 
+                                println!("[DBG][REG] found_onchain node={} wallet={}... h={}", 
+                                         node_id, &wallet_address[..16.min(wallet_address.len())], height); 
+                            }
+                            return Some((node_type.clone(), wallet_address.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    /// Cache node registration for fast lookups
+    async fn cache_node_registration(&self, node_id: &str, node_type: qnet_state::NodeType, wallet: String) {
+        // Use storage for persistence
+        let type_str = match node_type {
+            qnet_state::NodeType::Light => "light",
+            qnet_state::NodeType::Full => "full",
+            qnet_state::NodeType::Super => "super",
+        };
+        let _ = self.storage.save_node_registration(node_id, type_str, &wallet, 1.0);
+    }
+    
+    /// Get cached node registration
+    async fn get_cached_node_registration(&self, node_id: &str) -> Option<(qnet_state::NodeType, String)> {
+        match self.storage.load_node_registration(node_id) {
+            Ok(Some((type_str, wallet, _))) => {
+                let node_type = match type_str.to_lowercase().as_str() {
+                    "super" => qnet_state::NodeType::Super,
+                    "full" => qnet_state::NodeType::Full,
+                    _ => qnet_state::NodeType::Light,
+                };
+                Some((node_type, wallet))
+            }
+            _ => None,
+        }
+    }
+    
+    /// Register all 5 Genesis nodes on-chain (called once at blockchain start)
+    /// Returns Vec of registration transactions to include in genesis/first block
+    /// Create Genesis node registration TXs with FIXED timestamp for determinism
+    /// CRITICAL: All 5 Genesis nodes MUST create IDENTICAL TXs for consensus
+    /// Uses timestamp=0 (genesis epoch) to ensure same hashes across all nodes
+    pub fn create_genesis_registration_txs() -> Vec<qnet_state::Transaction> {
+        let mut txs = Vec::new();
+        
+        // CRITICAL: Fixed timestamp = 0 for deterministic TX hashes
+        // This ensures ALL nodes produce IDENTICAL genesis block
+        const GENESIS_TX_TIMESTAMP: u64 = 0;
+        
+        for (bootstrap_id, wallet) in crate::genesis_constants::GENESIS_WALLETS {
+            let node_id = format!("genesis_node_{}", bootstrap_id);
+            let tx = Self::create_node_registration_tx_with_timestamp(
+                &node_id,
+                qnet_state::NodeType::Super,
+                wallet,
+                "genesis", // Proof for genesis nodes
+                Some(GENESIS_TX_TIMESTAMP), // Fixed timestamp for determinism
+            );
+            
+            if is_info() { 
+                println!("[INFO][REG] genesis_tx_created node={} wallet={}... hash={}...", 
+                         node_id, &wallet[..16.min(wallet.len())],
+                         &tx.hash[..16.min(tx.hash.len())]); 
+            }
+            txs.push(tx);
+        }
+        
+        txs
+    }
+    
+    /// Get wallet for node from on-chain registration (PRIMARY) or fallback
+    /// This is the SINGLE SOURCE OF TRUTH for node→wallet mapping
+    pub async fn get_node_wallet(&self, node_id: &str) -> Option<String> {
+        // 1. Check on-chain registration (PRIMARY)
+        if let Some((_, wallet)) = self.find_node_registration(node_id).await {
+            return Some(wallet);
+        }
+        
+        // 2. Fallback for Genesis nodes (if not yet in blockchain)
+        if node_id.starts_with("genesis_node_") {
+            let bootstrap_id = node_id.strip_prefix("genesis_node_").unwrap_or("001");
+            if let Some(wallet) = crate::genesis_constants::get_genesis_wallet_by_id(bootstrap_id) {
+                if is_debug() { 
+                    println!("[DBG][REG] genesis_fallback node={} wallet={}...", 
+                             node_id, &wallet[..16.min(wallet.len())]); 
+                }
+                return Some(wallet.to_string());
+            }
+        }
+        
+        None
+    }
+
     /// Process reward window for emission block
     /// PRODUCTION v2.43.1: Takes explicit emission_block_height parameter
     /// This fixes off-by-one bug where window_end was current_height (N-1) instead of emission block (N)
@@ -1787,8 +1971,12 @@ impl BlockchainNode {
                 Ok(None) => {
                     // Node not registered - check if genesis (they're pre-registered)
                     if node_id.starts_with("genesis_node_") {
-                        // Genesis nodes are hardcoded Super nodes
-                        Some((qnet_consensus::NodeType::Super, generate_eon_address_from_id(node_id)))
+                        // Genesis nodes - use PREDEFINED wallets from genesis_constants.rs!
+                        let bootstrap_id = node_id.strip_prefix("genesis_node_").unwrap_or("001");
+                        let wallet = crate::genesis_constants::get_genesis_wallet_by_id(bootstrap_id)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| generate_eon_address_from_id(node_id));
+                        Some((qnet_consensus::NodeType::Super, wallet))
                     } else {
                         eprintln!("[ERR][REWARDS] node_not_registered node={} SKIPPING", node_id);
                         continue; // Skip - node must be registered to receive rewards!
@@ -4217,6 +4405,23 @@ impl BlockchainNode {
                                                          total_pool3, activation_data.len()); }
                                             }
                                         }
+                                        // v2.71: Cache NodeRegistration on block receive for fast wallet lookups
+                                        qnet_state::TransactionType::NodeRegistration { 
+                                            node_id, node_type, wallet_address, .. 
+                                        } => {
+                                            // Cache in RocksDB for fast access (blockchain is source of truth)
+                                            let type_str = match node_type {
+                                                qnet_state::NodeType::Super => "super",
+                                                qnet_state::NodeType::Full => "full",
+                                                qnet_state::NodeType::Light => "light",
+                                            };
+                                            let _ = storage.save_node_registration(node_id, type_str, wallet_address, 1.0);
+                                            if is_debug() { 
+                                                println!("[DBG][REG] cached_from_block node={} wallet={}... h={}", 
+                                                         node_id, &wallet_address[..16.min(wallet_address.len())], 
+                                                         received_block.height); 
+                                            }
+                                        }
                                         _ => {} // Other transaction types don't contribute to Pool 3
                                     }
                                 }
@@ -4382,6 +4587,20 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 Ok(_) => {
                     if should_log {
                         if is_debug() { println!("[DBG][BLOCK] stored h={}", received_block.height); }
+                    }
+                    
+                    // v2.72: Broadcast NewBlock via WebSocket for real-time explorer updates
+                    if received_block.block_type == "micro" {
+                        let decompressed = zstd::decode_all(&received_block.data[..]).unwrap_or_else(|_| received_block.data.clone());
+                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&decompressed) {
+                            crate::rpc::broadcast_ws_event(crate::rpc::WsEvent::NewBlock {
+                                height: mb.height,
+                                hash: hex::encode(mb.hash()),
+                                timestamp: mb.timestamp,
+                                tx_count: mb.transactions.len(),
+                                producer: mb.producer.clone(),
+                            });
+                        }
                     }
                     
                     // CRITICAL v2.32: If we just received Genesis block, update GLOBAL_GENESIS_TIMESTAMP!
@@ -6042,13 +6261,24 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     
                     match create_genesis_block(genesis_config) {
                         Ok(genesis_block) => {
+                            // v2.71: Combine existing genesis TXs with Genesis Node Registration TXs
+                            // This ensures all 5 Genesis nodes are registered ON-CHAIN in block 0
+                            let mut all_genesis_txs = genesis_block.transactions.clone();
+                            let genesis_registration_txs = Self::create_genesis_registration_txs();
+                            all_genesis_txs.extend(genesis_registration_txs);
+                            
+                            if is_info() { 
+                                println!("[INFO][GEN] genesis_txs total={} (original={} + registration=5)", 
+                                         all_genesis_txs.len(), genesis_block.transactions.len()); 
+                            }
+                            
                             // Convert to MicroBlock format for storage
-                            let merkle_root = Self::calculate_merkle_root(&genesis_block.transactions);
+                            let merkle_root = Self::calculate_merkle_root(&all_genesis_txs);
                             let mut genesis_microblock = qnet_state::MicroBlock {
                                 height: 0,
                                 timestamp: genesis_block.timestamp,
                                 previous_hash: [0u8; 32],
-                                transactions: genesis_block.transactions,
+                                transactions: all_genesis_txs,
                                 producer: "genesis".to_string(),
                                 merkle_root,
                                 signature: Vec::new(), // Will be signed with quantum crypto
@@ -8521,9 +8751,11 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             let is_benchmark = benchmark_mode_enabled && tx.from.starts_with("EON1benchmark");
                             
                             // v2.66: System TX bypass nonce/balance validation (like submit_transaction)
+                            // v2.71: NodeRegistration TX also bypasses (nonce=0, gas=0, no balance needed)
                             let is_system_tx = tx.from == "system_emission" 
                                 || tx.from == "system_ping_commitment"
-                                || tx.from.starts_with("system_");
+                                || tx.from.starts_with("system_")
+                                || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. });
                             
                             let is_valid = if is_benchmark || is_system_tx {
                                 // Benchmark OR System TX: skip balance/nonce validation
@@ -8565,9 +8797,11 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     for (hash, tx, is_valid) in validated {
                         if is_valid {
                             // v2.68: Separate system TX from user TX
+                            // v2.71: NodeRegistration is also system TX (no state execution needed)
                             let is_system = tx.from == "system_emission" 
                                 || tx.from == "system_ping_commitment"
-                                || tx.from.starts_with("system_");
+                                || tx.from.starts_with("system_")
+                                || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. });
                             
                             if is_system {
                                 system_txs.push(tx);
@@ -16519,6 +16753,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("[Transaction] ✅ Validated and submitted: {} (amount: {}, gas: {}{})", 
                  &tx_hash[..16.min(tx_hash.len())], tx.amount, effective_gas, quantum_flag);
         
+        // v2.72: Broadcast PendingTx via WebSocket for real-time explorer updates
+        if added {
+            crate::rpc::broadcast_ws_event(crate::rpc::WsEvent::PendingTx {
+                tx_hash: tx_hash.clone(),
+                from: tx.from.clone(),
+                to: tx.to.clone().unwrap_or_default(),
+                amount: tx.amount,
+            });
+        }
+        
         // PRODUCTION v2.26: Return SHA3(bincode) hash - same as stored in mempool
         Ok(tx_hash)
     }
@@ -18146,6 +18390,39 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if is_info() { println!("[INFO][REWARDS] node_registered id={} type={:?}", 
                          self.node_id, node_type); }
                 if is_debug() { println!("[DBG][REWARDS] wallet={}...", &wallet_address[..20.min(wallet_address.len())]); }
+            }
+            
+            // v2.71: Create ON-CHAIN NodeRegistration TX for Full/Super nodes
+            // This ensures wallet→node binding is immutable and verifiable by all nodes
+            let qnet_node_type = match node_type {
+                NodeType::Super => qnet_state::NodeType::Super,
+                NodeType::Full => qnet_state::NodeType::Full,
+                _ => qnet_state::NodeType::Light,
+            };
+            
+            // Use activation code hash as registration proof
+            let registration_proof = registry.hash_activation_code_for_blockchain(code)
+                .unwrap_or_else(|_| blake3::hash(code.as_bytes()).to_hex().to_string());
+            
+            let registration_tx = Self::create_node_registration_tx(
+                &self.node_id,
+                qnet_node_type,
+                &wallet_address,
+                &registration_proof,
+            );
+            
+            // Add to mempool for inclusion in next block
+            let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
+            let tx_hash = registration_tx.hash.clone();
+            if self.mempool.add_binary_transaction(tx_bytes, tx_hash.clone(), 0) {
+                if is_info() { 
+                    println!("[INFO][REG] onchain_tx_submitted node={} wallet={}... hash={}...", 
+                             self.node_id, 
+                             &wallet_address[..16.min(wallet_address.len())],
+                             &tx_hash[..16.min(tx_hash.len())]); 
+                }
+            } else {
+                eprintln!("[WARN][REG] onchain_tx_failed node={}", self.node_id);
             }
         }
         

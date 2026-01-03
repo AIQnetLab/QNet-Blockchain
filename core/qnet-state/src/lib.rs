@@ -19,7 +19,7 @@ pub mod state;
 #[cfg(feature = "python")]
 mod python_bindings;
 
-pub use account::{Account, AccountState};
+pub use account::{Account, AccountState, NodeType};
 pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock, StoredMicroBlock, PoHState, storage_version, SlashingEventData, AutomaticJailData, EligibleProducer, RewardHeartbeat, HeartbeatSummary};
 pub use transaction::{Transaction, TransactionReceipt, TransactionType, gas_limits, PingSampleData};
 pub use state_db::StateDB;

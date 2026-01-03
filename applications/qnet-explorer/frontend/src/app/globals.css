@@ -3272,6 +3272,11 @@ a[href*="play.google.com"] img {
 .badge-system { background: rgba(160,100,240,0.15); color: #a080f0; }
 .badge-default { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.55); }
 
+.col-type {
+  min-width: 100px;
+  text-align: center;
+}
+
 .col-addresses {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.82rem;

@@ -1,9 +1,9 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 3.3 (v2.62.0)  
-**Date:** December 30, 2025  
-**Status:** Production Ready (Per-Round Consensus Storage + Intercontinental Sync)  
+**Version:** 3.4 (v2.73.0)  
+**Date:** January 3, 2026  
+**Status:** Production Ready (PostgreSQL Indexer + Explorer Infrastructure)  
 
 ---
 
@@ -76,6 +76,18 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Reveal Loss Prevention** (participant nodes don't call trigger mid-consensus)
 - ✅ **Dynamic Height Threshold** (5/10/20 blocks based on network size for scalability)
 - ✅ **Signed Reveal Messages** (SHA3-256 + Dilithium+Ed25519 hybrid signatures)
+
+### v2.73.0 Additions (Explorer Infrastructure + On-chain Registration)
+- ✅ **PostgreSQL Indexer** (`qnet-indexer` service for high-performance queries)
+- ✅ **WebSocket Real-time** (live NewBlock, PendingTx events to explorer)
+- ✅ **NodeRegistration TX** (on-chain wallet-to-node binding for all node types)
+- ✅ **API Key Authentication** (X-API-Key header for production security)
+- ✅ **Rate Limiting** (100 req/min per IP to prevent abuse)
+- ✅ **Configurable CORS** (INDEXER_CORS_ORIGINS env var)
+- ✅ **System TX Indexing** (emission, rewards, node registration all indexed)
+- ✅ **Dilithium Claim Option** (post-quantum signatures for reward claims, free gas)
+- ✅ **TX Index Fix** (BLAKE3 hash consistency for system TX lookup)
+- ✅ **Fallback Architecture** (Indexer primary, Node RPC fallback)
 
 ### v2.62.0 Additions (Per-Round Consensus Storage)
 - ✅ **Per-Round Storage** (`HashMap<u64, RoundData>` - each round is independent)

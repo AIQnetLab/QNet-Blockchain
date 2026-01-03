@@ -616,6 +616,16 @@ impl BlockValidator {
                 let _ = amount_out_min; // Explicitly mark as intentionally unused here
                 // Gas fee for swaps goes to Pool 2 (70% Super, 30% Full)
             }
+            TransactionType::NodeRegistration { node_id, wallet_address, .. } => {
+                // v2.73: On-chain node registration validation
+                if node_id.is_empty() {
+                    return Err(IntegrationError::ValidationError("Node ID cannot be empty".to_string()));
+                }
+                if wallet_address.is_empty() {
+                    return Err(IntegrationError::ValidationError("Wallet address cannot be empty".to_string()));
+                }
+                // System transaction - no gas fees
+            }
         }
         
         Ok(())

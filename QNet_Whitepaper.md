@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.62.0-experimental  
-**Date**: December 30, 2025  
+**Version**: 2.73.0-experimental  
+**Date**: January 3, 2026  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -82,6 +82,12 @@ Experimental achievements:
 - ✅ **Automatic Round Cleanup (v2.62.0)**: Old rounds (>5 epochs) auto-purged
 - ✅ **100% First-Attempt Success (v2.62.0)**: Eliminated race conditions in consensus
 - ✅ **Production L1 Architecture (v2.62.0)**: Per-round storage standard for top blockchains
+- ✅ **PostgreSQL Indexer (v2.73.0)**: High-performance blockchain indexing for explorer
+- ✅ **WebSocket Real-time (v2.73.0)**: Live block/transaction streaming
+- ✅ **On-chain Node Registration (v2.73.0)**: Immutable wallet-to-node binding via `NodeRegistration` TX
+- ✅ **Explorer API Security (v2.73.0)**: Rate limiting, API keys, configurable CORS
+- ✅ **System TX Indexing (v2.73.0)**: Emission and reward transactions fully indexed
+- ✅ **Dilithium Claim Option (v2.73.0)**: Post-quantum signatures for reward claims (free gas)
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 

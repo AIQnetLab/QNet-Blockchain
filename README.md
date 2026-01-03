@@ -44,7 +44,27 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🚀 **LATEST UPDATES (v2.62.0 - December 30, 2025)**
+### 🚀 **LATEST UPDATES (v2.73.0 - January 3, 2026)**
+
+**🔍 PostgreSQL Indexer & Explorer Infrastructure:**
+- **PostgreSQL Indexer**: High-performance blockchain indexing service (`qnet-indexer`)
+- **WebSocket Real-time**: Live block and transaction events via WebSocket
+- **On-chain Node Registration**: `NodeRegistration` TX type for immutable wallet-to-node binding
+- **Explorer API**: Full block/transaction/address data with clickable hashes
+- **API Security**: Rate limiting (100 req/min), API key auth, configurable CORS
+- **System TX Support**: Emission, reward distribution indexed correctly
+- **Dilithium Claim Option**: Post-quantum signatures for reward claims (free gas)
+
+**Key Architecture:**
+```
+Explorer → Indexer (PostgreSQL) → Node RPC (fallback)
+                ↓
+    - O(1) queries via SQL indexes
+    - Real-time WebSocket subscription
+    - 100% data coverage (all TX types)
+```
+
+### 🛡️ **Previous Updates (v2.62.0 - December 30, 2025)**
 
 **🏛️ Per-Round Consensus Storage (Production L1 Architecture):**
 - **Independent Round Storage**: Each round has its own commits/reveals HashMap
@@ -54,15 +74,6 @@ This project uses **dual licensing**:
 - **100% First-Attempt Success**: Eliminates "Reveal doesn't match commit" errors
 - **Race Condition Fix**: Async tasks can't corrupt each other's data
 - **New API**: `finalize_round_by_number(round)`, `get_commits_for_round(round)`
-
-**Key Changes:**
-```rust
-// OLD: Single current_round (data loss on transition)
-current_round: Option<RoundState>
-
-// NEW: Per-round storage (no data loss!)
-rounds: HashMap<u64, RoundData>
-```
 
 ### 🛡️ **Previous Updates (v2.61.0 - December 29, 2025)**
 

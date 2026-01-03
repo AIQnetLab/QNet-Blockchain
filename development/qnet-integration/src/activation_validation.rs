@@ -1141,6 +1141,18 @@ impl BlockchainActivationRegistry {
             .find(|n| n.activation_code == code_hash || n.activation_code == code)
             .cloned()
     }
+    
+    /// v2.71: Get node info by wallet address (for claim validation)
+    pub async fn get_node_info_by_wallet(&self, wallet: &str) -> Result<Option<NodeInfo>, IntegrationError> {
+        let active_nodes = self.active_nodes.read().await;
+        
+        // Find node with matching wallet address
+        let node_info = active_nodes.values()
+            .find(|n| n.wallet_address == wallet)
+            .cloned();
+        
+        Ok(node_info)
+    }
 
     /// Determine node type from activation code structure
     async fn determine_node_type_from_code(&self, code: &str) -> Result<String, IntegrationError> {

@@ -133,6 +133,17 @@ pub enum TransactionType {
     /// Reward distribution
     RewardDistribution,
     
+    /// Node registration (ON-CHAIN binding of node_id → wallet)
+    /// All nodes must register on-chain to receive rewards
+    /// Genesis: predefined wallets, Super/Full: from activation, Light: from mobile app
+    NodeRegistration {
+        node_id: String,
+        node_type: NodeType,
+        wallet_address: String,
+        /// For Genesis: "genesis", For activated: activation_code hash, For Light: device signature hash
+        registration_proof: String,
+    },
+    
     /// Create new account
     CreateAccount {
         address: String,
@@ -591,6 +602,17 @@ impl Transaction {
                     }
                 }
             }
+            TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } => {
+                // System transaction: validate node registration data
+                if node_id.is_empty() {
+                    return Err("Node ID cannot be empty".to_string());
+                }
+                if wallet_address.is_empty() {
+                    return Err("Wallet address cannot be empty".to_string());
+                }
+                // node_type is validated by enum
+                let _ = node_type; // Explicitly mark as used
+            }
         }
         
         Ok(())
@@ -938,6 +960,13 @@ impl Transaction {
                          total_ping_count, successful_ping_count, ping_samples.len(), 
                          &merkle_root[..16]);
                 // No state modification needed - commitment will be validated during emission check
+            }
+            TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } => {
+                // System transaction: on-chain node registration
+                // No balance changes, only registers node_id -> wallet_address binding
+                println!("[NODE-REG] 📋 On-chain registration: {} ({:?}) -> {}", 
+                         node_id, node_type, &wallet_address[..20.min(wallet_address.len())]);
+                // Registration data is stored in blockchain for immutable lookup
             }
         }
         

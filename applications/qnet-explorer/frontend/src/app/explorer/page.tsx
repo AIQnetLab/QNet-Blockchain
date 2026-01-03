@@ -1,7 +1,8 @@
 'use client';
 
-import { memo, useState, useEffect } from 'react';
+import { memo, useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
+import { RealTimeStatus } from '../../components/RealTimeStatus';
 
 interface ActivityItem {
   hash: string;
@@ -13,24 +14,34 @@ interface ActivityItem {
   time: string;
 }
 
-// Memoized row for performance
-const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) {
-  const badgeClass = {
+// Get badge class for transaction type
+function getBadgeClass(type: string): string {
+  const classes: Record<string, string> = {
     'Transfer': 'badge-transfer',
     'Swap': 'badge-swap',
     'Node Activation': 'badge-activation',
+    'Activation': 'badge-activation',
     'Reward': 'badge-reward',
     'Smart Contract': 'badge-contract',
     'System': 'badge-system',
-  }[item.type] || 'badge-default';
+    'Registration': 'badge-system',
+    'Attestation': 'badge-system',
+    'Ping Commitment': 'badge-system',
+  };
+  return classes[type] || 'badge-default';
+}
 
+// Memoized row for performance
+const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) {
   return (
     <tr className="activity-row">
       <td className="col-hash">
         <Link href={`/explorer/tx/${item.hash}`} className="addr">
           {item.hash.slice(0, 8)}...{item.hash.slice(-6)}
         </Link>
-        <span className={`type-badge ${badgeClass}`}>{item.type}</span>
+      </td>
+      <td className="col-type">
+        <span className={`type-badge ${getBadgeClass(item.type)}`}>{item.type}</span>
       </td>
       <td className="col-addresses">
         <Link href={`/explorer/address/${item.from}`} className="addr">
@@ -58,11 +69,12 @@ export default function ExplorerPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [page, setPage] = useState(1);
 
-  // Fetch activity on mount and every 5 seconds
+  // Fetch activity on mount and every 30 seconds (reduced from 5s for performance)
   useEffect(() => {
     const fetchActivity = async () => {
       try {
-        const res = await fetch('/api/activity?limit=50');
+        // Reduced limit from 50 to 20 for faster loading
+        const res = await fetch('/api/activity?limit=20');
         const data = await res.json();
         if (data.success && data.data) {
           setActivity(data.data);
@@ -75,7 +87,8 @@ export default function ExplorerPage() {
     };
 
     fetchActivity();
-    const interval = setInterval(fetchActivity, 5000);
+    // Refresh every 30 seconds instead of 5
+    const interval = setInterval(fetchActivity, 30000);
     return () => clearInterval(interval);
   }, []);
   
@@ -104,8 +117,31 @@ export default function ExplorerPage() {
     }
   };
 
+  // Handle new block from WebSocket - trigger refresh
+  const handleNewBlock = useCallback(() => {
+    // Trigger activity refresh on new block
+    const fetchActivity = async () => {
+      try {
+        const res = await fetch('/api/activity?limit=20&t=' + Date.now());
+        const data = await res.json();
+        if (data.success && data.data) {
+          setActivity(data.data);
+        }
+      } catch (err) {
+        console.error('Failed to fetch activity:', err);
+      }
+    };
+    fetchActivity();
+  }, []);
+
   return (
     <div className="explorer-page">
+      {/* Real-time WebSocket status */}
+      <RealTimeStatus 
+        backendUrl={process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8001'}
+        onNewBlock={handleNewBlock}
+      />
+      
       <div className="explorer-header">
         <h1>Quantum Blockchain Explorer</h1>
         <p>Real-time network data and blockchain analytics</p>
@@ -144,11 +180,12 @@ export default function ExplorerPage() {
             <table className="activity-table">
               <thead>
                 <tr>
-                  <th>Transaction</th>
-                  <th>From → To</th>
-                  <th>Amount</th>
-                  <th>Block</th>
-                  <th>Time</th>
+                  <th>TRANSACTION</th>
+                  <th>TYPE</th>
+                  <th>FROM → TO</th>
+                  <th>AMOUNT</th>
+                  <th>BLOCK</th>
+                  <th>TIME</th>
                 </tr>
               </thead>
               <tbody>

@@ -1,7 +1,24 @@
 import { NextResponse } from 'next/server';
 
-// PRODUCTION: Use Genesis Node 001 as primary API source
-const QNET_API_URL = process.env.QNET_API_URL || 'http://154.38.160.39:8001';
+// ============================================================================
+// PRODUCTION v2.72: Hybrid approach - Node RPC for live height, Indexer for stats
+// ============================================================================
+
+// Node RPC for real-time height (must be live)
+const NODE_RPC_URL = process.env.QNET_API_URL || 'http://154.38.160.39:8001';
+
+// Indexer for aggregated stats (optional, faster)
+const INDEXER_API_URL = process.env.INDEXER_API_URL || 'http://localhost:9000';
+const INDEXER_API_KEY = process.env.INDEXER_API_KEY || '';
+
+// Helper: Get headers for Indexer requests
+function getIndexerHeaders(): HeadersInit {
+  const headers: HeadersInit = { 'Content-Type': 'application/json' };
+  if (INDEXER_API_KEY) {
+    headers['X-API-Key'] = INDEXER_API_KEY;
+  }
+  return headers;
+}
 
 // Disable ALL caching
 export const dynamic = 'force-dynamic';
@@ -10,17 +27,26 @@ export const fetchCache = 'force-no-store';
 
 export async function GET() {
   try {
-    // Use /height endpoint for real-time data (no caching)
-    const [heightRes, statsRes] = await Promise.all([
-      fetch(`${QNET_API_URL}/api/v1/height?t=${Date.now()}`, {
+    // Fetch height from Node RPC (must be real-time)
+    // Fetch stats from Indexer if available, fallback to Node RPC
+    const [heightRes, indexerStatsRes, nodeStatsRes] = await Promise.all([
+      fetch(`${NODE_RPC_URL}/api/v1/height?t=${Date.now()}`, {
         cache: 'no-store',
-        next: { revalidate: 0 }
+        signal: AbortSignal.timeout(5000),
       }),
-      fetch(`${QNET_API_URL}/api/v1/public/stats?t=${Date.now()}`, {
+      fetch(`${INDEXER_API_URL}/api/v1/stats`, {
+        headers: getIndexerHeaders(),
         cache: 'no-store',
-        next: { revalidate: 0 }
-      })
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => null),
+      fetch(`${NODE_RPC_URL}/api/v1/public/stats?t=${Date.now()}`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => null),
     ]);
+    
+    // Use Indexer stats if available, else Node RPC
+    const statsRes = indexerStatsRes?.ok ? indexerStatsRes : nodeStatsRes;
     
     if (heightRes.ok) {
       const heightData = await heightRes.json();

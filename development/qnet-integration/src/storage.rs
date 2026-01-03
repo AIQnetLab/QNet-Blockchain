@@ -2240,19 +2240,22 @@ impl Storage {
         // Step 1: Save each transaction with PATTERN RECOGNITION + Zstd compression
         // Pattern Recognition provides 80-95% compression for common TX types
         for tx in &microblock.transactions {
-            // Calculate transaction hash
-            let tx_hash = {
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(bincode::serialize(tx).unwrap_or_default());
-                let result = hasher.finalize();
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&result);
-                hash
-            };
-            tx_hashes.push(tx_hash);
+            // v2.72: Use transaction's own hash (BLAKE3) for consistency with lookups
+            // Previously we computed SHA3(bincode) which didn't match tx.hash
+            // This caused find_transaction_by_hash() to fail for system TX
+            let tx_hash_str = &tx.hash; // Already computed by tx.calculate_hash()
             
-            let tx_key = format!("tx_{}", hex::encode(tx_hash));
+            // Convert to [u8; 32] for EfficientMicroBlock
+            let tx_hash_bytes: [u8; 32] = {
+                let decoded = hex::decode(tx_hash_str).unwrap_or_else(|_| vec![0u8; 32]);
+                let mut arr = [0u8; 32];
+                let len = decoded.len().min(32);
+                arr[..len].copy_from_slice(&decoded[..len]);
+                arr
+            };
+            tx_hashes.push(tx_hash_bytes);
+            
+            let tx_key = format!("tx_{}", tx_hash_str);
             
             // Serialize original transaction for size tracking
             let tx_data = bincode::serialize(tx)
@@ -2283,13 +2286,13 @@ impl Storage {
             
             // INDEX: address -> tx_hash for account transaction queries
             let timestamp = tx.timestamp;
-            let from_key = format!("addr_{}_{:016x}_{}", tx.from, timestamp, hex::encode(tx_hash));
-            batch.put_cf(&tx_by_addr_cf, from_key.as_bytes(), &tx_hash);
+            let from_key = format!("addr_{}_{:016x}_{}", tx.from, timestamp, tx_hash_str);
+            batch.put_cf(&tx_by_addr_cf, from_key.as_bytes(), tx_hash_str.as_bytes());
             
-            if let Some(ref to) = tx.to {
-                let to_key = format!("addr_{}_{:016x}_{}", to, timestamp, hex::encode(tx_hash));
-                batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), &tx_hash);
-            }
+            // Index 'to' address (if present, including system addresses)
+            let to_addr = tx.to.as_ref().map(|s| s.as_str()).unwrap_or(&tx.from);
+            let to_key = format!("addr_{}_{:016x}_{}", to_addr, timestamp, tx_hash_str);
+            batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), tx_hash_str.as_bytes());
         }
         
         // Log pattern compression results (every 100 blocks)

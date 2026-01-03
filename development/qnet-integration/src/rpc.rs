@@ -4738,6 +4738,30 @@ async fn handle_light_node_register(
         };
         p2p.register_light_node(registration);
         println!("[GOSSIP] 📤 Light node registration gossiped to network ({})", push_type_str);
+        
+        // v2.71: Create ON-CHAIN NodeRegistration TX for Light nodes (only for NEW nodes)
+        if registration_result == "node_created" {
+            let device_sig_hash = blake3::hash(register_request.device_id.as_bytes()).to_hex().to_string();
+            let registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
+                &light_node_pseudonym,
+                qnet_state::NodeType::Light,
+                &register_request.wallet_address,
+                &device_sig_hash[..32], // First 32 chars of device signature hash as proof
+            );
+            
+            // Add to mempool for inclusion in next block
+            let mempool = blockchain.get_mempool();
+            let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
+            let tx_hash = registration_tx.hash.clone();
+            if mempool.add_binary_transaction(tx_bytes, tx_hash.clone(), 0) {
+                println!("[INFO][REG] light_onchain_tx node={} wallet={}... hash={}...", 
+                         light_node_pseudonym, 
+                         &register_request.wallet_address[..16.min(register_request.wallet_address.len())],
+                         &tx_hash[..16.min(tx_hash.len())]);
+            } else {
+                eprintln!("[WARN][REG] light_onchain_tx_failed node={}", light_node_pseudonym);
+            }
+        }
     }
     
     // Calculate next ping time for this node
@@ -6468,66 +6492,34 @@ async fn handle_claim_rewards(
         }
     }
     
-    // CRITICAL FIX: Get the ACTUAL wallet address from node_ownership in reward_manager
-    // The wallet was registered during node activation - we MUST use that, not generate a new one!
-    // This prevents attackers from claiming rewards to a different wallet.
-    let registered_wallet = {
-        let reward_manager_arc = blockchain.get_reward_manager();
-        let reward_manager = reward_manager_arc.read().await;
-        reward_manager.get_node_owner(&claim_request.node_id)
-    };
+    // v2.71: ON-CHAIN WALLET VERIFICATION
+    // Uses blockchain NodeRegistration TX as SINGLE SOURCE OF TRUTH
+    // Fallback to genesis_constants for Genesis nodes (until on-chain registration is in block)
+    let registered_wallet = blockchain.get_node_wallet(&claim_request.node_id).await;
     
     let wallet_address = match registered_wallet {
         Some(registered) => {
-            // SECURITY: Verify claimant wallet matches registered wallet
+            // SECURITY: Verify claimant wallet matches ON-CHAIN registered wallet
             if registered != claim_request.wallet_address {
-                println!("[SECURITY] ❌ Wallet mismatch for node {}", claim_request.node_id);
-                println!("   Registered: {}...", &registered[..16.min(registered.len())]);
-                println!("   Claimed by: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
+                println!("[SECURITY][CLAIM] wallet_mismatch node={}", claim_request.node_id);
+                println!("[SECURITY][CLAIM] onchain={}... claimed={}...", 
+                         &registered[..16.min(registered.len())],
+                         &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
                 return Ok(warp::reply::json(&json!({
                     "success": false,
-                    "error": "Wallet address does not match registered owner"
+                    "error": "Wallet address does not match on-chain registration"
                 })));
             }
+            println!("[INFO][CLAIM] wallet_verified node={} source=blockchain", claim_request.node_id);
             registered
         }
         None => {
-            // Node not registered in reward_manager - check if it's a Genesis node
-            if claim_request.node_id.starts_with("genesis_node_") {
-                // Genesis nodes use PREDEFINED wallets from genesis_constants.rs
-                // CRITICAL: Must match the wallet used during registration in node.rs
-                let bootstrap_id = claim_request.node_id.strip_prefix("genesis_node_").unwrap_or("001");
-                
-                match crate::genesis_constants::get_genesis_wallet_by_id(bootstrap_id) {
-                    Some(genesis_wallet) => {
-                        // Verify claimant is using the correct Genesis wallet
-                        if genesis_wallet != claim_request.wallet_address {
-                            println!("[SECURITY] ❌ Genesis wallet mismatch for node {}", claim_request.node_id);
-                            println!("   Expected: {}...", &genesis_wallet[..16.min(genesis_wallet.len())]);
-                            println!("   Claimed by: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
-                            return Ok(warp::reply::json(&json!({
-                                "success": false,
-                                "error": "Invalid Genesis wallet address"
-                            })));
-                        }
-                        genesis_wallet.to_string()
-                    }
-                    None => {
-                        println!("[SECURITY] ❌ Unknown Genesis bootstrap ID: {}", bootstrap_id);
-                        return Ok(warp::reply::json(&json!({
-                            "success": false,
-                            "error": "Unknown Genesis node ID"
-                        })));
-                    }
-                }
-            } else {
-                // Node not registered - cannot claim
-                println!("[SECURITY] ❌ Node {} not registered for rewards", claim_request.node_id);
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Node not registered for rewards. Register your node first."
-                })));
-            }
+            // Node not registered on-chain
+            println!("[SECURITY][CLAIM] no_onchain_registration node={}", claim_request.node_id);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Node not registered on-chain. Registration TX required before claiming rewards."
+            })));
         }
     };
     

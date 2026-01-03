@@ -1,0 +1,60 @@
+[workspace]
+
+[package]
+name = "qnet-indexer"
+version = "1.0.0"
+edition = "2021"
+description = "QNet Blockchain PostgreSQL Indexer - High-performance block/transaction indexing service"
+authors = ["QNet Team"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full", "rt-multi-thread", "sync", "time", "macros"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
+
+# HTTP client for node RPC
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+
+# WebSocket client
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Configuration
+config = "0.14"
+dotenv = "0.15"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Hex encoding
+hex = "0.4"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Async channels
+async-channel = "2.1"
+
+# HTTP server for API
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Utilities
+lazy_static = "1.4"
+
+[[bin]]
+name = "qnet-indexer"
+path = "src/main.rs"
+

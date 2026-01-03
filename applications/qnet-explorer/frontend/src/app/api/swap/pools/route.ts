@@ -1,15 +1,19 @@
 import { NextResponse } from 'next/server';
 
-// SWAP Pools API - DEX not yet available
+// ============================================================================
+// SWAP Pools API - DEX Module
 // When launched: Fees from swaps go to Pool 2 (70% Super nodes, 30% Full nodes)
+// Status: Planned for Phase 3
+// ============================================================================
 
-const QNET_API_URL = process.env.QNET_API_URL || 'http://localhost:8000';
+const QNET_API_URL = process.env.QNET_API_URL || 'http://localhost:8001';
 
 export async function GET() {
   try {
-    // Try to fetch from backend
+    // Try to fetch from backend DEX module
     const res = await fetch(`${QNET_API_URL}/api/v1/dex/pools`, {
-      next: { revalidate: 30 }
+      cache: 'no-store',
+      signal: AbortSignal.timeout(5000),
     });
     
     if (res.ok) {
@@ -22,28 +26,24 @@ export async function GET() {
       });
     }
     
-    // DEX not available
+    // DEX module not deployed yet
     return NextResponse.json({
       success: false,
-      error: 'DEX not available yet',
+      error: 'DEX_NOT_DEPLOYED',
+      message: 'Decentralized Exchange is scheduled for Phase 3',
       pools: [],
       totalTvl: '0',
       pool2Balance: '0',
-    }, { status: 503 });
+    }, { status: 501 }); // 501 Not Implemented
     
   } catch {
     return NextResponse.json({
       success: false,
-      error: 'DEX not available yet',
+      error: 'DEX_UNAVAILABLE',
+      message: 'DEX service is not available',
       pools: [],
       totalTvl: '0',
       pool2Balance: '0',
     }, { status: 503 });
   }
 }
-
-
-
-
-
-
