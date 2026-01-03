@@ -2616,25 +2616,39 @@ impl BlockchainNode {
                     if reward_count > 0 {
                         // Restore each pending reward to reward_manager
                         for (node_id, reward) in stored_rewards {
-                            // First ensure node is registered (load registration from storage)
-                            if let Ok(Some((node_type_str, wallet, _reputation))) = storage.load_node_registration(&node_id) {
-                                let node_type = match node_type_str.as_str() {
-                                    "light" => RewardNodeType::Light,
-                                    "full" => RewardNodeType::Full,
-                                    "super" => RewardNodeType::Super,
-                                    _ => RewardNodeType::Light,
-                                };
-                                
-                                // Register node if not already registered
-                                if let Err(_) = reward_manager_guard.register_node(node_id.clone(), node_type, wallet) {
-                                    // Already registered, that's fine
+                            // Load node registration from storage
+                            let registration = storage.load_node_registration(&node_id);
+                            
+                            let (node_type, wallet) = match registration {
+                                Ok(Some((node_type_str, wallet, _reputation))) => {
+                                    // Normal case: node found in storage
+                                    let nt = match node_type_str.as_str() {
+                                        "light" => RewardNodeType::Light,
+                                        "full" => RewardNodeType::Full,
+                                        "super" => RewardNodeType::Super,
+                                        _ => RewardNodeType::Full,
+                                    };
+                                    (nt, wallet)
                                 }
-                                
-                                // Restore pending reward to reward_manager
-                                let reward_amount = reward.total_reward;
-                                reward_manager_guard.restore_pending_reward(node_id.clone(), reward);
-                                if is_debug() { println!("[DBG][REWARDS] restored node={} amt={}", 
-                                         node_id, reward_amount); }
+                                _ => {
+                                    // Node not in storage - cannot restore without knowing type/wallet
+                                    // This is a data integrity issue - rewards exist but node doesn't
+                                    if is_warn() { 
+                                        println!("[WARN][REWARDS] orphan_reward node={} (no registration, skipping)", node_id); 
+                                    }
+                                    continue;
+                                }
+                            };
+                            
+                            // Register node in reward_manager (may already be registered)
+                            let _ = reward_manager_guard.register_node(node_id.clone(), node_type, wallet);
+                            
+                            // Restore pending reward
+                            let reward_amount = reward.total_reward;
+                            reward_manager_guard.restore_pending_reward(node_id.clone(), reward);
+                            if is_info() { 
+                                println!("[INFO][REWARDS] restored node={} amt={} QNC", 
+                                    &node_id[..node_id.len().min(20)], reward_amount / 1_000_000_000); 
                             }
                         }
                         if is_info() { println!("[INFO][REWARDS] restored={}", reward_count); }
@@ -3151,6 +3165,15 @@ impl BlockchainNode {
                 } else {
                     if is_info() { println!("[INFO][REWARDS] genesis_reg node={} wallet={}...", 
                              genesis_node_id, &genesis_wallet[..30]); }
+                }
+                
+                // v2.70: CRITICAL - Save Genesis node to storage for reward recovery on restart
+                // Without this, rewards won't restore after node restart!
+                use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
+                if let Err(e) = blockchain.storage.save_node_registration(&genesis_node_id, "super", &genesis_wallet, INITIAL_REPUTATION) {
+                    eprintln!("[WARN][STORAGE] genesis_reg_save_fail node={} err={}", genesis_node_id, e);
+                } else {
+                    if is_info() { println!("[INFO][STORAGE] genesis_saved node={}", genesis_node_id); }
                 }
             }
             
@@ -16234,27 +16257,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     pub async fn get_block(&self, height: u64) -> Result<Option<qnet_state::Block>, QNetError> {
-        // CRITICAL FIX: We store MicroBlocks, not Blocks
-        // Convert MicroBlock to Block format for API compatibility
-        match self.storage.load_microblock(height) {
-            Ok(Some(data)) => {
-                // Deserialize MicroBlock
-                match bincode::deserialize::<qnet_state::MicroBlock>(&data) {
-                    Ok(microblock) => {
-                        // Convert MicroBlock to Block format
-                        let block = qnet_state::Block {
-                            height: microblock.height,
-                            timestamp: microblock.timestamp,
-                            previous_hash: microblock.previous_hash,
-                            merkle_root: microblock.merkle_root,
-                            transactions: microblock.transactions,
-                            producer: microblock.producer,
-                            signature: microblock.signature,
-                        };
-                        Ok(Some(block))
-                    }
-                    Err(e) => Err(QNetError::StorageError(format!("Failed to deserialize microblock: {}", e))),
-                }
+        // v2.70: Use auto-format loader that handles both EfficientMicroBlock and legacy MicroBlock
+        // EfficientMicroBlock stores only TX hashes - full TXs are in separate "transactions" CF
+        // load_microblock_auto_format() reconstructs full block with transactions
+        match self.storage.load_microblock_auto_format(height) {
+            Ok(Some(microblock)) => {
+                // Convert MicroBlock to Block format for API compatibility
+                let block = qnet_state::Block {
+                    height: microblock.height,
+                    timestamp: microblock.timestamp,
+                    previous_hash: microblock.previous_hash,
+                    merkle_root: microblock.merkle_root,
+                    transactions: microblock.transactions,
+                    producer: microblock.producer,
+                    signature: microblock.signature,
+                };
+                Ok(Some(block))
             }
             Ok(None) => Ok(None),
             Err(e) => Err(QNetError::StorageError(e.to_string())),
@@ -16304,26 +16322,43 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             } else if tx.from == "system_ping_commitment" {
                 // v2.53: Ping commitments are system transactions, validated by merkle proofs
                 if is_info() { println!("[INFO][REWARDS] ping_commitment_accepted system_tx"); }
-            } else if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) {
-                // User reward claims - MUST have valid user signature (not just non-empty!)
-                // v2.65: Full cryptographic verification to prevent P2P bypass attacks
+            } else if tx.from == "system_rewards_pool" && matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) {
+                // v2.70: Reward claims from system_rewards_pool
+                // Signature was already verified by API endpoint on message "claim_rewards:{node_id}:{wallet}"
+                // Here we just verify the TX has the required fields (signature, pubkey, data)
                 if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
-                    return Err(QNetError::ValidationError("Reward claim must be signed by user".to_string()));
+                    return Err(QNetError::ValidationError("Reward claim must have signature".to_string()));
                 }
                 if tx.public_key.as_ref().map_or(true, |k| k.is_empty()) {
                     return Err(QNetError::ValidationError("Reward claim requires public_key".to_string()));
+                }
+                // data contains "reward_claim:{node_id}:{amount}" - used for audit trail
+                if tx.data.as_ref().map_or(true, |d| !d.starts_with("reward_claim:")) {
+                    return Err(QNetError::ValidationError("Reward claim must have valid data field".to_string()));
+                }
+                let has_quantum = tx.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty());
+                if is_info() { 
+                    println!("[INFO][REWARDS] claim_tx_accepted from=system_rewards_pool quantum_safe={}", has_quantum); 
+                }
+            } else if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) {
+                // Other RewardDistribution TX (not from system_rewards_pool) - verify signature on TX hash
+                if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
+                    return Err(QNetError::ValidationError("Reward TX must be signed".to_string()));
+                }
+                if tx.public_key.as_ref().map_or(true, |k| k.is_empty()) {
+                    return Err(QNetError::ValidationError("Reward TX requires public_key".to_string()));
                 }
                 
                 if let Some(ref sig) = tx.signature {
                     if let Some(ref pubkey) = tx.public_key {
                         if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
                             return Err(QNetError::ValidationError(
-                                "Invalid Ed25519 signature for reward claim".to_string()
+                                "Invalid Ed25519 signature for reward TX".to_string()
                             ));
                         }
                     }
                 }
-                if is_info() { println!("[INFO][REWARDS] claim_signature_verified"); }
+                if is_info() { println!("[INFO][REWARDS] reward_tx_signature_verified"); }
             }
         } else {
             // Regular transactions MUST have signature

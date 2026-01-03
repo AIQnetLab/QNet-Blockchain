@@ -6338,8 +6338,14 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
 struct ClaimRewardsRequest {
     node_id: String,
     wallet_address: String,
-    quantum_signature: String,
-    public_key: String,
+    quantum_signature: String,  // Ed25519 signature (REQUIRED)
+    public_key: String,         // Ed25519 public key (REQUIRED)
+    // v2.70: Optional Dilithium signature for quantum-safe claims
+    // If provided, adds post-quantum protection (NIST FIPS 204)
+    #[serde(default)]
+    dilithium_signature: Option<String>,
+    #[serde(default)]
+    dilithium_public_key: Option<String>,
 }
 
 async fn handle_claim_rewards(
@@ -6385,12 +6391,11 @@ async fn handle_claim_rewards(
     let claim_message = format!("claim_rewards:{}:{}", claim_request.node_id, claim_request.wallet_address);
     
     // v2.66: Diagnostic logging for signature verification
-    println!("[CLAIM] Verifying Ed25519 signature:");
-    println!("[CLAIM]   node_id: {}", claim_request.node_id);
-    println!("[CLAIM]   wallet: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
-    println!("[CLAIM]   message: {}", claim_message);
-    println!("[CLAIM]   sig_len: {}, pubkey_len: {}", 
-             claim_request.quantum_signature.len(), claim_request.public_key.len());
+    println!("[INFO][CLAIM] verify_ed25519 node={} wallet={}... sig_len={} pubkey_len={}",
+             claim_request.node_id,
+             &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())],
+             claim_request.quantum_signature.len(),
+             claim_request.public_key.len());
     
     let signature_valid = verify_ed25519_client_signature(
         &claim_request.node_id,  // context for logging
@@ -6400,7 +6405,7 @@ async fn handle_claim_rewards(
     ).await;
     
     if !signature_valid {
-        println!("[CLAIM] ❌ Ed25519 signature verification FAILED");
+        println!("[WARN][CLAIM] ed25519_invalid node={}", claim_request.node_id);
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "Invalid Ed25519 signature for reward claim",
@@ -6414,7 +6419,54 @@ async fn handle_claim_rewards(
         })));
     }
     
-    println!("[CLAIM] ✅ Ed25519 signature verified successfully");
+    println!("[INFO][CLAIM] ed25519_verified node={}", claim_request.node_id);
+    
+    // v2.70: OPTIONAL Dilithium signature verification for quantum-safe claims
+    // If provided, verify post-quantum signature (same message format as Ed25519)
+    let has_dilithium = claim_request.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty());
+    if has_dilithium {
+        let dilithium_sig = claim_request.dilithium_signature.as_ref().unwrap();
+        let dilithium_pubkey = match &claim_request.dilithium_public_key {
+            Some(pk) if !pk.is_empty() => pk.clone(),
+            _ => {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "dilithium_public_key required when dilithium_signature is provided"
+                })));
+            }
+        };
+        
+        // Create Dilithium signature struct for verification
+        use crate::quantum_crypto::DilithiumSignature;
+        let dilithium_struct = DilithiumSignature {
+            signature: dilithium_sig.clone(),
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            strength: "quantum-resistant".to_string(),
+        };
+        
+        // Verify Dilithium signature on same message
+        let crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+        match crypto.verify_dilithium_signature(&claim_message, &dilithium_struct, &dilithium_pubkey).await {
+            Ok(true) => {
+                println!("[INFO][CLAIM] dilithium_verified node={} quantum_safe=true", claim_request.node_id);
+            }
+            Ok(false) => {
+                println!("[WARN][CLAIM] dilithium_invalid node={}", claim_request.node_id);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Invalid Dilithium signature for quantum-safe claim"
+                })));
+            }
+            Err(e) => {
+                println!("[ERR][CLAIM] dilithium_verify_fail node={} err={}", claim_request.node_id, e);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": format!("Dilithium verification failed: {}", e)
+                })));
+            }
+        }
+    }
     
     // CRITICAL FIX: Get the ACTUAL wallet address from node_ownership in reward_manager
     // The wallet was registered during node activation - we MUST use that, not generate a new one!
@@ -6513,30 +6565,33 @@ async fn handle_claim_rewards(
         to: Some(claim_request.wallet_address.clone()), // User's wallet receiving rewards
         amount: reward_amount,
         nonce: 0, // will be set by state
-        gas_price: 0, // No gas for reward claims
+        gas_price: 0, // No gas for reward claims (Ed25519 + Dilithium both FREE!)
         gas_limit: 0, // No gas for reward claims
         timestamp: chrono::Utc::now().timestamp() as u64,
         signature: Some(claim_request.quantum_signature.clone()), // User's Ed25519 signature
         public_key: Some(claim_request.public_key.clone()), // User's Ed25519 public key
         tx_type: qnet_state::TransactionType::RewardDistribution,
-        data: Some(format!("reward_claim:{}:{}", claim_request.node_id, reward_amount)), // Track which node claimed
-        dilithium_signature: None,   // Reward claim - no quantum sig
-        dilithium_public_key: None,
+        data: Some(format!("reward_claim:{}:{}:{}", claim_request.node_id, reward_amount,
+            if has_dilithium { "quantum" } else { "standard" })), // Track which node claimed + quantum flag
+        // v2.70: Pass through Dilithium signature if provided (quantum-safe claim)
+        dilithium_signature: claim_request.dilithium_signature.clone(),
+        dilithium_public_key: claim_request.dilithium_public_key.clone(),
     };
     
     // Calculate transaction hash
     tx.hash = tx.calculate_hash();
     
-    println!("[REWARDS] 📝 Creating RewardDistribution transaction:");
-    println!("[REWARDS]    Node: {}", claim_request.node_id);
-    println!("[REWARDS]    Wallet: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
-    println!("[REWARDS]    Amount: {:.9} QNC", reward_amount as f64 / 1_000_000_000.0);
-    println!("[REWARDS]    TxHash: {}", tx.hash);
+    println!("[INFO][CLAIM] tx_created node={} wallet={}... amount={} QNC hash={} security={}",
+             claim_request.node_id,
+             &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())],
+             reward_amount / 1_000_000_000,
+             &tx.hash[..16.min(tx.hash.len())],
+             if has_dilithium { "quantum" } else { "standard" });
     
     // Submit transaction to blockchain
     match blockchain.submit_transaction(tx.clone()).await {
         Ok(tx_hash) => {
-            println!("[REWARDS] ✅ Reward claim transaction submitted: {}", tx_hash);
+            println!("[INFO][CLAIM] tx_submitted node={} hash={}", claim_request.node_id, tx_hash);
             
             // CRITICAL: Mark rewards as claimed in reward_manager AFTER successful blockchain submission
             let claim_result = {
@@ -6676,8 +6731,9 @@ async fn handle_get_pending_rewards(
     };
     let is_eligible = heartbeat_count >= required_heartbeats;
     
-    // v2.64: Get pending rewards ONLY if eligible, otherwise show 0
-    let (pending_amount, pool1, pool2, pool3, phase) = if is_eligible {
+    // v2.70: ALWAYS show pending rewards (they may have accumulated from previous epochs)
+    // Eligibility only affects NEW reward accumulation, not existing pending rewards
+    let (pending_amount, pool1, pool2, pool3, phase) = {
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
         
@@ -6742,9 +6798,6 @@ async fn handle_get_pending_rewards(
                 (0, 0, 0, 0, phase_str)
             }
         }
-    } else {
-        // NOT eligible - show 0 rewards
-        (0, 0, 0, 0, "Phase1".to_string())
     };
     
     // Get last claim time from storage

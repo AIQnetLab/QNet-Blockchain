@@ -9,7 +9,7 @@ export const revalidate = 0;
 
 export interface ActivityItem {
   hash: string;
-  type: 'Transfer' | 'Node Activation' | 'Swap' | 'Reward' | 'Smart Contract' | 'Block';
+  type: 'Transfer' | 'Node Activation' | 'Swap' | 'Reward' | 'Smart Contract' | 'Block' | 'System';
   from: string;
   to: string;
   amount: string;
@@ -18,7 +18,70 @@ export interface ActivityItem {
   timestamp: number;
 }
 
-// Fetch latest activity from QNet backend
+// Fetch transactions from recent blocks
+async function fetchBlockTransactions(limit: number): Promise<ActivityItem[]> {
+  const activity: ActivityItem[] = [];
+  
+  try {
+    // Get current height
+    const heightRes = await fetch(`${QNET_API_URL}/api/v1/height`, {
+      cache: 'no-store',
+    });
+    
+    if (!heightRes.ok) return activity;
+    
+    const heightData = await heightRes.json();
+    const currentHeight = heightData.height || 0;
+    
+    // Fetch last 20 blocks to find transactions
+    const blocksToCheck = Math.min(20, currentHeight);
+    
+    for (let i = 0; i < blocksToCheck && activity.length < limit; i++) {
+      const blockHeight = currentHeight - i;
+      if (blockHeight < 0) break;
+      
+      try {
+        const blockRes = await fetch(`${QNET_API_URL}/api/v1/block/${blockHeight}`, {
+          cache: 'no-store',
+        });
+        
+        if (blockRes.ok) {
+          const block = await blockRes.json();
+          const transactions = block.transactions || block.txs || [];
+          
+          for (const tx of transactions) {
+            if (activity.length >= limit) break;
+            
+            // Detect system/emission transactions
+            const isSystemTx = tx.from?.startsWith('system_') || 
+                               tx.to === 'system_rewards_pool' ||
+                               tx.tx_type === 'RewardDistribution' ||
+                               tx.type === 'RewardDistribution';
+            
+            activity.push({
+              hash: tx.hash || tx.id || `block_${blockHeight}_tx_${activity.length}`,
+              type: isSystemTx ? 'Reward' : mapTxType(tx.type || tx.tx_type),
+              from: tx.from || tx.sender || 'system_emission',
+              to: tx.to || tx.recipient || 'system_rewards_pool',
+              amount: formatAmount(tx.amount),
+              block: blockHeight,
+              time: formatTimeAgo(tx.timestamp || block.timestamp || Date.now()),
+              timestamp: tx.timestamp || block.timestamp || Date.now(),
+            });
+          }
+        }
+      } catch {
+        // Skip failed block fetch
+      }
+    }
+  } catch {
+    // Return what we have
+  }
+  
+  return activity;
+}
+
+// Fetch latest activity from QNet backend (mempool)
 async function fetchActivityFromBackend(limit: number): Promise<ActivityItem[] | null> {
   try {
     // Try mempool transactions first (shows pending/recent)
@@ -69,6 +132,9 @@ function mapTxType(type: string | object): ActivityItem['type'] {
     'BatchTransfers': 'Transfer',
     'PingAttestation': 'Transfer',
     'PingCommitmentWithSampling': 'Transfer',
+    // System transactions
+    'SystemEmission': 'Reward',
+    'Emission': 'Reward',
     // Legacy/alternate formats
     'SEND': 'Transfer',
     'send': 'Transfer',
@@ -88,16 +154,24 @@ function mapTxType(type: string | object): ActivityItem['type'] {
 function formatAmount(amount: any): string {
   if (!amount) return '0 QNC';
   const num = typeof amount === 'string' ? parseFloat(amount) : amount;
-  if (num >= 1e9) {
-    return (num / 1e9).toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' QNC';
+  // Amount is in smallest units (like wei), convert to QNC (divide by 1e9)
+  const qnc = num / 1e9;
+  if (qnc >= 1000000) {
+    return (qnc / 1000000).toLocaleString('en-US', { maximumFractionDigits: 2 }) + 'M QNC';
   }
-  return num.toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' QNC';
+  if (qnc >= 1000) {
+    return (qnc / 1000).toLocaleString('en-US', { maximumFractionDigits: 2 }) + 'K QNC';
+  }
+  return qnc.toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' QNC';
 }
 
 function formatTimeAgo(timestamp: number): string {
   const now = Date.now();
-  const diff = now - timestamp;
+  // Handle both seconds and milliseconds timestamps
+  const ts = timestamp > 1e12 ? timestamp : timestamp * 1000;
+  const diff = now - ts;
   
+  if (diff < 0) return 'just now';
   if (diff < 60000) return `${Math.floor(diff / 1000)}s ago`;
   if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
   if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
@@ -108,13 +182,40 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const limit = parseInt(searchParams.get('limit') || '50', 10);
   
-  // Try backend first
-  const activity = await fetchActivityFromBackend(limit);
+  // Try mempool first
+  const mempoolActivity = await fetchActivityFromBackend(limit);
   
-  // Return real data only, or empty array if backend unavailable
+  // Also fetch from recent blocks (includes system transactions)
+  const blockActivity = await fetchBlockTransactions(limit);
+  
+  // Merge and deduplicate by hash
+  const allActivity: ActivityItem[] = [];
+  const seenHashes = new Set<string>();
+  
+  // Add mempool transactions first (pending)
+  if (mempoolActivity) {
+    for (const item of mempoolActivity) {
+      if (!seenHashes.has(item.hash)) {
+        seenHashes.add(item.hash);
+        allActivity.push(item);
+      }
+    }
+  }
+  
+  // Add block transactions
+  for (const item of blockActivity) {
+    if (!seenHashes.has(item.hash)) {
+      seenHashes.add(item.hash);
+      allActivity.push(item);
+    }
+  }
+  
+  // Sort by timestamp (newest first)
+  allActivity.sort((a, b) => b.timestamp - a.timestamp);
+  
+  // Return limited results
   return NextResponse.json({
     success: true,
-    data: activity || [],
+    data: allActivity.slice(0, limit),
   });
 }
-

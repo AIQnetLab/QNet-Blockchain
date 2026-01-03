@@ -3269,6 +3269,7 @@ a[href*="play.google.com"] img {
 .badge-activation { background: rgba(0,240,150,0.15); color: #00f090; }
 .badge-reward { background: rgba(240,200,60,0.15); color: #f0d040; }
 .badge-contract { background: rgba(240,130,130,0.15); color: #f09090; }
+.badge-system { background: rgba(160,100,240,0.15); color: #a080f0; }
 .badge-default { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.55); }
 
 .col-addresses {

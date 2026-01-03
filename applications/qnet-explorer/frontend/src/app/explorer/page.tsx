@@ -21,6 +21,7 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
     'Node Activation': 'badge-activation',
     'Reward': 'badge-reward',
     'Smart Contract': 'badge-contract',
+    'System': 'badge-system',
   }[item.type] || 'badge-default';
 
   return (
