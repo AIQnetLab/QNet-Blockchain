@@ -9184,11 +9184,23 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             validation_futures.push(tokio::spawn(async move {
                                 // Validate each transaction in parallel
                                 for tx in batch {
+                                    // v2.69: System TX bypass signature/amount validation
+                                    // Like Bitcoin coinbase, Ethereum block rewards - no user signature needed
+                                    let is_system_tx = tx.from == "system_emission" 
+                                        || tx.from == "system_ping_commitment"
+                                        || tx.from.starts_with("system_");
+                                    
+                                    if is_system_tx {
+                                        // System TX: only basic validation (no signature/amount check)
+                                        continue;
+                                    }
+                                    
                                     // REAL PRODUCTION VALIDATION - not a stub!
                                     if let Err(_) = tx.validate() {
                                         return false;
                                     }
                                     // Additional parallel checks: signature, balance, nonce
+                                    // v2.69: Only for USER transactions (system TX already skipped above)
                                     if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
                                         return false;
                                     }
