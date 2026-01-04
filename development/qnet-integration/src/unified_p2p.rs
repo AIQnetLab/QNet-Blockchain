@@ -2125,8 +2125,13 @@ impl SimplifiedP2P {
         }
         
         // IMPROVED: Try to setup UPnP port forwarding for NAT traversal
-        // SAFE: Check if Tokio runtime is available to prevent panic
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // SKIP in Docker - ports are already forwarded via -p flag
+        let is_docker = std::env::var("DOCKER_ENV").is_ok() 
+            || std::path::Path::new("/.dockerenv").exists();
+        
+        if is_docker {
+            println!("[P2P] 🐳 Docker detected - skipping UPnP (ports forwarded via -p)");
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let port = self.port;
             let _node_id = self.node_id.clone();
             handle.spawn(async move {

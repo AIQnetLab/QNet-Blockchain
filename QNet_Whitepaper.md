@@ -82,7 +82,7 @@ Experimental achievements:
 - ✅ **Automatic Round Cleanup (v2.62.0)**: Old rounds (>5 epochs) auto-purged
 - ✅ **100% First-Attempt Success (v2.62.0)**: Eliminated race conditions in consensus
 - ✅ **Production L1 Architecture (v2.62.0)**: Per-round storage standard for top blockchains
-- ✅ **Embedded RocksDB Indexing (v2.74.0)**: Built-in tx_index (like Cosmos/Tendermint)
+- ✅ **Embedded RocksDB Indexing (v2.74.0)**: Built-in tx_index
 - ✅ **On-chain Node Registration (v2.74.0)**: Immutable wallet-to-node binding via `NodeRegistration` TX
 - ✅ **System TX Indexing (v2.74.0)**: Emission and reward transactions fully indexed
 - ✅ **Dilithium Claim Option (v2.74.0)**: Post-quantum signatures for reward claims (free gas)

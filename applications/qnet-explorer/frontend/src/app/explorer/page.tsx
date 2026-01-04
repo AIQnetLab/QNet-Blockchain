@@ -19,13 +19,10 @@ function getBadgeClass(type: string): string {
     'Transfer': 'badge-transfer',
     'Swap': 'badge-swap',
     'Node Activation': 'badge-activation',
-    'Activation': 'badge-activation',
     'Reward': 'badge-reward',
     'Smart Contract': 'badge-contract',
     'System': 'badge-system',
-    'Registration': 'badge-system',
-    'Attestation': 'badge-system',
-    'Ping Commitment': 'badge-system',
+    'Registration': 'badge-registration',
   };
   return classes[type] || 'badge-default';
 }

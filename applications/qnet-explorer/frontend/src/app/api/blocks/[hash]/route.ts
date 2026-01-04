@@ -19,17 +19,17 @@ function getTransactionType(txType: unknown): string {
     const typeMap: Record<string, string> = {
       'Transfer': 'Transfer',
       'NodeRegistration': 'Registration',
-      'NodeActivation': 'Activation',
+      'NodeActivation': 'Node Activation',
       'RewardDistribution': 'Reward',
-      'CreateAccount': 'Create Account',
-      'PingAttestation': 'Attestation',
-      'PingCommitmentWithSampling': 'Ping Commitment',
+      'CreateAccount': 'System',
+      'PingAttestation': 'System',
+      'PingCommitmentWithSampling': 'System',
       'Swap': 'Swap',
-      'ContractDeploy': 'Contract Deploy',
-      'ContractCall': 'Contract Call',
-      'BatchTransfers': 'Batch Transfer',
-      'BatchNodeActivations': 'Batch Activation',
-      'BatchRewardClaims': 'Batch Claim',
+      'ContractDeploy': 'Smart Contract',
+      'ContractCall': 'Smart Contract',
+      'BatchTransfers': 'Transfer',
+      'BatchNodeActivations': 'Node Activation',
+      'BatchRewardClaims': 'Reward',
     };
     return typeMap[typeKey] || typeKey || 'Unknown';
   }

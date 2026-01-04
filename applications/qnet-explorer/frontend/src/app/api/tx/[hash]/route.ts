@@ -13,21 +13,21 @@ function mapTxType(type: string | object | undefined): string {
   const typeStr = typeof type === 'object' ? Object.keys(type)[0] : type;
   
   const map: Record<string, string> = {
-    'Transfer': 'SEND',
-    'NodeActivation': 'NODE_ACTIVATION',
-    'NodeRegistration': 'REGISTRATION',
-    'Swap': 'SWAP',
-    'RewardDistribution': 'REWARD',
-    'ContractDeploy': 'CONTRACT_DEPLOY',
-    'ContractCall': 'CONTRACT_CALL',
-    'CreateAccount': 'CREATE_ACCOUNT',
-    'BatchRewardClaims': 'BATCH_REWARD',
-    'BatchNodeActivations': 'BATCH_ACTIVATION',
-    'BatchTransfers': 'BATCH_TRANSFER',
-    'PingAttestation': 'PING',
-    'PingCommitmentWithSampling': 'PING_COMMITMENT',
+    'Transfer': 'Transfer',
+    'NodeActivation': 'Node Activation',
+    'NodeRegistration': 'Registration',
+    'Swap': 'Swap',
+    'RewardDistribution': 'Reward',
+    'ContractDeploy': 'Smart Contract',
+    'ContractCall': 'Smart Contract',
+    'CreateAccount': 'System',
+    'BatchRewardClaims': 'Reward',
+    'BatchNodeActivations': 'Node Activation',
+    'BatchTransfers': 'Transfer',
+    'PingAttestation': 'System',
+    'PingCommitmentWithSampling': 'System',
   };
-  return map[typeStr] || 'SEND';
+  return map[typeStr] || 'Transfer';
 }
 
 // Format amount from nanoQNC to QNC

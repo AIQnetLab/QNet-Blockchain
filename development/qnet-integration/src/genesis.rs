@@ -71,6 +71,31 @@ impl Default for GenesisConfig {
 pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
     let mut transactions = Vec::new();
     
+    // CRITICAL FIX v2.74.1: Create "genesis" account FIRST
+    // This account is the source for all initial token distributions
+    // Without this, Transfer TX fail with "Account not found: genesis"
+    let total_distribution: u64 = config.accounts.iter().map(|(_, amt)| amt).sum();
+    let genesis_account_tx = Transaction {
+        hash: String::new(),
+        from: "system".to_string(), // System creates genesis account
+        to: Some("genesis".to_string()),
+        amount: 0,
+        nonce: 0,
+        gas_price: 0,
+        gas_limit: 0,
+        timestamp: config.timestamp,
+        signature: Some("system".to_string()),
+        public_key: None,
+        tx_type: TransactionType::CreateAccount {
+            address: "genesis".to_string(),
+            initial_balance: total_distribution, // Enough for all distributions
+        },
+        data: Some("Genesis account - source of initial token distribution".to_string()),
+        dilithium_signature: None,
+        dilithium_public_key: None,
+    };
+    transactions.push(genesis_account_tx);
+    
     // CRITICAL: Create system_rewards_pool account for reward distribution
     // This account is used as "from" address for RewardDistribution transactions
     let rewards_pool_tx = Transaction {
@@ -94,7 +119,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
     };
     transactions.push(rewards_pool_tx);
     
-    // Create initial distribution transactions
+    // Create initial distribution transactions (now "genesis" account exists!)
     for (address, amount) in config.accounts {
         let tx = Transaction {
             hash: String::new(), // will be calculated

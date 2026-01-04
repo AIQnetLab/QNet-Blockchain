@@ -13,7 +13,7 @@ export const revalidate = 0;
 
 export interface ActivityItem {
   hash: string;
-  type: 'Transfer' | 'Node Activation' | 'Swap' | 'Reward' | 'Smart Contract' | 'Block' | 'System';
+  type: 'Transfer' | 'Node Activation' | 'Swap' | 'Reward' | 'Smart Contract' | 'Block' | 'System' | 'Registration';
   from: string;
   to: string;
   amount: string;
@@ -126,7 +126,7 @@ function mapTxType(type: string | object): ActivityItem['type'] {
   const map: Record<string, ActivityItem['type']> = {
     'Transfer': 'Transfer',
     'NodeActivation': 'Node Activation',
-    'NodeRegistration': 'System',
+    'NodeRegistration': 'Registration',
     'Swap': 'Swap',
     'RewardDistribution': 'Reward',
     'ContractDeploy': 'Smart Contract',
@@ -138,6 +138,7 @@ function mapTxType(type: string | object): ActivityItem['type'] {
     'PingCommitmentWithSampling': 'System',
     'SystemEmission': 'Reward',
     'Emission': 'Reward',
+    'CreateAccount': 'System',
   };
   return map[typeStr] || 'Transfer';
 }
