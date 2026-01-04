@@ -1609,10 +1609,43 @@ const WalletScreen = () => {
       const result = await walletManager.claimRewards(activatedNodeType, activationCode, walletAddress, password);
       
       if (result.success) {
+        // v2.80: Rich content with clickable transaction hash
+        const richContent = (
+          <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
+            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 16 }]}>
+              Successfully claimed {result.amount} QNC rewards from your {activatedNodeType} node.
+            </Text>
+            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 8, fontSize: 12, color: '#888' }]}>
+              Transaction:
+            </Text>
+            <TouchableOpacity 
+              onPress={() => {
+                const explorerUrl = `https://explorer.qnet.network/tx/${result.txHash}`;
+                Linking.openURL(explorerUrl).catch(() => {
+                  Clipboard.setString(result.txHash);
+                  showAlert('Copied', 'Transaction hash copied to clipboard');
+                });
+              }}
+              style={{ backgroundColor: 'rgba(0, 255, 255, 0.1)', padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#00ffff40' }}
+            >
+              <Text style={{ color: '#00ffff', fontSize: 12, fontFamily: 'monospace', textAlign: 'center' }}>
+                {result.txHash?.slice(0, 20)}...{result.txHash?.slice(-20)}
+              </Text>
+              <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
+                Tap to open in Explorer
+              </Text>
+            </TouchableOpacity>
+          </View>
+        );
+        
         showAlert(
           'Rewards Claimed!',
-          `Successfully claimed ${result.amount} QNC rewards.\n\nTransaction: ${result.txHash}`,
+          '', // Empty - using richContent
           [
+            { text: 'Copy Hash', style: 'default', onPress: () => {
+              Clipboard.setString(result.txHash);
+              showAlert('Copied', 'Transaction hash copied to clipboard');
+            }},
             { text: 'OK', onPress: () => {
               // Reload rewards
               loadNodeRewards();
@@ -1621,7 +1654,8 @@ const WalletScreen = () => {
                 loadBalance(wallet.publicKey);
               }
             }}
-          ]
+          ],
+          richContent
         );
       } else {
         showAlert('Cannot Claim', result.message);
@@ -1653,10 +1687,44 @@ const WalletScreen = () => {
       
       if (result.success) {
         const claimedAmount = (pendingRewards / 1e9).toFixed(4);
+        
+        // v2.80: Rich content with clickable transaction hash
+        const richContent = (
+          <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
+            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 16 }]}>
+              Successfully claimed {claimedAmount} QNC rewards from your {activatedNodeType} node.
+            </Text>
+            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 8, fontSize: 12, color: '#888' }]}>
+              Transaction:
+            </Text>
+            <TouchableOpacity 
+              onPress={() => {
+                const explorerUrl = `https://explorer.qnet.network/tx/${result.txHash}`;
+                Linking.openURL(explorerUrl).catch(() => {
+                  Clipboard.setString(result.txHash);
+                  showAlert('Copied', 'Transaction hash copied to clipboard');
+                });
+              }}
+              style={{ backgroundColor: 'rgba(0, 255, 255, 0.1)', padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#00ffff40' }}
+            >
+              <Text style={{ color: '#00ffff', fontSize: 12, fontFamily: 'monospace', textAlign: 'center' }}>
+                {result.txHash?.slice(0, 20)}...{result.txHash?.slice(-20)}
+              </Text>
+              <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
+                Tap to open in Explorer
+              </Text>
+            </TouchableOpacity>
+          </View>
+        );
+        
         showAlert(
           'Rewards Claimed!',
-          `Successfully claimed ${claimedAmount} QNC rewards from your ${activatedNodeType} node.\n\nTransaction: ${result.txHash}`,
+          '', // Empty - using richContent
           [
+            { text: 'Copy Hash', style: 'default', onPress: () => {
+              Clipboard.setString(result.txHash);
+              showAlert('Copied', 'Transaction hash copied to clipboard');
+            }},
             { text: 'OK', onPress: () => {
               // Reload server node status (will show updated pending rewards)
               loadServerNodeStatus();
@@ -1665,7 +1733,8 @@ const WalletScreen = () => {
                 loadBalance(wallet.publicKey);
               }
             }}
-          ]
+          ],
+          richContent
         );
       } else {
         showAlert('Cannot Claim', result.message);

@@ -1654,6 +1654,80 @@ impl PersistentStorage {
         
         Ok(count)
     }
+    
+    /// Get recent transactions globally (paginated, newest first)
+    /// Uses tx_by_address CF which stores addr_{address}_{timestamp}_{tx_hash}
+    /// By iterating in reverse, we get newest transactions first
+    pub async fn get_recent_transactions(&self, page: usize, per_page: usize) -> IntegrationResult<(Vec<qnet_state::Transaction>, usize)> {
+        let tx_by_addr_cf = self.db.cf_handle("tx_by_address")
+            .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
+        let tx_cf = self.db.cf_handle("transactions")
+            .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
+        
+        // Iterate in reverse to get newest transactions first
+        let iter = self.db.iterator_cf(&tx_by_addr_cf, rocksdb::IteratorMode::End);
+        
+        let mut transactions = Vec::new();
+        let mut seen_hashes = std::collections::HashSet::new();
+        let skip_count = page.saturating_sub(1) * per_page;
+        let mut skipped = 0;
+        let mut total_count = 0;
+        
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            
+            // Only process addr_* keys
+            if !key_str.starts_with("addr_") {
+                continue;
+            }
+            
+            let tx_hash = std::str::from_utf8(&value).unwrap_or("");
+            
+            // Skip duplicates (same TX can appear twice - from and to)
+            if seen_hashes.contains(tx_hash) {
+                continue;
+            }
+            seen_hashes.insert(tx_hash.to_string());
+            total_count += 1;
+            
+            // Pagination: skip previous pages
+            if skipped < skip_count {
+                skipped += 1;
+                continue;
+            }
+            
+            // Already have enough for this page
+            if transactions.len() >= per_page {
+                continue; // Keep counting total but don't load more
+            }
+            
+            // Load transaction
+            let tx_key = format!("tx_{}", tx_hash);
+            if let Some(tx_data) = self.db.get_cf(&tx_cf, tx_key.as_bytes())? {
+                // Decompress if needed
+                let decompressed = zstd::decode_all(tx_data.as_slice())
+                    .unwrap_or_else(|_| tx_data.to_vec());
+                
+                if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&decompressed) {
+                    transactions.push(tx);
+                }
+            }
+        }
+        
+        Ok((transactions, total_count))
+    }
+    
+    /// Count total transactions in the blockchain
+    pub async fn count_total_transactions(&self) -> IntegrationResult<usize> {
+        let tx_index_cf = self.db.cf_handle("tx_index")
+            .ok_or_else(|| IntegrationError::StorageError("tx_index column family not found".to_string()))?;
+        
+        let iter = self.db.iterator_cf(&tx_index_cf, rocksdb::IteratorMode::Start);
+        let count = iter.count();
+        
+        Ok(count)
+    }
 }
 
 /// Storage modes for different node types
@@ -2688,6 +2762,16 @@ impl Storage {
     /// Count transactions for an address
     pub async fn count_transactions_by_address(&self, address: &str) -> IntegrationResult<usize> {
         self.persistent.count_transactions_by_address(address).await
+    }
+    
+    /// Get recent transactions globally (paginated, newest first)
+    pub async fn get_recent_transactions(&self, page: usize, per_page: usize) -> IntegrationResult<(Vec<qnet_state::Transaction>, usize)> {
+        self.persistent.get_recent_transactions(page, per_page).await
+    }
+    
+    /// Count total transactions in the blockchain
+    pub async fn count_total_transactions(&self) -> IntegrationResult<usize> {
+        self.persistent.count_total_transactions().await
     }
     
     /// Get reputation history for a node
@@ -4373,6 +4457,32 @@ impl Storage {
         Ok(removed)
     }
     
+    /// v2.75: Get all heartbeats for a block height range (for emission fallback)
+    /// Returns Vec<(node_id, heartbeat_index, timestamp, block_height)>
+    pub fn get_heartbeats_for_block_range(&self, start_height: u64, end_height: u64) -> IntegrationResult<Vec<(String, u8, u64, u64)>> {
+        let hb_cf = self.persistent.db.cf_handle("heartbeats")
+            .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
+        
+        let iter = self.persistent.db.iterator_cf(&hb_cf, rocksdb::IteratorMode::Start);
+        let mut result = Vec::new();
+        
+        for item in iter {
+            let (_key, value) = item?;
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
+                let block_height = parsed["block_height"].as_u64().unwrap_or(0);
+                if block_height >= start_height && block_height < end_height {
+                    let node_id = parsed["node_id"].as_str().unwrap_or("").to_string();
+                    let heartbeat_index = parsed["heartbeat_index"].as_u64().unwrap_or(0) as u8;
+                    let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
+                    result.push((node_id, heartbeat_index, timestamp, block_height));
+                }
+            }
+        }
+        
+        println!("[INFO][STORAGE] heartbeats_for_range start={} end={} found={}", start_height, end_height, result.len());
+        Ok(result)
+    }
+    
     // ===== FAILOVER EVENT METHODS =====
     
     /// Save a failover event (optimized with bincode serialization and LZ4 compression)
@@ -4662,7 +4772,27 @@ impl Storage {
             account_count += 1;
         }
         
-        // 5. Compress snapshot with LZ4 for efficient storage
+        // 5. v2.75: Include pending_rewards for fast sync (lazy rewards survive restart)
+        let mut rewards_count = 0u64;
+        if let Some(rewards_cf) = self.persistent.db.cf_handle("pending_rewards") {
+            // Write marker for rewards section
+            snapshot_data.extend_from_slice(b"REWARDS_V1");
+            
+            let rewards_iter = self.persistent.db.iterator_cf(&rewards_cf, rocksdb::IteratorMode::Start);
+            for item in rewards_iter {
+                let (key, value) = item?;
+                snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                snapshot_data.extend_from_slice(&key);
+                snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                snapshot_data.extend_from_slice(&value);
+                rewards_count += 1;
+            }
+            
+            // Write end marker
+            snapshot_data.extend_from_slice(b"REWARDS_END");
+        }
+        
+        // 6. Compress snapshot with LZ4 for efficient storage
         let compressed = lz4_flex::compress_prepend_size(&snapshot_data);
         
         // 6. Calculate hash for integrity check
@@ -4684,8 +4814,8 @@ impl Storage {
         self.persistent.db.put_cf(&snapshots_cf, b"latest_snapshot", &height.to_le_bytes())?;
         
         let duration = start_time.elapsed();
-        println!("[SNAPSHOT] ✅ Snapshot created: {} accounts, {} bytes compressed in {:.2}s", 
-                 account_count, compressed.len(), duration.as_secs_f64());
+        println!("[SNAPSHOT] ✅ Snapshot created: {} accounts, {} rewards, {} bytes compressed in {:.2}s", 
+                 account_count, rewards_count, compressed.len(), duration.as_secs_f64());
         
         // PRODUCTION: Clean up old snapshots (keep only last 5)
         self.cleanup_old_snapshots(height, 5)?;
@@ -4744,14 +4874,26 @@ impl Storage {
         let mut batch = WriteBatch::default();
         let mut account_count = 0;
         
+        // Read accounts until we hit REWARDS_V1 marker or end of data
         while cursor < decompressed.len() {
+            // Check for REWARDS_V1 marker (10 bytes)
+            if cursor + 10 <= decompressed.len() && &decompressed[cursor..cursor+10] == b"REWARDS_V1" {
+                break; // Switch to rewards section
+            }
+            
+            if cursor + 4 > decompressed.len() { break; }
             let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Key length field must be 4 bytes")) as usize;
             cursor += 4;
+            
+            if cursor + key_len > decompressed.len() { break; }
             let key = &decompressed[cursor..cursor+key_len];
             cursor += key_len;
             
+            if cursor + 4 > decompressed.len() { break; }
             let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Value length field must be 4 bytes")) as usize;
             cursor += 4;
+            
+            if cursor + value_len > decompressed.len() { break; }
             let value = &decompressed[cursor..cursor+value_len];
             cursor += value_len;
             
@@ -4761,7 +4903,46 @@ impl Storage {
         
         self.persistent.db.write(batch)?;
         
-        println!("[SNAPSHOT] ✅ Restored {} accounts from snapshot", account_count);
+        // v2.75: Restore pending_rewards if present
+        let mut rewards_count = 0;
+        if cursor + 10 <= decompressed.len() && &decompressed[cursor..cursor+10] == b"REWARDS_V1" {
+            cursor += 10; // Skip marker
+            
+            if let Some(rewards_cf) = self.persistent.db.cf_handle("pending_rewards") {
+                let mut rewards_batch = WriteBatch::default();
+                
+                // Read until REWARDS_END marker
+                while cursor < decompressed.len() {
+                    // Check for REWARDS_END marker (11 bytes)
+                    if cursor + 11 <= decompressed.len() && &decompressed[cursor..cursor+11] == b"REWARDS_END" {
+                        break;
+                    }
+                    
+                    if cursor + 4 > decompressed.len() { break; }
+                    let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Key length must be 4 bytes")) as usize;
+                    cursor += 4;
+                    
+                    if cursor + key_len > decompressed.len() { break; }
+                    let key = &decompressed[cursor..cursor+key_len];
+                    cursor += key_len;
+                    
+                    if cursor + 4 > decompressed.len() { break; }
+                    let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Value length must be 4 bytes")) as usize;
+                    cursor += 4;
+                    
+                    if cursor + value_len > decompressed.len() { break; }
+                    let value = &decompressed[cursor..cursor+value_len];
+                    cursor += value_len;
+                    
+                    rewards_batch.put_cf(&rewards_cf, key, value);
+                    rewards_count += 1;
+                }
+                
+                self.persistent.db.write(rewards_batch)?;
+            }
+        }
+        
+        println!("[SNAPSHOT] ✅ Restored {} accounts, {} rewards from snapshot", account_count, rewards_count);
         
         Ok(())
     }

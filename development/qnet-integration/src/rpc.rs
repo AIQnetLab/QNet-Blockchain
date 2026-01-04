@@ -622,6 +622,19 @@ struct TransactionHistoryQuery {
     end_time: Option<u64>,
 }
 
+/// Query parameters for global recent transactions
+#[derive(Debug, Deserialize)]
+struct RecentTransactionsQuery {
+    /// Page number (1-indexed, default: 1)
+    #[serde(default = "default_page")]
+    page: usize,
+    /// Transactions per page (default: 50, max: 100)
+    #[serde(default = "default_per_page_50")]
+    per_page: usize,
+}
+
+fn default_per_page_50() -> usize { 50 }
+
 fn default_page() -> usize { 1 }
 fn default_per_page() -> usize { 20 }
 fn default_tx_type() -> String { "all".to_string() }
@@ -988,6 +1001,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::query::<TransactionHistoryQuery>())
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_history);
+    
+    // Global recent transactions (paginated, newest first)
+    // GET /api/v1/transactions/recent?page=1&per_page=50
+    let transactions_recent = api_v1
+        .and(warp::path("transactions"))
+        .and(warp::path("recent"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<RecentTransactionsQuery>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_recent_transactions);
     
     // Block endpoints
     let block_latest = api_v1
@@ -1893,6 +1917,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let transaction_routes = transaction_submit
         .or(transaction_get)
         .or(transaction_history)  // Extended history API with pagination
+        .or(transactions_recent)  // Global recent transactions API
         .or(mempool_status)
         .or(mempool_transactions);
     
@@ -3041,6 +3066,63 @@ async fn handle_transaction_history(
     }
 }
 
+/// Handler for global recent transactions (paginated, newest first)
+/// API: GET /api/v1/transactions/recent?page=1&per_page=50
+async fn handle_recent_transactions(
+    query: RecentTransactionsQuery,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let page = if query.page == 0 { 1 } else { query.page };
+    let per_page = query.per_page.min(100).max(1); // Clamp to 1-100
+    
+    let storage = blockchain.get_storage();
+    
+    match storage.get_recent_transactions(page, per_page).await {
+        Ok((transactions, total_count)) => {
+            let txs: Vec<Value> = transactions.iter().map(|tx| {
+                json!({
+                    "hash": tx.hash,
+                    "from": tx.from,
+                    "to": tx.to,
+                    "amount": tx.amount,
+                    "nonce": tx.nonce,
+                    "timestamp": tx.timestamp,
+                    "type": format!("{:?}", tx.tx_type),
+                    "gas_price": tx.gas_price,
+                    "gas_limit": tx.gas_limit,
+                    "is_quantum_signed": tx.is_quantum_signed()
+                })
+            }).collect();
+            
+            let total_pages = (total_count + per_page - 1) / per_page;
+            let current_height = blockchain.get_height().await;
+            
+            let response = json!({
+                "success": true,
+                "transactions": txs,
+                "pagination": {
+                    "page": page,
+                    "per_page": per_page,
+                    "total_count": total_count,
+                    "total_pages": total_pages,
+                    "has_next": page < total_pages,
+                    "has_prev": page > 1
+                },
+                "current_height": current_height
+            });
+            Ok(warp::reply::json(&response))
+        }
+        Err(e) => {
+            println!("[API] ❌ Recent transactions error: {}", e);
+            let error_response = json!({
+                "success": false,
+                "error": format!("Failed to fetch recent transactions: {}", e)
+            });
+            Ok(warp::reply::json(&error_response))
+        }
+    }
+}
+
 async fn handle_block_latest(
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
@@ -3149,6 +3231,22 @@ async fn handle_macroblock_by_index(
 ) -> Result<impl Reply, Rejection> {
     match blockchain.get_macroblock(index).await {
         Ok(Some(macroblock)) => {
+            // v2.75: Decode heartbeat summaries if present
+            let heartbeat_info = macroblock.consensus_data.reward_heartbeats.as_ref()
+                .and_then(|data| bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(data).ok())
+                .map(|summaries| {
+                    let eligible = summaries.iter().filter(|s| s.is_eligible).count();
+                    json!({
+                        "total_nodes": summaries.len(),
+                        "eligible_nodes": eligible,
+                        "nodes": summaries.iter().take(20).map(|s| json!({
+                            "node_id": s.node_id,
+                            "heartbeat_count": s.heartbeat_count,
+                            "is_eligible": s.is_eligible
+                        })).collect::<Vec<_>>()
+                    })
+                });
+            
             let response = json!({
                 "index": index,
                 "height": macroblock.height,
@@ -3162,6 +3260,10 @@ async fn handle_macroblock_by_index(
                     "next_leader": macroblock.consensus_data.next_leader,
                     "commits_count": macroblock.consensus_data.commits.len(),
                     "reveals_count": macroblock.consensus_data.reveals.len(),
+                    // v2.75: Reward data for emission macroblocks
+                    "reward_heartbeats": heartbeat_info,
+                    "pool2_total_fees": macroblock.consensus_data.pool2_total_fees,
+                    "pool3_total_activations": macroblock.consensus_data.pool3_total_activations,
                 },
                 "previous_hash": hex::encode(macroblock.previous_hash),
                 "poh_hash": hex::encode(&macroblock.poh_hash),
@@ -6524,16 +6626,35 @@ async fn handle_claim_rewards(
     };
     
     // PRODUCTION: Check pending rewards BEFORE creating transaction
+    // v2.75: Try memory first, fallback to RocksDB (lazy rewards survive restarts!)
     let reward_amount = {
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
         match reward_manager.get_pending_reward(&claim_request.node_id) {
             Some(reward) => reward.total_reward,
             None => {
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "No pending rewards available"
-                })));
+                // FALLBACK: Check RocksDB for persisted pending rewards
+                let storage = blockchain.get_storage();
+                match storage.load_pending_reward(&claim_request.node_id) {
+                    Ok(Some(stored_reward)) => {
+                        println!("[INFO][CLAIM] loaded_from_rocksdb node={} amount={}", 
+                                 claim_request.node_id, stored_reward.total_reward);
+                        stored_reward.total_reward
+                    }
+                    Ok(None) => {
+                        return Ok(warp::reply::json(&json!({
+                            "success": false,
+                            "error": "No pending rewards available"
+                        })));
+                    }
+                    Err(e) => {
+                        eprintln!("[ERR][CLAIM] rocksdb_load_fail node={} err={}", claim_request.node_id, e);
+                        return Ok(warp::reply::json(&json!({
+                            "success": false,
+                            "error": "Failed to load pending rewards from storage"
+                        })));
+                    }
+                }
             }
         }
     };
@@ -6602,6 +6723,14 @@ async fn handle_claim_rewards(
                     .as_secs();
                 
                 let storage = blockchain.get_storage();
+                
+                // v2.75: CRITICAL - Delete pending reward from RocksDB to prevent double-claim after restart
+                if let Err(e) = storage.delete_pending_reward(&claim_request.node_id) {
+                    eprintln!("[WARN][CLAIM] failed_to_delete_pending node={} err={}", claim_request.node_id, e);
+                } else {
+                    println!("[INFO][CLAIM] pending_deleted_from_storage node={}", claim_request.node_id);
+                }
+                
                 let epoch_key = format!("rewards:{}:epoch:{}", claim_request.node_id, current_epoch);
                 
                 // Write pool breakdown for history API
@@ -6723,12 +6852,13 @@ async fn handle_get_pending_rewards(
     };
     let is_eligible = heartbeat_count >= required_heartbeats;
     
-    // v2.70: ALWAYS show pending rewards (they may have accumulated from previous epochs)
-    // Eligibility only affects NEW reward accumulation, not existing pending rewards
-    let (pending_amount, pool1, pool2, pool3, phase) = {
+    // v2.75: Show REAL pending rewards only (no estimated!)
+    // Eligibility check happens at emission time - if rewards exist, they are claimable
+    let (pending_amount, pool1, pool2, pool3, phase, is_claimable) = {
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
         
+        // First check reward_manager (RAM)
         if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
             (
                 reward.total_reward,
@@ -6736,58 +6866,28 @@ async fn handle_get_pending_rewards(
                 reward.pool2_transaction_fees,
                 reward.pool3_activation_bonus,
                 format!("{:?}", reward.current_phase),
+                reward.total_reward >= 1_000_000_000, // Claimable if >= 1 QNC
             )
         } else {
-            // Eligible but no pending reward yet (emission not processed)
-            // v2.64: Calculate estimated reward using REAL emission with halving
-            let reward_manager_arc = blockchain.get_reward_manager();
-            let reward_manager = reward_manager_arc.read().await;
-            let stats = reward_manager.get_reward_stats();
-            
-            // Get current phase and Pool1 emission (with halving applied!)
-            let current_phase = stats.current_phase.clone();
-            let pool1_base_emission = stats.pool1_current_emission; // Already has halving!
-            
-            // Count eligible nodes from P2P
-            let eligible_count = if let Some(p2p) = blockchain.get_unified_p2p() {
-                let all_heartbeats = p2p.get_heartbeats_for_block_range(epoch_start, current_height);
-                let mut node_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                for (nid, _, _, _) in &all_heartbeats {
-                    *node_counts.entry(nid.clone()).or_insert(0) += 1;
+            // FALLBACK: Check RocksDB for persisted pending rewards
+            let storage = blockchain.get_storage();
+            match storage.load_pending_reward(&node_id) {
+                Ok(Some(reward)) => {
+                    (
+                        reward.total_reward,
+                        reward.pool1_base_emission,
+                        reward.pool2_transaction_fees,
+                        reward.pool3_activation_bonus,
+                        format!("{:?}", reward.current_phase),
+                        reward.total_reward >= 1_000_000_000,
+                    )
                 }
-                // Count nodes that meet eligibility (9 for genesis/super, 8 for full)
-                node_counts.iter()
-                    .filter(|(nid, count)| {
-                        let req = if nid.starts_with("genesis_") || nid.starts_with("super_") { 9 } else { 8 };
-                        **count >= req
-                    })
-                    .count() as u64
-            } else {
-                0
-            };
-            
-            if eligible_count > 0 {
-                // Pool1: base emission divided equally among ALL eligible nodes
-                let pool1_share = pool1_base_emission / eligible_count;
-                
-                // Pool2: Transaction fees (70% Super, 30% Full)
-                // For estimation, we don't know pool2 yet, show 0
-                let pool2_share = 0u64;
-                
-                // Pool3: Only in Phase2 (activation bonuses)
-                let pool3_share = match current_phase {
-                    qnet_consensus::lazy_rewards::QNetPhase::Phase1 => 0,
-                    qnet_consensus::lazy_rewards::QNetPhase::Phase2 => {
-                        // In Phase2, Pool3 is distributed equally
-                        stats.pool3_activation_pool / eligible_count
-                    },
-                };
-                
-                let phase_str = format!("{:?}", current_phase);
-                (pool1_share + pool2_share + pool3_share, pool1_share, pool2_share, pool3_share, phase_str)
-            } else {
-                let phase_str = format!("{:?}", current_phase);
-                (0, 0, 0, 0, phase_str)
+                _ => {
+                    // No rewards yet - show 0 (NOT estimated!)
+                    let stats = reward_manager.get_reward_stats();
+                    let phase_str = format!("{:?}", stats.current_phase);
+                    (0, 0, 0, 0, phase_str, false)
+                }
             }
         }
     };
@@ -6837,7 +6937,8 @@ async fn handle_get_pending_rewards(
             "remaining": if heartbeat_count < required_heartbeats { required_heartbeats - heartbeat_count } else { 0 }
         },
         "is_active": is_active,
-        "is_eligible": is_eligible
+        "is_eligible": is_eligible,
+        "is_claimable": is_claimable  // v2.75: True if pending >= 1 QNC
     });
     
     Ok(warp::reply::json(&reward_info))

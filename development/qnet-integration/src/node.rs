@@ -1941,9 +1941,24 @@ impl BlockchainNode {
         }
         
         // STEP 1B: Collect Full/Super node heartbeats
-        let heartbeats = p2p.get_heartbeats_for_block_range(window_start_height, window_end_height);
-        if is_info() { println!("[INFO][HEARTBEAT] block_range_filter start={} end={} found={}", 
+        // v2.75: Try P2P memory first, fallback to RocksDB for persistence across restarts
+        let mut heartbeats = p2p.get_heartbeats_for_block_range(window_start_height, window_end_height);
+        if is_info() { println!("[INFO][HEARTBEAT] p2p_memory start={} end={} found={}", 
                                 window_start_height, window_end_height, heartbeats.len()); }
+        
+        // FALLBACK: If P2P memory is empty, load from persistent storage (RocksDB)
+        if heartbeats.is_empty() {
+            if is_info() { println!("[INFO][HEARTBEAT] p2p_empty fallback=rocksdb"); }
+            match self.storage.get_heartbeats_for_block_range(window_start_height, window_end_height) {
+                Ok(stored) => {
+                    if is_info() { println!("[INFO][HEARTBEAT] rocksdb_loaded count={}", stored.len()); }
+                    heartbeats = stored;
+                }
+                Err(e) => {
+                    eprintln!("[ERR][HEARTBEAT] rocksdb_fallback_fail err={}", e);
+                }
+            }
+        }
         
         // Count heartbeats per node
         let mut heartbeat_counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
@@ -4337,6 +4352,34 @@ impl BlockchainNode {
                                     } else {
                                         let new_supply = state_guard.get_total_supply();
                                         if is_debug() { println!("[DBG][STATE] supply_updated total={} QNC", new_supply / 1_000_000_000); }
+                                    }
+                                }
+                                
+                                // v2.75: Handle CLAIM transactions (from system_rewards_pool)
+                                // When another node claims, remove their pending_reward locally
+                                // This ensures all nodes stay in sync
+                                if tx.tx_type == qnet_state::TransactionType::RewardDistribution 
+                                   && tx.from == "system_rewards_pool" {
+                                    // Extract node_id from tx.data: "reward_claim:{node_id}:{amount}:..."
+                                    if let Some(ref data) = tx.data {
+                                        let parts: Vec<&str> = data.split(':').collect();
+                                        if parts.len() >= 2 && parts[0] == "reward_claim" {
+                                            let claimed_node_id = parts[1];
+                                            
+                                            // Remove from reward_manager (RAM)
+                                            {
+                                                let mut reward_mgr = reward_manager.write().await;
+                                                let _ = reward_mgr.clear_pending_reward(claimed_node_id);
+                                            }
+                                            
+                                            // Remove from storage (RocksDB)
+                                            if let Err(e) = storage.delete_pending_reward(claimed_node_id) {
+                                                if is_debug() { println!("[DBG][CLAIM] delete_pending_fail node={} err={}", claimed_node_id, e); }
+                                            } else {
+                                                println!("[INFO][CLAIM] synced_claim node={} amount={} QNC", 
+                                                         claimed_node_id, tx.amount / 1_000_000_000);
+                                            }
+                                        }
                                     }
                                 }
                                 
@@ -17889,6 +17932,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                          index, index / EMISSION_MACROBLOCK_INTERVAL, 
                                          heartbeat_summaries.len(), eligible,
                                          pool2_total, pool3_total);
+                                
+                                // v2.75: CRITICAL - Save pending rewards to RocksDB for persistence!
+                                // This enables lazy claims to work after node restarts
+                                let pending = reward_manager.get_all_pending_rewards();
+                                let mut saved_count = 0;
+                                for (node_id, _amount) in &pending {
+                                    if let Some(reward) = reward_manager.get_pending_reward(node_id) {
+                                        if let Err(e) = self.storage.save_pending_reward(node_id, reward) {
+                                            eprintln!("[WARN][REWARDS] save_fail node={} err={}", node_id, e);
+                                        } else {
+                                            saved_count += 1;
+                                        }
+                                    }
+                                }
+                                println!("[INFO][REWARDS] pending_saved count={}", saved_count);
                             }
                             Err(e) => {
                                 println!("[WARN][REWARDS] emission_failed mb={} err={}", index, e);

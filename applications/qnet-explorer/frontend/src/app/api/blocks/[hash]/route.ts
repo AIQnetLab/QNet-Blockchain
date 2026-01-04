@@ -6,7 +6,7 @@ import type { Block, BlockTransaction } from '@/lib/types';
 // ============================================================================
 
 // Node RPC (direct blockchain access via RocksDB)
-const NODE_RPC_URL = process.env.QNET_API_URL || 'http://localhost:8001';
+const NODE_RPC_URL = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
 
 // Map transaction type to display name
 function getTransactionType(txType: unknown): string {

@@ -3226,6 +3226,125 @@ a[href*="play.google.com"] img {
   font-size: 0.9rem;
 }
 
+/* Activity controls */
+.activity-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.refresh-btn {
+  padding: 0.4rem 0.6rem;
+  background: rgba(0,200,220,0.1);
+  border: 1px solid rgba(0,220,240,0.25);
+  border-radius: 6px;
+  color: #00e5f0;
+  cursor: pointer;
+  font-size: 1rem;
+  transition: all 0.15s;
+}
+
+.refresh-btn:hover {
+  background: rgba(0,220,240,0.2);
+  transform: rotate(45deg);
+}
+
+.refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sort-btn {
+  padding: 0.4rem 1rem;
+  background: rgba(0,200,220,0.1);
+  border: 1px solid rgba(0,220,240,0.25);
+  border-radius: 6px;
+  color: #00e5f0;
+  cursor: pointer;
+  font-size: 0.8rem;
+  transition: all 0.15s;
+}
+
+.sort-btn:hover {
+  background: rgba(0,220,240,0.2);
+}
+
+.sort-btn.active {
+  background: rgba(0,220,240,0.25);
+  border-color: #00e5f0;
+}
+
+.tx-count {
+  color: #5a7a8a;
+  font-size: 0.85rem;
+}
+
+/* Type filter dropdown */
+.type-filter {
+  padding: 0.4rem 0.8rem;
+  background: rgba(0, 20, 30, 0.8);
+  border: 1px solid rgba(0, 220, 240, 0.25);
+  border-radius: 6px;
+  color: #00e5f0;
+  font-size: 0.85rem;
+  cursor: pointer;
+  outline: none;
+  transition: all 0.15s;
+}
+
+.type-filter:hover,
+.type-filter:focus {
+  border-color: #00e5f0;
+  background: rgba(0, 220, 240, 0.1);
+}
+
+.type-filter option {
+  background: #0a1520;
+  color: #fff;
+  padding: 8px;
+}
+
+/* Sortable table header */
+.sortable-header {
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s;
+}
+
+.sortable-header:hover {
+  color: #00e5f0;
+}
+
+/* Load more */
+.load-more {
+  display: flex;
+  justify-content: center;
+  padding: 1.5rem;
+  border-top: 1px solid rgba(0,200,220,0.1);
+}
+
+.load-more-btn {
+  padding: 0.75rem 2rem;
+  background: linear-gradient(135deg, rgba(0,200,220,0.2), rgba(0,150,180,0.15));
+  border: 1px solid rgba(0,220,240,0.3);
+  border-radius: 8px;
+  color: #00e5f0;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: all 0.2s;
+}
+
+.load-more-btn:hover:not(:disabled) {
+  background: linear-gradient(135deg, rgba(0,220,240,0.3), rgba(0,180,200,0.2));
+  transform: translateY(-1px);
+}
+
+.load-more-btn:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
 /* Empty state */
 .empty-state {
   display: flex;

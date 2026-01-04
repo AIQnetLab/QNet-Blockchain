@@ -96,6 +96,9 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
     };
     transactions.push(genesis_account_tx);
     
+    // Track nonce for "genesis" account - starts at 0, increments for each TX
+    let mut genesis_nonce: u64 = 0;
+    
     // CRITICAL: Create system_rewards_pool account for reward distribution
     // This account is used as "from" address for RewardDistribution transactions
     let rewards_pool_tx = Transaction {
@@ -103,7 +106,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
         from: "genesis".to_string(),
         to: Some("system_rewards_pool".to_string()),
         amount: 0, // Pool starts empty - rewards are emitted dynamically
-        nonce: 0,
+        nonce: genesis_nonce,
         gas_price: 0,
         gas_limit: 0,
         timestamp: config.timestamp,
@@ -118,15 +121,17 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
         dilithium_public_key: None,
     };
     transactions.push(rewards_pool_tx);
+    genesis_nonce += 1; // nonce=1 for next TX
     
     // Create initial distribution transactions (now "genesis" account exists!)
+    // v2.74.2: Sequential nonce to prevent "Invalid nonce" errors on other nodes
     for (address, amount) in config.accounts {
         let tx = Transaction {
             hash: String::new(), // will be calculated
             from: "genesis".to_string(),
             to: Some(address.clone()),
             amount,
-            nonce: 0,
+            nonce: genesis_nonce,
             gas_price: 0, // no gas for genesis
             public_key: None, // Not needed for genesis transactions
             gas_limit: 0, // no gas limit
@@ -142,7 +147,11 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
             dilithium_public_key: None,
         };
         transactions.push(tx);
+        genesis_nonce += 1; // Increment for next TX
     }
+    
+    println!("[INFO][GEN] genesis_txs={} (1 CreateAccount genesis + 1 CreateAccount rewards_pool + {} distributions)", 
+             transactions.len(), genesis_nonce - 1);
     
     // Create genesis block
     let previous_hash = [0u8; 32]; // all zeros for genesis

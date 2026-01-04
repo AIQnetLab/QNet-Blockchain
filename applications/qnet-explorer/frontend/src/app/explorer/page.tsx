@@ -1,6 +1,6 @@
 'use client';
 
-import { memo, useState, useEffect } from 'react';
+import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Link from 'next/link';
 
 interface ActivityItem {
@@ -11,9 +11,46 @@ interface ActivityItem {
   amount: string;
   block: number;
   time: string;
+  timestamp: number;
 }
 
-// Get badge class for transaction type
+// ============================================================================
+// v2.82: Explorer with column sorting, type filter, hydration fix
+// - Sort by clicking TIME column header
+// - Filter by transaction type dropdown
+// - Fixed hydration error (no dynamic values in initial render)
+// ============================================================================
+
+const CACHE_KEY = 'qnet_explorer_cache_v3';
+const CACHE_TTL = 300000;
+
+function getCachedData(): { transactions: Map<string, ActivityItem>, height: number, timestamp: number } | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const cached = sessionStorage.getItem(CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Date.now() - parsed.timestamp < CACHE_TTL) {
+        const txMap = new Map<string, ActivityItem>();
+        (parsed.transactions || []).forEach((tx: ActivityItem) => txMap.set(tx.hash, tx));
+        return { transactions: txMap, height: parsed.height, timestamp: parsed.timestamp };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function saveToCache(transactions: Map<string, ActivityItem>, height: number) {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.setItem(CACHE_KEY, JSON.stringify({
+      transactions: Array.from(transactions.values()),
+      height,
+      timestamp: Date.now()
+    }));
+  } catch {}
+}
+
 function getBadgeClass(type: string): string {
   const classes: Record<string, string> = {
     'Transfer': 'badge-transfer',
@@ -27,7 +64,6 @@ function getBadgeClass(type: string): string {
   return classes[type] || 'badge-default';
 }
 
-// Memoized row for performance
 const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) {
   return (
     <tr className="activity-row">
@@ -57,74 +93,163 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
   );
 });
 
-const ITEMS_PER_PAGE = 10;
+const ITEMS_PER_PAGE = 50;
+
+// All available transaction types for filter
+const TX_TYPES = ['All', 'Transfer', 'Reward', 'Registration', 'Node Activation', 'Smart Contract', 'System', 'Swap'];
 
 export default function ExplorerPage() {
-  const [activity, setActivity] = useState<ActivityItem[]>([]);
+  // Initialize state without cache to avoid hydration mismatch
+  const [transactionMap, setTransactionMap] = useState<Map<string, ActivityItem>>(new Map());
+  const [currentHeight, setCurrentHeight] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(true);
+  const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
+  const [typeFilter, setTypeFilter] = useState('All');
+  const [mounted, setMounted] = useState(false);
+  const initialLoadDone = useRef(false);
 
-  // Fetch activity on mount and every 30 seconds (reduced from 5s for performance)
+  // Load cache ONLY on client after mount (fixes hydration)
   useEffect(() => {
-    const fetchActivity = async () => {
-      try {
-        // Reduced limit from 50 to 20 for faster loading
-        const res = await fetch('/api/activity?limit=20');
-        const data = await res.json();
-        if (data.success && data.data) {
-          setActivity(data.data);
-        }
-      } catch (err) {
-        console.error('Failed to fetch activity:', err);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchActivity();
-    // Refresh every 30 seconds instead of 5
-    const interval = setInterval(fetchActivity, 30000);
-    return () => clearInterval(interval);
-  }, []);
-  
-  const totalPages = Math.ceil(activity.length / ITEMS_PER_PAGE);
-  const paginatedActivity = activity.slice((page - 1) * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE);
-
-  // Handle search
-  const handleSearch = () => {
-    if (!searchQuery.trim()) return;
-    
-    const q = searchQuery.trim();
-    
-    // Detect type and redirect
-    if (q.length === 64 && /^[0-9A-Fa-f]+$/.test(q)) {
-      // 64 hex chars = block hash or tx hash
-      window.location.href = `/explorer/block/${q}`;
-    } else if (q.length === 41 && q.includes('eon')) {
-      // EON address
-      window.location.href = `/explorer/address/${q}`;
-    } else if (/^\d+$/.test(q)) {
-      // Block number
-      window.location.href = `/explorer/block/${q}`;
-    } else {
-      // General search
-      window.location.href = `/explorer/search?q=${encodeURIComponent(q)}`;
+    setMounted(true);
+    const cached = getCachedData();
+    if (cached && cached.transactions.size > 0) {
+      setTransactionMap(cached.transactions);
+      setCurrentHeight(cached.height);
+      setLoading(false);
     }
+  }, []);
+
+  // Filter and sort locally
+  const filteredAndSortedActivity = useMemo(() => {
+    let items = Array.from(transactionMap.values());
+    
+    // Filter by type
+    if (typeFilter !== 'All') {
+      items = items.filter(tx => tx.type === typeFilter);
+    }
+    
+    // Sort by: 1) block number, 2) timestamp (for same block)
+    // This ensures strict ordering even when timestamps are equal
+    return items.sort((a, b) => {
+      const blockA = typeof a.block === 'number' ? a.block : 0;
+      const blockB = typeof b.block === 'number' ? b.block : 0;
+      
+      if (sortOrder === 'desc') {
+        // Newest first: higher block = newer
+        if (blockB !== blockA) return blockB - blockA;
+        // Same block: sort by timestamp
+        return (b.timestamp || 0) - (a.timestamp || 0);
+      } else {
+        // Oldest first: lower block = older
+        if (blockA !== blockB) return blockA - blockB;
+        return (a.timestamp || 0) - (b.timestamp || 0);
+      }
+    });
+  }, [transactionMap, sortOrder, typeFilter]);
+
+  // Fetch activity
+  const fetchActivity = useCallback(async (pageNum: number, isLoadMore: boolean = false, forceRefresh: boolean = false) => {
+    try {
+      if (isLoadMore) setLoadingMore(true);
+      // Only show loading on initial load or force refresh, not on background updates
+      else if (transactionMap.size === 0 || forceRefresh) setLoading(true);
+      
+      const refreshParam = forceRefresh ? '&refresh=1' : '';
+      const res = await fetch(`/api/activity?page=${pageNum}&limit=${ITEMS_PER_PAGE}&sort=desc${refreshParam}`, {
+        cache: 'no-store'
+      });
+      const data = await res.json();
+      
+      if (data.success && data.data && data.data.length > 0) {
+        setTransactionMap(prev => {
+          const newMap = new Map(prev);
+          let addedCount = 0;
+          
+          for (const tx of data.data as ActivityItem[]) {
+            if (tx.hash && !newMap.has(tx.hash)) {
+              newMap.set(tx.hash, tx);
+              addedCount++;
+            }
+          }
+          
+          console.log(`[Explorer] Fetched page ${pageNum}: ${data.data.length} items, ${addedCount} new`);
+          saveToCache(newMap, data.pagination?.currentHeight || currentHeight);
+          return newMap;
+        });
+        
+        if (data.pagination?.currentHeight) {
+          setCurrentHeight(data.pagination.currentHeight);
+        }
+        setHasMore(data.pagination?.hasMore ?? false);
+      }
+    } catch (err) {
+      console.error('[Explorer] Fetch error:', err);
+    } finally {
+      setLoading(false);
+      setLoadingMore(false);
+    }
+  }, [transactionMap.size, currentHeight]);
+
+  // Initial fetch after mount
+  useEffect(() => {
+    if (mounted && !initialLoadDone.current) {
+      initialLoadDone.current = true;
+      fetchActivity(1);
+    }
+  }, [mounted, fetchActivity]);
+
+  // Background refresh every 10 seconds
+  useEffect(() => {
+    if (!mounted) return;
+    const interval = setInterval(() => fetchActivity(1), 10000);
+    return () => clearInterval(interval);
+  }, [mounted, fetchActivity]);
+
+  const loadMore = () => {
+    if (!hasMore || loadingMore) return;
+    const nextPage = page + 1;
+    setPage(nextPage);
+    fetchActivity(nextPage, true);
   };
 
+  // Toggle sort by clicking TIME header
+  const toggleSort = () => {
+    setSortOrder(prev => prev === 'desc' ? 'asc' : 'desc');
+  };
+
+  const handleSearch = () => {
+    if (!searchQuery.trim()) return;
+    const q = searchQuery.trim();
+    
+    if (q.length === 64 && /^[0-9A-Fa-f]+$/.test(q)) {
+      window.location.href = `/explorer/tx/${q}`;
+    } else if (q.length >= 38 && q.includes('eon')) {
+      window.location.href = `/explorer/address/${q}`;
+    } else if (/^\d+$/.test(q)) {
+      window.location.href = `/explorer/block/${q}`;
+    } else if (q.startsWith('genesis') || q.startsWith('system') || q.startsWith('qnet_')) {
+      window.location.href = `/explorer/tx/${q}`;
+    } else {
+      window.location.href = `/explorer/tx/${q}`;
+    }
+  };
 
   return (
     <div className="explorer-page">
       <div className="explorer-header">
         <h1>Quantum Blockchain Explorer</h1>
-        <p>Real-time network data and blockchain analytics</p>
+        {/* Show height only after mount to avoid hydration mismatch */}
+        <p>All transactions from Genesis to Now • Block Height: {mounted ? (currentHeight || '...') : '...'}</p>
       </div>
 
       <div className="explorer-search">
         <input
           type="text"
-          placeholder="Search transactions, blocks, or addresses..."
+          placeholder="Search by TX hash, block number, or EON address..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
@@ -139,16 +264,31 @@ export default function ExplorerPage() {
 
       <div className="explorer-activity">
         <div className="activity-header">
-          <h2>Latest Activity</h2>
+          <h2>All Transactions</h2>
+          <div className="activity-controls">
+            <select 
+              className="type-filter"
+              value={typeFilter}
+              onChange={(e) => setTypeFilter(e.target.value)}
+            >
+              {TX_TYPES.map(type => (
+                <option key={type} value={type}>{type}</option>
+              ))}
+            </select>
+            <span className="tx-count">
+              {filteredAndSortedActivity.length} transactions
+              {typeFilter !== 'All' && ` (${typeFilter})`}
+            </span>
+          </div>
         </div>
         
         <div className="table-wrapper">
-          {loading ? (
-            <div className="loading-state">Loading...</div>
-          ) : activity.length === 0 ? (
+          {loading && filteredAndSortedActivity.length === 0 ? (
+            <div className="loading-state">Loading transactions...</div>
+          ) : filteredAndSortedActivity.length === 0 ? (
             <div className="empty-state">
-              <p>No transactions yet</p>
-              <span>Waiting for network activity...</span>
+              <p>No transactions found</p>
+              <span>{typeFilter !== 'All' ? `No ${typeFilter} transactions yet` : 'Waiting for network activity...'}</span>
             </div>
           ) : (
             <table className="activity-table">
@@ -159,34 +299,32 @@ export default function ExplorerPage() {
                   <th>FROM → TO</th>
                   <th>AMOUNT</th>
                   <th>BLOCK</th>
-                  <th>TIME</th>
+                  <th 
+                    className="sortable-header"
+                    onClick={toggleSort}
+                    title="Click to sort"
+                  >
+                    TIME {sortOrder === 'desc' ? '↓' : '↑'}
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {paginatedActivity.map((item) => (
-                  <ActivityRow key={item.hash} item={item} />
+                {filteredAndSortedActivity.map((item, idx) => (
+                  <ActivityRow key={`${item.hash}-${idx}`} item={item} />
                 ))}
               </tbody>
             </table>
           )}
         </div>
         
-        {totalPages > 1 && (
-          <div className="pagination">
+        {hasMore && typeFilter === 'All' && (
+          <div className="load-more">
             <button 
-              onClick={() => setPage(p => Math.max(1, p - 1))} 
-              disabled={page === 1}
-              className="page-btn"
+              onClick={loadMore}
+              disabled={loadingMore}
+              className="load-more-btn"
             >
-              ← Prev
-            </button>
-            <span className="page-info">Page {page} of {totalPages}</span>
-            <button 
-              onClick={() => setPage(p => Math.min(totalPages, p + 1))} 
-              disabled={page === totalPages}
-              className="page-btn"
-            >
-              Next →
+              {loadingMore ? 'Loading...' : `Load More Transactions`}
             </button>
           </div>
         )}

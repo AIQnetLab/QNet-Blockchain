@@ -525,6 +525,11 @@ impl PhaseAwareRewardManager {
         self.pending_rewards.get(node_id)
     }
     
+    /// v2.75: Clear pending reward for a node (used when syncing claims from other nodes)
+    pub fn clear_pending_reward(&mut self, node_id: &str) -> Option<PhaseAwareReward> {
+        self.pending_rewards.remove(node_id)
+    }
+    
     /// Get the wallet address that owns a node (for claim verification)
     pub fn get_node_owner(&self, node_id: &str) -> Option<String> {
         self.node_ownership.get(node_id).cloned()

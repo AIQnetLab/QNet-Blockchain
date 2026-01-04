@@ -5,7 +5,7 @@ import { NextRequest, NextResponse } from 'next/server';
 // ============================================================================
 
 // Node RPC (direct blockchain access via RocksDB)
-const NODE_RPC_URL = process.env.QNET_API_URL || 'http://localhost:8001';
+const NODE_RPC_URL = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
 
 // System addresses
 const SYSTEM_ADDRESSES = ['system_rewards_pool', 'system_emission', 'genesis'];
