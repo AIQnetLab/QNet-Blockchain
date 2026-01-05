@@ -1734,10 +1734,10 @@ impl BlockchainNode {
             return Ok(false); // v2.53: No emission created
         }
         
-        // Calculate total emission for this window
-        let total_emission: u64 = pending_rewards.iter()
-            .map(|(_, amount)| amount)
-            .sum();
+        // v2.84: CRITICAL FIX - Use epoch emission ONLY, not accumulated pending rewards!
+        // pending_rewards contains accumulated rewards across multiple epochs (for claiming)
+        // last_epoch_emission contains ONLY this epoch's emission (for total_supply update)
+        let total_emission: u64 = reward_manager.get_last_epoch_emission();
         
         // CRITICAL: Update total supply IMMEDIATELY when rewards are calculated
         // Not when claimed! Emission happens every 4 hours regardless
@@ -1913,9 +1913,8 @@ impl BlockchainNode {
                 if is_warn() { println!("[WARN][REWARDS] p2p_unavailable fallback=local_storage"); }
                 self.process_reward_window_local(&mut reward_manager, window_start, emission_block_height).await?;
                 
-                // Get pending rewards after local processing
-                let pending_rewards = reward_manager.get_all_pending_rewards();
-                let total_emission: u64 = pending_rewards.iter().map(|(_, amount)| amount).sum();
+                // v2.84: Use epoch emission, not accumulated pending rewards
+                let total_emission: u64 = reward_manager.get_last_epoch_emission();
                 return Ok(total_emission);
             }
         };
@@ -2034,8 +2033,8 @@ impl BlockchainNode {
             return Ok(0);
         }
         
-        // Calculate total emission
-        let total_emission: u64 = pending_rewards.iter().map(|(_, amount)| amount).sum();
+        // v2.84: Use epoch emission, not accumulated pending rewards
+        let total_emission: u64 = reward_manager.get_last_epoch_emission();
         
         if total_emission == 0 {
             return Ok(0);

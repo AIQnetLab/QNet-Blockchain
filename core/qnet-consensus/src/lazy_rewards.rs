@@ -210,6 +210,11 @@ pub struct PhaseAwareRewardManager {
     
     /// Pool 3 remainder from previous distribution (Phase 2 only)
     pool3_remainder: u64,
+    
+    /// v2.84: Track emission for CURRENT EPOCH ONLY (for RewardDistribution TX)
+    /// This is separate from pending_rewards which accumulates for claiming
+    /// Reset at each emission, used for blockchain emission TX
+    last_epoch_emission: u64,
 }
 
 impl PhaseAwareRewardManager {
@@ -235,6 +240,8 @@ impl PhaseAwareRewardManager {
             pool2_full_remainder: 0,
             pool2_super_remainder: 0,
             pool3_remainder: 0,
+            // v2.84: Track current epoch emission separately
+            last_epoch_emission: 0,
         }
     }
     
@@ -647,6 +654,18 @@ impl PhaseAwareRewardManager {
             .collect()
     }
     
+    /// v2.84: Get emission for CURRENT EPOCH ONLY (for RewardDistribution TX)
+    /// This returns the amount emitted in the last process_macroblock_heartbeats call
+    /// NOT the accumulated pending rewards (which may span multiple epochs)
+    pub fn get_last_epoch_emission(&self) -> u64 {
+        self.last_epoch_emission
+    }
+    
+    /// v2.84: Reset epoch emission counter (called after TX is created)
+    pub fn reset_epoch_emission(&mut self) {
+        self.last_epoch_emission = 0;
+    }
+    
     /// Get wallet address for a node
     pub fn get_node_wallet_address(&self, node_id: &str) -> Option<String> {
         self.node_ownership.get(node_id).cloned()
@@ -801,6 +820,9 @@ impl PhaseAwareRewardManager {
         println!("[INFO][REWARDS] remainders pool1={} pool2_full={} pool2_super={} pool3={} (carried to next)",
                  pool1_new_remainder, pool2_full_new_remainder, pool2_super_new_remainder, pool3_new_remainder);
         
+        // v2.84: Track emission for THIS EPOCH ONLY (for RewardDistribution TX)
+        let mut epoch_emission: u64 = 0;
+        
         // Calculate rewards for each eligible node
         for summary in heartbeat_summaries {
             if summary.is_eligible {
@@ -834,6 +856,9 @@ impl PhaseAwareRewardManager {
                     total_reward,
                 };
                 
+                // v2.84: Track emission for THIS EPOCH (before accumulation)
+                epoch_emission += total_reward;
+                
                 // v2.67: CRITICAL FIX - Accumulate rewards instead of overwriting!
                 // This ensures unclaimed rewards from previous epochs are preserved
                 self.pending_rewards
@@ -855,6 +880,11 @@ impl PhaseAwareRewardManager {
                     .or_insert(reward);
             }
         }
+        
+        // v2.84: Store epoch emission for RewardDistribution TX
+        self.last_epoch_emission = epoch_emission;
+        println!("[INFO][REWARDS] epoch_emission={} QNC (this epoch only)", 
+                 epoch_emission / 1_000_000_000);
         
         // v2.51.1: Store remainders for next emission period
         self.pool1_remainder = pool1_new_remainder;
