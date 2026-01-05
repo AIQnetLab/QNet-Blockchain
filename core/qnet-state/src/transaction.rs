@@ -98,6 +98,25 @@ pub enum TransactionType {
         amount: u64,
     },
     
+    /// Token swap via DEX smart contract
+    /// Fee: standard gas fee goes to Pool 2 (distributed to validators)
+    Swap {
+        /// Address initiating the swap
+        from: String,
+        /// Token being sold (e.g., "QNC", contract address for custom tokens)
+        token_in: String,
+        /// Token being bought
+        token_out: String,
+        /// Amount of token_in being swapped
+        amount_in: u64,
+        /// Minimum amount of token_out expected (slippage protection)
+        amount_out_min: u64,
+        /// Actual amount of token_out received (filled after execution)
+        amount_out: u64,
+        /// DEX pool/contract address
+        pool_address: String,
+    },
+    
     /// Node activation (Phase 1: 1DEV burn on Solana, Phase 2: QNC transfer to Pool 3)
     NodeActivation {
         node_type: NodeType,
@@ -113,6 +132,17 @@ pub enum TransactionType {
     
     /// Reward distribution
     RewardDistribution,
+    
+    /// Node registration (ON-CHAIN binding of node_id → wallet)
+    /// All nodes must register on-chain to receive rewards
+    /// Genesis: predefined wallets, Super/Full: from activation, Light: from mobile app
+    NodeRegistration {
+        node_id: String,
+        node_type: NodeType,
+        wallet_address: String,
+        /// For Genesis: "genesis", For activated: activation_code hash, For Light: device signature hash
+        registration_proof: String,
+    },
     
     /// Create new account
     CreateAccount {
@@ -234,6 +264,21 @@ pub struct Transaction {
     
     /// Call data
     pub data: Option<String>,
+    
+    /// QUANTUM v2.25: Optional CRYSTALS-Dilithium3 signature for post-quantum security
+    /// When present: TX is quantum-resistant + 50% higher gas cost
+    /// Format: hex-encoded Dilithium signature (~3293 bytes = 6586 hex chars)
+    /// Use case: High-value transfers, enterprise, paranoid users
+    /// NOTE: No skip_serializing_if - bincode requires all fields to be serialized
+    #[serde(default)]
+    pub dilithium_signature: Option<String>,
+    
+    /// QUANTUM v2.25: Dilithium public key for signature verification
+    /// Required when dilithium_signature is present
+    /// Format: hex-encoded Dilithium public key (~1952 bytes = 3904 hex chars)
+    /// NOTE: No skip_serializing_if - bincode requires all fields to be serialized
+    #[serde(default)]
+    pub dilithium_public_key: Option<String>,
 }
 
 /// Transaction receipt (simplified)
@@ -318,9 +363,41 @@ impl Transaction {
             public_key: None, // Optional: Set by client for Ed25519 verification
             tx_type,
             data,
+            dilithium_signature: None, // QUANTUM v2.25: Optional post-quantum signature
+            dilithium_public_key: None, // QUANTUM v2.25: Optional post-quantum pubkey
         };
         tx.hash = tx.calculate_hash();
         tx
+    }
+    
+    /// QUANTUM v2.25.2: Set quantum signature fields after creation
+    /// This allows adding Dilithium signature to an existing transaction
+    pub fn with_quantum_signature(mut self, dilithium_sig: Option<String>, dilithium_pk: Option<String>) -> Self {
+        self.dilithium_signature = dilithium_sig;
+        self.dilithium_public_key = dilithium_pk;
+        self
+    }
+    
+    /// QUANTUM v2.25.2: Set public key for Ed25519 verification
+    pub fn with_public_key(mut self, public_key: Option<String>) -> Self {
+        self.public_key = public_key;
+        self
+    }
+    
+    /// QUANTUM v2.25: Check if transaction has Dilithium signature (quantum-resistant)
+    pub fn is_quantum_signed(&self) -> bool {
+        self.dilithium_signature.is_some() && self.dilithium_public_key.is_some()
+    }
+    
+    /// QUANTUM v2.25: Get effective gas price (50% higher for Dilithium TX)
+    /// This compensates for larger TX size and verification cost
+    pub fn effective_gas_price(&self) -> u64 {
+        if self.is_quantum_signed() {
+            // 50% gas premium for quantum-resistant TX
+            self.gas_price + (self.gas_price / 2)
+        } else {
+            self.gas_price
+        }
     }
     
     /// Calculate transaction hash as hex string
@@ -391,6 +468,25 @@ impl Transaction {
                 if self.to.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
                     return Err("Empty contract address".to_string());
                 }
+            }
+            TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, pool_address, .. } => {
+                if from.is_empty() {
+                    return Err("Swap sender address cannot be empty".to_string());
+                }
+                if token_in.is_empty() || token_out.is_empty() {
+                    return Err("Swap token identifiers cannot be empty".to_string());
+                }
+                if token_in == token_out {
+                    return Err("Cannot swap token for itself".to_string());
+                }
+                if *amount_in == 0 {
+                    return Err("Swap amount must be greater than 0".to_string());
+                }
+                if pool_address.is_empty() {
+                    return Err("DEX pool address cannot be empty".to_string());
+                }
+                // amount_out_min can be 0 (no slippage protection, risky but allowed)
+                let _ = amount_out_min; // Explicitly mark as intentionally unused here
             }
             TransactionType::RewardDistribution => {
                 // No additional validation needed for RewardDistribution
@@ -484,12 +580,15 @@ impl Transaction {
                     return Err("Successful ping count cannot exceed total ping count".to_string());
                 }
                 
-                // Validate sample size (must be at least 1% or 10,000, whichever is larger)
-                let min_sample_size = (*total_ping_count / 100).max(10_000);
+                // Validate sample size: ADAPTIVE based on network size!
+                // - Small network (<10K nodes): verify ALL pings (no sampling)
+                // - Large network (10K+ nodes): 1% sampling for scalability
+                // Formula: max(total/100, min(10000, total))
+                let min_sample_size = (*total_ping_count / 100).max(10_000_u32.min(*total_ping_count));
                 if ping_samples.len() < min_sample_size as usize {
                     return Err(format!(
-                        "Insufficient samples: got {}, expected at least {}",
-                        ping_samples.len(), min_sample_size
+                        "Insufficient samples: got {}, expected at least {} (total={})",
+                        ping_samples.len(), min_sample_size, total_ping_count
                     ));
                 }
                 
@@ -502,6 +601,17 @@ impl Transaction {
                         return Err("Sample ping response time cannot exceed 60 seconds".to_string());
                     }
                 }
+            }
+            TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } => {
+                // System transaction: validate node registration data
+                if node_id.is_empty() {
+                    return Err("Node ID cannot be empty".to_string());
+                }
+                if wallet_address.is_empty() {
+                    return Err("Wallet address cannot be empty".to_string());
+                }
+                // node_type is validated by enum
+                let _ = node_type; // Explicitly mark as used
             }
         }
         
@@ -525,8 +635,8 @@ impl Transaction {
                     )));
                 }
                 
-                // Check balance
-                let total_amount = amount + self.gas_price * self.gas_limit;
+                // Check balance (QUANTUM v2.25: use effective_gas_price for +50% Dilithium TX)
+                let total_amount = amount + self.effective_gas_price() * self.gas_limit;
                 if sender.balance < total_amount {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -565,8 +675,8 @@ impl Transaction {
                     )));
                 }
 
-                // Fee calculation
-                let fee = self.gas_price * self.gas_limit;
+                // Fee calculation (QUANTUM v2.25: use effective_gas_price for +50% Dilithium TX)
+                let fee = self.effective_gas_price() * self.gas_limit;
                 let total_amount = amount + fee;
 
                 if sender.balance < total_amount {
@@ -596,8 +706,8 @@ impl Transaction {
                     )));
                 }
                 
-                // Check balance for deployment fee
-                let fee = self.gas_price * self.gas_limit;
+                // Check balance for deployment fee (QUANTUM v2.25: +50% for Dilithium TX)
+                let fee = self.effective_gas_price() * self.gas_limit;
                 if sender.balance < fee {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -625,8 +735,8 @@ impl Transaction {
                     )));
                 }
                 
-                // Check balance for call fee + value
-                let fee = self.gas_price * self.gas_limit;
+                // Check balance for call fee + value (QUANTUM v2.25: +50% for Dilithium TX)
+                let fee = self.effective_gas_price() * self.gas_limit;
                 let total_cost = fee + self.amount;
                 
                 if sender.balance < total_cost {
@@ -642,6 +752,64 @@ impl Transaction {
                 
                 // Contract call logic would go here
                 println!("Contract call by {} with fee {} QNC, value {} QNC", self.from, fee, self.amount);
+            }
+            TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, amount_out, pool_address } => {
+                // Token swap via DEX
+                // Gas fee goes to Pool 2 (distributed to validators: 70% Super, 30% Full)
+                let sender = accounts.get_mut(from)
+                    .ok_or_else(|| StateError::AccountNotFound(from.clone()))?;
+                
+                // CRITICAL SECURITY: Check nonce to prevent replay attacks
+                if self.nonce != sender.nonce + 1 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        sender.nonce + 1, self.nonce
+                    )));
+                }
+                
+                // Calculate gas fee (QUANTUM v2.25: +50% for Dilithium TX)
+                let fee = self.effective_gas_price() * self.gas_limit;
+                
+                // For QNC swaps: check if user has enough balance (amount_in + fee)
+                // For other tokens: only check fee (token balance checked by DEX contract)
+                let total_cost = if token_in == "QNC" {
+                    amount_in + fee
+                } else {
+                    fee
+                };
+                
+                if sender.balance < total_cost {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: total_cost,
+                    });
+                }
+                
+                // Slippage protection: ensure amount_out >= amount_out_min
+                if *amount_out < *amount_out_min {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Slippage exceeded: got {} {}, minimum was {} {}",
+                        amount_out, token_out, amount_out_min, token_out
+                    )));
+                }
+                
+                // Deduct fee (always in QNC)
+                sender.balance -= fee;
+                
+                // If swapping QNC for another token, deduct amount_in
+                if token_in == "QNC" {
+                    sender.balance -= amount_in;
+                }
+                
+                // If receiving QNC, add amount_out
+                if token_out == "QNC" {
+                    sender.balance += amount_out;
+                }
+                
+                sender.nonce += 1;
+                
+                println!("[SWAP] 🔄 {} swapped {} {} for {} {} via pool {} (fee: {} QNC → Pool 2)", 
+                         from, amount_in, token_in, amount_out, token_out, pool_address, fee);
             }
             TransactionType::RewardDistribution => {
                 // System transaction for reward distribution
@@ -677,8 +845,8 @@ impl Transaction {
                     )));
                 }
 
-                // Calculate total fee for batch
-                let total_fee = (self.gas_price * self.gas_limit) * node_ids.len() as u64;
+                // Calculate total fee for batch (QUANTUM v2.25: +50% for Dilithium TX)
+                let total_fee = (self.effective_gas_price() * self.gas_limit) * node_ids.len() as u64;
 
                 if sender.balance < total_fee {
                     return Err(StateError::InsufficientBalance {
@@ -708,9 +876,9 @@ impl Transaction {
                     )));
                 }
 
-                // Calculate total activation amount and fees
+                // Calculate total activation amount and fees (QUANTUM v2.25: +50% for Dilithium TX)
                 let total_activation_amount: u64 = activation_data.iter().map(|d| d.activation_amount).sum();
-                let total_fee = (self.gas_price * self.gas_limit) * activation_data.len() as u64;
+                let total_fee = (self.effective_gas_price() * self.gas_limit) * activation_data.len() as u64;
                 let total_cost = total_activation_amount + total_fee;
 
                 if sender.balance < total_cost {
@@ -741,9 +909,9 @@ impl Transaction {
                     )));
                 }
 
-                // Calculate total transfer amount and fees
+                // Calculate total transfer amount and fees (QUANTUM v2.25: +50% for Dilithium TX)
                 let total_transfer_amount: u64 = transfers.iter().map(|t| t.amount).sum();
-                let total_fee = (self.gas_price * self.gas_limit) * transfers.len() as u64;
+                let total_fee = (self.effective_gas_price() * self.gas_limit) * transfers.len() as u64;
                 let total_cost = total_transfer_amount + total_fee;
 
                 if sender.balance < total_cost {
@@ -792,6 +960,13 @@ impl Transaction {
                          total_ping_count, successful_ping_count, ping_samples.len(), 
                          &merkle_root[..16]);
                 // No state modification needed - commitment will be validated during emission check
+            }
+            TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } => {
+                // System transaction: on-chain node registration
+                // No balance changes, only registers node_id -> wallet_address binding
+                println!("[NODE-REG] 📋 On-chain registration: {} ({:?}) -> {}", 
+                         node_id, node_type, &wallet_address[..20.min(wallet_address.len())]);
+                // Registration data is stored in blockchain for immutable lookup
             }
         }
         
@@ -1017,11 +1192,12 @@ impl TransactionProcessor {
         tx.apply_to_state(accounts)?;
         
         // Calculate and process fee for Pool 2 - Phase 1 activations are FREE!
+        // QUANTUM v2.25: Use effective_gas_price() which adds +50% for Dilithium TX
         let fee_amount = match &tx.tx_type {
             TransactionType::NodeActivation { phase: ActivationPhase::Phase1, .. } => {
                 0 // Phase 1 activations are completely FREE - no QNC gas fees!
             },
-            _ => tx.gas_price * tx.gas_limit // Normal fees for other transactions
+            _ => tx.effective_gas_price() * tx.gas_limit // Normal fees (+50% for quantum TX)
         };
         
         if fee_amount > 0 {

@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.19.22-experimental  
-**Date**: November 30, 2025  
+**Version**: 2.73.0-experimental  
+**Date**: January 3, 2026  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -38,6 +38,55 @@ Experimental achievements:
 - ✅ **Chain Reorganization**: Byzantine-safe fork resolution with 2/3 majority consensus
 - ✅ **Advanced Synchronization**: Out-of-order block buffering with active missing block requests
 - ✅ **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
+- ✅ **Consensus Deduplication v2.49.1**: ACTIVE_CONSENSUS_MB prevents 60→1 duplicate tasks
+- ✅ **Idempotent Rounds v2.49.1**: Preserves commits/reveals if round already active
+- ✅ **700x Faster Consensus v2.49.1**: 7107s→3-10s per MacroBlock
+- ✅ **Batch Ed25519 Verification (v2.25.2)**: 3x faster signature verification using batch API
+- ✅ **Batch Mempool (v2.25.2)**: 1 lock per 1000 TX (1000x reduction in lock contention)
+- ✅ **TX Accumulator (v2.25.2)**: Batch 1000 TX for verification with 100ms timeout
+- ✅ **Skip Self-Broadcast (v2.25.2)**: Producer doesn't re-broadcast own TX
+- ✅ **Epoch-Based Validator Set (v2.27.0)**: Deterministic producer selection from MacroBlock snapshots
+- ✅ **No Gossip Race Conditions (v2.27.0)**: All nodes use same producer list from blockchain
+- ✅ **MAX_VALIDATORS_PER_EPOCH = 1000 (v2.27.0)**: Scalable deterministic sampling
+- ✅ **N-2 Entropy Source (v2.30.0)**: MacroBlock N-2 for producer selection (guaranteed finalization)
+- ✅ **Extended Genesis Epoch (v2.30.0)**: 180 blocks (not 90) for N-2 compatibility
+- ✅ **Explicit State Machine (v2.30.0)**: 27 integration points (Syncing, Producing, Error, etc.)
+- ✅ **Real Reputation (v2.30.0)**: DeterministicReputationState instead of hardcoded values
+- ✅ **Graceful Shutdown (v2.30.0)**: Certificate persistence on Ctrl+C/SIGTERM
+- ✅ **No Fallback Policy (v2.30.0)**: Desynchronized nodes excluded from production
+- ✅ **Round Tolerance ±90 (v2.44.0)**: Fork recovery accepts consensus messages within 1 epoch
+- ✅ **Aggressive Catch-up (v2.44.0)**: 15s/5 blocks threshold (was 120s/50) for fast stall recovery
+- ✅ **Byzantine Median Height (v2.44.0)**: Fresh network height from HealthPing peer data
+- ✅ **100K+ TPS Stress Tested (v2.44.0)**: Network recovery after high-load scenarios
+- ✅ **LAST_FINALIZED_CONSENSUS_ROUND (v2.48.0)**: Global atomic tracks actually finalized rounds
+- ✅ **Round Update at Save Only (v2.48.0)**: Prevents premature round advancement causing desync
+- ✅ **Reveal Loss Prevention (v2.48.0)**: Participant nodes don't reset consensus engine mid-round
+- ✅ **Dynamic Height Threshold (v2.48.0)**: 5/10/20 blocks based on network size (scalable resync)
+- ✅ **Stage Pipeline (v2.57.0)**: Isolated runtime for each processing stage
+- ✅ **SIGVERIFY_RUNTIME (v2.57.0)**: Dedicated threads for Ed25519/Dilithium verification
+- ✅ **BANKING_RUNTIME (v2.57.0)**: Dedicated threads for transaction intake and mempool
+- ✅ **REPLAY_RUNTIME (v2.57.0)**: Dedicated threads for state machine execution
+- ✅ **BROADCAST_RUNTIME (v2.57.0)**: Dedicated threads for Shred protocol propagation
+- ✅ **Adaptive Threading (v2.57.0)**: 2 cores→4t, 4 cores→5t, 8 cores→10t, 16 cores→20t
+- ✅ **Zero Starvation Guarantee (v2.57.0)**: Crypto ops never block network propagation
+- ✅ **Size-Based Sync Batching (v2.61.0)**: BlocksBatch max 1MB, MacroblocksBatch max 500KB
+- ✅ **ShredProtocol Unicast Sync (v2.61.0)**: `send_block_via_shred_to_peer()` for blocks >1MB
+- ✅ **Repair Batching (v2.61.0)**: 10 chunks per batch with 5ms pacing
+- ✅ **Peer Heights Tracking (v2.61.0)**: `get_peer_heights()` from Dilithium-signed heartbeats
+- ✅ **Strict Emergency Sync Check (v2.61.0)**: Emergency producer must have prev block (N-1)
+- ✅ **is_new_chunk Dedup (v2.61.0)**: Prevents infinite chunk forwarding loops
+- ✅ **Intercontinental Sync (v2.61.0)**: Reliable USA↔Europe 7500km block propagation
+- ✅ **Per-Round Consensus Storage (v2.62.0)**: Independent storage for each consensus round
+- ✅ **No Data Loss on Round Transition (v2.62.0)**: Rounds coexist without overwriting
+- ✅ **Parallel Consensus Rounds (v2.62.0)**: Multiple rounds can work simultaneously
+- ✅ **Automatic Round Cleanup (v2.62.0)**: Old rounds (>5 epochs) auto-purged
+- ✅ **100% First-Attempt Success (v2.62.0)**: Eliminated race conditions in consensus
+- ✅ **Production L1 Architecture (v2.62.0)**: Per-round storage standard for top blockchains
+- ✅ **Embedded RocksDB Indexing (v2.74.0)**: Built-in tx_index
+- ✅ **On-chain Node Registration (v2.74.0)**: Immutable wallet-to-node binding via `NodeRegistration` TX
+- ✅ **System TX Indexing (v2.74.0)**: Emission and reward transactions fully indexed
+- ✅ **Dilithium Claim Option (v2.74.0)**: Post-quantum signatures for reward claims (free gas)
+- ✅ **Single Container Deployment (v2.74.0)**: No external PostgreSQL, simplified ops
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 
@@ -280,7 +329,7 @@ Block #N+5 arrives → Missing #N+1,N+2,N+3,N+4 → Buffer #N+5 → Request Miss
 
 **Buffer Management (v2.19.20):**
 - HashMap storage: O(1) lookup by block height
-- **Pseudo-infinite retries** (like Solana/Ethereum) - blocks NEVER discarded
+- **Pseudo-infinite retries** - blocks NEVER discarded
 - **Adaptive buffer size**: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
 - **Exponential backoff**: 10s (retries 0-9) → 30s → 60s → 120s → 240s → 300s max
 - Timestamp tracking for age-based re-request (not eviction)
@@ -815,7 +864,7 @@ MAX_MESSAGE_SIZE: 10 MB       // Supports full macroblocks (~3MB)
 
 ### 6.5 Reputation System
 
-**Deterministic Blockchain-Based Reputation (v2.24 - Ethereum 2.0 Style):**
+**Deterministic Blockchain-Based Reputation (v2.24):**
 
 > **ARCHITECTURE v2.24:** Reputation computed from blockchain data + FULL snapshots in macroblocks.
 > All nodes have IDENTICAL reputation state after every macroblock - 100% synchronized.
@@ -851,11 +900,12 @@ REWARDS (from blockchain data):
   ├── Consensus Participation: +1.0 (macroblock commit+reveal)
   └── Passive Recovery: +1.0/4h (online nodes with rep 10-69%)
 
-PENALTIES (SlashingEvent with cryptographic proof):
-  ├── Invalid Block: -20.0 (proof: the invalid block itself)
-  ├── Double Sign: -50.0 + PERMANENT BAN (proof: both signed blocks)
-  ├── Chain Fork: PERMANENT BAN (proof: conflicting chains)
-  └── Missed Blocks: -2.0 per block (AutomaticJail in macroblock)
+PENALTIES (SlashingEvent - cryptographic proof REQUIRED):
+  ├── Double Sign: -100% + PERMANENT BAN (proof: 2 signatures at same height)
+  ├── Invalid Block: -20% (proof: invalid signature/hash)
+  ├── Chain Fork: -100% + PERMANENT BAN (proof: conflicting signed blocks)
+  └── Missed Blocks: NOT SLASHABLE (no cryptographic proof possible)
+      └── Instead: No reward for partial rotation (natural consequence)
 
 SNAPSHOT STORAGE (every 90 blocks in macroblock):
   ├── All reputations (HashMap<String, f64>)
@@ -895,6 +945,14 @@ Architecture (v2.23):
 ├── Light node reputation: Fixed at 70 (immutable, not affected by events)
 ├── Storage: Tiered (Light ~100MB headers, Full ~500GB pruned, Super ~2TB full)
 └── Mobile monitoring: viewing only, no attestations
+
+Deterministic On-Chain Heartbeats (v2.41):
+├── Heartbeats collected via gossip → stored in heartbeat_history (RAM)
+├── ONLY recorded in EMISSION MacroBlocks (every 160th = 4 hours)
+├── HeartbeatSummary[] → ConsensusData.reward_heartbeats (BLOCKCHAIN)
+├── All nodes read SAME data from blockchain = deterministic rewards
+├── Strict node_id validation: light_, full_, super_, genesis_node_ only
+└── Invalid formats REJECTED (no default assignments)
 
 > **Note (v2.19.10)**: Sharding is for parallel TX processing, NOT storage partitioning. All nodes receive all blocks via P2P.
 ```
@@ -959,7 +1017,7 @@ OPTIMIZATIONS (v2.19.20):
 ├── Fire-and-Forget Broadcast: Shred Protocol doesn't block production (1 block/sec guaranteed)
 ├── Genesis Startup Wait: 30-second network stabilization before production
 ├── Emergency Timeout 10s: Allows original producer delivery (was 2s)
-├── Pseudo-Infinite Retries: Blocks NEVER discarded (like Solana/Ethereum)
+├── Pseudo-Infinite Retries: Blocks NEVER discarded
 ├── Exponential Backoff: 10s (0-9) → 30s → 60s → 120s → 240s → 300s max
 ├── Adaptive Buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
 ├── Kademlia K-neighbors: Heartbeats use DHT distance for efficient routing
@@ -1563,6 +1621,39 @@ Priority Multipliers:
 ├── Fast: 2.0x (priority processing)
 └── Priority: 3.0x (immediate processing)
 
+Quantum Transaction Premium (v2.25):
+├── Standard TX: Ed25519 only (1.0x gas)
+└── Quantum TX: Ed25519 + Dilithium3 (1.5x gas)
+    ├── Optional post-quantum protection
+    ├── Both signatures verified
+    └── Enterprise-grade security
+```
+
+**Transaction Signature Architecture (v2.25):**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    TRANSACTION SIGNATURES                           │
+├─────────────────────────────────────────────────────────────────────┤
+│  STANDARD TX (default)        │  QUANTUM TX (optional)              │
+│  ─────────────────────────    │  ──────────────────────────────────│
+│  Ed25519 signature: REQUIRED  │  Ed25519 signature: REQUIRED       │
+│  Ed25519 pubkey: REQUIRED     │  Ed25519 pubkey: REQUIRED          │
+│  Dilithium3 sig: null         │  Dilithium3 sig: REQUIRED          │
+│  Dilithium3 pubkey: null      │  Dilithium3 pubkey: REQUIRED       │
+│                               │                                     │
+│  Gas: gas_price * gas_limit   │  Gas: gas_price * 1.5 * gas_limit  │
+│  Use case: Regular users      │  Use case: Enterprise, high-value  │
+└─────────────────────────────────────────────────────────────────────┘
+
+Signature Flow:
+1. Client creates Ed25519 signature (always)
+2. Client optionally creates Dilithium3 signature
+3. Node verifies Ed25519 (mandatory)
+4. Node verifies Dilithium3 if present (optional)
+5. Gas fee calculated with quantum premium if applicable
+```
+
 Smart Contract Fees:
 ├── Base Execution: 0.001 QNC
 ├── Computational Complexity: Variable scaling
@@ -1838,7 +1929,8 @@ pub struct Shred ProtocolChunk {
 ```
 
 **Performance metrics:**
-- Maximum block size: 64KB (64 chunks)
+- Maximum block size: 43.5MB (170 × 256KB chunks) - supports 100K+ TPS (v2.63)
+- Block creation limit: 40MB (defense against network deadlock)
 - Propagation time: O(log₃(N)) where N = network size
 - Packet loss tolerance: Up to 33% with full recovery
 
@@ -1975,7 +2067,8 @@ async fn get_finalized_entropy(
         // Normal: Use block 10 blocks behind current
         let entropy_height = current_height - FINALITY_WINDOW;
         let entropy_block = storage.load_microblock(entropy_height)?;
-        return Sha3_256::digest(&entropy_block).into();
+        // UNIFIED v2.36: SHA3-512 everywhere for maximum quantum security
+        return Sha3_512::digest(&entropy_block).into();
     }
 }
 
@@ -2217,10 +2310,39 @@ pub struct PreExecutionMetrics {
 - Prevention of voting manipulation
 - Finalization through information disclosure
 - Resistance to 33% malicious nodes
+- **Block-based phase synchronization (v2.40)**: All nodes in same phase at same height
 
-### 9.2 Detailed Process
+### 9.2 Block-Based Phase Layout (v2.40)
 
-**Phase 1 - Commit (15 seconds):**
+**90-Block Epoch Structure:**
+| Blocks | Phase | Duration | Purpose |
+|--------|-------|----------|---------|
+| 1-60 | Production | 60s | Microblock creation only |
+| 61-72 | Commit | 12s | Validators submit encrypted votes |
+| 73-84 | Reveal | 12s | Validators reveal votes |
+| 85-90 | Finalize | 6s | Leader creates MacroBlock |
+
+**Phase Determination:**
+```rust
+// DETERMINISTIC: All nodes compute IDENTICAL phase from height
+fn get_phase_for_block(height: u64) -> ConsensusPhase {
+    match height % 90 {
+        0 => Finalize,        // Block 90, 180, 270...
+        1..=60 => Production, // Microblocks only
+        61..=72 => Commit,    // Submit commits
+        73..=84 => Reveal,    // Submit reveals
+        85..=89 => Finalize,  // Create MacroBlock
+    }
+}
+```
+
+**Grace Periods (Network Tolerance):**
+- Commits accepted: blocks 61-78 (includes early Reveal grace)
+- Reveals accepted: blocks 69-90 (includes late Commit and Finalize grace)
+
+### 9.3 Message Structures
+
+**Commit Message:**
 ```rust
 commit = {
     round_id: u64,
@@ -2231,7 +2353,7 @@ commit = {
 }
 ```
 
-**Phase 2 - Reveal (15 seconds):**
+**Reveal Message:**
 ```rust
 reveal = {
     round_id: u64,
@@ -2248,7 +2370,17 @@ reveal = {
 - Count votes from valid reveals
 - Consensus at 2f+1 agreeing votes
 
-### 9.3 Validator Selection
+### 9.4 No Automatic Jailing (v2.40)
+
+**Previous behavior:** Nodes that committed but didn't reveal were jailed (1h+)
+**Current behavior:** Only -1% reputation penalty (no jail)
+
+**Rationale:**
+- Timing issues may be caused by network latency, not malicious intent
+- Cannot cryptographically prove if miss was intentional
+- Prevents cascade jailing that kills the network
+
+### 9.5 Validator Selection
 
 **Cryptographically deterministic selection:**
 

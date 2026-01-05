@@ -1,11 +1,17 @@
-# QNET Deterministic Reputation System v2.24
+# QNET Deterministic Reputation System v2.61
 
 ## Overview
 
 QNET uses a **deterministic blockchain-based reputation system** that eliminates P2P gossip vulnerabilities.
 All nodes compute identical reputation scores from on-chain data.
 
-**NEW in v2.24:** Ethereum 2.0 style reputation snapshots ensure 100% synchronization across all nodes!
+**NEW in v2.61:** Strict sync check (N-1) for emergency producer selection!
+
+**NEW in v2.40:** Block-based consensus phases eliminate cascade jailing!
+
+**NEW in v2.27:** Epoch-based validator sets + QRDS (Quantum-Resistant Deterministic Selection) eliminate gossip race conditions!
+
+**NEW in v2.24:** Reputation snapshots ensure 100% synchronization across all nodes!
 
 **Architecture Comparison:**
 | Feature | OLD (P2P Gossip) | NEW (Deterministic) |
@@ -16,6 +22,39 @@ All nodes compute identical reputation scores from on-chain data.
 | Evidence | ❌ Ephemeral keys | ✅ Cryptographic proof |
 | Synchronization | ❌ Gossip lag | ✅ Block-based |
 | Long-Range Attack | ❌ Vulnerable | ✅ Finality Checkpoints |
+| **Producer Selection** | ❌ Gossip races | ✅ MacroBlock snapshot (v2.27) |
+
+---
+
+## Epoch-Based Validator Set (v2.27)
+
+Producer selection now uses **MacroBlock snapshots** instead of gossip registry:
+
+### Data Structure
+
+```rust
+// Stored in MacroBlock.consensus_data.eligible_producers
+pub struct EligibleProducer {
+    pub node_id: String,      // Node identifier
+    pub reputation: f64,      // 0.0 - 1.0 (from reputation system)
+}
+```
+
+### Epoch Flow
+
+| Blocks | Source | Description |
+|--------|--------|-------------|
+| 1-90 | `genesis_constants.rs` | Static Genesis nodes |
+| 91-180 | MacroBlock #1 | Snapshot from block 90 |
+| 181-270 | MacroBlock #2 | Snapshot from block 180 |
+| ... | ... | Each epoch uses previous MacroBlock |
+
+### Benefits
+
+1. **Determinism**: All nodes read same snapshot from blockchain
+2. **No Race Conditions**: Gossip propagation delays don't affect selection
+3. **Scalability**: MAX_VALIDATORS_PER_EPOCH = 1000 with deterministic sampling
+4. **Emergency Failover**: Uses same snapshot for consistency
 
 ---
 
@@ -430,6 +469,41 @@ let cutoff = now - (24 * 60 * 60);
 history.retain(|_, record| record.timestamp >= cutoff);
 ```
 
+### v2.41 On-Chain Heartbeat Recording
+
+**Critical Change:** Heartbeats are now recorded in MacroBlock for deterministic rewards!
+
+#### Flow (v2.41.1):
+```
+1. Full/Super send heartbeats → Gossip → heartbeat_history (RAM)
+2. MacroBlock creation:
+   - Regular MacroBlock (#1-159): reward_heartbeats = None
+   - EMISSION MacroBlock (#160, #320...): collect heartbeats → blockchain!
+3. EMISSION = every 160th MacroBlock (14400 microblocks / 90 = 160)
+4. MacroBlock sync:
+   - Regular: don't process rewards
+   - EMISSION: process_macroblock_heartbeats() → calculate rewards
+5. All nodes read SAME data from blockchain = deterministic!
+```
+
+**Location:** `node.rs:15547` - MacroBlock sync
+
+```rust
+const EMISSION_MACROBLOCK_INTERVAL: u64 = 160; // 4 hours
+let is_emission_macroblock = index > 0 && index % EMISSION_MACROBLOCK_INTERVAL == 0;
+
+if is_emission_macroblock {
+    if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
+        // Deserialize and process rewards
+        reward_manager.process_macroblock_heartbeats(&summary_data);
+    }
+}
+```
+
+**Strict Node ID Validation (v2.41.1):**
+- Valid formats: `light_*`, `full_*`, `super_*`, `genesis_node_*`
+- Invalid formats: **REJECTED** (no default assignments!)
+
 ### Requirements Summary
 
 | Node Type | Pings/4h | Required | Success Rate | Timeout | Reputation |
@@ -477,32 +551,90 @@ history.retain(|_, record| record.timestamp >= cutoff);
 
 ---
 
-## Slashing Events
+## Slashing & Jailing (v2.40)
 
-### Types
+### Architecture: Cryptographic Proof Only
 
-| Type | Penalty | Evidence Required |
-|------|---------|-------------------|
-| DoubleSign | -50% + Permanent Ban | Both signed blocks |
-| InvalidBlock | -20% | Invalid block data |
-| ChainFork | -100% + Permanent Ban | Conflicting chain data |
-| MissedBlocks | -2% per block | List of missed heights |
+Slashing is applied **ONLY** for offenses with cryptographic proof.
+This prevents false positives from network delays or P2P gossip inconsistencies.
 
-### Collection Flow
+### Slashable Offenses
+
+| Type | Penalty | Evidence Required | Detection |
+|------|---------|-------------------|-----------|
+| DoubleSign | -100% + Permanent Ban | 2 signatures at same height | On-chain analysis |
+| InvalidBlock | -20% | Invalid signature/hash | Block validation |
+| ChainFork | -100% + Permanent Ban | Conflicting blocks | On-chain analysis |
+
+### NOT Slashable (v2.38+)
+
+| Type | Reason | Alternative |
+|------|--------|-------------|
+| MissedBlocks | Cannot prove "who should have produced" | Reputation decay (no reward) |
+
+### Automatic Jails: REMOVED (v2.40)
+
+| Before (v2.39) | After (v2.40) |
+|----------------|---------------|
+| Commit without reveal = 1h jail | **No jail** |
+| Cascade jail effect | **Impossible** |
+| Timing issues = offense | **Timing issues = NOT offense** |
+
+**Why removed:**
+- Block-based phases mean nodes may miss reveal window due to network latency
+- This is NOT a provable offense (cannot determine if malicious or network issue)
+- Alternative: -1% reputation penalty (`PENALTY_MISSED_CONSENSUS`)
+- Node can still participate in next consensus (89% > 70% threshold)
+
+### Consensus Phase Synchronization (v2.40)
+
+Phases are now determined by **block height**, not message counts:
 
 ```
+Block Layout per 90-block epoch:
+├── Blocks 1-60:  Production (microblocks only)
+├── Blocks 61-72: Commit phase (12 seconds)
+├── Blocks 73-84: Reveal phase (12 seconds)
+└── Blocks 85-90: Finalize phase (6 seconds)
+
+get_phase_for_block(height) = deterministic on ALL nodes
+```
+
+**Grace Periods:**
+| Message | Accept In |
+|---------|-----------|
+| Commits | Commit (61-72) + early Reveal (73-78) |
+| Reveals | late Commit (69-72) + Reveal (73-84) + Finalize (85-90) |
+
+### Collection Flow (v2.38)
+
+```
+                    ON-CHAIN SLASHING ANALYSIS
+                    
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Detect Offense │────►│ report_invalid_ │────►│ slashing_       │
-│  (validation)   │     │ block() / etc   │     │ collector       │
+│  MacroBlock     │────►│ analyze_chain_  │────►│ SlashingEvent   │
+│  Creation       │     │ for_slashing()  │     │ (if proof)      │
 └─────────────────┘     └─────────────────┘     └────────┬────────┘
                                                          │
-                                                         │ Macroblock
-                                                         │ creation
+                        Checks for:                      │
+                        - Double-sign (2 sigs @ height)  │
+                        - Invalid blocks                 │
                                                          ▼
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ All nodes apply │◄────│ drain_slashing_ │◄────│ MacroBlock      │
-│ same penalties  │     │ events()        │     │ ConsensusData   │
+│ All nodes apply │◄────│ process_        │◄────│ MacroBlock      │
+│ same penalties  │     │ macroblock()    │     │ ConsensusData   │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
+
+Result: DETERMINISTIC - all nodes analyzing same chain = same result!
+```
+
+### Emergency Failover (NOT Slashing)
+
+```
+Emergency notification → Failover only (chain continues)
+                       → NO immediate slashing
+                       → Producer recorded in block.producer
+                       → Reputation: no reward for missed rotation
 ```
 
 ---
@@ -604,7 +736,7 @@ Before v2.24, nodes could have different reputation values due to:
 - Failed deserialization of some blocks
 - Different blockchain heights
 
-### Solution: Ethereum 2.0 Style Snapshots
+### Solution: Deterministic Snapshots
 
 Every macroblock now contains a **FULL reputation snapshot** stored in blockchain:
 

@@ -543,6 +543,8 @@ impl Mempool {
                 amount: 0,
             },
             data: None,
+            dilithium_signature: None,   // QUANTUM v2.25: Optional
+            dilithium_public_key: None,  // QUANTUM v2.25: Optional
         };
         
         let priority = self.priority_calc.calculate_priority(&tx);

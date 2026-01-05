@@ -57,17 +57,12 @@ async fn decode_activation_code_quantum_secure(
     code: &str, 
     selected_node_type: NodeType
 ) -> Result<ActivationCodeData, String> {
-    // Use GLOBAL quantum crypto instance to avoid multiple initializations
-    use qnet_integration::node::GLOBAL_QUANTUM_CRYPTO;
+    // PRODUCTION v2.50: Lock-free quantum crypto
+    use qnet_integration::node::{init_global_quantum_crypto, get_quantum_crypto};
     
-    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-    if crypto_guard.is_none() {
-        let mut crypto = QNetQuantumCrypto::new();
-        crypto.initialize().await
-            .map_err(|e| format!("Failed to initialize quantum crypto: {}", e))?;
-        *crypto_guard = Some(crypto);
-    }
-    let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+    init_global_quantum_crypto().await
+        .map_err(|e| format!("Failed to initialize quantum crypto: {}", e))?;
+    let quantum_crypto = get_quantum_crypto();
 
     // 1. Decrypt activation code using quantum-resistant decryption
     println!("🔓 Decrypting quantum-secure activation code...");
@@ -2578,16 +2573,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
         println!("🔐 Recording quantum-secure activation in QNet blockchain...");
         
-        // Use GLOBAL quantum crypto instance
-        use qnet_integration::node::GLOBAL_QUANTUM_CRYPTO;
+        // PRODUCTION v2.51: Initialize crypto if not yet done (Genesis nodes skip decode_activation_code)
+        use qnet_integration::node::{init_global_quantum_crypto, try_get_quantum_crypto};
+        init_global_quantum_crypto().await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize quantum crypto: {}", e))?;
         
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = qnet_integration::quantum_crypto::QNetQuantumCrypto::new();
-            crypto.initialize().await?;
-            *crypto_guard = Some(crypto);
-        }
-        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        let quantum_crypto = try_get_quantum_crypto()
+            .ok_or_else(|| anyhow::anyhow!("Quantum crypto not initialized"))?;
         
         // Decrypt activation code to get payload
         let payload = quantum_crypto.decrypt_activation_code(&activation_code).await?;
@@ -2859,8 +2851,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("");
     println!("=== BLOCKCHAIN LOGS (Live) ===");
     
-    // Continue with live blockchain logging - no background transition
-    let _ = node_handle.await;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRODUCTION FIX v2.30: Graceful shutdown with certificate persistence
+    // Handles Ctrl+C and SIGTERM to save certificate_history before exit
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    tokio::select! {
+        // Normal monitoring loop
+        _ = node_handle => {
+            println!("[SHUTDOWN] Node monitoring ended unexpectedly");
+        }
+        
+        // Graceful shutdown on Ctrl+C or SIGTERM
+        _ = tokio::signal::ctrl_c() => {
+            println!("\n[SHUTDOWN] 🛑 Received shutdown signal...");
+            println!("[SHUTDOWN] 💾 Saving certificate history...");
+            
+            // Persist certificate history before exit
+            if node_type != NodeType::Light {
+                if let Some(p2p) = node.get_unified_p2p() {
+                    // Use QNET_STORAGE_PATH (set during init) with fallback to "data"
+                    let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
+                    let data_dir = std::path::Path::new(&storage_path);
+                    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                        println!("[SHUTDOWN] ⚠️ Failed to create data dir {}: {}", storage_path, e);
+                    } else if let Ok(mut cert_manager) = p2p.certificate_manager.write() {
+                        let unified_node_type = match node_type {
+                            NodeType::Light => qnet_integration::unified_p2p::NodeType::Light,
+                            NodeType::Full => qnet_integration::unified_p2p::NodeType::Full,
+                            NodeType::Super => qnet_integration::unified_p2p::NodeType::Super,
+                        };
+                        match cert_manager.persist_to_disk(&data_dir, unified_node_type) {
+                            Ok(_) => println!("[SHUTDOWN] ✅ Certificate history saved to {}", storage_path),
+                            Err(e) => println!("[SHUTDOWN] ⚠️ Failed to save certificates: {}", e),
+                        }
+                    }
+                }
+            }
+            
+            println!("[SHUTDOWN] ✅ Graceful shutdown complete");
+        }
+    }
     
     Ok(())
 }
@@ -2930,8 +2961,8 @@ fn configure_production_mode() {
     
     std::env::set_var("QNET_HIGH_FREQUENCY", "1");
     std::env::set_var("QNET_MAX_TPS", "12800000");
-    std::env::set_var("QNET_MEMPOOL_SIZE", "5000000");
-    std::env::set_var("QNET_BATCH_SIZE", "50000");
+    std::env::set_var("QNET_MEMPOOL_SIZE", "10000000");
+    std::env::set_var("QNET_BATCH_SIZE", "100000");
     std::env::set_var("QNET_PARALLEL_VALIDATION", "1");
     std::env::set_var("QNET_PARALLEL_THREADS", "16");
     std::env::set_var("QNET_COMPRESSION", "1");

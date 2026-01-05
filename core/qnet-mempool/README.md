@@ -1,16 +1,16 @@
-# QNet Mempool
+# QNet Mempool v2.25
 
 High-performance transaction mempool for QNet blockchain, written in Rust.
 
 ## Features
 
 - **Lock-free concurrent operations** using DashMap
-- **Priority-based ordering** by gas price
-- **Nonce tracking** per sender
-- **Transaction validation** with state checks
-- **Automatic eviction** of old/low-priority transactions
+- **Priority-based ordering** by gas price (highest first)
+- **Binary storage** with bincode (10-20x faster than JSON)
+- **100K+ TX/block support** (up from 50K)
+- **10M mempool capacity** (up from 5M)
+- **Dual format**: bincode (new) + JSON (legacy fallback)
 - **Prometheus metrics** for monitoring
-- **Support for 50K+ transactions**
 
 ## Architecture
 
@@ -38,51 +38,100 @@ High-performance transaction mempool for QNet blockchain, written in Rust.
 
 ## Usage
 
+### SimpleMempool (v2.25 - bincode)
+
 ```rust
-use qnet_mempool::prelude::*;
-use qnet_state::StateDB;
-use std::sync::Arc;
+use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 
-// Create mempool with default config
-let config = MempoolConfig::default();
-let state_db = Arc::new(StateDB::with_rocksdb("./state")?);
-let mempool = Mempool::new(config, state_db);
+// Create mempool
+let config = SimpleMempoolConfig { max_size: 10_000_000 };
+let mempool = SimpleMempool::new(config);
 
-// Add transaction
-let tx = create_transaction();
-mempool.add_transaction(tx).await?;
+// Add binary transaction (bincode - RECOMMENDED)
+let tx_bytes = bincode::serialize(&tx)?;
+let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
+mempool.add_binary_transaction(tx_bytes, tx_hash, tx.gas_price);
 
-// Get top transactions for block
-let txs = mempool.get_top_transactions(1000);
+// Get binary transactions for block building
+let tx_bytes_list = mempool.get_pending_binary_transactions(100_000);
+for tx_bytes in tx_bytes_list {
+    let tx: Transaction = bincode::deserialize(&tx_bytes)?;
+    // Process transaction
+}
 
-// Remove executed transactions
-mempool.remove_sender_transactions("sender", Some(executed_nonce));
+// Remove after inclusion in block
+mempool.remove_transaction(&tx_hash);
+```
+
+### Legacy JSON (backward compatible)
+
+```rust
+// Add JSON transaction (legacy)
+let tx_json = serde_json::to_string(&tx)?;
+let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
+mempool.add_raw_transaction(tx_json, tx_hash, tx.gas_price);
+
+// Get JSON transactions
+let tx_jsons = mempool.get_pending_transactions(1000);
 ```
 
 ## Configuration
 
 ```rust
-let config = MempoolConfig {
-    max_size: 50_000,              // Maximum transactions
-    max_per_account: 100,          // Per-account limit
-    min_gas_price: 1,              // Minimum gas price
-    tx_expiry: Duration::from_secs(3600),  // 1 hour
-    eviction_interval: Duration::from_secs(60),
-    enable_priority_senders: true,
+let config = SimpleMempoolConfig {
+    max_size: 10_000_000,  // 10M transactions (v2.25)
 };
+
+// For high TPS (> 100K tx/block), use binary storage:
+// Automatically enabled when max_size > 100,000
 ```
 
-## Performance
+## API Reference
 
-### Benchmarks (on typical hardware)
+### Binary Methods (v2.25 - RECOMMENDED)
 
-| Operation | Performance | Notes |
-|-----------|-------------|-------|
-| Add Transaction | ~50 µs | With validation |
-| Get Transaction | ~100 ns | From cache |
-| Get Top 100 | ~100 µs | Sorted by priority |
-| Remove Transaction | ~1 µs | With index updates |
-| Concurrent Adds | ~10K TPS | 10 threads |
+| Method | Description | Performance |
+|--------|-------------|-------------|
+| `add_binary_transaction(bytes, hash, gas_price)` | Add bincode TX | ~10 µs |
+| `get_binary_transaction(hash)` | Get single TX | ~100 ns |
+| `get_pending_binary_transactions(limit)` | Get TXs for block | ~1 ms for 100K |
+
+### JSON Methods (Legacy)
+
+| Method | Description | Performance |
+|--------|-------------|-------------|
+| `add_raw_transaction(json, hash, gas_price)` | Add JSON TX | ~50 µs |
+| `get_raw_transaction(hash)` | Get single TX | ~500 ns |
+| `get_pending_transactions(limit)` | Get TXs for block | ~10 ms for 100K |
+
+### Common Methods
+
+| Method | Description |
+|--------|-------------|
+| `remove_transaction(hash)` | Remove TX after block inclusion |
+| `len()` | Current mempool size |
+| `clear()` | Clear all transactions |
+
+## Performance v2.25
+
+### Benchmarks
+
+| Operation | JSON (v2.19) | bincode (v2.25) | Improvement |
+|-----------|--------------|-----------------|-------------|
+| Serialize TX | ~50 µs | ~5 µs | **10x** |
+| Deserialize TX | ~50 µs | ~3 µs | **16x** |
+| Add to mempool | ~50 µs | ~10 µs | **5x** |
+| Get 100K TXs | ~100 ms | ~5 ms | **20x** |
+| Block building | ~200 ms | ~10 ms | **20x** |
+
+### Throughput
+
+| Metric | v2.19 | v2.25 | Notes |
+|--------|-------|-------|-------|
+| TX/block limit | 50K | **100K** | 2x increase |
+| Mempool capacity | 5M | **10M** | 2x increase |
+| Block building | ~200 ms | ~10 ms | bincode + parallel |
+| Expected TPS | 10-20K | **50-100K+** | Gulf Stream + bincode |
 
 ### Run Benchmarks
 
@@ -127,12 +176,34 @@ await mempool.add_transaction(tx)
 top_txs = mempool.get_top_transactions(100)
 ```
 
-### With QNet Node
+### With QNet Node v2.25
 
 The mempool integrates with:
 - `qnet-state` for account validation
 - `qnet-consensus` for block production
-- API server for transaction submission
+- **Gulf Stream** for direct TX forwarding to producer
+- **QUIC transport** for binary TX broadcast
+- **bincode** serialization for high TPS
+
+```rust
+// BlockchainNode integration (node.rs)
+// All TX methods now use bincode:
+
+// Submit transaction (client API)
+pub async fn submit_transaction(&self, tx: Transaction) -> Result<String> {
+    let tx_bytes = bincode::serialize(&tx)?;
+    mempool.add_binary_transaction(tx_bytes.clone(), hash, gas_price);
+    p2p.broadcast_transaction(tx_bytes);  // Gulf Stream
+    Ok(hash)
+}
+
+// Block building
+let tx_bytes_list = mempool.get_pending_binary_transactions(100_000);
+for tx_bytes in tx_bytes_list {
+    let tx: Transaction = bincode::deserialize(&tx_bytes)?;
+    block.transactions.push(tx);
+}
+```
 
 ## License
 

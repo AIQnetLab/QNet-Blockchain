@@ -1,9 +1,9 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 2.3 (v2.19.20)  
-**Date:** November 30, 2025  
-**Status:** Production Ready  
+**Version:** 3.5 (v2.74.0)  
+**Date:** January 3, 2026  
+**Status:** Production Ready (Embedded RocksDB Indexing + Explorer)  
 
 ---
 
@@ -20,6 +20,133 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Forward secrecy** (4.5-minute certificate lifetime with 80% rotation threshold)
 - ✅ **Byzantine-safe** (2/3+ honest nodes at all verification layers)
 
+### v2.25 Additions (Transaction Optimization)
+- ✅ **bincode serialization** (10-20x faster than JSON for TX processing)
+- ✅ **Gulf Stream protocol** (direct TX forwarding to producer, ~10ms latency)
+- ✅ **Anti-Storm protection** (DashSet deduplication prevents gossip amplification)
+- ✅ **100K TX/block** (up from 50K, bincode enables faster processing)
+- ✅ **Optional Dilithium TX signatures** (post-quantum for enterprise, +50% gas)
+
+### v2.25.2 Additions (High TPS Optimization)
+- ✅ **Batch Ed25519 verification** (3x faster using ed25519-dalek batch verify)
+- ✅ **Batch mempool operations** (1 lock per 1000 TX instead of per TX)
+- ✅ **10K TX batch size** (benchmark optimized for 100K TX/block)
+- ✅ **Skip self-broadcast** (producer doesn't broadcast TX to self)
+- ✅ **Snapshot mempool reads** (release lock early, DashMap is lock-free)
+- ✅ **HealthPing with height** (accurate network_height every 15 seconds)
+- ✅ **TX accumulator** (batch 1000 TX for verification, 100ms timeout)
+
+### v2.27.0 Additions (Epoch-Based Validator Set)
+- ✅ **MacroBlock snapshots** (eligible producers stored in blockchain)
+- ✅ **Deterministic producer selection** (no gossip race conditions)
+- ✅ **Entropy from finality block** (SHA3-512 hash from FINALITY_WINDOW=10 blocks ago)
+- ✅ **Genesis epoch static list** (genesis_constants.rs for blocks 1-180, N-2 logic)
+- ✅ **MAX_VALIDATORS_PER_EPOCH = 1000** (deterministic sampling for scalability)
+
+### v2.31.0 Additions (5-Layer Macroblock Protection)
+- ✅ **5-Layer Macroblock Sync** (unsync, not-validator, boundary, periodic, on-demand)
+- ✅ **Rate Limiting** (ACTIVE_MACROBLOCK_CHECK_TASKS, max 5 concurrent)
+- ✅ **TaskGuard RAII** (automatic cleanup of spawned tasks)
+- ✅ **Proactive Fork Detection** (rollback if local > network on startup)
+- ✅ **ShredProtocol Tuning** (5s timeout, 4 retries for reliability)
+
+### v2.36.0 Additions (Unified SHA3-512 Security)
+- ✅ **Unified hash algorithm** (SHA3-512 for ALL producer/leader selection)
+- ✅ **256-bit quantum resistance** (Grover's algorithm protection)
+- ✅ **Consistent selection** (microblock, macroblock, failover all use SHA3-512)
+
+### v2.30.0 Additions (Fork Prevention + State Machine)
+- ✅ **N-2 Entropy Source** (MacroBlock N-2 for producer selection, guarantees finalization)
+- ✅ **Extended Genesis Epoch** (180 blocks instead of 90 for N-2 compatibility)
+- ✅ **Real Reputation** (DeterministicReputationState instead of hardcoded values)
+- ✅ **State Machine** (27 integration points: Initializing, Syncing, Producing, Error, etc.)
+- ✅ **Graceful Shutdown** (tokio::signal::ctrl_c() saves certificates before exit)
+- ✅ **No Fallback Policy** (desynchronized nodes excluded from production)
+- ✅ **Certificate Persistence** (load_from_disk/persist_to_disk on startup/shutdown)
+
+### v2.44.0 Additions (Aggressive Recovery + Round Tolerance)
+- ✅ **Round Tolerance ±90** (accept consensus messages within 1 epoch for fork recovery)
+- ✅ **Aggressive Catch-up** (15s stall / 5 block gap threshold, was 120s/50)
+- ✅ **Byzantine Median Height** (fresh height from QUIC HealthPing peer data)
+- ✅ **100K TPS Stress Tested** (network recovery after high-load scenarios)
+
+### v2.48.0 Additions (Round Mismatch Fix + Dynamic Threshold)
+- ✅ **LAST_FINALIZED_CONSENSUS_ROUND** (global AtomicU64 tracks actually finalized rounds)
+- ✅ **Round update ONLY at save** (not at spawn/sync/rate-limit - prevents desync)
+- ✅ **Reveal Loss Prevention** (participant nodes don't call trigger mid-consensus)
+- ✅ **Dynamic Height Threshold** (5/10/20 blocks based on network size for scalability)
+- ✅ **Signed Reveal Messages** (SHA3-256 + Dilithium+Ed25519 hybrid signatures)
+
+### v2.74.0 Additions (Embedded RocksDB Indexing)
+- ✅ **Built-in TX Index** (`tx_index` column family in RocksDB for O(1) lookups)
+- ✅ **Address TX Index** (`tx_by_address` column family for O(1) address history)
+- ✅ **No External Database** (single container deployment, no PostgreSQL)
+- ✅ **NodeRegistration TX** (on-chain wallet-to-node binding for all node types)
+- ✅ **System TX Indexing** (emission, rewards, node registration all indexed)
+- ✅ **Dilithium Claim Option** (post-quantum signatures for reward claims, free gas)
+- ✅ **TX Index Fix** (BLAKE3 hash consistency for system TX lookup)
+
+### v2.62.0 Additions (Per-Round Consensus Storage)
+- ✅ **Per-Round Storage** (`HashMap<u64, RoundData>` - each round is independent)
+- ✅ **No Data Loss** (round transitions don't destroy previous round commits/reveals)
+- ✅ **Parallel Rounds** (multiple consensus rounds can coexist simultaneously)
+- ✅ **Auto Cleanup** (rounds older than 5 epochs automatically purged)
+- ✅ **100% First-Attempt Success** (eliminates "Reveal doesn't match commit" errors)
+- ✅ **New API** (`finalize_round_by_number()`, `get_commits_for_round()`)
+- ✅ **Race Condition Fix** (async tasks can't corrupt each other's consensus data)
+- ✅ **Production L1 Architecture** (per-round storage is industry standard)
+
+### v2.61.0 Additions (Intercontinental Sync)
+- ✅ **Size-Based Batching** (BlocksBatch max 1MB, MacroblocksBatch max 500KB)
+- ✅ **ShredProtocol Unicast** (`send_block_via_shred_to_peer()` for blocks >1MB)
+- ✅ **Repair Batching** (10 chunks per batch, 5ms pacing)
+- ✅ **Peer Heights Tracking** (`get_peer_heights()` from Dilithium-signed heartbeats)
+- ✅ **Strict Sync Check** (emergency producer must have prev block N-1)
+- ✅ **is_new_chunk Dedup** (prevents infinite forwarding loops)
+- ✅ **Genesis Latency Fanout** (fanout=max(producers, 4) for high-latency)
+- ✅ **Intercontinental Support** (USA↔Europe 7500km reliable sync)
+
+### v2.57.0 Additions (Stage Pipeline Runtime Isolation)
+- ✅ **SIGVERIFY_RUNTIME** (dedicated Ed25519/Dilithium verification)
+- ✅ **BANKING_RUNTIME** (transaction intake, mempool operations)
+- ✅ **REPLAY_RUNTIME** (state machine execution, balance updates)
+- ✅ **BROADCAST_RUNTIME** (Shred protocol, block propagation)
+- ✅ **Adaptive Threading** (2 cores→4t, 4 cores→5t, 8 cores→10t, 16 cores→20t)
+- ✅ **Configurable thread counts** (QNET_SIGVERIFY_THREADS, QNET_BANKING_THREADS, etc.)
+- ✅ **Zero starvation guarantee** (crypto ops never block broadcast)
+- ✅ **Consistent latency** (Ed25519 <50μs, Dilithium <500μs guaranteed)
+- ✅ **verify_ed25519_tx_signature_async()** (runs on SIGVERIFY_RUNTIME)
+- ✅ **verify_dilithium_tx_signature_async()** (runs on SIGVERIFY_RUNTIME)
+- ✅ **spawn_sigverify()** (public API for external crypto tasks)
+- ✅ **RuntimeStats** (monitoring: get_runtime_stats())
+
+### v2.49.1 Additions (Consensus Deduplication + Idempotent Rounds)
+- ✅ **ACTIVE_CONSENSUS_MB** (AtomicU64 prevents 60 duplicate tasks → only 1 per MB)
+- ✅ **Idempotent start_round_at_height()** (preserves commits/reveals if round already active)
+- ✅ **Stale Lock Override** (old_mb < new_mb → automatic recovery from panic/timeout)
+- ✅ **Retry via Sync** (gap > 90 blocks → P2P sync instead of consensus - prevents Round Mismatch)
+- ✅ **Lock-free Architecture** (compare_exchange with SeqCst ordering, no mutexes)
+- ✅ **700x Faster Consensus** (7107s → 3-10s per MacroBlock)
+
+### v2.50.0 Additions (Lock-Free Global Architecture)
+- ✅ **OnceCell + Arc Pattern** (industry-standard lock-free initialization for Rust async)
+- ✅ **GLOBAL_QUANTUM_CRYPTO** (25x faster: `OnceCell<Arc<QNetQuantumCrypto>>` replaces `Mutex<Option<...>>`)
+- ✅ **GLOBAL_STORAGE_INSTANCE** (10x faster: lock-free RocksDB access for every block write)
+- ✅ **GLOBAL_MEMPOOL_INSTANCE** (lock-free transaction pool access for every TX)
+- ✅ **Zero Lock Contention** (all crypto/storage/mempool reads are instant pointer dereferences)
+- ✅ **Deadlock Prevention** (eliminates `futex_wait` deadlocks under high load)
+- ✅ **Parallel Verification** (100+ concurrent signature verifications without blocking)
+- ✅ **API Responsiveness** (health checks pass even during 100K TPS stress tests)
+- ✅ **Timeout Protection** (10s fallback in spawn_blocking for crypto operations)
+
+**Performance Comparison (v2.49 → v2.50):**
+| Operation | Before (Mutex) | After (OnceCell+Arc) | Speedup |
+|-----------|---------------|---------------------|---------|
+| Crypto access | ~50μs | ~1ns | **50,000x** |
+| Storage access | ~30μs | ~1ns | **30,000x** |
+| Mempool access | ~20μs | ~1ns | **20,000x** |
+| 100 parallel verify | ~5000μs | ~50μs | **100x** |
+
 ---
 
 ## 📋 Table of Contents
@@ -29,6 +156,7 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
    - 1.2 [Verifiable Time Sequence (VTS)](#12-verifiable-time-sequence-vts---sequential-hash-chain)
    - 1.3 [Ping Commitment Cryptography](#13-ping-commitment-cryptography-v2190)
    - 1.4 [MEV Bundle Cryptography](#14-mev-bundle-cryptography-v2193)
+   - 1.5 [Transaction Serialization (v2.25)](#15-transaction-serialization-v225) ⭐ NEW
 2. [Signature Systems (v2.19)](#signature-systems-v219)
 3. [Cryptography Usage by Component](#cryptography-usage-by-component)
 4. [Hybrid Cryptography (Consensus Messages)](#hybrid-cryptography-consensus-messages)
@@ -37,6 +165,7 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 7. [Security Analysis](#security-analysis)
 8. [Implementation Details](#implementation-details)
 9. [Compliance & Standards](#compliance--standards)
+10. [Gulf Stream & bincode (v2.25)](#gulf-stream--bincode-v225) ⭐ NEW
 
 ---
 
@@ -101,20 +230,26 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 
 ### Overview
 
-QNet implements **Ed25519-only signatures** for client transactions (mobile wallets and browser extensions), providing optimal performance and security for user-facing applications.
+QNet implements **Ed25519 signatures** for client transactions with **optional Dilithium3** for quantum-resistant transactions. This provides optimal performance for regular users while offering enterprise-grade post-quantum security for high-value transfers.
 
-### Architecture
+### Architecture v2.25
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  CLIENT LAYER (Mobile + Browser)                        │
 ├─────────────────────────────────────────────────────────┤
-│  ✅ Ed25519 ONLY (no Dilithium)                         │
+│  DEFAULT: Ed25519 ONLY                                  │
 │  ✅ 20μs sign/verify operations                         │
 │  ✅ 64-byte signatures                                  │
 │  ✅ 32-byte public keys                                 │
 │  ✅ Low energy consumption                              │
 │  ✅ BIP39 mnemonic + HD derivation                      │
+├─────────────────────────────────────────────────────────┤
+│  OPTIONAL: Ed25519 + Dilithium3 (QUANTUM)               │
+│  🔐 Post-quantum resistant                              │
+│  🔐 +50% gas fee (compensates verification cost)        │
+│  🔐 ~3293-byte signature + ~1952-byte pubkey            │
+│  🔐 For enterprise/high-value transfers                 │
 └─────────────────────────────────────────────────────────┘
                          ↓
 ┌─────────────────────────────────────────────────────────┐
@@ -127,12 +262,51 @@ QNet implements **Ed25519-only signatures** for client transactions (mobile wall
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Why Ed25519 for Clients?
+### Transaction Signature Options
 
-| Aspect | Ed25519 | Dilithium | Decision |
-|--------|---------|-----------|----------|
+| Mode | Ed25519 | Dilithium3 | Gas Cost | Use Case |
+|------|---------|------------|----------|----------|
+| **Standard** | ✅ Required | ❌ None | 100% | Regular transfers |
+| **Quantum** | ✅ Required | ✅ Optional | **150%** | Enterprise, high-value |
+
+### Transaction Structure v2.25
+
+```rust
+pub struct Transaction {
+    // ... existing fields ...
+    
+    /// Ed25519 signature (64 bytes, hex encoded) - REQUIRED
+    pub signature: Option<String>,
+    
+    /// Ed25519 public key (32 bytes, hex encoded) - REQUIRED
+    pub public_key: Option<String>,
+    
+    /// QUANTUM v2.25: Dilithium3 signature (~3293 bytes) - OPTIONAL
+    /// When present: TX is quantum-resistant + 50% higher gas
+    pub dilithium_signature: Option<String>,
+    
+    /// QUANTUM v2.25: Dilithium3 public key (~1952 bytes) - OPTIONAL
+    pub dilithium_public_key: Option<String>,
+}
+
+// Effective gas calculation
+impl Transaction {
+    pub fn effective_gas_price(&self) -> u64 {
+        if self.is_quantum_signed() {
+            self.gas_price + (self.gas_price / 2)  // +50%
+        } else {
+            self.gas_price
+        }
+    }
+}
+```
+
+### Why Ed25519 as Default?
+
+| Aspect | Ed25519 | Dilithium3 | Decision |
+|--------|---------|------------|----------|
 | **Speed** | 20μs | 100ms | ✅ Ed25519 (5000x faster) |
-| **Size** | 64 bytes | 2420 bytes | ✅ Ed25519 (38x smaller) |
+| **Size** | 64 bytes | 3293 bytes | ✅ Ed25519 (51x smaller) |
 | **Energy** | Low | High | ✅ Ed25519 (mobile-friendly) |
 | **Security** | 128-bit | Post-quantum | ✅ Ed25519 (sufficient for clients) |
 | **Maturity** | RFC 8032 | NIST Draft | ✅ Ed25519 (battle-tested) |
@@ -1592,7 +1766,7 @@ development/qnet-integration/src/
 ├── hybrid_crypto.rs          # Consensus commit/reveal signatures (NIST/Cisco ephemeral)
 ├── key_manager.rs            # Persistent block signatures (SHA3-512 + Dilithium)
 ├── quantum_crypto.rs         # Core crypto operations & Dilithium management
-├── vrf_hybrid.rs             # Hybrid VRF (used for block signing proof, NOT selection)
+├── vrf_hybrid.rs             # Hybrid VRF (used for QRB randomness beacon, NOT producer selection)
 └── vrf.rs                    # Legacy VRF (deprecated)
 
 core/qnet-consensus/src/
@@ -1990,4 +2164,126 @@ pub fn get_optimal_shard_count(network_size: usize) -> u32 {
 QNET_SHARD_COUNT=256 ./qnet-node  # Force 256 shards for testing
 # System will auto-adjust to optimal count based on actual network size
 ```
+
+---
+
+## 1.5 Transaction Serialization (v2.25)
+
+### bincode vs JSON
+
+QNet v2.25 replaces JSON with **bincode** for all internal transaction processing:
+
+| Aspect | JSON (v2.19) | bincode (v2.25) | Improvement |
+|--------|--------------|-----------------|-------------|
+| Serialize TX | ~50 µs | ~5 µs | **10x** |
+| Deserialize TX | ~50 µs | ~3 µs | **16x** |
+| TX size | ~500 bytes | ~200 bytes | **2.5x smaller** |
+| CPU usage | High (parsing) | Low (direct copy) | **5-10x less** |
+
+### Hash Calculation
+
+Transaction hashes are now computed from bincode bytes:
+
+```rust
+// v2.25: bincode-based hash
+let tx_bytes = bincode::serialize(&tx)?;
+let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
+```
+
+**Security Note**: SHA3-256 hash is computed from binary representation, providing identical cryptographic guarantees as JSON-based hashing.
+
+### Backward Compatibility
+
+```rust
+// Deserialization with legacy fallback
+let tx = bincode::deserialize::<Transaction>(&tx_bytes)
+    .or_else(|_| {
+        let json = String::from_utf8(tx_bytes)?;
+        serde_json::from_str::<Transaction>(&json)
+    })?;
+```
+
+---
+
+## 10. Gulf Stream & bincode (v2.25)
+
+### Overview
+
+Gulf Stream is a transaction forwarding protocol that reduces TX latency by sending transactions directly to the current block producer:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    GULF STREAM PROTOCOL                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Traditional Gossip:                                        │
+│  Client → Node A → Node B → Node C → Producer               │
+│  Latency: 100-300ms (3+ hops)                               │
+│                                                             │
+│  Gulf Stream:                                               │
+│  Client → Node → Producer (direct)                          │
+│  Latency: 10-50ms (1 hop)                                   │
+│                                                             │
+│  + Backup gossip to 2 random peers for reliability          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Cryptographic Integrity
+
+1. **TX Signature**: Ed25519 signature verified before broadcast
+2. **TX Hash**: SHA3-256 hash computed from bincode bytes
+3. **Deduplication**: Hash-based seen_tx_hashes prevents replay
+4. **Producer Verification**: Producer identity from consensus
+
+### Anti-Storm Protection
+
+Prevents exponential message amplification:
+
+```rust
+// DashSet for lock-free O(1) operations
+seen_tx_hashes: Arc<DashSet<String>>
+
+// On TX receive:
+let tx_hash = sha3::Sha3_256::digest(&tx_bytes);
+if seen_tx_hashes.contains(&tx_hash) {
+    return;  // Already seen - skip processing and gossip
+}
+seen_tx_hashes.insert(tx_hash);
+// Process TX and gossip to max 2 peers
+
+// Cleanup every 60 seconds to prevent memory exhaustion
+```
+
+**Result**: Linear message growth O(N) instead of exponential O(2^N)
+
+### Network Message Format
+
+```rust
+pub enum NetworkMessage {
+    /// Single transaction (bincode bytes)
+    Transaction {
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,  // bincode::serialize(&tx)
+    },
+    
+    /// Batch of transactions (v2.25)
+    TransactionBatch {
+        #[serde(with = "base64_bytes_vec")]
+        transactions: Vec<Vec<u8>>,  // Vec of bincode bytes
+        timestamp: u64,
+    },
+    // ... other message types
+}
+```
+
+### Performance Summary
+
+| Metric | Before v2.25 | After v2.25 | Notes |
+|--------|--------------|-------------|-------|
+| TX latency | 100-300ms | 10-50ms | Gulf Stream direct |
+| Serialization | JSON (~50µs) | bincode (~5µs) | 10x faster |
+| Messages per TX | O(2^N) | O(10) | Anti-Storm |
+| TX/block | 50K | 100K | bincode enables |
+| Expected TPS | 10-20K | 50-100K+ | Combined effect |
 

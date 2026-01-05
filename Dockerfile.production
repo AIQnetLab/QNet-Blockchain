@@ -55,6 +55,7 @@ RUN echo '[workspace]' > Cargo.toml && \
 RUN mkdir -p core/qnet-consensus/src core/qnet-core/src core/qnet-mempool/src \
     core/qnet-state/src core/qnet-sharding/src \
     development/qnet-integration/src/bin development/qnet-integration/src \
+    development/qnet-integration/benches \
     core/qnet-consensus/benches core/qnet-mempool/benches \
     core/qnet-state/benches core/qnet-sharding/benches && \
     echo "pub fn dummy() {}" > core/qnet-consensus/src/lib.rs && \
@@ -67,7 +68,9 @@ RUN mkdir -p core/qnet-consensus/src core/qnet-core/src core/qnet-mempool/src \
     echo "fn main() {}" > core/qnet-consensus/benches/consensus_bench.rs && \
     echo "fn main() {}" > core/qnet-mempool/benches/mempool_bench.rs && \
     echo "fn main() {}" > core/qnet-state/benches/state_bench.rs && \
-    echo "fn main() {}" > core/qnet-sharding/benches/sharding_bench.rs
+    echo "fn main() {}" > core/qnet-sharding/benches/sharding_bench.rs && \
+    echo "fn main() {}" > development/qnet-integration/benches/poh_benchmark.rs && \
+    echo "fn main() {}" > development/qnet-integration/benches/full_benchmark.rs
     # Removed qnet-api dummy files - not needed for production
 
 # Build dependencies only (this layer gets cached!)

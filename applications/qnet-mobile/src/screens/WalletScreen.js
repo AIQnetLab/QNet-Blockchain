@@ -29,6 +29,7 @@ import {
   checkServerNodeStatus,
   getAllNodesByWallet
 } from '../services/PushService';
+import logger from '../utils/logger';
 
 // 1DEV Burn Tracker Contract (same as browser extension)
 const BURN_CONTRACT_PROGRAM_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
@@ -726,8 +727,14 @@ const WalletScreen = () => {
   const [sendAddress, setSendAddress] = useState('');
   const [sendAmount, setSendAmount] = useState('');
   const [showSettings, setShowSettings] = useState(false);
-  const [selectedToken, setSelectedToken] = useState('sol');
-  const [selectedNetwork, setSelectedNetwork] = useState('solana'); // 'qnet' or 'solana'
+  const [selectedToken, setSelectedToken] = useState('qnc');
+  
+  // Send Screen state (triggered from Assets) - NOT modal, inline screen
+  const [showSendScreen, setShowSendScreen] = useState(false);
+  const [sendingToken, setSendingToken] = useState(null); // { symbol: 'QNC', balance: 100.0, network: 'qnet' }
+  const [sendingTransaction, setSendingTransaction] = useState(false);
+  const [txResult, setTxResult] = useState(null); // { success: true/false, txHash, error }
+  const [selectedNetwork, setSelectedNetwork] = useState('qnet'); // 'qnet' or 'solana' - default to QNet
   const [isTestnet, setIsTestnet] = useState(true); // testnet by default (true = testnet RPC)
   const [tokenPrices, setTokenPrices] = useState({
     qnc: 0.0,
@@ -901,8 +908,9 @@ const WalletScreen = () => {
   // - Full/Super/Genesis: Server is the node, app just monitors via single API call
   // - NEW: Load ALL nodes owned by this wallet for unified display
   useEffect(() => {
-    if (activeTab === 'node' && wallet && wallet.publicKey) {
+    if (activeTab === 'node' && wallet) {
       // UNIFIED: Load ALL nodes for this wallet (Light + Full + Super + Genesis)
+      // Uses QNet address for lookup (Genesis nodes use QNet addresses)
       loadAllUserNodes();
       
       // Also load specific node data if activated
@@ -915,10 +923,7 @@ const WalletScreen = () => {
           loadNodeRewards();
           loadLightNodeStatus();
           
-          // Start ping interval if not already running (for responding to challenges)
-          if (!global.nodePingInterval) {
-            startNodePingInterval();
-          }
+          // No automatic ping interval - user can manually refresh
           
           // NO POLLING - user can pull-to-refresh
           // Light nodes get push notifications for pings anyway
@@ -991,36 +996,196 @@ const WalletScreen = () => {
     if (activatedNodeType === 'light' || !activationCode) return;
     
     try {
-      const status = await checkServerNodeStatus(activationCode);
+      // For Genesis nodes, also pass nodePseudonym as nodeId for better API lookup
+      const nodeId = (activatedNodeType === 'super' && nodePseudonym && nodePseudonym.startsWith('genesis_node_')) 
+        ? nodePseudonym 
+        : null;
+      
+      const status = await checkServerNodeStatus(activationCode, nodeId);
+      
+      // Set status (UI will show appropriate state based on success flag)
       setServerNodeStatus(status);
       
       // Also load pseudonym for display
       await loadNodePseudonym(activationCode);
       
-      if (status.needsAttention) {
-        console.log('[Node] Server node needs attention:', status.message);
-      }
+      // Silent handling - no errors shown to user
+      // If node not found, UI shows "Server nodes require server activation"
     } catch (error) {
-      console.error('Failed to load server node status:', error);
+      // Network error - set null status, UI will show activation prompt
+      setServerNodeStatus({ success: false, error: 'Network unavailable' });
     }
   };
   
   // Load ALL nodes owned by this wallet (unified view for Light + Full + Super + Genesis)
+  // Battery optimization: runs once on tab open, no polling
   const loadAllUserNodes = async () => {
-    if (!wallet || !wallet.publicKey || loadingAllNodes) return;
+    if (!wallet || loadingAllNodes) return;
+    
+    // CRITICAL: Use QNet address for node lookup (not Solana address)
+    const walletAddress = wallet.qnetAddress || wallet.address;
+    if (!walletAddress) return; // Silent fail - no address
     
     setLoadingAllNodes(true);
     try {
-      const result = await getAllNodesByWallet(wallet.publicKey);
+      const result = await getAllNodesByWallet(walletAddress);
       
       if (result.success) {
         setAllUserNodes(result.nodes || []);
-        console.log(`[Nodes] Loaded ${result.nodes?.length || 0} nodes for wallet`);
         
-        // If we found server nodes that aren't activated locally, show them
+        // AUTO-LINK: If we found server nodes that aren't activated locally, link them automatically
         const serverNodes = (result.nodes || []).filter(n => n.node_type !== 'light' && n.status === 'active');
+        
         if (serverNodes.length > 0 && !activatedNodeType) {
-          console.log('[Nodes] Found active server nodes - auto-linking...');
+          // Priority 1: Check for Genesis nodes first (bootstrap nodes)
+          const genesisNodes = serverNodes.filter(n => 
+            n.node_id && n.node_id.startsWith('genesis_node_')
+          );
+          
+          if (genesisNodes.length > 0) {
+            // Auto-link first Genesis node found
+            const genesisNode = genesisNodes[0];
+            const bootstrapId = genesisNode.node_id.replace('genesis_node_', '');
+            const genesisCode = `QNET-BOOT-${bootstrapId}-STRAP`;
+            
+            // Set activation state
+            setActivationCode(genesisCode);
+            setActivatedNodeType('super'); // Genesis nodes are Super nodes
+            setNodePseudonym(genesisNode.node_id);
+            
+            // Save to AsyncStorage
+            await AsyncStorage.setItem(`node_pseudonym_${genesisCode}`, genesisNode.node_id);
+            await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+              nodeType: 'super',
+              code: genesisCode,
+              pseudonym: genesisNode.node_id,
+              isGenesis: true,
+              bootstrapId: bootstrapId,
+              timestamp: Date.now()
+            }));
+            
+            // Load server status immediately
+            loadServerNodeStatus();
+            return; // Don't process other nodes if Genesis found
+          }
+          
+          // Priority 2: Auto-link other server nodes (Full/Super)
+          const otherServerNodes = serverNodes.filter(n => 
+            !n.node_id || !n.node_id.startsWith('genesis_node_')
+          );
+          
+          if (otherServerNodes.length > 0) {
+            // Auto-link first active server node found
+            const serverNode = otherServerNodes[0];
+            const activationCode = serverNode.activation_code || serverNode.node_id;
+            
+            // Set activation state
+            setActivationCode(activationCode);
+            setActivatedNodeType(serverNode.node_type);
+            setNodePseudonym(serverNode.node_id || serverNode.pseudonym);
+            
+            // Save to AsyncStorage
+            if (serverNode.node_id) {
+              await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, serverNode.node_id);
+            }
+            await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+              nodeType: serverNode.node_type,
+              code: activationCode,
+              pseudonym: serverNode.node_id || serverNode.pseudonym,
+              timestamp: Date.now()
+            }));
+            
+            // Load server status immediately
+            loadServerNodeStatus();
+            
+            console.log(`[Nodes] Auto-linked ${serverNode.node_type} node`);
+          }
+        }
+        
+        // AUTO-LINK: Also check if wallet matches Genesis wallet (even if not in API response)
+        if (!activatedNodeType && wallet) {
+          // v2.66: Updated to Ed25519-based addresses
+          const GENESIS_WALLETS = {
+            '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db46743',
+            '002': '0bac6225a082de1f659eond0c96f1706cf19c35eb',
+            '003': 'd216bb23fbe7f853636eon3f16b378b91922701a6',
+            '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e',
+            '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f440b8',
+          };
+          
+          const userQNetAddress = (wallet.qnetAddress || wallet.address || '').toLowerCase();
+          
+          if (!userQNetAddress) {
+            console.log('[Nodes] No QNet address available for Genesis check');
+            return;
+          }
+          
+          console.log(`[Nodes] Checking Genesis wallets. User QNet: ${userQNetAddress.substring(0, 20)}...`);
+          console.log(`[Nodes] Full QNet address: ${userQNetAddress}`);
+          
+          // Check if wallet matches any Genesis wallet
+          for (const [bootstrapId, genesisWallet] of Object.entries(GENESIS_WALLETS)) {
+            const normalizedGenesis = genesisWallet.toLowerCase();
+            
+            // Check exact match first
+            let isMatch = false;
+            if (userQNetAddress === normalizedGenesis) {
+              console.log(`[Nodes] Exact match with Genesis ${bootstrapId}`);
+              isMatch = true;
+            } else {
+              // Check format match (legacy vs new format)
+              const userPart1 = userQNetAddress.substring(0, 19);
+              const expectedPart1 = normalizedGenesis.substring(0, 19);
+              
+              if (userPart1 === expectedPart1 && userQNetAddress.includes('eon')) {
+                console.log(`[Nodes] Format match with Genesis ${bootstrapId} (first 19 chars match)`);
+                isMatch = true;
+              } else {
+                console.log(`[Nodes] No match with Genesis ${bootstrapId} (user: ${userPart1}, expected: ${expectedPart1})`);
+              }
+            }
+            
+            if (isMatch) {
+              // Wallet matches Genesis wallet - check if node is active via API
+              const genesisNodeId = `genesis_node_${bootstrapId}`;
+              const genesisCode = `QNET-BOOT-${bootstrapId}-STRAP`;
+              
+              console.log(`[Nodes] Wallet matches Genesis ${bootstrapId}, checking node status...`);
+              
+              try {
+                // Check if Genesis node is active in network
+                const status = await checkServerNodeStatus(genesisCode, genesisNodeId);
+                
+                if (status.success && status.isOnline) {
+                  console.log(`[Nodes] Genesis node ${genesisNodeId} is active - auto-linking`);
+                  
+                  // Set activation state
+                  setActivationCode(genesisCode);
+                  setActivatedNodeType('super');
+                  setNodePseudonym(genesisNodeId);
+                  
+                  // Save to AsyncStorage
+                  await AsyncStorage.setItem(`node_pseudonym_${genesisCode}`, genesisNodeId);
+                  await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                    nodeType: 'super',
+                    code: genesisCode,
+                    pseudonym: genesisNodeId,
+                    isGenesis: true,
+                    bootstrapId: bootstrapId,
+                    timestamp: Date.now()
+                  }));
+                  
+                  // Load server status immediately
+                  loadServerNodeStatus();
+                  
+                  break; // Found matching Genesis node, stop checking
+                }
+              } catch (error) {
+                console.log(`[Nodes] Genesis node ${genesisNodeId} check failed:`, error.message);
+                // Continue checking other Genesis nodes
+              }
+            }
+          }
         }
       }
     } catch (error) {
@@ -1062,16 +1227,7 @@ const WalletScreen = () => {
       const rewards = await walletManager.getNodeRewards(activatedNodeType, activationCode, wallet.publicKey);
       setNodeRewards(rewards);
       
-      // Auto-ping node if needed (4 hour interval)
-      if (rewards && !rewards.isActive && password) {
-        // Send automatic ping to keep node active
-        const pingResult = await walletManager.pingNode(activationCode, wallet.publicKey, activatedNodeType, password);
-        if (pingResult.success) {
-          // Reload rewards after successful ping
-          const updatedRewards = await walletManager.getNodeRewards(activatedNodeType, activationCode, wallet.publicKey);
-          setNodeRewards(updatedRewards);
-        }
-      }
+      // No auto-ping - user can manually ping via UI if needed
       
       // Load system-generated pseudonym
       await loadNodePseudonym(activationCode);
@@ -1116,8 +1272,9 @@ const WalletScreen = () => {
       const code = activationInputCode.trim();
       
       // GENESIS NODE SUPPORT: Check if this is a Genesis bootstrap code
-      // Format: QNET-BOOT-000X-STRAP (X = 1-5)
-      const genesisPattern = /^QNET-BOOT-000([1-5])-STRAP$/;
+      // Format: QNET-BOOT-XXX-STRAP or QNET-BOOT-0XXX-STRAP (X = 1-5)
+      // v2.66: Support both 3-digit (001) and 4-digit (0001) formats
+      const genesisPattern = /^QNET-BOOT-0*([1-5])-STRAP$/;
       const genesisMatch = code.match(genesisPattern);
       
       if (genesisMatch) {
@@ -1127,12 +1284,13 @@ const WalletScreen = () => {
         // SECURITY: Genesis nodes have PREDEFINED wallets
         // User's wallet MUST match the hardcoded wallet for this Genesis node
         // PRODUCTION: Genesis wallet addresses (format: 19+3+15+4=41 chars)
+        // v2.66: Updated to Ed25519-based addresses
         const GENESIS_WALLETS = {
-          '001': '7bc83500fd08525250feonff5503d0dce4dbdede8',
-          '002': '714a0f700a4dbcc0d88eonf635ace76ed2eb9a186',
-          '003': '357842d58e86cc300cfeon0203e16eef3e7044db1',
-          '004': '4f710f9b3152659c56aeond4c05f2731a1890aedf',
-          '005': '8fa8ebe9e85dee95080eond0a7365096572f03e1c',
+          '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db46743',
+          '002': '0bac6225a082de1f659eond0c96f1706cf19c35eb',
+          '003': 'd216bb23fbe7f853636eon3f16b378b91922701a6',
+          '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e',
+          '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f440b8',
         };
         
         const expectedWallet = GENESIS_WALLETS[bootstrapId];
@@ -1161,8 +1319,8 @@ const WalletScreen = () => {
         // with your actual QNet wallet addresses from the mobile app!
         if (normalizedUser !== normalizedExpected) {
           // Check if formats are different but base parts match
-          // Legacy: 7bc83500fd08525250feonff5503d0dce4dbdede8 (19+3+19=41)
-          // New:    7bc83500fd08525250feonff5503d0dce4dbXXXX (19+3+15+4=41)
+          // Format: 19 hex + "eon" + 15 hex + 4 checksum = 41 chars
+          // Example: f36ff465a0944fd06cdeonfca0ad004ff9db46743
           const userPart1 = normalizedUser.substring(0, 19);
           const userEon = normalizedUser.substring(19, 22);
           const expectedPart1 = normalizedExpected.substring(0, 19);
@@ -1198,7 +1356,7 @@ const WalletScreen = () => {
           );
         }
         
-        console.log('[GENESIS] ✅ Wallet verification passed for node', bootstrapId);
+        console.log('[GENESIS] Wallet verification passed for node', bootstrapId);
         
         // Genesis node verified - set up as Super node
         setActivationCode(code);
@@ -1268,7 +1426,7 @@ const WalletScreen = () => {
         }));
         
         // Start automatic ping interval (every 4 hours)
-        startNodePingInterval();
+        // No automatic ping interval
         
         showAlert(
           'Node Activated!',
@@ -1289,44 +1447,7 @@ const WalletScreen = () => {
     }
   };
   
-  // Start automatic ping interval for active nodes
-  const startNodePingInterval = () => {
-    // Clear any existing interval
-    if (global.nodePingInterval) {
-      clearInterval(global.nodePingInterval);
-    }
-    
-    // Ping every 4 hours (14400000 ms)
-    global.nodePingInterval = setInterval(async () => {
-      if (activationCode && wallet && password) {
-        const pingResult = await walletManager.pingNode(
-          activationCode,
-          wallet.publicKey,
-          activatedNodeType || 'light',
-          password
-        );
-        
-        if (pingResult.success) {
-          // Update rewards after successful ping
-          loadNodeRewards();
-        }
-      }
-    }, 4 * 60 * 60 * 1000); // 4 hours
-    
-    // Also do an immediate ping
-    if (activationCode && wallet && password) {
-      walletManager.pingNode(
-        activationCode,
-        wallet.publicKey,
-        activatedNodeType || 'light',
-        password
-      ).then(result => {
-        if (result.success) {
-          loadNodeRewards();
-        }
-      });
-    }
-  };
+  // No automatic ping interval - user can manually refresh via pull-to-refresh
   
   // Get the correct wallet address for claims based on activation phase and node type
   // SECURITY: Different node types use different wallet address formats
@@ -1336,8 +1457,9 @@ const WalletScreen = () => {
   const getWalletAddressForClaim = async () => {
     try {
       // GENESIS NODES: Always use QNet address (hardcoded in genesis_constants.rs)
-      // Genesis codes format: QNET-BOOT-000X-STRAP
-      if (activationCode && /^QNET-BOOT-000[1-5]-STRAP$/.test(activationCode)) {
+      // Genesis codes format: QNET-BOOT-XXX-STRAP (supports 001-005 or 0001-0005)
+      // v2.66: Support both 3-digit and 4-digit formats
+      if (activationCode && /^QNET-BOOT-0*[1-5]-STRAP$/.test(activationCode)) {
         const qnetAddr = wallet.qnetAddress;
         if (!qnetAddr) {
           throw new Error('QNet address required for Genesis node claims');
@@ -1368,6 +1490,114 @@ const WalletScreen = () => {
     }
   };
   
+  // Open Send Screen from Assets (click on token) - inline, not modal
+  const openSendModal = (tokenSymbol, tokenBalance, network) => {
+    setSendingToken({
+      symbol: tokenSymbol,
+      balance: tokenBalance,
+      network: network
+    });
+    setSendAddress('');
+    setSendAmount('');
+    setTxResult(null);
+    setShowSendScreen(true);
+  };
+  
+  // Close Send Screen and go back to assets
+  const closeSendScreen = () => {
+    setShowSendScreen(false);
+    setSendingToken(null);
+    setTxResult(null);
+    setSendAddress('');
+    setSendAmount('');
+  };
+  
+  // Set amount as percentage of balance
+  const setAmountPercentage = (percentage) => {
+    if (!sendingToken) return;
+    const amount = (sendingToken.balance * percentage / 100).toFixed(sendingToken.symbol === 'QNC' ? 4 : 6);
+    setSendAmount(amount);
+  };
+  
+  // QNet transaction fee constants (matching blockchain)
+  const QNET_GAS_PRICE = 1; // nanoQNC
+  const QNET_GAS_LIMIT = 10000; // for transfers
+  const QNET_TX_FEE = (QNET_GAS_PRICE * QNET_GAS_LIMIT) / 1_000_000_000; // 0.00001 QNC
+  
+  // Send QNC transaction (real blockchain transaction)
+  const handleSendTransaction = async () => {
+    if (!sendAddress || !sendAmount || sendingTransaction) return;
+    
+    const amount = parseFloat(sendAmount);
+    if (isNaN(amount) || amount <= 0) {
+      setTxResult({ success: false, error: 'Please enter a valid amount' });
+      return;
+    }
+    
+    // Calculate total cost (amount + fee)
+    const totalCost = amount + QNET_TX_FEE;
+    
+    if (totalCost > sendingToken.balance) {
+      setTxResult({ 
+        success: false, 
+        error: `Insufficient balance. Need ${totalCost.toFixed(6)} ${sendingToken.symbol} (including fee).\nYour balance: ${sendingToken.balance.toFixed(6)} ${sendingToken.symbol}`
+      });
+      return;
+    }
+    
+    // Validate address format for QNet EON: 41 chars with 'eon' in middle
+    if (sendingToken.network === 'qnet') {
+      const isValidEon = sendAddress.includes('eon') && sendAddress.length === 41;
+      const isValidHex = /^[0-9a-fA-F]{64}$/.test(sendAddress);
+      
+      if (!isValidEon && !isValidHex) {
+        setTxResult({ 
+          success: false, 
+          error: 'Invalid address format.\nMust be EON (41 chars) or Hex (64 chars)'
+        });
+        return;
+      }
+    }
+    
+    setSendingTransaction(true);
+    try {
+      // Get wallet address
+      const fromAddress = sendingToken.network === 'qnet' 
+        ? (wallet.qnetAddress || wallet.address)
+        : (wallet.solanaAddress || wallet.address);
+      
+      // Call WalletManager to send transaction
+      const result = await walletManager.sendTransaction(
+        fromAddress,
+        sendAddress,
+        amount,
+        sendingToken.symbol,
+        password
+      );
+      
+      if (result.success) {
+        // Show success screen (not alert)
+        setTxResult({
+          success: true,
+          txHash: result.txHash,
+          amount: amount,
+          to: sendAddress,
+          symbol: sendingToken.symbol
+        });
+        // Refresh balance
+        if (wallet && wallet.publicKey) {
+          loadBalance(wallet.publicKey);
+        }
+      } else {
+        setTxResult({ success: false, error: result.error || 'Transaction failed' });
+      }
+    } catch (error) {
+      setTxResult({ success: false, error: error.message || 'Transaction failed' });
+    } finally {
+      setSendingTransaction(false);
+    }
+  };
+  
   // Claim rewards for Light nodes (local tracking)
   const handleProcessValidation = async () => {
     if (!nodeRewards || nodeRewards.unclaimed <= 0 || processingValidation) return;
@@ -1379,10 +1609,43 @@ const WalletScreen = () => {
       const result = await walletManager.claimRewards(activatedNodeType, activationCode, walletAddress, password);
       
       if (result.success) {
+        // v2.80: Rich content with clickable transaction hash
+        const richContent = (
+          <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
+            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 16 }]}>
+              Successfully claimed {result.amount} QNC rewards from your {activatedNodeType} node.
+            </Text>
+            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 8, fontSize: 12, color: '#888' }]}>
+              Transaction:
+            </Text>
+            <TouchableOpacity 
+              onPress={() => {
+                const explorerUrl = `https://explorer.qnet.network/tx/${result.txHash}`;
+                Linking.openURL(explorerUrl).catch(() => {
+                  Clipboard.setString(result.txHash);
+                  showAlert('Copied', 'Transaction hash copied to clipboard');
+                });
+              }}
+              style={{ backgroundColor: 'rgba(0, 255, 255, 0.1)', padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#00ffff40' }}
+            >
+              <Text style={{ color: '#00ffff', fontSize: 12, fontFamily: 'monospace', textAlign: 'center' }}>
+                {result.txHash?.slice(0, 20)}...{result.txHash?.slice(-20)}
+              </Text>
+              <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
+                Tap to open in Explorer
+              </Text>
+            </TouchableOpacity>
+          </View>
+        );
+        
         showAlert(
           'Rewards Claimed!',
-          `Successfully claimed ${result.amount} QNC rewards.\n\nTransaction: ${result.txHash}`,
+          '', // Empty - using richContent
           [
+            { text: 'Copy Hash', style: 'default', onPress: () => {
+              Clipboard.setString(result.txHash);
+              showAlert('Copied', 'Transaction hash copied to clipboard');
+            }},
             { text: 'OK', onPress: () => {
               // Reload rewards
               loadNodeRewards();
@@ -1391,7 +1654,8 @@ const WalletScreen = () => {
                 loadBalance(wallet.publicKey);
               }
             }}
-          ]
+          ],
+          richContent
         );
       } else {
         showAlert('Cannot Claim', result.message);
@@ -1423,10 +1687,44 @@ const WalletScreen = () => {
       
       if (result.success) {
         const claimedAmount = (pendingRewards / 1e9).toFixed(4);
+        
+        // v2.80: Rich content with clickable transaction hash
+        const richContent = (
+          <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
+            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 16 }]}>
+              Successfully claimed {claimedAmount} QNC rewards from your {activatedNodeType} node.
+            </Text>
+            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 8, fontSize: 12, color: '#888' }]}>
+              Transaction:
+            </Text>
+            <TouchableOpacity 
+              onPress={() => {
+                const explorerUrl = `https://explorer.qnet.network/tx/${result.txHash}`;
+                Linking.openURL(explorerUrl).catch(() => {
+                  Clipboard.setString(result.txHash);
+                  showAlert('Copied', 'Transaction hash copied to clipboard');
+                });
+              }}
+              style={{ backgroundColor: 'rgba(0, 255, 255, 0.1)', padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#00ffff40' }}
+            >
+              <Text style={{ color: '#00ffff', fontSize: 12, fontFamily: 'monospace', textAlign: 'center' }}>
+                {result.txHash?.slice(0, 20)}...{result.txHash?.slice(-20)}
+              </Text>
+              <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
+                Tap to open in Explorer
+              </Text>
+            </TouchableOpacity>
+          </View>
+        );
+        
         showAlert(
           'Rewards Claimed!',
-          `Successfully claimed ${claimedAmount} QNC rewards from your ${activatedNodeType} node.\n\nTransaction: ${result.txHash}`,
+          '', // Empty - using richContent
           [
+            { text: 'Copy Hash', style: 'default', onPress: () => {
+              Clipboard.setString(result.txHash);
+              showAlert('Copied', 'Transaction hash copied to clipboard');
+            }},
             { text: 'OK', onPress: () => {
               // Reload server node status (will show updated pending rewards)
               loadServerNodeStatus();
@@ -1435,7 +1733,8 @@ const WalletScreen = () => {
                 loadBalance(wallet.publicKey);
               }
             }}
-          ]
+          ],
+          richContent
         );
       } else {
         showAlert('Cannot Claim', result.message);
@@ -1577,9 +1876,7 @@ const WalletScreen = () => {
                       timestamp: Date.now()
                     }));
                     // Start ping interval for active node
-                    if (!global.nodePingInterval) {
-                      setTimeout(() => startNodePingInterval(), 1000);
-                    }
+                    // No automatic ping interval
                   } else {
                     // Code doesn't match current wallet, clear it
                     setActivatedNodeType(null);
@@ -1592,9 +1889,7 @@ const WalletScreen = () => {
               setActivatedNodeType(nodeType);
               setActivationCode(code.code || code);
               // Start ping interval for active node
-              if (!global.nodePingInterval) {
-                setTimeout(() => startNodePingInterval(), 1000);
-              }
+              // No automatic ping interval
             }
           } else {
             // No codes found, ensure state is cleared
@@ -2130,64 +2425,64 @@ const WalletScreen = () => {
   };
 
   const fetchTokenPrices = async () => {
-    // Set fallback prices immediately
-    setTokenPrices({
-      qnc: 0.0125,
-      sol: 150.00,
-      '1dev': 0.0001
+    // Set fallback prices ONLY if not already set (prevent resetting real prices)
+    setTokenPrices(prev => {
+      if (prev.sol === 0 || prev.sol === undefined) {
+        return { qnc: 0.0125, sol: 150.00, '1dev': 0.0001 };
+      }
+      return prev; // Keep existing prices
     });
     
-    // Then try to fetch real prices in background
-    setTimeout(async () => {
+    // Fetch real prices (no delay needed)
     try {
       // Only fetch prices if wallet is loaded
       if (!wallet) return;
         
-        // Helper function to fetch with timeout (1 second)
-        const fetchWithTimeout = async (url, timeout = 1000) => {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), timeout);
-          
-          try {
-            const response = await fetch(url, { signal: controller.signal });
-            clearTimeout(timeoutId);
-            return response;
-          } catch (error) {
-            clearTimeout(timeoutId);
-            throw error;
-          }
-        };
+      // Helper function to fetch with timeout (2 seconds)
+      const fetchWithTimeout = async (url, timeout = 2000) => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        
+        try {
+          const response = await fetch(url, { signal: controller.signal });
+          clearTimeout(timeoutId);
+          return response;
+        } catch (error) {
+          clearTimeout(timeoutId);
+          throw error;
+        }
+      };
       
-      // Fetch real prices from CoinGecko API
-        const prices = { qnc: 0.0125, sol: 150.00, '1dev': 0.0001 };
-      
-        // Fetch SOL price with timeout
+      // Fetch SOL price with timeout
       try {
-          const solResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+        const solResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
         if (solResponse.ok) {
           const solData = await solResponse.json();
-            prices.sol = solData.solana?.usd || 150.00;
-            setTokenPrices(prev => ({ ...prev, sol: prices.sol }));
+          const realPrice = solData.solana?.usd;
+          if (realPrice && realPrice > 0) {
+            setTokenPrices(prev => ({ ...prev, sol: realPrice }));
+          }
         }
       } catch (e) {
-          // Silently fail, use fallback
-        }
-        
-        // Fetch 1DEV price (if available) with timeout
-        try {
-          const devResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=1dev&vs_currencies=usd');
+        // Silently fail, keep existing price
+      }
+      
+      // Fetch 1DEV price (if available) with timeout
+      try {
+        const devResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=1dev&vs_currencies=usd');
         if (devResponse.ok) {
           const devData = await devResponse.json();
-          prices['1dev'] = devData['1dev']?.usd || 0.0001;
-            setTokenPrices(prev => ({ ...prev, '1dev': prices['1dev'] }));
+          const devPrice = devData['1dev']?.usd;
+          if (devPrice && devPrice > 0) {
+            setTokenPrices(prev => ({ ...prev, '1dev': devPrice }));
+          }
         }
       } catch (e) {
-          // Silently fail, use fallback
+        // Silently fail, keep existing price
       }
     } catch (error) {
-        // Silently fail, fallback prices already set
-      }
-    }, 100); // Small delay to not block UI
+      // Silently fail, keep existing prices
+    }
   };
 
   const generateActivationCode = async () => {
@@ -3024,6 +3319,172 @@ const WalletScreen = () => {
   const renderTabContent = () => {
     switch(activeTab) {
       case 'assets':
+        // Show Send Screen (inline, same size as assets)
+        if (showSendScreen && sendingToken) {
+          // Transaction Result Screen
+          if (txResult) {
+            return (
+              <ScrollView 
+                style={styles.content}
+                contentContainerStyle={[styles.scrollContentContainer, styles.sendScreenContainer]}
+              >
+                <View style={styles.sendScreenHeader}>
+                  <TouchableOpacity onPress={closeSendScreen} style={styles.backButton}>
+                    <Text style={styles.backButtonText}>← Back</Text>
+                  </TouchableOpacity>
+                  <Text style={styles.sendScreenTitle}>
+                    {txResult.success ? 'Success' : 'Failed'}
+                  </Text>
+                  <View style={{width: 60}} />
+                </View>
+                
+                <View style={styles.txResultContainer}>
+                  {txResult.success ? (
+                    <>
+                      <View style={styles.txSuccessIcon}>
+                        <Text style={styles.txSuccessIconText}>✓</Text>
+                      </View>
+                      <Text style={styles.txResultTitle}>Transaction Sent!</Text>
+                      <Text style={styles.txResultAmount}>
+                        {txResult.amount} {txResult.symbol}
+                      </Text>
+                      <Text style={styles.txResultTo}>
+                        To: {txResult.to?.substring(0, 12)}...{txResult.to?.substring(txResult.to.length - 8)}
+                      </Text>
+                      <View style={styles.txHashContainer}>
+                        <Text style={styles.txHashLabel}>Transaction Hash</Text>
+                        <Text style={styles.txHashValue}>{txResult.txHash?.substring(0, 24)}...</Text>
+                      </View>
+                    </>
+                  ) : (
+                    <>
+                      <View style={styles.txErrorIcon}>
+                        <Text style={styles.txErrorIconText}>✕</Text>
+                      </View>
+                      <Text style={styles.txResultTitle}>Transaction Failed</Text>
+                      <Text style={styles.txErrorMessage}>{txResult.error}</Text>
+                    </>
+                  )}
+                  
+                  <TouchableOpacity 
+                    style={styles.txDoneButton}
+                    onPress={closeSendScreen}
+                  >
+                    <Text style={styles.txDoneButtonText}>Done</Text>
+                  </TouchableOpacity>
+                </View>
+              </ScrollView>
+            );
+          }
+          
+          // Send Form Screen
+          return (
+            <ScrollView 
+              style={styles.content}
+              contentContainerStyle={[styles.scrollContentContainer, styles.sendScreenContainer]}
+            >
+              <View style={styles.sendScreenHeader}>
+                <TouchableOpacity onPress={closeSendScreen} style={styles.backButton}>
+                  <Text style={styles.backButtonText}>← Back</Text>
+                </TouchableOpacity>
+                <Text style={styles.sendScreenTitle}>Send {sendingToken.symbol}</Text>
+                <View style={{width: 60}} />
+              </View>
+              
+              {/* Balance Info */}
+              <View style={styles.sendBalanceInfo}>
+                <Text style={styles.sendBalanceLabel}>Available Balance</Text>
+                <Text style={styles.sendBalanceAmount}>{sendingToken.balance.toFixed(4)} {sendingToken.symbol}</Text>
+              </View>
+              
+              {/* Recipient Address */}
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>To Address</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder={sendingToken.network === 'qnet' ? 'Enter EON address' : 'Enter address'}
+                  placeholderTextColor="#888"
+                  value={sendAddress}
+                  onChangeText={setSendAddress}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+              </View>
+              
+              {/* Amount Input */}
+              <View style={styles.formGroup}>
+                <Text style={styles.label}>Amount</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="0.00"
+                  placeholderTextColor="#888"
+                  keyboardType="decimal-pad"
+                  value={sendAmount}
+                  onChangeText={setSendAmount}
+                />
+                
+                {/* Percentage Buttons */}
+                <View style={styles.percentageButtons}>
+                  <TouchableOpacity 
+                    style={styles.percentButton}
+                    onPress={() => setAmountPercentage(25)}
+                  >
+                    <Text style={styles.percentButtonText}>25%</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity 
+                    style={styles.percentButton}
+                    onPress={() => setAmountPercentage(50)}
+                  >
+                    <Text style={styles.percentButtonText}>50%</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity 
+                    style={styles.percentButton}
+                    onPress={() => setAmountPercentage(75)}
+                  >
+                    <Text style={styles.percentButtonText}>75%</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity 
+                    style={styles.percentButton}
+                    onPress={() => setAmountPercentage(100)}
+                  >
+                    <Text style={styles.percentButtonText}>MAX</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+              
+              {/* Network Fee */}
+              <View style={styles.sendFeeContainer}>
+                <Text style={styles.sendFeeLabel}>Network Fee</Text>
+                <Text style={styles.sendFeeValue}>
+                  {sendingToken.network === 'qnet' ? '0.00001 QNC' : '~0.00025 SOL'}
+                </Text>
+              </View>
+              
+              {/* Total Cost */}
+              {sendAmount && parseFloat(sendAmount) > 0 && (
+                <View style={styles.sendTotalContainer}>
+                  <Text style={styles.sendTotalLabel}>Total</Text>
+                  <Text style={styles.sendTotalValue}>
+                    {(parseFloat(sendAmount) + (sendingToken.network === 'qnet' ? 0.00001 : 0.00025)).toFixed(6)} {sendingToken.symbol}
+                  </Text>
+                </View>
+              )}
+              
+              {/* Send Button */}
+              <TouchableOpacity 
+                style={[styles.button, (!sendAddress || !sendAmount || sendingTransaction) && styles.buttonDisabled]}
+                onPress={handleSendTransaction}
+                disabled={!sendAddress || !sendAmount || sendingTransaction}
+              >
+                <Text style={styles.buttonText}>
+                  {sendingTransaction ? 'Sending...' : 'Send Transaction'}
+                </Text>
+              </TouchableOpacity>
+            </ScrollView>
+          );
+        }
+        
+        // Normal Assets View
         return (
           <ScrollView 
             style={styles.content}
@@ -3116,8 +3577,12 @@ const WalletScreen = () => {
             {/* Token List based on selected network */}
             {selectedNetwork === 'qnet' ? (
               <View style={styles.tokenList}>
-                {/* QNC Token */}
-                <View style={styles.tokenItem}>
+                {/* QNC Token - Clickable to open Send screen */}
+                <TouchableOpacity 
+                  style={styles.tokenItemClickable}
+                  onPress={() => openSendModal('QNC', tokenBalances.qnc, 'qnet')}
+                  activeOpacity={0.6}
+                >
                   <View style={styles.tokenInfo}>
                     <View style={styles.tokenIcon}>
                         <Image 
@@ -3133,7 +3598,7 @@ const WalletScreen = () => {
                   <View style={styles.tokenBalance}>
                     <Text style={styles.tokenAmount}>{tokenBalances.qnc.toFixed(4)}</Text>
                   </View>
-                </View>
+                </TouchableOpacity>
               </View>
             ) : (
               <View style={styles.tokenList}>
@@ -3851,6 +4316,32 @@ const WalletScreen = () => {
             scrollEnabled={true}
             onScroll={handleUserActivity}
             scrollEventThrottle={500}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={async () => {
+                  setRefreshing(true);
+                  try {
+                    // Reload all node data
+                    await loadAllUserNodes();
+                    if (activatedNodeType === 'light') {
+                      await loadNodeRewards();
+                      await loadLightNodeStatus();
+                    } else if (activatedNodeType) {
+                      await loadServerNodeStatus();
+                    }
+                  } catch (error) {
+                    console.error('Error refreshing node data:', error);
+                  } finally {
+                    setRefreshing(false);
+                  }
+                }}
+                colors={['#00d4ff']}
+                tintColor="#00d4ff"
+                titleColor="#00d4ff"
+                title="Pull to refresh"
+              />
+            }
           >
             <Text style={styles.tabTitle}>Node Monitoring</Text>
             
@@ -3905,12 +4396,7 @@ const WalletScreen = () => {
               </View>
             )}
             
-            {/* Loading indicator */}
-            {loadingAllNodes && !activatedNodeType && (
-              <View style={{padding: 20, alignItems: 'center'}}>
-                <Text style={styles.nodeMonitoringLabel}>Checking for linked nodes...</Text>
-              </View>
-            )}
+            {/* Loading indicator - hidden, runs silently in background */}
             
             {/* No node yet - show how to activate */}
             {!loadingAllNodes && allUserNodes.length === 0 && !activatedNodeType && (
@@ -3922,23 +4408,24 @@ const WalletScreen = () => {
                   Activate a Light node here, or use your EON address when setting up a Full/Super node on a server.
                 </Text>
                 
-                {/* Copy EON address for server activation */}
+                {/* Copy QNet EON address for server activation */}
                 <View style={{padding: 10, backgroundColor: '#1a1a2e', borderRadius: 8}}>
                   <Text style={[styles.nodeMonitoringLabel, {fontSize: 11, color: '#888'}]}>
-                    Your EON Address (for server node activation):
+                    Your QNet Address (for server node activation):
                   </Text>
                   <TouchableOpacity 
                     onPress={() => {
-                      if (wallet?.publicKey) {
-                        Clipboard.setString(wallet.publicKey);
-                        setCopiedAddress(wallet.publicKey);
+                      const qnetAddr = wallet?.qnetAddress || wallet?.address;
+                      if (qnetAddr) {
+                        Clipboard.setString(qnetAddr);
+                        setCopiedAddress(qnetAddr);
                         setTimeout(() => setCopiedAddress(''), 2000);
                       }
                     }}
                     style={{marginTop: 6}}
                   >
                     <Text style={[styles.nodeMonitoringLabel, {fontSize: 11, color: '#007AFF'}]}>
-                      {copiedAddress === wallet?.publicKey ? 'Copied!' : `Copy: ${wallet?.publicKey?.substring(0, 20)}...`}
+                      {copiedAddress === (wallet?.qnetAddress || wallet?.address) ? 'Copied!' : `Copy: ${(wallet?.qnetAddress || wallet?.address)?.substring(0, 20)}...`}
                     </Text>
                   </TouchableOpacity>
                 </View>
@@ -4012,7 +4499,7 @@ const WalletScreen = () => {
                         ) : lightNodeStatus?.isActive ? (
                           <View style={[styles.serverActivationNotice, {backgroundColor: '#34c75920', borderColor: '#34c759'}]}>
                             <Text style={[styles.serverActivationText, {color: '#34c759'}]}>
-                              ✅ Node Active - Responding to pings
+                              Node Active - Responding to pings
                             </Text>
                             <Text style={styles.serverActivationSubtext}>
                               Next ping: {lightNodeStatus.nextPingTime ? 
@@ -4058,29 +4545,8 @@ const WalletScreen = () => {
                     )
                   ) : (
                     <>
-                      {/* Server Node Status from Network */}
-                      {serverNodeStatus?.success ? (
-                        serverNodeStatus.isOnline ? (
-                          <View style={[styles.serverActivationNotice, {backgroundColor: '#34c75920', borderColor: '#34c759'}]}>
-                            <Text style={[styles.serverActivationText, {color: '#34c759'}]}>
-                              ✅ Server Online - {serverNodeStatus.heartbeatCount}/{serverNodeStatus.requiredHeartbeats} heartbeats
-                            </Text>
-                            <Text style={styles.serverActivationSubtext}>
-                              Reputation: {serverNodeStatus.reputation?.toFixed(1) || 'N/A'} • 
-                              Block: {serverNodeStatus.currentBlockHeight || 'N/A'}
-                            </Text>
-                          </View>
-                        ) : (
-                          <View style={[styles.serverActivationNotice, {backgroundColor: '#ff3b3020', borderColor: '#ff3b30'}]}>
-                            <Text style={[styles.serverActivationText, {color: '#ff3b30'}]}>
-                              ⚠️ Server Offline - Last seen {Math.floor((serverNodeStatus.lastSeenAgoSeconds || 0) / 60)} min ago
-                            </Text>
-                            <Text style={styles.serverActivationSubtext}>
-                              {serverNodeStatus.message || 'Check your server is running'}
-                            </Text>
-                          </View>
-                        )
-                      ) : (
+                      {/* Server Node Status from Network - Status shown in badge, no need for separate notice */}
+                      {!serverNodeStatus?.success && (
                         <View style={styles.serverActivationNotice}>
                           <Text style={styles.serverActivationText}>
                             {activatedNodeType === 'full' ? 'Full' : 'Super'} nodes require server activation
@@ -4094,12 +4560,12 @@ const WalletScreen = () => {
                   )}
                 </View>
                 
-                {/* Validator Status Section */}
+                {/* Status Section */}
                 <View style={styles.rewardsCard}>
-                  <Text style={styles.rewardsTitle}>Validator Status</Text>
+                  <Text style={styles.rewardsTitle}>Status</Text>
                   
                   <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>Validator Node:</Text>
+                    <Text style={styles.rewardLabel}>Node:</Text>
                     <Text style={[styles.rewardValue, {
                       color: !nodePseudonym 
                         ? '#ff3b30'  // Red - not activated
@@ -4142,12 +4608,22 @@ const WalletScreen = () => {
                   {activatedNodeType !== 'light' && serverNodeStatus?.success && (
                     <>
                       <View style={styles.rewardItem}>
-                        <Text style={styles.rewardLabel}>Heartbeats (4h window):</Text>
-                        <Text style={[styles.rewardValue, {
-                          color: serverNodeStatus.isRewardEligible ? '#34c759' : '#ff9500'
-                        }]}>
-                          {serverNodeStatus.heartbeatCount || 0}/{serverNodeStatus.requiredHeartbeats || 8} 
-                          {serverNodeStatus.isRewardEligible ? ' ✓' : ' (need more)'}
+                        <Text style={styles.rewardLabel}>Next Rewards:</Text>
+                        <Text style={[styles.rewardValue, { color: '#34c759' }]}>
+                          {(() => {
+                            const EMISSION_INTERVAL = 14400; // 4 hours in blocks
+                            const currentHeight = serverNodeStatus.currentBlockHeight || 0;
+                            if (currentHeight === 0) return 'Loading...';
+                            const blocksUntil = EMISSION_INTERVAL - (currentHeight % EMISSION_INTERVAL);
+                            // Convert to time estimate
+                            const minutes = Math.floor(blocksUntil / 60);
+                            const hours = Math.floor(minutes / 60);
+                            const mins = minutes % 60;
+                            if (hours > 0) {
+                              return `${blocksUntil.toLocaleString()} blocks (~${hours}h ${mins}m)`;
+                            }
+                            return `${blocksUntil.toLocaleString()} blocks (~${mins}m)`;
+                          })()}
                         </Text>
                       </View>
                       
@@ -4156,7 +4632,12 @@ const WalletScreen = () => {
                         <Text style={[styles.rewardValue, {
                           color: (serverNodeStatus.reputation || 0) >= 70 ? '#34c759' : '#ff9500'
                         }]}>
-                          {serverNodeStatus.reputation?.toFixed(1) || '0.0'}
+                          {(() => {
+                            const rep = serverNodeStatus.reputation || 0;
+                            // Remove trailing zeros - show as integer if whole number
+                            const formatted = rep.toFixed(1).replace(/\.0+$/, '');
+                            return formatted;
+                          })()}
                         </Text>
                       </View>
                       
@@ -4165,16 +4646,16 @@ const WalletScreen = () => {
                         <Text style={[styles.rewardValue, {
                           color: (serverNodeStatus.pendingRewards || 0) > 0 ? '#34c759' : '#00d4ff'
                         }]}>
-                          {((serverNodeStatus.pendingRewards || 0) / 1e9).toFixed(4)} QNC
+                          {(() => {
+                            const rewards = (serverNodeStatus.pendingRewards || 0) / 1e9;
+                            if (rewards === 0) return '0 QNC';
+                            // Round to 5-6 decimal places and remove trailing zeros
+                            const formatted = rewards.toFixed(6).replace(/\.?0+$/, '');
+                            return `${formatted} QNC`;
+                          })()}
                         </Text>
                       </View>
                       
-                      <View style={styles.rewardItem}>
-                        <Text style={styles.rewardLabel}>Block Height:</Text>
-                        <Text style={styles.rewardValue}>
-                          {serverNodeStatus.currentBlockHeight?.toLocaleString() || 'N/A'}
-                        </Text>
-                      </View>
                     </>
                   )}
                   
@@ -4210,29 +4691,15 @@ const WalletScreen = () => {
                       <Text style={styles.buttonText}>
                         {processingValidation ? 'Claiming...' : 
                          (serverNodeStatus.pendingRewards || 0) <= 0 ? 'Claim Rewards' :
-                         `Claim ${((serverNodeStatus.pendingRewards || 0) / 1e9).toFixed(4)} QNC`}
+                         (() => {
+                           const rewards = (serverNodeStatus.pendingRewards || 0) / 1e9;
+                           const formatted = rewards.toFixed(6).replace(/\.?0+$/, '');
+                           return `Claim ${formatted} QNC`;
+                         })()}
                       </Text>
                     </TouchableOpacity>
                   )}
                   
-                  <TouchableOpacity 
-                    style={[styles.button, styles.secondaryButton, {marginTop: 10}]}
-                    onPress={() => {
-                      // Open blockchain explorer
-                      const explorerUrl = `https://explorer.aiqnet.io/validator/${walletAddress}`;
-                      Linking.openURL(explorerUrl).catch(err => 
-                        showAlert('Error', 'Unable to open blockchain explorer')
-                      );
-                    }}
-                  >
-                    <Text style={styles.buttonText}>
-                      View on Explorer
-                    </Text>
-                  </TouchableOpacity>
-                  
-                  <Text style={styles.validatorNote}>
-                    Validator activities are recorded on-chain. Process pending activities to finalize them on the blockchain. View complete history on explorer.
-                  </Text>
                 </View>
               </View>
             ) : (
@@ -4473,15 +4940,7 @@ const WalletScreen = () => {
           <Text style={[styles.tabText, activeTab === 'assets' && styles.activeTabText]}>Assets</Text>
         </TouchableOpacity>
         
-        <TouchableOpacity 
-          style={[styles.tab, activeTab === 'send' && styles.activeTab]}
-          onPress={() => {
-            setActiveTab('send');
-            setNodeStatus(null); // Reset node selection when leaving activate tab
-          }}
-        >
-          <Text style={[styles.tabText, activeTab === 'send' && styles.activeTabText]}>Send</Text>
-        </TouchableOpacity>
+        {/* Send tab hidden - use Assets to send tokens */}
         
         <TouchableOpacity 
           style={[styles.tab, activeTab === 'receive' && styles.activeTab]}
@@ -5627,6 +6086,214 @@ const styles = StyleSheet.create({
   tokenValue: {
     color: '#888',
     fontSize: 12,
+  },
+  tokenItemClickable: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#16213e',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.2)',
+  },
+  tokenSendHint: {
+    color: '#00d4ff',
+    fontSize: 24,
+    fontWeight: '300',
+    marginLeft: 8,
+  },
+  // Send Modal Styles
+  sendBalanceInfo: {
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 16,
+    alignItems: 'center',
+  },
+  sendBalanceLabel: {
+    color: '#888',
+    fontSize: 12,
+    marginBottom: 4,
+  },
+  sendBalanceAmount: {
+    color: '#00d4ff',
+    fontSize: 20,
+    fontWeight: '700',
+  },
+  percentageButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 10,
+    gap: 8,
+  },
+  percentButton: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 212, 255, 0.15)',
+    borderRadius: 6,
+    paddingVertical: 8,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.3)',
+  },
+  percentButtonText: {
+    color: '#00d4ff',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  sendFeeContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 12,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.1)',
+    marginTop: 8,
+    marginBottom: 16,
+  },
+  sendFeeLabel: {
+    color: '#888',
+    fontSize: 14,
+  },
+  sendFeeValue: {
+    color: '#ffaa00',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  sendTotalContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  sendTotalLabel: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  sendTotalValue: {
+    color: '#00d4ff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  // Send Screen Styles (inline, not modal)
+  sendScreenContainer: {
+    paddingTop: 0,
+  },
+  sendScreenHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 16,
+    paddingHorizontal: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.1)',
+    marginBottom: 20,
+  },
+  sendScreenTitle: {
+    color: '#00d4ff',
+    fontSize: 18,
+    fontWeight: '600',
+  },
+  backButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+  },
+  backButtonText: {
+    color: '#00d4ff',
+    fontSize: 16,
+  },
+  // Transaction Result Styles
+  txResultContainer: {
+    alignItems: 'center',
+    paddingVertical: 40,
+    paddingHorizontal: 20,
+  },
+  txSuccessIcon: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: 'rgba(0, 255, 136, 0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  txSuccessIconText: {
+    color: '#00ff88',
+    fontSize: 40,
+    fontWeight: '700',
+  },
+  txErrorIcon: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: 'rgba(255, 68, 68, 0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  txErrorIconText: {
+    color: '#ff4444',
+    fontSize: 40,
+    fontWeight: '700',
+  },
+  txResultTitle: {
+    color: '#ffffff',
+    fontSize: 24,
+    fontWeight: '700',
+    marginBottom: 16,
+  },
+  txResultAmount: {
+    color: '#00d4ff',
+    fontSize: 32,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  txResultTo: {
+    color: '#888',
+    fontSize: 14,
+    marginBottom: 24,
+  },
+  txHashContainer: {
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
+    borderRadius: 12,
+    padding: 16,
+    width: '100%',
+    marginBottom: 24,
+  },
+  txHashLabel: {
+    color: '#888',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  txHashValue: {
+    color: '#00d4ff',
+    fontSize: 14,
+    fontFamily: 'monospace',
+  },
+  txErrorMessage: {
+    color: '#ff6b6b',
+    fontSize: 14,
+    textAlign: 'center',
+    marginBottom: 24,
+    paddingHorizontal: 20,
+  },
+  txDoneButton: {
+    backgroundColor: '#00d4ff',
+    borderRadius: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 60,
+    marginTop: 20,
+  },
+  txDoneButtonText: {
+    color: '#0a0a1a',
+    fontSize: 16,
+    fontWeight: '700',
   },
   phaseCard: {
     backgroundColor: '#16213e',

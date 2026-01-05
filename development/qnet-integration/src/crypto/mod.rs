@@ -17,8 +17,8 @@
 //! ├── hybrid_crypto.rs    - Dilithium + Ed25519 hybrid signatures
 //! ├── quantum_crypto.rs   - Quantum-resistant cryptography core
 //! ├── quantum_poh.rs      - Verifiable Time Sequence (VTS)
-//! ├── vrf.rs              - Verifiable Random Function
-//! ├── vrf_hybrid.rs       - Hybrid VRF (quantum + classical)
+//! ├── vrf.rs              - Legacy VRF (deprecated)
+//! ├── vrf_hybrid.rs       - Hybrid VRF for QRB (NOT producer selection)
 //! ├── key_manager.rs      - Key generation and management
 //! └── crypto_integration.rs - Service integration layer
 //! ```
@@ -51,12 +51,13 @@ pub mod quantum_crypto;
 /// Time-based consensus with quantum-resistant hashing
 pub mod quantum_poh;
 
-/// Verifiable Random Function
-/// Deterministic randomness for leader selection
+/// Legacy VRF (DEPRECATED for producer selection)
+/// Keep for reference only - production uses SHA3-512 deterministic selection
 pub mod vrf;
 
-/// Hybrid VRF (quantum + classical)
-/// Post-quantum VRF with classical backup
+/// Hybrid VRF for QRB (Quantum Randomness Beacon)
+/// Used for: microblock VRF outputs → RANDAO accumulation → dApp randomness
+/// NOT used for: Producer selection (uses deterministic SHA3-512 in node.rs)
 pub mod vrf_hybrid;
 
 /// Key management

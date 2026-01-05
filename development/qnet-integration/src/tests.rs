@@ -133,7 +133,7 @@ pub const API_ENDPOINTS: &[(&str, &str)] = &[
     // Gas
     ("GET", "/api/v1/gas/recommendations"),
     
-    // Solana-inspired
+    // ShredProtocol metrics
     ("GET", "/api/v1/turbine/metrics"),
     ("GET", "/api/v1/poh/status"),
     ("GET", "/api/v1/sealevel/metrics"),
@@ -394,7 +394,7 @@ mod stress_tests {
         let manager = BenchmarkManager::new();
         manager.initialize(100).await;
         
-        let target_tx = 50_000;
+        let target_tx = 100_000;
         let start = Instant::now();
         let mut generated = 0u64;
         

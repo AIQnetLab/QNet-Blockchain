@@ -6,7 +6,7 @@
 //! - 100% deterministic (all nodes compute same result)
 //! - Verifiable (can recompute from genesis)
 //!
-//! Inspired by Ethereum 2.0, Solana, Cosmos best practices
+//! Production-grade deterministic reputation system
 
 use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,7 @@ pub struct FullReputationSnapshot {
 }
 
 // ============================================================================
-// CONSTANTS - Same as Ethereum/Cosmos approach
+// CONSTANTS - Blockchain-standard approach
 // ============================================================================
 
 /// Starting reputation for all nodes (consensus threshold)
@@ -663,7 +663,7 @@ impl DeterministicReputationState {
     }
     
     // =========================================================================
-    // REPUTATION SNAPSHOT (v2.24.0) - Ethereum 2.0 style
+    // REPUTATION SNAPSHOT (v2.24.0) - Deterministic state sync
     // Ensures all nodes have IDENTICAL reputation after macroblock
     // =========================================================================
     
@@ -715,7 +715,7 @@ impl DeterministicReputationState {
         let count = snapshot.len();
         
         // CRITICAL: Replace ALL reputations with snapshot values
-        // This is the Ethereum 2.0 approach - blockchain is authoritative
+        // Blockchain is authoritative - all nodes must have identical state
         for (node_id, reputation) in snapshot {
             self.reputations.insert(node_id, reputation);
         }

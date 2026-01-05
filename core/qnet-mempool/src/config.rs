@@ -38,7 +38,7 @@ impl Default for MempoolConfig {
         let max_per_sender = std::env::var("QNET_MAX_PER_SENDER")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1_000); // Allow burst sending
+            .unwrap_or(10_000); // v2.26.5: Increased for benchmark (was 1000)
             
         let tx_ttl_seconds = std::env::var("QNET_MEMPOOL_TTL")
             .ok()

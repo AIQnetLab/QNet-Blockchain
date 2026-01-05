@@ -107,12 +107,13 @@ class NodeConfig:
     # Genesis validator addresses (free activation)
     # Format: 19 hex + "eon" + 15 hex + 4 hex checksum = 41 chars
     # SOURCE OF TRUTH: genesis_constants.rs (Rust)
+    # v2.66: Updated to Ed25519-based addresses
     genesis_validators = [
-        "7bc83500fd08525250feonff5503d0dce4dbdede8",  # Bootstrap Node 1
-        "714a0f700a4dbcc0d88eonf635ace76ed2eb9a186",  # Bootstrap Node 2
-        "357842d58e86cc300cfeon0203e16eef3e7044db1",  # Bootstrap Node 3
-        "4f710f9b3152659c56aeond4c05f2731a1890aedf",  # Bootstrap Node 4
-        "8fa8ebe9e85dee95080eond0a7365096572f03e1c"   # Bootstrap Node 5
+        "f36ff465a0944fd06cdeonfca0ad004ff9db46743",  # Bootstrap Node 1
+        "0bac6225a082de1f659eond0c96f1706cf19c35eb",  # Bootstrap Node 2
+        "d216bb23fbe7f853636eon3f16b378b91922701a6",  # Bootstrap Node 3
+        "e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e",  # Bootstrap Node 4
+        "02af45d56bd1f5d9002eon0eb1c522f96a2f440b8"   # Bootstrap Node 5
     ]
 
 @dataclass

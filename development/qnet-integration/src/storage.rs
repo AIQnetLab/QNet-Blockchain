@@ -1256,6 +1256,12 @@ impl PersistentStorage {
         }
     }
     
+    /// Save macroblock to storage (IDEMPOTENT - won't overwrite existing)
+    /// 
+    /// CRITICAL v2.26.8: Made idempotent to prevent:
+    /// - Race conditions between consensus and PFP
+    /// - Data inconsistency from parallel writes
+    /// - Overwriting valid macroblocks with different data
     pub async fn save_macroblock(&self, height: u64, macroblock: &qnet_state::MacroBlock) -> IntegrationResult<()> {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
@@ -1263,6 +1269,16 @@ impl PersistentStorage {
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         
         let key = format!("macroblock_{}", height);
+        
+        // IDEMPOTENT CHECK: Don't overwrite existing macroblock
+        // This prevents race conditions and ensures data consistency
+        if let Some(existing) = self.db.get_cf(&microblocks_cf, key.as_bytes())? {
+            if !existing.is_empty() {
+                println!("[Storage] ℹ️ Macroblock #{} already exists - skipping save (idempotent)", height);
+                return Ok(());
+            }
+        }
+        
         let data = bincode::serialize(macroblock)
             .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
         
@@ -1274,6 +1290,7 @@ impl PersistentStorage {
         batch.put_cf(&metadata_cf, b"latest_macroblock_hash", &hash);
         
         self.db.write(batch)?;
+        println!("[Storage] ✅ Macroblock #{} saved successfully", height);
         Ok(())
     }
     
@@ -1291,6 +1308,19 @@ impl PersistentStorage {
             Some(data) => Ok(Some(data)),
             None => Ok(None),
         }
+    }
+    
+    /// PRODUCTION v2.45: Delete macroblock by index (for fork recovery)
+    /// Used when node is stuck on fork and needs to resync from network
+    pub fn delete_macroblock(&self, macroblock_index: u64) -> IntegrationResult<()> {
+        let microblocks_cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        
+        let key = format!("macroblock_{}", macroblock_index);
+        self.db.delete_cf(&microblocks_cf, key.as_bytes())?;
+        
+        println!("[INFO][STORAGE] delete_mb idx={}", macroblock_index);
+        Ok(())
     }
     
     pub fn get_stats(&self) -> IntegrationResult<StorageStats> {
@@ -1621,6 +1651,80 @@ impl PersistentStorage {
                 count += 1;
             }
         }
+        
+        Ok(count)
+    }
+    
+    /// Get recent transactions globally (paginated, newest first)
+    /// Uses tx_by_address CF which stores addr_{address}_{timestamp}_{tx_hash}
+    /// By iterating in reverse, we get newest transactions first
+    pub async fn get_recent_transactions(&self, page: usize, per_page: usize) -> IntegrationResult<(Vec<qnet_state::Transaction>, usize)> {
+        let tx_by_addr_cf = self.db.cf_handle("tx_by_address")
+            .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
+        let tx_cf = self.db.cf_handle("transactions")
+            .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
+        
+        // Iterate in reverse to get newest transactions first
+        let iter = self.db.iterator_cf(&tx_by_addr_cf, rocksdb::IteratorMode::End);
+        
+        let mut transactions = Vec::new();
+        let mut seen_hashes = std::collections::HashSet::new();
+        let skip_count = page.saturating_sub(1) * per_page;
+        let mut skipped = 0;
+        let mut total_count = 0;
+        
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            
+            // Only process addr_* keys
+            if !key_str.starts_with("addr_") {
+                continue;
+            }
+            
+            let tx_hash = std::str::from_utf8(&value).unwrap_or("");
+            
+            // Skip duplicates (same TX can appear twice - from and to)
+            if seen_hashes.contains(tx_hash) {
+                continue;
+            }
+            seen_hashes.insert(tx_hash.to_string());
+            total_count += 1;
+            
+            // Pagination: skip previous pages
+            if skipped < skip_count {
+                skipped += 1;
+                continue;
+            }
+            
+            // Already have enough for this page
+            if transactions.len() >= per_page {
+                continue; // Keep counting total but don't load more
+            }
+            
+            // Load transaction
+            let tx_key = format!("tx_{}", tx_hash);
+            if let Some(tx_data) = self.db.get_cf(&tx_cf, tx_key.as_bytes())? {
+                // Decompress if needed
+                let decompressed = zstd::decode_all(tx_data.as_slice())
+                    .unwrap_or_else(|_| tx_data.to_vec());
+                
+                if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&decompressed) {
+                    transactions.push(tx);
+                }
+            }
+        }
+        
+        Ok((transactions, total_count))
+    }
+    
+    /// Count total transactions in the blockchain
+    pub async fn count_total_transactions(&self) -> IntegrationResult<usize> {
+        let tx_index_cf = self.db.cf_handle("tx_index")
+            .ok_or_else(|| IntegrationError::StorageError("tx_index column family not found".to_string()))?;
+        
+        let iter = self.db.iterator_cf(&tx_index_cf, rocksdb::IteratorMode::Start);
+        let count = iter.count();
         
         Ok(count)
     }
@@ -2210,19 +2314,22 @@ impl Storage {
         // Step 1: Save each transaction with PATTERN RECOGNITION + Zstd compression
         // Pattern Recognition provides 80-95% compression for common TX types
         for tx in &microblock.transactions {
-            // Calculate transaction hash
-            let tx_hash = {
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(bincode::serialize(tx).unwrap_or_default());
-                let result = hasher.finalize();
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&result);
-                hash
-            };
-            tx_hashes.push(tx_hash);
+            // v2.72: Use transaction's own hash (BLAKE3) for consistency with lookups
+            // Previously we computed SHA3(bincode) which didn't match tx.hash
+            // This caused find_transaction_by_hash() to fail for system TX
+            let tx_hash_str = &tx.hash; // Already computed by tx.calculate_hash()
             
-            let tx_key = format!("tx_{}", hex::encode(tx_hash));
+            // Convert to [u8; 32] for EfficientMicroBlock
+            let tx_hash_bytes: [u8; 32] = {
+                let decoded = hex::decode(tx_hash_str).unwrap_or_else(|_| vec![0u8; 32]);
+                let mut arr = [0u8; 32];
+                let len = decoded.len().min(32);
+                arr[..len].copy_from_slice(&decoded[..len]);
+                arr
+            };
+            tx_hashes.push(tx_hash_bytes);
+            
+            let tx_key = format!("tx_{}", tx_hash_str);
             
             // Serialize original transaction for size tracking
             let tx_data = bincode::serialize(tx)
@@ -2253,13 +2360,13 @@ impl Storage {
             
             // INDEX: address -> tx_hash for account transaction queries
             let timestamp = tx.timestamp;
-            let from_key = format!("addr_{}_{:016x}_{}", tx.from, timestamp, hex::encode(tx_hash));
-            batch.put_cf(&tx_by_addr_cf, from_key.as_bytes(), &tx_hash);
+            let from_key = format!("addr_{}_{:016x}_{}", tx.from, timestamp, tx_hash_str);
+            batch.put_cf(&tx_by_addr_cf, from_key.as_bytes(), tx_hash_str.as_bytes());
             
-            if let Some(ref to) = tx.to {
-                let to_key = format!("addr_{}_{:016x}_{}", to, timestamp, hex::encode(tx_hash));
-                batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), &tx_hash);
-            }
+            // Index 'to' address (if present, including system addresses)
+            let to_addr = tx.to.as_ref().map(|s| s.as_str()).unwrap_or(&tx.from);
+            let to_key = format!("addr_{}_{:016x}_{}", to_addr, timestamp, tx_hash_str);
+            batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), tx_hash_str.as_bytes());
         }
         
         // Log pattern compression results (every 100 blocks)
@@ -2269,7 +2376,7 @@ impl Storage {
                      height, total_original_size, total_compressed_size, tx_savings);
         }
         
-        // Step 2: Create EfficientMicroBlock with hashes only (includes PoH data)
+        // Step 2: Create EfficientMicroBlock with hashes only (includes PoH data + VRF)
         let efficient_block = qnet_state::EfficientMicroBlock {
             height: microblock.height,
             timestamp: microblock.timestamp,
@@ -2280,6 +2387,9 @@ impl Storage {
             merkle_root: microblock.merkle_root,
             poh_hash: microblock.poh_hash.clone(),
             poh_count: microblock.poh_count,
+            // Quantum Randomness Beacon (QRB) v3.0
+            vrf_output: microblock.vrf_output,
+            vrf_proof: microblock.vrf_proof.clone(),
         };
         
         // Step 3: Save PoH state separately for fast validation (v2.19.13)
@@ -2358,6 +2468,11 @@ impl Storage {
     /// Get macroblock by its index (height / 90)
     pub fn get_macroblock_by_height(&self, macroblock_index: u64) -> IntegrationResult<Option<Vec<u8>>> {
         self.persistent.get_macroblock_by_height(macroblock_index)
+    }
+    
+    /// PRODUCTION v2.45: Delete macroblock by index (for fork recovery)
+    pub fn delete_macroblock(&self, macroblock_index: u64) -> IntegrationResult<()> {
+        self.persistent.delete_macroblock(macroblock_index)
     }
     
     /// Save state snapshot for efficient storage
@@ -2649,6 +2764,16 @@ impl Storage {
         self.persistent.count_transactions_by_address(address).await
     }
     
+    /// Get recent transactions globally (paginated, newest first)
+    pub async fn get_recent_transactions(&self, page: usize, per_page: usize) -> IntegrationResult<(Vec<qnet_state::Transaction>, usize)> {
+        self.persistent.get_recent_transactions(page, per_page).await
+    }
+    
+    /// Count total transactions in the blockchain
+    pub async fn count_total_transactions(&self) -> IntegrationResult<usize> {
+        self.persistent.count_total_transactions().await
+    }
+    
     /// Get reputation history for a node
     pub fn get_reputation_history(&self, node_id: &str, limit: usize) -> IntegrationResult<Vec<serde_json::Value>> {
         self.get_reputation_history_internal(node_id, limit)
@@ -2738,7 +2863,7 @@ impl Storage {
                         }
                     }
                     
-                    // Create full MicroBlock
+                    // Create full MicroBlock (including QRB VRF data)
                     let full_block = qnet_state::MicroBlock {
                         height: efficient_block.height,
                         timestamp: efficient_block.timestamp,
@@ -2749,6 +2874,9 @@ impl Storage {
                         merkle_root: efficient_block.merkle_root,
                         poh_hash: efficient_block.poh_hash,
                         poh_count: efficient_block.poh_count,
+                        // QRB v3.0: VRF fields
+                        vrf_output: efficient_block.vrf_output,
+                        vrf_proof: efficient_block.vrf_proof,
                     };
                     
                     // Serialize as full MicroBlock for network transmission
@@ -2906,7 +3034,7 @@ impl Storage {
                 }
             }
             
-            // Reconstruct full MicroBlock
+            // Reconstruct full MicroBlock (including QRB VRF data)
             let microblock = qnet_state::MicroBlock {
                 height: efficient_block.height,
                 timestamp: efficient_block.timestamp,
@@ -2917,6 +3045,9 @@ impl Storage {
                 merkle_root: efficient_block.merkle_root,
                 poh_hash: efficient_block.poh_hash,
                 poh_count: efficient_block.poh_count,
+                // Quantum Randomness Beacon (QRB) v3.0
+                vrf_output: efficient_block.vrf_output,
+                vrf_proof: efficient_block.vrf_proof,
             };
             
             return Ok(Some(microblock));
@@ -3968,11 +4099,21 @@ impl Storage {
                 let parsed: serde_json::Value = serde_json::from_str(json_str)
                     .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
                 
-                Ok(Some((
-                    parsed["node_type"].as_str().unwrap_or("light").to_string(),
-                    parsed["wallet"].as_str().unwrap_or("").to_string(),
-                    parsed["reputation"].as_f64().unwrap_or(70.0)
-                )))
+                // PRODUCTION v2.41.1: Validate required fields
+                let node_type = match parsed["node_type"].as_str() {
+                    Some(t) => t.to_string(),
+                    None => {
+                        eprintln!("[WARN][STORAGE] node_registration_missing_type id={} data={}", 
+                                 node_id, json_str);
+                        return Err(IntegrationError::DeserializationError(
+                            format!("Missing node_type for {}", node_id)));
+                    }
+                };
+                let wallet = parsed["wallet"].as_str().unwrap_or("").to_string();
+                let reputation = parsed["reputation"].as_f64()
+                    .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
+                
+                Ok(Some((node_type, wallet, reputation)))
             },
             None => Ok(None),
         }
@@ -4316,6 +4457,32 @@ impl Storage {
         Ok(removed)
     }
     
+    /// v2.75: Get all heartbeats for a block height range (for emission fallback)
+    /// Returns Vec<(node_id, heartbeat_index, timestamp, block_height)>
+    pub fn get_heartbeats_for_block_range(&self, start_height: u64, end_height: u64) -> IntegrationResult<Vec<(String, u8, u64, u64)>> {
+        let hb_cf = self.persistent.db.cf_handle("heartbeats")
+            .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
+        
+        let iter = self.persistent.db.iterator_cf(&hb_cf, rocksdb::IteratorMode::Start);
+        let mut result = Vec::new();
+        
+        for item in iter {
+            let (_key, value) = item?;
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
+                let block_height = parsed["block_height"].as_u64().unwrap_or(0);
+                if block_height >= start_height && block_height < end_height {
+                    let node_id = parsed["node_id"].as_str().unwrap_or("").to_string();
+                    let heartbeat_index = parsed["heartbeat_index"].as_u64().unwrap_or(0) as u8;
+                    let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
+                    result.push((node_id, heartbeat_index, timestamp, block_height));
+                }
+            }
+        }
+        
+        println!("[INFO][STORAGE] heartbeats_for_range start={} end={} found={}", start_height, end_height, result.len());
+        Ok(result)
+    }
+    
     // ===== FAILOVER EVENT METHODS =====
     
     /// Save a failover event (optimized with bincode serialization and LZ4 compression)
@@ -4605,7 +4772,27 @@ impl Storage {
             account_count += 1;
         }
         
-        // 5. Compress snapshot with LZ4 for efficient storage
+        // 5. v2.75: Include pending_rewards for fast sync (lazy rewards survive restart)
+        let mut rewards_count = 0u64;
+        if let Some(rewards_cf) = self.persistent.db.cf_handle("pending_rewards") {
+            // Write marker for rewards section
+            snapshot_data.extend_from_slice(b"REWARDS_V1");
+            
+            let rewards_iter = self.persistent.db.iterator_cf(&rewards_cf, rocksdb::IteratorMode::Start);
+            for item in rewards_iter {
+                let (key, value) = item?;
+                snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                snapshot_data.extend_from_slice(&key);
+                snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                snapshot_data.extend_from_slice(&value);
+                rewards_count += 1;
+            }
+            
+            // Write end marker
+            snapshot_data.extend_from_slice(b"REWARDS_END");
+        }
+        
+        // 6. Compress snapshot with LZ4 for efficient storage
         let compressed = lz4_flex::compress_prepend_size(&snapshot_data);
         
         // 6. Calculate hash for integrity check
@@ -4627,8 +4814,8 @@ impl Storage {
         self.persistent.db.put_cf(&snapshots_cf, b"latest_snapshot", &height.to_le_bytes())?;
         
         let duration = start_time.elapsed();
-        println!("[SNAPSHOT] ✅ Snapshot created: {} accounts, {} bytes compressed in {:.2}s", 
-                 account_count, compressed.len(), duration.as_secs_f64());
+        println!("[SNAPSHOT] ✅ Snapshot created: {} accounts, {} rewards, {} bytes compressed in {:.2}s", 
+                 account_count, rewards_count, compressed.len(), duration.as_secs_f64());
         
         // PRODUCTION: Clean up old snapshots (keep only last 5)
         self.cleanup_old_snapshots(height, 5)?;
@@ -4687,14 +4874,26 @@ impl Storage {
         let mut batch = WriteBatch::default();
         let mut account_count = 0;
         
+        // Read accounts until we hit REWARDS_V1 marker or end of data
         while cursor < decompressed.len() {
+            // Check for REWARDS_V1 marker (10 bytes)
+            if cursor + 10 <= decompressed.len() && &decompressed[cursor..cursor+10] == b"REWARDS_V1" {
+                break; // Switch to rewards section
+            }
+            
+            if cursor + 4 > decompressed.len() { break; }
             let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Key length field must be 4 bytes")) as usize;
             cursor += 4;
+            
+            if cursor + key_len > decompressed.len() { break; }
             let key = &decompressed[cursor..cursor+key_len];
             cursor += key_len;
             
+            if cursor + 4 > decompressed.len() { break; }
             let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Value length field must be 4 bytes")) as usize;
             cursor += 4;
+            
+            if cursor + value_len > decompressed.len() { break; }
             let value = &decompressed[cursor..cursor+value_len];
             cursor += value_len;
             
@@ -4704,7 +4903,46 @@ impl Storage {
         
         self.persistent.db.write(batch)?;
         
-        println!("[SNAPSHOT] ✅ Restored {} accounts from snapshot", account_count);
+        // v2.75: Restore pending_rewards if present
+        let mut rewards_count = 0;
+        if cursor + 10 <= decompressed.len() && &decompressed[cursor..cursor+10] == b"REWARDS_V1" {
+            cursor += 10; // Skip marker
+            
+            if let Some(rewards_cf) = self.persistent.db.cf_handle("pending_rewards") {
+                let mut rewards_batch = WriteBatch::default();
+                
+                // Read until REWARDS_END marker
+                while cursor < decompressed.len() {
+                    // Check for REWARDS_END marker (11 bytes)
+                    if cursor + 11 <= decompressed.len() && &decompressed[cursor..cursor+11] == b"REWARDS_END" {
+                        break;
+                    }
+                    
+                    if cursor + 4 > decompressed.len() { break; }
+                    let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Key length must be 4 bytes")) as usize;
+                    cursor += 4;
+                    
+                    if cursor + key_len > decompressed.len() { break; }
+                    let key = &decompressed[cursor..cursor+key_len];
+                    cursor += key_len;
+                    
+                    if cursor + 4 > decompressed.len() { break; }
+                    let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Value length must be 4 bytes")) as usize;
+                    cursor += 4;
+                    
+                    if cursor + value_len > decompressed.len() { break; }
+                    let value = &decompressed[cursor..cursor+value_len];
+                    cursor += value_len;
+                    
+                    rewards_batch.put_cf(&rewards_cf, key, value);
+                    rewards_count += 1;
+                }
+                
+                self.persistent.db.write(rewards_batch)?;
+            }
+        }
+        
+        println!("[SNAPSHOT] ✅ Restored {} accounts, {} rewards from snapshot", account_count, rewards_count);
         
         Ok(())
     }
@@ -5570,6 +5808,26 @@ impl Storage {
         
         Ok(result)
     }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CERTIFICATE STORAGE ARCHITECTURE v2.29
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Certificates are NOT stored separately!
+    // They are ALREADY embedded in each block's vrf_proof field.
+    // 
+    // vrf_proof contains HybridSignature which includes:
+    // - certificate: HybridCertificate (~2.6KB)
+    // - ephemeral_public_key
+    // - message_signature
+    // - dilithium_key_signature
+    //
+    // For historical block validation:
+    // 1. Load block from storage (already have vrf_proof)
+    // 2. Extract certificate from vrf_proof
+    // 3. Verify signature using extracted certificate
+    //
+    // This approach uses ZERO additional storage!
+    // ═══════════════════════════════════════════════════════════════════════════
 }
 
 // =========================================================================

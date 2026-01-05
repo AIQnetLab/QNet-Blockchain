@@ -4,7 +4,7 @@
 //! - Consensus participation data (who committed + revealed)
 //! - Slashing events with cryptographic proof
 //! - Automatic jails for missing consecutive blocks
-//! - Next leader selection based on VRF
+//! - Next leader selection based on deterministic SHA3-512 (QRDS)
 
 use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};

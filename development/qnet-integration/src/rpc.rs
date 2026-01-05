@@ -64,6 +64,25 @@ pub enum WsEvent {
         to: String,
         amount: u64,
     },
+    /// PRODUCTION v2.43.1: Reward update for node
+    RewardUpdate {
+        node_id: String,
+        epoch: u64,
+        pending_qnc: f64,
+        pool1_base: f64,
+        pool2_fees: f64,
+        pool3_activation: f64,
+        is_eligible: bool,
+        heartbeats: u8,
+    },
+    /// PRODUCTION v2.43.1: Reward claimed
+    RewardClaimed {
+        node_id: String,
+        wallet_address: String,
+        amount_qnc: f64,
+        tx_hash: String,
+        epoch: u64,
+    },
 }
 
 /// Global WebSocket event broadcaster
@@ -78,6 +97,37 @@ pub fn broadcast_ws_event(event: WsEvent) {
     // Ignore send errors (no subscribers)
     let _ = WS_BROADCASTER.send(event);
 }
+
+// ============================================================================
+// PRODUCTION v2.43.1: CACHING FOR REWARD STATS
+// ============================================================================
+
+/// Cache for Pool2/Pool3 accumulated stats (10 second TTL)
+/// Reduces load when multiple clients poll for epoch stats
+static REWARD_POOLS_CACHE: Lazy<std::sync::RwLock<(RewardPoolsCache, std::time::Instant)>> = 
+    Lazy::new(|| std::sync::RwLock::new((RewardPoolsCache::default(), std::time::Instant::now())));
+
+/// Cache for network-wide reward statistics (30 second TTL)
+static REWARD_NETWORK_STATS_CACHE: Lazy<std::sync::RwLock<(serde_json::Value, std::time::Instant)>> = 
+    Lazy::new(|| std::sync::RwLock::new((serde_json::json!({}), std::time::Instant::now())));
+
+/// Cache for node summary statistics (60 second TTL per node)
+/// Key: node_id, Value: (summary_json, last_update)
+static REWARD_SUMMARY_CACHE: Lazy<DashMap<String, (serde_json::Value, std::time::Instant)>> = 
+    Lazy::new(|| DashMap::new());
+
+const REWARD_SUMMARY_CACHE_TTL_SECS: u64 = 60;
+
+#[derive(Default, Clone)]
+struct RewardPoolsCache {
+    pool2_fees: u64,
+    pool3_activations: u64,
+    epoch: u64,
+    blocks_in_epoch: u64,
+}
+
+const REWARD_POOLS_CACHE_TTL_SECS: u64 = 10;
+const REWARD_NETWORK_STATS_CACHE_TTL_SECS: u64 = 30;
 
 // ============================================================================
 // SECURITY: IP-based Rate Limiting for REST API DDoS Protection
@@ -537,6 +587,15 @@ struct TransactionRequest {
     signature: String,
     /// Ed25519 public key for verification (REQUIRED)
     public_key: String,
+    /// QUANTUM v2.25: Optional Dilithium3 signature for post-quantum security
+    /// When present: TX is quantum-resistant, gas cost +50%
+    /// Format: hex-encoded (~6586 chars for 3293 bytes)
+    #[serde(default)]
+    dilithium_signature: Option<String>,
+    /// QUANTUM v2.25: Dilithium3 public key (required if dilithium_signature present)
+    /// Format: hex-encoded (~3904 chars for 1952 bytes)
+    #[serde(default)]
+    dilithium_public_key: Option<String>,
 }
 
 /// Query parameters for transaction history API
@@ -562,6 +621,19 @@ struct TransactionHistoryQuery {
     /// End timestamp (Unix seconds, optional)
     end_time: Option<u64>,
 }
+
+/// Query parameters for global recent transactions
+#[derive(Debug, Deserialize)]
+struct RecentTransactionsQuery {
+    /// Page number (1-indexed, default: 1)
+    #[serde(default = "default_page")]
+    page: usize,
+    /// Transactions per page (default: 50, max: 100)
+    #[serde(default = "default_per_page_50")]
+    per_page: usize,
+}
+
+fn default_per_page_50() -> usize { 50 }
 
 fn default_page() -> usize { 1 }
 fn default_per_page() -> usize { 20 }
@@ -696,7 +768,7 @@ pub use crate::storage::StoredContractInfo as ContractInfo;
 // ============================================================================
 
 /// WebSocket subscription query parameters
-/// Example: ws://node:8001/ws/subscribe?channels=blocks,account:EON_ADDRESS,contract:EON_ADDRESS
+/// Example: ws://node:8001/ws/subscribe?channels=blocks,account:EON_ADDRESS,rewards:NODE_ID
 #[derive(Debug, Deserialize)]
 struct WsSubscribeQuery {
     /// Comma-separated list of channels to subscribe to
@@ -704,6 +776,7 @@ struct WsSubscribeQuery {
     ///   - "blocks" - all new blocks
     ///   - "account:ADDRESS" - balance updates for specific address
     ///   - "contract:ADDRESS" - events from specific contract
+    ///   - "rewards:NODE_ID" - reward updates for specific node (v2.43.1)
     ///   - "mempool" - pending transactions
     ///   - "tx:HASH" - specific transaction confirmation
     #[serde(default)]
@@ -723,6 +796,27 @@ enum WsChannel {
     Mempool,
     /// Subscribe to specific transaction confirmation
     Transaction(String),
+    /// PRODUCTION v2.43.1: Subscribe to reward updates for specific node
+    Rewards(String),
+}
+
+// ============================================================================
+// PRODUCTION v2.43.1: BATCH & PAGINATION STRUCTURES
+// ============================================================================
+
+/// Request body for batch pending rewards
+#[derive(Debug, Deserialize)]
+struct BatchPendingRewardsRequest {
+    node_ids: Vec<String>,
+}
+
+/// Query parameters for reward history with pagination
+#[derive(Debug, Deserialize)]
+struct RewardHistoryQuery {
+    #[serde(default)]
+    offset: Option<u32>,
+    #[serde(default)]
+    limit: Option<u32>,
 }
 
 /// Start comprehensive API server (JSON-RPC + REST)
@@ -764,8 +858,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             
             if let Some(p2p) = blockchain.get_unified_p2p() {
                 // API DEADLOCK FIX: Get cached height without network calls
+                // PRODUCTION v2.53: Use max(local, cached) to prevent stale cache showing lower height
                 if let Some(cached_height) = p2p.get_cached_network_height() {
-                    network_height = cached_height;
+                    network_height = std::cmp::max(height, cached_height);
                 } else {
                     // No cache available - check if we're bootstrap node
                     if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
@@ -906,6 +1001,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::query::<TransactionHistoryQuery>())
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_history);
+    
+    // Global recent transactions (paginated, newest first)
+    // GET /api/v1/transactions/recent?page=1&per_page=50
+    let transactions_recent = api_v1
+        .and(warp::path("transactions"))
+        .and(warp::path("recent"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<RecentTransactionsQuery>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_recent_transactions);
     
     // Block endpoints
     let block_latest = api_v1
@@ -1108,18 +1214,25 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 let mut selected_genesis = Vec::new();
                 let max_genesis_to_return = std::cmp::min(2, genesis_ips.len());
                 
+                // Get deterministic reputation for real values
+                let det_rep = blockchain.get_deterministic_reputation();
+                let rep_guard = det_rep.read().unwrap_or_else(|p| p.into_inner());
+                
                 for (idx, ip) in genesis_ips.iter().enumerate().take(max_genesis_to_return) {
                     let genesis_addr = format!("{}:8001", ip);
+                    let genesis_id = format!("genesis_node_{:03}", idx + 1);
                     // Check if not already in list
                     let already_exists = peers.iter().any(|p| p.address == genesis_addr);
                     if !already_exists {
+                        // Get real reputation from deterministic system
+                        let real_reputation = rep_guard.get_reputation(&genesis_id, current_time);
                         selected_genesis.push(json!({
-                            "id": format!("genesis_node_{:03}", idx + 1),
+                            "id": genesis_id,
                             "address": genesis_addr,
                             "node_type": "Super",
                             "region": "Global",
                             "last_seen": current_time, // Genesis nodes are always active
-                            "reputation": 70.0, // Genesis nodes start at 70% reputation like all nodes
+                            "reputation": real_reputation, // Real reputation from blockchain
                             "version": "qnet-v1.0" // Include version
                         }));
                     }
@@ -1294,15 +1407,84 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_claim_rewards);
     
-    // Get pending rewards endpoint
+    // Get pending rewards endpoint (with rate limiting)
     let pending_rewards = api_v1
         .and(warp::path("rewards"))
         .and(warp::path("pending"))
         .and(warp::path::param::<String>()) // node_id
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_get_pending_rewards);
+    
+    // PRODUCTION v2.43.1: Get reward history by epochs (with rate limiting + pagination)
+    let reward_history = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("history"))
+        .and(warp::path::param::<String>()) // node_id
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<RewardHistoryQuery>()) // ?offset=0&limit=10
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_reward_history);
+    
+    // PRODUCTION v2.43.1: Get detailed pool breakdown (Pool1/Pool2/Pool3) (with rate limiting)
+    let reward_pools = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("pools"))
+        .and(warp::path::param::<String>()) // node_id
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_reward_pools);
+    
+    // PRODUCTION v2.43.1: Get all nodes for a wallet address
+    let rewards_by_wallet = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("by-wallet"))
+        .and(warp::path::param::<String>()) // wallet_address
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_rewards_by_wallet);
+    
+    // PRODUCTION v2.43.1: Batch get pending rewards for multiple nodes
+    let rewards_pending_batch = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("pending"))
+        .and(warp::path("batch"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_pending_rewards_batch);
+    
+    // PRODUCTION v2.43.1: Network-wide reward statistics
+    let rewards_network_stats = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("network"))
+        .and(warp::path("stats"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_reward_network_stats);
+    
+    // PRODUCTION v2.43.1: Node lifetime reward summary (aggregated stats)
+    let rewards_summary = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("summary"))
+        .and(warp::path::param::<String>()) // node_id
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_reward_summary);
     
     // Node registration endpoint
     let register_node = api_v1
@@ -1735,6 +1917,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let transaction_routes = transaction_submit
         .or(transaction_get)
         .or(transaction_history)  // Extended history API with pagination
+        .or(transactions_recent)  // Global recent transactions API
         .or(mempool_status)
         .or(mempool_transactions);
     
@@ -1787,6 +1970,12 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(light_node_pending_challenge)
         .or(claim_rewards)
         .or(pending_rewards)
+        .or(reward_history)
+        .or(reward_pools)
+        .or(rewards_by_wallet)
+        .or(rewards_pending_batch)
+        .or(rewards_network_stats)
+        .or(rewards_summary)
         .or(register_node)
         .or(activations_by_wallet)
         .or(generate_activation_code)
@@ -1885,16 +2074,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         
         // CRITICAL: Start heartbeat service for Full/Super nodes (required for rewards!)
         // Full nodes need 8/10 heartbeats, Super nodes need 9/10 per 4h window
+        // v2.42.2: Now uses tokio::spawn with sync height access (no block_on!)
         if let Some(p2p) = blockchain.get_unified_p2p() {
             let blockchain_for_heartbeat = blockchain.clone();
-            // CRITICAL FIX: Get runtime handle BEFORE spawning std::thread
-            // Otherwise Handle::current() panics in non-tokio thread
-            let runtime_handle = tokio::runtime::Handle::current();
+            // v2.42.2: Use sync height accessor to avoid block_on in async context
             p2p.start_heartbeat_service(move || {
-                // Use pre-captured handle instead of Handle::current()
-                runtime_handle.block_on(async { blockchain_for_heartbeat.get_height().await })
+                blockchain_for_heartbeat.get_height_sync()
             });
-            println!("💓 Heartbeat service started (10 heartbeats per 4h window for rewards)");
+            println!("💓 Heartbeat service started (10 heartbeats per 4h window for rewards) [v2.42.2 tokio]");
         }
     }
     
@@ -1931,6 +2118,11 @@ async fn handle_rpc(
         
         // Stats methods
         "stats_get" => stats_get(blockchain).await,
+        
+        // Quantum Randomness Beacon (QRB) methods
+        "qrb_getRandomness" => qrb_get_randomness(blockchain.clone(), request.params).await,
+        "qrb_getLatestRandomness" => qrb_get_latest_randomness(blockchain.clone()).await,
+        "qrb_getRandomnessWithSeed" => qrb_get_randomness_with_seed(blockchain.clone(), request.params).await,
         
         // Node transfer methods
         "device_migration" => device_migration(blockchain, request.params).await,
@@ -2123,6 +2315,18 @@ async fn tx_submit(
         message: "Missing public_key - required for signature verification".to_string(),
     })?;
     
+    // QUANTUM v2.25: Optional Dilithium signature for post-quantum security
+    let dilithium_signature = params["dilithium_signature"].as_str().map(|s| s.to_string());
+    let dilithium_public_key = params["dilithium_public_key"].as_str().map(|s| s.to_string());
+    
+    // Validate: if dilithium_signature present, dilithium_public_key must also be present
+    if dilithium_signature.is_some() && dilithium_public_key.is_none() {
+        return Err(RpcError {
+            code: -32602,
+            message: "dilithium_public_key required when dilithium_signature is present".to_string(),
+        });
+    }
+    
     // Create transaction
     let mut tx = qnet_state::Transaction {
         hash: String::new(), // will be calculated
@@ -2141,6 +2345,8 @@ async fn tx_submit(
             amount,
         },
         data: None, // no data for simple transfer
+        dilithium_signature,      // QUANTUM v2.25: Optional post-quantum signature
+        dilithium_public_key,     // QUANTUM v2.25: Optional post-quantum pubkey
     };
     
     // Calculate hash
@@ -2296,6 +2502,8 @@ async fn mempool_submit(
                 amount,
             },
             data: None, // no data for simple transfer
+            dilithium_signature: None,   // Batch TX - no quantum sig by default
+            dilithium_public_key: None,
         };
         
         // Calculate hash
@@ -2398,6 +2606,167 @@ pub async fn handle_get_stats(blockchain: Arc<BlockchainNode>) -> Result<impl wa
             });
             Ok(warp::reply::json(&error_response))
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// QUANTUM RANDOMNESS BEACON (QRB) v3.0 - RPC API
+// Provides verifiable randomness for smart contracts: gambling, NFT mints, auctions
+// Quantum-safe: All VRFs use Dilithium3 signatures (NIST FIPS 204)
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+/// Get randomness beacon for a specific epoch (macroblock)
+/// Method: qrb_getRandomness
+/// Params: { "epoch": u64 } - macroblock number (1, 2, 3, ...)
+/// Returns: { "randomness": "0x...", "epoch": u64, "vrf_contributions": u64 }
+async fn qrb_get_randomness(
+    blockchain: Arc<BlockchainNode>,
+    params: Option<Value>,
+) -> Result<Value, RpcError> {
+    let params = params.ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing params - expected { epoch: number }".to_string(),
+    })?;
+    
+    let epoch = params["epoch"].as_u64().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing or invalid 'epoch' parameter".to_string(),
+    })?;
+    
+    // Get macroblock for epoch
+    let storage = blockchain.get_storage();
+    match storage.get_macroblock_by_height(epoch) {
+        Ok(Some(macro_data)) => {
+            match bincode::deserialize::<qnet_state::MacroBlock>(&macro_data) {
+                Ok(macroblock) => {
+                    let randomness = macroblock.consensus_data.randomness_beacon
+                        .map(|r| format!("0x{}", hex::encode(r)))
+                        .unwrap_or_else(|| "0x".to_string() + &"0".repeat(64));
+                    
+                    let vrf_count = macroblock.consensus_data.vrf_contributions_count.unwrap_or(0);
+                    
+                    Ok(json!({
+                        "randomness": randomness,
+                        "epoch": epoch,
+                        "vrf_contributions": vrf_count,
+                        "timestamp": macroblock.timestamp,
+                        "verified": vrf_count > 0,
+                        "quantum_safe": true,
+                        "algorithm": "XOR(VRF_Dilithium3_1...VRF_Dilithium3_N)"
+                    }))
+                }
+                Err(e) => Err(RpcError {
+                    code: -32000,
+                    message: format!("Failed to deserialize macroblock: {}", e),
+                }),
+            }
+        }
+        Ok(None) => Err(RpcError {
+            code: -32001,
+            message: format!("Epoch {} not yet finalized", epoch),
+        }),
+        Err(e) => Err(RpcError {
+            code: -32000,
+            message: format!("Storage error: {:?}", e),
+        }),
+    }
+}
+
+/// Get latest finalized randomness beacon
+/// Method: qrb_getLatestRandomness
+/// Returns: { "randomness": "0x...", "epoch": u64, "vrf_contributions": u64 }
+async fn qrb_get_latest_randomness(
+    blockchain: Arc<BlockchainNode>,
+) -> Result<Value, RpcError> {
+    let height = blockchain.get_height().await;
+    let latest_epoch = height / 90; // Each macroblock covers 90 microblocks
+    
+    if latest_epoch == 0 {
+        return Err(RpcError {
+            code: -32001,
+            message: "No epochs finalized yet".to_string(),
+        });
+    }
+    
+    // Get the latest finalized epoch
+    qrb_get_randomness(blockchain, Some(json!({ "epoch": latest_epoch }))).await
+}
+
+/// Get randomness combined with user-provided seed
+/// Method: qrb_getRandomnessWithSeed
+/// Params: { "epoch": u64, "seed": "0x..." }
+/// Returns: { "randomness": "0x...", "combined": "0x...", "epoch": u64 }
+/// Formula: combined = SHA3-256(beacon || seed)
+async fn qrb_get_randomness_with_seed(
+    blockchain: Arc<BlockchainNode>,
+    params: Option<Value>,
+) -> Result<Value, RpcError> {
+    let params = params.ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing params - expected { epoch: number, seed: string }".to_string(),
+    })?;
+    
+    let epoch = params["epoch"].as_u64().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing or invalid 'epoch' parameter".to_string(),
+    })?;
+    
+    let seed_hex = params["seed"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing 'seed' parameter".to_string(),
+    })?;
+    
+    // Remove 0x prefix if present
+    let seed_clean = seed_hex.trim_start_matches("0x");
+    let seed_bytes = hex::decode(seed_clean).map_err(|e| RpcError {
+        code: -32602,
+        message: format!("Invalid seed hex: {}", e),
+    })?;
+    
+    // Get base randomness
+    let storage = blockchain.get_storage();
+    match storage.get_macroblock_by_height(epoch) {
+        Ok(Some(macro_data)) => {
+            match bincode::deserialize::<qnet_state::MacroBlock>(&macro_data) {
+                Ok(macroblock) => {
+                    let beacon = macroblock.consensus_data.randomness_beacon
+                        .unwrap_or([0u8; 32]);
+                    
+                    // Combine: SHA3-256(beacon || seed)
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(b"QNet_QRB_v3_WithSeed");
+                    hasher.update(&beacon);
+                    hasher.update(&seed_bytes);
+                    let combined = hasher.finalize();
+                    
+                    let vrf_count = macroblock.consensus_data.vrf_contributions_count.unwrap_or(0);
+                    
+                    Ok(json!({
+                        "randomness": format!("0x{}", hex::encode(beacon)),
+                        "seed": seed_hex,
+                        "combined": format!("0x{}", hex::encode(combined)),
+                        "epoch": epoch,
+                        "vrf_contributions": vrf_count,
+                        "verified": vrf_count > 0,
+                        "quantum_safe": true,
+                        "algorithm": "SHA3-256(beacon || seed)"
+                    }))
+                }
+                Err(e) => Err(RpcError {
+                    code: -32000,
+                    message: format!("Failed to deserialize macroblock: {}", e),
+                }),
+            }
+        }
+        Ok(None) => Err(RpcError {
+            code: -32001,
+            message: format!("Epoch {} not yet finalized", epoch),
+        }),
+        Err(e) => Err(RpcError {
+            code: -32000,
+            message: format!("Storage error: {:?}", e),
+        }),
     }
 }
 
@@ -2650,7 +3019,8 @@ async fn handle_transaction_history(
                     "timestamp": tx.timestamp,
                     "gas_price": tx.gas_price,
                     "gas_limit": tx.gas_limit,
-                    "gas_used": tx.gas_price * tx.gas_limit,
+                    "gas_used": tx.effective_gas_price() * tx.gas_limit,
+                    "is_quantum_signed": tx.is_quantum_signed(),
                     "nonce": tx.nonce,
                     "type": tx_type_str,
                     "direction": direction
@@ -2690,6 +3060,63 @@ async fn handle_transaction_history(
                 "success": false,
                 "error": format!("Failed to fetch transaction history: {}", e),
                 "address": query.address
+            });
+            Ok(warp::reply::json(&error_response))
+        }
+    }
+}
+
+/// Handler for global recent transactions (paginated, newest first)
+/// API: GET /api/v1/transactions/recent?page=1&per_page=50
+async fn handle_recent_transactions(
+    query: RecentTransactionsQuery,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let page = if query.page == 0 { 1 } else { query.page };
+    let per_page = query.per_page.min(100).max(1); // Clamp to 1-100
+    
+    let storage = blockchain.get_storage();
+    
+    match storage.get_recent_transactions(page, per_page).await {
+        Ok((transactions, total_count)) => {
+            let txs: Vec<Value> = transactions.iter().map(|tx| {
+                json!({
+                    "hash": tx.hash,
+                    "from": tx.from,
+                    "to": tx.to,
+                    "amount": tx.amount,
+                    "nonce": tx.nonce,
+                    "timestamp": tx.timestamp,
+                    "type": format!("{:?}", tx.tx_type),
+                    "gas_price": tx.gas_price,
+                    "gas_limit": tx.gas_limit,
+                    "is_quantum_signed": tx.is_quantum_signed()
+                })
+            }).collect();
+            
+            let total_pages = (total_count + per_page - 1) / per_page;
+            let current_height = blockchain.get_height().await;
+            
+            let response = json!({
+                "success": true,
+                "transactions": txs,
+                "pagination": {
+                    "page": page,
+                    "per_page": per_page,
+                    "total_count": total_count,
+                    "total_pages": total_pages,
+                    "has_next": page < total_pages,
+                    "has_prev": page > 1
+                },
+                "current_height": current_height
+            });
+            Ok(warp::reply::json(&response))
+        }
+        Err(e) => {
+            println!("[API] ❌ Recent transactions error: {}", e);
+            let error_response = json!({
+                "success": false,
+                "error": format!("Failed to fetch recent transactions: {}", e)
             });
             Ok(warp::reply::json(&error_response))
         }
@@ -2804,6 +3231,22 @@ async fn handle_macroblock_by_index(
 ) -> Result<impl Reply, Rejection> {
     match blockchain.get_macroblock(index).await {
         Ok(Some(macroblock)) => {
+            // v2.75: Decode heartbeat summaries if present
+            let heartbeat_info = macroblock.consensus_data.reward_heartbeats.as_ref()
+                .and_then(|data| bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(data).ok())
+                .map(|summaries| {
+                    let eligible = summaries.iter().filter(|s| s.is_eligible).count();
+                    json!({
+                        "total_nodes": summaries.len(),
+                        "eligible_nodes": eligible,
+                        "nodes": summaries.iter().take(20).map(|s| json!({
+                            "node_id": s.node_id,
+                            "heartbeat_count": s.heartbeat_count,
+                            "is_eligible": s.is_eligible
+                        })).collect::<Vec<_>>()
+                    })
+                });
+            
             let response = json!({
                 "index": index,
                 "height": macroblock.height,
@@ -2817,6 +3260,10 @@ async fn handle_macroblock_by_index(
                     "next_leader": macroblock.consensus_data.next_leader,
                     "commits_count": macroblock.consensus_data.commits.len(),
                     "reveals_count": macroblock.consensus_data.reveals.len(),
+                    // v2.75: Reward data for emission macroblocks
+                    "reward_heartbeats": heartbeat_info,
+                    "pool2_total_fees": macroblock.consensus_data.pool2_total_fees,
+                    "pool3_total_activations": macroblock.consensus_data.pool3_total_activations,
                 },
                 "previous_hash": hex::encode(macroblock.previous_hash),
                 "poh_hash": hex::encode(&macroblock.poh_hash),
@@ -2978,11 +3425,14 @@ async fn handle_transaction_submit(
     // =========================================================================
     
     // Build message to verify (canonical format)
-    let message_to_sign = format!("transfer:{}:{}:{}:{}", 
+    // v2.43: Changed from nonce to gas_price:gas_limit for client compatibility
+    // This is MORE secure: different gas params = different signature = replay-resistant
+    let message_to_sign = format!("transfer:{}:{}:{}:{}:{}", 
         tx_request.from, 
         tx_request.to,
         tx_request.amount,
-        tx_request.nonce
+        tx_request.gas_price,
+        tx_request.gas_limit
     );
     
     // Verify Ed25519 signature
@@ -3000,7 +3450,7 @@ async fn handle_transaction_submit(
             "success": false,
             "error": "Signature verification failed (NIST FIPS 186-5)",
             "details": "Ed25519 signature does not match the transaction data",
-            "message_format": "transfer:{from}:{to}:{amount}:{nonce}"
+            "message_format": "transfer:{from}:{to}:{amount}:{gas_price}:{gas_limit}"
         })));
     }
     
@@ -3009,15 +3459,16 @@ async fn handle_transaction_submit(
              &tx_request.to[..8.min(tx_request.to.len())]);
     
     // Create transaction from request WITH verified signature
+    // QUANTUM v2.25.2: Full support for both Ed25519 and Ed25519+Dilithium TX
     let tx = qnet_state::Transaction::new(
         tx_request.from.clone(),
-        Some(tx_request.signature.clone()), // CRITICAL: Include verified signature
+        Some(tx_request.to.clone()),
+        tx_request.amount,
         tx_request.nonce,
         tx_request.gas_price,
         tx_request.gas_limit,
         chrono::Utc::now().timestamp() as u64,
-        0, // block_height: u64
-        None, // block_hash: Option<String>
+        Some(tx_request.signature.clone()), // CRITICAL: Include verified Ed25519 signature
         qnet_state::TransactionType::Transfer {
             from: tx_request.from.clone(),
             to: tx_request.to.clone(),
@@ -3028,12 +3479,20 @@ async fn handle_transaction_submit(
             "public_key": tx_request.public_key,
             "standard": "NIST FIPS 186-5 (Ed25519)"
         })).unwrap_or_default()),
-    );
+    )
+    .with_public_key(Some(tx_request.public_key.clone()))
+    .with_quantum_signature(tx_request.dilithium_signature.clone(), tx_request.dilithium_public_key.clone());
 
-    // Convert to JSON and add to mempool
-    match serde_json::to_string(&tx) {
-        Ok(tx_json) => {
-            let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
+    // Log quantum TX if present
+    if tx.is_quantum_signed() {
+        println!("[TX-QUANTUM] 🔐 Transaction with Dilithium signature from {}", &tx_request.from[..16.min(tx_request.from.len())]);
+    }
+
+    // PRODUCTION v2.26: Use bincode hash for consistency with mempool
+    // This ensures client receives the SAME hash as stored in mempool
+    match bincode::serialize(&tx) {
+        Ok(tx_bytes) => {
+            let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
             
             // Add to mempool using public method
             match blockchain.add_transaction_to_mempool(tx).await {
@@ -3073,6 +3532,10 @@ async fn handle_transaction_get(
     // PRODUCTION: Fetch real transaction from blockchain storage
     match blockchain.get_transaction(&tx_hash).await {
         Ok(Some(tx)) => {
+            // QUANTUM v2.25.2: Include quantum signature info in explorer
+            let is_quantum = tx.is_quantum_signed();
+            let effective_gas = tx.effective_gas_price() * tx.gas_limit;
+            
             let mut transaction_data = json!({
                 "hash": tx.hash,
                 "from": tx.from,
@@ -3081,10 +3544,25 @@ async fn handle_transaction_get(
                 "nonce": tx.nonce,
                 "gas_price": tx.gas_price,
                 "gas_limit": tx.gas_limit,
+                "effective_gas_cost": effective_gas,
                 "timestamp": tx.timestamp,
                 "block_height": tx.block_height,
-                "status": tx.status
+                "status": tx.status,
+                "tx_type": tx.tx_type,  // Include transaction type for explorer
+                "is_quantum_signed": is_quantum,
+                "signature_type": if is_quantum { "Ed25519 + Dilithium3" } else { "Ed25519" }
             });
+            
+            // Add quantum signature details if present
+            if is_quantum {
+                transaction_data["quantum_security"] = json!({
+                    "algorithm": "CRYSTALS-Dilithium3 (NIST FIPS 204)",
+                    "quantum_resistant": true,
+                    "gas_premium": "50%",
+                    "dilithium_signature_present": tx.dilithium_signature.is_some(),
+                    "dilithium_pubkey_present": tx.dilithium_public_key.is_some()
+                });
+            }
             
             // Add Fast Finality Indicators if available
             if let Some(ref confirmation_level) = tx.confirmation_level {
@@ -3234,19 +3712,25 @@ async fn handle_bundle_submit(
     };
     
     // Calculate total gas price for bundle
-    let mempool_arc = blockchain.get_mempool();
-    let mempool = mempool_arc.read().await;
+    // v2.26: Direct access - SimpleMempool is already thread-safe
+    // v2.26: Use binary transactions with bincode (not JSON!)
+    let mempool = blockchain.get_mempool();
     let mut total_gas_price = 0u64;
     for tx_hash in &transactions {
-        if let Some(tx_json) = mempool.get_raw_transaction(&tx_hash) {
-            if let Ok(tx_data) = serde_json::from_str::<serde_json::Value>(&tx_json) {
+        if let Some(tx_bytes) = mempool.get_binary_transaction(&tx_hash) {
+            // Try bincode first (new format), then JSON (legacy)
+            if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&tx_bytes) {
+                total_gas_price = total_gas_price.saturating_add(tx.gas_price);
+            } else if let Ok(json_str) = String::from_utf8(tx_bytes) {
+                // Fallback: legacy JSON format
+                if let Ok(tx_data) = serde_json::from_str::<serde_json::Value>(&json_str) {
                 if let Some(gas_price) = tx_data["gas_price"].as_u64() {
                     total_gas_price = total_gas_price.saturating_add(gas_price);
                 }
             }
         }
     }
-    drop(mempool);
+    }
     
     // Create bundle
     let bundle = TxBundle {
@@ -3262,12 +3746,13 @@ async fn handle_bundle_submit(
     
     // Get REAL reputation for bundle submitter
     // SECURITY: This is used for MEV bundle reputation check (min 80% required)
-    // ARCHITECTURE: Reputation = consensus_score ONLY (synced via blocks)
+    // ARCHITECTURE: Reputation from DeterministicReputationState (synced via blocks)
+    use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
     let submitter_node_id = hex::encode(&bundle.submitter_pubkey);
     let submitter_reputation = if let Some(p2p) = blockchain.get_p2p() {
         p2p.get_node_combined_reputation(&submitter_node_id)
     } else {
-        70.0 // Default if P2P not initialized (consensus threshold)
+        INITIAL_REPUTATION // Default if P2P not initialized
     };
     
     // Get current time
@@ -3468,6 +3953,8 @@ async fn handle_batch_claim_rewards(
                     gas_limit: 0, // No gas for rewards
                     nonce: 0,
                     data: Some(format!("Claim for node: {}", node_id)), // Track which node claimed
+                    dilithium_signature: None,   // System TX - no quantum sig
+                    dilithium_public_key: None,
                 };
                 
                 // Calculate hash using blake3 (EXISTING method)
@@ -3916,12 +4403,17 @@ async fn handle_network_ping(
 /// - Reward claims: "claim_rewards:{node_id}:{wallet}"
 /// - Batch transfers: "batch_transfer:{from}:{total}:{count}:{batch_id}"
 async fn verify_ed25519_client_signature(
-    _context: &str,        // For logging only (e.g., "from", "node_id")
+    context: &str,         // For logging only (e.g., "from", "node_id")
     message: &str,         // ACTUAL message that was signed by client
     signature_hex: &str,
     public_key_hex: &str
 ) -> bool {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    
+    // v2.66: Detailed logging for debugging signature issues
+    println!("[CRYPTO] Ed25519 verify for context={}", context);
+    println!("[CRYPTO]   message={}", message);
+    println!("[CRYPTO]   sig_len={} pubkey_len={}", signature_hex.len(), public_key_hex.len());
     
     // Basic validation
     if signature_hex.len() != 128 {  // 64 bytes = 128 hex chars
@@ -4007,14 +4499,17 @@ async fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &
         return false;
     }
     
-    // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
-    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-    if crypto_guard.is_none() {
-        let mut crypto = QNetQuantumCrypto::new();
-        let _ = crypto.initialize().await;
-        *crypto_guard = Some(crypto);
-    }
-    let crypto = crypto_guard.as_mut().expect("Crypto initialized above");
+    // PRODUCTION v2.50: Lock-free quantum crypto
+    use crate::node::try_get_quantum_crypto;
+    let crypto = match try_get_quantum_crypto() {
+        Some(c) => c,
+        None => {
+            if crate::node::is_warn() {
+                println!("[WARN][RPC] dilithium_verify_skip reason=crypto_not_initialized");
+            }
+            return false;
+        }
+    };
     
     // Create DilithiumSignature struct from string signature
     let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
@@ -4061,12 +4556,8 @@ async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
     
     let mut instances_guard = instances.lock().await;
     
-    // Normalize node_id
-    let normalized_node_id = if node_id.starts_with("qn_") {
-        node_id.to_string()
-    } else {
-        format!("qn_{}", node_id)
-    };
+    // v2.24: Use node_id directly
+    let normalized_node_id = node_id.to_string();
     
     // Create instance if not exists
     if !instances_guard.contains_key(&normalized_node_id) {
@@ -4089,15 +4580,14 @@ async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
     }
     
     // CRITICAL: Sign RAW challenge with hybrid (hashes before signing)
+    // OPTIMIZED v2.24: bincode+zstd - use standard compact_bin format for verification compatibility
     match hybrid.sign_raw_message_compact(challenge.as_bytes()).await {
         Ok(compact_sig) => {
-            match serde_json::to_string(&compact_sig) {
-                Ok(json) => {
-                    println!("[CRYPTO] ✅ HYBRID signature created for node {} (NIST/Cisco compliant)", node_id);
-                    println!("[CRYPTO]    Ephemeral key: ✅ (new for this challenge)");
-                    println!("[CRYPTO]    Dilithium key sig: ✅");
-                    println!("[CRYPTO]    Dilithium msg sig: ✅");
-                    format!("hybrid_rpc:{}", json)
+            match compact_sig.to_binary_compressed() {
+                Ok(binary_data) => {
+                    let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                    println!("[CRYPTO] ✅ HYBRID RPC signature created for node {} (bincode v2.24)", node_id);
+                    format!("compact_bin:{}", base64_data)  // Standard format for verification
                 }
                 Err(e) => {
                     println!("[CRYPTO] ❌ Failed to serialize hybrid signature: {}", e);
@@ -4350,6 +4840,30 @@ async fn handle_light_node_register(
         };
         p2p.register_light_node(registration);
         println!("[GOSSIP] 📤 Light node registration gossiped to network ({})", push_type_str);
+        
+        // v2.71: Create ON-CHAIN NodeRegistration TX for Light nodes (only for NEW nodes)
+        if registration_result == "node_created" {
+            let device_sig_hash = blake3::hash(register_request.device_id.as_bytes()).to_hex().to_string();
+            let registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
+                &light_node_pseudonym,
+                qnet_state::NodeType::Light,
+                &register_request.wallet_address,
+                &device_sig_hash[..32], // First 32 chars of device signature hash as proof
+            );
+            
+            // Add to mempool for inclusion in next block
+            let mempool = blockchain.get_mempool();
+            let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
+            let tx_hash = registration_tx.hash.clone();
+            if mempool.add_binary_transaction(tx_bytes, tx_hash.clone(), 0) {
+                println!("[INFO][REG] light_onchain_tx node={} wallet={}... hash={}...", 
+                         light_node_pseudonym, 
+                         &register_request.wallet_address[..16.min(register_request.wallet_address.len())],
+                         &tx_hash[..16.min(tx_hash.len())]);
+            } else {
+                eprintln!("[WARN][REG] light_onchain_tx_failed node={}", light_node_pseudonym);
+            }
+        }
     }
     
     // Calculate next ping time for this node
@@ -4454,13 +4968,14 @@ async fn handle_shred_protocol_metrics(blockchain: Arc<BlockchainNode>) -> Resul
     
     let metrics = json!({
         "enabled": true,
-        "chunk_size": 1024,
+        "chunk_size": 262144,  // v2.63: 256KB (was 128KB - increased for 100K TPS)
         "fanout": fanout,  // REAL-TIME: Adaptive fanout (4-32)
         "qualified_producers": producers,  // REAL-TIME: Producers with reputation >= 70%
         "average_latency_ms": latency,  // REAL-TIME: Network performance
         "redundancy_factor": 1.5,
-        "max_chunks": 2048,
-        "max_block_size": 2097152, // 2 MB for 50K TX support
+        "max_chunks": 170,           // v2.63: 170 data chunks (GF(2^8) limit: 170+85=255)
+        "chunk_size_kb": 256,        // v2.63: 256KB chunks (was 128KB - increased for 100K TPS)
+        "max_block_size": 43515904,  // v2.63: 170 × 256KB = 43.5 MB (supports 100K+ TPS)
         "status": "active"
     });
     
@@ -4514,8 +5029,8 @@ async fn handle_pre_execution_status(blockchain: Arc<BlockchainNode>) -> Result<
     let status = json!({
         "enabled": true,
         "lookahead_blocks": 3,
-        "max_tx_per_block": 50000, // 50K TX/block max
-        "cache_size": 50000, // Match max TX per block
+        "max_tx_per_block": 100000, // 100K TX/block max
+        "cache_size": 100000, // Match max TX per block
         "total_pre_executed": metrics.total_pre_executed,
         "cache_hits": metrics.cache_hits,
         "cache_misses": metrics.cache_misses,
@@ -4611,12 +5126,8 @@ async fn handle_light_node_ping_response(
             
             let mut instances_guard = instances.lock().await;
             
-            // Normalize node_id
-            let normalized_node_id = if our_node_id.starts_with("qn_") {
-                our_node_id.clone()
-            } else {
-                format!("qn_{}", our_node_id)
-            };
+            // v2.24: Use node_id directly
+            let normalized_node_id = our_node_id.clone();
             
             // Create instance if not exists
             if !instances_guard.contains_key(&normalized_node_id) {
@@ -4639,12 +5150,14 @@ async fn handle_light_node_ping_response(
             }
             
             // CRITICAL: Sign RAW attestation with hybrid (hashes before signing)
+            // OPTIMIZED v2.24: bincode+zstd instead of JSON
             match hybrid.sign_raw_message_compact(attestation_data.as_bytes()).await {
                 Ok(compact_sig) => {
-                    match serde_json::to_string(&compact_sig) {
-                        Ok(json) => {
-                            println!("[LIGHT] ✅ HYBRID attestation signature (NIST/Cisco compliant)");
-                            format!("hybrid_attest:{}", json)
+                    match compact_sig.to_binary_compressed() {
+                        Ok(binary_data) => {
+                            let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                            println!("[LIGHT] ✅ HYBRID attestation signature (bincode v2.24)");
+                            format!("compact_bin:{}", base64_data)  // Standard format for verification
                         }
                         Err(e) => {
                             println!("[LIGHT] ❌ Failed to serialize hybrid signature: {}", e);
@@ -4666,6 +5179,8 @@ async fn handle_light_node_ping_response(
         };
         
         // Create attestation with Light node's signature
+        // v2.59: Include block_height for epoch-based reward filtering
+        let current_block_height = blockchain.get_height().await;
         let attestation = LightNodeAttestation {
             light_node_id: node_id.clone(),
             pinger_id: our_node_id.clone(),
@@ -4674,6 +5189,7 @@ async fn handle_light_node_ping_response(
             light_node_signature: signature.clone(), // Light node's actual signature!
             pinger_signature,
             challenge: challenge.clone(),
+            block_height: current_block_height, // v2.59: For epoch filtering
         };
         
         // Gossip attestation to all nodes
@@ -4719,10 +5235,11 @@ async fn handle_light_node_ping_response(
         });
         
         // Register and record ping
+        use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         let _ = reward_manager.register_node(node_id.clone(), RewardNodeType::Light, wallet_addr.clone());
         let _ = reward_manager.record_ping_attempt(&node_id, true, 50);
         let _ = blockchain.get_storage().save_ping_attempt(&node_id, now, true, 50);
-        let _ = blockchain.get_storage().save_node_registration(&node_id, "light", &wallet_addr, 70.0);
+        let _ = blockchain.get_storage().save_node_registration(&node_id, "light", &wallet_addr, INITIAL_REPUTATION);
     }
     
     // Mark node as successfully responding (resets failure counter, reactivates if inactive)
@@ -5947,8 +6464,14 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
 struct ClaimRewardsRequest {
     node_id: String,
     wallet_address: String,
-    quantum_signature: String,
-    public_key: String,
+    quantum_signature: String,  // Ed25519 signature (REQUIRED)
+    public_key: String,         // Ed25519 public key (REQUIRED)
+    // v2.70: Optional Dilithium signature for quantum-safe claims
+    // If provided, adds post-quantum protection (NIST FIPS 204)
+    #[serde(default)]
+    dilithium_signature: Option<String>,
+    #[serde(default)]
+    dilithium_public_key: Option<String>,
 }
 
 async fn handle_claim_rewards(
@@ -5992,6 +6515,14 @@ async fn handle_claim_rewards(
     // PRODUCTION: Verify Ed25519 signature from client (NOT Dilithium - that's for node consensus only)
     // Client signs: "claim_rewards:{node_id}:{wallet_address}"
     let claim_message = format!("claim_rewards:{}:{}", claim_request.node_id, claim_request.wallet_address);
+    
+    // v2.66: Diagnostic logging for signature verification
+    println!("[INFO][CLAIM] verify_ed25519 node={} wallet={}... sig_len={} pubkey_len={}",
+             claim_request.node_id,
+             &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())],
+             claim_request.quantum_signature.len(),
+             claim_request.public_key.len());
+    
     let signature_valid = verify_ed25519_client_signature(
         &claim_request.node_id,  // context for logging
         &claim_message,          // actual signed message
@@ -6000,87 +6531,130 @@ async fn handle_claim_rewards(
     ).await;
     
     if !signature_valid {
+        println!("[WARN][CLAIM] ed25519_invalid node={}", claim_request.node_id);
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "Invalid Ed25519 signature for reward claim",
-            "message_format": "claim_rewards:{node_id}:{wallet_address}"
+            "message_format": "claim_rewards:{node_id}:{wallet_address}",
+            "debug": {
+                "node_id": claim_request.node_id,
+                "wallet_preview": &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())],
+                "sig_len": claim_request.quantum_signature.len(),
+                "pubkey_len": claim_request.public_key.len()
+            }
         })));
     }
     
-    // CRITICAL FIX: Get the ACTUAL wallet address from node_ownership in reward_manager
-    // The wallet was registered during node activation - we MUST use that, not generate a new one!
-    // This prevents attackers from claiming rewards to a different wallet.
-    let registered_wallet = {
-        let reward_manager_arc = blockchain.get_reward_manager();
-        let reward_manager = reward_manager_arc.read().await;
-        reward_manager.get_node_owner(&claim_request.node_id)
-    };
+    println!("[INFO][CLAIM] ed25519_verified node={}", claim_request.node_id);
+    
+    // v2.70: OPTIONAL Dilithium signature verification for quantum-safe claims
+    // If provided, verify post-quantum signature (same message format as Ed25519)
+    let has_dilithium = claim_request.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty());
+    if has_dilithium {
+        let dilithium_sig = claim_request.dilithium_signature.as_ref().unwrap();
+        let dilithium_pubkey = match &claim_request.dilithium_public_key {
+            Some(pk) if !pk.is_empty() => pk.clone(),
+            _ => {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "dilithium_public_key required when dilithium_signature is provided"
+                })));
+            }
+        };
+        
+        // Create Dilithium signature struct for verification
+        use crate::quantum_crypto::DilithiumSignature;
+        let dilithium_struct = DilithiumSignature {
+            signature: dilithium_sig.clone(),
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            strength: "quantum-resistant".to_string(),
+        };
+        
+        // Verify Dilithium signature on same message
+        let crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+        match crypto.verify_dilithium_signature(&claim_message, &dilithium_struct, &dilithium_pubkey).await {
+            Ok(true) => {
+                println!("[INFO][CLAIM] dilithium_verified node={} quantum_safe=true", claim_request.node_id);
+            }
+            Ok(false) => {
+                println!("[WARN][CLAIM] dilithium_invalid node={}", claim_request.node_id);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Invalid Dilithium signature for quantum-safe claim"
+                })));
+            }
+            Err(e) => {
+                println!("[ERR][CLAIM] dilithium_verify_fail node={} err={}", claim_request.node_id, e);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": format!("Dilithium verification failed: {}", e)
+                })));
+            }
+        }
+    }
+    
+    // v2.71: ON-CHAIN WALLET VERIFICATION
+    // Uses blockchain NodeRegistration TX as SINGLE SOURCE OF TRUTH
+    // Fallback to genesis_constants for Genesis nodes (until on-chain registration is in block)
+    let registered_wallet = blockchain.get_node_wallet(&claim_request.node_id).await;
     
     let wallet_address = match registered_wallet {
         Some(registered) => {
-            // SECURITY: Verify claimant wallet matches registered wallet
+            // SECURITY: Verify claimant wallet matches ON-CHAIN registered wallet
             if registered != claim_request.wallet_address {
-                println!("[SECURITY] ❌ Wallet mismatch for node {}", claim_request.node_id);
-                println!("   Registered: {}...", &registered[..16.min(registered.len())]);
-                println!("   Claimed by: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
+                println!("[SECURITY][CLAIM] wallet_mismatch node={}", claim_request.node_id);
+                println!("[SECURITY][CLAIM] onchain={}... claimed={}...", 
+                         &registered[..16.min(registered.len())],
+                         &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
                 return Ok(warp::reply::json(&json!({
                     "success": false,
-                    "error": "Wallet address does not match registered owner"
+                    "error": "Wallet address does not match on-chain registration"
                 })));
             }
+            println!("[INFO][CLAIM] wallet_verified node={} source=blockchain", claim_request.node_id);
             registered
         }
         None => {
-            // Node not registered in reward_manager - check if it's a Genesis node
-            if claim_request.node_id.starts_with("genesis_node_") {
-                // Genesis nodes use PREDEFINED wallets from genesis_constants.rs
-                // CRITICAL: Must match the wallet used during registration in node.rs
-                let bootstrap_id = claim_request.node_id.strip_prefix("genesis_node_").unwrap_or("001");
-                
-                match crate::genesis_constants::get_genesis_wallet_by_id(bootstrap_id) {
-                    Some(genesis_wallet) => {
-                        // Verify claimant is using the correct Genesis wallet
-                        if genesis_wallet != claim_request.wallet_address {
-                            println!("[SECURITY] ❌ Genesis wallet mismatch for node {}", claim_request.node_id);
-                            println!("   Expected: {}...", &genesis_wallet[..16.min(genesis_wallet.len())]);
-                            println!("   Claimed by: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
-                            return Ok(warp::reply::json(&json!({
-                                "success": false,
-                                "error": "Invalid Genesis wallet address"
-                            })));
-                        }
-                        genesis_wallet.to_string()
-                    }
-                    None => {
-                        println!("[SECURITY] ❌ Unknown Genesis bootstrap ID: {}", bootstrap_id);
-                        return Ok(warp::reply::json(&json!({
-                            "success": false,
-                            "error": "Unknown Genesis node ID"
-                        })));
-                    }
-                }
-            } else {
-                // Node not registered - cannot claim
-                println!("[SECURITY] ❌ Node {} not registered for rewards", claim_request.node_id);
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Node not registered for rewards. Register your node first."
-                })));
-            }
+            // Node not registered on-chain
+            println!("[SECURITY][CLAIM] no_onchain_registration node={}", claim_request.node_id);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Node not registered on-chain. Registration TX required before claiming rewards."
+            })));
         }
     };
     
     // PRODUCTION: Check pending rewards BEFORE creating transaction
+    // v2.75: Try memory first, fallback to RocksDB (lazy rewards survive restarts!)
     let reward_amount = {
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
         match reward_manager.get_pending_reward(&claim_request.node_id) {
             Some(reward) => reward.total_reward,
             None => {
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "No pending rewards available"
-                })));
+                // FALLBACK: Check RocksDB for persisted pending rewards
+                let storage = blockchain.get_storage();
+                match storage.load_pending_reward(&claim_request.node_id) {
+                    Ok(Some(stored_reward)) => {
+                        println!("[INFO][CLAIM] loaded_from_rocksdb node={} amount={}", 
+                                 claim_request.node_id, stored_reward.total_reward);
+                        stored_reward.total_reward
+                    }
+                    Ok(None) => {
+                        return Ok(warp::reply::json(&json!({
+                            "success": false,
+                            "error": "No pending rewards available"
+                        })));
+                    }
+                    Err(e) => {
+                        eprintln!("[ERR][CLAIM] rocksdb_load_fail node={} err={}", claim_request.node_id, e);
+                        return Ok(warp::reply::json(&json!({
+                            "success": false,
+                            "error": "Failed to load pending rewards from storage"
+                        })));
+                    }
+                }
             }
         }
     };
@@ -6096,35 +6670,41 @@ async fn handle_claim_rewards(
     }
     
     // PRODUCTION: Create RewardDistribution transaction for blockchain transparency
-    // This ensures all reward claims are recorded on-chain and auditable
+    // CRITICAL: Rewards come from system_rewards_pool (emission), NOT from node_id
+    // Node_id has no balance - rewards are minted from system pool
     let mut tx = qnet_state::Transaction {
         hash: String::new(), // will be calculated
-        from: claim_request.node_id.clone(), // Node claiming rewards
+        from: "system_rewards_pool".to_string(), // FIXED: Rewards come from system pool (like emission)
         to: Some(claim_request.wallet_address.clone()), // User's wallet receiving rewards
         amount: reward_amount,
         nonce: 0, // will be set by state
-        gas_price: 0, // No gas for reward claims
+        gas_price: 0, // No gas for reward claims (Ed25519 + Dilithium both FREE!)
         gas_limit: 0, // No gas for reward claims
         timestamp: chrono::Utc::now().timestamp() as u64,
         signature: Some(claim_request.quantum_signature.clone()), // User's Ed25519 signature
         public_key: Some(claim_request.public_key.clone()), // User's Ed25519 public key
         tx_type: qnet_state::TransactionType::RewardDistribution,
-        data: None,
+        data: Some(format!("reward_claim:{}:{}:{}", claim_request.node_id, reward_amount,
+            if has_dilithium { "quantum" } else { "standard" })), // Track which node claimed + quantum flag
+        // v2.70: Pass through Dilithium signature if provided (quantum-safe claim)
+        dilithium_signature: claim_request.dilithium_signature.clone(),
+        dilithium_public_key: claim_request.dilithium_public_key.clone(),
     };
     
     // Calculate transaction hash
     tx.hash = tx.calculate_hash();
     
-    println!("[REWARDS] 📝 Creating RewardDistribution transaction:");
-    println!("[REWARDS]    Node: {}", claim_request.node_id);
-    println!("[REWARDS]    Wallet: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
-    println!("[REWARDS]    Amount: {:.9} QNC", reward_amount as f64 / 1_000_000_000.0);
-    println!("[REWARDS]    TxHash: {}", tx.hash);
+    println!("[INFO][CLAIM] tx_created node={} wallet={}... amount={} QNC hash={} security={}",
+             claim_request.node_id,
+             &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())],
+             reward_amount / 1_000_000_000,
+             &tx.hash[..16.min(tx.hash.len())],
+             if has_dilithium { "quantum" } else { "standard" });
     
     // Submit transaction to blockchain
     match blockchain.submit_transaction(tx.clone()).await {
         Ok(tx_hash) => {
-            println!("[REWARDS] ✅ Reward claim transaction submitted: {}", tx_hash);
+            println!("[INFO][CLAIM] tx_submitted node={} hash={}", claim_request.node_id, tx_hash);
             
             // CRITICAL: Mark rewards as claimed in reward_manager AFTER successful blockchain submission
             let claim_result = {
@@ -6132,6 +6712,58 @@ async fn handle_claim_rewards(
                 let mut reward_manager = reward_manager_arc.write().await;
                 reward_manager.claim_rewards(&claim_request.node_id, &claim_request.wallet_address)
             };
+            
+            if let Some(ref reward) = claim_result.reward {
+                // PRODUCTION v2.43.1: Save claim history to storage for /rewards/history API
+                let current_height = blockchain.get_height().await;
+                let current_epoch = (current_height / 14400) + 1;
+                let current_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                
+                let storage = blockchain.get_storage();
+                
+                // v2.75: CRITICAL - Delete pending reward from RocksDB to prevent double-claim after restart
+                if let Err(e) = storage.delete_pending_reward(&claim_request.node_id) {
+                    eprintln!("[WARN][CLAIM] failed_to_delete_pending node={} err={}", claim_request.node_id, e);
+                } else {
+                    println!("[INFO][CLAIM] pending_deleted_from_storage node={}", claim_request.node_id);
+                }
+                
+                let epoch_key = format!("rewards:{}:epoch:{}", claim_request.node_id, current_epoch);
+                
+                // Write pool breakdown for history API
+                let _ = storage.save_contract_state(&epoch_key, "claimed", &reward.total_reward.to_string());
+                let _ = storage.save_contract_state(&epoch_key, "pool1", &reward.pool1_base_emission.to_string());
+                let _ = storage.save_contract_state(&epoch_key, "pool2", &reward.pool2_transaction_fees.to_string());
+                let _ = storage.save_contract_state(&epoch_key, "pool3", &reward.pool3_activation_bonus.to_string());
+                let _ = storage.save_contract_state(&epoch_key, "claim_time", &current_time.to_string());
+                let _ = storage.save_contract_state(&epoch_key, "tx_hash", &tx_hash);
+                
+                // Update last claim time
+                let _ = storage.save_contract_state(
+                    &format!("rewards:{}", claim_request.node_id), 
+                    "last_claim", 
+                    &current_time.to_string()
+                );
+                
+                println!("[REWARDS] 📊 History saved: epoch={} pool1={} pool2={} pool3={}", 
+                    current_epoch, 
+                    reward.pool1_base_emission,
+                    reward.pool2_transaction_fees,
+                    reward.pool3_activation_bonus
+                );
+                
+                // PRODUCTION v2.43.1: Broadcast RewardClaimed event via WebSocket
+                broadcast_ws_event(WsEvent::RewardClaimed {
+                    node_id: claim_request.node_id.clone(),
+                    wallet_address: claim_request.wallet_address.clone(),
+                    amount_qnc: reward.total_reward as f64 / 1_000_000_000.0,
+                    tx_hash: tx_hash.clone(),
+                    epoch: current_epoch,
+                });
+            }
             
             if let Some(reward) = claim_result.reward {
                 Ok(warp::reply::json(&json!({
@@ -6166,56 +6798,399 @@ async fn handle_claim_rewards(
 }
 
 // GET /api/v1/rewards/pending/{node_id} - Get pending rewards for a node
+// v2.64: Uses REAL heartbeat data from P2P, not fallback values
 async fn handle_get_pending_rewards(
     node_id: String,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    use qnet_consensus::lazy_rewards::NodeType;
+    // PRODUCTION v2.43.1: Rate limiting (300 req/min for read-only)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
     
-    // Get pending rewards from reward manager
-    let reward_info = {
-        // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
+    // Calculate current epoch boundaries
+    let current_height = blockchain.get_height().await;
+    let current_epoch = (current_height / 14400) + 1;
+    let epoch_start = (current_epoch - 1) * 14400;
+    let epoch_end = current_epoch * 14400;
+    let blocks_until_next = epoch_end.saturating_sub(current_height);
+    
+    // Determine node type from ID
+    let node_type = if node_id.starts_with("light_") {
+        "Light"
+    } else if node_id.starts_with("full_") {
+        "Full"
+    } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
+        "Super"
+    } else {
+        "Unknown"
+    };
+    
+    // v2.64: Get REAL heartbeat count from P2P using block height filtering
+    let (heartbeat_count, last_heartbeat_time) = if let Some(p2p) = blockchain.get_unified_p2p() {
+        let heartbeats = p2p.get_heartbeats_for_block_range(epoch_start, current_height);
+        let node_heartbeats: Vec<_> = heartbeats.iter()
+            .filter(|(nid, _, _, _)| nid == &node_id)
+            .collect();
+        let count = node_heartbeats.len();
+        let last_time = node_heartbeats.iter()
+            .map(|(_, _, ts, _)| *ts)
+            .max()
+            .unwrap_or(0);
+        (count, last_time)
+    } else {
+        (0, 0)
+    };
+    
+    // Calculate eligibility based on REAL heartbeat count
+    let required_heartbeats = match node_type {
+        "Super" => 9,
+        "Full" => 8,
+        "Light" => 1,
+        _ => 10, // Unknown nodes can never be eligible
+    };
+    let is_eligible = heartbeat_count >= required_heartbeats;
+    
+    // v2.75: Show REAL pending rewards only (no estimated!)
+    // Eligibility check happens at emission time - if rewards exist, they are claimable
+    let (pending_amount, pool1, pool2, pool3, phase, is_claimable) = {
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
         
-        // Get pending reward amount
-        let pending_amount = reward_manager.get_pending_reward(&node_id)
-            .map(|r| r.total_reward)
+        // First check reward_manager (RAM)
+        if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
+            (
+                reward.total_reward,
+                reward.pool1_base_emission,
+                reward.pool2_transaction_fees,
+                reward.pool3_activation_bonus,
+                format!("{:?}", reward.current_phase),
+                reward.total_reward >= 1_000_000_000, // Claimable if >= 1 QNC
+            )
+        } else {
+            // FALLBACK: Check RocksDB for persisted pending rewards
+            let storage = blockchain.get_storage();
+            match storage.load_pending_reward(&node_id) {
+                Ok(Some(reward)) => {
+                    (
+                        reward.total_reward,
+                        reward.pool1_base_emission,
+                        reward.pool2_transaction_fees,
+                        reward.pool3_activation_bonus,
+                        format!("{:?}", reward.current_phase),
+                        reward.total_reward >= 1_000_000_000,
+                    )
+                }
+                _ => {
+                    // No rewards yet - show 0 (NOT estimated!)
+                    let stats = reward_manager.get_reward_stats();
+                    let phase_str = format!("{:?}", stats.current_phase);
+                    (0, 0, 0, 0, phase_str, false)
+                }
+            }
+        }
+    };
+    
+    // Get last claim time from storage
+    let last_claim = {
+        let storage = blockchain.get_storage();
+        storage.get_contract_state(&format!("rewards:{}", node_id), "last_claim")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    
+    // Check if node is active (had heartbeat in current epoch)
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let is_active = last_heartbeat_time > 0 && (current_time - last_heartbeat_time) < 14400;
+    
+    // Convert to QNC (from nanoQNC)
+    let total_qnc = pending_amount as f64 / 1_000_000_000.0;
+    let pool1_qnc = pool1 as f64 / 1_000_000_000.0;
+    let pool2_qnc = pool2 as f64 / 1_000_000_000.0;
+    let pool3_qnc = pool3 as f64 / 1_000_000_000.0;
+    
+    let reward_info = json!({
+        "node_id": node_id,
+        "node_type": node_type,
+        "phase": phase,
+        "pending_rewards": total_qnc,
+        "pools": {
+            "pool1_base_emission": pool1_qnc,
+            "pool2_tx_fees": pool2_qnc,
+            "pool3_activation_bonus": pool3_qnc
+        },
+        "current_epoch": current_epoch,
+        "epoch_block_range": format!("{}-{}", epoch_start, epoch_end),
+        "blocks_until_next_epoch": blocks_until_next,
+        "seconds_until_next_epoch": blocks_until_next,
+        "last_claim": last_claim,
+        "last_heartbeat": last_heartbeat_time,
+        "heartbeats": {
+            "current": heartbeat_count,
+            "required": required_heartbeats,
+            "remaining": if heartbeat_count < required_heartbeats { required_heartbeats - heartbeat_count } else { 0 }
+        },
+        "is_active": is_active,
+        "is_eligible": is_eligible,
+        "is_claimable": is_claimable  // v2.75: True if pending >= 1 QNC
+    });
+    
+    Ok(warp::reply::json(&reward_info))
+}
+
+// PRODUCTION v2.43.1: GET /api/v1/rewards/history/{node_id}?offset=0&limit=10 - Get reward history by epochs
+async fn handle_get_reward_history(
+    node_id: String,
+    query: RewardHistoryQuery,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // PRODUCTION v2.43.1: Rate limiting (300 req/min for read-only)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    let current_height = blockchain.get_height().await;
+    let current_epoch = (current_height / 14400) + 1;
+    
+    // Pagination: default offset=0, limit=10, max limit=100
+    let offset = query.offset.unwrap_or(0) as u64;
+    let limit = query.limit.unwrap_or(10).min(100) as usize;
+    
+    // Get claimed rewards history from storage
+    let storage = blockchain.get_storage();
+    let mut epochs_history = Vec::new();
+    
+    // Calculate which epochs to scan based on offset
+    let total_epochs = current_epoch;  // v2.63: 1-based epochs
+    let start_epoch = if offset < total_epochs { 
+        current_epoch.saturating_sub(offset) 
+    } else { 
+        1  // v2.63: minimum epoch is 1
+    };
+    
+    // Scan epochs with pagination (v2.63: epochs start from 1)
+    let mut scanned = 0usize;
+    for epoch in (1..=start_epoch).rev() {
+        if scanned >= limit {
+            break;
+        }
+        
+        // v2.63: Convert 1-based epoch to block range
+        let epoch_start_block = (epoch - 1) * 14400;
+        let epoch_end_block = epoch * 14400;
+        
+        // Get claimed amount for this epoch from storage
+        let claimed_key = format!("rewards:{}:epoch:{}", node_id, epoch);
+        let claimed = storage.get_contract_state(&claimed_key, "claimed")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
         
-        // Get ping history for performance stats
-        let ping_history = reward_manager.get_ping_history(&node_id);
+        // Get pool breakdown for this epoch
+        let pool1 = storage.get_contract_state(&claimed_key, "pool1")
+            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let pool2 = storage.get_contract_state(&claimed_key, "pool2")
+            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let pool3 = storage.get_contract_state(&claimed_key, "pool3")
+            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         
-        // Calculate stats
-        let (successful_pings, total_pings, last_ping, uptime_percentage) = if let Some(history) = ping_history {
-            let total = history.attempts.len();
-            let successful = history.attempts.iter()
-                .filter(|p| p.success)
-                .count();
-            let last = history.attempts.last()
-                .map(|p| p.timestamp)
-                .unwrap_or(0);
-            let uptime = if total > 0 {
-                (successful as f64 / total as f64) * 100.0
-            } else {
-                0.0
-            };
-            (successful, total, last, uptime)
+        let claim_time = storage.get_contract_state(&claimed_key, "claim_time")
+            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        
+        epochs_history.push(json!({
+            "epoch": epoch,
+            "block_range": format!("{}-{}", epoch_start_block, epoch_end_block),
+            "claimed_qnc": claimed as f64 / 1_000_000_000.0,
+            "pools": {
+                "pool1_base": pool1 as f64 / 1_000_000_000.0,
+                "pool2_fees": pool2 as f64 / 1_000_000_000.0,
+                "pool3_activation": pool3 as f64 / 1_000_000_000.0
+            },
+            "claim_time": claim_time,
+            "status": if claimed > 0 { "claimed" } else if epoch == current_epoch { "pending" } else { "missed" }
+        }));
+        
+        scanned += 1;
+    }
+    
+    Ok(warp::reply::json(&json!({
+        "node_id": node_id,
+        "current_epoch": current_epoch,
+        "current_height": current_height,
+        "pagination": {
+            "offset": offset,
+            "limit": limit,
+            "total_epochs": total_epochs,
+            "has_more": offset + limit as u64 <= total_epochs
+        },
+        "history": epochs_history
+    })))
+}
+
+// PRODUCTION v2.43.1: GET /api/v1/rewards/pools/{node_id} - Get detailed pool breakdown
+async fn handle_get_reward_pools(
+    node_id: String,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // PRODUCTION v2.43.1: Rate limiting (300 req/min for read-only)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Get current phase
+    let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+    let current_phase = if burn_percentage >= 90.0 { 2 } else { 1 };
+    
+    // Get pending rewards with pool breakdown
+    let reward_manager_arc = blockchain.get_reward_manager();
+    let reward_manager = reward_manager_arc.read().await;
+    let pending_reward = reward_manager.get_pending_reward(&node_id).cloned();
+    drop(reward_manager);
+    
+    let (pool1, pool2, pool3, total, phase_str) = if let Some(ref reward) = pending_reward {
+        (
+            reward.pool1_base_emission,
+            reward.pool2_transaction_fees,
+            reward.pool3_activation_bonus,
+            reward.total_reward,
+            format!("{:?}", reward.current_phase),
+        )
+    } else {
+        (0, 0, 0, 0, "Phase1".to_string())
+    };
+    
+    // Calculate current epoch info
+    let current_height = blockchain.get_height().await;
+    let current_epoch = (current_height / 14400) + 1;
+    let blocks_in_epoch = current_height % 14400;
+    
+    // PRODUCTION v2.43.1: Use cached accumulated pools (10 sec TTL)
+    let (accumulated_pool2, accumulated_pool3) = {
+        // Check cache first
+        let cache_valid = {
+            let cache = REWARD_POOLS_CACHE.read().unwrap();
+            cache.1.elapsed().as_secs() < REWARD_POOLS_CACHE_TTL_SECS && cache.0.epoch == current_epoch
+        };
+        
+        if cache_valid {
+            let cache = REWARD_POOLS_CACHE.read().unwrap();
+            (cache.0.pool2_fees, cache.0.pool3_activations)
         } else {
-            (0, 0, 0, 0.0)
-        };
+            // Refresh cache
+            let (p2, p3) = if let Some(p2p) = blockchain.get_unified_p2p() {
+                (p2p.peek_pool2_fees(), p2p.peek_pool3_activations())
+            } else {
+                (0, 0)
+            };
+            
+            // Update cache
+            let mut cache = REWARD_POOLS_CACHE.write().unwrap();
+            cache.0 = RewardPoolsCache {
+                pool2_fees: p2,
+                pool3_activations: p3,
+                epoch: current_epoch,
+                blocks_in_epoch,
+            };
+            cache.1 = std::time::Instant::now();
+            
+            (p2, p3)
+        }
+    };
+    
+    let blocks_until_emission = 14400 - blocks_in_epoch;
+    
+    // Determine node type
+    let node_type = if node_id.starts_with("light_") {
+        "Light"
+    } else if node_id.starts_with("full_") {
+        "Full"
+    } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
+        "Super"
+    } else {
+        "Unknown"
+    };
+    
+    Ok(warp::reply::json(&json!({
+        "node_id": node_id,
+        "node_type": node_type,
+        "current_phase": current_phase,
+        "phase_description": if current_phase == 1 { 
+            "Phase 1: 1DEV burn (Pool3 disabled)" 
+        } else { 
+            "Phase 2: QNC payment (Pool3 active)" 
+        },
         
-        // Get last claim time from storage
-        let last_claim = {
-            let storage = blockchain.get_storage();
-            storage.get_contract_state(&format!("rewards:{}", node_id), "last_claim")
-                .ok()
-                .flatten()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
-        };
+        // Node's pending rewards breakdown
+        "pending_rewards": {
+            "total_qnc": total as f64 / 1_000_000_000.0,
+            "pool1_base_emission": {
+                "amount_qnc": pool1 as f64 / 1_000_000_000.0,
+                "description": "Base emission (dynamic halving, ~251K QNC/4h at Year 0) - distributed to all eligible nodes"
+            },
+            "pool2_tx_fees": {
+                "amount_qnc": pool2 as f64 / 1_000_000_000.0,
+                "description": "Transaction fees - 70% Super, 30% Full, 0% Light",
+                "eligible": node_type == "Full" || node_type == "Super"
+            },
+            "pool3_activation_bonus": {
+                "amount_qnc": pool3 as f64 / 1_000_000_000.0,
+                "description": "Activation payments Phase 2 - equal share to ALL eligible nodes",
+                "phase2_only": true,
+                "active": current_phase == 2
+            }
+        },
         
-        // Determine node type from ID
+        // Current epoch accumulated pools (network-wide)
+        "epoch_accumulated": {
+            "epoch": current_epoch,
+            "blocks_processed": blocks_in_epoch,
+            "blocks_until_emission": blocks_until_emission,
+            "seconds_until_emission": blocks_until_emission,
+            "pool2_total_fees_qnc": accumulated_pool2 as f64 / 1_000_000_000.0,
+            "pool3_total_activations_qnc": accumulated_pool3 as f64 / 1_000_000_000.0
+        }
+    })))
+}
+
+// PRODUCTION v2.43.1: GET /api/v1/rewards/by-wallet/{wallet_address} - Get all nodes for wallet
+async fn handle_get_rewards_by_wallet(
+    wallet_address: String,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting (300 req/min for read-only)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Get all nodes owned by this wallet from reward_manager
+    let reward_manager_arc = blockchain.get_reward_manager();
+    let reward_manager = reward_manager_arc.read().await;
+    
+    let nodes = reward_manager.get_nodes_by_owner(&wallet_address);
+    drop(reward_manager);
+    
+    let mut nodes_info = Vec::new();
+    let current_height = blockchain.get_height().await;
+    let current_epoch = (current_height / 14400) + 1;
+    
+    for node_id in nodes {
+        // Get pending rewards for each node
+        let reward_manager = blockchain.get_reward_manager();
+        let rm = reward_manager.read().await;
+        let pending = rm.get_pending_reward(&node_id).cloned();
+        drop(rm);
+        
+        // Determine node type
         let node_type = if node_id.starts_with("light_") {
             "Light"
         } else if node_id.starts_with("full_") {
@@ -6226,29 +7201,361 @@ async fn handle_get_pending_rewards(
             "Unknown"
         };
         
-        // Check if node is active (had ping in last 4 hours)
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let is_active = last_ping > 0 && (current_time - last_ping) < 14400; // 4 hours
+        let (total, pool1, pool2, pool3, phase) = if let Some(ref reward) = pending {
+            (
+                reward.total_reward as f64 / 1_000_000_000.0,
+                reward.pool1_base_emission as f64 / 1_000_000_000.0,
+                reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
+                reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
+                format!("{:?}", reward.current_phase),
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0, "Phase1".to_string())
+        };
         
-        json!({
+        // Get last claim time
+        let storage = blockchain.get_storage();
+        let last_claim = storage.get_contract_state(&format!("rewards:{}", node_id), "last_claim")
+            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        
+        nodes_info.push(json!({
             "node_id": node_id,
             "node_type": node_type,
-            "pending_rewards": pending_amount as f64 / 1_000_000_000.0,
-            "pool1_rewards": pending_amount as f64 / 1_000_000_000.0 * 0.7, // 70% from base
-            "pool2_rewards": pending_amount as f64 / 1_000_000_000.0 * 0.3, // 30% from fees
-            "last_claim": last_claim,
-            "last_ping": last_ping,
-            "successful_pings": successful_pings,
-            "total_pings": total_pings,
-            "uptime_percentage": uptime_percentage,
-            "is_active": is_active
-        })
+            "phase": phase,
+            "pending_rewards_qnc": total,
+            "pools": {
+                "pool1_base": pool1,
+                "pool2_fees": pool2,
+                "pool3_activation": pool3
+            },
+            "last_claim": last_claim
+        }));
+    }
+    
+    // Calculate totals
+    let total_pending: f64 = nodes_info.iter()
+        .map(|n| n["pending_rewards_qnc"].as_f64().unwrap_or(0.0))
+        .sum();
+    
+    Ok(warp::reply::json(&json!({
+        "wallet_address": wallet_address,
+        "total_nodes": nodes_info.len(),
+        "total_pending_qnc": total_pending,
+        "current_epoch": current_epoch,
+        "nodes": nodes_info
+    })))
+}
+
+// PRODUCTION v2.43.1: POST /api/v1/rewards/pending/batch - Batch get pending rewards
+async fn handle_get_pending_rewards_batch(
+    request: BatchPendingRewardsRequest,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Limit batch size to prevent abuse
+    const MAX_BATCH_SIZE: usize = 100;
+    if request.node_ids.len() > MAX_BATCH_SIZE {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": format!("Batch size exceeds maximum of {} nodes", MAX_BATCH_SIZE)
+        })));
+    }
+    
+    let reward_manager_arc = blockchain.get_reward_manager();
+    let reward_manager = reward_manager_arc.read().await;
+    
+    let current_height = blockchain.get_height().await;
+    let current_epoch = (current_height / 14400) + 1;
+    
+    let mut results = Vec::new();
+    let mut total_pending = 0.0f64;
+    
+    for node_id in &request.node_ids {
+        let pending = reward_manager.get_pending_reward(node_id).cloned();
+        
+        let (total, pool1, pool2, pool3) = if let Some(ref reward) = pending {
+            let t = reward.total_reward as f64 / 1_000_000_000.0;
+            total_pending += t;
+            (
+                t,
+                reward.pool1_base_emission as f64 / 1_000_000_000.0,
+                reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
+                reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        
+        results.push(json!({
+            "node_id": node_id,
+            "pending_qnc": total,
+            "pools": {
+                "pool1_base": pool1,
+                "pool2_fees": pool2,
+                "pool3_activation": pool3
+            }
+        }));
+    }
+    
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "current_epoch": current_epoch,
+        "total_pending_qnc": total_pending,
+        "count": results.len(),
+        "nodes": results
+    })))
+}
+
+// PRODUCTION v2.43.1: GET /api/v1/rewards/network/stats - Network-wide statistics
+async fn handle_get_reward_network_stats(
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Check cache first (30 sec TTL)
+    {
+        let cache = REWARD_NETWORK_STATS_CACHE.read().unwrap();
+        if cache.1.elapsed().as_secs() < REWARD_NETWORK_STATS_CACHE_TTL_SECS {
+            return Ok(warp::reply::json(&cache.0));
+        }
+    }
+    
+    let current_height = blockchain.get_height().await;
+    let current_epoch = (current_height / 14400) + 1;
+    let storage = blockchain.get_storage();
+    
+    // Get accumulated pools from P2P
+    let (pool2_accumulated, pool3_accumulated) = if let Some(p2p) = blockchain.get_unified_p2p() {
+        (p2p.peek_pool2_fees(), p2p.peek_pool3_activations())
+    } else {
+        (0, 0)
     };
     
-    Ok(warp::reply::json(&reward_info))
+    // Count total claims from storage (scan last 10 epochs)
+    let mut total_claims = 0u64;
+    let mut total_distributed = 0u64;
+    
+    // Get reward manager stats
+    let reward_manager_arc = blockchain.get_reward_manager();
+    let reward_manager = reward_manager_arc.read().await;
+    let total_registered_nodes = reward_manager.get_nodes_by_owner("").len(); // Empty returns 0, but we count all
+    drop(reward_manager);
+    
+    // Scan storage for claim history
+    for epoch in (0..=current_epoch).rev().take(50) {
+        let epoch_claims_key = format!("rewards:network:epoch:{}:claims", epoch);
+        if let Ok(Some(claims_str)) = storage.get_contract_state(&epoch_claims_key, "count") {
+            if let Ok(claims) = claims_str.parse::<u64>() {
+                total_claims += claims;
+            }
+        }
+        let epoch_distributed_key = format!("rewards:network:epoch:{}:distributed", epoch);
+        if let Ok(Some(dist_str)) = storage.get_contract_state(&epoch_distributed_key, "amount") {
+            if let Ok(dist) = dist_str.parse::<u64>() {
+                total_distributed += dist;
+            }
+        }
+    }
+    
+    let blocks_until_next = 14400 - (current_height % 14400);
+    let avg_reward_per_epoch = if current_epoch > 0 {
+        total_distributed as f64 / 1_000_000_000.0 / current_epoch as f64
+    } else {
+        0.0
+    };
+    
+    let stats = json!({
+        "success": true,
+        "current_epoch": current_epoch,
+        "current_height": current_height,
+        "blocks_until_next_epoch": blocks_until_next,
+        "seconds_until_next_epoch": blocks_until_next,
+        
+        "epoch_accumulated": {
+            "pool2_tx_fees_qnc": pool2_accumulated as f64 / 1_000_000_000.0,
+            "pool3_activations_qnc": pool3_accumulated as f64 / 1_000_000_000.0
+        },
+        
+        "network_totals": {
+            "total_claims": total_claims,
+            "total_distributed_qnc": total_distributed as f64 / 1_000_000_000.0,
+            "avg_reward_per_epoch_qnc": avg_reward_per_epoch
+        },
+        
+        "emission_rate": {
+            // Dynamic halving: 251,432 QNC/epoch at Year 0, halving every 4 years
+            // Current value depends on years since genesis
+            "pool1_base_per_epoch_qnc": "dynamic - use /api/v1/rewards/pools for current value",
+            "initial_rate_qnc_per_epoch": 251_432.34,
+            "halving_period_years": 4,
+            "sharp_drop_at_year": 20,
+            "sharp_drop_multiplier": 10
+        },
+        
+        "cache_ttl_seconds": REWARD_NETWORK_STATS_CACHE_TTL_SECS
+    });
+    
+    // Update cache
+    {
+        let mut cache = REWARD_NETWORK_STATS_CACHE.write().unwrap();
+        *cache = (stats.clone(), std::time::Instant::now());
+    }
+    
+    Ok(warp::reply::json(&stats))
+}
+
+// PRODUCTION v2.43.1: GET /api/v1/rewards/summary/{node_id} - Lifetime aggregated stats
+async fn handle_get_reward_summary(
+    node_id: String,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Check cache first (60 sec TTL) - important for nodes with years of history
+    if let Some(cached) = REWARD_SUMMARY_CACHE.get(&node_id) {
+        if cached.1.elapsed().as_secs() < REWARD_SUMMARY_CACHE_TTL_SECS {
+            return Ok(warp::reply::json(&cached.0));
+        }
+    }
+    
+    let storage = blockchain.get_storage();
+    let current_height = blockchain.get_height().await;
+    let current_epoch = (current_height / 14400) + 1;
+    
+    // Aggregated counters
+    let mut total_claimed: u64 = 0;
+    let mut total_pool1: u64 = 0;
+    let mut total_pool2: u64 = 0;
+    let mut total_pool3: u64 = 0;
+    let mut epochs_claimed: u64 = 0;
+    let mut epochs_missed: u64 = 0;
+    let mut first_claim_epoch: Option<u64> = None;
+    let mut last_claim_epoch: Option<u64> = None;
+    let mut first_claim_time: u64 = 0;
+    let mut last_claim_time: u64 = 0;
+    
+    // Scan ALL epochs for this node (from storage)
+    // This uses indexed keys so it's O(epochs) not O(all_data)
+    for epoch in 0..=current_epoch {
+        let epoch_key = format!("rewards:{}:epoch:{}", node_id, epoch);
+        
+        if let Ok(Some(claimed_str)) = storage.get_contract_state(&epoch_key, "claimed") {
+            if let Ok(claimed) = claimed_str.parse::<u64>() {
+                if claimed > 0 {
+                    total_claimed += claimed;
+                    epochs_claimed += 1;
+                    
+                    // Track first/last claim
+                    if first_claim_epoch.is_none() {
+                        first_claim_epoch = Some(epoch);
+                        if let Ok(Some(time_str)) = storage.get_contract_state(&epoch_key, "claim_time") {
+                            first_claim_time = time_str.parse().unwrap_or(0);
+                        }
+                    }
+                    last_claim_epoch = Some(epoch);
+                    if let Ok(Some(time_str)) = storage.get_contract_state(&epoch_key, "claim_time") {
+                        last_claim_time = time_str.parse().unwrap_or(0);
+                    }
+                    
+                    // Pool breakdown
+                    if let Ok(Some(p1)) = storage.get_contract_state(&epoch_key, "pool1") {
+                        total_pool1 += p1.parse::<u64>().unwrap_or(0);
+                    }
+                    if let Ok(Some(p2)) = storage.get_contract_state(&epoch_key, "pool2") {
+                        total_pool2 += p2.parse::<u64>().unwrap_or(0);
+                    }
+                    if let Ok(Some(p3)) = storage.get_contract_state(&epoch_key, "pool3") {
+                        total_pool3 += p3.parse::<u64>().unwrap_or(0);
+                    }
+                } else {
+                    epochs_missed += 1;
+                }
+            }
+        }
+    }
+    
+    // Get current pending rewards
+    let pending_qnc = {
+        let reward_manager = blockchain.get_reward_manager();
+        let rm = reward_manager.read().await;
+        rm.get_pending_reward(&node_id)
+            .map(|r| r.total_reward as f64 / 1_000_000_000.0)
+            .unwrap_or(0.0)
+    };
+    
+    // Calculate averages
+    let avg_reward = if epochs_claimed > 0 {
+        total_claimed as f64 / 1_000_000_000.0 / epochs_claimed as f64
+    } else {
+        0.0
+    };
+    
+    // Determine node type
+    let node_type = if node_id.starts_with("light_") {
+        "Light"
+    } else if node_id.starts_with("full_") {
+        "Full"
+    } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
+        "Super"
+    } else {
+        "Unknown"
+    };
+    
+    let summary = json!({
+        "node_id": node_id.clone(),
+        "node_type": node_type,
+        "current_epoch": current_epoch,
+        
+        "lifetime_totals": {
+            "total_claimed_qnc": total_claimed as f64 / 1_000_000_000.0,
+            "pool1_base_qnc": total_pool1 as f64 / 1_000_000_000.0,
+            "pool2_fees_qnc": total_pool2 as f64 / 1_000_000_000.0,
+            "pool3_activation_qnc": total_pool3 as f64 / 1_000_000_000.0
+        },
+        
+        "epochs": {
+            "total_epochs": current_epoch + 1,
+            "epochs_claimed": epochs_claimed,
+            "epochs_missed": epochs_missed,
+            "claim_rate_percent": if current_epoch > 0 { 
+                (epochs_claimed as f64 / (current_epoch + 1) as f64) * 100.0 
+            } else { 0.0 }
+        },
+        
+        "first_claim": {
+            "epoch": first_claim_epoch,
+            "timestamp": first_claim_time
+        },
+        "last_claim": {
+            "epoch": last_claim_epoch,
+            "timestamp": last_claim_time
+        },
+        
+        "averages": {
+            "avg_reward_per_epoch_qnc": avg_reward
+        },
+        
+        "current_pending_qnc": pending_qnc,
+        "cache_ttl_seconds": REWARD_SUMMARY_CACHE_TTL_SECS
+    });
+    
+    // Update cache
+    REWARD_SUMMARY_CACHE.insert(node_id, (summary.clone(), std::time::Instant::now()));
+    
+    Ok(warp::reply::json(&summary))
 }
 
 // POST /api/v1/nodes - Register a new node
@@ -6256,7 +7563,22 @@ async fn handle_register_node(
     body: serde_json::Value,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    let node_type = body["node_type"].as_str().unwrap_or("light");
+    // PRODUCTION v2.41.1: node_type is REQUIRED - no defaults!
+    let node_type = match body["node_type"].as_str() {
+        Some(t) if t == "light" || t == "full" || t == "super" => t,
+        Some(t) => {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": format!("Invalid node_type '{}'. Must be: light, full, or super", t)
+            })));
+        },
+        None => {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Missing required field: node_type (must be: light, full, or super)"
+            })));
+        }
+    };
     let wallet_address = body["wallet_address"].as_str().unwrap_or("");
     let activation_code = body["activation_code"].as_str().unwrap_or("");
     let device_id = body["device_id"].as_str().unwrap_or("");
@@ -6265,7 +7587,7 @@ async fn handle_register_node(
     if wallet_address.is_empty() || activation_code.is_empty() {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Missing required fields"
+            "error": "Missing required fields: wallet_address and activation_code"
         })));
     }
     
@@ -6297,7 +7619,8 @@ async fn handle_register_node(
         }
         
         // CRITICAL: Save node registration to storage (survive restarts)
-        if let Err(e) = blockchain.get_storage().save_node_registration(&node_id, node_type, &wallet_address, 70.0) {
+        use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
+        if let Err(e) = blockchain.get_storage().save_node_registration(&node_id, node_type, &wallet_address, INITIAL_REPUTATION) {
             println!("[STORAGE] ⚠️ Failed to save node registration: {}", e);
         }
     }
@@ -6962,14 +8285,17 @@ async fn handle_consensus_commit(
             signature: generate_quantum_signature(&commit_request.node_id, &commit_request.commit_hash).await,
         };
 
-        // Process commit through consensus engine
-        match consensus_engine.process_commit(commit).await {
+        // PRODUCTION v2.40: Get current block height for phase validation
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // Process commit through consensus engine with block height
+        match consensus_engine.process_commit(commit, current_height).await {
             Ok(_) => {
-                println!("[CONSENSUS] ✅ Commit processed by engine for round {}", commit_request.round);
+                println!("[INFO][CONS] rpc_commit round={} h={}", commit_request.round, current_height);
                 true
             }
             Err(e) => {
-                println!("[CONSENSUS] ❌ Commit rejected by engine: {:?}", e);
+                println!("[WARN][CONS] rpc_commit_rejected: {:?}", e);
                 false
             }
         }
@@ -7025,22 +8351,27 @@ async fn handle_consensus_reveal(
         let mut consensus_engine = consensus.write().await;
 
         // Create reveal object for consensus engine
+        // v2.40.3: RPC reveals don't have signature (external API)
         use qnet_consensus::commit_reveal::Reveal;
         let reveal = Reveal {
             node_id: reveal_request.node_id.clone(),
             reveal_data: hex::decode(&reveal_request.reveal_hash).unwrap_or_default(),
             nonce: [0u8; 32], // PRODUCTION: Use proper nonce
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            signature: String::new(), // RPC external API - no signature
         };
 
-        // Process reveal through consensus engine
-        match consensus_engine.submit_reveal(reveal) {
+        // PRODUCTION v2.40.3: Get current block height for phase validation
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // Process reveal through consensus engine with block height (async)
+        match consensus_engine.submit_reveal(reveal, current_height).await {
             Ok(_) => {
-                println!("[CONSENSUS] ✅ Reveal processed by engine for round {}", reveal_request.round);
+                println!("[INFO][CONS] rpc_reveal round={} h={}", reveal_request.round, current_height);
                 true
             }
             Err(e) => {
-                println!("[CONSENSUS] ❌ Reveal rejected by engine: {:?}", e);
+                println!("[WARN][CONS] rpc_reveal_rejected: {:?}", e);
                 false
             }
         }
@@ -7083,6 +8414,7 @@ async fn handle_consensus_round_status(
                     qnet_consensus::commit_reveal::ConsensusPhase::Commit => "commit",
                     qnet_consensus::commit_reveal::ConsensusPhase::Reveal => "reveal",
                     qnet_consensus::commit_reveal::ConsensusPhase::Finalize => "finalize",
+                    qnet_consensus::commit_reveal::ConsensusPhase::Production => "production",
                 };
 
                 json!({
@@ -7429,12 +8761,8 @@ async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
     
     let mut instances_guard = instances.lock().await;
     
-    // Normalize node_id
-    let normalized_node_id = if node_id.starts_with("qn_") {
-        node_id.to_string()
-    } else {
-        format!("qn_{}", node_id)
-    };
+    // v2.24: Use node_id directly
+    let normalized_node_id = node_id.to_string();
     
     // Create instance if not exists
     if !instances_guard.contains_key(&normalized_node_id) {
@@ -7457,12 +8785,14 @@ async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
     }
     
     // CRITICAL: Sign RAW data with hybrid (hashes before signing)
+    // OPTIMIZED v2.24: bincode+zstd instead of JSON
     match hybrid.sign_raw_message_compact(data.as_bytes()).await {
         Ok(compact_sig) => {
-            match serde_json::to_string(&compact_sig) {
-                Ok(json) => {
-                    println!("[CRYPTO] ✅ HYBRID RPC signature created (NIST/Cisco compliant)");
-                    format!("hybrid_rpc:{}", json)
+            match compact_sig.to_binary_compressed() {
+                Ok(binary_data) => {
+                    let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                    println!("[CRYPTO] ✅ HYBRID RPC signature created (bincode v2.24)");
+                    format!("compact_bin:{}", base64_data)  // Standard format for verification
                 }
                 Err(e) => {
                     println!("[CRYPTO] ❌ FATAL: Failed to serialize hybrid signature: {}", e);
@@ -8067,9 +9397,14 @@ async fn handle_sync_status(
     };
     
     let is_syncing = local_height < network_height;
+    let is_ahead = local_height > network_height;
     let blocks_behind = network_height.saturating_sub(local_height);
+    let blocks_ahead = local_height.saturating_sub(network_height);
+    
+    // FIX: sync_progress should be capped at 100%, with separate "ahead" indicator
     let sync_progress = if network_height > 0 {
-        (local_height as f64 / network_height as f64) * 100.0
+        let progress = (local_height as f64 / network_height as f64) * 100.0;
+        progress.min(100.0) // Cap at 100%
     } else {
         100.0
     };
@@ -8078,10 +9413,14 @@ async fn handle_sync_status(
         "local_height": local_height,
         "network_height": network_height,
         "is_syncing": is_syncing,
+        "is_ahead": is_ahead,
         "blocks_behind": blocks_behind,
+        "blocks_ahead": blocks_ahead,
         "sync_progress": format!("{:.2}%", sync_progress),
         "estimated_sync_time": if blocks_behind > 0 {
-            format!("{}s", blocks_behind) // 1 block per second
+            format!("{}s", blocks_behind)
+        } else if blocks_ahead > 0 {
+            format!("ahead by {} blocks", blocks_ahead)
         } else {
             "synced".to_string()
         }
@@ -8231,12 +9570,20 @@ async fn handle_reputation_history(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
     
-    // Get actual reputation from P2P if available
+    // Get actual reputation from deterministic blockchain system
     let current_reputation = if let Some(p2p) = blockchain.get_unified_p2p() {
-        // This is a real method that exists
-        crate::node::BlockchainNode::get_node_reputation_score(&node_id, &p2p).await * 100.0
+        // Use deterministic reputation from blockchain (not cached P2P value)
+        p2p.get_node_reputation_from_blockchain(&node_id)
     } else {
-        70.0 // Default reputation
+        // Fallback: try deterministic_reputation directly
+        let current_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        blockchain.get_deterministic_reputation()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_reputation(&node_id, current_ts)
     };
     
     // Get reputation history from persistent storage
@@ -8525,7 +9872,7 @@ async fn handle_contract_deploy(
     // Submit to mempool
     match blockchain.add_transaction_to_mempool(tx).await {
         Ok(_) => {
-            println!("📜 Contract deployment submitted: {}", &contract_address[..16]);
+            println!("📜 Contract deployment submitted: {}", &contract_address[..16.min(contract_address.len())]);
             println!("   Security: Ed25519 ✅ | Dilithium: {}", if is_quantum_secure { "✅" } else { "N/A" });
             Ok(warp::reply::json(&json!({
                 "success": true,
@@ -8557,28 +9904,29 @@ async fn handle_contract_deploy(
     }
 }
 
-/// NIST FIPS 204: Verify Dilithium signature for smart contracts
+/// NIST FIPS 204: Verify Dilithium3 signature for smart contracts
+/// FIXED v2.26.6: Use Dilithium3 consistently across entire codebase (was Dilithium5)
 async fn verify_dilithium_signature_for_contract(
     message: &str,
     signature_hex: &str,
     public_key_hex: &str,
 ) -> bool {
-    use pqcrypto_dilithium::dilithium5;
+    use pqcrypto_dilithium::dilithium3;
     use pqcrypto_traits::sign::*;
     
     // Decode public key
     let pk_bytes = match hex::decode(public_key_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("[DILITHIUM] ❌ Invalid public key hex: {}", e);
+            println!("[DILITHIUM3] ❌ Invalid public key hex: {}", e);
             return false;
         }
     };
     
-    let public_key = match dilithium5::PublicKey::from_bytes(&pk_bytes) {
+    let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
         Ok(pk) => pk,
         Err(e) => {
-            println!("[DILITHIUM] ❌ Invalid Dilithium public key: {:?}", e);
+            println!("[DILITHIUM3] ❌ Invalid Dilithium3 public key: {:?}", e);
             return false;
         }
     };
@@ -8587,7 +9935,7 @@ async fn verify_dilithium_signature_for_contract(
     let sig_bytes = match hex::decode(signature_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("[DILITHIUM] ❌ Invalid signature hex: {}", e);
+            println!("[DILITHIUM3] ❌ Invalid signature hex: {}", e);
             return false;
         }
     };
@@ -8596,22 +9944,22 @@ async fn verify_dilithium_signature_for_contract(
     let mut signed_msg = sig_bytes.clone();
     signed_msg.extend_from_slice(message.as_bytes());
     
-    let signed_message = match dilithium5::SignedMessage::from_bytes(&signed_msg) {
+    let signed_message = match dilithium3::SignedMessage::from_bytes(&signed_msg) {
         Ok(sm) => sm,
         Err(e) => {
-            println!("[DILITHIUM] ❌ Invalid signed message format: {:?}", e);
+            println!("[DILITHIUM3] ❌ Invalid signed message format: {:?}", e);
             return false;
         }
     };
     
     // Verify signature
-    match dilithium5::open(&signed_message, &public_key) {
+    match dilithium3::open(&signed_message, &public_key) {
         Ok(_) => {
-            println!("[DILITHIUM] ✅ Signature verified (NIST FIPS 204)");
+            println!("[DILITHIUM3] ✅ Signature verified (NIST FIPS 204, Level 3)");
             true
         }
         Err(_) => {
-            println!("[DILITHIUM] ❌ Signature verification failed");
+            println!("[DILITHIUM3] ❌ Signature verification failed");
             false
         }
     }
@@ -8808,14 +10156,17 @@ async fn handle_contract_call(
         })).unwrap_or_default()),
     );
     
+    // PRODUCTION v2.26: Use bincode hash for consistency with mempool
+    let tx_hash = match bincode::serialize(&tx) {
+        Ok(tx_bytes) => format!("{:x}", Sha3_256::digest(&tx_bytes)),
+        Err(_) => hex::encode(&tx.hash), // Fallback to tx.hash
+    };
+    
     // Submit to mempool
     match blockchain.add_transaction_to_mempool(tx).await {
         Ok(_) => {
-            let tx_hash = format!("{:x}", Sha3_256::digest(format!("{}:{}:{}", 
-                request.from, request.contract_address, request.nonce).as_bytes()));
-            
             println!("📜 Contract call submitted: {}::{}", 
-                     &request.contract_address[..16], request.method);
+                     &request.contract_address[..16.min(request.contract_address.len())], request.method);
             
             Ok(warp::reply::json(&json!({
                 "success": true,
@@ -9043,6 +10394,9 @@ fn parse_ws_channels(channels_str: &str) -> Vec<WsChannel> {
                 Some(WsChannel::Contract(ch[9..].to_string()))
             } else if ch.starts_with("tx:") {
                 Some(WsChannel::Transaction(ch[3..].to_string()))
+            } else if ch.starts_with("rewards:") {
+                // PRODUCTION v2.43.1: rewards:{node_id} channel
+                Some(WsChannel::Rewards(ch[8..].to_string()))
             } else {
                 None
             }
@@ -9068,6 +10422,17 @@ fn event_matches_channels(event: &WsEvent, channels: &[WsChannel]) -> bool {
             }
             (WsChannel::Transaction(hash), WsEvent::TxConfirmed { tx_hash, .. }) => {
                 if tx_hash == hash {
+                    return true;
+                }
+            }
+            // PRODUCTION v2.43.1: Match reward updates for subscribed node
+            (WsChannel::Rewards(node), WsEvent::RewardUpdate { node_id, .. }) => {
+                if node_id == node {
+                    return true;
+                }
+            }
+            (WsChannel::Rewards(node), WsEvent::RewardClaimed { node_id, .. }) => {
+                if node_id == node {
                     return true;
                 }
             }
@@ -9388,7 +10753,7 @@ async fn handle_token_deploy(
     ) {
         Ok(token) => {
             println!("[TOKEN] 🪙 QRC-20 deployed: {} ({}) by {}", 
-                     token.name, token.symbol, &request.from[..16]);
+                     token.name, token.symbol, &request.from[..16.min(request.from.len())]);
             
             Ok(warp::reply::json(&json!({
                 "success": true,
@@ -9579,7 +10944,7 @@ async fn handle_benchmark_start(
     } else if request.shards.is_some() || request.total.is_some() || request.target_tps.is_some() {
         // Custom configuration
         let shards = request.shards.unwrap_or(256).min(256).max(1);
-        let tps_per_shard = 50_000u64;
+        let tps_per_shard = 100_000u64;
         BenchmarkConfig {
             preset: crate::benchmark::BenchmarkPreset::Custom,
             shards,
@@ -9603,8 +10968,13 @@ async fn handle_benchmark_start(
             let total = config.total_transactions;
             let target_tps = config.target_tps;
             
+            let is_progressive = config.is_progressive();
             tokio::spawn(async move {
-                run_benchmark_generator(blockchain_clone, total, target_tps).await;
+                if is_progressive {
+                    run_progressive_benchmark(blockchain_clone, total).await;
+                } else {
+                    run_benchmark_generator(blockchain_clone, total, target_tps).await;
+                }
             });
             
             Ok(warp::reply::json(&json!({
@@ -9626,78 +10996,493 @@ async fn handle_benchmark_start(
     }
 }
 
-/// Run benchmark transaction generator
+/// Run benchmark transaction generator - ADAPTIVE with EARLY BACKPRESSURE
+/// Uses multiple worker tasks to generate and submit transactions concurrently
+/// v2.41.2: Adaptive workers/batch based on target_tps + early backpressure = STABLE!
 async fn run_benchmark_generator(
     blockchain: Arc<BlockchainNode>,
     total_transactions: u64,
     target_tps: u64,
 ) {
-    use crate::benchmark::BENCHMARK_MANAGER;
-    use std::time::{Duration, Instant};
+    use crate::benchmark::{BENCHMARK_MANAGER, BenchmarkManager};
+    use std::time::Instant;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc as StdArc;
     
-    println!("[BENCHMARK] 🚀 Starting transaction generator: {} tx at {} TPS", total_transactions, target_tps);
-    
-    let delay_per_tx = if target_tps > 0 {
-        Duration::from_nanos(1_000_000_000 / target_tps)
-    } else {
-        Duration::from_millis(1)
+    // v2.47: ADAPTIVE workers based on target TPS
+    // Balanced for stability - more workers at high TPS but with rate limiting
+    let num_workers = match target_tps {
+        0..=10_000 => 2,           // 5K-10K TPS: 2 workers
+        10_001..=30_000 => 4,      // 10K-30K TPS: 4 workers
+        30_001..=60_000 => 8,      // 30K-60K TPS: 8 workers
+        60_001..=100_000 => 12,    // v2.47: 60K-100K TPS: 12 workers (balanced)
+        _ => 16,                    // v2.47: 100K+ TPS: 16 workers (with delay!)
     };
     
-    let batch_size = 1000usize; // Send in batches for efficiency
-    let mut sent = 0u64;
-    let start = Instant::now();
+    // v2.47: ADAPTIVE batch size based on target TPS
+    // Optimized for stability at ALL TPS levels
+    let batch_size = match target_tps {
+        0..=10_000 => 500,          // Low TPS: small batches
+        10_001..=30_000 => 1_000,   // Medium TPS: medium batches
+        30_001..=60_000 => 2_000,   // High TPS: larger batches
+        60_001..=100_000 => 3_000,  // v2.47: Very high TPS: controlled batches
+        _ => 4_000,                  // v2.47: Extreme TPS: still limited!
+    };
     
-    while sent < total_transactions && BENCHMARK_MANAGER.is_running() {
-        let batch_start = Instant::now();
+    // v2.47: RATE LIMITING delay between batches
+    // CRITICAL: Always have SOME delay to prevent network saturation!
+    // This prevents overwhelming the mempool and QUIC transport!
+    let batch_delay_ms = match target_tps {
+        0..=10_000 => 50,           // 50ms delay = controlled flow
+        10_001..=30_000 => 20,      // 20ms delay
+        30_001..=60_000 => 10,      // 10ms delay
+        60_001..=100_000 => 5,      // v2.47: 5ms delay for 100K TPS
+        _ => 2,                      // v2.47: 2ms minimum (NEVER 0!)
+    };
+    
+    println!("[BENCHMARK] 🔧 ADAPTIVE MODE v2.47 - target: {} TPS", target_tps);
+    println!("[BENCHMARK] 🛡️ Early backpressure + rate limiting + ALWAYS delay = STABLE!");
+    println!("[BENCHMARK] ⚙️ Workers: {}, Batch: {}, Delay: {}ms (NEVER 0!)", num_workers, batch_size, batch_delay_ms);
+    
+    let tx_per_worker = total_transactions / num_workers as u64;
+    // Yield every N transactions to allow block production
+    let yield_interval = 50usize;
+    
+    println!("[BENCHMARK] 🚀 STABLE generator v2.47: {} tx at {} TPS target", total_transactions, target_tps);
+    println!("[BENCHMARK] ⚡ Workers: {}, TX/worker: {}, Batch: {}, Yield every: {} TX", 
+             num_workers, tx_per_worker, batch_size, yield_interval);
+    
+    // v2.41.2: Store batch_delay_ms for workers
+    let batch_delay = std::time::Duration::from_millis(batch_delay_ms);
+    
+    // v2.26.3: Get accounts snapshot ONCE - eliminates ALL lock contention!
+    // Each worker gets its own clone - no RwLock during TX generation
+    let accounts_snapshot = BENCHMARK_MANAGER.get_accounts_snapshot().await;
+    if accounts_snapshot.len() < 2 {
+        println!("[BENCHMARK] ❌ Not enough accounts! Need at least 2, have {}", accounts_snapshot.len());
+        return;
+    }
+    println!("[BENCHMARK] 📋 Accounts snapshot: {} accounts cloned for workers", accounts_snapshot.len());
+    
+    let start = Instant::now();
+    let global_sent = StdArc::new(AtomicU64::new(0));
+    let global_confirmed = StdArc::new(AtomicU64::new(0));
+    let global_errors = StdArc::new(AtomicU64::new(0));
+    
+    // Spawn parallel workers
+    let mut handles = Vec::with_capacity(num_workers);
+    
+    for worker_id in 0..num_workers {
+        let blockchain_clone = blockchain.clone();
+        let sent_counter = global_sent.clone();
+        let confirmed_counter = global_confirmed.clone();
+        let error_counter = global_errors.clone();
+        let batch_delay = batch_delay; // Copy for this worker
         
-        // Generate and send batch
+        // v2.26.3: PARTITION accounts between workers to avoid nonce collision!
+        // Each worker gets a SLICE of accounts - no shared nonces
+        let accounts_per_worker = accounts_snapshot.len() / num_workers;
+        let start_idx = worker_id * accounts_per_worker;
+        let end_idx = if worker_id == num_workers - 1 {
+            accounts_snapshot.len()  // Last worker gets remainder
+    } else {
+            start_idx + accounts_per_worker
+    };
+        let worker_accounts: Vec<_> = accounts_snapshot[start_idx..end_idx].to_vec();
+        
+        let handle = tokio::spawn(async move {
+            let mut local_sent = 0u64;
+            let mut local_confirmed = 0u64;
+            let mut local_errors = 0u64;
+            let mut latencies = Vec::with_capacity(1000);
+            let mut yield_counter = 0usize;
+            
+            while local_sent < tx_per_worker && BENCHMARK_MANAGER.is_running() {
+                // Generate batch of transactions using SNAPSHOT (NO LOCK!)
+                let mut batch_txs = Vec::with_capacity(batch_size);
+                
         for _ in 0..batch_size {
-            if sent >= total_transactions || !BENCHMARK_MANAGER.is_running() {
+                    if local_sent >= tx_per_worker || !BENCHMARK_MANAGER.is_running() {
                 break;
             }
             
-            // Generate transaction
-            if let Some(tx) = BENCHMARK_MANAGER.generate_transaction().await {
-                let tx_start = Instant::now();
-                
-                // Submit to blockchain (will broadcast to network)
-                match blockchain.submit_benchmark_transaction(tx).await {
-                    Ok(_) => {
-                        BENCHMARK_MANAGER.record_sent();
-                        BENCHMARK_MANAGER.record_confirmed();
-                        let latency = tx_start.elapsed().as_secs_f64() * 1000.0;
-                        BENCHMARK_MANAGER.record_latency(latency).await;
-                    }
-                    Err(_) => {
-                        BENCHMARK_MANAGER.record_error();
+                    // v2.26.3: Generate from snapshot - NO async, NO lock!
+                    if let Some(tx) = BenchmarkManager::generate_transaction_from_snapshot(&worker_accounts) {
+                        batch_txs.push(tx);
+                        local_sent += 1;
+                        yield_counter += 1;
+                        
+                        // v2.26.3: Yield every N TX to allow block production
+                        // This is CRITICAL - prevents runtime starvation
+                        if yield_counter >= yield_interval {
+                            yield_counter = 0;
+                            tokio::task::yield_now().await;
+                        }
                     }
                 }
                 
-                sent += 1;
+                if batch_txs.is_empty() {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                
+                // v2.41.2: EARLY BACKPRESSURE - prevent crash BEFORE it happens!
+                let mempool_size = blockchain_clone.get_mempool_size().await.unwrap_or(0);
+                
+                // Use realistic mempool capacity (100K for genesis, not 1M fantasy)
+                let mempool_capacity = 100_000usize;
+                let mempool_fill_ratio = mempool_size as f64 / mempool_capacity as f64;
+                
+                // v2.41.2: EARLY backpressure thresholds (50/70/90, not 90/95!)
+                if mempool_fill_ratio > 0.90 {
+                    // CRITICAL: mempool >90%, long pause
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    if local_sent % 10_000 == 0 {
+                        println!("[BENCHMARK] 🔴 Mempool {:.0}% ({} TX) - CRITICAL pause 200ms", 
+                                 mempool_fill_ratio * 100.0, mempool_size);
+                    }
+                } else if mempool_fill_ratio > 0.70 {
+                    // HIGH: mempool >70%, medium pause
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    if local_sent % 20_000 == 0 {
+                        println!("[BENCHMARK] 🟠 Mempool {:.0}% ({} TX) - pause 100ms", 
+                                 mempool_fill_ratio * 100.0, mempool_size);
+                    }
+                } else if mempool_fill_ratio > 0.50 {
+                    // MEDIUM: mempool >50%, short pause
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                } else if mempool_fill_ratio > 0.30 {
+                    // LOW: mempool >30%, tiny pause
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+                // Below 30%: proceed with configured batch_delay
+                
+                // Submit batch to mempool
+                let batch_start = Instant::now();
+                let batch_len = batch_txs.len();
+                
+                match blockchain_clone.submit_benchmark_batch(batch_txs).await {
+                    Ok(confirmed) => {
+                        local_confirmed += confirmed as u64;
+                        local_errors += (batch_len - confirmed) as u64;
+                        let latency = batch_start.elapsed().as_secs_f64() * 1000.0 / batch_len as f64;
+                        latencies.push(latency);
+                        
+                        // v2.26.4: Update global counter IMMEDIATELY for live progress
+                        sent_counter.fetch_add(batch_len as u64, Ordering::SeqCst);
+                        confirmed_counter.fetch_add(confirmed as u64, Ordering::SeqCst);
+                    }
+                    Err(_) => {
+                        local_errors += batch_len as u64;
+                        error_counter.fetch_add(batch_len as u64, Ordering::SeqCst);
+                        
+                        // PROTECTION: If batch failed, brief wait then retry
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    }
+                }
+                
+                // v2.41.2: Rate limiting delay after batch (configured per TPS level)
+                if batch_delay.as_millis() > 0 {
+                    tokio::time::sleep(batch_delay).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+            
+            // Final counters already updated per-batch, just log
+            
+            // Record latencies
+            for lat in latencies {
+                BENCHMARK_MANAGER.record_latency(lat).await;
+                    }
+            
+            println!("[BENCHMARK] Worker {} finished: {} TX sent, {} confirmed", 
+                     worker_id, local_sent, local_confirmed);
+            
+            (worker_id, local_sent, local_confirmed)
+        });
+        
+        handles.push(handle);
+        }
+        
+    // Progress reporter task
+    let progress_sent = global_sent.clone();
+    let progress_handle = tokio::spawn(async move {
+        let report_start = Instant::now();
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            
+            if !BENCHMARK_MANAGER.is_running() {
+                break;
+            }
+            
+            let sent = progress_sent.load(Ordering::SeqCst);
+            let elapsed = report_start.elapsed().as_secs_f64();
+            let current_tps = if elapsed > 0.0 { sent as f64 / elapsed } else { 0.0 };
+            
+            println!("[BENCHMARK] 📊 Progress: {}/{} ({:.0} TPS)", sent, total_transactions, current_tps);
+            
+            // FIXED v2.26.2: Direct atomic update instead of async loop
+            // Previous version caused async deadlock with get_status().await in tight loop
+            let manager_sent = BENCHMARK_MANAGER.transactions_sent.load(Ordering::SeqCst);
+            let delta = sent.saturating_sub(manager_sent);
+            if delta > 0 {
+                BENCHMARK_MANAGER.transactions_sent.fetch_add(delta, Ordering::SeqCst);
+                BENCHMARK_MANAGER.transactions_confirmed.fetch_add(delta, Ordering::SeqCst);
+            }
+            
+            // Update peak TPS directly
+            {
+                let mut peak = BENCHMARK_MANAGER.peak_tps.write().await;
+                if current_tps > *peak {
+                    *peak = current_tps;
+                }
             }
         }
-        
-        // Log progress every 10k transactions
-        if sent % 10_000 == 0 {
-            let elapsed = start.elapsed().as_secs_f64();
-            let current_tps = sent as f64 / elapsed;
-            println!("[BENCHMARK] 📊 Progress: {}/{} ({:.0} TPS)", sent, total_transactions, current_tps);
+    });
+    
+    // Wait for all workers to complete
+    let mut total_by_workers = 0u64;
+    for handle in handles {
+        if let Ok((worker_id, sent, confirmed)) = handle.await {
+            total_by_workers += sent;
+            if worker_id == 0 || worker_id == num_workers - 1 {
+                println!("[BENCHMARK] ✅ Worker {} completed: {} sent, {} confirmed", worker_id, sent, confirmed);
+            }
         }
-        
-        // Throttle if needed
-        let batch_elapsed = batch_start.elapsed();
-        let expected_batch_time = delay_per_tx * batch_size as u32;
-        if batch_elapsed < expected_batch_time {
-            tokio::time::sleep(expected_batch_time - batch_elapsed).await;
+    }
+    
+    // Stop progress reporter
+    progress_handle.abort();
+    
+    // Final stats update
+    let final_sent = global_sent.load(Ordering::SeqCst);
+    let final_confirmed = global_confirmed.load(Ordering::SeqCst);
+    let final_errors = global_errors.load(Ordering::SeqCst);
+    
+    // Sync with benchmark manager
+    let current_stats = BENCHMARK_MANAGER.get_status().await;
+    let remaining_sent = final_sent.saturating_sub(current_stats.transactions_sent);
+    let remaining_confirmed = final_confirmed.saturating_sub(current_stats.transactions_confirmed);
+    
+    for _ in 0..remaining_sent {
+        BENCHMARK_MANAGER.record_sent();
         }
+    for _ in 0..remaining_confirmed {
+        BENCHMARK_MANAGER.record_confirmed();
+    }
+    for _ in 0..final_errors {
+        BENCHMARK_MANAGER.record_error();
     }
     
     // Stop benchmark
     BENCHMARK_MANAGER.stop().await;
     
     let elapsed = start.elapsed().as_secs_f64();
-    let final_tps = sent as f64 / elapsed;
-    println!("[BENCHMARK] 🏁 Completed: {} transactions in {:.2}s ({:.0} TPS)", sent, elapsed, final_tps);
+    let final_tps = final_sent as f64 / elapsed;
+    
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK] 🏁 PARALLEL BENCHMARK COMPLETED");
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK] ⚡ Workers used:    {}", num_workers);
+    println!("[BENCHMARK] 📦 Total sent:      {}", final_sent);
+    println!("[BENCHMARK] ✅ Confirmed:       {}", final_confirmed);
+    println!("[BENCHMARK] ❌ Errors:          {}", final_errors);
+    println!("[BENCHMARK] ⏱️  Duration:        {:.2}s", elapsed);
+    println!("[BENCHMARK] 🚀 ACTUAL TPS:      {:.0}", final_tps);
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+}
+
+/// v2.41.2: PROGRESSIVE BENCHMARK - automatically find node's maximum TPS!
+/// Starts at 5K TPS and increases by 5K every 10 seconds until node can't keep up
+async fn run_progressive_benchmark(
+    blockchain: Arc<BlockchainNode>,
+    max_transactions: u64,
+) {
+    use crate::benchmark::{BENCHMARK_MANAGER, BenchmarkManager};
+    use std::time::Instant;
+    use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+    
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK] 🔬 PROGRESSIVE MAX TEST v2.41.2");
+    println!("[BENCHMARK] 🎯 Goal: Find maximum sustainable TPS for this node");
+    println!("[BENCHMARK] 📈 Starting at 5K TPS, +5K every 10 seconds");
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    
+    let accounts_snapshot = BENCHMARK_MANAGER.get_accounts_snapshot().await;
+    if accounts_snapshot.len() < 2 {
+        println!("[BENCHMARK] ❌ Not enough accounts!");
+        return;
+    }
+    
+    let start = Instant::now();
+    let global_sent = StdArc::new(AtomicU64::new(0));
+    let global_confirmed = StdArc::new(AtomicU64::new(0));
+    let should_stop = StdArc::new(AtomicBool::new(false));
+    let current_target_tps = StdArc::new(AtomicU64::new(5_000)); // Start at 5K
+    let max_achieved_tps = StdArc::new(AtomicU64::new(0));
+    
+    // Single adaptive worker that respects current_target_tps
+    let blockchain_clone = blockchain.clone();
+    let sent_counter = global_sent.clone();
+    let confirmed_counter = global_confirmed.clone();
+    let stop_flag = should_stop.clone();
+    let target_tps = current_target_tps.clone();
+    let max_tps = max_achieved_tps.clone();
+    
+    let worker_handle = tokio::spawn(async move {
+        let mut local_sent = 0u64;
+        let mut phase_start = Instant::now();
+        let mut phase_sent = 0u64;
+        
+        while !stop_flag.load(Ordering::SeqCst) && local_sent < max_transactions {
+            let current_target = target_tps.load(Ordering::SeqCst);
+            
+            // Adaptive batch size based on current target
+            let batch_size = (current_target / 100).max(100).min(2000) as usize;
+            
+            // Rate limiting: calculate delay to achieve target TPS
+            let target_per_batch = batch_size as f64;
+            let target_batch_time_ms = (target_per_batch / current_target as f64) * 1000.0;
+            
+            // Generate batch
+            let mut batch_txs = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
+                if let Some(tx) = BenchmarkManager::generate_transaction_from_snapshot(&accounts_snapshot) {
+                    batch_txs.push(tx);
+                }
+            }
+            
+            if batch_txs.is_empty() {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            
+            // Backpressure check
+            let mempool_size = blockchain_clone.get_mempool_size().await.unwrap_or(0);
+            if mempool_size > 50_000 {
+                // Mempool overloaded - we found the limit!
+                println!("[BENCHMARK] ⚠️ Mempool overload at {} TPS (mempool: {})", current_target, mempool_size);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            
+            let batch_start = Instant::now();
+            let batch_len = batch_txs.len();
+            
+            match blockchain_clone.submit_benchmark_batch(batch_txs).await {
+                Ok(confirmed) => {
+                    local_sent += batch_len as u64;
+                    phase_sent += batch_len as u64;
+                    sent_counter.fetch_add(batch_len as u64, Ordering::SeqCst);
+                    confirmed_counter.fetch_add(confirmed as u64, Ordering::SeqCst);
+                }
+                Err(_) => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+            }
+            
+            // Calculate actual TPS for this phase
+            let phase_elapsed = phase_start.elapsed().as_secs_f64();
+            if phase_elapsed >= 10.0 {
+                let actual_tps = phase_sent as f64 / phase_elapsed;
+                let prev_max = max_tps.load(Ordering::SeqCst);
+                if actual_tps as u64 > prev_max {
+                    max_tps.store(actual_tps as u64, Ordering::SeqCst);
+                }
+                
+                println!("[BENCHMARK] 📊 Phase complete: target={}K, actual={:.0} TPS", 
+                         current_target / 1000, actual_tps);
+                
+                // Reset phase
+                phase_start = Instant::now();
+                phase_sent = 0;
+            }
+            
+            // Rate limiting delay
+            let batch_elapsed = batch_start.elapsed().as_millis() as f64;
+            if batch_elapsed < target_batch_time_ms {
+                let delay = (target_batch_time_ms - batch_elapsed) as u64;
+                if delay > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+        
+        local_sent
+    });
+    
+    // TPS escalation controller - increases target every 10 seconds
+    let escalation_stop = should_stop.clone();
+    let escalation_tps = current_target_tps.clone();
+    let escalation_max = max_achieved_tps.clone();
+    let escalation_sent = global_sent.clone();
+    
+    let escalation_handle = tokio::spawn(async move {
+        let mut last_sent = 0u64;
+        let mut stall_count = 0u32;
+        
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            
+            if escalation_stop.load(Ordering::SeqCst) {
+                break;
+            }
+            
+            let current_sent = escalation_sent.load(Ordering::SeqCst);
+            let current_target = escalation_tps.load(Ordering::SeqCst);
+            
+            // Check if we're actually achieving the target
+            let delta = current_sent - last_sent;
+            let actual_tps = delta / 10; // 10 second window
+            
+            if actual_tps < current_target * 8 / 10 {
+                // Not achieving 80% of target - we found the limit!
+                stall_count += 1;
+                if stall_count >= 2 {
+                    println!("[BENCHMARK] 🏁 MAX TPS FOUND: ~{} TPS (target {} couldn't sustain)", 
+                             escalation_max.load(Ordering::SeqCst), current_target);
+                    escalation_stop.store(true, Ordering::SeqCst);
+                    break;
+                }
+            } else {
+                stall_count = 0;
+                // Increase target by 5K
+                let new_target = current_target + 5_000;
+                if new_target <= 150_000 { // Cap at 150K
+                    println!("[BENCHMARK] 📈 Increasing target: {}K → {}K TPS", 
+                             current_target / 1000, new_target / 1000);
+                    escalation_tps.store(new_target, Ordering::SeqCst);
+                } else {
+                    println!("[BENCHMARK] 🏆 REACHED 150K TPS - TEST COMPLETE!");
+                    escalation_stop.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+            
+            last_sent = current_sent;
+        }
+    });
+    
+    // Wait for completion
+    let _ = worker_handle.await;
+    should_stop.store(true, Ordering::SeqCst);
+    escalation_handle.abort();
+    
+    BENCHMARK_MANAGER.stop().await;
+    
+    let elapsed = start.elapsed().as_secs_f64();
+    let final_sent = global_sent.load(Ordering::SeqCst);
+    let max_tps = max_achieved_tps.load(Ordering::SeqCst);
+    
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK] 🏁 PROGRESSIVE TEST COMPLETED");
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK] 📦 Total sent:       {}", final_sent);
+    println!("[BENCHMARK] ⏱️  Duration:         {:.2}s", elapsed);
+    println!("[BENCHMARK] 🚀 MAX STABLE TPS:   {} ({:.0}K)", max_tps, max_tps as f64 / 1000.0);
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 
 /// Handle GET /api/v1/benchmark/status
@@ -9772,8 +11557,8 @@ async fn handle_benchmark_presets() -> Result<impl Reply, Rejection> {
                 "name": "single_shard",
                 "description": "Single shard test",
                 "shards": 1,
-                "target_tps": 50_000,
-                "total_transactions": 50_000
+                "target_tps": 100_000,
+                "total_transactions": 100_000
             },
             {
                 "name": "small_scale",

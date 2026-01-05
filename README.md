@@ -44,7 +44,122 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.22 - November 30, 2025)**
+### 🚀 **LATEST UPDATES (v2.74.0 - January 3, 2026)**
+
+**🔍 Embedded RocksDB Indexing:**
+- **Built-in TX Index**: Fast O(1) transaction lookup via `tx_index` column family
+- **Address Index**: Fast O(1) address transaction history via `tx_by_address` column family
+- **No External Database**: All indexing in RocksDB (no PostgreSQL required)
+- **On-chain Node Registration**: `NodeRegistration` TX type for immutable wallet-to-node binding
+- **Explorer API**: Full block/transaction/address data with clickable hashes
+- **System TX Support**: Emission, reward distribution indexed correctly
+- **Dilithium Claim Option**: Post-quantum signatures for reward claims (free gas)
+
+**Key Architecture:**
+```
+Explorer → Node RPC (RocksDB)
+              ↓
+    - tx_index: hash → block_height (O(1))
+    - tx_by_address: address → [tx_hashes] (O(1))
+    - Single container deployment
+    - 100% data coverage
+```
+
+### 🛡️ **Previous Updates (v2.62.0 - December 30, 2025)**
+
+**🏛️ Per-Round Consensus Storage (Production L1 Architecture):**
+- **Independent Round Storage**: Each round has its own commits/reveals HashMap
+- **No Data Loss**: Round transitions don't destroy previous round data
+- **Parallel Rounds**: Multiple consensus rounds can coexist simultaneously  
+- **Automatic Cleanup**: Old rounds (>5 epochs) automatically purged
+- **100% First-Attempt Success**: Eliminates "Reveal doesn't match commit" errors
+- **Race Condition Fix**: Async tasks can't corrupt each other's data
+- **New API**: `finalize_round_by_number(round)`, `get_commits_for_round(round)`
+
+### 🛡️ **Previous Updates (v2.61.0 - December 29, 2025)**
+
+**🌍 Intercontinental Sync (Reliable USA↔Europe):**
+- **Size-Based Batching**: BlocksBatch max 1MB, MacroblocksBatch max 500KB
+- **ShredProtocol Unicast**: `send_block_via_shred_to_peer()` for blocks >1MB
+- **Repair Batching**: 10 chunks per batch with 5ms pacing
+- **Peer Heights Tracking**: `get_peer_heights()` from Dilithium-signed heartbeats
+- **Strict Sync Check**: Emergency producer must have prev block (N-1)
+- **is_new_chunk Dedup**: Prevents infinite forwarding loops
+- **Genesis Latency Fanout**: fanout=max(producers, 4) for high-latency networks
+
+### 🛡️ **Previous Updates (v2.57.0 - December 28, 2025)**
+
+**⚡ Stage Pipeline (Full Runtime Isolation):**
+- **BROADCAST_RUNTIME**: Dedicated threads for Shred protocol
+- **SIGVERIFY_RUNTIME**: Isolated Ed25519/Dilithium verification
+- **BANKING_RUNTIME**: Transaction intake and mempool ops
+- **REPLAY_RUNTIME**: State machine execution
+- **Adaptive Threading**: 2 cores→4t, 4 cores→5t, 8 cores→10t, 16 cores→20t
+- **Configurable**: `QNET_BROADCAST_THREADS`, `QNET_SIGVERIFY_THREADS`, etc.
+- **Result**: 3-4x TPS improvement, no starvation, consistent latency
+
+### 🛡️ **Previous Updates (v2.48.0 - December 25, 2025)**
+
+**🔧 Consensus Stability v2.48 (Round Mismatch Fix + Reveal Loss Prevention):**
+- **LAST_FINALIZED_CONSENSUS_ROUND**: Global atomic tracks ONLY successfully saved MacroBlocks
+- **Round Update at Save Only**: Prevents premature round advancement causing desync
+- **Reveal Loss Prevention**: Participant nodes don't reset consensus engine mid-round
+- **Dynamic Height Threshold**: 5/10/20 blocks based on network size (scalable resync)
+- **Signed Reveal Messages**: SHA3-256 + Dilithium hybrid signatures for reveals
+
+### 🛡️ **Previous Updates (v2.44.0 - December 24, 2025)**
+
+**🔄 Network Recovery v2.44 (Aggressive Catch-up + Round Tolerance):**
+- **Round Tolerance ±90**: Accept consensus messages within 1 epoch for fork recovery
+- **Aggressive Catch-up**: 15s/5 blocks threshold (was 120s/50) for fast stall recovery
+- **Byzantine Median Height**: Fresh network height from HealthPing peer data
+- **100K TPS Recovery**: Network self-heals after high-load stress tests
+
+### 🛡️ **Previous Updates (v2.41.1 - December 17, 2025)**
+
+**💓 Deterministic Reward Heartbeats v2.41:**
+- **On-Chain Recording**: Heartbeats stored in MacroBlock (not gossip)
+- **Emission MacroBlocks**: Heartbeats only in every 160th MacroBlock (4 hours)
+- **Strict Validation**: Unknown node_id formats REJECTED (no defaults)
+- **Full/Super**: 10 heartbeats per 4h (80%/90% threshold)
+- **Light Nodes**: Separate ping system (MIN_PING_SAMPLES = 10,000)
+
+**🎯 Block-Based Consensus Phases v2.40:**
+- **Deterministic Phases**: `get_phase_for_block(height)` - identical on ALL nodes
+- **No Local Transitions**: Phases determined by block height, not message counts
+- **Eliminated Cascade Jailing**: Timing issues are NOT offenses (no auto-jails)
+- **Grace Periods**: Commits accepted until block 78, reveals until block 90
+- **Phase Layout**: Commit (61-72) → Reveal (73-84) → Finalize (85-90)
+
+**🔐 On-Chain Slashing v2.38:**
+- **Cryptographic Proof Only**: Slashing requires on-chain evidence
+- **Double-Sign Detection**: 100% penalty + permanent ban
+- **No False Positives**: Network delays don't cause slashing
+
+### 🛡️ **Previous Updates (v2.31.0 - December 13, 2025)**
+
+**🛡️ 5-Layer Macroblock Protection v2.31:**
+- **Layer 1**: Unsync node sync (45s delay + 3 retries)
+- **Layer 2**: Not-validator sync (15s delay + 3 retries)
+- **Layer 3**: Boundary verify (45s delay + 3 retries)
+- **Layer 4**: Periodic check every 60s (last 10 macroblocks)
+- **Layer 5**: On-demand sync in calculate_qualified_candidates
+- **Rate Limiting**: Max 5 concurrent macroblock check tasks (prevents spawn storm)
+- **TaskGuard RAII**: Automatic cleanup of spawned tasks
+- **Proactive Fork Detection**: Rollback if local height > network on startup
+
+**🔐 Zero Fork Guarantee v2.30:**
+- **N-2 Entropy Source**: MacroBlock N-2 for producer selection (guaranteed finalization)
+- **Extended Genesis**: 180 blocks (not 90) for N-2 compatibility
+- **No Fallbacks**: Lagging nodes cannot participate - must sync first
+- **100% Determinism**: All nodes select same producer guaranteed
+- **Epoch-Based Validators**: Producer list from MacroBlock snapshots
+
+**🚀 State Machine & Reliability:**
+- **Explicit State Machine**: 27 integration points (Syncing, Producing, Error, etc.)
+- **Real Reputation**: DeterministicReputationState instead of hardcoded values
+- **Graceful Shutdown**: Certificate persistence on Ctrl+C/SIGTERM
+- **No Fallback Policy**: Desynchronized nodes excluded from production
 
 **🔐 NIST/Cisco Compliant Hybrid Cryptography:**
 - **Ephemeral Keys**: NEW Ed25519 keypair for EACH message (forward secrecy)
@@ -65,12 +180,28 @@ This project uses **dual licensing**:
 - **Fire-and-Forget Broadcast**: Shred Protocol block propagation no longer blocks production (1 block/sec guaranteed)
 - **Genesis Startup Wait**: 30-second network stabilization before block production (prevents race conditions)
 - **Emergency Timeout 10s**: Increased from 2s to allow original producer delivery
-- **Pseudo-Infinite Retries**: Blocks are NEVER discarded (like Solana/Ethereum)
+- **Pseudo-Infinite Retries**: Blocks are NEVER discarded
 - **Exponential Backoff**: 10s (retries 0-9) → 30s → 60s → 120s → 240s → 300s max
 - **Adaptive Buffer Size**: Full/Super nodes: 500 blocks (~50MB), Light nodes: 100 blocks (~10MB)
 - **Background Re-request**: Missing blocks automatically re-requested every 30s with backoff
 
-### 🛡️ **Latest Update (v2.20.0 - December 4, 2025)**
+### 🛡️ **Latest Update (v2.27.0 - December 11, 2025)**
+- **Epoch-Based Validator Set**: Deterministic producer selection from MacroBlock snapshots
+- **No Gossip Race Conditions**: All nodes use same producer list from blockchain
+- **EligibleProducer Struct**: `{ node_id, reputation, stake }` stored in MacroBlock
+- **Genesis Epoch Static**: Blocks 1-90 use `genesis_constants.rs` hardcoded list
+- **MAX_VALIDATORS_PER_EPOCH = 1000**: Scalable deterministic sampling
+
+### 🛡️ **Previous Update (v2.25.2 - December 9, 2025)**
+- **Batch Ed25519 Verification**: 3x faster signature verification using ed25519-dalek batch API
+- **Batch Mempool Operations**: 1 lock per 1000 TX instead of per-TX (1000x reduction)
+- **TX Accumulator**: Batch 1000 TX for verification, 100ms timeout
+- **Skip Self-Broadcast**: Producer doesn't broadcast TX to itself
+- **Snapshot Mempool**: Release lock early for DashMap reads
+- **HealthPing Height**: Accurate network_height every 15 seconds
+- **10K TX Batch Size**: Optimized for 100K TX/block throughput
+
+### 🛡️ **Previous Update (v2.20.0 - December 4, 2025)**
 - **Reputation System Fix**: Only INFLATION is an attack (DEFLATION is legitimate after penalties)
 - **Tolerance Increased**: 2% → 10% for network delays and sync timing
 - **Deterministic Producer Selection**: Round 0 uses Genesis + leadership_round as entropy
@@ -278,12 +409,12 @@ This project uses **dual licensing**:
   - 100 ticks per second (10ms intervals) for smooth entropy generation
   - 5,000 hashes per tick (optimized for 1-second microblocks)
   - Sequential ordering via SHA3-512 every 4th hash (limits parallelization, not formal VDF)
-  - Integrated into producer selection for unpredictable leader election
+  - Integrated into QRDS (Quantum-Resistant Deterministic Selection) for consensus
   - Checkpoint persistence with zstd compression (every 1M hashes)
   - Clock drift: 5-7% (excellent for production)
   - 72 bytes overhead per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
-- **Quantum-Resistant Producer Selection**: Deterministic selection with finality window, Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
+- **QRDS (Quantum-Resistant Deterministic Selection)**: SHA3-512 deterministic selection with FINALITY_WINDOW entropy, Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
 - **Hybrid Parallel Executor Execution**: 5-stage pipeline with 10,000 parallel transactions
 - **Adaptive BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
@@ -409,8 +540,10 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 **Cryptographic Approach:**
 - ✅ **Consensus Layer**: Real CRYSTALS-Dilithium3 (pqcrypto-dilithium 0.5) - fully post-quantum
 - ✅ **Node Signatures**: Hybrid Dilithium3 + Ed25519 with NIST/Cisco encapsulated keys
-- ⚠️ **Client Transactions**: Ed25519-only (NOT post-quantum, optimized for mobile/battery)
-- 🔄 **Migration Path**: Client layer upgrade planned when quantum threat becomes imminent (10-15 years)
+- ✅ **Client Transactions (v2.25)**: Ed25519 required + **optional Dilithium3** for quantum protection
+  - Standard TX: Ed25519 only (fast, low gas)
+  - Quantum TX: Ed25519 + Dilithium3 (+50% gas premium, post-quantum security)
+- 🔐 **Enterprise Option**: Optional Dilithium signatures for high-value transfers
 
 **Consensus Architecture:**
 - ⚠️ **Producer Selection**: Deterministic SHA3-512 (finality window), NOT true VRF with private keys
@@ -421,7 +554,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 **Security Trade-offs:**
 - ✅ **AES-256-GCM**: Grover-resistant (2^128 operations = 10^38 years attack time)
 - ✅ **Nonce Management**: CSPRNG with 2^96 space, 10^-10% collision probability
-- ⚠️ **Architecture Inspiration**: Shred Protocol propagation concept inspired by Solana (original implementation)
+- ⚠️ **ShredProtocol**: Original implementation with Reed-Solomon erasure coding
 - ✅ **Sybil Resistance**: Multi-layer (1DEV burn + QNC pool, reputation, time barrier, 67%+ coordination cost)
 
 ### 💾 Ultra-Modern Storage Architecture
@@ -623,7 +756,7 @@ QNet implements production-grade failover mechanisms for zero-downtime operation
 - **Participant Filter**: Only Full and Super nodes (Light nodes excluded for mobile optimization)
 - **Producer Readiness Validation**: Pre-creation checks (reputation ≥70%, network health, connectivity)
 - **Fixed Timeout Detection**: 5 seconds (deterministic for consensus safety across all nodes)
-- **Emergency Selection**: Deterministic fallback selection from qualified backup producers (SHA3-256 hash)
+- **Emergency Selection**: Deterministic fallback selection from qualified backup producers (SHA3-512 hash, v2.36 unified)
 - **Enhanced Status Visibility**: Comprehensive failover dashboard with recovery metrics
 - **Network Recovery**: <7 seconds automatic recovery time with full broadcast success tracking
 - **Reputation Impact**: -20.0 penalty for failed producer, +5.0 reward for emergency takeover
@@ -650,13 +783,13 @@ When all nodes fall below 70% reputation threshold:
 - **Progressive Penalties**: Escalating reputation penalties prevent repeated failures
 - **Network Transparency**: All failover events logged and broadcast to peers
 
-## 💎 Reputation System (v2.24 - Ethereum 2.0 Style Snapshots)
+## 💎 Reputation System (v2.24 - Deterministic Snapshots)
 
 **ARCHITECTURE v2.24:** Blockchain-based reputation with full state snapshots
 - All nodes compute identical reputation from on-chain data
 - Sybil-resistant: Cannot fake reputation via gossip
 - Deterministic: Verifiable by replaying blockchain from genesis
-- **NEW:** Full reputation snapshot in every macroblock (Ethereum 2.0 style)
+- **NEW:** Full reputation snapshot in every macroblock
 - **NEW:** Strict 30/30 rule - only FULL rotation gets reward!
 
 See full documentation: [docs/REPUTATION_SYSTEM.md](docs/REPUTATION_SYSTEM.md)
@@ -679,9 +812,10 @@ pub struct FullReputationSnapshot {
 |--------|------------|--------|-------------|
 | **Full Rotation** | +2.0 | block producer | **30/30 blocks only!** |
 | **Consensus Participation** | +1.0 | macroblock commit+reveal | Full participation |
-| **Invalid Block** | -20.0 | SlashingEvent in macroblock | Cryptographic proof |
-| **Double-Sign** | -50.0 + BAN | SlashingEvent | Both blocks as evidence |
-| **Chain Fork** | PERMANENT BAN | SlashingEvent | Fork evidence |
+| **Double-Sign** | -100% + BAN | SlashingEvent | 2 signatures at same height |
+| **Invalid Block** | -20% | SlashingEvent | Invalid signature/hash |
+| **Chain Fork** | -100% + BAN | SlashingEvent | Conflicting signed blocks |
+| **Missed Blocks** | 0 (no penalty) | — | **Not slashable** (no reward instead) |
 | **Passive Recovery** | +1.0/4h | online nodes 10-69% | Not jailed |
 | **Partial Rotation** | 0 | — | NO REWARD if <30 blocks! |
 
@@ -2159,10 +2293,11 @@ Layer 3: Coordination Complexity
 ├── Large networks: coordination becomes exponentially harder
 └── Example: 1M nodes network = 670K nodes must coordinate
 
-Layer 4: Reputation Slashing
-├── InvalidBlock: -20 points
-├── MaliciousBehavior: -50 points → jail
-├── DoubleSign: -100 points → instant jail
+Layer 4: Reputation Slashing (Cryptographic Proof Only)
+├── DoubleSign: -100% → permanent ban (proof: 2 sigs at same height)
+├── InvalidBlock: -20% (proof: bad signature/hash)
+├── ChainFork: -100% → permanent ban (proof: conflicting blocks)
+├── MissedBlocks: NOT slashable (no proof possible, use reputation decay)
 └── consensus_score < 70% → excluded from consensus
 
 Layer 5: Network Effects

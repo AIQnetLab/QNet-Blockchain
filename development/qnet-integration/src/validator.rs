@@ -70,9 +70,19 @@ impl BlockValidator {
         // Validate transaction type
         self.validate_transaction_type(&tx.tx_type)?;
         
-        // Validate signature if present
+        // Validate Ed25519 signature if present
         if let Some(ref signature) = tx.signature {
             self.validate_signature(tx, signature)?;
+        }
+        
+        // QUANTUM v2.25: Validate Dilithium signature if present
+        // This is OPTIONAL - TX can have Ed25519 only, or Ed25519 + Dilithium
+        if tx.dilithium_signature.is_some() {
+            if !self.verify_quantum_signature(tx)? {
+                return Err(IntegrationError::ValidationError(
+                    "Invalid Dilithium signature - quantum verification failed".to_string()
+                ));
+            }
         }
         
         Ok(())
@@ -104,8 +114,12 @@ impl BlockValidator {
     /// Verify transaction signature (Ed25519 or Hybrid)
     fn verify_ed25519_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
         // PRODUCTION: Support multiple signature formats
-        if signature_hex.starts_with("hybrid:") {
-            // Node hybrid signature (with certificate) - for consensus messages
+        // v2.24: Prioritize binary formats (bincode+zstd)
+        if signature_hex.starts_with("hybrid_bin:") {
+            // OPTIMIZED v2.24: Binary hybrid signature (bincode+zstd)
+            self.verify_hybrid_binary_signature(tx, signature_hex)
+        } else if signature_hex.starts_with("hybrid:") {
+            // Legacy: Node hybrid signature JSON (with certificate)
             self.verify_hybrid_signature(tx, signature_hex)
         } else if signature_hex.starts_with("dilithium_sig_") {
             // Pure Dilithium signature
@@ -113,6 +127,77 @@ impl BlockValidator {
         } else {
             // Ed25519 signature - requires public_key in transaction
             self.verify_ed25519_with_pubkey(tx, signature_hex)
+        }
+    }
+    
+    /// QUANTUM v2.25: Verify optional Dilithium signature for quantum-resistant TX
+    /// Returns Ok(true) if Dilithium signature is valid
+    /// Returns Ok(false) if Dilithium signature is present but invalid
+    /// Returns Ok(true) if no Dilithium signature (quantum signature is optional)
+    pub fn verify_quantum_signature(&self, tx: &Transaction) -> IntegrationResult<bool> {
+        // QUANTUM v2.25: Check if transaction has Dilithium signature
+        let dilithium_sig = match &tx.dilithium_signature {
+            Some(sig) if !sig.is_empty() => sig,
+            _ => return Ok(true), // No quantum signature - that's OK, it's optional
+        };
+        
+        let dilithium_pubkey = match &tx.dilithium_public_key {
+            Some(pk) if !pk.is_empty() => pk,
+            _ => return Err(IntegrationError::ValidationError(
+                "Dilithium signature present but missing dilithium_public_key".to_string()
+            )),
+        };
+        
+        println!("[VALIDATOR] 🔐 QUANTUM: Verifying Dilithium3 signature for TX from {}", tx.from);
+        
+        // Decode signature (~3293 bytes)
+        let sig_bytes = hex::decode(dilithium_sig)
+            .map_err(|e| IntegrationError::ValidationError(format!("Invalid Dilithium signature hex: {}", e)))?;
+        
+        // Decode public key (~1952 bytes)
+        let pubkey_bytes = hex::decode(dilithium_pubkey)
+            .map_err(|e| IntegrationError::ValidationError(format!("Invalid Dilithium public key hex: {}", e)))?;
+        
+        // Expected sizes for Dilithium3
+        const DILITHIUM3_SIG_SIZE: usize = 3293;
+        const DILITHIUM3_PK_SIZE: usize = 1952;
+        
+        if sig_bytes.len() != DILITHIUM3_SIG_SIZE {
+            return Err(IntegrationError::ValidationError(format!(
+                "Invalid Dilithium3 signature size: {} (expected {})", sig_bytes.len(), DILITHIUM3_SIG_SIZE
+            )));
+        }
+        
+        if pubkey_bytes.len() != DILITHIUM3_PK_SIZE {
+            return Err(IntegrationError::ValidationError(format!(
+                "Invalid Dilithium3 public key size: {} (expected {})", pubkey_bytes.len(), DILITHIUM3_PK_SIZE
+            )));
+        }
+        
+        // Create message to verify (same as Ed25519)
+        let message = self.create_client_signing_message(tx)?;
+        
+        // PRODUCTION: Real Dilithium3 verification
+        use pqcrypto_dilithium::dilithium3::{verify_detached_signature, PublicKey, DetachedSignature};
+        use pqcrypto_traits::sign::PublicKey as _;
+        use pqcrypto_traits::sign::DetachedSignature as _;
+        
+        let pk = PublicKey::from_bytes(&pubkey_bytes)
+            .map_err(|_| IntegrationError::ValidationError("Invalid Dilithium3 public key format".to_string()))?;
+        
+        let sig = DetachedSignature::from_bytes(&sig_bytes)
+            .map_err(|_| IntegrationError::ValidationError("Invalid Dilithium3 signature format".to_string()))?;
+        
+        match verify_detached_signature(&sig, &message, &pk) {
+            Ok(_) => {
+                println!("[VALIDATOR] ✅ QUANTUM: Dilithium3 signature verified for TX from {}", tx.from);
+                println!("[VALIDATOR] 🛡️ TX is POST-QUANTUM RESISTANT (+50% gas fee applied)");
+                Ok(true)
+            }
+            Err(_) => {
+                println!("[VALIDATOR] ❌ QUANTUM: Invalid Dilithium3 signature from {}", tx.from);
+                Ok(false)
+            }
         }
     }
     
@@ -163,7 +248,49 @@ impl BlockValidator {
         }
     }
     
-    /// Verify hybrid signature (O(1) performance with caching)
+    /// OPTIMIZED v2.24: Verify hybrid BINARY signature (bincode+zstd)
+    fn verify_hybrid_binary_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
+        use crate::hybrid_crypto::{HybridSignature, HybridCrypto};
+        use base64::{Engine as _, engine::general_purpose};
+        
+        // Parse binary signature: "hybrid_bin:<base64_bincode_zstd>"
+        let base64_data = &signature_hex[11..]; // Skip "hybrid_bin:" prefix
+        let binary_data = general_purpose::STANDARD.decode(base64_data)
+            .map_err(|e| IntegrationError::ValidationError(format!("Invalid base64 in hybrid_bin: {}", e)))?;
+        
+        let hybrid_sig: HybridSignature = HybridSignature::from_binary_compressed(&binary_data)
+            .map_err(|e| IntegrationError::ValidationError(format!("Invalid binary hybrid signature: {}", e)))?;
+        
+        // Create message to verify
+        let message = self.create_signing_message(tx)?;
+        
+        // Verify using hybrid crypto (with certificate caching)
+        let rt = tokio::runtime::Handle::try_current()
+            .or_else(|_| tokio::runtime::Runtime::new().map(|rt| rt.handle().clone()))
+            .map_err(|e| IntegrationError::ValidationError(format!("Runtime error: {}", e)))?;
+        
+        let result = rt.block_on(async {
+            let verifier = HybridCrypto::new(hybrid_sig.certificate.node_id.clone());
+            verifier.verify_signature(&message, &hybrid_sig).await
+        });
+        
+        match result {
+            Ok(valid) => {
+                if valid {
+                    println!("[VALIDATOR] ✅ Binary hybrid signature verified (v2.24 bincode)");
+                } else {
+                    println!("[VALIDATOR] ❌ Invalid binary hybrid signature");
+                }
+                Ok(valid)
+            }
+            Err(e) => {
+                println!("[VALIDATOR] ⚠️ Binary hybrid verification error: {}", e);
+                Ok(false)
+            }
+        }
+    }
+    
+    /// LEGACY: Verify hybrid JSON signature (O(1) performance with caching)
     fn verify_hybrid_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
         use crate::hybrid_crypto::{HybridSignature, HybridCrypto};
         use serde_json;
@@ -224,18 +351,13 @@ impl BlockValidator {
             .map_err(|e| IntegrationError::ValidationError(format!("Runtime error: {}", e)))?;
         
         let result = rt.block_on(async {
-            // OPTIMIZATION: Use GLOBAL crypto instance
-            use crate::node::GLOBAL_QUANTUM_CRYPTO;
+            // PRODUCTION v2.50: Lock-free quantum crypto
+            use crate::node::try_get_quantum_crypto;
             
-            let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-            if crypto_guard.is_none() {
-                let mut crypto = QNetQuantumCrypto::new();
-                if let Err(e) = crypto.initialize().await {
-                    return Err(anyhow::anyhow!("Crypto init failed: {}", e));
-                }
-                *crypto_guard = Some(crypto);
-            }
-            let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+            let crypto = match try_get_quantum_crypto() {
+                Some(c) => c,
+                None => return Err(anyhow::anyhow!("Quantum crypto not initialized")),
+            };
             crypto.verify_dilithium_signature(&message_str, &dilithium_sig, &tx.from).await
         });
         
@@ -472,6 +594,37 @@ impl BlockValidator {
                 }
                 
                 // Ping commitments are FREE system operations
+            }
+            TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, pool_address, .. } => {
+                // v2.50.0: DEX Swap transaction validation
+                if from.is_empty() {
+                    return Err(IntegrationError::ValidationError("Swap from address cannot be empty".to_string()));
+                }
+                if token_in.is_empty() || token_out.is_empty() {
+                    return Err(IntegrationError::ValidationError("Swap token identifiers cannot be empty".to_string()));
+                }
+                if token_in == token_out {
+                    return Err(IntegrationError::ValidationError("Cannot swap token for itself".to_string()));
+                }
+                if *amount_in == 0 {
+                    return Err(IntegrationError::ValidationError("Swap amount must be greater than 0".to_string()));
+                }
+                if pool_address.is_empty() {
+                    return Err(IntegrationError::ValidationError("DEX pool address cannot be empty".to_string()));
+                }
+                // amount_out_min can be 0 (no slippage protection - risky but allowed)
+                let _ = amount_out_min; // Explicitly mark as intentionally unused here
+                // Gas fee for swaps goes to Pool 2 (70% Super, 30% Full)
+            }
+            TransactionType::NodeRegistration { node_id, wallet_address, .. } => {
+                // v2.73: On-chain node registration validation
+                if node_id.is_empty() {
+                    return Err(IntegrationError::ValidationError("Node ID cannot be empty".to_string()));
+                }
+                if wallet_address.is_empty() {
+                    return Err(IntegrationError::ValidationError("Wallet address cannot be empty".to_string()));
+                }
+                // System transaction - no gas fees
             }
         }
         

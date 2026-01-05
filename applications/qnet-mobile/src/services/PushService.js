@@ -525,31 +525,60 @@ export async function checkServerNodeStatus(activationCode, nodeId = null) {
     const apiUrl = getRandomBootstrapNode();
     
     // GENESIS NODE SUPPORT: Convert Genesis activation code to node_id
-    // Genesis codes: QNET-BOOT-000X-STRAP → genesis_node_00X
+    // Genesis codes: QNET-BOOT-001-STRAP → genesis_node_001
     let queryParams = '';
-    const genesisMatch = activationCode?.match(/^QNET-BOOT-000([1-5])-STRAP$/);
+    const genesisMatch = activationCode?.match(/^QNET-BOOT-00([1-5])-STRAP$/);
     
     if (genesisMatch) {
       // Genesis node: use node_id format for API query
       const bootstrapId = genesisMatch[1].padStart(3, '0');
       const genesisNodeId = `genesis_node_${bootstrapId}`;
+      console.log(`[Push] Genesis node detected: ${activationCode} → ${genesisNodeId}`);
       queryParams = `node_id=${encodeURIComponent(genesisNodeId)}`;
+    } else if (nodeId) {
+      // If nodeId is provided directly, use it
+      console.log(`[Push] Using provided nodeId: ${nodeId}`);
+      queryParams = `node_id=${encodeURIComponent(nodeId)}`;
     } else if (activationCode) {
       queryParams = `activation_code=${encodeURIComponent(activationCode)}`;
-    } else if (nodeId) {
-      queryParams = `node_id=${encodeURIComponent(nodeId)}`;
     } else {
       return { success: false, error: 'activation_code or node_id required' };
     }
     
-    const response = await fetch(
-      `${apiUrl}/api/v1/node/status?${queryParams}`,
-      { method: 'GET' }
-    );
+    const url = `${apiUrl}/api/v1/node/status?${queryParams}`;
+    console.log(`[Push] Checking server node status: ${url}`);
+    
+    const response = await fetch(url, { method: 'GET' });
 
     const result = await response.json();
+    console.log(`[Push] Server node status response:`, {
+      success: result.success,
+      node_id: result.node_id,
+      node_type: result.node_type,
+      is_online: result.is_online,
+      heartbeat_count: result.heartbeat_count,
+      required_heartbeats: result.required_heartbeats,
+      pending_rewards: result.pending_rewards,
+      pending_rewards_type: typeof result.pending_rewards,
+      is_reward_eligible: result.is_reward_eligible,
+      reputation: result.reputation,
+      error: result.error,
+      full_response: JSON.stringify(result).substring(0, 500)
+    });
 
     if (result.success) {
+      // Calculate required heartbeats based on node type if not provided by server
+      let requiredHeartbeats = result.required_heartbeats;
+      if (!requiredHeartbeats && result.node_type) {
+        if (result.node_type === 'super') {
+          requiredHeartbeats = 9; // Super nodes: 9/10 (90%)
+        } else if (result.node_type === 'full') {
+          requiredHeartbeats = 8; // Full nodes: 8/10 (80%)
+        } else {
+          requiredHeartbeats = 8; // Default fallback
+        }
+      }
+      
       return {
         success: true,
         nodeId: result.node_id,
@@ -557,8 +586,8 @@ export async function checkServerNodeStatus(activationCode, nodeId = null) {
         isOnline: result.is_online,
         lastSeen: result.last_seen,
         lastSeenAgoSeconds: result.last_seen_ago_seconds,
-        heartbeatCount: result.heartbeat_count,
-        requiredHeartbeats: result.required_heartbeats,
+        heartbeatCount: result.heartbeat_count || 0,
+        requiredHeartbeats: requiredHeartbeats || (result.node_type === 'super' ? 9 : 8),
         isRewardEligible: result.is_reward_eligible,
         reputation: result.reputation,
         currentBlockHeight: result.current_block_height,
@@ -569,9 +598,9 @@ export async function checkServerNodeStatus(activationCode, nodeId = null) {
       };
     }
 
-    return { success: false, error: result.error };
+    return { success: false, error: result.error || 'Unknown error' };
   } catch (error) {
-    console.error('[Push] ❌ Server node status check failed:', error);
+    // Silent fail - network errors are expected when nodes are offline
     return { success: false, error: error.message };
   }
 }
@@ -612,8 +641,9 @@ export async function getAllNodesByWallet(walletAddress) {
     
     return { success: true, nodes: [], totalNodes: 0 };
   } catch (error) {
-    console.error('[Nodes] ❌ Failed to get nodes by wallet:', error);
-    return { success: false, error: error.message, nodes: [] };
+    // Silent fail - no nodes found is not an error, just return empty
+    // Battery optimization: don't spam logs
+    return { success: true, nodes: [], totalNodes: 0 };
   }
 }
 

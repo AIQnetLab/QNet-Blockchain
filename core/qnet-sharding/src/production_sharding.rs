@@ -590,7 +590,7 @@ pub fn create_production_config(region: &str, node_id: &str) -> ShardConfig {
         shard_id,
         managed_shards,
         cross_shard_enabled: true,
-        max_tps_per_shard: 15625, // 1M TPS / 64 shards = 15625 TPS per shard
+        max_tps_per_shard: 100_000, // v2.64: 100K TPS per shard (25.6M total with 256 shards)
     }
 }
 

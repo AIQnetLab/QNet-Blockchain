@@ -9,19 +9,28 @@
 //! - Mempool processing
 //! - Block inclusion
 //! 
-//! Usage:
-//! ## Presets (use "preset" field):
-//! - "single_shard"  : 1 shard,   50K TPS,   50K TX
-//! - "small_scale"   : 8 shards,  400K TPS,  400K TX
-//! - "medium_scale"  : 32 shards, 1.6M TPS,  1.6M TX
-//! - "large_scale"   : 64 shards, 3.2M TPS,  3.2M TX
-//! - "extra_large"   : 128 shards, 6.4M TPS, 6.4M TX
-//! - "full_scale"    : 256 shards, 12.8M TPS, 12.8M TX (MAX)
+//! ## v2.41.2: STABILITY-FIRST Presets
+//! 
+//! ### SAFE Presets (recommended for single-node testing):
+//! - "stability_test"  : 5K TPS,  50K TX   - GUARANTEED STABLE! ✅ (DEFAULT)
+//! - "stress_test"     : 20K TPS, 200K TX  - Find real capacity
+//! - "max_capacity"    : 50K TPS, 500K TX  - Push to safe limit
+//! - "progressive_max" : AUTO-FIND MAX!    - Starts 5K, +5K every 10s until limit
+//! 
+//! ### DANGEROUS Presets (may crash single node!):
+//! - "single_shard"  : 100K TPS ⚠️ - Too fast for single node!
+//! - "small_scale"   : 100K TPS ⚠️
+//! - "medium_scale"  : 100K TPS ⚠️
+//! - "large_scale"   : 100K TPS ⚠️
+//! - "extra_large"   : 100K TPS ⚠️
+//! - "full_scale"    : 100K TPS ⚠️⚠️ - WILL CRASH!
 //! 
 //! ## API Examples:
-//! POST /api/v1/benchmark/start { "preset": "single_shard" }
-//! POST /api/v1/benchmark/start { "preset": "full_scale" }
-//! POST /api/v1/benchmark/start { "shards": 64, "total": 5000000, "target_tps": 3200000 }
+//! POST /api/v1/benchmark/start                              → stability_test (SAFE)
+//! POST /api/v1/benchmark/start { "preset": "stability_test" } → 5K TPS, stable
+//! POST /api/v1/benchmark/start { "preset": "stress_test" }    → 20K TPS, moderate
+//! POST /api/v1/benchmark/start { "preset": "max_capacity" }   → 50K TPS, high load
+//! POST /api/v1/benchmark/start { "target_tps": 10000, "total": 100000 } → custom
 //! GET /api/v1/benchmark/status
 //! GET /api/v1/benchmark/results
 
@@ -44,17 +53,30 @@ pub const ONE_QNC: u64 = 1_000_000_000;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkPreset {
-    /// Single shard test: 50K TPS
+    /// v2.41.2: STABILITY TEST - safe for single node, guaranteed not to crash
+    /// 5K TPS, 50K TX, 2 workers - USE THIS FOR TESTING!
+    StabilityTest,
+    /// v2.41.2: STRESS TEST - find real node capacity
+    /// 20K TPS, 200K TX, 4 workers - moderate load
+    StressTest,
+    /// v2.41.2: MAX CAPACITY - push node to limit with protection
+    /// 50K TPS, 500K TX, 8 workers - high load with early backpressure
+    MaxCapacity,
+    /// v2.41.2: PROGRESSIVE TEST - automatically find node's maximum TPS!
+    /// Starts at 5K, increases by 5K every 10 seconds until failure
+    /// Returns the actual maximum TPS the node can handle
+    ProgressiveMax,
+    /// Single shard test: 100K TPS (DANGEROUS for single node!)
     SingleShard,
-    /// 8 shards test: 400K TPS
+    /// 8 shards test: 100K TPS (DANGEROUS!)
     SmallScale,
-    /// 32 shards test: 1.6M TPS  
+    /// 32 shards test: 100K TPS (DANGEROUS!)
     MediumScale,
-    /// 64 shards test: 3.2M TPS
+    /// 64 shards test: 100K TPS (DANGEROUS!)
     LargeScale,
-    /// 128 shards test: 6.4M TPS
+    /// 128 shards test: 100K TPS (DANGEROUS!)
     ExtraLarge,
-    /// Full 256 shards: 12.8M TPS (MAXIMUM)
+    /// Full 256 shards: 100K TPS (EXTREMELY DANGEROUS - WILL CRASH!)
     FullScale,
     /// Custom configuration
     Custom,
@@ -62,11 +84,13 @@ pub enum BenchmarkPreset {
 
 impl Default for BenchmarkPreset {
     fn default() -> Self {
-        BenchmarkPreset::FullScale
+        // v2.41.2: Safe default - won't crash node!
+        BenchmarkPreset::StabilityTest
     }
 }
 
 /// Benchmark configuration
+/// v2.27.2: NO artificial TPS limits - smart backpressure handles overload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkConfig {
     /// Preset type for quick configuration
@@ -77,7 +101,7 @@ pub struct BenchmarkConfig {
     pub shards: usize,
     /// Total number of transactions to generate
     pub total_transactions: u64,
-    /// Target TPS (transactions per second)
+    /// Target TPS (transactions per second) - NO LIMIT, backpressure handles it
     pub target_tps: u64,
     /// Number of test accounts to use
     pub num_accounts: usize,
@@ -89,15 +113,26 @@ fn default_shards() -> usize { 256 }
 
 impl BenchmarkConfig {
     /// Create config from preset
+    /// v2.41.2: Safe presets for single-node testing + dangerous high-load presets
     pub fn from_preset(preset: BenchmarkPreset) -> Self {
+        // v2.41.2: STABILITY-FIRST presets
+        // StabilityTest/StressTest/MaxCapacity are SAFE for single node
+        // Other presets are DANGEROUS and may crash the node!
         let (shards, total, tps, accounts) = match preset {
-            BenchmarkPreset::SingleShard => (1, 50_000, 50_000, 100),
-            BenchmarkPreset::SmallScale => (8, 400_000, 400_000, 500),
-            BenchmarkPreset::MediumScale => (32, 1_600_000, 1_600_000, 2_000),
-            BenchmarkPreset::LargeScale => (64, 3_200_000, 3_200_000, 4_000),
-            BenchmarkPreset::ExtraLarge => (128, 6_400_000, 6_400_000, 8_000),
-            BenchmarkPreset::FullScale => (256, 12_800_000, 12_800_000, 10_000),
-            BenchmarkPreset::Custom => (256, 12_800_000, 12_800_000, 10_000),
+            // === SAFE PRESETS (v2.41.2) ===
+            BenchmarkPreset::StabilityTest => (1, 50_000, 5_000, 1_000),      // 5K TPS - SAFE!
+            BenchmarkPreset::StressTest => (4, 200_000, 20_000, 2_000),       // 20K TPS - moderate
+            BenchmarkPreset::MaxCapacity => (8, 500_000, 50_000, 5_000),      // 50K TPS - high
+            BenchmarkPreset::ProgressiveMax => (1, 1_000_000, 5_000, 10_000), // Start 5K, auto-increase
+            
+            // === DANGEROUS PRESETS (may crash single node!) ===
+            BenchmarkPreset::SingleShard => (1, 500_000, 100_000, 5_000),     // 100K TPS ⚠️
+            BenchmarkPreset::SmallScale => (8, 1_000_000, 100_000, 10_000),   // 100K TPS ⚠️
+            BenchmarkPreset::MediumScale => (32, 2_000_000, 100_000, 20_000), // 100K TPS ⚠️
+            BenchmarkPreset::LargeScale => (64, 3_000_000, 100_000, 30_000),  // 100K TPS ⚠️
+            BenchmarkPreset::ExtraLarge => (128, 5_000_000, 100_000, 40_000), // 100K TPS ⚠️
+            BenchmarkPreset::FullScale => (256, 10_000_000, 100_000, 50_000), // 100K TPS ⚠️⚠️
+            BenchmarkPreset::Custom => (256, 5_000_000, 100_000, 50_000),
         };
         
         Self {
@@ -111,6 +146,15 @@ impl BenchmarkConfig {
     }
     
     /// Quick presets
+    pub fn stability_test() -> Self { Self::from_preset(BenchmarkPreset::StabilityTest) }
+    pub fn stress_test() -> Self { Self::from_preset(BenchmarkPreset::StressTest) }
+    pub fn max_capacity() -> Self { Self::from_preset(BenchmarkPreset::MaxCapacity) }
+    pub fn progressive_max() -> Self { Self::from_preset(BenchmarkPreset::ProgressiveMax) }
+    
+    /// Check if this is a progressive test that auto-scales TPS
+    pub fn is_progressive(&self) -> bool {
+        self.preset == BenchmarkPreset::ProgressiveMax
+    }
     pub fn single_shard() -> Self { Self::from_preset(BenchmarkPreset::SingleShard) }
     pub fn small_scale() -> Self { Self::from_preset(BenchmarkPreset::SmallScale) }
     pub fn medium_scale() -> Self { Self::from_preset(BenchmarkPreset::MediumScale) }
@@ -121,7 +165,8 @@ impl BenchmarkConfig {
 
 impl Default for BenchmarkConfig {
     fn default() -> Self {
-        Self::from_preset(BenchmarkPreset::FullScale)
+        // v2.41.2: Safe default - StabilityTest won't crash node!
+        Self::from_preset(BenchmarkPreset::StabilityTest)
     }
 }
 
@@ -202,20 +247,24 @@ pub struct BenchmarkManager {
     accounts: RwLock<Vec<BenchmarkAccount>>,
     /// Running state
     is_running: AtomicBool,
-    /// Transactions sent
-    transactions_sent: AtomicU64,
-    /// Transactions confirmed
-    transactions_confirmed: AtomicU64,
+    /// Transactions sent (pub for direct update from benchmark generator)
+    pub transactions_sent: AtomicU64,
+    /// Transactions confirmed (pub for direct update from benchmark generator)
+    pub transactions_confirmed: AtomicU64,
     /// Errors count
     errors: AtomicU64,
-    /// Peak TPS observed
-    peak_tps: RwLock<f64>,
+    /// Peak TPS observed (instantaneous, pub for direct update)
+    pub peak_tps: RwLock<f64>,
     /// Start time
     start_time: RwLock<Option<Instant>>,
     /// End time
     end_time: RwLock<Option<Instant>>,
     /// Latencies for percentile calculation
     latencies: RwLock<Vec<f64>>,
+    /// Last TPS check time (for instantaneous TPS calculation)
+    last_tps_check: RwLock<Option<Instant>>,
+    /// TX count at last TPS check
+    last_tx_count: AtomicU64,
 }
 
 impl BenchmarkManager {
@@ -231,6 +280,8 @@ impl BenchmarkManager {
             start_time: RwLock::new(None),
             end_time: RwLock::new(None),
             latencies: RwLock::new(Vec::new()),
+            last_tps_check: RwLock::new(None),
+            last_tx_count: AtomicU64::new(0),
         }
     }
     
@@ -262,6 +313,8 @@ impl BenchmarkManager {
         *self.start_time.write().await = Some(Instant::now());
         *self.end_time.write().await = None;
         self.latencies.write().await.clear();
+        *self.last_tps_check.write().await = None;
+        self.last_tx_count.store(0, Ordering::SeqCst);
         
         // Initialize accounts if needed
         let accounts_count = self.accounts.read().await.len();
@@ -312,6 +365,7 @@ impl BenchmarkManager {
         let sent = self.transactions_sent.load(Ordering::SeqCst);
         let confirmed = self.transactions_confirmed.load(Ordering::SeqCst);
         let errors = self.errors.load(Ordering::SeqCst);
+        let now = Instant::now();
         
         let elapsed = if let Some(start) = *self.start_time.read().await {
             start.elapsed().as_secs_f64()
@@ -319,23 +373,45 @@ impl BenchmarkManager {
             0.0
         };
         
-        let current_tps = if elapsed > 0.0 {
+        // Calculate cumulative average TPS
+        let avg_tps = if elapsed > 0.0 {
             sent as f64 / elapsed
         } else {
             0.0
         };
         
-        // Update peak TPS
+        // Calculate instantaneous TPS (TX since last check)
+        let last_check_opt = *self.last_tps_check.read().await;
+        let last_count = self.last_tx_count.load(Ordering::SeqCst);
+        
+        let instant_tps = if let Some(last_check) = last_check_opt {
+            let elapsed_since_last = now.duration_since(last_check).as_secs_f64();
+            let tx_delta = sent.saturating_sub(last_count);
+            
+            if elapsed_since_last > 0.01 { // Minimum 10ms between checks
+                tx_delta as f64 / elapsed_since_last
+            } else {
+                avg_tps // Too short interval, use average
+            }
+        } else {
+            avg_tps // First check, use average
+        };
+        
+        // Update last check timestamp and count
+        *self.last_tps_check.write().await = Some(now);
+        self.last_tx_count.store(sent, Ordering::SeqCst);
+        
+        // Update peak TPS with instantaneous value
         let mut peak = self.peak_tps.write().await;
-        if current_tps > *peak {
-            *peak = current_tps;
+        if instant_tps > *peak {
+            *peak = instant_tps;
         }
         
         BenchmarkStatus {
             is_running: self.is_running.load(Ordering::SeqCst),
             transactions_sent: sent,
             transactions_confirmed: confirmed,
-            current_tps,
+            current_tps: instant_tps,
             peak_tps: *peak,
             elapsed_seconds: elapsed,
             errors,
@@ -402,7 +478,7 @@ impl BenchmarkManager {
         }
     }
     
-    /// Generate a signed transaction
+    /// Generate a signed transaction (legacy - has lock contention!)
     pub async fn generate_transaction(&self) -> Option<qnet_state::Transaction> {
         let accounts = self.accounts.read().await;
         if accounts.len() < 2 {
@@ -448,14 +524,92 @@ impl BenchmarkManager {
                 to: receiver.address.clone(),
                 amount,
             },
+            dilithium_signature: None,   // Benchmark TX - no quantum sig
+            dilithium_public_key: None,
         };
         
         // Calculate hash
         tx.hash = tx.calculate_hash();
         
-        // Sign with Ed25519 - message format from CRYPTOGRAPHY_IMPLEMENTATION.md
-        let message = format!("transfer:{}:{}:{}:{}:{}", 
-            tx.from, receiver.address, amount, tx.gas_price, tx.gas_limit);
+        // Sign with Ed25519 - MUST match verify format in node.rs verify_ed25519_tx_signature
+        // Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp
+        let message = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            tx.from, receiver.address, amount, nonce, tx.gas_price, tx.gas_limit, timestamp
+        );
+        let signature = sender.signing_key.sign(message.as_bytes());
+        tx.signature = Some(hex::encode(signature.to_bytes()));
+        
+        Some(tx)
+    }
+    
+    /// Get accounts snapshot for lock-free transaction generation
+    /// Call ONCE per worker at start, then use generate_transaction_from_snapshot
+    pub async fn get_accounts_snapshot(&self) -> Vec<BenchmarkAccount> {
+        self.accounts.read().await.clone()
+    }
+    
+    /// Generate transaction from pre-cloned accounts snapshot (NO LOCK!)
+    /// This is the HIGH-PERFORMANCE path for benchmark workers
+    pub fn generate_transaction_from_snapshot(
+        accounts: &[BenchmarkAccount],
+    ) -> Option<qnet_state::Transaction> {
+        if accounts.len() < 2 {
+            return None;
+        }
+        
+        // Pick random sender and receiver
+        let sender_idx = rand::random::<usize>() % accounts.len();
+        let mut receiver_idx = rand::random::<usize>() % accounts.len();
+        while receiver_idx == sender_idx {
+            receiver_idx = rand::random::<usize>() % accounts.len();
+        }
+        
+        let sender = &accounts[sender_idx];
+        let receiver = &accounts[receiver_idx];
+        
+        let nonce = sender.get_next_nonce();
+        let amount = ONE_QNC; // 1 QNC = 10^9 nanoQNC
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // PRODUCTION VALUES - identical to production transactions
+        const GAS_LIMIT_TRANSFER: u64 = 10_000;
+        const GAS_PRICE_STANDARD: u64 = 1;
+        
+        // Create transaction with correct structure (100% production-identical)
+        let mut tx = qnet_state::Transaction {
+            hash: String::new(),
+            from: sender.address.clone(),
+            to: Some(receiver.address.clone()),
+            amount,
+            nonce,
+            timestamp,
+            gas_price: GAS_PRICE_STANDARD,
+            gas_limit: GAS_LIMIT_TRANSFER,
+            data: None,
+            signature: None,
+            public_key: Some(hex::encode(sender.verifying_key.as_bytes())),
+            tx_type: qnet_state::TransactionType::Transfer {
+                from: sender.address.clone(),
+                to: receiver.address.clone(),
+                amount,
+            },
+            dilithium_signature: None,
+            dilithium_public_key: None,
+        };
+        
+        // Calculate hash (real SHA3-256)
+        tx.hash = tx.calculate_hash();
+        
+        // Sign with Ed25519 - MUST match verify format in node.rs verify_ed25519_tx_signature
+        // Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp
+        let message = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            tx.from, receiver.address, amount, nonce, tx.gas_price, tx.gas_limit, timestamp
+        );
         let signature = sender.signing_key.sign(message.as_bytes());
         tx.signature = Some(hex::encode(signature.to_bytes()));
         

@@ -407,17 +407,10 @@ impl BlockchainActivationRegistry {
     /// Extract wallet address from activation code using quantum decryption
     async fn extract_wallet_from_activation_code(&self, code: &str) -> Result<String, IntegrationError> {
         // Use quantum crypto to decrypt and get wallet address
-        // OPTIMIZATION: Use GLOBAL crypto instance
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-        
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            crypto.initialize().await
-                .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
-            *crypto_guard = Some(crypto);
-        }
-        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        // PRODUCTION v2.50: Lock-free quantum crypto
+        use crate::node::try_get_quantum_crypto;
+        let quantum_crypto = try_get_quantum_crypto()
+            .ok_or_else(|| IntegrationError::CryptoError("Quantum crypto not initialized".to_string()))?;
             
         // SECURITY: NO FALLBACK ALLOWED - quantum decryption MUST work for security
         match quantum_crypto.decrypt_activation_code(code).await {
@@ -1148,6 +1141,18 @@ impl BlockchainActivationRegistry {
             .find(|n| n.activation_code == code_hash || n.activation_code == code)
             .cloned()
     }
+    
+    /// v2.71: Get node info by wallet address (for claim validation)
+    pub async fn get_node_info_by_wallet(&self, wallet: &str) -> Result<Option<NodeInfo>, IntegrationError> {
+        let active_nodes = self.active_nodes.read().await;
+        
+        // Find node with matching wallet address
+        let node_info = active_nodes.values()
+            .find(|n| n.wallet_address == wallet)
+            .cloned();
+        
+        Ok(node_info)
+    }
 
     /// Determine node type from activation code structure
     async fn determine_node_type_from_code(&self, code: &str) -> Result<String, IntegrationError> {
@@ -1535,12 +1540,22 @@ impl BlockchainActivationRegistry {
                                         }
                                         
                                         // Create activation record from transaction
+                                        // PRODUCTION v2.41.1: node_type is REQUIRED
+                                        let node_type = match activation_json["node_type"].as_str() {
+                                            Some(t) => t.to_string(),
+                                            None => {
+                                                eprintln!("[WARN][ACTIVATION] missing_node_type code={} tx={}", 
+                                                         code_hash, burn_tx_hash);
+                                                continue; // Skip invalid activation
+                                            }
+                                        };
+                                        
                                         let record = ActivationRecord {
                                             code_hash: code_hash.clone(),
                                             wallet_address: activation_json["wallet"].as_str().unwrap_or("").to_string(),
                                             tx_hash: burn_tx_hash, // Use burn_tx_hash from JSON
                                             activated_at: activation_json["activated_at"].as_u64().unwrap_or(0),
-                                            node_type: activation_json["node_type"].as_str().unwrap_or("Full").to_string(),
+                                            node_type,
                                             phase: 1, // Phase 1 (Solana burn)
                                             activation_amount: 0, // Phase 1: no QNC cost
                                             blockchain_height: block_height,
@@ -1723,6 +1738,8 @@ impl BlockchainActivationRegistry {
             public_key: None, // Not needed for activation transactions
             tx_type: TransactionType::ContractCall, // Use tx_type, not transaction_type
             timestamp: record.activated_at,
+            dilithium_signature: None,   // Activation TX - no quantum sig
+            dilithium_public_key: None,
         };
         
         // PRODUCTION: Submit to blockchain through GLOBAL mempool
@@ -1730,28 +1747,19 @@ impl BlockchainActivationRegistry {
         
         // CRITICAL: Use GLOBAL_MEMPOOL_INSTANCE to add transaction to mempool
         // This ensures transaction will be included in next microblock
-        use crate::node::GLOBAL_MEMPOOL_INSTANCE;
+        // PRODUCTION v2.50: Lock-free mempool access
+        use crate::node::try_get_mempool;
         
-        // Clone mempool Arc before releasing the lock to avoid lifetime issues
-        let mempool_arc_opt = if let Ok(mempool_guard) = GLOBAL_MEMPOOL_INSTANCE.lock() {
-            mempool_guard.clone()
-        } else {
-            println!("[REGISTRY] ⚠️ Failed to lock global mempool");
-            None
-        };
-        
-        if let Some(mempool_arc) = mempool_arc_opt {
-            // Serialize transaction to JSON for mempool
-            match serde_json::to_string(&transaction) {
-                Ok(tx_json) => {
-                    // Calculate transaction hash for mempool (using SHA3-256)
+        if let Some(mempool_arc) = try_get_mempool() {
+            // PRODUCTION v2.26: Use bincode for consistency with block production
+            match bincode::serialize(&transaction) {
+                Ok(tx_bytes) => {
+                    // Calculate transaction hash for mempool (using SHA3-256 of bincode)
                     use sha3::{Sha3_256, Digest};
-                    let tx_hash_for_mempool = format!("{:x}", Sha3_256::digest(tx_json.as_bytes()));
+                    let tx_hash_for_mempool = format!("{:x}", Sha3_256::digest(&tx_bytes));
                     
-                    // Add to mempool (blocks will pick it up automatically)
-                    let mempool_write = mempool_arc.write().await;
-                    // PRODUCTION: Add with gas_price for priority ordering
-                    if mempool_write.add_raw_transaction(tx_json, tx_hash_for_mempool.clone(), transaction.gas_price) {
+                    // v2.26: Direct access - SimpleMempool is already thread-safe
+                    if mempool_arc.add_binary_transaction(tx_bytes, tx_hash_for_mempool.clone(), transaction.gas_price) {
                         println!("[REGISTRY] ✅ Activation transaction added to mempool: {}", tx_hash_for_mempool);
                     } else {
                         println!("[REGISTRY] ⚠️ Failed to add activation transaction to mempool (may be full or duplicate)");
@@ -1995,17 +2003,10 @@ impl BlockchainActivationRegistry {
     /// Extract activation signature from quantum-secured code
     async fn extract_activation_signature(&self, activation_code: &str) -> Result<String, IntegrationError> {
         // Use quantum crypto module to decrypt and extract signature
-        // OPTIMIZATION: Use GLOBAL crypto instance
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-        
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            crypto.initialize().await
-                .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
-            *crypto_guard = Some(crypto);
-        }
-        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        // PRODUCTION v2.50: Lock-free quantum crypto
+        use crate::node::try_get_quantum_crypto;
+        let quantum_crypto = try_get_quantum_crypto()
+            .ok_or_else(|| IntegrationError::CryptoError("Quantum crypto not initialized".to_string()))?;
         
         // Decrypt activation code to get payload with signature
         let payload = quantum_crypto.decrypt_activation_code(activation_code).await
@@ -2257,17 +2258,10 @@ impl BlockchainActivationRegistry {
         // 4. Quantum entropy
         
         // Use quantum crypto to verify derivation
-        // OPTIMIZATION: Use GLOBAL crypto instance
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-        
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            crypto.initialize().await
-                .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
-            *crypto_guard = Some(crypto);
-        }
-        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        // PRODUCTION v2.50: Lock-free quantum crypto
+        use crate::node::try_get_quantum_crypto;
+        let quantum_crypto = try_get_quantum_crypto()
+            .ok_or_else(|| IntegrationError::CryptoError("Quantum crypto not initialized".to_string()))?;
         
         // Decrypt payload to get wallet address
         let payload = quantum_crypto.decrypt_activation_code(activation_code).await
@@ -2287,17 +2281,10 @@ impl BlockchainActivationRegistry {
 
     /// Extract transaction hash from activation code (Phase 1: burn tx, Phase 2: transfer tx)
     async fn extract_tx_hash_from_code(&self, activation_code: &str) -> Result<String, IntegrationError> {
-        // OPTIMIZATION: Use GLOBAL crypto instance
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-        
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            crypto.initialize().await
-                .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
-            *crypto_guard = Some(crypto);
-        }
-        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        // PRODUCTION v2.50: Lock-free quantum crypto
+        use crate::node::try_get_quantum_crypto;
+        let quantum_crypto = try_get_quantum_crypto()
+            .ok_or_else(|| IntegrationError::CryptoError("Quantum crypto not initialized".to_string()))?;
         
         let payload = quantum_crypto.decrypt_activation_code(activation_code).await
             .map_err(|e| IntegrationError::CryptoError(format!("Decryption failed: {}", e)))?;

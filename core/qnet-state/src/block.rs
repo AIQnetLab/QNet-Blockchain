@@ -44,6 +44,26 @@ pub struct MicroBlock {
     pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
     /// Verifiable Time Sequence counter at block creation
     pub poh_count: u64,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // QUANTUM RANDOMNESS BEACON (QRB) v3.0
+    // Each producer contributes signed randomness for epoch accumulation
+    // Provides "true randomness" for gambling, NFT mints, fair auctions
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// QRB randomness output from producer (32 bytes)
+    /// Generated using Hybrid signature (Dilithium3 + Ed25519)
+    /// Input: SHA3(prev_block_hash || height || producer_id)
+    /// Note: Field named vrf_output for serialization compatibility
+    #[serde(default)]
+    pub vrf_output: Option<[u8; 32]>,
+    
+    /// Serialized QRB proof for verification
+    /// Contains: HybridSignature (Dilithium certificate + Ed25519 ephemeral signature)
+    /// Any node can verify the randomness contribution is authentic
+    /// Note: Field named vrf_proof for serialization compatibility
+    #[serde(default)]
+    pub vrf_proof: Option<Vec<u8>>,
 }
 
 /// Macroblock structure - consensus blocks that finalize microblocks
@@ -94,7 +114,7 @@ pub struct ConsensusData {
     
     // ═══════════════════════════════════════════════════════════════════
     // REPUTATION SNAPSHOT (v2.24.0)
-    // Ethereum 2.0 style: snapshot stored in macroblock for consistency
+    // Snapshot stored in macroblock for consistency across all nodes
     // All nodes MUST have identical reputation after applying macroblock
     // ═══════════════════════════════════════════════════════════════════
     
@@ -103,6 +123,87 @@ pub struct ConsensusData {
     /// This ensures ALL nodes have IDENTICAL reputation (no drift!)
     #[serde(default)]
     pub reputation_snapshot: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // ELIGIBLE PRODUCERS SNAPSHOT (v2.27.0)
+    // Epoch-based validator set for deterministic producer selection
+    // Snapshot determines producers for next 90 blocks (next epoch)
+    // ═══════════════════════════════════════════════════════════════════
+    
+    /// Eligible producers for next epoch (90 blocks)
+    /// Format: bincode serialized Vec<EligibleProducer>
+    /// All nodes use this SAME list for producer selection - NO gossip!
+    /// This eliminates race conditions and guarantees determinism
+    #[serde(default)]
+    pub eligible_producers: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // QUANTUM RANDOMNESS BEACON (QRB) v3.0
+    // Accumulated randomness from all QRB outputs in this epoch
+    // Quantum-resistant randomness beacon with Dilithium signatures
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Quantum Randomness Beacon - accumulated from epoch's randomness outputs
+    /// Formula: QRB = XOR(output_1, output_2, ..., output_90)
+    /// Use cases: gambling, NFT mints, fair auctions, leader election
+    /// Quantum-safe: All signatures use Dilithium3 (NIST FIPS 204)
+    #[serde(default)]
+    pub randomness_beacon: Option<[u8; 32]>,
+    
+    /// Number of QRB contributions in this beacon (for verification)
+    /// Should equal number of microblocks in epoch (typically 90)
+    /// Note: Field named vrf_contributions_count for serialization compatibility
+    #[serde(default)]
+    pub vrf_contributions_count: Option<u64>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REWARD HEARTBEATS (v2.41.0)
+    // Deterministic heartbeat recording for Full/Super node rewards
+    // Replaces gossip-based heartbeats which were non-deterministic and lossy
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Aggregated heartbeat summaries for all nodes in this epoch
+    /// Format: bincode serialized Vec<HeartbeatSummary>
+    /// Deterministic: all nodes see same heartbeat data from blockchain
+    /// Used for reward calculation at emission blocks (every 4 hours)
+    #[serde(default)]
+    pub reward_heartbeats: Option<Vec<u8>>,
+    
+    /// Merkle root of all individual heartbeats for verification
+    /// Allows light clients to verify heartbeat inclusion without full data
+    #[serde(default)]
+    pub heartbeats_merkle_root: Option<[u8; 32]>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // POOL 2 & POOL 3 TOTALS (v2.50.0)
+    // Deterministic fee totals for reward calculation
+    // Leader aggregates all transaction fees in epoch → all nodes use same value
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Pool 2: Total transaction fees collected in this emission window (4 hours)
+    /// Recorded ONLY in EMISSION MacroBlocks (every 160th = 4 hours)
+    /// Distribution: 70% Super nodes, 30% Full nodes, 0% Light nodes
+    /// All nodes use this SAME value for deterministic reward calculation
+    #[serde(default)]
+    pub pool2_total_fees: Option<u64>,
+    
+    /// Pool 3: Total activation QNC collected in this emission window (Phase 2 only)
+    /// Recorded ONLY in EMISSION MacroBlocks when Phase 2 is active
+    /// Distribution: Equal share to ALL eligible nodes (Light + Full + Super)
+    /// Phase 1: Always None (Pool 3 disabled, 1DEV burn instead)
+    /// Phase 2: Sum of all node activation QNC payments
+    #[serde(default)]
+    pub pool3_total_activations: Option<u64>,
+}
+
+/// Eligible producer entry for epoch-based validator set
+/// Stored in macroblock, used for deterministic producer selection
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EligibleProducer {
+    /// Node identifier (e.g., "genesis_node_001" or "node_abc123")
+    pub node_id: String,
+    /// Reputation score at snapshot time (0.0 - 1.0)
+    pub reputation: f64,
 }
 
 /// Slashing event data for blockchain storage (simplified for serialization)
@@ -137,6 +238,47 @@ pub struct AutomaticJailData {
     pub reason: String,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// REWARD HEARTBEAT DATA (v2.41.0)
+// Deterministic heartbeat recording for Full/Super node rewards
+// Stored in MacroBlock for verifiable, deterministic reward calculation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Reward heartbeat entry for blockchain storage
+/// Each Full/Super node must send 10 heartbeats per 4-hour window
+/// Super nodes need 9/10 (90%), Full nodes need 8/10 (80%) for rewards
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RewardHeartbeat {
+    /// Node identifier (pseudonym, not IP)
+    pub node_id: String,
+    /// Heartbeat sequence number within 4-hour window (1-10)
+    pub sequence: u8,
+    /// Block height when heartbeat was recorded
+    pub block_height: u64,
+    /// Timestamp of heartbeat
+    pub timestamp: u64,
+    /// Dilithium signature hash (first 8 bytes for compactness)
+    pub signature_hash: [u8; 8],
+}
+
+/// Aggregated heartbeat summary for a node in a reward window
+/// Used for efficient storage: one entry per node instead of 10
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeartbeatSummary {
+    /// Node identifier
+    pub node_id: String,
+    /// Node type: 0=Light, 1=Full, 2=Super
+    pub node_type: u8,
+    /// Number of successful heartbeats in this epoch (0-10 for Full/Super)
+    pub heartbeat_count: u8,
+    /// First heartbeat timestamp in epoch
+    pub first_heartbeat: u64,
+    /// Last heartbeat timestamp in epoch  
+    pub last_heartbeat: u64,
+    /// Whether node meets reward threshold (8/10 for Full, 9/10 for Super)
+    pub is_eligible: bool,
+}
+
 /// Efficient microblock structure - stores only transaction hashes instead of full transactions
 /// Optimized for distributed storage architecture with separate transaction pool
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -159,6 +301,20 @@ pub struct EfficientMicroBlock {
     pub poh_hash: Vec<u8>,
     /// Verifiable Time Sequence counter at block creation
     pub poh_count: u64,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // QUANTUM RANDOMNESS BEACON (QRB) v3.0
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// QRB randomness output from producer (32 bytes)
+    /// Note: Field named vrf_output for serialization compatibility
+    #[serde(default)]
+    pub vrf_output: Option<[u8; 32]>,
+    
+    /// Serialized QRB proof (HybridSignature: Dilithium + Ed25519)
+    /// Note: Field named vrf_proof for serialization compatibility
+    #[serde(default)]
+    pub vrf_proof: Option<Vec<u8>>,
 }
 
 /// Light microblock header for mobile nodes
@@ -551,6 +707,9 @@ impl MicroBlock {
             // Default PoH values for backward compatibility
             poh_hash: vec![0u8; 64], // SHA3-512 produces 64 bytes
             poh_count: 0,
+            // QRB v3.0: VRF fields (None for legacy/compatibility)
+            vrf_output: None,
+            vrf_proof: None,
         }
     }
     
@@ -637,6 +796,9 @@ impl EfficientMicroBlock {
             merkle_root,
             poh_hash: vec![],
             poh_count: 0,
+            // QRB v3.0: VRF fields (None for legacy/compatibility)
+            vrf_output: None,
+            vrf_proof: None,
         }
     }
     
@@ -682,6 +844,9 @@ impl EfficientMicroBlock {
             merkle_root: microblock.merkle_root,
             poh_hash: microblock.poh_hash.clone(),
             poh_count: microblock.poh_count,
+            // QRB v3.0: Copy VRF fields from source microblock
+            vrf_output: microblock.vrf_output,
+            vrf_proof: microblock.vrf_proof.clone(),
         }
     }
     

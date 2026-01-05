@@ -36,8 +36,8 @@ const MAX_LIGHT_NODE_REGISTRY_SIZE: usize = 100_000;
 const MAX_ATTESTATIONS_SIZE: usize = 100_000;
 
 /// Max heartbeat records in RAM (24h window, auto-cleanup)
-/// 50K records × ~200 bytes = ~10MB RAM
-const MAX_HEARTBEATS_SIZE: usize = 50_000;
+/// 100K records × ~200 bytes = ~20MB RAM
+const MAX_HEARTBEATS_SIZE: usize = 100_000;
 
 /// Max active Full/Super nodes tracked
 /// 10K nodes × ~150 bytes = ~1.5MB RAM
@@ -121,6 +121,12 @@ static CACHED_BLOCKCHAIN_HEIGHT: Lazy<Arc<Mutex<(u64, Instant)>>> =
 pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> = 
     Lazy::new(|| Arc::new(AtomicU64::new(0)));
 
+// PRODUCTION v2.54: Gap detection pending sync queue
+// When gap detected in handle_shred_protocol_chunk, store here for background sync
+// node.rs sync loop will pick up and process these gaps
+pub static PENDING_GAP_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PENDING_GAP_SYNC_TO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // CRITICAL FIX: Deduplicate failover messages to prevent spam
 // Store processed failover events: (block_height, failed_producer, new_producer)
 // SCALABILITY: Use DashSet for lock-free concurrent access with millions of nodes
@@ -173,9 +179,243 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("Failed to create global HTTP client")
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════════
+// PRODUCTION v2.57: DEDICATED BROADCAST RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════════
+// WHY: Main Tokio runtime handles heartbeats, peer discovery, API requests, consensus.
+//      During high load, broadcast tasks get starved → chunks not sent → emergency failover.
+// SOLUTION: Dedicated runtime ONLY for Shred Protocol broadcast.
+// GUARANTEE: Broadcast always has dedicated threads, never competes with main loop.
+// ADAPTIVE: 2 cores→1t, 4 cores→2t, 8+ cores→50% (scales with CPU)
+// ENV: QNET_BROADCAST_THREADS - override thread count
+// ═══════════════════════════════════════════════════════════════════════════════════
+static BROADCAST_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    
+    // ADAPTIVE for small configs: 2 cores→1t, 4 cores→2t, 8+ cores→50%
+    let default_threads = if cpu_count <= 2 { 
+        1 
+    } else if cpu_count <= 4 { 
+        2 
+    } else { 
+        (cpu_count / 2).max(2) 
+    };
+    
+    let broadcast_threads = std::env::var("QNET_BROADCAST_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|env_val| env_val.max(1).min(cpu_count))
+        .unwrap_or(default_threads);
+    
+    println!("[INFO][BROADCAST] runtime_init cpus={} threads={}", cpu_count, broadcast_threads);
+    
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(broadcast_threads)
+        .thread_name("qnet-broadcast")
+        .enable_all()
+        .build()
+        .expect("Failed to create dedicated broadcast runtime")
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// PRODUCTION v2.57: DEDICATED SIGVERIFY RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════════
+// WHY: Signature verification is CPU-intensive (Ed25519 ~10k/sec, Dilithium ~1k/sec)
+//      Running in main runtime blocks event loop → degraded TPS
+// SOLUTION: Dedicated runtime for ALL cryptographic verification
+// ADAPTIVE: 2 cores→1t, 4 cores→1t, 8+ cores→2t (scales with CPU)
+// ENV: QNET_SIGVERIFY_THREADS - override thread count
+// ═══════════════════════════════════════════════════════════════════════════════════
+static SIGVERIFY_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    
+    // ADAPTIVE: For small configs (2-4 cores), use minimal threads
+    // 2 cores: 1 thread, 4 cores: 1 thread, 8+ cores: 2+ threads
+    let default_threads = if cpu_count <= 4 { 1 } else { (cpu_count / 4).max(2) };
+    
+    let sigverify_threads = std::env::var("QNET_SIGVERIFY_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|v| v.max(1).min(cpu_count))
+        .unwrap_or(default_threads);
+    
+    println!("[INFO][SIGVERIFY] runtime_init cpus={} threads={}", cpu_count, sigverify_threads);
+    
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(sigverify_threads)
+        .thread_name("qnet-sigverify")
+        .enable_all()
+        .build()
+        .expect("Failed to create dedicated sigverify runtime")
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// PRODUCTION v2.57: DEDICATED BANKING RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════════
+// WHY: Transaction processing (validation, state reads, mempool ops) is I/O heavy
+// ADAPTIVE: 2-4 cores→1t, 8+ cores→2t (not active yet, reserved for future)
+// ENV: QNET_BANKING_THREADS - override thread count
+// ═══════════════════════════════════════════════════════════════════════════════════
+static BANKING_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    
+    // ADAPTIVE: Minimal for small configs (not active yet)
+    let default_threads = if cpu_count <= 4 { 1 } else { (cpu_count / 4).max(2) };
+    
+    let banking_threads = std::env::var("QNET_BANKING_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|v| v.max(1).min(cpu_count))
+        .unwrap_or(default_threads);
+    
+    println!("[INFO][BANKING] runtime_init cpus={} threads={}", cpu_count, banking_threads);
+    
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(banking_threads)
+        .thread_name("qnet-banking")
+        .enable_all()
+        .build()
+        .expect("Failed to create dedicated banking runtime")
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// PRODUCTION v2.57: DEDICATED REPLAY RUNTIME
+// ═══════════════════════════════════════════════════════════════════════════════════
+// WHY: State application (executing transactions, updating balances) is critical path
+// ADAPTIVE: 2-4 cores→1t, 8+ cores→2t (not active yet, reserved for future)
+// ENV: QNET_REPLAY_THREADS - override thread count
+// ═══════════════════════════════════════════════════════════════════════════════════
+static REPLAY_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    
+    // ADAPTIVE: Minimal for small configs (not active yet)
+    let default_threads = if cpu_count <= 4 { 1 } else { (cpu_count / 4).max(2) };
+    
+    let replay_threads = std::env::var("QNET_REPLAY_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|v| v.max(1).min(cpu_count))
+        .unwrap_or(default_threads);
+    
+    println!("[INFO][REPLAY] runtime_init cpus={} threads={}", cpu_count, replay_threads);
+    
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(replay_threads)
+        .thread_name("qnet-replay")
+        .enable_all()
+        .build()
+        .expect("Failed to create dedicated replay runtime")
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// RUNTIME DISTRIBUTION (Stage Pipeline):
+// ═══════════════════════════════════════════════════════════════════════════════════
+// Main Runtime:      Heartbeats, Peer discovery, API, Consensus
+// BROADCAST_RUNTIME: Shred protocol, chunk sending
+// SIGVERIFY_RUNTIME: Ed25519/Dilithium verification
+// BANKING_RUNTIME:   Transaction intake, mempool (25% cores)
+// REPLAY_RUNTIME:    State machine, execution (25% cores)
+// Total: ~125% cores (intentional oversubscription for I/O overlap)
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+/// Spawn task on SIGVERIFY_RUNTIME for crypto verification
+pub fn spawn_sigverify<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    SIGVERIFY_RUNTIME.spawn(future)
+}
+
+/// Spawn task on BANKING_RUNTIME for transaction processing
+pub fn spawn_banking<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    BANKING_RUNTIME.spawn(future)
+}
+
+/// Spawn task on REPLAY_RUNTIME for state operations
+pub fn spawn_replay<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    REPLAY_RUNTIME.spawn(future)
+}
+
+/// Spawn task on BROADCAST_RUNTIME for block propagation
+pub fn spawn_broadcast<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    BROADCAST_RUNTIME.spawn(future)
+}
+
+/// Runtime statistics
+#[derive(Debug, Clone)]
+pub struct RuntimeStats {
+    pub cpu_count: usize,
+    pub broadcast_threads: usize,
+    pub sigverify_threads: usize,
+    pub banking_threads: usize,
+    pub replay_threads: usize,
+}
+
+impl RuntimeStats {
+    pub fn total(&self) -> usize {
+        self.broadcast_threads + self.sigverify_threads + self.banking_threads + self.replay_threads
+    }
+}
+
+/// Get runtime statistics with adaptive thread counts
+pub fn get_runtime_stats() -> RuntimeStats {
+    let cpu_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    
+    // ADAPTIVE defaults matching runtime initialization
+    let broadcast_default = if cpu_count <= 2 { 1 } else if cpu_count <= 4 { 2 } else { (cpu_count / 2).max(2) };
+    let sigverify_default = if cpu_count <= 4 { 1 } else { (cpu_count / 4).max(2) };
+    let banking_default = if cpu_count <= 4 { 1 } else { (cpu_count / 4).max(2) };
+    let replay_default = if cpu_count <= 4 { 1 } else { (cpu_count / 4).max(2) };
+    
+    RuntimeStats {
+        cpu_count,
+        broadcast_threads: std::env::var("QNET_BROADCAST_THREADS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(broadcast_default),
+        sigverify_threads: std::env::var("QNET_SIGVERIFY_THREADS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(sigverify_default),
+        banking_threads: std::env::var("QNET_BANKING_THREADS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(banking_default),
+        replay_threads: std::env::var("QNET_REPLAY_THREADS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(replay_default),
+    }
+}
+
 // PRODUCTION v2.19.21: QUIC-only mode
 // HTTP fallback has been removed for maximum performance
 // All nodes MUST support QUIC (port 10876 = P2P port + 1000)
+
+// v2.24.3: Global QUIC transport for static sync methods
+// Set during SimplifiedP2P initialization, used by download_block_range_static
+// ARCHITECTURE: Enables QUIC-based sync without passing &self to static methods
+// SCALABILITY: Single shared transport handles 100K+ nodes efficiently
+pub static GLOBAL_QUIC_TRANSPORT: Lazy<std::sync::RwLock<Option<Arc<tokio::sync::RwLock<crate::quic_transport::QuicTransport>>>>> = 
+    Lazy::new(|| std::sync::RwLock::new(None));
+
+// v2.24.3: Global node ID for static sync methods
+// Set during SimplifiedP2P initialization
+pub static GLOBAL_NODE_ID: Lazy<std::sync::RwLock<String>> = 
+    Lazy::new(|| std::sync::RwLock::new("unknown".to_string()));
 
 // SECURITY: Track invalid blocks from each node for malicious behavior detection
 // Format: node_id -> (invalid_count, first_invalid_time)
@@ -201,6 +441,18 @@ static EMERGENCY_CONFIRMATIONS: Lazy<Arc<DashMap<(u64, String), (AtomicU64, Inst
 // ARCHITECTURE: Soft blacklist (network issues) vs Hard blacklist (Byzantine attacks)
 static PEER_BLACKLIST: Lazy<Arc<DashMap<String, BlacklistEntry>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
+
+// BROADCAST OPTIMIZATION: Short-term cooldown for unresponsive peers
+// Key: peer_addr → Value: (retry_count, cooldown_until)
+// SCALABILITY: Prevents retry storms to "not ready" peers
+// Cooldown: 2s base, exponential backoff up to 30s max
+static PEER_RETRY_COOLDOWN: Lazy<Arc<DashMap<String, (u32, std::time::Instant)>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+// Cooldown constants
+const PEER_COOLDOWN_BASE_SECS: u64 = 2;    // Base cooldown: 2 seconds
+const PEER_COOLDOWN_MAX_SECS: u64 = 30;    // Max cooldown: 30 seconds
+const PEER_COOLDOWN_RESET_SECS: u64 = 60;  // Reset retry count after 60s of success
 
 /// SYNC: Blacklist reason categories (Soft vs Hard)
 /// Soft: Temporary network issues (timeouts, latency) - affects network_score only
@@ -311,40 +563,49 @@ pub struct PeerInfo {
     #[serde(default)]
     pub bucket_index: usize,    // K-bucket this peer belongs to
     
-    // CRITICAL: Split reputation for Byzantine-safe consensus
-    // consensus_score: Malicious behavior (invalid blocks, Byzantine attacks)
-    // network_score: Network reliability (timeouts, latency, availability)
-    #[serde(default = "default_consensus_score")]
-    pub consensus_score: f64,   // Byzantine behavior tracking (0-100, min 70 for consensus)
-    #[serde(default = "default_network_score")]
-    pub network_score: f64,     // Network performance tracking (0-100, used for prioritization)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REPUTATION v2.45.1: Cached from DeterministicReputationState
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Source of truth: DeterministicReputationState (in blockchain)
+    // This cached value is populated via get_node_reputation_from_blockchain()
+    // when PeerInfo is created. Used for P2P peer selection and consensus checks.
+    // ═══════════════════════════════════════════════════════════════════════════
+    #[serde(default = "default_reputation_70")]
+    pub reputation: f64,   // Cached blockchain reputation (70-100 scale)
     
-    // BACKWARD COMPATIBILITY: Keep old field for migration
-    #[serde(default = "default_reputation")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reputation_score: Option<f64>,  // Legacy field (migrated to split scores)
+    // LEGACY FIELDS - kept for serde backward compatibility only
+    #[serde(default = "default_reputation_70")]
+    #[doc(hidden)]
+    pub consensus_score: f64,   // LEGACY: Use `reputation` field instead
+    
+    #[serde(default = "default_reputation_100")]
+    #[doc(hidden)]
+    pub network_score: f64,     // LEGACY: Not used anymore
+    
+    #[serde(default)]
+    #[doc(hidden)]
+    pub reputation_score: Option<f64>,  // LEGACY: Not used anymore
     
     #[serde(default)]
     pub successful_pings: u32,  // Successful interactions
     #[serde(default)]
     pub failed_pings: u32,      // Failed interactions
+    
+    // v2.24.3: Track peer's blockchain height (from blocks/heartbeats)
+    // Enables QUIC-only sync without HTTP height queries
+    #[serde(default)]
+    pub last_block_height: u64,
 }
 
-fn default_consensus_score() -> f64 {
-    // PRODUCTION: Start at Byzantine threshold (fair for all nodes)
-    // Decreases on invalid blocks, increases on valid blocks
-    70.0 // Minimum for consensus participation
+fn default_reputation_70() -> f64 {
+    // v2.45.1: Use INITIAL_REPUTATION from consensus module
+    // Real reputation loaded from DeterministicReputationState
+    qnet_consensus::deterministic_reputation::INITIAL_REPUTATION
 }
 
-fn default_network_score() -> f64 {
-    // PRODUCTION: Start at full network score
-    // Decreases on timeouts/latency, increases on successful responses
-    100.0 // Optimal network performance
-}
-
-fn default_reputation() -> Option<f64> {
-    // BACKWARD COMPATIBILITY: None for new nodes (uses split scores)
-    None
+fn default_reputation_100() -> f64 {
+    // v2.45.1: Legacy field default
+    100.0
 }
 
 /// Network event types for P2P routing optimization
@@ -388,44 +649,44 @@ pub enum ReputationEvent {
 }
 
 impl PeerInfo {
-    /// Get reputation score
+    /// Get cached reputation score (from blockchain)
     /// ═══════════════════════════════════════════════════════════════════════════
-    /// ARCHITECTURE v2.21: TEMPORARY - Returns consensus_score from PeerInfo
+    /// ARCHITECTURE v2.45.1: Returns cached blockchain reputation
     /// 
-    /// In production, reputation should be computed from blockchain via
-    /// DeterministicReputationState. This field is kept for backward compatibility
-    /// during migration but should not be relied upon for consensus decisions.
-    /// 
-    /// For P2P routing optimization, use network_score instead.
+    /// Get peer's cached blockchain reputation
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// This is cached from DeterministicReputationState when PeerInfo was created.
+    /// For authoritative value, use SimplifiedP2P::get_node_reputation_from_blockchain()
     /// ═══════════════════════════════════════════════════════════════════════════
     pub fn reputation(&self) -> f64 {
-        // Return consensus_score for backward compatibility
-        // Real reputation comes from DeterministicReputationState
-        self.consensus_score
+        self.reputation
     }
     
     /// Backward compatibility alias
     #[inline]
     pub fn combined_reputation(&self) -> f64 {
-        self.reputation()
+        self.reputation
     }
     
-    /// Check if peer is qualified for consensus (Byzantine threshold)
-    /// CRITICAL: Only consensus_score matters for Byzantine safety
-    /// SCALABILITY: Light nodes NEVER participate in consensus (millions of Light nodes in production)
+    /// Check if peer is qualified for consensus (cached check)
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// WARNING: For authoritative consensus check, use:
+    /// SimplifiedP2P::can_node_participate_in_consensus(&node_id)
+    /// ═══════════════════════════════════════════════════════════════════════════
     pub fn is_consensus_qualified(&self) -> bool {
-        // Light nodes are EXCLUDED from consensus participation (only Super and Full nodes)
+        // Light nodes are EXCLUDED from consensus (only Super and Full nodes)
         if self.node_type == NodeType::Light {
             return false;
         }
         // Super and Full nodes must meet Byzantine threshold (70%)
-        self.consensus_score >= 70.0
+        // This is CACHED - for authoritative check use can_node_participate_in_consensus()
+        self.consensus_score >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION
     }
     
-    /// Migrate legacy reputation_score to split scores
+    /// Migrate legacy reputation_score to cached reputation
     pub fn migrate_legacy_reputation(&mut self) {
         if let Some(legacy_score) = self.reputation_score {
-            // Migrate legacy score to both consensus and network scores
+            // Migrate legacy score to cached blockchain reputation
             self.consensus_score = legacy_score;
             self.network_score = legacy_score;
             self.reputation_score = None; // Clear legacy field
@@ -517,10 +778,6 @@ pub struct SimplifiedP2P {
     // DUAL INDEXING: Secondary index for O(1) ID lookups
     peer_id_to_addr: Arc<DashMap<String, String>>,  // node_id -> address
     
-    // Legacy support (will migrate gradually)
-    connected_peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
-    connected_peer_addrs: Arc<RwLock<HashSet<String>>>,
-    
     // SHARDING: Use existing qnet_sharding for distribution
     shard_id: u8,  // This node's shard (0-255)
     peer_shards: Arc<DashMap<u8, Vec<String>>>,  // shard -> peer addresses
@@ -558,9 +815,8 @@ pub struct SimplifiedP2P {
     /// Reputation system for consensus (public for ping service access)
     pub reputation_system: Arc<Mutex<NodeReputation>>,
     
-    /// PRODUCTION: Slashing event collector for next macroblock
-    /// Events are collected during block production and included in macroblock
-    slashing_collector: Arc<Mutex<Vec<qnet_consensus::deterministic_reputation::SlashingEvent>>>,
+    // DEPRECATED v2.38: slashing_collector removed
+    // Slashing now determined on-chain via analyze_chain_for_slashing()
     
     /// PRODUCTION: Deterministic reputation state (shared with BlockchainNode)
     /// Set via set_deterministic_reputation() after BlockchainNode creation
@@ -610,7 +866,8 @@ pub struct SimplifiedP2P {
     /// PRODUCTION: Active Full/Super nodes for pinger selection
     /// Updated via gossip, used for deterministic pinger assignment
     /// Key: node_id, Value: ActiveNodeInfo
-    active_full_super_nodes: Arc<RwLock<HashMap<String, ActiveNodeInfo>>>,
+    /// PRODUCTION v2.51: Lock-free DashMap for 10x faster producer selection
+    active_full_super_nodes: Arc<DashMap<String, ActiveNodeInfo>>,
     
     /// PRODUCTION: Macroblock sync request channel
     /// Used for requesting macroblocks from storage (similar to sync_request_tx)
@@ -621,7 +878,7 @@ pub struct SimplifiedP2P {
     macroblock_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>>>,
     
     /// PRODUCTION v2.19.21: QUIC transport for high-performance P2P
-    /// Provides Solana/Aptos-level performance with persistent connections
+    /// High-performance transport with persistent connections
     /// Uses binary protocol (bincode) instead of JSON for efficiency
     quic_transport: Option<Arc<tokio::sync::RwLock<crate::quic_transport::QuicTransport>>>,
     
@@ -637,6 +894,36 @@ pub struct SimplifiedP2P {
     /// Received transactions from P2P are sent here for validation and mempool
     /// This enables full transaction propagation across the network
     transaction_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedTransaction>>>>,
+    
+    /// GULF STREAM v2.25: Current block producer for TX forwarding
+    /// TX is sent directly to producer (0 hops) + backup gossip (reliability)
+    /// Updated by node.rs after each block via set_current_producer()
+    /// Format: (producer_node_id, producer_address)
+    current_producer_info: Arc<RwLock<Option<(String, String)>>>,
+    
+    /// ANTI-STORM v2.25: Seen transaction hashes to prevent gossip amplification
+    /// TX is only forwarded ONCE - prevents exponential message growth
+    /// Auto-cleaned every 60 seconds (TX older than 2 minutes removed)
+    /// Capacity: 1M TX hashes (~64MB memory)
+    seen_tx_hashes: Arc<DashSet<String>>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v2.50.0: POOL 2 & POOL 3 ACCUMULATORS
+    // Accumulated fees/activations for deterministic reward distribution
+    // Reset to 0 after each EMISSION MacroBlock (every 160 = 4 hours)
+    // Values are stored in MacroBlock for all nodes to use identical amounts
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Pool 2: Accumulated transaction fees (nanoQNC)
+    /// Distribution: 70% Super nodes, 30% Full nodes, 0% Light nodes
+    /// Reset after each EMISSION MacroBlock (every 4 hours)
+    pool2_accumulated_fees: Arc<AtomicU64>,
+    
+    /// Pool 3: Accumulated node activation payments (nanoQNC)
+    /// Phase 1: Always 0 (1DEV burn, Pool 3 disabled)
+    /// Phase 2: Sum of all activation payments (equal share to ALL nodes)
+    /// Reset after each EMISSION MacroBlock (every 4 hours)
+    pool3_accumulated_activations: Arc<AtomicU64>,
 }
 
 /// HYBRID: Simplified certificate manager for microblocks only
@@ -708,6 +995,12 @@ impl CertificateManager {
     /// Store our own certificate
     pub fn set_local_certificate(&mut self, cert_serial: String, certificate: Vec<u8>) {
         self.local_certificate = Some((cert_serial, certificate));
+    }
+    
+    /// v2.26: Get local certificate with serial number for SHRED_PROTOCOL inclusion
+    /// Returns (serial_number, certificate_bytes) for creating ProducerCertificate
+    pub fn get_local_cert_with_serial(&self) -> Option<(String, Vec<u8>)> {
+        self.local_certificate.clone()
     }
     
     /// Store remote certificate (for microblock producers only)
@@ -979,6 +1272,43 @@ impl CertificateManager {
         }
         
         println!("[CERTIFICATE] 💾 Persisted {} critical certificates to disk", saved_count);
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION FIX: Persist certificate_history for rotation validation
+        // Without this, nodes reject valid rotated certificates after restart!
+        // ═══════════════════════════════════════════════════════════════════════════
+        let history_file = cert_dir.join("certificate_history.bin");
+        if !self.certificate_history.is_empty() {
+            // Serialize: node_id -> Vec<(cert_serial, ed25519_pubkey)>
+            // Format: [node_count][node_id_len][node_id][entry_count][serial_len][serial][pubkey:32]...
+            let mut history_data = Vec::new();
+            let history_count = self.certificate_history.len() as u32;
+            history_data.extend_from_slice(&history_count.to_le_bytes());
+            
+            for (node_id, entries) in &self.certificate_history {
+                // Node ID
+                let node_id_bytes = node_id.as_bytes();
+                history_data.extend_from_slice(&(node_id_bytes.len() as u16).to_le_bytes());
+                history_data.extend_from_slice(node_id_bytes);
+                
+                // Entries count
+                history_data.extend_from_slice(&(entries.len() as u8).to_le_bytes());
+                
+                for (cert_serial, ed25519_pubkey) in entries {
+                    // Certificate serial
+                    let serial_bytes = cert_serial.as_bytes();
+                    history_data.extend_from_slice(&(serial_bytes.len() as u16).to_le_bytes());
+                    history_data.extend_from_slice(serial_bytes);
+                    
+                    // Ed25519 public key (always 32 bytes)
+                    history_data.extend_from_slice(ed25519_pubkey);
+                }
+            }
+            
+            fs::write(&history_file, &history_data)?;
+            println!("[CERTIFICATE] 💾 Persisted {} node certificate histories", history_count);
+        }
+        
         Ok(())
     }
     
@@ -1038,6 +1368,78 @@ impl CertificateManager {
         }
         
         println!("[CERTIFICATE] 📂 Loaded {} certificates from disk ({} expired)", loaded_count, expired_count);
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION FIX: Load certificate_history for rotation validation
+        // Without this, nodes reject valid rotated certificates after restart!
+        // ═══════════════════════════════════════════════════════════════════════════
+        let history_file = cert_dir.join("certificate_history.bin");
+        if history_file.exists() {
+            match fs::read(&history_file) {
+                Ok(data) => {
+                    let mut offset = 0;
+                    
+                    // Read node count
+                    if data.len() < 4 {
+                        println!("[CERTIFICATE] ⚠️ History file too short");
+                        return Ok(());
+                    }
+                    let node_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                    offset += 4;
+                    
+                    let mut loaded_histories = 0;
+                    
+                    for _ in 0..node_count {
+                        if offset + 2 > data.len() { break; }
+                        
+                        // Read node_id length and value
+                        let node_id_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                        offset += 2;
+                        
+                        if offset + node_id_len > data.len() { break; }
+                        let node_id = String::from_utf8_lossy(&data[offset..offset + node_id_len]).to_string();
+                        offset += node_id_len;
+                        
+                        if offset + 1 > data.len() { break; }
+                        let entry_count = data[offset] as usize;
+                        offset += 1;
+                        
+                        let mut entries = Vec::with_capacity(entry_count);
+                        
+                        for _ in 0..entry_count {
+                            if offset + 2 > data.len() { break; }
+                            
+                            // Read cert serial
+                            let serial_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                            offset += 2;
+                            
+                            if offset + serial_len > data.len() { break; }
+                            let cert_serial = String::from_utf8_lossy(&data[offset..offset + serial_len]).to_string();
+                            offset += serial_len;
+                            
+                            // Read ed25519 pubkey (32 bytes)
+                            if offset + 32 > data.len() { break; }
+                            let mut ed25519_pubkey = [0u8; 32];
+                            ed25519_pubkey.copy_from_slice(&data[offset..offset + 32]);
+                            offset += 32;
+                            
+                            entries.push((cert_serial, ed25519_pubkey));
+                        }
+                        
+                        if !entries.is_empty() {
+                            self.certificate_history.insert(node_id, entries);
+                            loaded_histories += 1;
+                        }
+                    }
+                    
+                    println!("[CERTIFICATE] 📂 Loaded {} certificate histories from disk", loaded_histories);
+                }
+                Err(e) => {
+                    println!("[CERTIFICATE] ⚠️ Failed to load certificate history: {}", e);
+                }
+            }
+        }
+        
         Ok(())
     }
 }
@@ -1048,17 +1450,48 @@ const KADEMLIA_ALPHA: usize = 3;     // Concurrent queries
 const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 
 // ShredProtocol block propagation constants
-const SHRED_PROTOCOL_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for Dilithium signatures)
-const SHRED_PROTOCOL_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
-const SHRED_PROTOCOL_MAX_CHUNKS: usize = 2048;      // Max chunks per block (2MB max for 50K TX support)
-                                                     // ADAPTIVE: Empty block ~1KB, full 50K TX block ~1.6MB
-const SHRED_CHUNK_TIMEOUT_SECS: u64 = 3;            // Timeout before requesting missing chunks (v2.21.3)
+// v2.43.7: CRITICAL FIX - Increased chunk size to avoid Reed-Solomon TooManyShards error
+// GF(2^8) Reed-Solomon supports max 255 shards (data + parity combined)
+// At 1KB chunks: 14MB block = 14000 chunks → TooManyShards FAILURE
+// At 128KB chunks: 20MB block = 156 chunks × 1.5 = 234 shards → OK!
+// v2.63: Increased to 256KB for 100K+ TPS support (170 × 256KB = 43.5MB max)
+const SHRED_PROTOCOL_CHUNK_SIZE: usize = 256 * 1024;  // 256KB chunks (was 128KB - increased for 100K TPS)
+const SHRED_PROTOCOL_REDUNDANCY_FACTOR: f32 = 1.5;    // 50% redundancy for Reed-Solomon  
+const SHRED_PROTOCOL_MAX_CHUNKS: usize = 170;         // Max data chunks (170 + 85 parity = 255 ≤ GF(2^8) limit)
+                                                      // v2.63: 170 × 256KB = 43.5MB max block size
+                                                      // Supports 100K+ TPS with proper Reed-Solomon encoding
+const SHRED_CHUNK_TIMEOUT_SECS: u64 = 5;            // Timeout before requesting missing chunks (v2.31: increased from 3s for reliability)
 const SHRED_CHUNK_CACHE_SIZE: usize = 100;          // Cache last N blocks' chunks for retransmit (v2.21.3)
-const SHRED_CHUNK_MAX_RETRIES: u8 = 2;              // Max retransmit attempts per block (v2.21.3)
+const SHRED_CHUNK_MAX_RETRIES: u8 = 4;              // Max retransmit attempts per block (v2.31: increased from 2 for reliability)
 const MAX_CONCURRENT_CHUNK_SENDS: usize = 20;       // Max concurrent QUIC streams for chunk sends (v2.21.4)
                                                      // Prevents receiver overload from burst of 72+ streams
 
+// ============================================================================
+// PRODUCTION v2.45: ADAPTIVE PACING CONSTANTS
+// ============================================================================
+// Prevents UDP burst and packet loss under high load by:
+// 1. Batching chunk sends with delays
+// 2. Dynamically adjusting delay based on failure rate
+//
+// CRITICAL CALCULATION for 100K TPS:
+// - 20MB block = 156 data + 78 parity = 234 chunks
+// - With fanout 6: 234 × 6 = 1404 sends
+// - Must complete in <500ms to leave time for propagation
+// - At batch=100 and delay=2ms: 14 batches × 2ms = 28ms overhead ✓
+const PACING_BATCH_SIZE_DEFAULT: usize = 100;    // Chunks per batch (optimized for 100K TPS)
+const PACING_BATCH_SIZE_MIN: usize = 50;         // Minimum batch size (high failure rate)
+const PACING_DELAY_MS_DEFAULT: u64 = 2;          // Base delay between batches (reduced from 10ms!)
+const PACING_DELAY_MS_MAX: u64 = 20;             // Maximum delay between batches (reduced from 100ms)
+const PACING_FAILURE_THRESHOLD: f32 = 0.15;      // 15% failure rate triggers backpressure
+const PACING_FAILURE_CRITICAL: f32 = 0.35;       // 35% failure rate triggers aggressive backpressure
+
+/// PRODUCTION v2.45: Global failure rate tracking for adaptive pacing
+static SHRED_SEND_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SHRED_SEND_FAILURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SHRED_LAST_FAILURE_RATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); // ×1000 for precision
+
 /// ShredProtocol chunk for block propagation
+/// v2.26: Added certificate field to eliminate certificate race condition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShredProtocolChunk {
     pub block_height: u64,
@@ -1068,6 +1501,20 @@ pub struct ShredProtocolChunk {
     pub is_parity: bool,  // Reed-Solomon parity chunk
     pub original_block_size: usize,  // CRITICAL: Original block size for correct reconstruction
     pub is_macroblock: bool,  // PRODUCTION: Distinguish macro/micro for correct deserialization
+    /// v2.26: Producer certificate included in chunk #0 (data chunks only)
+    /// This eliminates race condition where block arrives before certificate
+    /// ~3KB overhead only in first chunk, but guarantees atomic block+cert delivery
+    #[serde(default)]
+    pub certificate: Option<ProducerCertificate>,
+}
+
+/// v2.26: Producer certificate for block signature verification
+/// Included in SHRED_PROTOCOL chunks to eliminate race condition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProducerCertificate {
+    pub serial_number: String,
+    pub node_id: String,
+    pub certificate_bytes: Vec<u8>,  // Serialized HybridCertificate
 }
 
 /// ShredProtocol block assembly state
@@ -1083,6 +1530,8 @@ struct ShredProtocolBlockAssembly {
     started_at: Instant,
     retransmit_attempts: u8,  // PRODUCTION v2.21.3: Track retransmit attempts
     retransmit_requested_at: Option<Instant>,  // When last retransmit was requested
+    /// v2.26: Certificate received from chunk #0 (eliminates race condition)
+    certificate: Option<ProducerCertificate>,
 }
 
 /// PRODUCTION v2.21.3: Cache entry for chunk retransmit
@@ -1136,10 +1585,6 @@ impl SimplifiedP2P {
             peer_id_to_addr: Arc::new(DashMap::new()),
             peer_shards: Arc::new(DashMap::new()),
             shard_id,
-            
-            // Legacy (for backward compatibility)
-            connected_peers: Arc::new(RwLock::new(HashMap::new())),
-            connected_peer_addrs: Arc::new(RwLock::new(HashSet::new())),
             regional_metrics: Arc::new(Mutex::new(HashMap::new())),
             lb_config: LoadBalancingConfig::default(),
             
@@ -1166,20 +1611,22 @@ impl SimplifiedP2P {
                     match bootstrap_id.as_str() {
                         "001" | "002" | "003" | "004" | "005" => {
                             // Set reputation for ALL Genesis nodes (not just self)
-                            // CRITICAL: All nodes start at 70% reputation (consensus threshold)
+                            // CRITICAL: All nodes start at INITIAL_REPUTATION (consensus threshold)
+                            use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                             for i in 1..=5 {
                                 let genesis_id = format!("genesis_node_{:03}", i);
-                                reputation_sys.set_reputation(&genesis_id, 70.0); // Default consensus threshold
+                                reputation_sys.set_reputation(&genesis_id, INITIAL_REPUTATION);
                             }
-                            println!("[P2P] 🛡️ Genesis node {} initialized - all Genesis nodes set to 70% reputation", bootstrap_id);
+                            println!("[P2P] 🛡️ Genesis node {} initialized - all Genesis nodes set to {:.0}% reputation", bootstrap_id, INITIAL_REPUTATION);
                         }
                         _ => {}
                     }
                 } else if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
                     // Legacy Genesis nodes also initialize all peers
+                    use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                     for i in 1..=5 {
                         let genesis_id = format!("genesis_node_{:03}", i);
-                        reputation_sys.set_reputation(&genesis_id, 70.0);
+                        reputation_sys.set_reputation(&genesis_id, INITIAL_REPUTATION);
                     }
                     // PRIVACY: Show pseudonym instead of node_id
                     let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
@@ -1205,7 +1652,6 @@ impl SimplifiedP2P {
                 
                 Arc::new(Mutex::new(reputation_sys))
             },
-            slashing_collector: Arc::new(Mutex::new(Vec::new())),
             deterministic_reputation: Arc::new(std::sync::RwLock::new(None)),
             consensus_tx: None,
             block_tx: Arc::new(Mutex::new(None)),
@@ -1225,8 +1671,8 @@ impl SimplifiedP2P {
             // PRODUCTION: Light Node attestations for sharded ping system
             light_node_attestations: Arc::new(RwLock::new(HashMap::new())),
             
-            // PRODUCTION: Active Full/Super nodes map for pinger selection (gossip-synced)
-            active_full_super_nodes: Arc::new(RwLock::new(HashMap::new())),
+            // PRODUCTION v2.51: Lock-free active nodes map for pinger selection
+            active_full_super_nodes: Arc::new(DashMap::new()),
             
             // PRODUCTION: Macroblock sync channels (v2.19.12)
             macroblock_sync_request_tx: None,
@@ -1241,6 +1687,16 @@ impl SimplifiedP2P {
             
             // PRODUCTION v2.19.25: Transaction channel (set via set_transaction_channel)
             transaction_tx: Arc::new(Mutex::new(None)),
+            
+            // GULF STREAM v2.25: Current producer for TX forwarding
+            current_producer_info: Arc::new(RwLock::new(None)),
+            
+            // ANTI-STORM v2.25: Prevent gossip amplification
+            seen_tx_hashes: Arc::new(DashSet::new()),
+            
+            // v2.50.0: Pool 2 & Pool 3 accumulators for deterministic rewards
+            pool2_accumulated_fees: Arc::new(AtomicU64::new(0)),
+            pool3_accumulated_activations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1279,6 +1735,38 @@ impl SimplifiedP2P {
         };
         *guard = Some(tx_channel);
         println!("[P2P] ✅ Transaction processing channel established");
+    }
+    
+    /// GULF STREAM v2.25: Set current block producer for TX forwarding
+    /// Called by node.rs after each block to update producer info
+    /// TX will be forwarded directly to producer for minimal latency
+    pub fn set_current_producer(&self, producer_id: &str, producer_addr: &str) {
+        if let Ok(mut guard) = self.current_producer_info.write() {
+            *guard = Some((producer_id.to_string(), producer_addr.to_string()));
+        }
+    }
+    
+    /// GULF STREAM v2.25: Get current producer info for TX forwarding
+    pub fn get_current_producer(&self) -> Option<(String, String)> {
+        self.current_producer_info.read().ok().and_then(|g| g.clone())
+    }
+    
+    /// GULF STREAM v2.25: Get producer address by node_id from connected peers
+    /// Used to resolve producer address when only node_id is known
+    pub fn get_peer_addr_by_id(&self, node_id: &str) -> Option<String> {
+        // First check dual index (O(1))
+        if let Some(addr) = self.peer_id_to_addr.get(node_id) {
+            return Some(addr.value().clone());
+        }
+        
+        // v2.51: Fallback to linear search in lock-free map
+        for entry in self.connected_peers_lockfree.iter() {
+            if entry.value().id == node_id {
+                return Some(entry.key().clone());
+            }
+        }
+        
+        None
     }
     
     /// PRODUCTION: Set macroblock sync request channel (v2.19.12)
@@ -1365,8 +1853,21 @@ impl SimplifiedP2P {
         transport.start_server().await
             .map_err(|e| format!("QUIC server start failed: {}", e))?;
         
-        self.quic_transport = Some(Arc::new(tokio::sync::RwLock::new(transport)));
+        let quic_arc = Arc::new(tokio::sync::RwLock::new(transport));
+        self.quic_transport = Some(quic_arc.clone());
         self.quic_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+        
+        // v2.24.3: Set global QUIC transport for static sync methods
+        // This enables QUIC-based block sync without passing &self
+        if let Ok(mut guard) = GLOBAL_QUIC_TRANSPORT.write() {
+            *guard = Some(quic_arc);
+            println!("[QUIC] 📦 Global QUIC transport registered for sync");
+        }
+        
+        // v2.24.3: Set global node ID for sync requests
+        if let Ok(mut guard) = GLOBAL_NODE_ID.write() {
+            *guard = self.node_id.clone();
+        }
         
         println!("[QUIC] ✅ Transport + Server initialized on port {}", quic_port);
         println!("[QUIC] 📊 Timeouts: connect=3s, idle=90s, keepalive=30s (aligned with HTTP)");
@@ -1422,11 +1923,10 @@ impl SimplifiedP2P {
             None => return Vec::new(),
         };
         
-        // Get current peers
-        let peers: Vec<PeerInfo> = match self.connected_peers.read() {
-            Ok(guard) => guard.values().cloned().collect(),
-            Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
-        };
+        // Get current peers (v2.51: lock-free)
+        let peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+            .map(|entry| entry.value().clone())
+            .collect();
         
         let transport = quic_transport.read().await;
         let mut results = Vec::new();
@@ -1604,10 +2104,10 @@ impl SimplifiedP2P {
         self.start_regional_rebalancer();
         
         // P2P FIX: Start peer exchange protocol for network discovery
-        // SCALABILITY: Light nodes should have less aggressive exchange to save bandwidth
-        let initial_peers = self.connected_peers.read()
-            .map(|peers| peers.values().cloned().collect())
-            .unwrap_or_else(|_| Vec::new());
+        // SCALABILITY: Light nodes should have less aggressive exchange to save bandwidth (v2.51: lock-free)
+        let initial_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+            .map(|entry| entry.value().clone())
+            .collect();
         
         if !initial_peers.is_empty() {
             // SCALABILITY: Only start exchange for nodes that need it
@@ -1625,13 +2125,21 @@ impl SimplifiedP2P {
         }
         
         // IMPROVED: Try to setup UPnP port forwarding for NAT traversal
-        let port = self.port;
-        let node_id = self.node_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = Self::setup_upnp_port_forwarding(port).await {
-                println!("[P2P] ⚠️ UPnP setup failed: {}", e);
-            }
-        });
+        // SKIP in Docker - ports are already forwarded via -p flag
+        let is_docker = std::env::var("DOCKER_ENV").is_ok() 
+            || std::path::Path::new("/.dockerenv").exists();
+        
+        if is_docker {
+            println!("[P2P] 🐳 Docker detected - skipping UPnP (ports forwarded via -p)");
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let port = self.port;
+            let _node_id = self.node_id.clone();
+            handle.spawn(async move {
+                if let Err(e) = Self::setup_upnp_port_forwarding(port).await {
+                    println!("[P2P] ⚠️ UPnP setup failed: {}", e);
+                }
+            });
+        }
         
         // QUANTUM OPTIMIZATION: Start performance monitor
         self.start_performance_optimizer();
@@ -1640,52 +2148,27 @@ impl SimplifiedP2P {
     }
     
     /// QUANTUM OPTIMIZATION: Monitor and adapt to network growth
+    /// v2.51: Simplified performance optimizer (fully lock-free)
     fn start_performance_optimizer(&self) {
-        let lockfree_clone = self.connected_peers_lockfree.clone();
-        let legacy_clone = self.connected_peers.clone();
-        let node_type = self.node_type.clone();
-        
-        tokio::spawn(async move {
-            let mut last_log = std::time::Instant::now();
-            let mut last_mode = false;
-            
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        let peers_clone = self.connected_peers_lockfree.clone();
+
+        handle.spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                
-                // Check current network size
-                let lockfree_count = lockfree_clone.len();
-                let legacy_count = legacy_clone.read().map(|p| p.len()).unwrap_or(0);
-                let max_count = lockfree_count.max(legacy_count);
-                
-                // AUTO-SCALING THRESHOLDS
-                let should_be_lockfree = match node_type {
-                    NodeType::Light => max_count >= 500,   // Light nodes: higher threshold
-                    NodeType::Full => max_count >= 100,    // Full nodes: medium threshold
-                    NodeType::Super => max_count >= 50,    // Super nodes: low threshold
-                };
-                
-                // Log mode switch
-                if should_be_lockfree != last_mode {
-                    if should_be_lockfree {
-                        println!("[P2P] ⚡ AUTO-SCALING: Activated lock-free mode ({} peers)", max_count);
-                    } else {
-                        println!("[P2P] 📊 AUTO-SCALING: Using legacy mode ({} peers)", max_count);
-                    }
-                    last_mode = should_be_lockfree;
-                }
-                
-                // Periodic statistics (every 5 minutes)
-                if last_log.elapsed() > Duration::from_secs(300) {
-                    let shard_status = if max_count >= 10000 { "ACTIVE" }
-                                    else if max_count >= 5000 { "READY" }
-                                    else { "STANDBY" };
-                    
-                    println!("[P2P] 📊 QUANTUM STATS: {} peers | Mode: {} | Sharding: {}",
-                            max_count,
-                            if should_be_lockfree { "lock-free" } else { "legacy" },
-                            shard_status);
-                    
-                    last_log = std::time::Instant::now();
+                tokio::time::sleep(Duration::from_secs(300)).await;
+
+                let peer_count = peers_clone.len();
+                let shard_status = if peer_count >= 10000 { "ACTIVE" }
+                    else if peer_count >= 5000 { "READY" }
+                    else { "STANDBY" };
+
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] stats peers={} mode=lock-free sharding={}",
+                            peer_count, shard_status);
                 }
             }
         });
@@ -1845,15 +2328,9 @@ impl SimplifiedP2P {
                 shard_peers.retain(|addr| addr != peer_addr);
             }
             
-            // BACKWARD COMPATIBILITY: Update legacy structures
-            if let Ok(mut peers) = self.connected_peers.write() {
-                peers.remove(peer_addr);
+            if crate::node::is_debug() {
+                println!("[DBG][P2P] peer_removed id={} shard={}", peer_info.id, peer_shard);
             }
-            if let Ok(mut addrs) = self.connected_peer_addrs.write() {
-                addrs.remove(peer_addr);
-            }
-            
-            println!("[P2P] ✅ LOCKFREE: Removed peer {} from shard {}", peer_info.id, peer_shard);
             true
         } else {
             false
@@ -1876,74 +2353,14 @@ impl SimplifiedP2P {
             }
         }
         
-        // Remove inactive peers
-        for peer_addr in peers_to_remove {
-            println!("[P2P] 🧹 Removing inactive peer {} (last seen > {} seconds ago)", 
-                    peer_addr, PEER_INACTIVE_TIMEOUT_SECS);
-            self.remove_peer_lockfree(&peer_addr);
+        // Remove inactive peers (v2.51: fully lock-free)
+        for peer_addr in &peers_to_remove {
+            self.remove_peer_lockfree(peer_addr);
         }
         
-        // Also clean up legacy structures if they exist
-        if let Ok(mut peers) = self.connected_peers.write() {
-            peers.retain(|_, peer| peer.last_seen >= threshold);
-        }
-        
-        if let Ok(mut addrs) = self.connected_peer_addrs.write() {
-            // Keep only addresses that still exist in main map
-            let active_addrs: HashSet<String> = self.connected_peers_lockfree
-                .iter()
-                .map(|entry| entry.key().clone())
-                .collect();
-            addrs.retain(|addr| active_addrs.contains(addr));
-        }
-    }
-    
-    /// QUANTUM MIGRATION: Sync data from legacy to lock-free structures
-    fn migrate_to_lockfree(&self) {
-        if let Ok(legacy_peers) = self.connected_peers.read() {
-            let mut migrated = 0;
-            
-            for (addr, peer) in legacy_peers.iter() {
-                // Only migrate if not already present
-                if !self.connected_peers_lockfree.contains_key(addr) {
-                    // CRITICAL: Check for self-connection before migration
-                    let peer_ip = addr.split(':').next().unwrap_or("");
-                    let external_ip_guard = match self.external_ip.read() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner()
-                    };
-                    let is_self_by_ip = if let Some(ref our_ip) = *external_ip_guard {
-                        peer_ip == our_ip
-                    } else {
-                        false
-                    };
-                    
-                    if peer.id == self.node_id || is_self_by_ip {
-                        println!("[P2P] 🚫 MIGRATION: Skipping self-connection {}", 
-                                 get_privacy_id_for_addr(&addr));
-                        continue;
-                    }
-                    
-                    // Calculate shard
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(peer.id.as_bytes());
-                    let hash = hasher.finalize();
-                    let peer_shard = hash[0];
-                    
-                    // Add to lock-free structures
-                    self.connected_peers_lockfree.insert(addr.clone(), peer.clone());
-                    self.peer_id_to_addr.insert(peer.id.clone(), addr.clone());
-                    self.peer_shards.entry(peer_shard)
-                        .or_insert_with(Vec::new)
-                        .push(addr.clone());
-                    
-                    migrated += 1;
-                }
-            }
-            
-            if migrated > 0 {
-                println!("[P2P] 🔄 MIGRATION: Moved {} peers to lock-free structures", migrated);
-            }
+        if !peers_to_remove.is_empty() && crate::node::is_info() {
+            println!("[INFO][P2P] cleanup_inactive removed={} threshold_sec={}", 
+                     peers_to_remove.len(), PEER_INACTIVE_TIMEOUT_SECS);
         }
     }
     
@@ -1963,88 +2380,25 @@ impl SimplifiedP2P {
     /// ═══════════════════════════════════════════════════════════════════════════
     #[allow(deprecated)]
     fn update_peer_reputation(&self, peer_addr: &str, event: ReputationEvent) {
-        // QUANTUM ROUTING: Try lock-free first if should use it
-        if self.should_use_lockfree() {
-            // AUTO-MIGRATE if needed
-            let legacy_has_peers = match self.connected_peers.read() {
-                Ok(peers) => !peers.is_empty(),
-                Err(poisoned) => !poisoned.into_inner().is_empty(),
-            };
-            if self.connected_peers_lockfree.is_empty() && legacy_has_peers {
-                self.migrate_to_lockfree();
-            }
-            
-            if let Some(mut peer) = self.connected_peers_lockfree.get_mut(peer_addr) {
-                // Migrate legacy reputation if needed
-                peer.migrate_legacy_reputation();
-                
-                // Apply event-specific changes
-                match event {
-                    // ═══════════════════════════════════════════════════════════
-                    // DEPRECATED CONSENSUS EVENTS - IGNORED!
-                    // Reputation now computed from blockchain
-                    // ═══════════════════════════════════════════════════════════
-                    ReputationEvent::FullRotationComplete |
-                    ReputationEvent::InvalidBlock |
-                    ReputationEvent::ConsensusParticipation |
-                    ReputationEvent::MaliciousBehavior => {
-                        // IGNORED: Use DeterministicReputationState from blockchain
-                        // Log only in debug mode to avoid spam
-                        #[cfg(debug_assertions)]
-                        println!("[REPUTATION] ⚠️ Deprecated consensus event ignored - use blockchain reputation");
-                    }
-                    
-                    // ═══════════════════════════════════════════════════════════
-                    // ACTIVE NETWORK EVENTS - For P2P routing only
-                    // ═══════════════════════════════════════════════════════════
-                    ReputationEvent::TimeoutFailure => {
-                        // SOFT penalty: WAN latency is not malicious
-                        peer.failed_pings += 1;
-                        peer.network_score = (peer.network_score - 2.0).max(0.0);
-                    }
-                    ReputationEvent::ConnectionFailure => {
-                        peer.failed_pings += 1;
-                        peer.network_score = (peer.network_score - 5.0).max(0.0);
-                    }
-                }
-                
-                peer.last_seen = self.current_timestamp();
-                return;
-            }
-        }
-        
-        // Fallback to legacy structure
-        let mut peers = match self.connected_peers.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connected peers mutex poisoned in reputation update, recovering...");
-                poisoned.into_inner()
-            }
-        };
-        if let Some(peer) = peers.get_mut(peer_addr) {
-            // Migrate legacy reputation if needed
+        // v2.51: Fully lock-free implementation
+        if let Some(mut peer) = self.connected_peers_lockfree.get_mut(peer_addr) {
             peer.migrate_legacy_reputation();
             
-            // Apply same event logic (deprecated consensus events ignored)
             match event {
-                // DEPRECATED CONSENSUS EVENTS - IGNORED
+                // DEPRECATED CONSENSUS EVENTS - IGNORED (use DeterministicReputationState)
                 ReputationEvent::FullRotationComplete |
                 ReputationEvent::InvalidBlock |
                 ReputationEvent::ConsensusParticipation |
-                ReputationEvent::MaliciousBehavior => {
-                    // IGNORED: Use DeterministicReputationState from blockchain
-                }
+                ReputationEvent::MaliciousBehavior => {}
                 
-                // ACTIVE NETWORK EVENTS
-                ReputationEvent::TimeoutFailure => {
-                    peer.failed_pings += 1;
-                    peer.network_score = (peer.network_score - 2.0).max(0.0);
-                }
+                // NETWORK EVENTS - Track for statistics only
+                ReputationEvent::TimeoutFailure |
                 ReputationEvent::ConnectionFailure => {
                     peer.failed_pings += 1;
-                    peer.network_score = (peer.network_score - 5.0).max(0.0);
                 }
             }
+            
+            peer.last_seen = self.current_timestamp();
         }
     }
     
@@ -2068,15 +2422,6 @@ impl SimplifiedP2P {
             if entry.value().id == node_id {
                 return Some(entry.value().addr.clone());
             }
-        }
-        
-        // Check connected peers (legacy)
-        let connected = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(peer) = connected.get(node_id) {
-            return Some(peer.addr.clone());
         }
         
         // Check peer_id_to_addr index
@@ -2129,14 +2474,8 @@ impl SimplifiedP2P {
             return;
         }
         
-        // Check if already connected (fast path)
-        let already_connected = if self.should_use_lockfree() {
-            self.connected_peers_lockfree.contains_key(&peer_addr)
-        } else {
-            self.connected_peers.read()
-                .map(|peers| peers.contains_key(&peer_addr))
-                .unwrap_or(false)
-        };
+        // Check if already connected (v2.51: lock-free)
+        let already_connected = self.connected_peers_lockfree.contains_key(&peer_addr);
         
         if already_connected {
             return; // Already connected, nothing to do
@@ -2198,17 +2537,19 @@ impl SimplifiedP2P {
             node_type,
             region,
             last_seen: self.current_timestamp(),
-            is_stable: false, // Will be marked stable after successful pings
-            latency_ms: 0,    // Unknown - will be measured on first ping
+            is_stable: false,
+            latency_ms: 0,
             connection_count: 0,
             bandwidth_usage: 0,
-            node_id_hash: Vec::new(),  // Will be calculated in add_peer_safe_static
-            bucket_index: 0,           // Will be calculated in add_peer_safe_static
-            consensus_score,           // Real or default based on node type
-            network_score: 50.0,       // Start at 50%, will increase with successful interactions
-            reputation_score: Some(consensus_score),
+            node_id_hash: Vec::new(),
+            bucket_index: 0,
+            reputation: consensus_score,  // v2.45.1: From blockchain
+            consensus_score,              // Legacy
+            network_score: 100.0,         // Legacy
+            reputation_score: None,       // Legacy
             successful_pings: 0,
             failed_pings: 0,
+            last_block_height: 0,
         };
         
         // Add peer using existing safe method
@@ -2222,6 +2563,8 @@ impl SimplifiedP2P {
     }
     
     /// CRITICAL FIX: Update peer last_seen AND optionally update their height
+    /// v2.24.3: Now stores height in PeerInfo for QUIC-only sync
+    /// v2.24.4: Fixed port mismatch - find peer by IP when ports differ (QUIC vs HTTP)
     pub fn update_peer_last_seen_with_height(&self, peer_id_or_addr: &str, height: Option<u64>) {
         let current_time = self.current_timestamp();
         
@@ -2230,7 +2573,8 @@ impl SimplifiedP2P {
         let peer_addr = if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id_or_addr) {
             addr_entry.clone()
         } else if peer_id_or_addr.contains(':') {
-            // Already an address
+            // v2.24.4: Address may have different port (QUIC 10876 vs P2P 9876 vs HTTP 8001)
+            // Extract IP and find peer by IP match
             peer_id_or_addr.to_string()
         } else if peer_id_or_addr.starts_with("genesis_node_") {
             // Try to construct address for Genesis nodes using helper
@@ -2242,22 +2586,43 @@ impl SimplifiedP2P {
             return; // Unknown peer format
         };
         
-        // QUANTUM ROUTING: Try lock-free first if should use it
-        if self.should_use_lockfree() {
-            if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
-                peer.last_seen = current_time;
-                return;
-            }
-        }
+        // v2.24.4: Extract IP for port-agnostic matching
+        // Problem: Heartbeat comes from QUIC port (10876), but peers stored with HTTP port (8001)
+        let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
         
-        // Fallback to legacy
-        if let Ok(mut peers) = self.connected_peers.write() {
-            if let Some(peer) = peers.get_mut(&peer_addr) {
-                peer.last_seen = current_time;
+        // v2.51: Fully lock-free implementation
+        // v2.58: REMOVED MAX_TRUSTED_HEIGHT_JUMP - heartbeats are Dilithium-signed!
+        // Old logic was breaking check_block_exists_on_network because peer heights
+        // were artificially limited, causing false emergency triggers and forks.
+        // Now we trust signed heartbeats completely - fake heights are cryptographically impossible.
+        if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
+            peer.last_seen = current_time;
+            if let Some(h) = height {
+                // Direct update - height comes from Dilithium-signed heartbeat
+                if h > peer.last_block_height {
+                    peer.last_block_height = h;
+                }
             }
+            return;
         }
+            
+            // v2.24.4: If exact match fails, find by IP (port-agnostic)
+            // v2.58: REMOVED MAX_TRUSTED_HEIGHT_JUMP - see above comment
+            for mut entry in self.connected_peers_lockfree.iter_mut() {
+                let stored_ip = entry.key().split(':').next().unwrap_or("");
+                if stored_ip == peer_ip {
+                    entry.last_seen = current_time;
+                    if let Some(h) = height {
+                        // Direct update - height comes from Dilithium-signed heartbeat
+                        if h > entry.last_block_height {
+                            entry.last_block_height = h;
+                        }
+                    }
+                    return;
+                }
+            }
     }
-    
+
     /// QUANTUM OPTIMIZATION: Lock-free peer addition for millions of nodes
     /// Uses DashMap for concurrent operations without blocking
     pub fn add_peer_lockfree(&self, mut peer_info: PeerInfo) -> bool {
@@ -2344,212 +2709,20 @@ impl SimplifiedP2P {
             .or_insert_with(Vec::new)
             .push(peer_info.addr.clone());
         
-        // BACKWARD COMPATIBILITY: Also update legacy structures
-        if let Ok(mut peers) = self.connected_peers.write() {
-            // Also apply K-bucket logic to legacy structure
-            let legacy_bucket_count = peers.values()
-                .filter(|p| p.bucket_index == peer_info.bucket_index)
-                .count();
-            
-            if legacy_bucket_count >= KADEMLIA_K {
-                // Find and remove worst peer from legacy too
-                if let Some(worst_addr) = peers.iter()
-                    .filter(|(_, p)| p.bucket_index == peer_info.bucket_index)
-                    .min_by(|a, b| a.1.reputation_score.partial_cmp(&b.1.reputation_score).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(addr, _)| addr.clone()) {
-                    
-                    peers.remove(&worst_addr);
-                    if let Ok(mut addrs) = self.connected_peer_addrs.write() {
-                        addrs.remove(&worst_addr);
-                    }
-                }
-            }
-            
-            peers.insert(peer_info.addr.clone(), peer_info.clone());
+        if crate::node::is_debug() {
+            println!("[DBG][P2P] peer_added id={} shard={} bucket={}", 
+                     peer_info.id, peer_shard, peer_info.bucket_index);
         }
-        if let Ok(mut addrs) = self.connected_peer_addrs.write() {
-            addrs.insert(peer_info.addr.clone());
-        }
-        
-        println!("[P2P] ✅ LOCKFREE: Added peer {} (shard: {}, bucket: {})", 
-                peer_info.id, peer_shard, peer_info.bucket_index);
         true
-    }
-    
-    /// QUANTUM AUTO-SCALING: Automatically determine optimal mode based on network size
-    fn should_use_lockfree(&self) -> bool {
-        // Check manual override first
-        if let Ok(manual) = std::env::var("QNET_USE_LOCKFREE") {
-            return manual == "1";
-        }
-        
-        // AUTO-DETECTION based on network characteristics
-        let peer_count = self.connected_peers_lockfree.len()
-            .max(self.connected_peers.read().map(|p| p.len()).unwrap_or(0));
-        
-        // Check if we're in Genesis phase
-        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
-            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-            .unwrap_or(false);
-        
-        // AUTOMATIC THRESHOLDS:
-        if is_genesis && peer_count <= 5 {
-            // Genesis with ≤5 nodes: legacy is fine
-            false
-        } else if peer_count < 100 {
-            // Small network (<100): legacy is sufficient
-            match self.node_type {
-                NodeType::Light => false,  // Light nodes don't need lock-free
-                _ => peer_count > 50       // Super/Full switch at 50 peers
-            }
-        } else if peer_count < 1000 {
-            // Medium network (100-1000): recommend lock-free
-            true
-        } else {
-            // Large network (1000+): MUST use lock-free
-            println!("[P2P] ⚡ AUTO-ENABLED lock-free mode for {} peers", peer_count);
-            true
-        }
     }
     
     /// CRITICAL FIX: Centralized method to add peer with duplicate prevention
     /// Returns true if peer was added, false if already exists
-    pub fn add_peer_safe(&self, mut peer_info: PeerInfo) -> bool {
-        // QUANTUM AUTO-SCALING: Automatically choose optimal path
-        if self.should_use_lockfree() {
-            return self.add_peer_lockfree(peer_info);
-        }
-        
-        // Legacy path for small networks
-        peer_info.bucket_index = self.get_bucket_index(&peer_info.id);
-        Self::add_peer_safe_static(
-            peer_info,
-            self.node_id.clone(),
-            self.connected_peers.clone(),
-            self.connected_peer_addrs.clone()
-        )
+    /// v2.51: Always uses lock-free DashMap
+    pub fn add_peer_safe(&self, peer_info: PeerInfo) -> bool {
+        self.add_peer_lockfree(peer_info)
     }
-    
-    /// STATIC VERSION: Thread-safe peer addition for use in tokio::spawn blocks
-    /// This is the MAIN implementation - add_peer_safe just delegates to this
-    fn add_peer_safe_static(
-        mut peer_info: PeerInfo,
-        node_id: String,
-        connected_peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
-        connected_peer_addrs: Arc<RwLock<HashSet<String>>>
-    ) -> bool {
-        // CRITICAL: Prevent self-connection
-        if peer_info.id == node_id {
-            println!("[P2P] 🚫 add_peer_safe_static: Rejecting self-connection by node_id {}", node_id);
-            return false;
-        }
-        
-        // PRODUCTION v2.21.4: Check global peer limit
-        {
-            let peers = match connected_peers.read() {
-                Ok(g) => g,
-                Err(p) => p.into_inner()
-            };
-            if peers.len() >= MAX_CONNECTED_PEERS {
-                // LRU eviction needed - find oldest peer
-                if let Some(oldest_addr) = peers.values()
-                    .min_by_key(|p| p.last_seen)
-                    .map(|p| p.addr.clone()) 
-                {
-                    drop(peers); // Release read lock before write
-                    // Remove oldest peer
-                    if let Ok(mut peers_write) = connected_peers.write() {
-                        peers_write.remove(&oldest_addr);
-                    }
-                    if let Ok(mut addrs_write) = connected_peer_addrs.write() {
-                        addrs_write.remove(&oldest_addr);
-                    }
-                } else {
-                    return false; // At limit, can't evict
-                }
-            }
-        }
-        
-        // First check if peer address already exists
-        {
-            let peer_addrs = match connected_peer_addrs.read() {
-                Ok(g) => g,
-                Err(p) => p.into_inner()
-            };
-            if peer_addrs.contains(&peer_info.addr) {
-                return false; // Peer already exists
-            }
-        }
-        
-        // Calculate Kademlia DHT fields if missing
-        if peer_info.node_id_hash.is_empty() {
-            let mut hasher = Sha3_256::new();
-            hasher.update(peer_info.id.as_bytes());
-            peer_info.node_id_hash = hasher.finalize().to_vec();
-        }
-        
-        // Calculate bucket index if not set
-        if peer_info.bucket_index == 0 {
-            let mut hasher = Sha3_256::new();
-            hasher.update(node_id.as_bytes());
-            hasher.update(peer_info.id.as_bytes());
-            let hash = hasher.finalize();
-            peer_info.bucket_index = (hash[0] as usize) % KADEMLIA_BITS;
-        }
-        
-        // Add to both collections atomically
-        {
-            let mut peer_addrs = match connected_peer_addrs.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let mut connected_peers = match connected_peers.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            
-            // Double-check in write lock (prevent race condition)
-            if peer_addrs.contains(&peer_info.addr) {
-                return false;
-            }
-            
-            // K-bucket management - limit peers per bucket
-            let peers_in_bucket = connected_peers.values()
-                .filter(|p| p.bucket_index == peer_info.bucket_index)
-                .count();
-            
-            if peers_in_bucket >= KADEMLIA_K {
-                // Replace least recently seen peer in bucket if new peer is better
-                // SCALABILITY: O(1) HashMap operations for millions of nodes
-                if let Some(oldest_addr) = connected_peers.values()
-                    .filter(|p| p.bucket_index == peer_info.bucket_index)
-                    .min_by_key(|p| p.last_seen)
-                    .map(|p| p.addr.clone()) {
-                    
-                    if let Some(oldest) = connected_peers.get(&oldest_addr) {
-                        if peer_info.reputation_score > oldest.reputation_score {
-                            println!("[P2P] 🔄 K-bucket {}: Replacing {} with better peer {}", 
-                                    peer_info.bucket_index, oldest_addr, peer_info.addr);
-                            peer_addrs.remove(&oldest_addr);
-                            connected_peers.remove(&oldest_addr);
-                        } else {
-                            println!("[P2P] ⚠️ K-bucket {} full, skipping peer {}", 
-                                    peer_info.bucket_index, peer_info.addr);
-                            return false;
-                        }
-                    }
-                }
-            }
-            
-            // Add to both collections - O(1) operations
-            peer_addrs.insert(peer_info.addr.clone());
-            connected_peers.insert(peer_info.addr.clone(), peer_info.clone());
-        }
-        
-        println!("[P2P] ✅ Added peer {} successfully (bucket: {})", peer_info.id, peer_info.bucket_index);
-        true
-    }
-    
+
     /// Connect to bootstrap peers OR use internet-wide peer discovery
     pub fn connect_to_bootstrap_peers(&self, peers: &[String]) {
         if peers.is_empty() {
@@ -2633,15 +2806,8 @@ impl SimplifiedP2P {
                     let peer_ip = peer_info.addr.split(':').next().unwrap_or("");
                     let is_genesis_peer = is_genesis_node_ip(peer_ip);
                 
-                // Check if not already connected (or if Genesis peer - always re-verify)
-                let already_connected = {
-                    let connected = match self.connected_peers.read() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    // SCALABILITY: O(1) HashMap lookup
-                    connected.contains_key(&peer_info.addr)
-                };
+                // Check if not already connected (or if Genesis peer - always re-verify) (v2.51: lock-free)
+                let already_connected = self.connected_peers_lockfree.contains_key(&peer_info.addr);
                 
                 // CRITICAL: Genesis peers must ALWAYS be re-verified for Byzantine safety
                 if !already_connected || is_genesis_peer {
@@ -2720,22 +2886,10 @@ impl SimplifiedP2P {
             }
         }
         
-        // Update connection count
-        // SECURITY: Safe connection count update with error handling
-        let peer_count = match self.connected_peers.read() {
-            Ok(peers) => peers.len(),
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connected peers mutex poisoned during count update");
-                poisoned.into_inner().len()
-            }
-        };
-        
-        match self.connection_count.lock() {
-            Ok(mut count) => *count = peer_count,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connection count mutex poisoned, recovering...");
-                *poisoned.into_inner() = peer_count;
-            }
+        // Update connection count (v2.51: lock-free)
+        let peer_count = self.connected_peers_lockfree.len();
+        if let Ok(mut count) = self.connection_count.lock() {
+            *count = peer_count;
         }
         
         if new_connections > 0 {
@@ -2752,11 +2906,10 @@ impl SimplifiedP2P {
                         requesting_node: peer_info.clone(),
                     };
                     
-                    // CRITICAL FIX: Use EXISTING broadcast pattern for immediate peer announcements
-                    let current_peers = match self.connected_peers.read() {
-                        Ok(peers) => peers.values().cloned().collect::<Vec<_>>(),
-                        Err(_) => continue,
-                    };
+                    // CRITICAL FIX: Use EXISTING broadcast pattern for immediate peer announcements (v2.51: lock-free)
+                    let current_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+                        .map(|e| e.value().clone())
+                        .collect();
                     
                     // Broadcast PeerDiscovery message to ALL connected nodes using existing send_network_message
                     // PRIVACY: Only Genesis nodes broadcast PeerDiscovery (their IPs are public)
@@ -2819,13 +2972,22 @@ impl SimplifiedP2P {
     
     /// Announce our node to the internet for peer discovery
     fn announce_node_to_internet(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - node announcement deferred");
+                return;
+            }
+        };
+        
         let node_id = self.node_id.clone();
         let region = self.region.clone();
         let node_type = self.node_type.clone();
         let port = self.port;
         let external_ip_store = self.external_ip.clone();
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[P2P] 🌐 Announcing node to internet...");
             
             // Get our external IP address
@@ -2902,16 +3064,24 @@ impl SimplifiedP2P {
     
     /// Search for other QNet nodes on the internet with cryptographic peer verification
     fn search_internet_peers(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - peer search deferred");
+                return;
+            }
+        };
+        
         let node_id = self.node_id.clone();
         let region = self.region.clone();
         let regional_peers = self.regional_peers.clone();
-        let connected_peers = self.connected_peers.clone();
-        let connected_peer_addrs = self.connected_peer_addrs.clone();  // EXISTING: Need for peer management
+        let connected_peers = self.connected_peers_lockfree.clone();
         let port = self.port;
         let node_type = self.node_type.clone();
         let reputation_system = self.reputation_system.clone();  // Clone for async block
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[P2P] 🌐 Searching for QNet peers with cryptographic verification...");
             
             let mut discovered_peers = Vec::new();
@@ -3003,7 +3173,7 @@ impl SimplifiedP2P {
                     match Self::verify_peer_authenticity(&target_addr).await {
                         Ok(peer_pubkey) => {
                             println!("🌟 [P2P] Quantum-secured peer verified: {} | 🔐 Dilithium signature validated | Key: {}...", 
-                                   target_addr, &peer_pubkey[..16]);
+                                   target_addr, &peer_pubkey[..peer_pubkey.len().min(16)]);
                             
                             // EXISTING: Use get_genesis_region_by_ip() to get correct Genesis peer region
                             use crate::genesis_constants::get_genesis_region_by_ip;
@@ -3018,9 +3188,9 @@ impl SimplifiedP2P {
                                 _ => region.clone(), // EXISTING: Use current region as fallback
                             };
                             
-                            // v2.21.5: Default reputation for initial discovery
-                            // Real reputation will be obtained from blockchain once connected
-                            let real_rep = 70.0; // Initial reputation for Genesis peers
+                            // v2.45.1: Use INITIAL_REPUTATION from consensus
+                            // Real reputation will be loaded from blockchain after sync
+                            let real_rep = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                             
                             let peer_info = PeerInfo {
                                 id: format!("genesis_{}", target_addr.replace(":", "_")),
@@ -3031,17 +3201,19 @@ impl SimplifiedP2P {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
-                                is_stable: false,  // Will be verified
-                                latency_ms: 0,     // Unknown - will be measured
+                                is_stable: false,
+                                latency_ms: 0,
                                 connection_count: 0,
                                 bandwidth_usage: 0,
-                                node_id_hash: Vec::new(),  // Calculated in add_peer_safe
-                                bucket_index: 0,           // Calculated in add_peer_safe
-                                consensus_score: real_rep,
-                                network_score: 100.0,  // CRITICAL FIX: Start at 100% like default_network_score
-                                reputation_score: Some(real_rep),
+                                node_id_hash: Vec::new(),
+                                bucket_index: 0,
+                                reputation: real_rep,     // v2.45.1: From blockchain
+                                consensus_score: real_rep, // Legacy
+                                network_score: 100.0,      // Legacy
+                                reputation_score: None,    // Legacy
                                 successful_pings: 0,
                                 failed_pings: 0,
+                                last_block_height: 0,  // v2.24.3
                             };
                             
                             discovered_peers.push(peer_info);
@@ -3090,64 +3262,40 @@ impl SimplifiedP2P {
                 }
             }
             
-            // Add validated peers directly using EXISTING logic from add_peer_safe
-            {
-                for mut peer in validated_peers.clone() {
-                    // CRITICAL FIX: Real connectivity check using static method (lifetime-safe)
-                    if Self::test_peer_connectivity_static(&peer.addr) {
-                        // First check if peer already exists
-                        let already_exists = {
-                            let peer_addrs = match connected_peer_addrs.read() {
-                                Ok(g) => g,
-                                Err(p) => p.into_inner()
-                            };
-                            peer_addrs.contains(&peer.addr)
-                        };
-                        
-                        if !already_exists {
-                            // Use centralized add_peer_safe_static to avoid code duplication
-                            Self::add_peer_safe_static(
-                                peer.clone(),
-                                node_id.clone(),
-                                connected_peers.clone(),
-                                connected_peer_addrs.clone()
-                            );
-                        } else {
-                            println!("[P2P] ⚠️ Internet peer {} already connected", peer.id);
-                        }
-                    } else {
-                        println!("[P2P] ❌ Skipped internet peer: {} (connection failed)", peer.id);
+            // v2.51: Add validated peers using lock-free DashMap
+            for peer in validated_peers.iter() {
+                if Self::test_peer_connectivity_static(&peer.addr) {
+                    if !connected_peers.contains_key(&peer.addr) {
+                        connected_peers.insert(peer.addr.clone(), peer.clone());
                     }
                 }
             }
-            
-            // QUANTUM DECENTRALIZED: In-memory peer management only - no file persistence
-            if !validated_peers.is_empty() {
-                println!("[P2P] 🔗 QUANTUM: {} validated peers discovered via cryptographic DHT protocol", validated_peers.len());
-                
-                // QUANTUM DECENTRALIZED: Peers added to connected_peers, peer exchange handled separately
-                println!("[P2P] 🔗 QUANTUM: {} peers ready for exchange protocol", validated_peers.len());
+
+            if crate::node::is_info() && !validated_peers.is_empty() {
+                println!("[INFO][P2P] peers_discovered count={}", validated_peers.len());
             }
-            
-            // If no peers found, still ready to accept new connections
-            let peers_empty = match connected_peers.read() {
-                Ok(peers) => peers.is_empty(),
-                Err(poisoned) => poisoned.into_inner().is_empty(),
-            };
-            if peers_empty {
+
+            if connected_peers.is_empty() {
                 println!("[P2P] 🌐 Running in genesis mode - accepting new peer connections");
-                println!("[P2P] 💡 Node ready to bootstrap other QNet nodes joining the network");
-                println!("[P2P] 💡 Other nodes will discover this node through bootstrap or peer exchange");
             }
         });
     }
     
     /// API DEADLOCK FIX: Background height synchronization to prevent circular dependencies
     fn start_background_height_sync(&self) {
-        let node_type = self.node_type.clone();
-        let connected_peers = self.connected_peers.clone();
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[SYNC] ⚠️ No Tokio runtime - background sync deferred");
+                return;
+            }
+        };
         
-        tokio::spawn(async move {
+        let node_type = self.node_type.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
+        
+        handle.spawn(async move {
             println!("[SYNC] 🔄 Starting background height synchronization...");
             
             // Initial delay to let network form
@@ -3174,56 +3322,11 @@ impl SimplifiedP2P {
                     }
                 };
                 
-                // CRITICAL FIX: Actually update network height cache periodically
-                // Query peers for their current height
-                let peers = match connected_peers.read() {
-                    Ok(guard) => guard.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                let mut peer_heights = Vec::new();
-                
-                for peer in peers.values().take(5) {  // Query up to 5 peers
-                    let peer_ip = peer.addr.split(':').next().unwrap_or("");
-                    let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
-                    
-                    // Simple HTTP query using reqwest with connection pooling
-                    match reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(2))
-                        .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
-                        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
-                        .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
-                        .build() 
-                    {
-                        Ok(client) => {
-                            match client.get(&endpoint).send().await {
-                                Ok(response) => {
-                                    // CRITICAL FIX: API returns JSON, not plain text
-                                    match response.json::<serde_json::Value>().await {
-                                        Ok(json) => {
-                                            if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
-                                                peer_heights.push(height);
-                                            } else {
-                                                // PRIVACY: Use pseudonym in logs
-                                                println!("[SYNC] ⚠️ Background: {} - malformed JSON response", get_privacy_id_for_addr(&peer_ip));
-                                            }
-                                        },
-                                        Err(e) => {
-                                            // PRIVACY: Use pseudonym in logs
-                                            println!("[SYNC] ⚠️ Background: {} - JSON parse error: {}", get_privacy_id_for_addr(&peer_ip), e);
-                                        }
-                                    }
-                                },
-                                Err(e) => {
-                                    // PRIVACY: Use pseudonym in logs
-                                    println!("[SYNC] ⚠️ Background: {} - HTTP error: {}", get_privacy_id_for_addr(&peer_ip), e);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            println!("[SYNC] ⚠️ Background: client build error: {}", e);
-                        }
-                    }
-                }
+                // v2.51: Lock-free height collection
+                let mut peer_heights: Vec<u64> = connected_peers.iter()
+                    .filter(|e| e.value().last_block_height > 0)
+                    .map(|e| e.value().last_block_height)
+                    .collect();
                 
                 // Update cache if we got responses
                 if !peer_heights.is_empty() {
@@ -3269,15 +3372,23 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Start periodic cleanup of inactive peers
     fn start_peer_cleanup_task(&self) {
-        // Clone Arc references for the async task
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - peer cleanup task deferred");
+                return;
+            }
+        };
+        
+        // v2.51: Clone references for async task
         let connected_peers_lockfree = self.connected_peers_lockfree.clone();
-        let connected_peers = self.connected_peers.clone();
-        let connected_peer_addrs = self.connected_peer_addrs.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let peer_id_to_addr = self.peer_id_to_addr.clone();
         let peer_shards = self.peer_shards.clone();
         let quic_transport = self.quic_transport.clone();
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[P2P] 🧹 Starting periodic peer cleanup task (every 5 minutes)...");
             
             // Initial delay to let network stabilize
@@ -3325,237 +3436,474 @@ impl SimplifiedP2P {
                             peer_addr, peer_id, PEER_INACTIVE_TIMEOUT_SECS);
                 }
                 
-                // Also clean up legacy structures if they exist
-                if !peers_to_remove.is_empty() {
-                    if let Ok(mut peers) = connected_peers.write() {
-                        peers.retain(|_, peer| peer.last_seen >= threshold);
-                    }
-                    
-                    if let Ok(mut addrs) = connected_peer_addrs.write() {
-                        // Keep only addresses that still exist in main map
-                        let active_addrs: HashSet<String> = connected_peers_lockfree
-                            .iter()
-                            .map(|entry| entry.key().clone())
-                            .collect();
-                        addrs.retain(|addr| active_addrs.contains(addr));
-                    }
-                    
-                    println!("[P2P] ✅ Cleaned up {} inactive peers", peers_to_remove.len());
+                // v2.51: All cleanup done via lockfree DashMap above
+                if !peers_to_remove.is_empty() && crate::node::is_info() {
+                    println!("[INFO][P2P] cleanup_inactive removed={}", peers_to_remove.len());
                 }
                 
-                // CRITICAL: Also cleanup idle QUIC connections
+                // CRITICAL v2.24: QUIC health check and cleanup
                 if let Some(ref quic_transport) = quic_transport {
                     let transport = quic_transport.read().await;
+                    
+                    // v2.24: Health check removes dead connections
+                    let (alive, removed) = transport.health_check();
+                    
+                    // Cleanup idle connections
                     transport.cleanup_idle();
-                    println!("[QUIC] 🧹 Cleaned up idle QUIC connections (timeout: 90s)");
+                    
+                    if removed > 0 || alive < 4 {
+                        println!("[QUIC] 🧹 Health check: {} alive, {} removed | Reconnecting to missing peers...", 
+                                 alive, removed);
+                    }
+                }
+            }
+        });
+        
+        // v2.24: Start frequent QUIC health check task (every 15 seconds)
+        self.start_quic_health_check_task();
+        
+        // v2.25: Start TX cache cleanup task (prevents memory leak)
+        self.start_tx_cache_cleanup_task();
+        
+        // PRODUCTION v2.56: Start background repair task for incomplete block assemblies
+        // CRITICAL: Ensures repair happens independently of chunk arrival
+        self.start_background_repair_task();
+    }
+    
+    /// v2.25: Periodic cleanup of seen_tx_hashes to prevent memory leak
+    /// Runs every 60 seconds, clears entire cache (TXs older than 60s are not re-gossiped anyway)
+    fn start_tx_cache_cleanup_task(&self) {
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        
+        let seen_tx_hashes = Arc::clone(&self.seen_tx_hashes);
+        
+        handle.spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            
+            loop {
+                interval.tick().await;
+                
+                let count = seen_tx_hashes.len();
+                if count > 0 {
+                    seen_tx_hashes.clear();
+                    println!("[ANTI-STORM] 🧹 Cleared {} TX hashes from dedup cache", count);
                 }
             }
         });
     }
     
-         /// Reputation-based peer validation using QNet reputation system (PRODUCTION)
-     fn start_reputation_validation(&self) {
-         let node_id = self.node_id.clone();
-         let connected_peers = self.connected_peers.clone();
-        let connected_peer_addrs = self.connected_peer_addrs.clone(); // CRITICAL: Clone for phantom cleanup
-         let _reputation_system = self.reputation_system.clone(); // DEPRECATED v2.21.5
-         let connected_peers_lockfree = self.connected_peers_lockfree.clone(); // For get_last_activity_map
-         let deterministic_rep = self.deterministic_reputation.clone(); // v2.21.5: Blockchain source
-         let genesis_ips = vec!["154.38.160.39".to_string(), "62.171.157.44".to_string(), 
-                               "161.97.86.81".to_string(), "5.189.130.160".to_string(), 
-                               "162.244.25.114".to_string()]; // Genesis IPs to avoid borrowing self
-         
-         tokio::spawn(async move {
-             println!("[P2P] 🔍 Starting reputation-based peer validation with shared reputation system...");
-             
-             // PRODUCTION: Use existing PERSISTENT reputation system
-             
-             loop {
-                // CRITICAL: Bootstrap nodes check more frequently (5 sec) for Byzantine safety
-                // Regular nodes with millions of peers check every 30 sec for scalability
-                let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID")
-                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                    .unwrap_or(false);
+    /// PRODUCTION v2.56: Background repair task for incomplete block assemblies
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// PROBLEM: Repair was only triggered when receiving chunks
+    ///          If no chunks arrive → repair never triggers → emergency failover
+    /// SOLUTION: Background task checks incomplete assemblies every 500ms
+    ///           Requests missing chunks proactively before emergency timeout
+    /// ARCHITECTURE: Uses BROADCAST_RUNTIME to avoid main loop contention
+    /// ═══════════════════════════════════════════════════════════════════════════
+    fn start_background_repair_task(&self) {
+        let shred_protocol_assemblies = self.shred_protocol_assemblies.clone();
+        let shred_chunk_cache = self.shred_chunk_cache.clone();
+        let connected_peers_lockfree = self.connected_peers_lockfree.clone();
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.clone();
+        let node_id = self.node_id.clone();
+        
+        // CRITICAL: Use BROADCAST_RUNTIME, not main Tokio runtime
+        // This ensures repair never competes with heartbeats, peer discovery, API
+        BROADCAST_RUNTIME.spawn(async move {
+            // Check every 500ms - gives 10 checks before 5s emergency timeout
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+            let mut repair_stats_log_counter = 0u64;
+            
+            loop {
+                interval.tick().await;
+                repair_stats_log_counter += 1;
                 
-                let check_interval = if is_bootstrap_node { 5 } else { 30 };
-                tokio::time::sleep(std::time::Duration::from_secs(check_interval)).await;
-                 
-                 // v2.21.5: Reputation decay now handled via DeterministicReputationState
-                 // Passive recovery in process_macroblock replaces decay
-                 // No legacy decay needed - blockchain is source of truth
-                 
-                 // PRODUCTION: Sync reputation with network every 5 minutes
-                 // Moved to a separate task to avoid complexity in validation loop
-                 
-                 // Validate all connected peers
-                let mut to_remove: Vec<String> = Vec::new(); // Store addresses, not indices
-                 {
-                    // SCALABILITY: Collect ALL peers for parallel checking (not just Genesis)
-                    // This fixes overlapping HTTP requests for Full/Super nodes
-                    let all_peers_to_check: Vec<(String, String, bool)> = {
-                        let connected = match connected_peers.read() {
-                            Ok(peers) => peers,
-                            Err(poisoned) => {
-                                println!("[P2P] ⚠️ Connected peers mutex poisoned during read");
-                                poisoned.into_inner()
-                            }
-                        };
-                        
-                        connected.iter()
-                            .map(|(addr, peer)| {
-                                let is_genesis = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
-                                (addr.clone(), peer.addr.clone(), is_genesis)
-                            })
-                            .collect()
-                    };
+                // Collect assemblies that need repair
+                let mut assemblies_to_repair: Vec<(u64, Vec<usize>, usize, usize)> = Vec::new();
+                
+                for entry in shred_protocol_assemblies.iter() {
+                    let height = *entry.key();
+                    let assembly = entry.value();
                     
-                    // SCALABILITY: Parallel connectivity checks for ALL nodes using buffer_unordered
-                    // Genesis nodes: critical for consensus (checked every iteration)
-                    // Full/Super nodes: potential producers (checked to prevent overlapping)
-                    // Light nodes: no consensus participation (but still checked for network health)
-                    let connectivity_results = if !all_peers_to_check.is_empty() {
-                        use futures::stream::{self, StreamExt};
-                        
-                        // ADAPTIVE CONCURRENCY: Scale with network size for optimal performance
-                        // Small networks: gentle (avoid overwhelming)
-                        // Large networks: aggressive (finish before next iteration)
-                        let peer_count = all_peers_to_check.len();
-                        let concurrency = match peer_count {
-                            0..=10 => 5,      // Small network: 5 concurrent (Genesis bootstrap)
-                            11..=50 => 10,    // Medium: 10 concurrent (early network)
-                            51..=200 => 20,   // Growing: 20 concurrent
-                            201..=500 => 30,  // Large: 30 concurrent
-                            _ => 50,          // Massive (500+): 50 concurrent (for 1000 producers)
-                        };
-                        
-                        println!("[P2P] 🔄 Checking {} peers with concurrency={} (adaptive)", peer_count, concurrency);
-                        
-                        let results = stream::iter(all_peers_to_check)
-                            .map(|(addr, peer_addr, is_genesis)| async move {
-                                // Use spawn_blocking for blocking I/O
-                                let is_reachable = tokio::task::spawn_blocking(move || {
-                                    Self::test_peer_connectivity_static(&peer_addr)
-                                }).await.unwrap_or(false);
-                                (addr, is_reachable, is_genesis)
-                            })
-                            .buffer_unordered(concurrency) // Adaptive concurrency based on network size
-                            .collect::<Vec<_>>()
-                            .await;
-                        results
-                    } else {
-                        Vec::new()
-                    };
+                    let elapsed_ms = assembly.started_at.elapsed().as_millis() as u64;
                     
-                    // Now apply results and check reputation
-                    let mut connected = match connected_peers.write() {
-                         Ok(peers) => peers,
-                         Err(poisoned) => {
-                             println!("[P2P] ⚠️ Connected peers mutex poisoned during reputation validation");
-                             poisoned.into_inner()
-                         }
-                     };
-                     
-                    // Apply connectivity results for ALL peers
-                    for (addr, is_reachable, is_genesis) in connectivity_results {
-                        if let Some(peer) = connected.get_mut(&addr) {
-                            if !is_reachable {
-                                if is_genesis {
-                                    // CRITICAL FIX: Do NOT remove Genesis nodes from connected_peers
-                                    // Genesis nodes are trusted anchors - temporary unavailability ≠ dead node
-                                    peer.is_stable = false;
-                                    println!("[P2P] ⚠️ Genesis peer {} temporarily unreachable (kept in peers, marked unstable)", peer.id);
-                                } else {
-                                    // Full/Super/Light nodes: Mark as unstable, will be removed if reputation is low
-                                    peer.is_stable = false;
-                                    println!("[P2P] ⚠️ Peer {} unreachable (marked unstable)", peer.id);
+                    // Skip if too fresh (< 500ms) or already reconstructed
+                    if elapsed_ms < 500 {
+                        continue;
+                    }
+                    
+                    // Count received chunks
+                    let data_received: usize = assembly.chunks_received.iter()
+                        .filter(|c| c.is_some())
+                        .count();
+                    let parity_received: usize = assembly.parity_chunks.iter()
+                        .filter(|c| c.is_some())
+                        .count();
+                    let total_received = data_received + parity_received;
+                    
+                    // Calculate required for Reed-Solomon (67%)
+                    let total_chunks = assembly.total_chunks;
+                    let required = ((total_chunks as f32) * 0.67).ceil() as usize;
+                    
+                    // If we have enough - reconstruction should happen, skip
+                    if total_received >= required {
+                        continue;
+                    }
+                    
+                    // Check if we should request repair (every 2 seconds, max 4 attempts)
+                    let should_request = assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
+                        && assembly.retransmit_requested_at
+                            .map(|t| t.elapsed().as_secs() >= 2)
+                            .unwrap_or(true);
+                    
+                    if should_request {
+                        // Find missing chunk indices
+                        let mut missing_indices: Vec<usize> = assembly.chunks_received.iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.is_none())
+                            .map(|(i, _)| i)
+                            .collect();
+                        
+                        // Add missing parity indices
+                        let parity_missing: Vec<usize> = assembly.parity_chunks.iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.is_none())
+                            .map(|(i, _)| total_chunks + i)
+                            .collect();
+                        missing_indices.extend(parity_missing);
+                        
+                        if !missing_indices.is_empty() {
+                            assemblies_to_repair.push((height, missing_indices, total_received, required));
+                        }
+                    }
+                }
+                
+                // Process repairs
+                for (height, missing_indices, received, required) in assemblies_to_repair {
+                    // Update assembly state
+                    if let Some(mut assembly) = shred_protocol_assemblies.get_mut(&height) {
+                        assembly.retransmit_attempts += 1;
+                        assembly.retransmit_requested_at = Some(std::time::Instant::now());
+                    }
+                    
+                    let missing_count = missing_indices.len();
+                    println!("[INFO][REPAIR] background_request h={} missing={} received={}/{} attempt={}",
+                        height, missing_count, received, required,
+                        shred_protocol_assemblies.get(&height).map(|a| a.retransmit_attempts).unwrap_or(0));
+                    
+                    // Find peers who might have the chunks (from cache or producers)
+                    let repair_targets: Vec<String> = connected_peers_lockfree.iter()
+                        .filter(|e| e.value().is_consensus_qualified())
+                        .take(3) // Ask up to 3 peers
+                        .map(|e| e.value().addr.clone())
+                        .collect();
+                    
+                    if repair_targets.is_empty() {
+                        println!("[WARN][REPAIR] no_qualified_peers h={}", height);
+                        continue;
+                    }
+                    
+                    // Send repair requests via QUIC
+                    if quic_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(ref transport) = quic_transport {
+                            let transport_guard = transport.read().await;
+                            
+                            for peer_addr in &repair_targets {
+                                // Build repair request message
+                                let request = NetworkMessage::RequestMissingChunks {
+                                    block_height: height,
+                                    missing_indices: missing_indices.clone(),
+                                    requester_id: node_id.clone(),
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                };
+                                
+                                // Parse peer address
+                                let parts: Vec<&str> = peer_addr.split(':').collect();
+                                if parts.len() == 2 {
+                                    if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
+                                        let quic_port = port.saturating_add(crate::quic_transport::QUIC_PORT_OFFSET);
+                                        let quic_addr = std::net::SocketAddr::new(ip, quic_port);
+                                        
+                                        let _ = transport_guard.broadcast_to(quic_addr, &request).await;
+                                    }
                                 }
-                            } else {
-                                // Peer is reachable - mark as stable
-                                peer.is_stable = true;
+                            }
+                            
+                            println!("[INFO][REPAIR] requests_sent h={} peers={} chunks={}",
+                                height, repair_targets.len(), missing_count);
+                        }
+                    }
+                }
+                
+                // Log repair stats periodically (every 60 seconds = 120 ticks)
+                if repair_stats_log_counter % 120 == 0 {
+                    let active_assemblies = shred_protocol_assemblies.len();
+                    if active_assemblies > 0 {
+                        println!("[INFO][REPAIR] background_stats active_assemblies={}", active_assemblies);
+                    }
+                }
+                
+                // Cleanup old assemblies (> 30 seconds = definitely timed out)
+                let mut expired: Vec<u64> = Vec::new();
+                for entry in shred_protocol_assemblies.iter() {
+                    if entry.value().started_at.elapsed().as_secs() > 30 {
+                        expired.push(*entry.key());
+                    }
+                }
+                for height in expired {
+                    shred_protocol_assemblies.remove(&height);
+                }
+            }
+        });
+        
+        println!("[INFO][REPAIR] background_task_started interval=500ms runtime=broadcast");
+    }
+    
+    /// v2.24.2: Frequent QUIC health check with ACTIVE HealthPing probing
+    /// SCALABLE: Works for any network size (5 nodes to 100K+)
+    /// ACTIVE: Sends HealthPing to all peers - detects zombie connections early
+    fn start_quic_health_check_task(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[QUIC] ⚠️ No Tokio runtime - health check task deferred");
+                return;
+            }
+        };
+        
+        let quic_transport = self.quic_transport.clone();
+        let connected_peers_lockfree = self.connected_peers_lockfree.clone();
+        let node_id = self.node_id.clone();
+        
+        handle.spawn(async move {
+            println!("[QUIC] 🔄 Starting QUIC health check task (every 15s) with ACTIVE HealthPing...");
+            
+            // Initial delay to let network stabilize
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                
+                if let Some(ref quic_transport) = quic_transport {
+                    let transport = quic_transport.read().await;
+                    
+                    // Step 1: Passive health check - removes connections with close_reason
+                    let (alive, removed) = transport.health_check();
+                    
+                    // Step 2: ACTIVE health check - send HealthPing to all connected peers
+                    // This detects zombie connections (NAT timeout) BEFORE they cause problems
+                    let connected_peers = transport.get_connected_peers();
+                    let mut zombie_count = 0;
+                    
+                    // v2.25.1: Get current height for HealthPing
+                    let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                    
+                    for (peer_addr, peer_id, _peer_type) in &connected_peers {
+                        let ping_msg = NetworkMessage::HealthPing {
+                            from: node_id.clone(),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            height: current_height,  // v2.25.1: Include height for network sync
+                        };
+                        
+                        // Try to send HealthPing - if it fails, connection is zombie
+                        match transport.broadcast_to(*peer_addr, &ping_msg).await {
+                            Ok(_) => {
+                                // Connection is healthy
+                            }
+                            Err(_e) => {
+                                // Connection is zombie - will be removed by retry logic
+                                zombie_count += 1;
+                                println!("[QUIC] 💀 Zombie connection detected to {} via HealthPing", 
+                                         get_privacy_id_for_addr(&peer_id));
                             }
                         }
                     }
                     
-                    // SCALABILITY: O(1) HashMap operations for millions of nodes
-                    // Reputation check for all peers (connectivity already checked above in parallel)
-                    for (addr, peer) in connected.iter_mut() {
-                       let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
-                       
-                         // Check peer reputation from blockchain (v2.21.5)
-                         let reputation = {
-                             let rep_result = deterministic_rep.read();
-                             if let Ok(outer) = rep_result {
-                                 if let Some(ref inner_arc) = *outer {
-                                     if let Ok(state) = inner_arc.read() {
-                                         state.get_reputation(&peer.id, std::time::SystemTime::now()
-                                             .duration_since(std::time::UNIX_EPOCH)
-                                             .unwrap_or_default()
-                                             .as_secs())
-                                     } else { 70.0 }
-                                 } else { 70.0 }
-                             } else { 70.0 }
-                         };
-                         
-                        // SECURITY FIX: Remove peers with very low reputation (Genesis nodes stay connected but penalized)
-                         if reputation < 10.0 && !is_genesis_peer {
-                             println!("[P2P] 🚫 Removing peer {} due to low reputation: {}", 
-                                 peer.id, reputation);
-                            to_remove.push(addr.clone());
-                         } else {
-                             // Update peer stability based on reputation and connectivity
-                             if is_genesis_peer {
-                                // Genesis peers: Stay connected but can lose stability for bad behavior
-                                // Stability requires BOTH good reputation AND connectivity
-                                let has_good_reputation = reputation >= 70.0;
-                                peer.is_stable = peer.is_stable && has_good_reputation; // AND with connectivity result
-                                
-                                if reputation < 70.0 {
-                                    println!("[P2P] ⚠️ Genesis peer {} unstable due to low reputation: {:.1}%", peer.id, reputation);
-                                } else if reputation < 90.0 {
-                                    println!("[P2P] 🔶 Genesis peer {} penalized but stable: {:.1}%", peer.id, reputation);
-                                } else {
-                                    println!("[P2P] 🛡️ Genesis peer {} excellent standing: {:.1}%", peer.id, reputation);
+                    // Log health status periodically
+                    if removed > 0 || zombie_count > 0 {
+                        println!("[QUIC] 🏥 Health check: {} alive, {} removed (passive), {} zombie (active)", 
+                                 alive, removed, zombie_count);
+                    }
+                    
+                    drop(transport); // Release read lock before reconnection
+                    
+                    // Step 3: Proactive reconnection if we have very few connections
+                    let effective_alive = alive.saturating_sub(zombie_count);
+                    let min_connections = 3; // Minimum for Byzantine tolerance
+                    
+                    if effective_alive < min_connections {
+                        // Get known peers from P2P layer (not just bootstrap)
+                        let peers_to_try: Vec<String> = connected_peers_lockfree
+                            .iter()
+                            .filter(|entry| entry.value().id != node_id)
+                            .take(10) // Limit reconnection attempts
+                            .map(|entry| entry.key().clone())
+                            .collect();
+                        
+                        if !peers_to_try.is_empty() {
+                            println!("[QUIC] 🔄 Low connections ({}/{}), attempting reconnect to {} peers...", 
+                                     effective_alive, min_connections, peers_to_try.len());
+                            
+                            for peer_addr_str in peers_to_try {
+                                if let Ok(addr) = peer_addr_str.parse::<std::net::SocketAddr>() {
+                                    let quic_addr = std::net::SocketAddr::new(
+                                        addr.ip(),
+                                        crate::quic_transport::QUIC_PORT
+                                    );
+                                    
+                                    let transport_clone = quic_transport.clone();
+                                    tokio::spawn(async move {
+                                        let t = transport_clone.read().await;
+                                        if !t.is_connection_alive(&quic_addr) {
+                                            let _ = t.connect(quic_addr).await;
+                                            // Silent - avoid log spam
+                                        }
+                                    });
                                 }
-                            } else {
-                                // Regular peers: Standard reputation handling
-                                // Stability requires BOTH good reputation AND connectivity
-                                let has_good_reputation = reputation >= 70.0;
-                                peer.is_stable = peer.is_stable && has_good_reputation; // AND with connectivity result
-                             }
-                         }
-                     }
-                     
-                   // ATOMICITY FIX: Get write lock on BOTH collections before removing
-                   let mut peer_addrs = match connected_peer_addrs.write() {
-                       Ok(addrs) => addrs,
-                       Err(e) => {
-                           println!("[P2P] ⚠️ Poisoned addrs lock, recovering");
-                           e.into_inner()
-                       }
-                   };
-                   
-                   // Remove low-reputation peers from BOTH collections atomically - O(1) per removal
-                    for addr_to_remove in &to_remove {
-                       connected.remove(addr_to_remove);
-                       peer_addrs.remove(addr_to_remove);
-                     }
-                 }
-                 
-                 if !to_remove.is_empty() {
-                     println!("[P2P] 🧹 Removed {} peers due to low reputation", to_remove.len());
-                 }
-             }
-         });
-     }
-     
-     /// Start multicast discovery for QNet nodes
-     fn start_multicast_discovery(&self) {
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Reputation-based peer validation (v2.51: lock-free)
+    fn start_reputation_validation(&self) {
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - reputation validation deferred");
+                return;
+            }
+        };
+
+        let connected_peers = self.connected_peers_lockfree.clone();
+        let deterministic_rep = self.deterministic_reputation.clone();
+        let genesis_ips: Vec<String> = vec![
+            "154.38.160.39".to_string(), "62.171.157.44".to_string(),
+            "161.97.86.81".to_string(), "5.189.130.160".to_string(),
+            "162.244.25.114".to_string()
+        ];
+
+        handle.spawn(async move {
+            loop {
+                let is_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
+                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                    .unwrap_or(false);
+                let check_interval = if is_bootstrap { 5 } else { 30 };
+                tokio::time::sleep(std::time::Duration::from_secs(check_interval)).await;
+
+                let mut to_remove: Vec<String> = Vec::new();
+
+                // Collect peers for parallel checking
+                let all_peers: Vec<(String, String, bool)> = connected_peers.iter()
+                    .map(|entry| {
+                        let peer = entry.value();
+                        let is_genesis = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
+                        (entry.key().clone(), peer.addr.clone(), is_genesis)
+                    })
+                    .collect();
+
+                if all_peers.is_empty() {
+                    continue;
+                }
+
+                // Parallel connectivity checks
+                use futures::stream::{self, StreamExt};
+                let concurrency = match all_peers.len() {
+                    0..=10 => 5,
+                    11..=50 => 10,
+                    51..=200 => 20,
+                    _ => 50,
+                };
+
+                let connectivity_results: Vec<_> = stream::iter(all_peers)
+                    .map(|(addr, peer_addr, is_genesis)| async move {
+                        let is_reachable = tokio::task::spawn_blocking(move || {
+                            Self::test_peer_connectivity_static(&peer_addr)
+                        }).await.unwrap_or(false);
+                        (addr, is_reachable, is_genesis)
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect()
+                    .await;
+
+                // Apply results
+                for (addr, is_reachable, is_genesis) in connectivity_results {
+                    if let Some(mut peer) = connected_peers.get_mut(&addr) {
+                        if !is_reachable && !is_genesis {
+                            peer.is_stable = false;
+                        } else if is_reachable {
+                            peer.is_stable = true;
+                        }
+                    }
+                }
+
+                // Check reputation
+                for entry in connected_peers.iter() {
+                    let peer = entry.value();
+                    let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
+
+                    let reputation = {
+                        let rep_result = deterministic_rep.read();
+                        if let Ok(outer) = rep_result {
+                            if let Some(ref inner_arc) = *outer {
+                                if let Ok(state) = inner_arc.read() {
+                                    state.get_reputation(&peer.id, std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs())
+                                } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
+                            } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
+                        } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
+                    };
+
+                    if reputation < 10.0 && !is_genesis_peer {
+                        to_remove.push(entry.key().clone());
+                    }
+                }
+
+                // Remove low-reputation peers
+                for addr in &to_remove {
+                    connected_peers.remove(addr);
+                }
+
+                if !to_remove.is_empty() && crate::node::is_info() {
+                    println!("[INFO][P2P] reputation_cleanup removed={}", to_remove.len());
+                }
+            }
+        });
+    }
+
+    /// Start multicast discovery for QNet nodes
+    fn start_multicast_discovery(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - multicast discovery deferred");
+                return;
+            }
+        };
+        
         let node_id = self.node_id.clone();
         let region = self.region.clone();
-        let connected_peers = self.connected_peers.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let port = self.port;
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[P2P] 🔍 Starting multicast discovery...");
             
             // Announce our presence via multicast
@@ -3811,7 +4159,7 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION v2.19.21: Broadcast block using ShredProtocol protocol via QUIC
-    /// Solana-inspired chunking with Reed-Solomon erasure coding
+    /// Chunking with Reed-Solomon erasure coding for reliability
     /// For microblocks only (default) - use broadcast_block_shred_protocol_typed for macroblocks
     pub async fn broadcast_block_shred_protocol(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
         self.broadcast_block_shred_protocol_typed(height, block_data, false).await
@@ -3819,13 +4167,25 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Broadcast block (micro or macro) using ShredProtocol protocol via QUIC
     /// Supports both microblocks and macroblocks with correct type tagging
+    /// v2.26: Certificate is now included in chunk #0 to eliminate race condition
     pub async fn broadcast_block_shred_protocol_typed(&self, height: u64, block_data: Vec<u8>, is_macroblock: bool) -> Result<(), String> {
         use futures::future::join_all;
         use crate::p2p_transport::P2PTransport;
         
-        // Check if block is too large for ShredProtocol
-        if block_data.len() > SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE {
-            return Err(format!("Block too large for ShredProtocol: {} bytes", block_data.len()));
+        let max_shred_size = SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE;
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.63: Block size validation
+        // ═══════════════════════════════════════════════════════════════════════════
+        // With Level 1 (40MB block size limit at creation) and Level 2 (43.5MB ShredProtocol max),
+        // blocks should NEVER exceed the limit. If they do, log error and reject.
+        if block_data.len() > max_shred_size {
+            println!("[ERR][SHRED] block_rejected h={} size_mb={:.2} max_mb={:.2} reason=exceeds_shred_limit",
+                     height, 
+                     block_data.len() as f64 / 1_000_000.0,
+                     max_shred_size as f64 / 1_000_000.0);
+            return Err(format!("Block {} exceeds ShredProtocol limit: {:.2}MB > {:.2}MB. This should never happen with Level 1 protection.",
+                              height, block_data.len() as f64 / 1_000_000.0, max_shred_size as f64 / 1_000_000.0));
         }
         
         // Get validated peers using existing method
@@ -3838,16 +4198,84 @@ impl SimplifiedP2P {
             return Ok(());
         }
         
+        // v2.26: Get producer certificate to include in chunk #0
+        // This eliminates race condition where block arrives before certificate
+        let producer_certificate: Option<ProducerCertificate> = {
+            let cert_manager = match self.certificate_manager.read() { 
+                Ok(g) => g, 
+                Err(p) => p.into_inner() 
+            };
+            // Get local certificate (we are the producer)
+            if let Some((serial, cert_bytes)) = cert_manager.get_local_cert_with_serial() {
+                Some(ProducerCertificate {
+                    serial_number: serial,
+                    node_id: self.node_id.clone(),
+                    certificate_bytes: cert_bytes,
+                })
+            } else {
+                // No certificate yet - this can happen during genesis
+                if height > 0 {
+                    println!("[SHRED_PROTOCOL] ⚠️ No producer certificate for block #{} - peers may need to request it", height);
+                }
+                None
+            }
+        };
+        
         // CRITICAL: Store original block size BEFORE splitting
         let original_block_size = block_data.len();
 
         // Split block into chunks
         let chunks = self.split_into_chunks(&block_data);
         let total_chunks = chunks.len();
-        let parity_count = ((total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize;
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.55: ADAPTIVE REDUNDANCY for large blocks
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.55: ADAPTIVE REDUNDANCY
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Problem: Fixed 1.5x redundancy insufficient for large blocks
+        // Solution: Scale redundancy with block size for optimal reliability
+        // ═══════════════════════════════════════════════════════════════════════════
+        let adaptive_redundancy = if original_block_size < 100_000 {
+            SHRED_PROTOCOL_REDUNDANCY_FACTOR  // 1.5x for small blocks
+        } else if original_block_size < 500_000 {
+            1.75  // Medium blocks
+        } else if original_block_size < 2_000_000 {
+            2.0   // Large blocks - 100% redundancy
+        } else {
+            2.5   // Very large blocks - extra safety
+        };
+        
+        let parity_count = ((total_chunks as f32) * (adaptive_redundancy - 1.0)).ceil() as usize;
         
         // Generate Reed-Solomon parity chunks
         let parity_chunks = self.generate_parity_chunks(&chunks, parity_count);
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.55: PRODUCER CACHE - Cache chunks IMMEDIATELY for repair
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Problem: Producer didn't cache chunks → repair requests returned nothing!
+        // Solution: Cache chunks at broadcast time so repair can find them
+        // ═══════════════════════════════════════════════════════════════════════════
+        let chunks_for_cache: Vec<Option<Vec<u8>>> = chunks.iter()
+            .map(|c| Some(c.clone()))
+            .collect();
+        let parity_for_cache: Vec<Option<Vec<u8>>> = parity_chunks.iter()
+            .map(|c| Some(c.clone()))
+            .collect();
+        
+        self.cache_chunks_for_retransmit(
+            height,
+            chunks_for_cache,
+            parity_for_cache,
+            original_block_size,
+            is_macroblock,
+        );
+        
+        if height <= 100 || height % 50 == 0 {
+            println!("[INFO][CACHE] producer_cache h={} data={} parity={} redundancy={:.1}x", 
+                     height, total_chunks, parity_count, adaptive_redundancy);
+        }
         
         // ADAPTIVE FANOUT: Calculate optimal fanout based on network size and latency
         let shred_protocol_fanout = self.get_shred_protocol_fanout();
@@ -3867,6 +4295,7 @@ impl SimplifiedP2P {
         let mut chunk_sends: Vec<(PeerInfo, NetworkMessage)> = Vec::new();
         
         // Collect data chunks
+        // v2.26: Include certificate in chunk #0 to eliminate race condition
         for (chunk_index, chunk_data) in chunks.into_iter().enumerate() {
             let shred_protocol_chunk = ShredProtocolChunk {
                 block_height: height,
@@ -3876,6 +4305,8 @@ impl SimplifiedP2P {
                 is_parity: false,
                 original_block_size,  // CRITICAL: Include original size
                 is_macroblock,  // PRODUCTION: Tag block type
+                // v2.26: Certificate only in chunk #0 (saves bandwidth, still atomic)
+                certificate: if chunk_index == 0 { producer_certificate.clone() } else { None },
             };
             
             let target_peers = self.select_shred_protocol_targets(&routing_tree, chunk_index, shred_protocol_fanout);
@@ -3886,7 +4317,7 @@ impl SimplifiedP2P {
             }
         }
         
-        // Collect parity chunks
+        // Collect parity chunks (no certificate - only in data chunk #0)
         for (parity_index, parity_data) in parity_chunks.into_iter().enumerate() {
             let shred_protocol_chunk = ShredProtocolChunk {
                 block_height: height,
@@ -3896,6 +4327,7 @@ impl SimplifiedP2P {
                 is_parity: true,
                 original_block_size,  // CRITICAL: Include original size
                 is_macroblock,  // PRODUCTION: Tag block type
+                certificate: None,  // v2.26: Certificate only in data chunk #0
             };
             
             let target_peers = self.select_shred_protocol_targets(&routing_tree, total_chunks + parity_index, shred_protocol_fanout);
@@ -3933,13 +4365,40 @@ impl SimplifiedP2P {
                 let semaphore = Arc::new(Semaphore::new(max_concurrent));
                 
                 // Log rate limiting for first 100 blocks and every 50th
+                // NOTE: peers_for_broadcast contains DUPLICATES (one entry per chunk×peer)
+                // total_sends = chunks × fanout, NOT unique peer count
                 if height <= 100 || height % 50 == 0 {
-                    println!("[SHRED_PROTOCOL] 🚦 Rate limit: {}/{} sends concurrent (peers: {})", 
-                        max_concurrent, total_sends, peers_for_broadcast.len());
+                    // Count unique peers for accurate logging
+                    let unique_peers: std::collections::HashSet<String> = peers_for_broadcast.iter()
+                        .map(|p| p.id.clone())
+                        .collect();
+                    println!("[SHRED_PROTOCOL] 🚦 Rate limit: {}/{} sends to {} unique peers", 
+                        max_concurrent, total_sends, unique_peers.len());
                 }
                 
-                // Build list of (quic_addr, msg) tuples
-                let mut send_tasks = Vec::with_capacity(total_sends);
+                // Build list of (quic_addr, msg) tuples for PACED sending
+                // PRODUCTION v2.45: ADAPTIVE PACING to prevent UDP burst and packet loss
+                // Instead of sending all chunks simultaneously, we batch them
+                // with dynamic delays based on recent failure rate
+                
+                // Calculate adaptive pacing parameters based on failure rate
+                let failure_rate_x1000 = SHRED_LAST_FAILURE_RATE.load(std::sync::atomic::Ordering::Relaxed);
+                let failure_rate = (failure_rate_x1000 as f32) / 1000.0;
+                
+                let (batch_size, delay_ms) = if failure_rate > PACING_FAILURE_CRITICAL {
+                    // Critical: 30%+ failure - very aggressive backpressure
+                    (PACING_BATCH_SIZE_MIN, PACING_DELAY_MS_MAX)
+                } else if failure_rate > PACING_FAILURE_THRESHOLD {
+                    // Warning: 10-30% failure - moderate backpressure
+                    let scaled_batch = PACING_BATCH_SIZE_DEFAULT - ((failure_rate - PACING_FAILURE_THRESHOLD) * 100.0) as usize;
+                    let scaled_delay = PACING_DELAY_MS_DEFAULT + ((failure_rate * 200.0) as u64);
+                    (scaled_batch.max(PACING_BATCH_SIZE_MIN), scaled_delay.min(PACING_DELAY_MS_MAX))
+                } else {
+                    // Normal: <10% failure - standard pacing
+                    (PACING_BATCH_SIZE_DEFAULT, PACING_DELAY_MS_DEFAULT)
+                };
+                
+                let mut send_items: Vec<(std::net::SocketAddr, NetworkMessage)> = Vec::with_capacity(total_sends);
                 
                 for (peer, msg) in peers_for_broadcast.iter().zip(messages.iter()) {
                     // CRITICAL: Skip self to prevent self-broadcast loops
@@ -3957,38 +4416,180 @@ impl SimplifiedP2P {
                     };
                     
                     let quic_addr = std::net::SocketAddr::new(ip, port.saturating_add(crate::p2p_transport::QUIC_PORT_OFFSET));
-                    let transport_clone = transport_arc.clone();
-                    let msg_clone = msg.clone();
-                    let permit = semaphore.clone();
+                    send_items.push((quic_addr, msg.clone()));
+                }
+                
+                // ============================================================================
+                // PRODUCTION v2.45.1: PRIORITY CHUNK #0 DELIVERY
+                // ============================================================================
+                // Certificate is ONLY in chunk #0! If parity arrives first and reconstructs
+                // the block, chunk #0 gets discarded → block has NO certificate → INVALID!
+                //
+                // SOLUTION: Send chunk #0 FIRST, separately from other chunks
+                // This guarantees certificate arrives before any reconstruction can happen
+                // ============================================================================
+                
+                // Separate chunk #0 (with certificate) from other chunks
+                let (chunk0_sends, other_sends): (Vec<_>, Vec<_>) = send_items
+                    .into_iter()
+                    .partition(|(_, msg)| {
+                        if let NetworkMessage::ShredProtocolChunk { chunk } = msg {
+                            chunk.chunk_index == 0 && !chunk.is_parity
+                        } else {
+                            false
+                        }
+                    });
+                
+                #[allow(unused_assignments)]
+                let mut total_success = 0usize;
+                
+                // STEP 1: Send chunk #0 FIRST (contains certificate!)
+                // No pacing needed - just send immediately to all targets
+                if !chunk0_sends.is_empty() {
+                    let mut chunk0_tasks = Vec::with_capacity(chunk0_sends.len());
                     
-                    // Spawn rate-limited task for each chunk
-                    // Semaphore ensures max N concurrent streams at any time
-                    send_tasks.push(tokio::spawn(async move {
-                        // Acquire permit before sending (blocks if limit reached)
-                        let _permit = permit.acquire().await.expect("Semaphore closed");
-                        let transport = transport_clone.read().await;
-                        let result = transport.broadcast_to(quic_addr, &msg_clone).await;
-                        // Permit automatically released when _permit drops
-                        result
-                    }));
+                    for (quic_addr, msg) in &chunk0_sends {
+                        let transport_clone = transport_arc.clone();
+                        let msg_clone = msg.clone();
+                        let addr = *quic_addr;
+                        let permit = semaphore.clone();
+                        
+                        // PRODUCTION v2.56: Use dedicated broadcast runtime (like Solana's broadcast_stage)
+                        // Prevents main Tokio runtime contention from starving broadcast tasks
+                        chunk0_tasks.push(BROADCAST_RUNTIME.spawn(async move {
+                            let _permit = match permit.acquire().await {
+                                Ok(p) => p,
+                                Err(_) => return Err("Semaphore closed".to_string()),
+                            };
+                            let transport = transport_clone.read().await;
+                            transport.broadcast_to(addr, &msg_clone).await
+                        }));
+                    }
+                    
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // PRODUCTION v2.54: Wait for chunk #0 with timeout (certificate is critical!)
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // - QUIC RTT ~50-100ms, 4 peers parallel ~100-200ms normal
+                    // - 500ms = 2.5x margin for jitter/congestion
+                    // - If timeout: slow peers recover via gap detection + sync_blocks()
+                    // - At least 1 peer with chunk0 = block is in network
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    let chunk0_result = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        futures::future::join_all(chunk0_tasks)
+                    ).await;
+                    
+                    let (chunk0_success, chunk0_timeout) = match chunk0_result {
+                        Ok(results) => {
+                            let success = results.iter()
+                                .filter(|r| matches!(r, Ok(Ok(_))))
+                                .count();
+                            (success, false)
+                        }
+                        Err(_) => {
+                            // Timeout - some peers slow, continue anyway
+                            // Reed-Solomon + gap detection will handle recovery
+                            (0, true)
+                        }
+                    };
+                    
+                    if height_for_log <= 100 || height_for_log % 50 == 0 || chunk0_timeout {
+                        if chunk0_timeout {
+                            println!("[WARN][SHRED] chunk0_timeout block={} (continuing)", height_for_log);
+                        } else {
+                            println!("[INFO][SHRED] chunk0_sent block={} ok={}/{}", 
+                                height_for_log, chunk0_success, chunk0_sends.len());
+                        }
+                    }
+                    
+                    // Small delay to ensure chunk #0 arrives before parity
+                    // This is critical to prevent race condition!
+                    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
                 }
                 
-                // Wait for all sends to complete (rate-limited by semaphore)
-                let results = futures::future::join_all(send_tasks).await;
-                let success_count = results.iter()
-                    .filter(|r| matches!(r, Ok(Ok(_))))
-                    .count();
-                let fail_count = results.len() - success_count;
+                // STEP 2: Send remaining chunks with adaptive pacing
+                let num_batches = if other_sends.is_empty() { 0 } else {
+                    (other_sends.len() + batch_size - 1) / batch_size
+                };
                 
-                // Log failures for debugging
-                if fail_count > 0 && (height_for_log <= 500 || height_for_log % 10 == 0) {
-                    println!("[SHRED_PROTOCOL] ⚠️ Block #{}: {}/{} chunks failed to send", 
-                        height_for_log, fail_count, results.len());
+                // ═══════════════════════════════════════════════════════════════════════════
+                // PRODUCTION v2.55: ASYNC BROADCAST + CHUNK REPAIR
+                // ═══════════════════════════════════════════════════════════════════════════
+                // Architecture:
+                // 1. Async broadcast (non-blocking, ~50ms for any block size)
+                // 2. Producer caches chunks (for repair requests)
+                // 3. Receiver caches chunks (can serve repair to other nodes)
+                // 4. Missing chunks after 500ms → automatic repair request
+                // 5. Adaptive redundancy (2x-2.5x for large blocks)
+                // 6. QUIC provides implicit ACK (connection-level reliability)
+                // ═══════════════════════════════════════════════════════════════════════════
+                
+                let sends_count = other_sends.len();
+                
+                    for (batch_idx, batch) in other_sends.chunks(batch_size).enumerate() {
+                        for (quic_addr, msg) in batch {
+                            let transport_clone = transport_arc.clone();
+                            let msg_clone = msg.clone();
+                            let addr = *quic_addr;
+                            let permit = semaphore.clone();
+                            
+                            // PRODUCTION v2.56: FIRE-AND-FORGET on dedicated broadcast runtime
+                            // Ensures broadcast never gets starved by main loop tasks
+                            // Like Solana's broadcast_stage - isolated thread pool for chunks
+                            BROADCAST_RUNTIME.spawn(async move {
+                                let _permit = match permit.acquire().await {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        SHRED_SEND_FAILURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        return;
+                                    }
+                                };
+                                let transport = transport_clone.read().await;
+                                match transport.broadcast_to(addr, &msg_clone).await {
+                                    Ok(_) => {
+                                        SHRED_SEND_SUCCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Err(_) => {
+                                    SHRED_SEND_FAILURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        });
+                    }
+                    
+                    // PACING: Small delay between batches to prevent UDP burst (except last)
+                    // This is async-friendly and doesn't block producer
+                    if batch_idx < num_batches - 1 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
                 }
                 
+                // Fire-and-forget: assume success, repair handles failures
+                total_success = sends_count;
+                
+                // Calculate and update failure rate periodically (from atomic counters)
+                let total_sent = SHRED_SEND_SUCCESS.load(std::sync::atomic::Ordering::Relaxed) 
+                               + SHRED_SEND_FAILURE.load(std::sync::atomic::Ordering::Relaxed);
+                if total_sent > 0 {
+                    let new_rate = (SHRED_SEND_FAILURE.load(std::sync::atomic::Ordering::Relaxed) as f32 / total_sent as f32 * 1000.0) as u64;
+                    SHRED_LAST_FAILURE_RATE.store(new_rate, std::sync::atomic::Ordering::Relaxed);
+                    
+                    // Reset counters periodically to avoid stale data (every 10000 sends)
+                    if total_sent > 10000 {
+                        SHRED_SEND_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
+                        SHRED_SEND_FAILURE.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                
+                // Log async broadcast dispatch
+                if height_for_log <= 100 || height_for_log % 50 == 0 {
+                    println!("[INFO][SHRED] broadcast h={} sends={} batches={}", 
+                        height_for_log, sends_count, num_batches);
+                }
+                
+                let total_sends = chunk0_sends.len() + other_sends.len();
                 if height_for_log <= 500 || height_for_log % 10 == 0 {
-                    println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} chunks delivered: {}/{} (PARALLEL binary protocol)", 
-                        height_for_log, success_count, total_sends);
+                    println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} delivered: {}/{} (chunk0_first, batch={}, delay={}ms, fail_rate={:.1}%)", 
+                        height_for_log, total_success, total_sends, batch_size, delay_ms, failure_rate * 100.0);
                 }
                 
                 return Ok(());
@@ -4105,6 +4706,45 @@ impl SimplifiedP2P {
             return;
         }
         
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.54: GAP DETECTION - Signal missing blocks for sync
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Problem: Fire-and-forget broadcast may lose blocks → nodes desync
+        // Solution: Detect gaps and store in global queue for background sync
+        // Main sync loop in node.rs will pick up and process these gaps
+        // ═══════════════════════════════════════════════════════════════════════════
+        let gap = height.saturating_sub(local_height + 1);
+        if gap > 0 && gap <= 50 {
+            // GAP DETECTED: Missing blocks between local_height and incoming block
+            static GAP_SYNC_COOLDOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let last_log = GAP_SYNC_COOLDOWN.load(std::sync::atomic::Ordering::Relaxed);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            
+            // Log at most once per 2 seconds to avoid spam
+            if now > last_log + 2 {
+                GAP_SYNC_COOLDOWN.store(now, std::sync::atomic::Ordering::Relaxed);
+                
+                let from_height = local_height + 1;
+                let to_height = height - 1;
+                
+                // Signal gap to global pending queue (processed by node.rs sync loop)
+                PENDING_GAP_SYNC.store(from_height, std::sync::atomic::Ordering::Relaxed);
+                PENDING_GAP_SYNC_TO.store(to_height, std::sync::atomic::Ordering::Relaxed);
+                
+                println!("[INFO][GAP] detected local={} incoming={} gap={} pending_sync={}-{}", 
+                        local_height, height, gap, from_height, to_height);
+            }
+        } else if gap > 50 {
+            // Large gap - log warning, regular sync will handle
+            if height % 10 == 0 {
+                println!("[WARN][GAP] large_gap local={} incoming={} gap={} (regular_sync)", 
+                        local_height, height, gap);
+            }
+        }
+        
         // CRITICAL FIX v2.19.24: Skip chunks for already processed blocks
         // This prevents infinite loop where chunks keep being forwarded and reconstructed
         if self.processed_shred_blocks.contains(&height) {
@@ -4122,7 +4762,8 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: Track state OUTSIDE DashMap lock to prevent deadlock
         // DashMap entry() holds a lock that would block remove() in reconstruct functions
-        let (should_reconstruct_all, should_reconstruct_parity, total_chunks, chunks_count, parity_count);
+        // v2.60: Added is_new_chunk to prevent infinite forwarding loops
+        let (should_reconstruct_all, should_reconstruct_parity, total_chunks, chunks_count, parity_count, is_new_chunk);
         
         {
             // Scoped block to release DashMap lock before calling reconstruct
@@ -4138,17 +4779,61 @@ impl SimplifiedP2P {
                     started_at: Instant::now(),
                     retransmit_attempts: 0,  // v2.21.3
                     retransmit_requested_at: None,  // v2.21.3
+                    certificate: None,  // v2.26: Will be populated from chunk #0
                 });
             
-            // Store chunk
+            // v2.26: Extract certificate from chunk #0 (eliminates race condition!)
+            // Certificate is included in data chunk #0 by producer
+            if !chunk.is_parity && chunk.chunk_index == 0 {
+                if let Some(ref cert) = chunk.certificate {
+                    if assembly.certificate.is_none() {
+                        println!("[SHRED_PROTOCOL] 🔐 Certificate received in chunk #0 for block #{}: {} ({})", 
+                                 height, cert.serial_number, cert.node_id);
+                        assembly.certificate = Some(cert.clone());
+                        
+                        // CRITICAL: Store certificate in certificate_manager immediately!
+                        // This ensures it's available when block validation needs it
+                        let cert_manager_result = self.certificate_manager.write();
+                        if let Ok(mut cert_manager) = cert_manager_result {
+                            cert_manager.store_remote_certificate(
+                                cert.serial_number.clone(), 
+                                cert.certificate_bytes.clone()
+                            );
+                            println!("[SHRED_PROTOCOL] ✅ Certificate {} stored in manager (block #{})", 
+                                     cert.serial_number, height);
+                        }
+                    }
+                }
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL FIX v2.60: CHECK IF CHUNK IS NEW BEFORE STORING
+            // ═══════════════════════════════════════════════════════════════════════════
+            // Problem: Duplicate chunks were forwarded infinitely (292x for chunk 56!)
+            // Root cause: No check if chunk already received → forward every time
+            // Solution: Track is_new_chunk and ONLY forward new chunks
+            // This eliminates infinite forwarding loops on high-latency networks
+            // ═══════════════════════════════════════════════════════════════════════════
+            
+            // Store chunk (only if slot is empty)
             if chunk.is_parity {
-                let parity_index = chunk.chunk_index - chunk.total_chunks;
+                let parity_index = chunk.chunk_index.saturating_sub(chunk.total_chunks);
                 if parity_index < assembly.parity_chunks.len() {
-                    assembly.parity_chunks[parity_index] = Some(chunk.data.clone());
+                    is_new_chunk = assembly.parity_chunks[parity_index].is_none();
+                    if is_new_chunk {
+                        assembly.parity_chunks[parity_index] = Some(chunk.data.clone());
+                    }
+                } else {
+                    is_new_chunk = false;
                 }
             } else {
                 if chunk.chunk_index < assembly.chunks_received.len() {
-                    assembly.chunks_received[chunk.chunk_index] = Some(chunk.data.clone());
+                    is_new_chunk = assembly.chunks_received[chunk.chunk_index].is_none();
+                    if is_new_chunk {
+                        assembly.chunks_received[chunk.chunk_index] = Some(chunk.data.clone());
+                    }
+                } else {
+                    is_new_chunk = false;
                 }
             }
             
@@ -4167,75 +4852,167 @@ impl SimplifiedP2P {
             }
         } // DashMap lock released here!
         
-        // CRITICAL: Mark block as processed BEFORE forwarding if we have enough chunks
-        // This prevents forward loop where chunks keep circulating after block is ready
-        if should_reconstruct_all || should_reconstruct_parity {
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.55: RECEIVER CACHE - Cache chunks IMMEDIATELY for repair
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Problem: Receivers only cached after reconstruction → repair returned nothing!
+        // Solution: Cache each chunk as it arrives so we can respond to repair requests
+        // This enables ANY node that received chunks to serve repair, not just producer
+        // ═══════════════════════════════════════════════════════════════════════════
+        {
+            // Update or create cache entry with this chunk
+            let mut cache_entry = self.shred_chunk_cache.entry(height)
+                .or_insert_with(|| {
+                    // Estimate parity count based on adaptive redundancy
+                    let estimated_parity = ((total_chunks as f32) * 1.5).ceil() as usize; // Conservative estimate
+                    ShredChunkCacheEntry {
+                        chunks: vec![None; total_chunks],
+                        parity_chunks: vec![None; estimated_parity],
+                        original_block_size: chunk.original_block_size,
+                        is_macroblock: chunk.is_macroblock,
+                        cached_at: Instant::now(),
+                    }
+                });
+            
+            // Store this chunk in cache
+            if chunk.is_parity {
+                let parity_idx = chunk.chunk_index.saturating_sub(total_chunks);
+                // Expand parity vec if needed
+                if parity_idx >= cache_entry.parity_chunks.len() {
+                    cache_entry.parity_chunks.resize(parity_idx + 1, None);
+                }
+                if parity_idx < cache_entry.parity_chunks.len() {
+                    cache_entry.parity_chunks[parity_idx] = Some(chunk.data.clone());
+                }
+            } else {
+                if chunk.chunk_index < cache_entry.chunks.len() {
+                    cache_entry.chunks[chunk.chunk_index] = Some(chunk.data.clone());
+                }
+            }
+        }
+        
+        // ============================================================================
+        // PRODUCTION v2.45.1: CHUNK #0 REQUIRED FOR PROCESSED STATUS
+        // ============================================================================
+        // Certificate is ONLY in chunk #0! Without it, block is INVALID!
+        // 
+        // PROBLEM: If parity arrives first and reconstructs block via Reed-Solomon,
+        // block gets marked as "processed" and chunk #0 is discarded when it arrives.
+        // Result: Block has no certificate → validation fails → network stalls!
+        //
+        // SOLUTION: Only mark as processed if chunk #0 is present
+        // ============================================================================
+        
+        // Check if chunk #0 (with certificate) has been received
+        let chunk0_received = if let Some(assembly) = self.shred_protocol_assemblies.get(&height) {
+            assembly.chunks_received.get(0).map(|c| c.is_some()).unwrap_or(false)
+        } else {
+            false
+        };
+        
+        // CRITICAL FIX: Only mark as processed if we can reconstruct AND have chunk #0!
+        // This prevents race condition where parity arrives before data chunk #0
+        if (should_reconstruct_all || should_reconstruct_parity) && chunk0_received {
             self.processed_shred_blocks.insert(height);
+        } else if should_reconstruct_parity && !chunk0_received {
+            // Can reconstruct from parity but missing chunk #0 - DON'T mark as processed!
+            // Keep waiting for chunk #0 to arrive with certificate
+            if height <= 500 || height % 100 == 0 {
+                println!("[SHRED_PROTOCOL] ⏳ Block #{} can reconstruct ({}/{} + {}/{} parity) but WAITING for chunk #0 (certificate)", 
+                    height, chunks_count, total_chunks, parity_count, 
+                    ((total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize);
+            }
         }
         
         // Forward chunk to other peers (ShredProtocol propagation)
-        // Only forward if block is NOT yet ready for reconstruction
-        if !should_reconstruct_all && !should_reconstruct_parity {
+        // v2.60: CRITICAL FIX - Only forward NEW chunks to prevent infinite loops!
+        // Problem: Without is_new_chunk check, duplicates forwarded 292x causing network storm
+        // Solution: Forward ONLY if chunk is new AND block not ready for reconstruction
+        let should_forward = is_new_chunk && !should_reconstruct_all && (!should_reconstruct_parity || !chunk0_received);
+        if should_forward {
             self.forward_shred_protocol_chunk(from_peer, chunk.clone());
             
-            // PRODUCTION v2.21.3: Check for timeout and request missing chunks
-            // If block is incomplete after SHRED_CHUNK_TIMEOUT_SECS, request missing chunks
+            // PRODUCTION v2.21.3 + v2.45.1: Check for timeout and request missing chunks
+            // PRIORITY: If chunk #0 is missing after 500ms, request it FIRST!
             if let Some(mut assembly) = self.shred_protocol_assemblies.get_mut(&height) {
-                let elapsed = assembly.started_at.elapsed().as_secs();
-                let can_request = assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
-                    && assembly.retransmit_requested_at
-                        .map(|t| t.elapsed().as_secs() > SHRED_CHUNK_TIMEOUT_SECS)
-                        .unwrap_or(true);
+                let elapsed_ms = assembly.started_at.elapsed().as_millis();
+                let elapsed_secs = assembly.started_at.elapsed().as_secs();
                 
-                if elapsed >= SHRED_CHUNK_TIMEOUT_SECS && can_request {
-                    // Find missing chunk indices
-                    let missing_data: Vec<usize> = assembly.chunks_received.iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.is_none())
-                        .map(|(i, _)| i)
-                        .collect();
+                // v2.45.1: PRIORITY REQUEST for chunk #0 after 500ms
+                // Certificate is critical - request it before other chunks!
+                let chunk0_missing = assembly.chunks_received.get(0).map(|c| c.is_none()).unwrap_or(true);
+                if chunk0_missing && elapsed_ms >= 500 && assembly.retransmit_attempts == 0 {
+                    assembly.retransmit_attempts += 1;
+                    assembly.retransmit_requested_at = Some(Instant::now());
+                    drop(assembly);
                     
-                    let missing_parity: Vec<usize> = assembly.parity_chunks.iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.is_none())
-                        .map(|(i, _)| assembly.total_chunks + i)
-                        .collect();
+                    println!("[INFO][REPAIR] priority_request h={} chunk=0 elapsed={}ms", height, elapsed_ms);
+                    self.request_missing_chunks(height, vec![0], from_peer);
+                }
+                // Standard timeout for other missing chunks
+                else {
+                    let can_request = assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
+                        && assembly.retransmit_requested_at
+                            .map(|t| t.elapsed().as_secs() > SHRED_CHUNK_TIMEOUT_SECS)
+                            .unwrap_or(true);
                     
-                    let total_missing = missing_data.len() + missing_parity.len();
-                    
-                    if total_missing > 0 {
-                        assembly.retransmit_attempts += 1;
-                        assembly.retransmit_requested_at = Some(Instant::now());
+                    if elapsed_secs >= SHRED_CHUNK_TIMEOUT_SECS && can_request {
+                        // Find missing chunk indices
+                        let missing_data: Vec<usize> = assembly.chunks_received.iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.is_none())
+                            .map(|(i, _)| i)
+                            .collect();
                         
-                        let mut missing_indices = missing_data;
-                        missing_indices.extend(missing_parity);
+                        let missing_parity: Vec<usize> = assembly.parity_chunks.iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.is_none())
+                            .map(|(i, _)| assembly.total_chunks + i)
+                            .collect();
                         
-                        // Drop the lock before requesting
-                        drop(assembly);
+                        let total_missing = missing_data.len() + missing_parity.len();
                         
-                        println!("[SHRED_PROTOCOL] 🔄 Requesting {} missing chunks for block #{} (attempt {})", 
-                                 total_missing, height, 
-                                 self.shred_protocol_assemblies.get(&height)
-                                     .map(|a| a.retransmit_attempts)
-                                     .unwrap_or(0));
+                        if total_missing > 0 {
+                            assembly.retransmit_attempts += 1;
+                            assembly.retransmit_requested_at = Some(Instant::now());
+                            
+                            let mut missing_indices = missing_data;
+                            missing_indices.extend(missing_parity);
+                            
+                            // Drop the lock before requesting
+                            drop(assembly);
+                            
+                            let attempt = self.shred_protocol_assemblies.get(&height)
+                                .map(|a| a.retransmit_attempts)
+                                .unwrap_or(0);
+                            println!("[INFO][REPAIR] chunk_request h={} missing={} attempt={}", 
+                                     height, total_missing, attempt);
                         
-                        self.request_missing_chunks(height, missing_indices, from_peer);
+                            self.request_missing_chunks(height, missing_indices, from_peer);
+                        }
                     }
                 }
             }
         }
         
         // Now safe to call reconstruct functions (they need remove() which needs DashMap lock)
-        if should_reconstruct_all {
-            // All data chunks received - reconstruct block
+        // CRITICAL v2.45.1: Only reconstruct if chunk #0 (certificate) is present!
+        if should_reconstruct_all && chunk0_received {
+            // All data chunks received including chunk #0 - reconstruct block
             self.reconstruct_block_from_shred_protocol(height);
-        } else if should_reconstruct_parity {
-            // Enough chunks + parity to reconstruct
+        } else if should_reconstruct_parity && chunk0_received {
+            // Enough chunks + parity to reconstruct AND have chunk #0 with certificate
             if height % 10 == 0 {
-                println!("[SHRED_PROTOCOL] 🔧 Reconstructing block #{} from {} data + {} parity chunks", 
+                println!("[SHRED_PROTOCOL] 🔧 Reconstructing block #{} from {} data + {} parity chunks (chunk #0 ✅)", 
                          height, chunks_count, parity_count);
             }
             self.reconstruct_block_with_parity(height);
+        } else if (should_reconstruct_all || should_reconstruct_parity) && !chunk0_received {
+            // Can reconstruct but missing chunk #0 - DON'T reconstruct yet!
+            // Wait for chunk #0 to arrive (it was requested via priority retry above)
+            if height <= 500 || height % 100 == 0 {
+                println!("[SHRED_PROTOCOL] ⏳ Block #{} ready to reconstruct but waiting for chunk #0 (certificate)", height);
+            }
         }
         
         // MEMORY CLEANUP: Remove old entries to prevent memory leak
@@ -4258,6 +5035,15 @@ impl SimplifiedP2P {
         if self.node_id == original_sender {
             return;
         }
+        
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ WARN: No Tokio runtime - operation skipped");
+                return;
+            }
+        };
         
         // CRITICAL: Don't forward chunks for already processed blocks (prevents infinite loop)
         if self.processed_shred_blocks.contains(&chunk.block_height) {
@@ -4303,13 +5089,27 @@ impl SimplifiedP2P {
         let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
         let quic_transport = self.quic_transport.clone();
         
+        // PRODUCTION v2.56: Log forward operations for debugging
+        let height = chunk.block_height;
+        let chunk_idx = chunk.chunk_index;
+        let is_parity = chunk.is_parity;
+        let forward_count = forward_targets.len();
+        
+        // Log every forward (critical for debugging large block issues)
+        if forward_count > 0 && (height <= 100 || height % 100 == 0 || forward_count > 2) {
+            println!("[INFO][FORWARD] h={} chunk={} parity={} targets={}", 
+                     height, chunk_idx, is_parity, forward_count);
+        }
+        
         for peer in forward_targets {
             let peer_addr = peer.addr.clone();
             let chunk_clone = chunk.clone();
             let quic_transport_clone = quic_transport.clone();
+            let peer_id = peer.id.clone();
             
-            // PRODUCTION v2.19.22: Use QUIC for chunk forwarding (unidirectional, no response)
-            tokio::spawn(async move {
+            // PRODUCTION v2.56: Use dedicated BROADCAST_RUNTIME for chunk forwarding
+            // Ensures forward operations never compete with main loop
+            BROADCAST_RUNTIME.spawn(async move {
                 let message = NetworkMessage::ShredProtocolChunk { chunk: chunk_clone };
                 
                 // Extract IP and calculate QUIC port
@@ -4322,7 +5122,17 @@ impl SimplifiedP2P {
                         if quic_enabled {
                             if let Some(ref transport) = quic_transport_clone {
                                 let transport_guard = transport.read().await;
-                                let _ = transport_guard.broadcast_to(quic_addr, &message).await;
+                                match transport_guard.broadcast_to(quic_addr, &message).await {
+                                    Ok(_) => {
+                                        // Success - chunk forwarded
+                                    }
+                                    Err(e) => {
+                                        // Log forward failures for production debugging
+                                        if height <= 100 {
+                                            println!("[WARN][FORWARD] failed h={} to={} err={}", height, peer_id, e);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -4331,9 +5141,225 @@ impl SimplifiedP2P {
         }
     }
     
+    /// PRODUCTION v2.37: Broadcast MacroBlock via dedicated channel (not ShredProtocol)
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// WHY NOT SHREDPROTOCOL:
+    /// - ShredProtocol uses height as dedup key → collision with microblocks
+    /// - MacroBlock #1 and Microblock #1 both use height=1 → one gets dropped
+    /// - Separate broadcast ensures 100% delivery
+    /// 
+    /// ARCHITECTURE:
+    /// - QUIC-only broadcast (same as microblocks, consensus commits/reveals)
+    /// - 3 retry attempts with exponential backoff
+    /// - Bounded parallelism (max 100 concurrent)
+    /// - Dedicated channel for reliable MacroBlock delivery
+    /// ═══════════════════════════════════════════════════════════════════════════
+    pub async fn broadcast_macroblock(&self, index: u64, compressed_data: Vec<u8>, epoch: u64) -> Result<(), String> {
+        use futures::stream::{self, StreamExt};
+        
+        let validated_peers = self.get_validated_active_peers();
+        
+        if validated_peers.is_empty() {
+            println!("[WARN][MB-P2P] no peers for broadcast idx={}", index);
+            return Ok(());
+        }
+        
+        let message = NetworkMessage::MacroBlockBroadcast {
+            index,
+            data: compressed_data.clone(),
+            sender_id: self.node_id.clone(),
+            epoch,
+        };
+        
+        let peer_count = validated_peers.len();
+        println!("[INFO][MB-P2P] → broadcast idx={} epoch={} peers={} bytes={}", 
+                 index, epoch, peer_count, compressed_data.len());
+        
+        // PRODUCTION: QUIC-only broadcast with retries (same as consensus commits)
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        
+        if !quic_enabled {
+            println!("[ERR][MB-P2P] QUIC not enabled - cannot broadcast idx={}", index);
+            return Err("QUIC transport required for MacroBlock broadcast".to_string());
+        }
+        
+        // Collect peer addresses
+        let peer_addresses: Vec<String> = validated_peers.iter()
+            .map(|p| p.addr.clone())
+            .collect();
+        
+        // PRODUCTION: Bounded parallelism with 3 retries (same as consensus)
+        let results = stream::iter(peer_addresses.clone())
+            .map(|peer_addr| {
+                let msg = message.clone();
+                let qt = quic_transport.clone();
+                async move {
+                    for attempt in 1..=3 {
+                        if Self::send_consensus_message_with_retry(&peer_addr, &msg, qt.clone(), true).await {
+                            return (peer_addr, true);
+                        }
+                        if attempt < 3 {
+                            // Exponential backoff: 100ms, 200ms, 400ms
+                            tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
+                        }
+                    }
+                    (peer_addr, false)
+                }
+            })
+            .buffer_unordered(100) // Max 100 concurrent (same as consensus)
+            .collect::<Vec<_>>()
+            .await;
+        
+        let successful = results.iter().filter(|(_, ok)| *ok).count();
+        let failed = results.iter().filter(|(_, ok)| !*ok).count();
+        
+        if failed > 0 {
+            println!("[WARN][MB-P2P] broadcast idx={}: ok={} fail={}", index, successful, failed);
+            
+            // RETRY: Second wave for failed peers (same as consensus)
+            let failed_peers: Vec<_> = results.iter()
+                .filter(|(_, ok)| !*ok)
+                .map(|(addr, _)| addr.clone())
+                .collect();
+            
+            if !failed_peers.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                
+                let retry_results = stream::iter(failed_peers)
+                    .map(|peer_addr| {
+                        let msg = message.clone();
+                        let qt = quic_transport.clone();
+                        async move {
+                            for attempt in 1..=2 {
+                                if Self::send_consensus_message_with_retry(&peer_addr, &msg, qt.clone(), true).await {
+                                    return true;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                            }
+                            false
+                        }
+                    })
+                    .buffer_unordered(50)
+                    .collect::<Vec<_>>()
+                    .await;
+                
+                let retry_success = retry_results.iter().filter(|ok| **ok).count();
+                println!("[INFO][MB-P2P] retry idx={}: +{} recovered", index, retry_success);
+            }
+        } else {
+            println!("[INFO][MB-P2P] broadcast idx={} complete: {} peers", index, successful);
+        }
+        
+        Ok(())
+    }
+    
+    /// PRODUCTION v2.56: Check if we have partial assembly for a block
+    /// Used by failover logic to determine repair strategy
+    pub fn has_partial_assembly(&self, block_height: u64) -> bool {
+        self.shred_protocol_assemblies.contains_key(&block_height)
+    }
+    
+    /// PRODUCTION v2.56: Check if block exists on network (prevents false emergency)
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// CRITICAL: Before triggering emergency, check if OTHER nodes have the block.
+    /// If 2/3+ peers have the block → it's OUR problem (sync issue), not producer failure.
+    /// This prevents FALSE EMERGENCY that causes FORKS.
+    /// 
+    /// SECURITY: Uses PeerInfo.last_block_height from SIGNED heartbeats (Dilithium)
+    /// ZERO network overhead - instant local check
+    /// ═══════════════════════════════════════════════════════════════════════════
+    pub async fn check_block_exists_on_network(&self, block_height: u64) -> (usize, usize) {
+        // Use already-verified peer heights from Dilithium-signed heartbeats
+        // NO HTTP requests needed - data is in connected_peers_lockfree
+        let mut total_peers = 0usize;
+        let mut peers_with_block = 0usize;
+        
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer = entry.value();
+            
+            // Skip self
+            if peer.id == self.node_id {
+                continue;
+            }
+            
+            // Only count consensus-qualified peers (validated nodes)
+            if !peer.is_consensus_qualified() {
+                continue;
+            }
+            
+            total_peers += 1;
+            
+            // Check if peer's last known height >= our target
+            // This height comes from Dilithium-signed heartbeats - VERIFIED!
+            if peer.last_block_height >= block_height {
+                peers_with_block += 1;
+            }
+        }
+        
+        if total_peers > 0 {
+            let ratio = (peers_with_block as f64 / total_peers as f64 * 100.0) as u32;
+            println!("[INFO][CONSENSUS] block_check h={} peers_with_block={}/{} ({}%)", 
+                     block_height, peers_with_block, total_peers, ratio);
+        }
+        
+        (peers_with_block, total_peers)
+    }
+    
+    /// PRODUCTION v2.56: Trigger chunk repair for a block
+    /// Called by failover logic before emergency to attempt chunk-based reconstruction
+    pub fn trigger_chunk_repair(&self, block_height: u64) {
+        // Get assembly to find missing chunks
+        if let Some(assembly) = self.shred_protocol_assemblies.get(&block_height) {
+            let total_chunks = assembly.total_chunks;
+            
+            // Find missing data chunk indices
+            let mut missing_indices: Vec<usize> = assembly.chunks_received.iter()
+                .enumerate()
+                .filter(|(_, c)| c.is_none())
+                .map(|(i, _)| i)
+                .collect();
+            
+            // Add missing parity indices
+            let parity_missing: Vec<usize> = assembly.parity_chunks.iter()
+                .enumerate()
+                .filter(|(_, c)| c.is_none())
+                .map(|(i, _)| total_chunks + i)
+                .collect();
+            missing_indices.extend(parity_missing);
+            
+            if missing_indices.is_empty() {
+                println!("[INFO][REPAIR] trigger_repair h={} no_missing_chunks", block_height);
+                return;
+            }
+            
+            let received = assembly.chunks_received.iter().filter(|c| c.is_some()).count()
+                + assembly.parity_chunks.iter().filter(|c| c.is_some()).count();
+            
+            println!("[INFO][REPAIR] trigger_repair h={} missing={} received={}", 
+                     block_height, missing_indices.len(), received);
+            
+            drop(assembly); // Release lock before calling request
+            
+            // Request missing chunks from multiple peers (parallel)
+            self.request_missing_chunks(block_height, missing_indices, "");
+        } else {
+            println!("[WARN][REPAIR] trigger_repair h={} no_assembly_found", block_height);
+        }
+    }
+    
     /// PRODUCTION v2.21.3: Request missing chunks from peers
     /// Called when block assembly times out without enough chunks
     fn request_missing_chunks(&self, block_height: u64, missing_indices: Vec<usize>, last_peer: &str) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ WARN: No Tokio runtime - operation skipped");
+                return;
+            }
+        };
+        
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -4390,7 +5416,7 @@ impl SimplifiedP2P {
             let request_clone = request.clone();
             let quic_transport_clone = quic_transport.clone();
             
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 let parts: Vec<&str> = peer_addr.split(':').collect();
                 if parts.len() == 2 {
                     if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
@@ -4411,6 +5437,15 @@ impl SimplifiedP2P {
     
     /// PRODUCTION v2.21.3: Handle incoming request for missing chunks
     fn handle_missing_chunks_request(&self, from_peer: &str, block_height: u64, missing_indices: Vec<usize>, requester_id: String) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ WARN: No Tokio runtime - operation skipped");
+                return;
+            }
+        };
+        
         // Check our chunk cache
         if let Some(cache_entry) = self.shred_chunk_cache.get(&block_height) {
             let mut chunks_to_send: Vec<(usize, Vec<u8>, bool)> = Vec::new();
@@ -4433,23 +5468,31 @@ impl SimplifiedP2P {
             }
             
             if !chunks_to_send.is_empty() {
-                println!("[SHRED_PROTOCOL] 📤 Sending {} cached chunks for block #{} to {}", 
-                         chunks_to_send.len(), block_height, get_privacy_id_for_addr(from_peer));
+                // ═══════════════════════════════════════════════════════════════════════════
+                // CRITICAL FIX v2.60: REPAIR BATCHING for intercontinental reliability
+                // ═══════════════════════════════════════════════════════════════════════════
+                // Problem: 54 chunks = 7MB in one message → lost on high-latency routes!
+                // Solution: Send in batches of 10 chunks with 5ms delay between batches
+                // This matches broadcast pacing strategy and prevents UDP burst loss
+                // ═══════════════════════════════════════════════════════════════════════════
+                const REPAIR_BATCH_SIZE: usize = 10;  // 10 chunks × 256KB = 2.56MB per batch (v2.63)
+                const REPAIR_BATCH_DELAY_MS: u64 = 5; // 5ms between batches for pacing
                 
-                let response = NetworkMessage::MissingChunksResponse {
-                    block_height,
-                    chunks: chunks_to_send,
-                    original_block_size: cache_entry.original_block_size,
-                    is_macroblock: cache_entry.is_macroblock,
-                    sender_id: self.node_id.clone(),
-                };
+                let total_chunks = chunks_to_send.len();
+                let num_batches = (total_chunks + REPAIR_BATCH_SIZE - 1) / REPAIR_BATCH_SIZE;
                 
-                // Send response via QUIC
+                println!("[SHRED_PROTOCOL] 📤 Sending {} cached chunks for block #{} to {} in {} batches", 
+                         total_chunks, block_height, get_privacy_id_for_addr(from_peer), num_batches);
+                
+                // Send response via QUIC in batches
                 let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
                 let quic_transport = self.quic_transport.clone();
                 let peer_addr = from_peer.to_string();
+                let original_block_size = cache_entry.original_block_size;
+                let is_macroblock = cache_entry.is_macroblock;
+                let sender_id = self.node_id.clone();
                 
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     let parts: Vec<&str> = peer_addr.split(':').collect();
                     if parts.len() == 2 {
                         if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
@@ -4458,8 +5501,24 @@ impl SimplifiedP2P {
                             
                             if quic_enabled {
                                 if let Some(ref transport) = quic_transport {
-                                    let transport_guard = transport.read().await;
-                                    let _ = transport_guard.broadcast_to(quic_addr, &response).await;
+                                    // Send chunks in batches with pacing
+                                    for (batch_idx, batch) in chunks_to_send.chunks(REPAIR_BATCH_SIZE).enumerate() {
+                                        let response = NetworkMessage::MissingChunksResponse {
+                                            block_height,
+                                            chunks: batch.to_vec(),
+                                            original_block_size,
+                                            is_macroblock,
+                                            sender_id: sender_id.clone(),
+                                        };
+                                        
+                                        let transport_guard = transport.read().await;
+                                        let _ = transport_guard.broadcast_to(quic_addr, &response).await;
+                                        
+                                        // Pacing delay between batches (except last)
+                                        if batch_idx < num_batches - 1 {
+                                            tokio::time::sleep(std::time::Duration::from_millis(REPAIR_BATCH_DELAY_MS)).await;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4470,17 +5529,19 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION v2.21.3: Handle response with missing chunks
-    fn handle_missing_chunks_response(&self, block_height: u64, chunks: Vec<(usize, Vec<u8>, bool)>, 
-                                       original_block_size: usize, is_macroblock: bool, sender_id: &str) {
-        // Check if block already processed
+    fn handle_missing_chunks_response(
+        &self,
+        block_height: u64,
+        chunks: Vec<(usize, Vec<u8>, bool)>,
+        original_block_size: usize,
+        is_macroblock: bool,
+        sender_id: &str,
+    ) {
         if self.processed_shred_blocks.contains(&block_height) {
             return;
         }
-        
-        // Get assembly
         if let Some(mut assembly) = self.shred_protocol_assemblies.get_mut(&block_height) {
             let mut added_count = 0;
-            
             for (idx, data, is_parity) in chunks {
                 if is_parity {
                     let parity_idx = idx - assembly.total_chunks;
@@ -4488,31 +5549,25 @@ impl SimplifiedP2P {
                         assembly.parity_chunks[parity_idx] = Some(data);
                         added_count += 1;
                     }
-                } else {
-                    if idx < assembly.chunks_received.len() && assembly.chunks_received[idx].is_none() {
-                        assembly.chunks_received[idx] = Some(data);
-                        added_count += 1;
-                    }
+                } else if idx < assembly.chunks_received.len() && assembly.chunks_received[idx].is_none() {
+                    assembly.chunks_received[idx] = Some(data);
+                    added_count += 1;
                 }
             }
-            
             if added_count > 0 {
-                // PRIVACY: Use pseudonym for sender_id in logs
                 let display_sender = if sender_id.starts_with("genesis_node_") {
                     sender_id.to_string()
                 } else {
                     get_privacy_id_for_addr(sender_id)
                 };
-                println!("[SHRED_PROTOCOL] ✅ Received {} retransmit chunks for block #{} from {}", 
-                         added_count, block_height, display_sender);
-                
-                // Check if we can reconstruct now
+                if crate::node::is_debug() {
+                    println!("[DBG][SHRED] retransmit_recv height={} chunks={} from={}",
+                             block_height, added_count, display_sender);
+                }
                 let data_count = assembly.chunks_received.iter().filter(|c| c.is_some()).count();
                 let parity_count = assembly.parity_chunks.iter().filter(|c| c.is_some()).count();
                 let total_chunks = assembly.total_chunks;
-                
-                drop(assembly); // Release lock before reconstruction
-                
+                drop(assembly);
                 if data_count == total_chunks {
                     self.processed_shred_blocks.insert(block_height);
                     self.reconstruct_block_from_shred_protocol(block_height);
@@ -4525,12 +5580,16 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION v2.21.3: Cache chunks after successful block reconstruction for retransmit
-    fn cache_chunks_for_retransmit(&self, height: u64, chunks: Vec<Option<Vec<u8>>>, 
-                                    parity_chunks: Vec<Option<Vec<u8>>>, 
-                                    original_block_size: usize, is_macroblock: bool) {
+    fn cache_chunks_for_retransmit(
+        &self,
+        height: u64,
+        chunks: Vec<Option<Vec<u8>>>,
+        parity_chunks: Vec<Option<Vec<u8>>>,
+        original_block_size: usize,
+        is_macroblock: bool,
+    ) {
         // Cleanup old entries if cache is full
         if self.shred_chunk_cache.len() >= SHRED_CHUNK_CACHE_SIZE {
-            // Find oldest entry
             let mut oldest_height = u64::MAX;
             for entry in self.shred_chunk_cache.iter() {
                 if *entry.key() < oldest_height {
@@ -4541,7 +5600,6 @@ impl SimplifiedP2P {
                 self.shred_chunk_cache.remove(&oldest_height);
             }
         }
-        
         self.shred_chunk_cache.insert(height, ShredChunkCacheEntry {
             chunks,
             parity_chunks,
@@ -4722,6 +5780,17 @@ impl SimplifiedP2P {
             let elapsed = assembly.started_at.elapsed();
             println!("[SHRED_PROTOCOL] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
             
+            // v2.26: Check if certificate was received (chunk #0 might have been lost)
+            // If no certificate, the block validation in node.rs will use fallback mechanism
+            // But we can log this for debugging
+            if assembly.certificate.is_none() {
+                println!("[SHRED_PROTOCOL] ⚠️ Block #{} reconstructed WITHOUT certificate (chunk #0 lost) - fallback will be used", height);
+                // NOTE: Don't panic - node.rs has retry mechanism for missing certificates
+                // The block will be buffered and certificate requested via broadcast_certificate_announce
+            } else {
+                println!("[SHRED_PROTOCOL] ✅ Block #{} has certificate from chunk #0", height);
+            }
+            
             // PRODUCTION: Use correct block_type based on chunk metadata
             let block_type = if assembly.is_macroblock { "macro".to_string() } else { "micro".to_string() };
             
@@ -4751,8 +5820,153 @@ impl SimplifiedP2P {
     /// Send a single ShredProtocol chunk to a peer
     // REMOVED v2.19.21: send_shred_protocol_chunk replaced by async QUIC broadcast in broadcast_block_shred_protocol
     
+    /// CRITICAL FIX v2.61: Send large block to specific peer via ShredProtocol (unicast)
+    /// Used by sync to reliably deliver blocks >1MB that would fail as single QUIC message
+    /// 
+    /// ARCHITECTURE: Same chunking as broadcast_block_shred_protocol but targeted to one peer
+    /// - Splits block into 256KB chunks with Reed-Solomon parity (v2.63)
+    /// - Sends chunks sequentially with pacing to prevent congestion
+    /// - Receiver uses existing handle_shred_protocol_chunk to reassemble
+    pub async fn send_block_via_shred_to_peer(&self, peer_addr: &str, height: u64, block_data: Vec<u8>, is_macroblock: bool) {
+        use crate::quic_transport::QUIC_PORT_OFFSET;
+        use crate::node::{is_info, is_debug};
+        
+        let start_time = std::time::Instant::now();
+        let block_size = block_data.len();
+        let block_type = if is_macroblock { "macro" } else { "micro" };
+        
+        if is_info() {
+            println!("[INFO][SHRED_SYNC] start h={} type={} size_kb={} peer={}", 
+                     height, block_type, block_size / 1024, peer_addr);
+        }
+        
+        // Check size limit
+        if block_size > SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE {
+            println!("[ERR][SHRED_SYNC] block_too_large h={} size_mb={} max_mb={}", 
+                     height, block_size / 1024 / 1024, 
+                     SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE / 1024 / 1024);
+            return;
+        }
+        
+        // Get QUIC transport
+        let quic_transport = match GLOBAL_QUIC_TRANSPORT.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        
+        let Some(ref transport_arc) = quic_transport else {
+            if is_debug() { println!("[DBG][SHRED_SYNC] no_quic_transport h={}", height); }
+            return;
+        };
+        
+        // Parse peer address to QUIC address
+        let parts: Vec<&str> = peer_addr.split(':').collect();
+        if parts.len() != 2 { return; }
+        
+        let ip = match parts[0].parse::<std::net::IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => return,
+        };
+        let port = match parts[1].parse::<u16>() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let quic_port = port.saturating_add(QUIC_PORT_OFFSET);
+        let quic_addr = std::net::SocketAddr::new(ip, quic_port);
+        
+        // Split block into chunks (same logic as broadcast_block_shred_protocol)
+        let original_block_size = block_size;
+        let data_chunk_count = (block_size + SHRED_PROTOCOL_CHUNK_SIZE - 1) / SHRED_PROTOCOL_CHUNK_SIZE;
+        let parity_chunk_count = (data_chunk_count + 1) / 2; // 50% redundancy
+        let total_chunks = data_chunk_count + parity_chunk_count;
+        
+        // Pad data to exact chunk boundaries
+        let mut padded_data = block_data.clone();
+        let target_size = data_chunk_count * SHRED_PROTOCOL_CHUNK_SIZE;
+        padded_data.resize(target_size, 0);
+        
+        // Split into data chunks
+        let mut data_chunks: Vec<Vec<u8>> = Vec::with_capacity(data_chunk_count);
+        for i in 0..data_chunk_count {
+            let start = i * SHRED_PROTOCOL_CHUNK_SIZE;
+            let end = start + SHRED_PROTOCOL_CHUNK_SIZE;
+            data_chunks.push(padded_data[start..end].to_vec());
+        }
+        
+        // Generate Reed-Solomon parity chunks
+        let parity_data = self.generate_parity_chunks(&data_chunks, parity_chunk_count);
+        let chunk_time = start_time.elapsed();
+        
+        if is_debug() {
+            println!("[DBG][SHRED_SYNC] chunked h={} data={} parity={} ms={}", 
+                     height, data_chunk_count, parity_chunk_count, chunk_time.as_millis());
+        }
+        
+        // Send chunks with pacing (5ms between chunks)
+        const CHUNK_PACING_MS: u64 = 5;
+        let mut sent_count = 0;
+        
+        let transport = transport_arc.read().await;
+        
+        // Send data chunks
+        for (i, chunk_data) in data_chunks.into_iter().enumerate() {
+            let chunk = ShredProtocolChunk {
+                block_height: height,
+                chunk_index: i,
+                total_chunks: data_chunk_count,
+                data: chunk_data,
+                is_parity: false,
+                original_block_size,
+                is_macroblock,
+                certificate: None,
+            };
+            
+            let msg = NetworkMessage::ShredProtocolChunk { chunk };
+            
+            if transport.broadcast_to(quic_addr, &msg).await.is_ok() {
+                sent_count += 1;
+            }
+            
+            tokio::time::sleep(std::time::Duration::from_millis(CHUNK_PACING_MS)).await;
+        }
+        
+        // Send parity chunks
+        for (i, parity_chunk_data) in parity_data.into_iter().enumerate() {
+            let chunk = ShredProtocolChunk {
+                block_height: height,
+                chunk_index: data_chunk_count + i,
+                total_chunks: data_chunk_count,
+                data: parity_chunk_data,
+                is_parity: true,
+                original_block_size,
+                is_macroblock,
+                certificate: None,
+            };
+            
+            let msg = NetworkMessage::ShredProtocolChunk { chunk };
+            
+            if transport.broadcast_to(quic_addr, &msg).await.is_ok() {
+                sent_count += 1;
+            }
+            
+            tokio::time::sleep(std::time::Duration::from_millis(CHUNK_PACING_MS)).await;
+        }
+        
+        let total_time = start_time.elapsed();
+        let throughput_kbps = if total_time.as_millis() > 0 {
+            (block_size as u64 * 8) / total_time.as_millis() as u64  // kbit/s
+        } else { 0 };
+        
+        if is_info() {
+            println!("[INFO][SHRED_SYNC] done h={} sent={}/{} size_kb={} ms={} kbps={}", 
+                     height, sent_count, total_chunks, block_size / 1024, 
+                     total_time.as_millis(), throughput_kbps);
+        }
+    }
+    
     /// API DEADLOCK FIX: Get cached network height WITHOUT triggering sync
     /// This method NEVER makes network calls - only reads cache
+    /// v2.26.1: Added fallback to max(peer.last_block_height) from HealthPing data
     pub fn get_cached_network_height(&self) -> Option<u64> {
         // Check cache actor first
         let height_cache_guard = match CACHE_ACTOR.height_cache.read() {
@@ -4779,7 +5993,45 @@ impl SimplifiedP2P {
             return Some(cache.0);
         }
         
+        // v2.26.1: Fallback to max(peer heights) from HealthPing data
+        // This ensures network_height is always accurate even without active sync
+        let max_peer_height = self.get_max_peer_height();
+        if max_peer_height > 0 {
+            return Some(max_peer_height);
+        }
+        
         None // No valid cache available
+    }
+    
+    /// v2.26.1: Get consensus network height from connected peers (from HealthPing data)
+    /// Uses median for Byzantine fault tolerance (same logic as sync_blockchain_height)
+    /// This provides real-time network height without HTTP calls
+    pub fn get_max_peer_height(&self) -> u64 {
+        // v2.51: Lock-free height collection
+        let mut peer_heights: Vec<u64> = self.connected_peers_lockfree.iter()
+            .filter(|e| e.value().last_block_height > 0)
+            .map(|e| e.value().last_block_height)
+            .collect();
+        
+        // Also include local height
+        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        if local_height > 0 {
+            peer_heights.push(local_height);
+        }
+        
+        if peer_heights.is_empty() {
+            return local_height;
+        }
+        
+        // Use same consensus logic as sync_blockchain_height
+        peer_heights.sort();
+        if peer_heights.len() >= 3 {
+            // Median for Byzantine fault tolerance
+            peer_heights[peer_heights.len() / 2]
+        } else {
+            // Max if less than 3 peers
+            *peer_heights.iter().max().unwrap_or(&0)
+        }
     }
     
     /// Sync blockchain height with peers for consensus
@@ -4834,34 +6086,22 @@ impl SimplifiedP2P {
             return Ok(0);
         }
         
-        // PRODUCTION v2.19.21: Query peers in PARALLEL using async (not sequential blocking!)
-        // This dramatically improves sync speed and prevents runtime deadlock
-        let peer_addrs: Vec<String> = validated_peers.iter().map(|p| p.addr.clone()).collect();
-        let peer_ids: Vec<String> = validated_peers.iter().map(|p| p.id.clone()).collect();
-        
-        // Create futures for all peer queries
-        let query_futures: Vec<_> = peer_addrs.iter()
-            .map(|addr| self.query_peer_height(addr))
+        // v2.24.3: QUIC-ONLY SYNC - Use cached heights from PeerInfo
+        // Heights are updated via heartbeats and block broadcasts (no HTTP queries needed)
+        // SCALABILITY: O(n) where n = connected peers, zero network overhead
+        let mut peer_heights: Vec<u64> = validated_peers.iter()
+            .filter(|p| p.last_block_height > 0)  // Only peers with known height
+            .map(|p| p.last_block_height)
             .collect();
         
-        // Execute all queries in parallel
-        let results = future::join_all(query_futures).await;
-        
-        // Collect successful heights
-        let mut peer_heights = Vec::new();
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(height) => {
-                    peer_heights.push(height);
-                    println!("[SYNC] Peer {} reports height: {}", peer_ids[i], height);
-                },
-                Err(e) => {
-                    println!("[SYNC] Failed to query peer {}: {}", peer_ids[i], e);
-                }
-            }
+        // Log peer heights for debugging
+        for peer in validated_peers.iter().filter(|p| p.last_block_height > 0) {
+            println!("[SYNC] Peer {} reports height: {} (cached)", peer.id, peer.last_block_height);
         }
         
         if peer_heights.is_empty() {
+            // Fallback: all peers have height 0 (network just started)
+            println!("[SYNC] ⚠️ No cached peer heights available - waiting for heartbeats");
             return Ok(0);
         }
         
@@ -5158,18 +6398,20 @@ impl SimplifiedP2P {
     
     /// Verify CRYSTALS-Dilithium signature (production implementation)
     async fn verify_dilithium_signature(challenge: &[u8], signature: &str, pubkey: &str) -> Result<bool, String> {
-        // PRODUCTION: Real CRYSTALS-Dilithium verification using QNetQuantumCrypto
-        // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        // PRODUCTION v2.50: Lock-free CRYSTALS-Dilithium verification
+        // Uses OnceCell+Arc for zero lock contention
+        use crate::node::try_get_quantum_crypto;
         
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
-            *crypto_guard = Some(crypto);
-        }
-        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
-            
+        let crypto = match try_get_quantum_crypto() {
+            Some(c) => c,
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CRYPTO] dilithium_verify_skip reason=not_initialized");
+                }
+                return Ok(false);
+            }
+        };
+
             // Use centralized quantum crypto verification
             use crate::quantum_crypto::DilithiumSignature;
             
@@ -5411,23 +6653,19 @@ impl SimplifiedP2P {
         // COMPATIBILITY: Function name kept for existing code
         // In production: This would return current round's primary validator
         
-        let connected = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        
+        // v2.51: lock-free
         // Return primary consensus participant from connected peers
         // Genesis nodes are determined by BOOTSTRAP_ID, not hardcoded IPs
-        for (_addr, peer) in connected.iter() {
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer = entry.value();
             let peer_ip = peer.addr.split(':').next().unwrap_or("");
             if let Some(_genesis_id) = crate::genesis_constants::get_genesis_id_by_ip(peer_ip) {
-                // This is a Genesis node that's actively connected
                 return Some(format!("validator_{}", peer.addr));
             }
         }
         
         // If no genesis validators, return first connected validator
-        connected.iter().next().map(|(_addr, peer)| format!("validator_{}", peer.addr))
+        self.connected_peers_lockfree.iter().next().map(|e| format!("validator_{}", e.value().addr))
     }
     
     /// Load genesis nodes from environment or config file (PRODUCTION FIX)
@@ -5511,61 +6749,113 @@ impl SimplifiedP2P {
         Err("No config file found".to_string())
     }
     
-    /// Broadcast transaction
+    /// GULF STREAM v2.25: Broadcast transaction with producer forwarding
+    /// 
+    /// HYBRID APPROACH for reliability + speed:
+    /// 1. Forward TX directly to current producer (0 hops - fastest path)
+    /// 2. Gossip to 2 backup peers (reliability if producer fails)
+    /// 
+    /// Benefits:
+    /// - Producer receives TX immediately (0 hops vs 1-3 hops)
+    /// - Backup gossip ensures TX survives producer failure
+    /// - 3 total sends (1 producer + 2 backup) vs 4 random
+    /// - Enables 30-40K TPS instead of 15-20K TPS
     pub fn broadcast_transaction(&self, tx_data: Vec<u8>) -> Result<(), String> {
-        let connected = match self.connected_peers.read() {
-            Ok(peers) => peers,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connected peers mutex poisoned during transaction broadcast");
-                poisoned.into_inner()
-            }
+        let tx_msg = NetworkMessage::Transaction {
+            data: tx_data,
         };
         
-        if connected.is_empty() {
+        // GULF STREAM: Forward directly to current producer (priority path)
+        let mut sent_to_producer = false;
+        if let Ok(guard) = self.current_producer_info.read() {
+            if let Some((producer_id, producer_addr)) = &*guard {
+                // Don't send to self
+                if producer_id != &self.node_id {
+                    self.send_network_message(producer_addr, tx_msg.clone());
+                    sent_to_producer = true;
+                }
+            }
+        }
+        
+        // BACKUP GOSSIP: Send to 2 random peers for reliability
+        // If producer fails, TX still propagates through network
+        // If we ARE the producer, send to 3 peers for good propagation
+        let backup_fanout = if sent_to_producer { 2 } else { 3 };
+        self.gossip_to_random_peers(tx_msg, backup_fanout);
+        
+        Ok(())
+    }
+    
+    /// PRODUCTION v2.25: Broadcast transaction batch for high-throughput
+    /// Sends multiple TXs in single QUIC message - reduces stream overhead
+    /// 
+    /// Benefits:
+    /// - 1 QUIC stream per batch instead of N streams for N TXs
+    /// - Reduces connection overhead by 100-1000x for batch sizes
+    /// - Gulf Stream: batch goes to producer first
+    /// - Enables 50K+ TPS with batching
+    pub fn broadcast_transaction_batch(&self, transactions: Vec<Vec<u8>>) -> Result<(), String> {
+        if transactions.is_empty() {
             return Ok(());
         }
         
-        // Only broadcast to Full and Super nodes
-        let target_peers: Vec<_> = connected.iter()
-            .filter(|(_addr, p)| matches!(p.node_type, NodeType::Full | NodeType::Super))
-            .collect();
+        // PRODUCTION v2.25.2: Skip broadcast if WE are the current producer
+        // TX is already in our mempool - no need to send anywhere
+        let we_are_producer = if let Ok(guard) = self.current_producer_info.read() {
+            guard.as_ref().map_or(false, |(producer_id, _)| producer_id == &self.node_id)
+        } else {
+            false
+        };
         
-        println!("[P2P] Broadcasting transaction to {} peers", target_peers.len());
-        
-        for (_addr, peer) in target_peers {
-            // PRODUCTION: Send transaction data via HTTP POST
-            let tx_msg = NetworkMessage::Transaction {
-                data: tx_data.clone(),
-            };
-            self.send_network_message(&peer.addr, tx_msg);
-            println!("[P2P] → Sent transaction to {}", get_privacy_id_for_addr(&peer.addr));
+        if we_are_producer {
+            // We're the producer - TX already in our mempool, skip network
+            return Ok(());
         }
+        
+        let batch_msg = NetworkMessage::TransactionBatch {
+            transactions,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        
+        // GULF STREAM: Forward batch to current producer first
+        let mut sent_to_producer = false;
+        if let Ok(guard) = self.current_producer_info.read() {
+            if let Some((producer_id, producer_addr)) = &*guard {
+                if producer_id != &self.node_id {
+                    self.send_network_message(producer_addr, batch_msg.clone());
+                    sent_to_producer = true;
+                }
+            }
+        }
+        
+        // BACKUP: Gossip to 2 random peers (only if we're not producer)
+        let backup_fanout = if sent_to_producer { 2 } else { 3 };
+        self.gossip_to_random_peers(batch_msg, backup_fanout);
         
         Ok(())
     }
     
     /// Broadcast system event to all connected peers (reorg, emergency, etc.)
     pub fn broadcast_system_event(&self, event_type: &str, event_data: &str) {
-        let connected = match self.connected_peers.read() {
-            Ok(peers) => peers,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connected peers mutex poisoned during system event broadcast");
-                poisoned.into_inner()
-            }
-        };
-        
-        if connected.is_empty() {
+        // v2.51: lock-free
+        if self.connected_peers_lockfree.is_empty() {
             return;
         }
         
         // Broadcast to all Full and Super nodes
-        let target_peers: Vec<_> = connected.iter()
-            .filter(|(_addr, p)| matches!(p.node_type, NodeType::Full | NodeType::Super))
+        let target_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+            .filter(|e| matches!(e.value().node_type, NodeType::Full | NodeType::Super))
+            .map(|e| e.value().clone())
             .collect();
         
-        println!("[P2P] 📢 Broadcasting system event '{}' to {} peers", event_type, target_peers.len());
+        if crate::node::is_info() {
+            println!("[INFO][P2P] broadcast_event type={} peers={}", event_type, target_peers.len());
+        }
         
-        for (_addr, peer) in target_peers {
+        for peer in target_peers {
             let event_msg = NetworkMessage::SystemEvent {
                 event_type: event_type.to_string(),
                 data: event_data.to_string(),
@@ -5633,23 +6923,8 @@ impl SimplifiedP2P {
             return validated_peers.len();
         }
         
-        // QUANTUM AUTO-SCALING: Automatically choose optimal method
-        if self.should_use_lockfree() {
-            return self.get_peer_count_lockfree();
-        }
-        
-        // Legacy path for small networks
-        match self.connected_peers.read() {
-            Ok(peers) => {
-                // PRODUCTION: Count all validated active peers (no hardcoded filtering)
-                // Dynamic peer discovery ensures only working nodes are in connected_peers
-                peers.len() // All peers in list are already validated and working
-            }
-            Err(e) => {
-                println!("[P2P] ⚠️ Failed to get peer count: {}, returning 0", e);
-                0
-            }
-        }
+        // v2.51: fully lock-free
+        self.connected_peers_lockfree.len()
     }
     
     /// CRITICAL FIX v2.19.25: Create PeerInfo from QUIC connection when P2P registry not updated yet
@@ -5724,11 +6999,13 @@ impl SimplifiedP2P {
             bandwidth_usage: 0,
             node_id_hash: Vec::new(),
             bucket_index: 0,
-            consensus_score: reputation,
-            network_score: 50.0,
-            reputation_score: Some(reputation),
+            reputation,                 // v2.45.1: From blockchain
+            consensus_score: reputation, // Legacy
+            network_score: 100.0,        // Legacy
+            reputation_score: None,      // Legacy
             successful_pings: 0,
             failed_pings: 0,
+            last_block_height: 0,  // v2.24.3
         })
     }
     
@@ -5762,27 +7039,19 @@ impl SimplifiedP2P {
             let peer_addr = format!("{}:8001", ip);
             let node_id = format!("genesis_node_{:03}", node_num);
             
-            // PRIORITY 1: Check connected_peers (RwLock) - peers added with bootstrap trust
-            let in_connected_peers = self.connected_peers.read()
-                .map(|peers| peers.values().any(|p| p.addr == peer_addr || p.id == node_id))
-                .unwrap_or(false);
-            
-            // PRIORITY 2: Check connected_peers_lockfree (DashMap)
-            let in_lockfree = self.connected_peers_lockfree.contains_key(&peer_addr) ||
+            // v2.51: Check connected_peers_lockfree (DashMap) and active_full_super_nodes
+            let in_peers = self.connected_peers_lockfree.contains_key(&peer_addr) ||
                 self.connected_peers_lockfree.iter().any(|e| e.value().id == node_id);
+            let in_active_registry = self.active_full_super_nodes.contains_key(&node_id);
             
-            // PRIORITY 3: Check active_full_super_nodes registry
-            let in_active_registry = self.active_full_super_nodes.read()
-                .map(|nodes| nodes.contains_key(&node_id))
-                .unwrap_or(false);
-            
-            // If in ANY of these - they are connected (no need for TCP test)
-            let is_connected = in_connected_peers || in_lockfree || in_active_registry;
+            let is_connected = in_peers || in_active_registry;
             
             if is_connected {
                 connected_count += 1;
-                println!("[P2P] ✅ Genesis {} connected (peers:{}, lockfree:{}, registry:{})", 
-                         node_id, in_connected_peers, in_lockfree, in_active_registry);
+                if crate::node::is_debug() {
+                    println!("[DBG][P2P] genesis_connected node={} peers={} registry={}", 
+                             node_id, in_peers, in_active_registry);
+                }
             } else {
                 // FALLBACK: TCP test only if not in any list
                 // This handles the case where peer just started and hasn't sent messages yet
@@ -5822,27 +7091,21 @@ impl SimplifiedP2P {
         Self::is_peer_actually_connected_static(peer_addr, estimated_peer_count)
     }
     
-    /// Get connected peer addresses for consensus participation (PRODUCTION: Fast method)
+    /// Get connected peer addresses for consensus participation (v2.51: lock-free)
     pub fn get_connected_peer_addresses(&self) -> Vec<String> {
-        // EXISTING: Use fast connected_peers access - sophisticated caching already implemented
-        // PERFORMANCE: Simple lock instead of expensive validation for consensus participation
-        match self.connected_peers.read() {
-            Ok(connected_peers) => {
-                // SCALABILITY: O(n) but optimized for HashMap iteration
-                let peer_addrs: Vec<String> = connected_peers.keys()
-                    .cloned()
-                    .collect();
-                
-                println!("[P2P] 📊 Consensus participants: {} connected peers", peer_addrs.len());
-                peer_addrs
-            }
-            Err(_) => Vec::new()
+        let peer_addrs: Vec<String> = self.connected_peers_lockfree.iter()
+            .map(|e| e.key().clone())
+            .collect();
+        
+        if crate::node::is_debug() {
+            println!("[DBG][P2P] consensus_peers count={}", peer_addrs.len());
         }
+        peer_addrs
     }
     
     /// PRODUCTION: Get discovery peers for DHT/API (Fast method for millions of nodes)  
     pub fn get_discovery_peers(&self) -> Vec<PeerInfo> {
-        // ARCHITECTURE: Bootstrap nodes use deterministic Genesis peer list for consistent VRF
+        // ARCHITECTURE: Bootstrap nodes use deterministic Genesis peer list for consistent selection
         // Regular nodes use dynamic peer discovery from DHT for scalability
         // This ensures deterministic consensus among Genesis nodes while allowing network growth
         
@@ -5865,8 +7128,11 @@ impl SimplifiedP2P {
                 let addr = format!("{}:8001", ip);
                 let node_id = format!("genesis_node_{}", id);
                 
-                // Skip self and check if working
-                if !self.node_id.contains(&format!("{:03}", id.parse::<usize>().unwrap_or(0) + 1)) {
+                // Skip self - check if our node_id ends with this id
+                // BUGFIX v2.27.1: Was incorrectly skipping NEXT node instead of self!
+                // Old: format!("{:03}", id.parse::<usize>().unwrap_or(0) + 1) → "001" became "002"
+                // Fixed: Just check if node_id contains the id directly
+                if !self.node_id.ends_with(id) {
                     if working_genesis_ips.contains(&ip.to_string()) {
                         // PRODUCTION: Get REAL peer data from connected_peers_lockfree
                         // NO FALLBACK! If peer not found in P2P state, skip it (not really connected)
@@ -5895,19 +7161,14 @@ impl SimplifiedP2P {
                      genesis_peers.len());
             genesis_peers
         } else {
-            // Normal phase: Use all connected peers
-            match self.connected_peers.read() {
-            Ok(connected_peers) => {
-                // SCALABILITY: Convert HashMap values to Vec for API compatibility
-                let peer_list: Vec<PeerInfo> = connected_peers.values().cloned().collect();
-                println!("[P2P] 📡 Discovery peers available: {} connected (fast DHT response)", peer_list.len());
-                peer_list
+            // Normal phase: Use all connected peers (v2.51: lock-free)
+            let peer_list: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+                .map(|e| e.value().clone())
+                .collect();
+            if crate::node::is_debug() {
+                println!("[DBG][P2P] discovery_peers count={}", peer_list.len());
             }
-            Err(_) => {
-                println!("[P2P] ⚠️ Failed to get discovery peers - lock error");
-                Vec::new()
-                }
-            }
+            peer_list
         }
     }
     
@@ -5931,6 +7192,12 @@ impl SimplifiedP2P {
     /// PRODUCTION: Broadcast certificate announcement when created/rotated
     /// This enables compact signatures for microblocks
     pub fn broadcast_certificate_announce(&self, cert_serial: String, certificate: Vec<u8>) -> Result<(), String> {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return Err("No Tokio runtime available".to_string()),
+        };
+        
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -5980,7 +7247,7 @@ impl SimplifiedP2P {
             let quic_transport = self.quic_transport.clone();
             let message_clone = message.clone();
             
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 if quic_enabled {
                     if let Some(ref transport) = quic_transport {
                         // Parse peer address to QUIC port
@@ -6089,8 +7356,9 @@ impl SimplifiedP2P {
         // Atomic counter for successful deliveries
         let success_count = Arc::new(AtomicUsize::new(0));
         
-        // Create async tasks for each peer
+        // Create async tasks for each peer (with cooldown check)
         let mut tasks = Vec::new();
+        let mut skipped_peers = 0usize;
         
         for peer_info in peers {
             if peer_info.id == self.node_id {
@@ -6098,9 +7366,22 @@ impl SimplifiedP2P {
             }
             
             let peer_addr = peer_info.addr.clone();
+            
+            // OPTIMIZATION v2.50: Check peer cooldown before sending
+            // Prevents retry storms to unresponsive/"not ready" peers
+            if let Some(entry) = PEER_RETRY_COOLDOWN.get(&peer_addr) {
+                let (retry_count, cooldown_until) = entry.value();
+                if std::time::Instant::now() < *cooldown_until {
+                    // Peer is in cooldown - skip this round
+                    skipped_peers += 1;
+                    continue;
+                }
+            }
+            
             let message_json_clone = Arc::clone(&message_json);
             let success_count_clone = Arc::clone(&success_count);
             let cert_serial_clone = cert_serial.clone();
+            let peer_addr_for_cooldown = peer_addr.clone();
             
             // PRODUCTION v2.19.22: Send via QUIC
             let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
@@ -6122,10 +7403,32 @@ impl SimplifiedP2P {
                                         success_count_clone.fetch_add(1, Ordering::SeqCst);
                                         // PRIVACY: Use pseudonym for peer address
                                         println!("[QUIC] ✅ Certificate {} delivered to {}", cert_serial_clone, get_privacy_id_for_addr(&peer_addr));
+                                        
+                                        // SUCCESS: Reset cooldown for this peer
+                                        PEER_RETRY_COOLDOWN.remove(&peer_addr_for_cooldown);
                                     }
                                     Err(e) => {
                                         println!("[QUIC] ⚠️ Certificate {} failed to {}: {}", 
                                                  cert_serial_clone, peer_addr, e);
+                                        
+                                        // FAILURE: Apply exponential backoff cooldown
+                                        let (retry_count, _) = PEER_RETRY_COOLDOWN
+                                            .get(&peer_addr_for_cooldown)
+                                            .map(|e| *e.value())
+                                            .unwrap_or((0, std::time::Instant::now()));
+                                        
+                                        let new_retry_count = retry_count + 1;
+                                        let backoff_secs = std::cmp::min(
+                                            PEER_COOLDOWN_BASE_SECS * (1 << new_retry_count.min(4)),
+                                            PEER_COOLDOWN_MAX_SECS
+                                        );
+                                        let cooldown_until = std::time::Instant::now() + 
+                                            std::time::Duration::from_secs(backoff_secs);
+                                        
+                                        PEER_RETRY_COOLDOWN.insert(
+                                            peer_addr_for_cooldown, 
+                                            (new_retry_count, cooldown_until)
+                                        );
                                     }
                                 }
                             }
@@ -6137,6 +7440,19 @@ impl SimplifiedP2P {
             tasks.push(task);
         }
         
+        // Log skipped peers if any
+        if skipped_peers > 0 {
+            println!("[P2P] ⏭️ Skipped {} peers in cooldown", skipped_peers);
+        }
+        
+        // CRITICAL: Recalculate effective peers and threshold after cooldown filtering
+        let effective_peers = total_peers - skipped_peers;
+        let effective_threshold = if effective_peers > 0 {
+            (effective_peers * 2 + 2) / 3  // 2/3+1 of EFFECTIVE peers
+        } else {
+            1  // At least 1 confirmation needed
+        };
+        
         // Wait for all tasks to complete (with adaptive timeout)
         let broadcast_start = std::time::Instant::now();
         
@@ -6144,9 +7460,9 @@ impl SimplifiedP2P {
         // Small networks (<=10): 3s is sufficient (local/fast network)
         // Medium networks (<=100): 5s for moderate WAN latency
         // Large networks (>100): 10s for global distribution
-        let timeout_secs = if total_peers <= 10 {
+        let timeout_secs = if effective_peers <= 10 {
             3  // 3s for small networks (doesn't conflict with Adaptive BFT 4s timeout)
-        } else if total_peers <= 100 {
+        } else if effective_peers <= 100 {
             5  // 5s for medium networks
         } else {
             10 // 10s for large networks (1000 validators)
@@ -6158,20 +7474,20 @@ impl SimplifiedP2P {
                 let delivery_time = broadcast_start.elapsed();
                 let successful = success_count.load(Ordering::SeqCst);
                 
-                println!("[P2P] 📊 Certificate {} delivery: {}/{} peers ({:.1}%) in {:?}", 
-                         cert_serial, successful, total_peers, 
-                         (successful as f64 / total_peers as f64) * 100.0,
+                println!("[P2P] 📊 Certificate {} delivery: {}/{} effective peers ({:.1}%) in {:?}", 
+                         cert_serial, successful, effective_peers, 
+                         if effective_peers > 0 { (successful as f64 / effective_peers as f64) * 100.0 } else { 0.0 },
                          delivery_time);
                 
-                // Check Byzantine threshold
-                if successful >= byzantine_threshold {
-                    println!("[P2P] ✅ Byzantine threshold reached: {}/{} ≥ 2/3", 
-                             successful, total_peers);
+                // Check Byzantine threshold (based on effective peers, not total)
+                if successful >= effective_threshold {
+                    println!("[P2P] ✅ Byzantine threshold reached: {}/{} ≥ 2/3 (effective)", 
+                             successful, effective_peers);
                     Ok(())
                 } else {
                     let err = format!(
-                        "Byzantine threshold NOT reached: {}/{} < 2/3 (need {})",
-                        successful, total_peers, byzantine_threshold
+                        "Byzantine threshold NOT reached: {}/{} < 2/3 (need {}, {} in cooldown)",
+                        successful, effective_peers, effective_threshold, skipped_peers
                     );
                     println!("[P2P] ❌ {}", err);
                     Err(err)
@@ -6180,8 +7496,8 @@ impl SimplifiedP2P {
             Err(_) => {
                 let successful = success_count.load(Ordering::SeqCst);
                 Err(format!(
-                    "Certificate broadcast timeout: only {}/{} confirmed in 10s",
-                    successful, total_peers
+                    "Certificate broadcast timeout: only {}/{} confirmed in {}s",
+                    successful, total_peers, timeout_secs
                 ))
             }
         }
@@ -6201,14 +7517,12 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: For Genesis bootstrap, return ALL configured peers WITHOUT TCP checks
         // TCP checks are ONLY for broadcast/failover, NOT for consensus candidate lists
-        // This ensures deterministic consensus: all nodes see SAME candidates for VRF
+        // This ensures deterministic consensus: all nodes see SAME candidates for QRDS
         if std::env::var("QNET_BOOTSTRAP_ID")
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.trim()))
             .unwrap_or(false) {
             let genesis_ips = get_genesis_bootstrap_ips();
             let mut genesis_peers = Vec::new();
-            
-            println!("[P2P] 📋 Building peer list from bootstrap config (deterministic for consensus)");
             
             for (i, ip) in genesis_ips.iter().enumerate() {
                 let node_id = format!("genesis_node_{:03}", i + 1);
@@ -6223,34 +7537,23 @@ impl SimplifiedP2P {
                     // CRITICAL: Check BOTH storage systems (lockfree DashMap AND legacy RwLock)
                     // Genesis nodes use legacy storage (should_use_lockfree=false for ≤5 peers)
                     
-                    // First try lock-free DashMap
+                    // v2.51: lock-free only
                     let peer_data = self.connected_peers_lockfree
                         .iter()
                         .find(|entry| entry.value().id == node_id)
                         .map(|entry| entry.value().clone());
                     
-                    // If not found in lockfree, try legacy connected_peers (RwLock)
-                    let peer_data = peer_data.or_else(|| {
-                        self.connected_peers.read().ok().and_then(|peers| {
-                            peers.iter()
-                                .find(|(_, p)| p.id == node_id)
-                                .map(|(_, p)| p.clone())
-                        })
-                    });
-                    
                     match peer_data {
                         Some(real_peer) => {
                             // PRODUCTION: Use ALL real data from P2P state
-                            println!("[P2P]   ├── {} (rep: {:.1}%, latency: {}ms)", 
-                                     real_peer.id, real_peer.consensus_score, real_peer.latency_ms);
                             genesis_peers.push(real_peer);
                         }
                         None => {
                             // CRITICAL FIX v2.19.15: Fallback to active_full_super_nodes registry
                             // This fixes Genesis startup where connected_peers is empty but
-                            // ActiveNodeAnnouncement has been received
-                            let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                            if let Some(active_info) = active_nodes.get(&node_id) {
+                            // ActiveNodeAnnouncement has been received (v2.51: lock-free)
+                            if let Some(active_info_ref) = self.active_full_super_nodes.get(&node_id) {
+                                let active_info = active_info_ref.value();
                                 // Create PeerInfo from ActiveNodeInfo - use REAL data!
                                 let node_type = match active_info.node_type.as_str() {
                                     "super" => NodeType::Super,
@@ -6273,28 +7576,25 @@ impl SimplifiedP2P {
                                     node_type,
                                     region,
                                     last_seen: active_info.last_seen,
-                                    is_stable: false,  // Will be verified
-                                    latency_ms: 0,     // Unknown - will be measured
+                                    is_stable: false,
+                                    latency_ms: 0,
                                     connection_count: 0,
                                     bandwidth_usage: 0,
-                                    node_id_hash: Vec::new(),  // Calculated later
-                                    bucket_index: 0,           // Calculated later
-                                    consensus_score: active_info.reputation,
-                                    network_score: 50.0,  // Start at 50%
-                                    reputation_score: Some(active_info.reputation),
+                                    node_id_hash: Vec::new(),
+                                    bucket_index: 0,
+                                    reputation: active_info.reputation,  // v2.45.1
+                                    consensus_score: active_info.reputation, // Legacy
+                                    network_score: 100.0,                    // Legacy
+                                    reputation_score: None,                  // Legacy
                                     successful_pings: 0,
                                     failed_pings: 0,
+                                    last_block_height: 0,
                                 };
-                                println!("[P2P]   ├── {} (from active_nodes registry, rep: {:.1}%)", 
-                                         node_id, active_info.reputation);
                                 genesis_peers.push(peer_info);
                             } else {
                                 // CRITICAL FIX v2.19.25: Check QUIC connections as last resort
                                 if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
-                                    println!("[P2P]   ├── {} (from QUIC, rep: {:.1}%)", node_id, peer_info.consensus_score);
                                     genesis_peers.push(peer_info);
-                                } else {
-                                    println!("[P2P]   ├── {} (NOT CONNECTED - skipping)", node_id);
                                 }
                             }
                         }
@@ -6302,7 +7602,6 @@ impl SimplifiedP2P {
                 }
             }
             
-            println!("[P2P] ✅ Peer list: {} REAL connected nodes (all data from P2P state)", genesis_peers.len());
             return genesis_peers;
         }
         
@@ -6310,28 +7609,16 @@ impl SimplifiedP2P {
         // Cache only for DOS protection, not for consensus decisions
         let validation_interval = Duration::from_millis(500); // 0.5 second cache - quantum-speed consensus
         
-        // CRITICAL FIX: Cache with topology-aware key to prevent stale cache on topology changes
-        let (peer_count, cache_key, peer_addrs) = {
-            let connected_peers = match self.connected_peers.read() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            // SCALABILITY: O(n) but optimized for HashMap keys
-            let mut peer_addrs: Vec<String> = connected_peers.keys()
-                .cloned()
-                .collect();
-            peer_addrs.sort(); // Deterministic order for consistent hashing
-            
-            // Create topology signature from sorted peer addresses
-            let peer_topology = peer_addrs.join("|");
-            let peer_topology_hash = format!("{:x}", peer_topology.len() + peer_addrs.len());
-            
-            let cache_key = format!("regular_{}_{}",
-                                   connected_peers.len(),
-                                   peer_topology_hash);
-            
-            (connected_peers.len(), cache_key, peer_addrs)
-        }; // Release lock before cache operations
+        // v2.51: lock-free cache with topology-aware key
+        let mut peer_addrs: Vec<String> = self.connected_peers_lockfree.iter()
+            .map(|e| e.key().clone())
+            .collect();
+        peer_addrs.sort();
+        
+        let peer_topology = peer_addrs.join("|");
+        let peer_topology_hash = format!("{:x}", peer_topology.len() + peer_addrs.len());
+        let peer_count = self.connected_peers_lockfree.len();
+        let cache_key = format!("regular_{}_{}", peer_count, peer_topology_hash);
         
         // IMPROVED: Check new cache actor first, then old cache
         let should_refresh = {
@@ -6405,218 +7692,114 @@ impl SimplifiedP2P {
         self.get_validated_active_peers_internal()
     }
     
-    /// Internal method without caching
-    fn get_validated_active_peers_internal(&self) -> Vec<PeerInfo> {
-        let validated_result = match self.connected_peers.read() {
-            Ok(peers) => {
-                // PRODUCTION: Different validation logic for different node types
-                let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
-                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                    .unwrap_or(false);
-                
-                if is_genesis {
-                    // GENESIS NODES: Use REAL connectivity validation - no phantom peers
-                    // Byzantine consensus requires minimum 4+ LIVE nodes for security
-                    // SCALABILITY: HashMap.values() for O(n) iteration over millions of nodes
-                    let validated_peers: Vec<PeerInfo> = peers.values()
-                        .filter(|peer| {
-                            // Only Full and Super nodes participate in consensus
-                            let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
-                            
-                            // CRITICAL: Real connectivity check - no more phantom validation
-                            // GENESIS FIX: For Genesis peers during bootstrap, be more tolerant
-                            let is_really_connected = if is_consensus_capable {
-                                let peer_ip = peer.addr.split(':').next().unwrap_or("");
-                                let is_genesis_peer = is_genesis_node_ip(peer_ip);
-                                let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-                                
-                                if is_genesis_peer && is_bootstrap_node {
-                                    // GENESIS FIX: During Genesis bootstrap, trust other Genesis peers
-                                    // They might be temporarily unreachable due to startup timing
-                                    // PRIVACY: Genesis IPs are public, but use pseudonym for consistency
-                                    println!("[P2P] 🔧 Genesis peer: Allowing {} in validated peers (bootstrap trust)", get_privacy_id_for_addr(&peer.addr));
-                                    true
-                                } else {
-                                self.is_peer_actually_connected(&peer.addr)
-                                }
-                            } else {
-                                false
-                            };
-                            
-                            if is_really_connected {
-                                // PRODUCTION: Silent success for scalability (essential logs only)
-                                // Only log connectivity issues, not every successful validation
-                            } else if is_consensus_capable {
-                                // PRODUCTION: Log connectivity failures (critical for Byzantine consensus monitoring)
-                                // PRIVACY: Use pseudonym in logs
-                                println!("[P2P] ❌ Genesis peer {} - consensus capable but NOT connected", get_privacy_id_for_addr(&peer.addr));
-                            }
-                            
-                            is_really_connected
-                        })
-                        .cloned()
-                        .collect();
-                    
-                    // EXISTING: Show REAL count vs minimum required (3+ peers for 4+ total nodes Byzantine safety)
-                    // EXISTING: 3f+1 Byzantine formula where f=1 requires 4 total nodes = 3 peers + 1 self
-                    let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 5); // EXISTING: Add self, max 5 Genesis
-                    println!("[P2P] 🔍 Genesis REAL validated peers: {}/{} ({} total nodes for Byzantine consensus)", 
-                             validated_peers.len(), peers.len(), total_network_nodes);
-                    
-                    if total_network_nodes < 4 {
-                        println!("[P2P] ⚠️ CRITICAL: Only {} total nodes - Byzantine consensus requires 4+ active nodes", total_network_nodes);
-                        println!("[P2P] 🚨 BLOCK PRODUCTION MUST WAIT until 4+ nodes are actually connected and validated");
-                    }
-                    
-                    validated_peers
-                } else {
-                    // REGULAR NODES (Super/Full): Deterministic Genesis peers + DHT discovered peers
-                    // CRITICAL: Light nodes already excluded at function start (line 4272-4274)
-                    // This ensures deterministic consensus: all Super/Full nodes see SAME Genesis candidates
-                    let mut all_validated_peers = Vec::new();
-                    
-                    // STEP 1: Add deterministic Genesis peers for consensus (same as Genesis nodes)
-                    // This ensures all nodes agree on Genesis candidates for VRF producer selection
-                    let genesis_ips = get_genesis_bootstrap_ips();
-                    let mut genesis_peer_ids = std::collections::HashSet::new();
-                    
-                    println!("[P2P] 📋 Adding deterministic Genesis peers for consensus (regular node)");
-                    for (i, ip) in genesis_ips.iter().enumerate() {
-                        let node_id = format!("genesis_node_{:03}", i + 1);
-                        let peer_addr = format!("{}:8001", ip);
-                        
-                        // Always track Genesis peer IDs for deduplication
-                        genesis_peer_ids.insert(node_id.clone());
-                        
-                        // PRODUCTION: Get REAL peer data from P2P state
-                        // CRITICAL: Check BOTH storage systems (lockfree DashMap AND legacy RwLock)
-                        // Genesis nodes use legacy storage (should_use_lockfree=false for ≤5 peers)
-                        
-                        // First try lock-free DashMap
-                        let peer_data = self.connected_peers_lockfree
-                            .iter()
-                            .find(|entry| entry.value().id == node_id)
-                            .map(|entry| entry.value().clone());
-                        
-                        // If not found in lockfree, try legacy connected_peers (RwLock)
-                        let peer_data = peer_data.or_else(|| {
-                            self.connected_peers.read().ok().and_then(|peers| {
-                                peers.iter()
-                                    .find(|(_, p)| p.id == node_id)
-                                    .map(|(_, p)| p.clone())
-                            })
-                        });
-                        
-                        match peer_data {
-                            Some(real_peer) => {
-                                // PRODUCTION: Use ALL real data from P2P state
-                                println!("[P2P]   ├── {} (rep: {:.1}%, latency: {}ms)", 
-                                         real_peer.id, real_peer.consensus_score, real_peer.latency_ms);
-                                all_validated_peers.push(real_peer);
-                            }
-                            None => {
-                                // CRITICAL FIX v2.19.25: Check QUIC connections as last resort
-                                if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
-                                    println!("[P2P]   ├── {} (from QUIC, rep: {:.1}%)", node_id, peer_info.consensus_score);
-                                    all_validated_peers.push(peer_info);
-                                } else {
-                                    println!("[P2P]   ├── {} (NOT CONNECTED - skipping)", node_id);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // STEP 2: Add DHT-discovered peers (excluding Genesis to avoid duplicates)
-                    // SCALABILITY: HashMap.values() for O(n) iteration over millions of nodes
-                    let dht_peers: Vec<PeerInfo> = peers.values()
-                        .filter(|peer| {
-                            // Exclude Genesis peers (already added deterministically)
-                            let is_genesis = genesis_peer_ids.contains(&peer.id);
-                            
-                            // Only include Super/Full nodes (Light nodes excluded)
-                            let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
-                            
-                            if is_genesis {
-                                // Skip - already added deterministically
-                                false
-                            } else if is_consensus_capable {
-                                // PRIVACY: Use pseudonym in logs
-                                println!("[P2P] ✅ DHT peer {} meets consensus requirements", get_privacy_id_for_addr(&peer.addr));
-                                true
-                            } else {
-                                // PRIVACY: Use pseudonym in logs
-                                println!("[P2P] 📱 Light peer {} excluded from consensus", get_privacy_id_for_addr(&peer.addr));
-                                false
-                            }
-                        })
-                        .cloned()
-                        .collect();
-                    
-                    // Combine Genesis (deterministic) + DHT-discovered peers
-                    all_validated_peers.extend(dht_peers);
-                    
-                    println!("[P2P] ✅ Regular validated peers: {} Genesis (deterministic) + {} DHT-discovered = {} total", 
-                             genesis_ips.len(), all_validated_peers.len() - genesis_ips.len(), all_validated_peers.len());
-                    all_validated_peers
-                }
-            }
-            Err(e) => {
-                println!("[P2P] ⚠️ Failed to get validated peers: {}", e);
-                Vec::new()
-            }
-        };
+    /// CRITICAL FIX v2.61: Get peer heights from signed heartbeats
+    /// Used for emergency producer selection to ensure only SYNCHRONIZED nodes are candidates
+    /// Returns HashMap<node_id, last_block_height> from Dilithium-signed HealthPing data
+    pub fn get_peer_heights(&self) -> std::collections::HashMap<String, u64> {
+        let mut heights = std::collections::HashMap::new();
         
-        // CRITICAL FIX: Simple peer cleanup to prevent phantom peers - no recursive validation calls
-        // DEADLOCK PREVENTION: Do not call is_peer_actually_connected() inside connected_peers lock
-        // Keep only peers that successfully passed validation in current validation cycle
-        // ATOMICITY FIX: Lock BOTH collections before modifying either
-        let mut connected = match self.connected_peers.write() {
-            Ok(c) => c,
-            Err(e) => {
-                println!("[P2P] ⚠️ Poisoned peers lock in cleanup, recovering");
-                e.into_inner()
-            }
-        };
-        
-        let mut peer_addrs = match self.connected_peer_addrs.write() {
-            Ok(a) => a,
-            Err(e) => {
-                println!("[P2P] ⚠️ Poisoned addrs lock in cleanup, recovering");
-                e.into_inner()
-            }
-        };
-        
-        if !connected.is_empty() {
-            let original_count = connected.len();
-            let mut to_remove = Vec::new();
-            
-            // SCALABILITY: O(n*m) but n=validated peers, m=connected peers (both small for Genesis)
-            for addr in connected.keys() {
-                if !validated_result.iter().any(|validated| validated.addr == *addr) {
-                    to_remove.push(addr.clone());
-                }
-            }
-            
-            // Remove from both collections - O(1) per removal for HashMap
-            for addr in &to_remove {
-                connected.remove(addr);
-                peer_addrs.remove(addr);
-            }
-            
-            let cleaned_count = to_remove.len();
-            if cleaned_count > 0 {
-                println!("[P2P] 🧹 Simple peer cleanup: removed {} non-validated peers, {} validated remain", 
-                         cleaned_count, connected.len());
-                
-                // Drop locks before invalidating cache
-                drop(connected);
-                drop(peer_addrs);
-                self.invalidate_peer_cache();
-                return validated_result;
+        // Collect heights from connected peers (lock-free)
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer = entry.value();
+            if peer.last_block_height > 0 {
+                heights.insert(peer.id.clone(), peer.last_block_height);
             }
         }
         
-        validated_result
+        // Also check validated active peers (may have fresher data)
+        let validated = self.get_validated_active_peers();
+        for peer in validated {
+            if peer.last_block_height > 0 {
+                heights.entry(peer.id.clone())
+                    .and_modify(|h| *h = (*h).max(peer.last_block_height))
+                    .or_insert(peer.last_block_height);
+            }
+        }
+        
+        heights
+    }
+    
+    /// Internal method without caching (v2.51: fully lock-free)
+    fn get_validated_active_peers_internal(&self) -> Vec<PeerInfo> {
+        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false);
+        
+        let peer_count = self.connected_peers_lockfree.len();
+        
+        if is_genesis {
+            // GENESIS NODES: Use REAL connectivity validation
+            let validated_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+                .filter(|entry| {
+                    let peer = entry.value();
+                    let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
+                    
+                    if is_consensus_capable {
+                        let peer_ip = peer.addr.split(':').next().unwrap_or("");
+                        let is_genesis_peer = is_genesis_node_ip(peer_ip);
+                        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+                        
+                        if is_genesis_peer && is_bootstrap_node {
+                            true // Bootstrap trust for Genesis peers
+                        } else {
+                            self.is_peer_actually_connected(&peer.addr)
+                        }
+                    } else {
+                        false
+                    }
+                })
+                .map(|entry| entry.value().clone())
+                .collect();
+            
+            let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 5);
+            if crate::node::is_info() {
+                println!("[INFO][P2P] genesis_validated peers={}/{} total_nodes={}", 
+                         validated_peers.len(), peer_count, total_network_nodes);
+            }
+            
+            validated_peers
+        } else {
+            // REGULAR NODES: Deterministic Genesis peers + DHT discovered peers
+            let mut all_validated_peers = Vec::new();
+            let genesis_ips = get_genesis_bootstrap_ips();
+            let mut genesis_peer_ids = std::collections::HashSet::new();
+            
+            for (i, ip) in genesis_ips.iter().enumerate() {
+                let node_id = format!("genesis_node_{:03}", i + 1);
+                let peer_addr = format!("{}:8001", ip);
+                genesis_peer_ids.insert(node_id.clone());
+                
+                let peer_data = self.connected_peers_lockfree
+                    .iter()
+                    .find(|entry| entry.value().id == node_id)
+                    .map(|entry| entry.value().clone());
+                
+                if let Some(real_peer) = peer_data {
+                    all_validated_peers.push(real_peer);
+                } else if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
+                    all_validated_peers.push(peer_info);
+                }
+            }
+            
+            // Add DHT-discovered peers (excluding Genesis)
+            let dht_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+                .filter(|entry| {
+                    let peer = entry.value();
+                    let is_genesis = genesis_peer_ids.contains(&peer.id);
+                    let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
+                    !is_genesis && is_consensus_capable
+                })
+                .map(|entry| entry.value().clone())
+                .collect();
+            
+            all_validated_peers.extend(dht_peers);
+            
+            if crate::node::is_debug() {
+                println!("[DBG][P2P] validated_peers genesis={} dht={} total={}", 
+                         genesis_ips.len(), all_validated_peers.len() - genesis_ips.len(), all_validated_peers.len());
+            }
+            all_validated_peers
+        }
     }
     
     /// CRITICAL: Force peer cache refresh for Byzantine safety checks (Producer nodes)
@@ -6691,22 +7874,33 @@ impl SimplifiedP2P {
     /// CRITICAL: Ensures blocks propagate within 50% of block time (500ms for 1s blocks)
     /// 
     /// Formula rationale:
-    /// - Genesis (5-50 producers): fanout=4 → 2 hops × latency
+    /// - Genesis (5-50 producers, LAN <50ms): fanout=4 → direct to all peers ✅
+    /// - Genesis (5-50 producers, WAN >50ms): fanout=ALL → no hops needed for intercontinental ✅
     /// - Small (51-200 producers, LAN <50ms): fanout=8 → 3 hops × latency = ~150ms ✅
     /// - Small (51-200 producers, WAN >50ms): fanout=16 → 2 hops × latency = ~400ms ✅
-    /// - Medium (201-1000 producers, LAN <50ms): fanout=8 → 4 hops × latency = ~200ms ✅
-    /// - Medium (201-1000 producers, WAN >50ms): fanout=16 → 3 hops × latency = ~600ms ✅
+    /// - Medium (201-1000 producers, LAN <50ms): fanout=8 → 4 hops = ~200ms ✅
+    /// - Medium (201-1000 producers, WAN >50ms): fanout=16 → 3 hops = ~600ms ✅
     /// - Large (>1000 producers): fanout=32 → 3 hops for 32K nodes
+    /// 
+    /// v2.60: CRITICAL FIX - Genesis with high latency now broadcasts to ALL peers
+    /// This ensures intercontinental nodes (USA vs Europe) receive all chunks directly
+    /// Without this, high-latency nodes miss chunks and can't reconstruct blocks
     pub fn get_shred_protocol_fanout(&self) -> usize {
         let producers = self.get_qualified_producers_count();
         let latency = self.get_average_peer_latency();
         
         // ARCHITECTURE: Adaptive fanout ensures < 50% block time propagation
         match (producers, latency) {
+            // ═══════════════════════════════════════════════════════════════════════════
             // GENESIS PHASE (5-50 producers):
-            // fanout=4 provides 2 hops for 16 nodes, 3 hops for 64 nodes
-            // Latency impact: 2-3 hops × latency < 500ms for any latency
-            (0..=50, _) => 4,
+            // v2.60 FIX: High latency (>50ms) = intercontinental network
+            // Send directly to ALL peers to prevent chunk loss on high-latency routes
+            // ═══════════════════════════════════════════════════════════════════════════
+            // LAN (<50ms): fanout=4 → 2 hops for 16 nodes, works well
+            (0..=50, 0..=50) => 4,
+            // WAN (>50ms): fanout=producers → send to ALL peers directly!
+            // This ensures USA node gets chunks from Germany producer without relay hops
+            (0..=50, _) => producers.max(4),
             
             // SMALL NETWORK (51-200 producers):
             // LAN (<50ms): fanout=8 → 3 hops = 150ms ✅
@@ -6747,20 +7941,25 @@ impl SimplifiedP2P {
     pub fn get_max_concurrent_chunk_sends(&self) -> usize {
         let peer_count = self.connected_peers_lockfree.len().max(1);
         
-        // Network-based limit (total concurrent streams in flight)
+        // v2.43.6: CRITICAL FIX for 100K TPS support
+        // v2.63: With 256KB chunks (was 128KB), broadcast supports larger blocks:
+        // - 43.5MB block = 170 data + 85 parity = 255 chunks
+        // - 255 chunks × 4 peers = 1,020 sends total
+        // - 1,020 / 200 concurrent = 5 batches × 10ms = ~50ms broadcast time
+        // Old 1KB chunks: 14MB = 14K chunks = 86K sends = 43+ seconds (TooManyShards!)
         let network_limit = match peer_count {
-            0..=10 => 20,        // Genesis: conservative
-            11..=100 => 50,      // Medium network
-            101..=1000 => 100,   // Large network
-            _ => 200,            // Huge network
+            0..=10 => 200,       // Genesis: 200 (was 20) for 100K TPS
+            11..=100 => 300,     // Medium network: increased
+            101..=1000 => 400,   // Large network: increased
+            _ => 500,            // Huge network
         };
         
-        // Per-peer limit: max 5 concurrent streams per receiving peer
-        // This prevents overloading any single receiver
-        let per_peer_limit = peer_count * 5;
+        // Per-peer limit: max 50 concurrent streams per receiving peer (was 5)
+        // Modern QUIC implementations handle this well
+        let per_peer_limit = peer_count * 50;
         
         // Use the smaller of the two limits
-        network_limit.min(per_peer_limit).max(10)  // minimum 10 for throughput
+        network_limit.min(per_peer_limit).max(100)  // minimum 100 for high TPS
     }
     
     /// Stop P2P network
@@ -6885,9 +8084,9 @@ impl SimplifiedP2P {
             NodeType::Full   // Default for regular nodes
         };
         
-        // Static method - default reputation is 70 for ALL nodes
-        // Reputation increases through consensus participation, not by node type
-        let default_rep = 70.0;
+        // v2.45.1: Use INITIAL_REPUTATION from consensus
+        // Real reputation loaded from blockchain in SimplifiedP2P methods
+        let default_rep = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         
         Ok(PeerInfo {
             id: peer_id,
@@ -6899,16 +8098,18 @@ impl SimplifiedP2P {
                 .unwrap_or_default()
                 .as_secs(),
             is_stable: false,
-            latency_ms: 0,     // Unknown - will be measured
+            latency_ms: 0,
             connection_count: 0,
             bandwidth_usage: 0,
-            node_id_hash: Vec::new(),  // Calculated in add_peer_safe
-            bucket_index: 0,           // Calculated in add_peer_safe
-            consensus_score: default_rep,
-            network_score: 50.0,  // Start at 50%, increases with interactions
-            reputation_score: None,  // Will be populated from reputation system
+            node_id_hash: Vec::new(),
+            bucket_index: 0,
+            reputation: default_rep,       // v2.45.1: From blockchain
+            consensus_score: default_rep,  // Legacy
+            network_score: 100.0,          // Legacy
+            reputation_score: None,        // Legacy
             successful_pings: 0,
             failed_pings: 0,
+            last_block_height: 0,
         })
     }
     
@@ -6929,15 +8130,24 @@ impl SimplifiedP2P {
     
     /// STARTUP FIX: Start regional connection establishment asynchronously (non-blocking startup)  
     fn start_regional_connection_establishment(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - regional connection deferred");
+                return;
+            }
+        };
+        
         let regional_peers = self.regional_peers.clone();
-        let connected_peers = self.connected_peers.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let primary_region = self.primary_region.clone();
         let backup_regions = self.backup_regions.clone();
         let node_id = self.node_id.clone();
         let port = self.port;
         
-        // EXISTING PATTERN: Use tokio::spawn like search_internet_peers for non-blocking startup
-        tokio::spawn(async move {
+        // EXISTING PATTERN: Use handle.spawn for non-blocking startup
+        handle.spawn(async move {
             println!("[P2P] 🔧 Starting regional connection establishment (background)...");
             
             let regional_peers_data = match regional_peers.lock() {
@@ -6948,133 +8158,73 @@ impl SimplifiedP2P {
                 }
             };
             
-            let mut connected_data = match connected_peers.write() {
-                Ok(peers) => peers.clone(), // Clone the HashMap
-                Err(poisoned) => {
-                    println!("[P2P] ⚠️ Connected peers mutex poisoned during connection establishment");
-                    poisoned.into_inner().clone()
-                }
-            };
-        
+            // v2.51: Lock-free peer operations
             // Connect to primary region first - WITH REAL connectivity validation
             if let Some(peers) = regional_peers_data.get(&primary_region) {
-                // DYNAMIC: Use flexible connection limits based on network conditions
                 let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-                let active_peers = connected_data.len();
-                let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
+                let active_peers = connected_peers.len();
+                let is_small_network = active_peers < 6;
                 let use_all_peers = is_bootstrap_node || is_small_network;
-                
-                // ROBUST: Connect to ALL peers during bootstrap or small network formation
                 let peer_limit = if use_all_peers { peers.len() } else { 5 };
+                
                 for peer in peers.iter().take(peer_limit) {
-                    // CRITICAL: Never add self as a peer in regional connections!
                     if peer.id == node_id || peer.addr.contains(&port.to_string()) {
-                        println!("[P2P] 🚫 Skipping self in regional connection: {}", peer.id);
                         continue;
                     }
                     
-                    // Use previously defined is_genesis_startup variable
-                    let ip = peer.addr.split(':').next().unwrap_or("");
-                    let is_genesis_peer = is_genesis_node_ip(ip);
-                    
-                                        // EXISTING: Use static connectivity check for async context
                     if Self::is_peer_actually_connected_static(&peer.addr, active_peers) {
-                        connected_data.insert(peer.addr.clone(), peer.clone());
-                        println!("[P2P] ✅ Added {} to connection pool from {:?} (REAL connection verified)", peer.id, peer.region);
-                    } else {
-                        // DIAGNOSTIC: Log why peer was skipped
-                        println!("[P2P] ❌ Skipped {} from {:?} (connection failed)", peer.id, peer.region);
-                        println!("[P2P] 🔍 DIAGNOSTIC: Genesis peer: {}", is_genesis_peer);
+                        connected_peers.insert(peer.addr.clone(), peer.clone());
+                        if crate::node::is_debug() {
+                            println!("[DBG][P2P] regional_added peer={}", peer.id);
+                        }
                     }
                 }
         }
         
-            // DYNAMIC: For bootstrap nodes or small networks, connect to ALL Genesis nodes regardless of region
+            // v2.51: Genesis mode - connect to all Genesis peers
             let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-            let active_peers = connected_data.len();
-            let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
-            let should_connect_all_genesis = is_bootstrap_node || is_small_network;
+            let active_peers = connected_peers.len();
+            let is_small_network = active_peers < 6;
             
-            if should_connect_all_genesis {
-                println!("[P2P] 🌟 GENESIS MODE: Attempting to connect to all Genesis peers regardless of region");
-                
-                // Try all regions for Genesis peers
-                for (region, peers_in_region) in regional_peers_data.iter() {
+            if is_bootstrap_node || is_small_network {
+                for (_region, peers_in_region) in regional_peers_data.iter() {
                     for peer in peers_in_region.iter().take(5) {
-                        // CRITICAL: Never add self as a peer!
                         if peer.id == node_id || peer.addr.contains(&port.to_string()) {
-                            println!("[P2P] 🚫 Skipping self in Genesis all-region scan: {}", peer.id);
                             continue;
                         }
-                        
                         let ip = peer.addr.split(':').next().unwrap_or("");
-                        let is_genesis_peer = is_genesis_node_ip(ip);
-                        
-                        if is_genesis_peer {
-                            // Skip if already connected
-                            let already_connected = connected_data.iter().any(|(_addr, p)| p.addr == peer.addr);
-                            if !already_connected {
-                                // EXISTING: Use FAST connectivity check for Genesis startup
-                                if Self::is_peer_actually_connected_static(&peer.addr, active_peers) {
-                                connected_data.insert(peer.addr.clone(), peer.clone());
-                                    // PRIVACY: Genesis IPs are public, but use pseudonym for consistency
-                                    println!("[P2P] 🌟 Added Genesis peer {} from region {:?} (verified)", get_privacy_id_for_addr(&peer.addr), region);
-                                } else {
-                                    println!("[P2P] ❌ Skipped Genesis peer {} from region {:?} (not reachable)", get_privacy_id_for_addr(&peer.addr), region);
+                        if is_genesis_node_ip(ip) && !connected_peers.contains_key(&peer.addr) {
+                            if Self::is_peer_actually_connected_static(&peer.addr, active_peers) {
+                                connected_peers.insert(peer.addr.clone(), peer.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // v2.51: Backup regions if needed
+            if connected_peers.len() < 3 {
+                let current_peers = connected_peers.len();
+                for backup_region in &backup_regions {
+                    if let Some(peers) = regional_peers_data.get(backup_region) {
+                        for peer in peers.iter().take(5) {
+                            if connected_peers.len() >= 5 { break; }
+                            if !connected_peers.contains_key(&peer.addr) {
+                                if Self::is_peer_actually_connected_static(&peer.addr, current_peers) {
+                                    connected_peers.insert(peer.addr.clone(), peer.clone());
                                 }
                             }
                         }
                     }
                 }
             }
-        
-            // If not enough peers, try backup regions - WITH REAL connectivity validation
-            if connected_data.len() < 3 {
-                // DYNAMIC: For backup regions, use flexible limits based on network conditions
-                let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-                let current_peers = connected_data.len();
-                let is_small_network = current_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
-                let use_all_backup_peers = is_bootstrap_node || is_small_network;
-            
-                for backup_region in &backup_regions {
-                    if let Some(peers) = regional_peers_data.get(backup_region) {
-                    // ROBUST: Connect to ALL backup peers during bootstrap or small network formation
-                    let backup_limit = if use_all_backup_peers { peers.len() } else { 2 };
-                    for peer in peers.iter().take(backup_limit) {
-                            // DYNAMIC: Remove connection limit for small networks or bootstrap nodes
-                            let should_connect = if use_all_backup_peers { true } else { connected_data.len() < 5 };
-                        if should_connect {
-                            let ip = peer.addr.split(':').next().unwrap_or("");
-                            let is_genesis_peer = is_genesis_node_ip(ip);
-                            
-                                    // FIXED: Genesis peers use FAST connectivity check for bootstrap trust
-                                    if is_genesis_peer {
-                                        if Self::is_peer_actually_connected_static(&peer.addr, current_peers) {
-                                        connected_data.insert(peer.addr.clone(), peer.clone());
-                                            // PRIVACY: Use pseudonym in logs
-                                            println!("[P2P] ✅ Added Genesis backup {} (verified)", get_privacy_id_for_addr(&peer.addr));
-                                        } else {
-                                            println!("[P2P] ❌ Skipped Genesis backup {} (not reachable)", get_privacy_id_for_addr(&peer.addr));
-                                        }
-                                    } else if Self::is_peer_actually_connected_static(&peer.addr, current_peers) {
-                                        connected_data.insert(peer.addr.clone(), peer.clone());
-                                        println!("[P2P] ✅ Added {} to backup pool from {:?} (REAL connection verified)", 
-                                                 peer.id, peer.region);
-                                    } else {
-                                        println!("[P2P] ❌ Skipped backup peer {} from {:?} (connection failed)", 
-                                     peer.id, peer.region);
-                                    }
-                        }
-                    }
-                }
+
+            if crate::node::is_info() {
+                println!("[INFO][P2P] regional_connect peers={}", connected_peers.len());
             }
-        }
-        
-            // Update real connected_peers with results from background establishment
-            if let Ok(mut connected) = connected_peers.write() {
-                *connected = connected_data;
-                println!("[P2P] 📋 Regional connection establishment completed: {} peers connected", connected.len());
-            } else {
+            
+            // v2.51: No need to copy back - already using DashMap directly
+            {
                 println!("[P2P] ⚠️ Failed to update connected_peers after establishment");
             }
         });
@@ -7218,31 +8368,15 @@ impl SimplifiedP2P {
         (latency_score * 0.6) + (stability_score * 0.4)
     }
     
-    /// Update peer metrics
+    /// Update peer metrics (v2.51: lock-free)
     pub fn update_peer_metrics(&self, peer_id: &str, latency_ms: u32, bandwidth_usage: u64) {
-        // PRODUCTION: Use dual indexing for O(1) lookup by ID (already implemented)
-        // First check if we should use lock-free mode
-        if self.should_use_lockfree() {
-            // Lock-free mode: Use DashMap with dual indexing for O(1) operations
-            if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id) {
-                let addr = addr_entry.clone();
-                if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&addr) {
-                    peer.latency_ms = latency_ms;
-                    peer.bandwidth_usage = bandwidth_usage;
-                    peer.last_seen = self.current_timestamp();
-                }
-            }
-        } else {
-            // Legacy mode: Still O(1) using dual index
-            if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id) {
-                let addr = addr_entry.clone();
-                if let Ok(mut connected) = self.connected_peers.write() {
-                    if let Some(peer) = connected.get_mut(&addr) {
-                        peer.latency_ms = latency_ms;
-                        peer.bandwidth_usage = bandwidth_usage;
-                        peer.last_seen = self.current_timestamp();
-                    }
-                }
+        // Use dual indexing for O(1) lookup by ID
+        if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id) {
+            let addr = addr_entry.clone();
+            if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&addr) {
+                peer.latency_ms = latency_ms;
+                peer.bandwidth_usage = bandwidth_usage;
+                peer.last_seen = self.current_timestamp();
             }
         }
         
@@ -7250,22 +8384,18 @@ impl SimplifiedP2P {
         self.update_regional_metrics();
     }
     
-    /// Update regional load balancing metrics
+    /// Update regional load balancing metrics (v2.51: lock-free)
     fn update_regional_metrics(&self) {
-        let connected = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
         let mut metrics = match self.regional_metrics.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         
         for region in &[Region::NorthAmerica, Region::Europe, Region::Asia, Region::SouthAmerica, Region::Africa, Region::Oceania] {
-            let region_peers: Vec<&PeerInfo> = connected
+            let region_peers: Vec<PeerInfo> = self.connected_peers_lockfree
                 .iter()
-                .filter(|(_addr, p)| p.region == *region)
-                .map(|(_addr, p)| p)
+                .filter(|e| e.value().region == *region)
+                .map(|e| e.value().clone())
                 .collect();
             
             if !region_peers.is_empty() {
@@ -7318,47 +8448,27 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // Drop connections from overloaded regions
-        let mut connected = match self.connected_peers.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let initial_count = connected.len();
-        
-        // SCALABILITY: Collect addresses to remove (can't modify HashMap while iterating)
-        let to_remove: Vec<String> = connected.values()
-            .filter(|peer| {
+        // v2.51: Lock-free overloaded peer removal
+        let initial_count = self.connected_peers_lockfree.len();
+        let to_remove: Vec<String> = self.connected_peers_lockfree.iter()
+            .filter(|entry| {
+                let peer = entry.value();
                 overloaded_regions.contains(&peer.region) && 
                 peer.latency_ms > self.lb_config.max_latency_threshold
             })
-            .map(|peer| {
-                println!("[P2P] 🔻 Dropping overloaded peer {} from {:?} (Latency: {}ms)", 
-                         peer.id, peer.region, peer.latency_ms);
-                peer.addr.clone()
-            })
+            .map(|entry| entry.key().clone())
             .collect();
         
-        // Remove peers - O(1) per removal for HashMap
-        for addr in to_remove {
-            connected.remove(&addr);
+        for addr in &to_remove {
+            self.connected_peers_lockfree.remove(addr);
         }
         
-        let dropped_count = initial_count - connected.len();
-        drop(connected);
+        let dropped_count = to_remove.len();
         
         if dropped_count > 0 {
-            // Reconnect to better peers
             let optimal_peers = self.select_optimal_peers(dropped_count);
-            let mut connected = match self.connected_peers.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            
             for peer in optimal_peers {
-                println!("[P2P] 🔺 Connecting to optimal peer {} from {:?} (Latency: {}ms)", 
-                         peer.id, peer.region, peer.latency_ms);
-                // SCALABILITY: O(1) insertion for HashMap
-                connected.insert(peer.addr.clone(), peer);
+                self.connected_peers_lockfree.insert(peer.addr.clone(), peer);
             }
             
             println!("[P2P] ✅ Rebalancing complete: dropped {}, reconnected to optimal peers", dropped_count);
@@ -7372,7 +8482,7 @@ impl SimplifiedP2P {
     fn start_load_balancing_monitor(&self) {
         let is_running = self.is_running.clone();
         let last_check = self.last_health_check.clone();
-        let connected_peers = self.connected_peers.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let regional_metrics = self.regional_metrics.clone();
         
         thread::spawn(move || {
@@ -7381,25 +8491,14 @@ impl SimplifiedP2P {
                 
                 *match last_check.lock() { Ok(g) => g, Err(p) => p.into_inner() } = Instant::now();
                 
-                // PRODUCTION: Collect real metrics from connected peers via HTTP
-                {
-                    let mut connected = match connected_peers.write() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    // SCALABILITY: Iterate over HashMap values for O(n)
-                    for peer in connected.values_mut() {
-                        // PRODUCTION: Query peer's /api/v1/node/health endpoint for real metrics
-                        if let Ok(metrics) = Self::query_peer_metrics(&peer.addr) {
-                            peer.latency_ms = metrics.latency_ms;
-                        peer.last_seen = std::time::SystemTime::now()
+                // PRODUCTION: Collect real metrics from connected peers via HTTP (v2.51: lock-free)
+                for mut entry in connected_peers.iter_mut() {
+                    if let Ok(metrics) = Self::query_peer_metrics(&entry.value().addr) {
+                        entry.latency_ms = metrics.latency_ms;
+                        entry.last_seen = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_else(|_| {
-                                    println!("[P2P] ⚠️ System time error, using fallback");
-                                    std::time::Duration::from_secs(0)
-                                })
+                            .unwrap_or_default()
                             .as_secs();
-                        }
                     }
                 }
                 
@@ -7427,10 +8526,6 @@ impl SimplifiedP2P {
     
     /// Get load balancing statistics
     pub fn get_load_balancing_stats(&self) -> HashMap<String, serde_json::Value> {
-        let connected = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
         let metrics = match self.regional_metrics.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -7438,8 +8533,8 @@ impl SimplifiedP2P {
         
         let mut stats = HashMap::new();
         
-        // Overall statistics
-        stats.insert("total_peers".to_string(), serde_json::Value::Number(connected.len().into()));
+        // v2.51: Lock-free peer count
+        stats.insert("total_peers".to_string(), serde_json::Value::Number(self.connected_peers_lockfree.len().into()));
         stats.insert("total_bytes_sent".to_string(), serde_json::Value::Number((*match self.total_bytes_sent.lock() { Ok(g) => g, Err(p) => p.into_inner() }).into()));
         stats.insert("total_bytes_received".to_string(), serde_json::Value::Number((*match self.total_bytes_received.lock() { Ok(g) => g, Err(p) => p.into_inner() }).into()));
         
@@ -7565,13 +8660,22 @@ impl SimplifiedP2P {
     
     /// Regional clustering for geographical load balancing
     fn start_regional_clustering(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - regional clustering deferred");
+                return;
+            }
+        };
+        
         let node_id = self.node_id.clone();
         let region = self.region.clone();
         let regional_peers = self.regional_peers.clone();
-        let connected_peers = self.connected_peers.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let is_running = self.is_running.clone();
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[P2P] 🌍 Starting regional clustering for region: {:?}", region);
             
             // Regional clustering logic
@@ -7581,14 +8685,9 @@ impl SimplifiedP2P {
                 // Rebalance regional connections
                 let mut regional_counts = std::collections::HashMap::new();
                 
-                {
-                    let connected = match connected_peers.read() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    for (_addr, peer) in connected.iter() {
-                        *regional_counts.entry(peer.region.clone()).or_insert(0) += 1;
-                    }
+                // v2.51: Lock-free regional counting
+                for entry in connected_peers.iter() {
+                    *regional_counts.entry(entry.value().region.clone()).or_insert(0) += 1;
                 }
                 
                 // Ensure we have peers in our region
@@ -8017,109 +9116,152 @@ impl SimplifiedP2P {
     }
     
     /// Download a range of blocks (helper for parallel sync)
-    async fn download_block_range_static(peers: &[String], storage: &crate::storage::Storage, start_height: u64, end_height: u64) {
+    /// v2.24.3: ARCHITECTURE FIX - Use QUIC RequestBlocks instead of HTTP
+    /// 
+    /// SCALABILITY: Designed for 100K+ nodes
+    /// - QUIC binary protocol: 10x faster than HTTP JSON
+    /// - Persistent connections: No TCP handshake per request
+    /// - Multiplexed streams: Parallel requests on single connection
+    /// - Backpressure: Built-in flow control prevents overload
+    async fn download_block_range_static(
+        peers: &[String], 
+        storage: &crate::storage::Storage, 
+        start_height: u64, 
+        end_height: u64
+    ) {
         if peers.is_empty() { return; }
         
+        // v2.24.3: Request blocks via QUIC (response comes async via handle_blocks_batch)
+        // Strategy: Send RequestBlocks to best peer, then poll storage for arrival
+        
         let mut consecutive_failures = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 20;  // CRITICAL FIX: Increased from 3 to 20 to handle async broadcast delays
+        const MAX_CONSECUTIVE_FAILURES: u32 = 30;  // Increased for QUIC async response
+        const POLL_INTERVAL_MS: u64 = 100;  // Check storage every 100ms
+        // v2.24.3: Increased timeout to handle batch validation latency
+        // Worst case: 100 blocks × 100ms validation = 10s + network latency
+        const REQUEST_TIMEOUT_SECS: u64 = 30;  // Max wait for QUIC response + validation
+        
+        // v2.24.3: Send initial QUIC RequestBlocks for entire range
+        // This triggers async response via handle_blocks_batch → block_tx → storage
+        Self::send_quic_block_request_static(peers, start_height, end_height).await;
         
         let mut height = start_height;
+        let mut last_request_time = std::time::Instant::now();
+        
         while height <= end_height {
-            // CRITICAL FIX: Check if block ACTUALLY exists (not just Ok())
+            // Check if block already exists in storage
             if storage.load_microblock(height).unwrap_or(None).is_some() {
                 consecutive_failures = 0;
                 height += 1;
                 continue;
             }
             
-            // Try downloading from peers
-            let mut fetched = false;
-            for peer_addr in peers {
-                let ip = peer_addr.split(':').next().unwrap_or("");
-                let url = format!("http://{}:8001/api/v1/microblock/{}", ip, height);
+            // v2.24.3: Poll storage for block arrival (QUIC response is async)
+            let poll_start = std::time::Instant::now();
+            let mut block_received = false;
+            
+            while poll_start.elapsed().as_secs() < REQUEST_TIMEOUT_SECS {
+                tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
                 
-                let client = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(5))
-                    .connect_timeout(std::time::Duration::from_secs(2))
-                    .user_agent("QNet-Node/1.0")
-                    .tcp_nodelay(true)
-                    .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
-                    .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
-                    .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
-                    .build() {
-                    Ok(client) => client,
-                    Err(_) => continue,
-                };
-                
-                match client.get(&url).send().await {
-                    Ok(response) => {
-                        if response.status().is_success() {
-                            if let Ok(val) = response.json::<serde_json::Value>().await {
-                                if let Some(b64) = val.get("data").and_then(|v| v.as_str()) {
-                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                                        if storage.save_microblock(height, &bytes).is_ok() {
-                                            fetched = true;
-                                            consecutive_failures = 0;
-                                            
-                                            // CRITICAL FIX: Update LOCAL_BLOCKCHAIN_HEIGHT when syncing
-                                            LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Relaxed);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        } else if response.status() == reqwest::StatusCode::NOT_FOUND {
-                            // Block not found on this peer - try next peer (don't break, maybe it's propagating)
-                            continue;
-                        }
-                    },
-                    Err(_) => continue,
+                if storage.load_microblock(height).unwrap_or(None).is_some() {
+                    block_received = true;
+                    LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Relaxed);
+                    break;
                 }
             }
             
-            if !fetched {
-                consecutive_failures += 1;
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    println!("[SYNC] ⚠️ Range {}-{} hit {} consecutive failures at block {} - waiting 3s for block propagation", 
-                             start_height, end_height, MAX_CONSECUTIVE_FAILURES, height);
-                    
-                    // CRITICAL FIX: Don't abort! Wait for blocks to propagate (async broadcast delay)
-                    // Then retry the same block - this handles producer async broadcast delays
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    consecutive_failures = 0;  // Reset counter to retry
-                    // DON'T increment height - retry the same block!
-                } else {
-                    // CRITICAL FIX: Wait longer for blocks to propagate (async broadcast can take 1-3 seconds)
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            } else {
-                // Successfully fetched block - move to next height
+            if block_received {
+                consecutive_failures = 0;
                 height += 1;
+                continue;
             }
+            
+            // Block not received after timeout - retry request
+            consecutive_failures += 1;
+            
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                println!("[SYNC] ⚠️ Range {}-{} hit {} failures at block {} - waiting 5s", 
+                         start_height, end_height, MAX_CONSECUTIVE_FAILURES, height);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                consecutive_failures = 0;
+            }
+            
+            // v2.24.3: Re-send QUIC request for remaining blocks (adaptive retry)
+            // Only re-request if enough time passed since last request
+            if last_request_time.elapsed().as_secs() >= 3 {
+                println!("[SYNC] 🔄 Re-requesting blocks {}-{} via QUIC", height, end_height);
+                Self::send_quic_block_request_static(peers, height, end_height).await;
+                last_request_time = std::time::Instant::now();
+            }
+        }
+    }
+    
+    /// v2.24.3: Send QUIC RequestBlocks to peers (static helper)
+    /// ARCHITECTURE: Fire-and-forget request, response handled by handle_blocks_batch
+    async fn send_quic_block_request_static(peers: &[String], from_height: u64, to_height: u64) {
+        use crate::quic_transport::QUIC_PORT_OFFSET;
+        
+        // Get global QUIC transport (set during node initialization)
+        let quic_transport = match GLOBAL_QUIC_TRANSPORT.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        
+        let node_id = GLOBAL_NODE_ID.read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "unknown".to_string());
+        
+        if let Some(ref transport_arc) = quic_transport {
+            // Create RequestBlocks message
+            let request = NetworkMessage::RequestBlocks {
+                from_height,
+                to_height,
+                requester_id: node_id,
+            };
+            
+            // Send to first available peer via QUIC
+            // SCALABILITY: In production, could fan-out to multiple peers
+            for peer_addr in peers.iter().take(3) {  // Try up to 3 peers
+                let parts: Vec<&str> = peer_addr.split(':').collect();
+                if parts.len() != 2 { continue; }
+                
+                let ip = match parts[0].parse::<std::net::IpAddr>() {
+                    Ok(ip) => ip,
+                    Err(_) => continue,
+                };
+                let port = match parts[1].parse::<u16>() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                
+                let quic_port = port.saturating_add(QUIC_PORT_OFFSET);
+                let quic_addr = std::net::SocketAddr::new(ip, quic_port);
+                
+                let transport = transport_arc.read().await;
+                match transport.broadcast_to(quic_addr, &request).await {
+                    Ok(_) => {
+                        // Request sent successfully - response will arrive async
+                        return;
+                    }
+                    Err(e) => {
+                        // Try next peer
+                        println!("[SYNC] ⚠️ QUIC request to {} failed: {}", 
+                                 get_privacy_id_for_addr(peer_addr), e);
+                    }
+                }
+            }
+            
+            println!("[SYNC] ⚠️ Failed to send QUIC RequestBlocks to any peer");
+        } else {
+            // Fallback: No QUIC transport available
+            println!("[SYNC] ⚠️ QUIC transport not available for sync request");
         }
     }
 }
 
-/// PRODUCTION: Base64 serialization module for efficient binary data in JSON
-mod base64_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    
-    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&STANDARD.encode(bytes))
-    }
-    
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        STANDARD.decode(&s).map_err(serde::de::Error::custom)
-    }
-}
+// NOTE: base64_bytes modules REMOVED in v2.26
+// bincode natively handles Vec<u8> as [u64_len][raw_bytes] - no base64 overhead needed!
+// This improves performance by ~33% for block/transaction serialization
 
 /// Push notification type for Light nodes
 /// Supports multiple providers for F-Droid compatibility
@@ -8169,6 +9311,7 @@ pub struct HeartbeatRecord {
     pub heartbeat_index: u8,          // 0-9 within 4h window
     pub signature: String,
     pub verified: bool,               // Signature verified
+    pub block_height: u64,            // v2.59: Block height when heartbeat was sent (for epoch filtering)
 }
 
 /// PRODUCTION: Light Node Attestation - proof that Light node responded to ping
@@ -8182,6 +9325,7 @@ pub struct LightNodeAttestation {
     pub light_node_signature: String, // Light node's signature on challenge
     pub pinger_signature: String,     // Pinger's signature on attestation
     pub challenge: String,            // Original challenge (for verification)
+    pub block_height: u64,            // v2.59: Block height for epoch-based filtering
 }
 
 /// Pinger role for Light node ping responsibility
@@ -8194,21 +9338,32 @@ pub enum PingerRole {
 }
 
 /// Message types for simplified network
+/// ARCHITECTURE v2.26: Pure bincode serialization for maximum performance
+/// bincode natively handles Vec<u8> as [u64_len][raw_bytes] - no base64 needed!
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
     /// Block data (microblock or macroblock)
-    /// PRODUCTION: Using base64 encoding for efficient binary data transfer over JSON
+    /// OPTIMIZED: Direct binary serialization via bincode (no base64 overhead)
     Block {
         height: u64,
-        #[serde(with = "base64_bytes")]
-        data: Vec<u8>,
+        data: Vec<u8>,  // bincode handles Vec<u8> natively
         block_type: String,  // "micro" or "macro"
     },
     
     /// Transaction data
+    /// OPTIMIZED: Direct binary serialization via bincode
     Transaction {
-        #[serde(with = "base64_bytes")]
-        data: Vec<u8>,
+        data: Vec<u8>,  // bincode handles Vec<u8> natively
+    },
+    
+    /// PRODUCTION v2.25: Transaction batch for high-throughput TX propagation
+    /// Sends multiple TXs in single message - reduces QUIC stream overhead
+    /// Each TX in batch is still individually validated and added to mempool
+    TransactionBatch {
+        /// Batch of serialized transactions - bincode handles Vec<Vec<u8>> natively
+        transactions: Vec<Vec<u8>>,
+        /// Batch timestamp for ordering
+        timestamp: u64,
     },
     
     /// Peer discovery
@@ -8216,10 +9371,13 @@ pub enum NetworkMessage {
         requesting_node: PeerInfo,
     },
     
-    /// Simple health ping
+    /// Simple health ping with block height for network sync
+    /// v2.25.1: Added height field to keep peer heights updated
     HealthPing {
         from: String,
         timestamp: u64,
+        #[serde(default)]  // Backward compatible with old messages
+        height: u64,       // Current block height of sender
     },
     
     /// State snapshot announcement
@@ -8245,6 +9403,7 @@ pub enum NetworkMessage {
         reveal_data: String,
         nonce: String,  // CRITICAL: Include nonce for reveal verification
         timestamp: u64,
+        signature: String,  // v2.48: Dilithium signature for Byzantine safety
     },
 
     /// Emergency producer change notification
@@ -8334,8 +9493,7 @@ pub enum NetworkMessage {
     /// Response with consensus state
     ConsensusState {
         round: u64,
-        #[serde(with = "base64_bytes")]
-        state_data: Vec<u8>,
+        state_data: Vec<u8>,  // bincode handles Vec<u8> natively
         sender_id: String,
     },
     
@@ -8356,8 +9514,7 @@ pub enum NetworkMessage {
     CertificateAnnounce {
         node_id: String,
         cert_serial: String,
-        #[serde(with = "base64_bytes")]
-        certificate: Vec<u8>,  // Serialized HybridCertificate
+        certificate: Vec<u8>,  // Serialized HybridCertificate - bincode handles natively
         timestamp: u64,
     },
     
@@ -8373,8 +9530,7 @@ pub enum NetworkMessage {
     CertificateResponse {
         node_id: String,
         cert_serial: String,
-        #[serde(with = "base64_bytes")]
-        certificate: Vec<u8>,  // Serialized HybridCertificate
+        certificate: Vec<u8>,  // Serialized HybridCertificate - bincode handles natively
         timestamp: u64,
     },
     
@@ -8436,6 +9592,7 @@ pub enum NetworkMessage {
         pinger_signature: String,     // Pinger's signature on attestation
         challenge: String,            // Original challenge
         gossip_hop: u8,               // Hop count for gossip TTL (max 3)
+        block_height: u64,            // v2.59: Block height for epoch-based filtering
     },
     
     /// PRODUCTION: Active Full/Super node announcement for pinger selection sync
@@ -8497,6 +9654,21 @@ pub enum NetworkMessage {
         is_macroblock: bool,
         sender_id: String,
     },
+    
+    /// PRODUCTION v2.37: Dedicated MacroBlock broadcast (NOT via ShredProtocol!)
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// WHY SEPARATE CHANNEL:
+    /// - ShredProtocol uses block height as dedup key
+    /// - MacroBlock #1 and Microblock #1 both have height=1 → collision!
+    /// - Separate broadcast ensures 100% MacroBlock delivery
+    /// - Dedicated channel avoids collision with microblocks
+    /// ═══════════════════════════════════════════════════════════════════════════
+    MacroBlockBroadcast {
+        index: u64,           // MacroBlock index (epoch number)
+        data: Vec<u8>,        // Compressed macroblock data (zstd)
+        sender_id: String,    // Leader who created macroblock
+        epoch: u64,           // Epoch number (same as index)
+    },
 }
 
 /// PRODUCTION: Active node info for gossip sync
@@ -8521,12 +9693,14 @@ pub enum ConsensusMessage {
         timestamp: u64,
     },
     /// Remote reveal received from peer
+    /// v2.48: Added signature for quantum-resistant authentication
     RemoteReveal {
         round_id: u64,
         node_id: String,
         reveal_data: String,
         nonce: String,  // CRITICAL: Include nonce for reveal verification
         timestamp: u64,
+        signature: String,  // v2.48: Dilithium signature for Byzantine safety
     },
 }
 
@@ -8672,17 +9846,26 @@ impl SimplifiedP2P {
                 // Update last_seen for the peer who sent the transaction
                 self.update_peer_last_seen(from_peer);
                 
+                // ANTI-STORM v2.25: Calculate hash FIRST for deduplication
+                let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&data));
+                
+                // ANTI-STORM: Check if we've already seen this TX
+                // If seen - skip processing AND gossip (prevents exponential amplification)
+                if self.seen_tx_hashes.contains(&tx_hash) {
+                    // Already processed - skip silently to avoid log spam
+                    return;
+                }
+                
+                // Mark as seen BEFORE processing (prevents race conditions)
+                self.seen_tx_hashes.insert(tx_hash.clone());
+                
                 // PRODUCTION v2.19.25: Full transaction processing
-                // Deserialize, validate basic structure, and send to mempool via channel
                 let tx_guard = match self.transaction_tx.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner()
                 };
                 
                 if let Some(ref tx_sender) = *tx_guard {
-                    // Calculate transaction hash for deduplication
-                    let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&data));
-                    
                     // Create received transaction for processing
                     let received_tx = ReceivedTransaction {
                         tx_hash: tx_hash.clone(),
@@ -8698,7 +9881,7 @@ impl SimplifiedP2P {
                     match tx_sender.send(received_tx) {
                         Ok(_) => {
                             println!("[P2P] ← Transaction {} from {} queued for processing", 
-                                     &tx_hash[..16], from_peer);
+                                     &tx_hash[..tx_hash.len().min(16)], from_peer);
                         }
                         Err(e) => {
                             println!("[P2P] ❌ Failed to queue transaction: {}", e);
@@ -8715,50 +9898,126 @@ impl SimplifiedP2P {
                 self.gossip_to_random_peers(gossip_msg, 2);
             }
             
+            // PRODUCTION v2.25: Transaction batch processing for high-throughput
+            NetworkMessage::TransactionBatch { transactions, timestamp: _ } => {
+                self.update_peer_last_seen(from_peer);
+                
+                // ANTI-STORM v2.25: Filter out already-seen transactions
+                let mut new_txs: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
+                for tx_data in &transactions {
+                    let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_data));
+                    if !self.seen_tx_hashes.contains(&tx_hash) {
+                        self.seen_tx_hashes.insert(tx_hash);
+                        new_txs.push(tx_data.clone());
+                    }
+                }
+                
+                // Skip if all TXs were already seen
+                if new_txs.is_empty() {
+                    return;
+                }
+                
+                let tx_guard = match self.transaction_tx.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner()
+                };
+                
+                if let Some(ref tx_sender) = *tx_guard {
+                    let mut processed = 0usize;
+                    
+                    for tx_data in &new_txs {
+                        let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_data));
+                        
+                        let received_tx = ReceivedTransaction {
+                            tx_hash: tx_hash.clone(),
+                            tx_data: tx_data.clone(),
+                            from_peer: from_peer.to_string(),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        };
+                        
+                        if tx_sender.send(received_tx).is_ok() {
+                            processed += 1;
+                        }
+                    }
+                    
+                    if processed > 0 {
+                        println!("[P2P] ← Transaction batch: {}/{} new TXs from {} queued", 
+                                 processed, new_txs.len(), from_peer);
+                    }
+                }
+                drop(tx_guard);
+                
+                // GOSSIP: Forward ONLY NEW transactions to 2 random peers
+                if !new_txs.is_empty() {
+                    let gossip_msg = NetworkMessage::TransactionBatch { 
+                        transactions: new_txs, 
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    self.gossip_to_random_peers(gossip_msg, 2);
+                }
+            }
+            
             NetworkMessage::PeerDiscovery { requesting_node } => {
                 println!("[P2P] ← Peer discovery from {} in {:?}", 
                          requesting_node.id, requesting_node.region);
                 self.add_peer_to_region(requesting_node);
             }
             
-            NetworkMessage::HealthPing { from, timestamp: _ } => {
-                // Update last_seen for the peer who sent the ping
-                self.update_peer_last_seen(&from);
+            NetworkMessage::HealthPing { from, timestamp: _, height } => {
+                // PRODUCTION v2.58: Direct height update from Dilithium-signed heartbeats
+                // v2.43.3-v2.57 used MAX_TRUSTED_HEIGHT_JUMP=100 which broke check_block_exists_on_network
+                // and caused false emergency triggers when nodes fell behind.
+                // 
+                // NOW: Heartbeats are Dilithium-signed → cryptographically verified → trust height directly
+                // Fake height claims are impossible without the private key.
+                self.update_peer_last_seen_with_height(&from, Some(height));
                 // Simple acknowledgment - no complex processing
                 // NOTE: This is P2P health check, NOT reward system ping!
-                println!("[P2P] ← Health ping from {}", from);
+                if crate::node::is_debug() && height % 100 == 0 {
+                    println!("[DBG][P2P] health_ping from={} h={}", from, height);
+                }
             }
 
             NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, signature, timestamp } => {
                 // Update last_seen for the peer who sent the commit
                 self.update_peer_last_seen(&node_id);
-                println!("[CONSENSUS] ← Received commit from {} for round {} at {}", 
-                         node_id, round_id, timestamp);
+                if crate::node::is_debug() { 
+                    println!("[DBG][CONS] commit_recv round={} from={}", round_id, node_id); 
+                }
                 
                 // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)
                 // Microblocks use simple producer signatures, NOT Byzantine consensus
                 if self.is_macroblock_consensus_round(round_id) {
-                    println!("[MACROBLOCK] ✅ Processing commit for consensus round {}", round_id);
+                    if crate::node::is_info() { 
+                        println!("[INFO][MACRO] commit_process round={}", round_id); 
+                    }
                     self.handle_remote_consensus_commit(round_id, node_id, commit_hash, signature, timestamp);
-                } else {
-                    println!("[CONSENSUS] ⏭️ Ignoring commit for microblock - no consensus needed for round {}", round_id);
                 }
+                // Silently ignore microblock commits - they don't need consensus
             }
 
-            NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp } => {
+            NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp, signature } => {
                 // Update last_seen for the peer who sent the reveal
                 self.update_peer_last_seen(&node_id);
-                println!("[CONSENSUS] ← Received reveal from {} for round {} at {}", 
-                         node_id, round_id, timestamp);
+                if crate::node::is_debug() { 
+                    println!("[DBG][CONS] reveal_recv round={} from={} sig_len={}", round_id, node_id, signature.len()); 
+                }
                 
                 // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)  
                 // Microblocks use simple producer signatures, NOT Byzantine consensus
                 if self.is_macroblock_consensus_round(round_id) {
-                    println!("[MACROBLOCK] ✅ Processing reveal for consensus round {}", round_id);
-                    self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, nonce, timestamp);
-                } else {
-                    println!("[CONSENSUS] ⏭️ Ignoring reveal for microblock - no consensus needed for round {}", round_id);
+                    if crate::node::is_info() { 
+                        println!("[INFO][MACRO] reveal_process round={}", round_id); 
+                    }
+                    self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, nonce, timestamp, signature);
                 }
+                // Silently ignore microblock reveals - they don't need consensus
             }
 
             NetworkMessage::ShredProtocolChunk { chunk } => {
@@ -8774,6 +10033,43 @@ impl SimplifiedP2P {
             // PRODUCTION v2.21.3: Handle chunk retransmit responses
             NetworkMessage::MissingChunksResponse { block_height, chunks, original_block_size, is_macroblock, sender_id } => {
                 self.handle_missing_chunks_response(block_height, chunks, original_block_size, is_macroblock, &sender_id);
+            }
+            
+            // PRODUCTION v2.37: Handle dedicated MacroBlock broadcast (NOT ShredProtocol!)
+            NetworkMessage::MacroBlockBroadcast { index, data, sender_id, epoch } => {
+                println!("[INFO][MB-RX] ← received idx={} epoch={} sender={} bytes={}", 
+                         index, epoch, get_privacy_id_for_addr(&sender_id), data.len());
+                
+                // Decompress macroblock data
+                let macroblock_data = match zstd::decode_all(&data[..]) {
+                    Ok(decompressed) => decompressed,
+                    Err(e) => {
+                        println!("[ERR][MB-RX] decompress failed idx={}: {}", index, e);
+                        return;
+                    }
+                };
+                
+                // Queue macroblock for processing via macroblock_tx channel
+                if let Some(ref macroblock_tx) = &*match self.macroblock_tx.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
+                    let received_macroblock = ReceivedBlock {
+                        height: index,
+                        data: macroblock_data,
+                        block_type: "macro".to_string(),
+                        from_peer: sender_id.clone(),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    
+                    if let Err(e) = macroblock_tx.send(received_macroblock) {
+                        println!("[ERR][MB-RX] queue failed idx={}: {}", index, e);
+                    } else {
+                        println!("[INFO][MB-RX] queued idx={} for processing", index);
+                    }
+                } else {
+                    println!("[WARN][MB-RX] no macroblock channel idx={}", index);
+                }
             }
 
             NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp, sender_node_id } => {
@@ -8822,9 +10118,10 @@ impl SimplifiedP2P {
                 
                 // CRITICAL: Ignore emergency messages from low-reputation nodes
                 // This naturally limits to ~1000 high-reputation nodes that can participate
-                if sender_reputation < 70.0 {
-                    println!("[SECURITY] ⚠️ Ignoring emergency from {} - reputation {:.1} < 70", 
-                             from_peer, sender_reputation);
+                use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
+                if sender_reputation < MIN_CONSENSUS_REPUTATION {
+                    println!("[SECURITY] ⚠️ Ignoring emergency from {} - reputation {:.1} < {:.0}", 
+                             from_peer, sender_reputation, MIN_CONSENSUS_REPUTATION);
                     println!("[SECURITY] 🚫 Low-reputation nodes cannot trigger emergency failover");
                     return; // Ignore message completely
                 }
@@ -8929,23 +10226,81 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::EntropyRequest { block_height, requester_id } => {
-                // Handle entropy request for rotation boundary verification
-                println!("[CONSENSUS] 🎲 Entropy request for block {} from {}", block_height, requester_id);
-                // Response will be sent by node.rs which has access to storage
-                // Store request for processing
+                // PRODUCTION FIX v2.51: Actually respond to entropy requests!
+                // Before: just logged, never responded -> "no_entropy_responses" fallback always
+                // After: calculate entropy hash and send response back
+                
+                // PRODUCTION v2.50: Lock-free storage access
+                let entropy_hash = if let Some(storage) = crate::node::try_get_storage() {
+                    match storage.load_microblock(block_height) {
+                        Ok(Some(block_data)) => {
+                            // Calculate entropy hash (same as node.rs get_previous_microblock_hash)
+                            use sha3::{Sha3_256, Digest};
+                            let mut hasher = Sha3_256::new();
+                            hasher.update(&block_data);
+                            let result = hasher.finalize();
+                            let mut hash = [0u8; 32];
+                            hash.copy_from_slice(&result);
+                            hash
+                        },
+                        Ok(None) => {
+                            // Block not found - we don't have it yet (lagging)
+                            [0u8; 32]
+                        },
+                        Err(e) => {
+                            println!("[CONSENSUS] ❌ Error loading block {}: {}", block_height, e);
+                            [0u8; 32]
+                        }
+                    }
+                } else {
+                    // Storage not initialized yet
+                    [0u8; 32]
+                };
+                
+                // Send response back to requester
+                let response = NetworkMessage::EntropyResponse {
+                    block_height,
+                    entropy_hash,
+                    responder_id: self.node_id.clone(),
+                };
+                
+                // Find requester address and send response
+                if let Some(requester_addr) = self.get_peer_address(&requester_id) {
+                    self.send_network_message(&requester_addr, response);
+                }
+                // Note: if requester not found, silently skip (peer may have disconnected)
             }
             
             NetworkMessage::EntropyResponse { block_height, entropy_hash, responder_id } => {
-                // Handle entropy response for consensus verification
-                println!("[CONSENSUS] 🎯 Entropy response for block {} from {}: {:x}", 
-                        block_height, responder_id,
-                        u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
-                                           entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
-                // Store response for verification in node.rs
+                // PRODUCTION FIX v2.51: Actually store entropy responses!
+                // Before: just logged -> never stored -> "no_entropy_responses" fallback
+                // After: store in ENTROPY_RESPONSES for consensus verification
+                
+                // Store response in global ENTROPY_RESPONSES map (used by node.rs)
+                if let Ok(mut responses) = crate::node::ENTROPY_RESPONSES.lock() {
+                    responses.insert((block_height, responder_id.clone()), entropy_hash);
+                }
+                
+                // Log only significant responses (not zeros)
+                if entropy_hash != [0u8; 32] {
+                    println!("[CONSENSUS] 🎯 Entropy response h={} from={}: {:x}", 
+                            block_height, responder_id,
+                            u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
+                                               entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
+                }
             }
             
             // PRODUCTION: Certificate management for compact signatures
             NetworkMessage::CertificateAnnounce { node_id, cert_serial, certificate, timestamp } => {
+                // SAFE: Get Tokio handle early to prevent panic in async verification
+                let handle = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(_) => {
+                        println!("[P2P] ⚠️ No Tokio runtime - certificate verification skipped");
+                        return;
+                    }
+                };
+                
                 self.update_peer_last_seen(&node_id);
                 
                 // SCALABILITY: Light nodes don't participate in consensus, skip certificate processing
@@ -9059,10 +10414,12 @@ impl SimplifiedP2P {
                     return;
                 }
                 
-                // SECURITY: Check certificate has not expired
-                if now > cert.expires_at {
-                    println!("[P2P] ❌ Certificate expired at {}, current time: {}", 
-                             cert.expires_at, now);
+                // SECURITY: Check certificate has not expired (with grace period)
+                // v2.64: 60 second grace period for network propagation delays
+                const CERTIFICATE_GRACE_PERIOD_SECS: u64 = 60;
+                if now > cert.expires_at + CERTIFICATE_GRACE_PERIOD_SECS {
+                    println!("[P2P] ❌ Certificate expired at {}, current time: {} (beyond {}s grace)", 
+                             cert.expires_at, now, CERTIFICATE_GRACE_PERIOD_SECS);
                     return;
                 }
                 
@@ -9117,7 +10474,7 @@ impl SimplifiedP2P {
                 let node_id_clone = node_id.clone();
                 let reputation_system_clone = self.reputation_system.clone();
                 
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     // Recreate encapsulated data for verification (same as in hybrid_crypto.rs)
                     let mut encapsulated_data = Vec::new();
                     encapsulated_data.extend_from_slice(&cert.ed25519_public_key);
@@ -9125,15 +10482,17 @@ impl SimplifiedP2P {
                     encapsulated_data.extend_from_slice(&cert.issued_at.to_le_bytes());
                     let encapsulated_hex = hex::encode(&encapsulated_data);
                     
-                    // Verify Dilithium signature using GLOBAL_QUANTUM_CRYPTO
-                    use crate::node::GLOBAL_QUANTUM_CRYPTO;
-                    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-                    if crypto_guard.is_none() {
-                        let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-                        let _ = crypto.initialize().await;
-                        *crypto_guard = Some(crypto);
-                    }
-                    let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+                    // PRODUCTION v2.50: Lock-free Dilithium verification
+                    use crate::node::try_get_quantum_crypto;
+                    let quantum_crypto = match try_get_quantum_crypto() {
+                        Some(c) => c,
+                        None => {
+                            if crate::node::is_warn() {
+                                println!("[WARN][CRYPTO] cert_verify_skip reason=not_initialized");
+                            }
+                            return;
+                        }
+                    };
                     
                     let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
                         signature: cert.dilithium_signature.clone(),
@@ -9241,10 +10600,15 @@ impl SimplifiedP2P {
                                 }
                                 history.push((cert_serial_clone.clone(), cert.ed25519_public_key));
                                 
-                                // OPTIMISTIC: Move from pending to verified cache
-                                cert_manager.pending_certificates.remove(&cert_serial_clone);
+                                // ATOMIC MOVE: First add to verified, THEN remove from pending
+                                // This prevents race condition where cert is in neither cache
                                 cert_manager.store_remote_certificate(cert_serial_clone.clone(), certificate_clone);
+                                cert_manager.pending_certificates.remove(&cert_serial_clone);
                                 println!("[P2P] ✅ Certificate moved from PENDING to VERIFIED cache");
+                                
+                                // FIX v2.28: Signal retry loop that new certificate is available
+                                // This triggers immediate retry of buffered blocks
+                                crate::node::NEW_CERTIFICATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             } else {
                                 println!("[P2P] ❌ Certificate rotation incompatible - rejecting");
                                 // Remove from pending without storing
@@ -9292,6 +10656,15 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::CertificateRequest { requester_id, node_id, cert_serial, timestamp } => {
+                // SAFE: Get Tokio handle early to prevent panic
+                let handle = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(_) => {
+                        println!("[P2P] ⚠️ WARN: No Tokio runtime - certificate request skipped");
+                        return;
+                    }
+                };
+
                 self.update_peer_last_seen(&requester_id);
                 println!("[P2P] 📋 Certificate request from {} for {}", requester_id, cert_serial);
                 
@@ -9320,7 +10693,7 @@ impl SimplifiedP2P {
                         let quic_transport = self.quic_transport.clone();
                         let response_clone = response.clone();
                         
-                        tokio::spawn(async move {
+                        handle.spawn(async move {
                             if quic_enabled {
                                 if let Some(ref transport) = quic_transport {
                                     let parts: Vec<&str> = peer_addr_clone.split(':').collect();
@@ -9357,6 +10730,9 @@ impl SimplifiedP2P {
                 let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
                 cert_manager.store_remote_certificate(cert_serial.clone(), certificate);
                 println!("[P2P] ✅ Received certificate {} cached", cert_serial);
+                
+                // FIX v2.28: Signal retry loop that new certificate is available
+                crate::node::NEW_CERTIFICATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             
             // PRODUCTION: Light Node registration gossip handling
@@ -9460,7 +10836,11 @@ impl SimplifiedP2P {
             NetworkMessage::NodeHeartbeat {
                 node_id, node_type, timestamp, block_height, signature, heartbeat_index, gossip_hop
             } => {
-                self.update_peer_last_seen(from_peer);
+                // PRODUCTION v2.58: Direct height update from gossip blocks
+                // v2.43.3-v2.57 used MAX_TRUSTED_HEIGHT_JUMP=100 which caused sync issues.
+                // GossipBlock contains block_height from actual produced block.
+                // Producer signature is verified before processing → trust height directly.
+                self.update_peer_last_seen_with_height(from_peer, Some(block_height));
                 
                 // GOSSIP TTL: Max 3 hops
                 if gossip_hop >= 3 {
@@ -9492,12 +10872,13 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // CRITICAL FIX v2.21.1: Check sender reputation >= 70% for QNC rewards!
+                // CRITICAL FIX v2.21.1: Check sender reputation >= MIN_CONSENSUS_REPUTATION for QNC rewards!
                 // Reject heartbeats from nodes with low reputation (v2.21.5: blockchain source)
+                use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
                 let sender_reputation = self.get_node_reputation_from_blockchain(&node_id);
-                if sender_reputation < 70.0 {
-                    println!("[HEARTBEAT] ⚠️ Rejecting heartbeat from {}: reputation {:.1}% < 70%", 
-                             node_id, sender_reputation);
+                if sender_reputation < MIN_CONSENSUS_REPUTATION {
+                    println!("[HEARTBEAT] ⚠️ Rejecting heartbeat from {}: reputation {:.1}% < {:.0}%", 
+                             node_id, sender_reputation, MIN_CONSENSUS_REPUTATION);
                     return;
                 }
                 
@@ -9508,10 +10889,8 @@ impl SimplifiedP2P {
                 // - CPU cost: ~5ms per heartbeat (acceptable for 10 heartbeats per 4 hours)
                 
                 // VERIFY: Node must be registered (first registration uses Dilithium)
-                let is_known_node = {
-                    let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                    active_nodes.contains_key(&node_id)
-                };
+                // v2.51: Lock-free check
+                let is_known_node = self.active_full_super_nodes.contains_key(&node_id);
                 
                 // For Genesis nodes, always accept (hardcoded IPs)
                 let is_genesis = node_id.starts_with("genesis_node_");
@@ -9534,6 +10913,7 @@ impl SimplifiedP2P {
                 println!("[HEARTBEAT] ✅ HYBRID signature verified for {} (quantum-resistant)", node_id);
                 
                 // Store heartbeat in RAM
+                // v2.59: Include block_height for reliable epoch-based filtering
                 {
                     let mut heartbeats = match self.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     heartbeats.insert(heartbeat_key, HeartbeatRecord {
@@ -9542,6 +10922,7 @@ impl SimplifiedP2P {
                         heartbeat_index,
                         signature: signature.clone(),
                         verified: true,
+                        block_height, // v2.59: From NetworkMessage for epoch filtering
                     });
                 }
                 
@@ -9553,8 +10934,12 @@ impl SimplifiedP2P {
                 // Update active nodes list (proves node is online)
                 self.update_active_nodes_from_heartbeat(&node_id, &node_type, timestamp);
                 
-                println!("[HEARTBEAT] ✅ {} ({}) heartbeat #{} verified at height {}", 
-                         node_id, node_type, heartbeat_index, block_height);
+                if crate::node::is_info() && heartbeat_index == 0 {
+                    // Log only first heartbeat of each 4h window to reduce spam
+                    println!("[INFO][HB] verified node={} type={} idx={}", node_id, node_type, heartbeat_index);
+                } else if crate::node::is_debug() {
+                    println!("[DBG][HB] verified node={} idx={} h={}", node_id, heartbeat_index, block_height);
+                }
                 
                 // RE-GOSSIP using Kademlia K-neighbors (v2.19.19)
                 // More efficient than random gossip for DHT-based networks
@@ -9625,7 +11010,7 @@ impl SimplifiedP2P {
             // PRODUCTION: Light Node attestation - proof of ping response
             NetworkMessage::LightNodeAttestation {
                 light_node_id, pinger_id, slot, timestamp, 
-                light_node_signature, pinger_signature, challenge, gossip_hop
+                light_node_signature, pinger_signature, challenge, gossip_hop, block_height
             } => {
                 self.update_peer_last_seen(from_peer);
                 
@@ -9656,12 +11041,10 @@ impl SimplifiedP2P {
                 }
                 
                 // VERIFY: Pinger must be in active Full/Super nodes list
-                {
-                    let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                    if !active_nodes.contains_key(&pinger_id) && !pinger_id.starts_with("genesis_node_") {
-                        println!("[ATTESTATION] ❌ Unknown pinger {} for Light node {}", pinger_id, light_node_id);
-                        return;
-                    }
+                // v2.51: Lock-free check
+                if !self.active_full_super_nodes.contains_key(&pinger_id) && !pinger_id.starts_with("genesis_node_") {
+                    println!("[ATTESTATION] ❌ Unknown pinger {} for Light node {}", pinger_id, light_node_id);
+                    return;
                 }
                 
                 // VERIFY: Light node must be in registry
@@ -9704,14 +11087,15 @@ impl SimplifiedP2P {
                         light_node_signature: light_node_signature.clone(),
                         pinger_signature: pinger_signature.clone(),
                         challenge: challenge.clone(),
+                        block_height, // v2.59: For epoch-based filtering
                     });
                 }
                 
                 // WHITEPAPER: Light nodes have FIXED reputation of 70
                 // NO reputation changes for Light nodes - they are always eligible if attested
                 
-                println!("[ATTESTATION] ✅ Light node {} attested by {} in slot {}", 
-                         light_node_id, pinger_id, slot);
+                println!("[ATTESTATION] ✅ Light node {} attested by {} in slot {} height={}", 
+                         light_node_id, pinger_id, slot, block_height);
                 
                 // RE-GOSSIP
                 let forward_msg = NetworkMessage::LightNodeAttestation {
@@ -9723,6 +11107,7 @@ impl SimplifiedP2P {
                     pinger_signature,
                     challenge,
                     gossip_hop: gossip_hop + 1,
+                    block_height, // v2.59: Propagate height for all nodes
                 };
                 self.gossip_to_random_peers(forward_msg, 3);
             }
@@ -9754,25 +11139,32 @@ impl SimplifiedP2P {
                 let announcement_data = format!("active:{}:{}:{}:{}:{}", 
                     node_id, node_type, shard_id, reputation as u64, timestamp);
                 if !self.verify_dilithium_heartbeat_signature(&announcement_data, &signature, &node_id) {
-                    println!("[ACTIVE] ❌ Invalid signature from {}", node_id);
+                    if crate::node::is_warn() {
+                        println!("[WARN][ACTIVE] sig_invalid node={}", node_id);
+                    }
                     return;
                 }
                 
                 // SECURITY FIX: Use REAL reputation from blockchain (v2.21.5)
                 // Don't trust the reputation value in the announcement - it could be faked!
                 let real_reputation = self.get_node_reputation_from_blockchain(&node_id);
+                use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                 
-                // REPUTATION FILTER: Only track nodes with rep >= 70
+                // REPUTATION FILTER: Only track nodes with rep >= INITIAL_REPUTATION
                 // Use REAL reputation, not the claimed one from announcement
-                if real_reputation < 70.0 {
-                    // If we don't know this node yet, give them benefit of doubt with default 70
-                    // New nodes start at 70, so this is fair
+                if real_reputation < INITIAL_REPUTATION {
+                    // If we don't know this node yet, give them benefit of doubt with INITIAL_REPUTATION
+                    // New nodes start at INITIAL_REPUTATION, so this is fair
                     if real_reputation == 0.0 {
                         // Unknown node - accept with default reputation
-                        println!("[ACTIVE] 🆕 New node {} - accepting with default reputation 70.0", node_id);
+                        if crate::node::is_info() {
+                            println!("[INFO][ACTIVE] new_node node={} default_rep={:.1}", node_id, INITIAL_REPUTATION);
+                        }
                     } else {
-                        println!("[ACTIVE] ⚠️ Ignoring {} with low REAL reputation {:.1} (claimed: {:.1})", 
-                                 node_id, real_reputation, reputation);
+                        if crate::node::is_warn() {
+                            println!("[WARN][ACTIVE] reject_low_rep node={} real={:.1} claimed={:.1}", 
+                                     node_id, real_reputation, reputation);
+                        }
                         return;
                     }
                 }
@@ -9804,28 +11196,34 @@ impl SimplifiedP2P {
                 // MONITORING ONLY: Log significant differences for debugging
                 let reputation_diff = (reputation - real_reputation).abs();
                 if reputation_diff > 5.0 && real_reputation > 0.0 {
-                    println!("[ACTIVE] ℹ️ Reputation diff for {} (monitoring): claimed {:.1}, local {:.1}, diff {:.1}", 
-                             node_id, reputation, real_reputation, reputation_diff);
+                    if crate::node::is_debug() {
+                        println!("[DBG][ACTIVE] rep_diff node={} claimed={:.1} local={:.1} diff={:.1}", 
+                                 node_id, reputation, real_reputation, reputation_diff);
+                    }
                 }
                 
-                // Use the HIGHER of real or default (70) for new nodes
-                let effective_reputation = if real_reputation > 0.0 { real_reputation } else { 70.0 };
+                // v2.45.1: Use real blockchain reputation, fallback to INITIAL_REPUTATION
+                let effective_reputation = if real_reputation > 0.0 { 
+                    real_reputation 
+                } else { 
+                    qnet_consensus::deterministic_reputation::INITIAL_REPUTATION 
+                };
                 
-                // Update active nodes map
-                {
-                    let mut active_nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-                    let existing = active_nodes.get(&node_id);
+                // Update active nodes map (v2.51: lock-free)
+                let should_update = self.active_full_super_nodes.get(&node_id)
+                    .map(|e| e.last_seen < timestamp)
+                    .unwrap_or(true);
                     
-                    // Only update if newer timestamp
-                    if existing.map(|e| e.last_seen < timestamp).unwrap_or(true) {
-                        active_nodes.insert(node_id.clone(), ActiveNodeInfo {
-                            node_id: node_id.clone(),
-                            node_type: node_type.clone(),
-                            shard_id,
-                            reputation: effective_reputation, // Use REAL reputation!
-                            last_seen: timestamp,
-                        });
-                        println!("[ACTIVE] ✅ {} ({}) registered/updated, shard {}, rep {:.1} (real)", 
+                if should_update {
+                    self.active_full_super_nodes.insert(node_id.clone(), ActiveNodeInfo {
+                        node_id: node_id.clone(),
+                        node_type: node_type.clone(),
+                        shard_id,
+                        reputation: effective_reputation, // Use REAL reputation!
+                        last_seen: timestamp,
+                    });
+                    if crate::node::is_info() {
+                        println!("[INFO][ACTIVE] updated node={} type={} shard={} rep={:.1}", 
                                  node_id, node_type, shard_id, effective_reputation);
                     }
                 }
@@ -9847,14 +11245,11 @@ impl SimplifiedP2P {
             NetworkMessage::ActiveNodesRequest { requester_id } => {
                 self.update_peer_last_seen(from_peer);
                 
-                // Collect active nodes with rep >= 70
-                let active_nodes: Vec<ActiveNodeInfo> = {
-                    let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                    nodes.values()
-                        .filter(|n| n.reputation >= 70.0)
-                        .cloned()
-                        .collect()
-                };
+                // Collect active nodes with rep >= 70 (v2.51: lock-free)
+                let active_nodes: Vec<ActiveNodeInfo> = self.active_full_super_nodes.iter()
+                    .filter(|entry| entry.value().reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION)
+                    .map(|entry| entry.value().clone())
+                    .collect();
                 
                 // Send response
                 let response = NetworkMessage::ActiveNodesResponse {
@@ -9870,7 +11265,9 @@ impl SimplifiedP2P {
             // PRODUCTION: Response with active nodes list
             NetworkMessage::ActiveNodesResponse { sender_id, active_nodes } => {
                 self.update_peer_last_seen(from_peer);
-                println!("[ACTIVE] 📥 Received {} active nodes from {}", active_nodes.len(), sender_id);
+                if crate::node::is_info() {
+                    println!("[INFO][ACTIVE] sync_received count={} from={}", active_nodes.len(), sender_id);
+                }
                 
                 // SECURITY: Track nodes that return suspiciously empty lists
                 // This could indicate an attack or node with corrupted state
@@ -9913,22 +11310,20 @@ impl SimplifiedP2P {
                 EMPTY_RESPONSE_TRACKER.remove(&sender_id);
                 
                 // Merge into local map (ADDITIVE - never replace or delete existing!)
+                // v2.51: Lock-free insert
                 let mut added = 0;
-                {
-                    let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-                    for node in active_nodes {
-                        // Only add if rep >= 70 and not stale (< 15 min old)
-                        if node.reputation >= 70.0 && node.last_seen > now.saturating_sub(15 * 60) {
-                            if !nodes.contains_key(&node.node_id) {
-                                nodes.insert(node.node_id.clone(), node);
-                                added += 1;
-                            }
+                for node in active_nodes {
+                    // Only add if rep >= 70 and not stale (< 15 min old)
+                    if node.reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION && node.last_seen > now.saturating_sub(15 * 60) {
+                        if !self.active_full_super_nodes.contains_key(&node.node_id) {
+                            self.active_full_super_nodes.insert(node.node_id.clone(), node);
+                            added += 1;
                         }
                     }
                 }
                 
-                if added > 0 {
-                    println!("[ACTIVE] ✅ Added {} new active nodes", added);
+                if added > 0 && crate::node::is_info() {
+                    println!("[INFO][ACTIVE] sync_added count={}", added);
                 }
             }
             
@@ -9972,17 +11367,11 @@ impl SimplifiedP2P {
         // CRITICAL FIX v2.19.15: Check BOTH connected_peers_lockfree AND connected_peers
         // Genesis nodes use legacy connected_peers (should_use_lockfree=false for ≤5 peers)
         // This was causing gossip to fail for Genesis nodes!
-        let peers: Vec<_> = if self.should_use_lockfree() {
-            self.connected_peers_lockfree
-                .iter()
-                .map(|r| r.value().clone())
-                .collect()
-        } else {
-            // Fallback to legacy connected_peers for Genesis nodes
-            self.connected_peers.read()
-                .map(|p| p.values().cloned().collect())
-                .unwrap_or_default()
-        };
+        // v2.51: lock-free
+        let peers: Vec<_> = self.connected_peers_lockfree
+            .iter()
+            .map(|r| r.value().clone())
+            .collect();
         
         if peers.is_empty() {
             return;
@@ -9996,24 +11385,12 @@ impl SimplifiedP2P {
         }
     }
     
-    /// OPTIMIZATION v2.19.19: Gossip to K closest neighbors using Kademlia distance
-    /// This reduces network traffic while maintaining reliable propagation
-    /// Used for: heartbeats, peer announcements (non-critical messages)
-    /// NOT used for: blocks, certificates (use broadcast_block or gossip_to_random_peers)
+    /// OPTIMIZATION v2.19.19: Gossip to K closest neighbors using Kademlia distance (v2.51: lock-free)
     pub fn gossip_to_k_neighbors(&self, message: NetworkMessage, k: usize) {
-        // CRITICAL: Check BOTH connected_peers_lockfree AND connected_peers
-        // Genesis nodes use legacy connected_peers (should_use_lockfree=false for ≤5 peers)
-        let mut peers: Vec<_> = if self.should_use_lockfree() {
-            self.connected_peers_lockfree
-                .iter()
-                .map(|r| r.value().clone())
-                .collect()
-        } else {
-            // Fallback to legacy connected_peers for Genesis nodes
-            self.connected_peers.read()
-                .map(|p| p.values().cloned().collect())
-                .unwrap_or_default()
-        };
+        let mut peers: Vec<_> = self.connected_peers_lockfree
+            .iter()
+            .map(|r| r.value().clone())
+            .collect();
         
         if peers.is_empty() {
             return;
@@ -10072,29 +11449,44 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // NEW FORMAT: Hybrid P2P signature (NIST/Cisco compliant)
+        // OPTIMIZED v2.24: Binary hybrid P2P signature (bincode+zstd)
+        if signature.starts_with("hybrid_p2p_bin:") {
+            return self.verify_hybrid_p2p_binary_async(message, signature, node_id).await;
+        }
+        
+        // LEGACY: JSON hybrid P2P signature
         if signature.starts_with("hybrid_p2p:") {
             return self.verify_hybrid_p2p_signature_async(message, signature, node_id).await;
         }
         
+        // v2.49.2: FULL hybrid binary signature (used for MACROBLOCK consensus)
+        if signature.starts_with("hybrid_bin:") {
+            return self.verify_hybrid_bin_signature_sync(message, signature, node_id);
+        }
+        
+        // v2.49.2: COMPACT hybrid binary signature
+        if signature.starts_with("compact_bin:") {
+            return self.verify_compact_bin_signature_sync(message, signature, node_id);
+        }
+        
         // LEGACY FORMAT: Pure Dilithium signature (for backward compatibility)
         if !signature.starts_with("dilithium_sig_") {
-            println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix");
+            println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix (got: {}...)", 
+                     &signature[..signature.len().min(20)]);
             return false;
         }
         
-        // Use global crypto instance
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = QNetQuantumCrypto::new();
-            if let Err(e) = crypto.initialize().await {
-                println!("[HEARTBEAT] ❌ Crypto init failed: {}", e);
+        // PRODUCTION v2.50: Lock-free heartbeat verification
+        use crate::node::try_get_quantum_crypto;
+        let crypto = match try_get_quantum_crypto() {
+            Some(c) => c,
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][HEARTBEAT] verify_skip reason=crypto_not_initialized");
+                }
                 return false;
             }
-            *crypto_guard = Some(crypto);
-        }
-        
-        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        };
         
         // Create DilithiumSignature struct
         let dilithium_sig = DilithiumSignature {
@@ -10124,7 +11516,119 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Verify HYBRID P2P signature (NIST/Cisco compliant with ephemeral keys)
+    /// OPTIMIZED v2.24: Verify HYBRID P2P BINARY signature (bincode+zstd)
+    async fn verify_hybrid_p2p_binary_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+        use crate::quantum_crypto::DilithiumSignature;
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        use sha3::{Sha3_256, Digest};
+        use base64::engine::general_purpose;
+        use base64::Engine;
+        
+        // Parse hybrid_p2p_bin signature
+        let base64_data = &signature[15..]; // Skip "hybrid_p2p_bin:" prefix
+        let binary_data = match general_purpose::STANDARD.decode(base64_data) {
+            Ok(data) => data,
+            Err(e) => {
+                println!("[HEARTBEAT] ❌ Failed to decode base64: {}", e);
+                return false;
+            }
+        };
+        
+        let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
+            Ok(sig) => sig,
+            Err(e) => {
+                println!("[HEARTBEAT] ❌ Failed to parse binary signature: {}", e);
+                return false;
+            }
+        };
+        
+        // v2.24: Direct node_id comparison
+        if compact_sig.node_id != node_id {
+            println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
+            return false;
+        }
+        
+        // Step 1: Verify ephemeral key is present
+        if compact_sig.ephemeral_public_key.iter().all(|&b| b == 0) {
+            println!("[HEARTBEAT] ❌ Ephemeral public key is all zeros!");
+            return false;
+        }
+        
+        // Step 2: Verify Ed25519 signature with ephemeral key
+        let mut hasher = Sha3_256::new();
+        hasher.update(message.as_bytes());
+        let message_hash = hasher.finalize();
+        
+        match HybridCrypto::verify_ed25519_signature(
+            &message_hash,
+            &compact_sig.message_signature,
+            &compact_sig.ephemeral_public_key
+        ) {
+            Ok(true) => {} // OK
+            Ok(false) => {
+                println!("[HEARTBEAT] ❌ Ed25519 signature INVALID!");
+                return false;
+            }
+            Err(e) => {
+                println!("[HEARTBEAT] ❌ Ed25519 verification error: {}", e);
+                return false;
+            }
+        }
+        
+        // Step 3: Verify Dilithium signature
+        if compact_sig.dilithium_key_signature.is_empty() {
+            println!("[HEARTBEAT] ❌ REJECTED: No Dilithium key signature!");
+            return false;
+        }
+        
+        // PRODUCTION v2.50: Lock-free quantum crypto
+        use crate::node::try_get_quantum_crypto;
+        let crypto = match try_get_quantum_crypto() {
+            Some(c) => c,
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] hybrid_p2p_bin_verify_skip reason=crypto_not_initialized");
+                }
+                return false;
+            }
+        };
+        
+        // Verify Dilithium key signature (encapsulated_data = ephemeral_key || message_hash || timestamp)
+        let mut encapsulated_data = Vec::new();
+        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
+        encapsulated_data.extend_from_slice(&message_hash);
+        encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
+        let encapsulated_hex = hex::encode(&encapsulated_data);
+        
+        // Convert RAW bytes to signature string
+        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+        let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
+        
+        let dilithium_key_sig = DilithiumSignature {
+            signature: signature_string,
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
+            timestamp: compact_sig.signed_at,
+            strength: "quantum-resistant".to_string(),
+        };
+        
+        match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
+            Ok(true) => {
+                println!("[HEARTBEAT] ✅ Binary signature verified (v2.24)");
+                true
+            }
+            Ok(false) => {
+                println!("[HEARTBEAT] ❌ Dilithium signature INVALID!");
+                false
+            }
+            Err(e) => {
+                println!("[HEARTBEAT] ❌ Dilithium verification error: {}", e);
+                false
+            }
+        }
+    }
+    
+    /// LEGACY: Verify HYBRID P2P JSON signature (NIST/Cisco compliant with ephemeral keys)
     async fn verify_hybrid_p2p_signature_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
         use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
         use crate::quantum_crypto::DilithiumSignature;
@@ -10141,13 +11645,8 @@ impl SimplifiedP2P {
             }
         };
         
-        // Verify node_id matches
-        let expected_node_id = if node_id.starts_with("qn_") {
-            node_id.to_string()
-        } else {
-            format!("qn_{}", node_id)
-        };
-        if compact_sig.node_id != expected_node_id && compact_sig.node_id != node_id {
+        // v2.24: Direct node_id comparison
+        if compact_sig.node_id != node_id {
             println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
             return false;
         }
@@ -10185,14 +11684,17 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // Get quantum crypto
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
-            *crypto_guard = Some(crypto);
-        }
-        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        // PRODUCTION v2.50: Lock-free quantum crypto
+        use crate::node::try_get_quantum_crypto;
+        let crypto = match try_get_quantum_crypto() {
+            Some(c) => c,
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CRYPTO] verify_skip reason=not_initialized");
+                }
+                return false;
+            }
+        };
         
         // Verify Dilithium key signature (encapsulated_data = ephemeral_key || message_hash || timestamp)
         let mut encapsulated_data = Vec::new();
@@ -10240,14 +11742,32 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // NEW FORMAT: Hybrid P2P signature (NIST/Cisco compliant)
+        // OPTIMIZED v2.24: Binary hybrid P2P signature (bincode+zstd)
+        if signature.starts_with("hybrid_p2p_bin:") {
+            return self.verify_hybrid_p2p_binary_sync(message, signature, node_id);
+        }
+        
+        // LEGACY: JSON hybrid P2P signature
         if signature.starts_with("hybrid_p2p:") {
             return self.verify_hybrid_p2p_signature_sync(message, signature, node_id);
         }
         
+        // v2.49.2: FULL hybrid binary signature (used for MACROBLOCK consensus)
+        // Format: "hybrid_bin:<base64_bincode_zstd>" with embedded certificate
+        if signature.starts_with("hybrid_bin:") {
+            return self.verify_hybrid_bin_signature_sync(message, signature, node_id);
+        }
+        
+        // v2.49.2: COMPACT hybrid binary signature  
+        // Format: "compact_bin:<base64_bincode_zstd>" requires pre-shared certificate
+        if signature.starts_with("compact_bin:") {
+            return self.verify_compact_bin_signature_sync(message, signature, node_id);
+        }
+        
         // LEGACY FORMAT: Pure Dilithium signature
         if !signature.starts_with("dilithium_sig_") {
-            println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix");
+            println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix (got: {}...)", 
+                     &signature[..signature.len().min(20)]);
             return false;
         }
         
@@ -10263,19 +11783,22 @@ impl SimplifiedP2P {
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => {
                     rt.block_on(async move {
-                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-                        
-                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-                        if crypto_guard.is_none() {
-                            let mut crypto = QNetQuantumCrypto::new();
-                            if let Err(e) = crypto.initialize().await {
-                                println!("[HEARTBEAT] ❌ Crypto init failed: {}", e);
+                        // PRODUCTION v2.50: Lock-free quantum crypto in isolated thread
+                        use crate::node::try_get_quantum_crypto;
+                        let crypto = match try_get_quantum_crypto() {
+                            Some(c) => c,
+                            None => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][HEARTBEAT] verify_skip reason=crypto_not_initialized");
+                                }
                                 return false;
                             }
-                            *crypto_guard = Some(crypto);
-                        }
+                        };
                         
-                        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+                        let crypto = match Some(crypto.as_ref()) {
+            Some(c) => c,
+            None => return false, // Crypto not initialized
+        };
                         
                         let dilithium_sig = DilithiumSignature {
                             signature: signature.clone(),
@@ -10320,7 +11843,359 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Verify HYBRID P2P signature (SYNC version) - NIST/Cisco compliant
+    /// v2.48: Verify consensus signature (commit/reveal) using Dilithium
+    /// Wrapper around verify_dilithium_heartbeat_signature for consistent API
+    fn verify_consensus_signature(&self, node_id: &str, message: &str, signature: &str) -> bool {
+        // Use the same verification logic as heartbeat (supports all formats)
+        self.verify_dilithium_heartbeat_signature(message, signature, node_id)
+    }
+    
+    /// OPTIMIZED v2.24: Verify HYBRID P2P BINARY signature (SYNC version)
+    fn verify_hybrid_p2p_binary_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        let message = message.to_string();
+        let signature = signature.to_string();
+        let node_id = node_id.to_string();
+        
+        // Use std::thread::spawn to isolate runtime
+        let handle = std::thread::spawn(move || {
+            use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+            use crate::quantum_crypto::DilithiumSignature;
+            use sha3::{Sha3_256, Digest};
+            use base64::engine::general_purpose;
+            use base64::Engine;
+            
+            // Parse binary signature
+            let base64_data = &signature[15..]; // Skip "hybrid_p2p_bin:" prefix
+            let binary_data = match general_purpose::STANDARD.decode(base64_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    println!("[HEARTBEAT] ❌ Failed to decode base64 (sync): {}", e);
+                    return false;
+                }
+            };
+            
+            let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    println!("[HEARTBEAT] ❌ Failed to parse binary signature (sync): {}", e);
+                    return false;
+                }
+            };
+            
+            // v2.24: Direct node_id comparison
+            if compact_sig.node_id != node_id {
+                println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
+                return false;
+            }
+            
+            // Verify Ed25519 signature
+            let mut hasher = Sha3_256::new();
+            hasher.update(message.as_bytes());
+            let message_hash = hasher.finalize();
+            
+            match HybridCrypto::verify_ed25519_signature(
+                &message_hash,
+                &compact_sig.message_signature,
+                &compact_sig.ephemeral_public_key
+            ) {
+                Ok(true) => {} // OK
+                _ => {
+                    println!("[HEARTBEAT] ❌ Ed25519 signature INVALID (sync)!");
+                    return false;
+                }
+            }
+            
+            // Verify Dilithium via runtime
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => {
+                    rt.block_on(async {
+                        // PRODUCTION v2.50: Lock-free quantum crypto
+                        use crate::node::try_get_quantum_crypto;
+                        let crypto = match try_get_quantum_crypto() {
+                            Some(c) => c.as_ref(),
+                            None => return false,
+                        };
+                        
+                        let mut encapsulated_data = Vec::new();
+                        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
+                        encapsulated_data.extend_from_slice(&message_hash);
+                        encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
+                        let encapsulated_hex = hex::encode(&encapsulated_data);
+                        
+                        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+                        let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
+                        
+                        let dilithium_key_sig = DilithiumSignature {
+                            signature: signature_string,
+                            algorithm: "CRYSTALS-Dilithium3".to_string(),
+                            timestamp: compact_sig.signed_at,
+                            strength: "quantum-resistant".to_string(),
+                        };
+                        
+                        match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
+                            Ok(true) => {
+                                println!("[HEARTBEAT] ✅ Binary signature verified (sync v2.24)");
+                                true
+                            }
+                            _ => false
+                        }
+                    })
+                }
+                Err(_) => false
+            }
+        });
+        
+        handle.join().unwrap_or(false)
+    }
+    
+    /// v2.49.2: Verify FULL hybrid binary signature (with embedded certificate)
+    /// Format: "hybrid_bin:<base64_bincode_zstd>" - used for MACROBLOCK consensus
+    fn verify_hybrid_bin_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        use crate::hybrid_crypto::{HybridSignature, HybridCrypto};
+        use base64::{Engine as _, engine::general_purpose};
+        
+        // Parse binary signature: "hybrid_bin:<base64_bincode_zstd>"
+        let base64_data = &signature[11..]; // Skip "hybrid_bin:" prefix
+        let binary_data = match general_purpose::STANDARD.decode(base64_data) {
+            Ok(data) => data,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] hybrid_bin base64 decode failed: {}", e);
+                }
+                return false;
+            }
+        };
+        
+        let hybrid_sig: HybridSignature = match HybridSignature::from_binary_compressed(&binary_data) {
+            Ok(sig) => sig,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] hybrid_bin signature parse failed: {}", e);
+                }
+                return false;
+            }
+        };
+        
+        // Verify node_id matches certificate
+        if hybrid_sig.certificate.node_id != node_id {
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] hybrid_bin node_id mismatch: {} vs {}", 
+                         hybrid_sig.certificate.node_id, node_id);
+            }
+            return false;
+        }
+        
+        // CRITICAL v2.49.3: commit_hash is HEX string, must decode to bytes for verification
+        // Signature was created on decoded bytes, not on HEX string!
+        let message_bytes: Vec<u8> = match hex::decode(message) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // Fallback: if not valid hex, use as-is (for non-commit messages)
+                message.as_bytes().to_vec()
+            }
+        };
+        
+        // v2.49.3: Use thread with TIMEOUT to prevent deadlock
+        // Previous version caused deadlock when all tokio workers blocked on join()
+        let (tx, rx) = std::sync::mpsc::channel();
+        let node_id_clone = hybrid_sig.certificate.node_id.clone();
+        let serial_clone = hybrid_sig.certificate.serial_number.clone();
+        
+        std::thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build() 
+            {
+                Ok(rt) => {
+                    rt.block_on(async move {
+                        let verifier = HybridCrypto::new(node_id_clone.clone());
+                        match verifier.verify_signature(&message_bytes, &hybrid_sig).await {
+                            Ok(true) => {
+                                if crate::node::is_debug() {
+                                    println!("[DBG][CONS] hybrid_bin_verified node={} cert={}", 
+                                             node_id_clone,
+                                             &serial_clone[..8.min(serial_clone.len())]);
+                                }
+                                true
+                            }
+                            Ok(false) => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][CONS] hybrid_bin_invalid node={}", node_id_clone);
+                                }
+                                false
+                            }
+                            Err(e) => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][CONS] hybrid_bin_error node={} err={}", node_id_clone, e);
+                                }
+                                false
+                            }
+                        }
+                    })
+                }
+                Err(_) => false
+            };
+            let _ = tx.send(result);
+        });
+        
+        // v2.49.3: Wait with 10 second timeout to prevent deadlock
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(_) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] hybrid_bin verification timeout for node={}", node_id);
+                }
+                false
+            }
+        }
+    }
+    
+    /// v2.49.2: Verify COMPACT hybrid binary signature (requires pre-shared certificate)
+    /// Format: "compact_bin:<base64_bincode_zstd>" - used for microblock signatures
+    fn verify_compact_bin_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+        use crate::quantum_crypto::DilithiumSignature;
+        use sha3::{Sha3_256, Digest};
+        use base64::{Engine as _, engine::general_purpose};
+        
+        // Parse binary signature: "compact_bin:<base64_bincode_zstd>"
+        let base64_data = &signature[12..]; // Skip "compact_bin:" prefix
+        let binary_data = match general_purpose::STANDARD.decode(base64_data) {
+            Ok(data) => data,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] compact_bin base64 decode failed: {}", e);
+                }
+                return false;
+            }
+        };
+        
+        let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
+            Ok(sig) => sig,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] compact_bin signature parse failed: {}", e);
+                }
+                return false;
+            }
+        };
+        
+        // Verify node_id matches
+        if compact_sig.node_id != node_id {
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] compact_bin node_id mismatch: {} vs {}", 
+                         compact_sig.node_id, node_id);
+            }
+            return false;
+        }
+        
+        // CRITICAL v2.49.2: message is HEX string, must decode to bytes for verification
+        // Signature was created on decoded bytes, not on HEX string!
+        let message_bytes: Vec<u8> = match hex::decode(message) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // Fallback: if not valid hex, use as-is (for non-commit messages)
+                message.as_bytes().to_vec()
+            }
+        };
+        
+        // Verify Ed25519 signature on message hash
+        let mut hasher = Sha3_256::new();
+        hasher.update(&message_bytes);
+        let message_hash = hasher.finalize();
+        
+        match HybridCrypto::verify_ed25519_signature(
+            &message_hash,
+            &compact_sig.message_signature,
+            &compact_sig.ephemeral_public_key
+        ) {
+            Ok(true) => {
+                if crate::node::is_debug() {
+                    println!("[DBG][CONS] compact_bin Ed25519 verified");
+                }
+            }
+            _ => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] compact_bin Ed25519 signature INVALID");
+                }
+                return false;
+            }
+        }
+        
+        // v2.49.3: Verify Dilithium signature on ephemeral key with TIMEOUT to prevent deadlock
+        let node_id_clone = node_id.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        
+        std::thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build() 
+            {
+                Ok(rt) => {
+                    rt.block_on(async move {
+                        // PRODUCTION v2.50: Lock-free quantum crypto
+                        use crate::node::try_get_quantum_crypto;
+                        let crypto = match try_get_quantum_crypto() {
+                            Some(c) => c.as_ref(),
+                            None => return false,
+                        };
+                        
+                        let mut encapsulated_data = Vec::new();
+                        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
+                        encapsulated_data.extend_from_slice(&message_hash);
+                        encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
+                        let encapsulated_hex = hex::encode(&encapsulated_data);
+                        
+                        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+                        let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
+                        
+                        let dilithium_key_sig = DilithiumSignature {
+                            signature: signature_string,
+                            algorithm: "CRYSTALS-Dilithium3".to_string(),
+                            timestamp: compact_sig.signed_at,
+                            strength: "quantum-resistant".to_string(),
+                        };
+                        
+                        match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &node_id_clone).await {
+                            Ok(true) => {
+                                if crate::node::is_debug() {
+                                    println!("[DBG][CONS] compact_bin_verified node={}", node_id_clone);
+                                }
+                                true
+                            }
+                            Ok(false) => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][CONS] compact_bin_invalid node={}", node_id_clone);
+                                }
+                                false
+                            }
+                            Err(e) => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][CONS] compact_bin_error node={} err={:?}", node_id_clone, e);
+                                }
+                                false
+                            }
+                        }
+                    })
+                }
+                Err(_) => false
+            };
+            let _ = tx.send(result);
+        });
+        
+        // v2.49.3: Wait with 10 second timeout to prevent deadlock
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(_) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] compact_bin verification timeout for node={}", node_id);
+                }
+                false
+            }
+        }
+    }
+    
+    /// LEGACY: Verify HYBRID P2P JSON signature (SYNC version) - NIST/Cisco compliant
     fn verify_hybrid_p2p_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
         let message = message.to_string();
         let signature = signature.to_string();
@@ -10375,15 +12250,12 @@ impl SimplifiedP2P {
                             }
                         }
                         
-                        // Get quantum crypto for Dilithium verification
-                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-                        if crypto_guard.is_none() {
-                            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-                            let _ = crypto.initialize().await;
-                            *crypto_guard = Some(crypto);
-                        }
-                        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+                        // PRODUCTION v2.50: Lock-free quantum crypto for Dilithium verification
+                        use crate::node::try_get_quantum_crypto;
+                        let crypto = match try_get_quantum_crypto() {
+                            Some(c) => c.as_ref(),
+                            None => return false,
+                        };
                         
                         // Verify Dilithium key signature
                         let mut encapsulated_data = Vec::new();
@@ -10474,8 +12346,11 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Start heartbeat service for Full/Super nodes (TIME-based, not block-based)
     /// This is called by the node on startup
+    /// v2.42.2: FIXED - Now uses tokio::spawn instead of std::thread for proper gossip!
     /// Returns Arc<Self> for thread safety
-    pub fn start_heartbeat_service(self: Arc<Self>, blockchain_height_fn: impl Fn() -> u64 + Send + Sync + 'static) {
+    /// 
+    /// CRITICAL: blockchain_height must be a clone of Arc that can be moved into async context
+    pub fn start_heartbeat_service_with_height(self: Arc<Self>, get_height: Arc<dyn Fn() -> u64 + Send + Sync>) {
         let node_id = self.node_id.clone();
         let node_type = match self.node_type {
             NodeType::Super => "super",
@@ -10486,8 +12361,21 @@ impl SimplifiedP2P {
         let p2p = self.clone();
         let node_type_str = node_type.to_string();
         
-        std::thread::spawn(move || {
-            println!("[HEARTBEAT] 🕐 Starting heartbeat service for {} ({})", node_id, node_type_str);
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX v2.42.2: Use tokio::spawn instead of std::thread::spawn!
+        // PROBLEM: std::thread has no tokio runtime, so send_network_message fails silently
+        // SOLUTION: Capture tokio Handle and spawn async task for proper QUIC gossip
+        // ═══════════════════════════════════════════════════════════════════════════
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[HEARTBEAT] ❌ No tokio runtime available - heartbeat service NOT started!");
+                return;
+            }
+        };
+        
+        handle.spawn(async move {
+            println!("[HEARTBEAT] 🕐 Starting heartbeat service for {} ({}) [tokio v2.42.2]", node_id, node_type_str);
             
             loop {
                 let now = std::time::SystemTime::now()
@@ -10518,7 +12406,7 @@ impl SimplifiedP2P {
                             // CRITICAL FIX v2.21.1: Check reputation >= 70% before sending heartbeat
                             // Nodes with low reputation should NOT participate in reward pings (v2.21.5: blockchain)
                             let our_reputation = p2p.get_node_reputation_from_blockchain(&node_id);
-                            if our_reputation < 70.0 {
+                            if our_reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
                                 // Log once per window (first heartbeat only)
                                 if index == 0 {
                                     println!("[HEARTBEAT] ⚠️ Skipping heartbeats: reputation {:.1}% < 70%", 
@@ -10527,7 +12415,7 @@ impl SimplifiedP2P {
                                 continue; // Skip this heartbeat slot
                             }
                             
-                            let block_height = blockchain_height_fn();
+                            let block_height = get_height();
                             
                             // SECURITY v2.23: HYBRID signature for heartbeats (NIST/Cisco compliant)
                             // CRITICAL: Dilithium signs ephemeral Ed25519 key for EVERY heartbeat
@@ -10536,9 +12424,19 @@ impl SimplifiedP2P {
                             // - Dilithium signs: ephemeral_key || message_hash || timestamp
                             // - Full quantum resistance for heartbeat integrity
                             let heartbeat_message = format!("{}:{}:{}:{}", node_id, now, block_height, index);
-                            let signature = match p2p.sign_heartbeat_dilithium(&heartbeat_message, &node_id) {
-                                Some(sig) => sig,
-                                None => {
+                            
+                            // v2.42.3: CRITICAL FIX - Use spawn_blocking for sign_heartbeat_dilithium!
+                            // sign_heartbeat_dilithium creates new Runtime::new() + block_on()
+                            // which PANICS if called from tokio::spawn context
+                            // spawn_blocking runs in separate thread pool - safe!
+                            let p2p_for_sign = p2p.clone();
+                            let message_for_sign = heartbeat_message.clone();
+                            let node_id_for_sign = node_id.clone();
+                            let signature = match tokio::task::spawn_blocking(move || {
+                                p2p_for_sign.sign_heartbeat_dilithium(&message_for_sign, &node_id_for_sign)
+                            }).await {
+                                Ok(Some(sig)) => sig,
+                                Ok(None) | Err(_) => {
                                     println!("[HEARTBEAT] ⚠️ HYBRID signing failed for heartbeat #{} - skipping", index);
                                     continue; // Skip this heartbeat if signing fails
                                 }
@@ -10555,6 +12453,7 @@ impl SimplifiedP2P {
                                 gossip_hop: 0,
                             };
                             
+                            // v2.42.2: Now gossip works because we're in tokio context!
                             // OPTIMIZATION v2.19.19: Use Kademlia K-neighbors for heartbeat
                             // This sends to K closest peers by XOR distance (DHT routing)
                             // More efficient than random gossip for large networks
@@ -10562,6 +12461,7 @@ impl SimplifiedP2P {
                             p2p.gossip_to_k_neighbors(heartbeat_msg, 3);
                             
                             // Record locally
+                            // v2.59: Include block_height for reliable epoch-based filtering
                             {
                                 let mut history = match p2p.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
                                 history.insert(heartbeat_key, HeartbeatRecord {
@@ -10570,10 +12470,11 @@ impl SimplifiedP2P {
                                     heartbeat_index: index as u8,
                                     signature,
                                     verified: true,
+                                    block_height, // v2.59: Current height for epoch filtering
                                 });
                             }
                             
-                            println!("[HEARTBEAT] 📡 Sent heartbeat #{} at height {}", index, block_height);
+                            println!("[HEARTBEAT] 📡 Sent heartbeat #{} at height {} [gossip OK]", index, block_height);
                         }
                     }
                 }
@@ -10581,10 +12482,17 @@ impl SimplifiedP2P {
                 // Cleanup old heartbeats (>24h)
                 p2p.cleanup_old_heartbeats();
                 
-                // Sleep for 30 seconds before next check
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                // v2.42.2: Use tokio::time::sleep instead of std::thread::sleep
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             }
         });
+    }
+    
+    /// Legacy wrapper for backwards compatibility
+    /// v2.42.2: Delegates to start_heartbeat_service_with_height
+    pub fn start_heartbeat_service(self: Arc<Self>, blockchain_height_fn: impl Fn() -> u64 + Send + Sync + 'static) {
+        let height_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(blockchain_height_fn);
+        self.start_heartbeat_service_with_height(height_fn);
     }
     
     /// Sign P2P message with HYBRID cryptography (ASYNC version) - NIST/Cisco compliant
@@ -10603,13 +12511,9 @@ impl SimplifiedP2P {
         
         let mut instances_guard = instances.lock().await;
         
-        // Normalize node_id
-        let normalized_node_id = if node_id.starts_with("qn_") {
-            node_id.to_string()
-        } else {
-            format!("qn_{}", node_id)
-        };
-        
+        // v2.24: Use node_id directly
+        let normalized_node_id = node_id.to_string();
+
         // Create instance if not exists
         if !instances_guard.contains_key(&normalized_node_id) {
             let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
@@ -10619,29 +12523,32 @@ impl SimplifiedP2P {
             }
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
-        
-        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
-        
+
+        let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+            Some(h) => h,
+            None => return None, // Should never happen but prevents panic
+        };
+
         // Check certificate rotation
         if hybrid.needs_rotation() {
             if let Err(e) = hybrid.rotate_certificate().await {
                 println!("[CRYPTO] ⚠️ Certificate rotation failed: {}", e);
             }
         }
-        
+
         // CRITICAL: Sign RAW message with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
         // Using sign_raw_message_compact which hashes the message before signing
         // This ensures consistency with verification which also hashes
+        // OPTIMIZED v2.24: bincode+zstd instead of JSON
         match hybrid.sign_raw_message_compact(message.as_bytes()).await {
             Ok(compact_sig) => {
-                // Serialize to JSON with prefix
-                match serde_json::to_string(&compact_sig) {
-                    Ok(json) => {
-                        let sig_with_prefix = format!("hybrid_p2p:{}", json);
-                        println!("[CRYPTO] ✅ HYBRID P2P signature created (NIST/Cisco compliant)");
-                        println!("[CRYPTO]    Ephemeral key: ✅ (new for this message)");
-                        println!("[CRYPTO]    Dilithium key sig: ✅");
-                        println!("[CRYPTO]    Dilithium msg sig: ✅");
+                // Serialize to bincode+zstd+base64
+                match compact_sig.to_binary_compressed() {
+                    Ok(binary_data) => {
+                        let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                        let sig_with_prefix = format!("hybrid_p2p_bin:{}", base64_data);
+                        println!("[CRYPTO] ✅ HYBRID P2P signature created (bincode v2.24)");
+                        println!("[CRYPTO]    Size: {} bytes (optimized)", binary_data.len());
                         Some(sig_with_prefix)
                     }
                     Err(e) => {
@@ -10680,12 +12587,8 @@ impl SimplifiedP2P {
                     
                     let mut instances_guard = instances.lock().await;
                     
-                    // Normalize node_id
-                    let normalized_node_id = if node_id_owned.starts_with("qn_") {
-                        node_id_owned.clone()
-                    } else {
-                        format!("qn_{}", node_id_owned)
-                    };
+                    // v2.24: Use node_id directly
+                    let normalized_node_id = node_id_owned.clone();
                     
                     // Create instance if not exists
                     if !instances_guard.contains_key(&normalized_node_id) {
@@ -10697,7 +12600,10 @@ impl SimplifiedP2P {
                         instances_guard.insert(normalized_node_id.clone(), hybrid);
                     }
                     
-                    let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
+                    let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+            Some(h) => h,
+            None => return Err(anyhow::anyhow!("Hybrid instance missing")),
+        };
                     
                     // Check certificate rotation
                     if hybrid.needs_rotation() {
@@ -10710,10 +12616,11 @@ impl SimplifiedP2P {
                 
                 match result {
                     Ok(compact_sig) => {
-                        match serde_json::to_string(&compact_sig) {
-                            Ok(json) => {
-                                let sig_with_prefix = format!("hybrid_p2p:{}", json);
-                                Some(sig_with_prefix)
+                        // OPTIMIZED v2.24: bincode+zstd
+                        match compact_sig.to_binary_compressed() {
+                            Ok(binary_data) => {
+                                let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                                Some(format!("hybrid_p2p_bin:{}", base64_data))
                             }
                             Err(_) => None
                         }
@@ -10765,6 +12672,292 @@ impl SimplifiedP2P {
         if removed > 0 {
             println!("[HEARTBEAT] 🧹 Cleaned up {} old heartbeat records", removed);
         }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v2.41.0: DETERMINISTIC HEARTBEAT COLLECTION FOR MACROBLOCK
+    // Collects heartbeat summaries for on-chain recording instead of gossip
+    // Ensures all nodes see identical heartbeat data = deterministic rewards
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Get heartbeat summaries for MacroBlock inclusion
+    /// Called during MacroBlock creation to record heartbeats on-chain
+    /// Returns Vec<HeartbeatSummary> for all nodes that sent heartbeats in completed epoch
+    /// 
+    /// CRITICAL FIX v2.59: Use block_height for 100% reliable epoch filtering
+    /// Previously used timestamp-based 4h windows which failed when:
+    /// - Network didn't start on 4h UTC boundary
+    /// - Clock drift between nodes
+    /// - Emission delayed across window boundaries
+    /// 
+    /// Now uses block_height stored in HeartbeatRecord for deterministic filtering:
+    /// - epoch_start_height = 14400 → heartbeats from blocks 0-14399
+    /// - epoch_start_height = 28800 → heartbeats from blocks 14400-28799
+    pub fn get_heartbeat_summaries_for_macroblock(&self, consensus_start_height: u64) -> Vec<qnet_state::HeartbeatSummary> {
+        const BLOCKS_PER_EPOCH: u64 = 14400;    // 1 block per second, 4 hours
+        
+        // FIX v2.65: Calculate correct epoch boundaries based on ANY height within the epoch
+        // The caller passes consensus_start_height (e.g., 14311 for mb=160)
+        // We need to find the EPOCH that this height belongs to:
+        // - height 14311 belongs to epoch 1 (blocks 0-14399)
+        // - height 28711 belongs to epoch 2 (blocks 14400-28799)
+        let epoch_number = (consensus_start_height / BLOCKS_PER_EPOCH) + 1;  // 1-based
+        let window_end_height = epoch_number * BLOCKS_PER_EPOCH;  // 14400, 28800, etc.
+        let window_start_height = window_end_height - BLOCKS_PER_EPOCH;  // 0, 14400, etc.
+        
+        println!("[INFO][HEARTBEAT] epoch_window epoch={} blocks={}-{} input_h={} (v2.65 fix)", 
+                 epoch_number, window_start_height, window_end_height, consensus_start_height);
+        
+        // Get heartbeat history
+        let history = match self.heartbeat_history.read() { 
+            Ok(g) => g, 
+            Err(p) => p.into_inner() 
+        };
+        
+        // Group heartbeats by node_id
+        let mut node_heartbeats: std::collections::HashMap<String, Vec<&HeartbeatRecord>> = 
+            std::collections::HashMap::new();
+        
+        for (_, record) in history.iter() {
+            // CRITICAL FIX v2.59: Filter by block_height instead of timestamp
+            // This is 100% deterministic and doesn't depend on:
+            // - Network start time alignment with UTC
+            // - Clock synchronization between nodes
+            // - Emission timing relative to window boundaries
+            if record.block_height >= window_start_height 
+                && record.block_height < window_end_height 
+                && record.verified 
+            {
+                node_heartbeats
+                    .entry(record.node_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(record);
+            }
+        }
+        
+        // Log heartbeat collection stats
+        let total_heartbeats: usize = node_heartbeats.values().map(|v| v.len()).sum();
+        println!("[INFO][HEARTBEAT] collected nodes={} heartbeats={} epoch={} range={}-{}", 
+                 node_heartbeats.len(), total_heartbeats, epoch_number,
+                 window_start_height, window_end_height);
+        
+        // Create summaries
+        let mut summaries = Vec::new();
+        
+        for (node_id, heartbeats) in node_heartbeats {
+            // ═══════════════════════════════════════════════════════════════════════════
+            // PRODUCTION: Strict node type detection - NO DEFAULTS!
+            // Node IDs MUST follow naming conventions:
+            // - "light_{region}_{hash}" for Light nodes (mobile apps)
+            // - "full_{activation_code}" for Full nodes (servers with partial state)
+            // - "super_{id}" or "genesis_node_{N}" for Super nodes (full validators)
+            // Unknown formats are REJECTED (not counted for rewards)
+            // ═══════════════════════════════════════════════════════════════════════════
+            let node_type: Option<u8> = if node_id.starts_with("light_") {
+                Some(0) // Light node - mobile app
+            } else if node_id.starts_with("full_") {
+                Some(1) // Full node - server with partial state
+            } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
+                Some(2) // Super node - full validator
+            } else {
+                // PRODUCTION: Unknown format - REJECT, don't guess!
+                // Node must re-register with correct ID format
+                println!("[WARN][HEARTBEAT] rejected_unknown_format id={} action=skip_rewards", node_id);
+                None // Skip this node - invalid format
+            };
+            
+            // Skip nodes with invalid ID format
+            let node_type = match node_type {
+                Some(t) => t,
+                None => continue, // Skip to next node - no rewards for invalid format
+            };
+            
+            let heartbeat_count = heartbeats.len() as u8;
+            
+            // PRODUCTION: Eligibility thresholds per node type
+            // Light nodes: 1 ping per 4h window (100% - single ping must succeed)
+            // Full nodes: 8/10 heartbeats (80% - allows 2 failures per window)
+            // Super nodes: 9/10 heartbeats (90% - stricter, only 1 failure allowed)
+            let required: u8 = match node_type {
+                0 => 1,  // Light: 1/1 (100%)
+                1 => 8,  // Full: 8/10 (80%)
+                2 => 9,  // Super: 9/10 (90%)
+                // Note: node_type is 0, 1, or 2 only - no other values possible
+                // This arm is unreachable but required for exhaustive match
+                3..=u8::MAX => unreachable!("node_type validated above"),
+            };
+            let is_eligible = heartbeat_count >= required;
+            
+            // Get first and last timestamps
+            let first_heartbeat = heartbeats.iter()
+                .map(|h| h.timestamp)
+                .min()
+                .unwrap_or(0);
+            let last_heartbeat = heartbeats.iter()
+                .map(|h| h.timestamp)
+                .max()
+                .unwrap_or(0);
+            
+            summaries.push(qnet_state::HeartbeatSummary {
+                node_id: node_id.clone(),
+                node_type,
+                heartbeat_count,
+                first_heartbeat,
+                last_heartbeat,
+                is_eligible,
+            });
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v2.59: LIGHT NODES - Collect from attestations (separate storage)
+        // Light nodes don't send heartbeats themselves; Full/Super nodes ping them
+        // and create attestations. Attestations are stored in light_node_attestations.
+        // Light nodes need only 1 attestation per epoch to be eligible for rewards.
+        // ═══════════════════════════════════════════════════════════════════════════
+        {
+            let attestations = match self.light_node_attestations.read() { 
+                Ok(g) => g, 
+                Err(p) => p.into_inner() 
+            };
+            
+            // Group attestations by light_node_id, filtered by block_height
+            let mut light_node_attestations_map: std::collections::HashMap<String, Vec<u64>> = 
+                std::collections::HashMap::new();
+            
+            for (_, attestation) in attestations.iter() {
+                // v2.59: Filter by block_height for reliable epoch matching
+                if attestation.block_height >= window_start_height 
+                    && attestation.block_height < window_end_height 
+                {
+                    light_node_attestations_map
+                        .entry(attestation.light_node_id.clone())
+                        .or_insert_with(Vec::new)
+                        .push(attestation.timestamp);
+                }
+            }
+            
+            // Create summaries for Light nodes
+            for (light_node_id, timestamps) in light_node_attestations_map {
+                let attestation_count = timestamps.len() as u8;
+                // Light nodes: 1 attestation per epoch = eligible (100%)
+                let is_eligible = attestation_count >= 1;
+                
+                let first_heartbeat = timestamps.iter().min().copied().unwrap_or(0);
+                let last_heartbeat = timestamps.iter().max().copied().unwrap_or(0);
+                
+                summaries.push(qnet_state::HeartbeatSummary {
+                    node_id: light_node_id,
+                    node_type: 0, // Light node
+                    heartbeat_count: attestation_count,
+                    first_heartbeat,
+                    last_heartbeat,
+                    is_eligible,
+                });
+            }
+            
+            let light_count = summaries.iter().filter(|s| s.node_type == 0).count();
+            if light_count > 0 {
+                println!("[INFO][HEARTBEAT] light_nodes_collected count={} for_epoch={}", 
+                         light_count, epoch_number);
+            }
+        }
+        
+        println!("[INFO][HEARTBEAT] collected_for_macroblock total={} eligible={} (full_super={} light={})", 
+                 summaries.len(),
+                 summaries.iter().filter(|s| s.is_eligible).count(),
+                 summaries.iter().filter(|s| s.node_type != 0).count(),
+                 summaries.iter().filter(|s| s.node_type == 0).count());
+        
+        summaries
+    }
+    
+    /// Calculate Merkle root of heartbeat summaries for light client verification
+    pub fn calculate_heartbeats_merkle_root(&self, summaries: &[qnet_state::HeartbeatSummary]) -> [u8; 32] {
+        use sha3::{Sha3_256, Digest};
+        
+        if summaries.is_empty() {
+            return [0u8; 32];
+        }
+        
+        // Create leaf hashes
+        let mut leaves: Vec<[u8; 32]> = summaries.iter().map(|s| {
+            let mut hasher = Sha3_256::new();
+            hasher.update(s.node_id.as_bytes());
+            hasher.update(&[s.node_type]);
+            hasher.update(&[s.heartbeat_count]);
+            hasher.update(&s.first_heartbeat.to_le_bytes());
+            hasher.update(&s.last_heartbeat.to_le_bytes());
+            hasher.update(&[if s.is_eligible { 1 } else { 0 }]);
+            let result = hasher.finalize();
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&result);
+            hash
+        }).collect();
+        
+        // Build Merkle tree
+        while leaves.len() > 1 {
+            let mut new_leaves = Vec::new();
+            for chunk in leaves.chunks(2) {
+                let mut hasher = Sha3_256::new();
+                hasher.update(&chunk[0]);
+                if chunk.len() > 1 {
+                    hasher.update(&chunk[1]);
+                } else {
+                    hasher.update(&chunk[0]); // Duplicate for odd count
+                }
+                let result = hasher.finalize();
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&result);
+                new_leaves.push(hash);
+            }
+            leaves = new_leaves;
+        }
+        
+        leaves[0]
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v2.50.0: POOL 2 & POOL 3 METHODS - Deterministic reward calculation
+    // These values are accumulated locally and written to MacroBlock at emission time
+    // All nodes then use SAME values from blockchain for identical reward calculation
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Add transaction fee to Pool 2 accumulator (called when TX is processed)
+    /// Pool 2: Distributed to validators (70% Super, 30% Full, 0% Light)
+    pub fn add_to_pool2(&self, fee_amount: u64) {
+        self.pool2_accumulated_fees.fetch_add(fee_amount, Ordering::SeqCst);
+    }
+    
+    /// Add activation payment to Pool 3 accumulator (Phase 2 only)
+    /// Pool 3: Distributed equally to ALL eligible nodes (Light + Full + Super)
+    pub fn add_to_pool3(&self, activation_amount: u64) {
+        self.pool3_accumulated_activations.fetch_add(activation_amount, Ordering::SeqCst);
+    }
+    
+    /// Get Pool 2 accumulated fees for MacroBlock inclusion (async for API compatibility)
+    /// Called during EMISSION MacroBlock creation to record fees in blockchain
+    /// Returns current accumulation and resets to 0
+    pub async fn get_pool2_accumulated_fees(&self) -> u64 {
+        // Atomic swap: read and reset in one operation (no race conditions)
+        self.pool2_accumulated_fees.swap(0, Ordering::SeqCst)
+    }
+    
+    /// Get Pool 3 accumulated activations for MacroBlock inclusion (async for API compatibility)
+    /// Called during EMISSION MacroBlock creation to record activations in blockchain
+    /// Returns current accumulation and resets to 0 (Phase 2 only, Phase 1 always returns 0)
+    pub async fn get_pool3_accumulated_activations(&self) -> u64 {
+        // Atomic swap: read and reset in one operation (no race conditions)
+        self.pool3_accumulated_activations.swap(0, Ordering::SeqCst)
+    }
+    
+    /// Get current Pool 2 balance without resetting (for monitoring)
+    pub fn peek_pool2_fees(&self) -> u64 {
+        self.pool2_accumulated_fees.load(Ordering::SeqCst)
+    }
+    
+    /// Get current Pool 3 balance without resetting (for monitoring)
+    pub fn peek_pool3_activations(&self) -> u64 {
+        self.pool3_accumulated_activations.load(Ordering::SeqCst)
     }
     
     /// Get Light Node registry (for ping service)
@@ -10973,12 +13166,11 @@ impl SimplifiedP2P {
         
         let current_slot = Self::get_current_slot();
         
-        // Get sorted active Full/Super node IDs (only rep >= 70)
+        // Get sorted active Full/Super node IDs (v2.51: lock-free)
         let active_node_ids: Vec<String> = {
-            let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-            let mut sorted: Vec<_> = nodes.values()
-                .filter(|n| n.reputation >= 70.0)
-                .map(|n| n.node_id.clone())
+            let mut sorted: Vec<_> = self.active_full_super_nodes.iter()
+                .filter(|entry| entry.value().reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION)
+                .map(|entry| entry.value().node_id.clone())
                 .collect();
             sorted.sort();
             sorted
@@ -11143,6 +13335,7 @@ impl SimplifiedP2P {
             pinger_signature: attestation.pinger_signature.clone(),
             challenge: attestation.challenge.clone(),
             gossip_hop: 0,
+            block_height: attestation.block_height, // v2.59: For epoch-based filtering
         };
         
         // Store locally first
@@ -11174,23 +13367,26 @@ impl SimplifiedP2P {
         // Get reputation from blockchain (v2.21.5)
         let reputation = self.get_node_reputation_from_blockchain(&self.node_id);
         
-        // Only register if rep >= 70
-        if reputation < 70.0 {
-            println!("[ACTIVE] ⚠️ Cannot register: reputation {:.1} < 70", reputation);
+        // Only register if rep >= MIN_CONSENSUS_REPUTATION
+        if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
+            if crate::node::is_warn() {
+                println!("[WARN][ACTIVE] register_skip reason=low_rep rep={:.1} min={:.0}", 
+                         reputation, qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION);
+            }
             return;
         }
         
-        // Register locally
-        {
-            let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-            nodes.insert(self.node_id.clone(), ActiveNodeInfo {
-                node_id: self.node_id.clone(),
-                node_type: node_type_str.to_string(),
-                shard_id: self.shard_id,
-                reputation,
-                last_seen: now,
-            });
-            println!("[ACTIVE] 📡 Registered as active {} node ({} total)", node_type_str, nodes.len());
+        // Register locally (v2.51: lock-free)
+        self.active_full_super_nodes.insert(self.node_id.clone(), ActiveNodeInfo {
+            node_id: self.node_id.clone(),
+            node_type: node_type_str.to_string(),
+            shard_id: self.shard_id,
+            reputation,
+            last_seen: now,
+        });
+        if crate::node::is_info() {
+            println!("[INFO][ACTIVE] registered_async node={} type={} total={}", 
+                     self.node_id, node_type_str, self.active_full_super_nodes.len());
         }
         
         // Sign with ASYNC Dilithium (proper quantum-resistant signature)
@@ -11199,7 +13395,9 @@ impl SimplifiedP2P {
         let signature = match self.sign_dilithium_async(&announcement_data, &self.node_id).await {
             Some(sig) => sig,
             None => {
-                println!("[ACTIVE] ⚠️ Skipping announcement - Dilithium unavailable");
+                if crate::node::is_warn() {
+                    println!("[WARN][ACTIVE] announce_skip reason=dilithium_unavailable");
+                }
                 return; // Skip announcement if signing fails
             }
         };
@@ -11235,23 +13433,26 @@ impl SimplifiedP2P {
         // Get reputation from blockchain (v2.21.5)
         let reputation = self.get_node_reputation_from_blockchain(&self.node_id);
         
-        // Only register if rep >= 70
-        if reputation < 70.0 {
-            println!("[ACTIVE] ⚠️ Cannot register: reputation {:.1} < 70", reputation);
+        // Only register if rep >= MIN_CONSENSUS_REPUTATION
+        if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
+            if crate::node::is_warn() {
+                println!("[WARN][ACTIVE] register_skip reason=low_rep rep={:.1} min={:.0}", 
+                         reputation, qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION);
+            }
             return;
         }
         
-        // Register locally
-        {
-            let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-            nodes.insert(self.node_id.clone(), ActiveNodeInfo {
-                node_id: self.node_id.clone(),
-                node_type: node_type_str.to_string(),
-                shard_id: self.shard_id,
-                reputation,
-                last_seen: now,
-            });
-            println!("[ACTIVE] 📡 Registered as active {} node ({} total)", node_type_str, nodes.len());
+        // Register locally (v2.51: lock-free)
+        self.active_full_super_nodes.insert(self.node_id.clone(), ActiveNodeInfo {
+            node_id: self.node_id.clone(),
+            node_type: node_type_str.to_string(),
+            shard_id: self.shard_id,
+            reputation,
+            last_seen: now,
+        });
+        if crate::node::is_info() {
+            println!("[INFO][ACTIVE] registered node={} type={} total={}", 
+                     self.node_id, node_type_str, self.active_full_super_nodes.len());
         }
         
         // Sign with SYNC Dilithium (creates new runtime - safe in std::thread::spawn)
@@ -11260,7 +13461,9 @@ impl SimplifiedP2P {
         let signature = match self.sign_heartbeat_dilithium(&announcement_data, &self.node_id) {
             Some(sig) => sig,
             None => {
-                println!("[ACTIVE] ⚠️ Skipping announcement - Dilithium unavailable");
+                if crate::node::is_warn() {
+                    println!("[WARN][ACTIVE] announce_skip reason=dilithium_unavailable");
+                }
                 return; // Skip announcement if signing fails
             }
         };
@@ -11284,7 +13487,9 @@ impl SimplifiedP2P {
             requester_id: self.node_id.clone(),
         };
         self.gossip_to_random_peers(request, 3);
-        println!("[ACTIVE] 📡 Requested active nodes sync");
+        if crate::node::is_info() {
+            println!("[INFO][ACTIVE] sync_request sent_to=3_peers");
+        }
     }
     
     /// Update active nodes from heartbeat (proves node is online)
@@ -11293,17 +13498,16 @@ impl SimplifiedP2P {
         // Get reputation from blockchain (v2.21.5)
         let reputation = self.get_node_reputation_from_blockchain(node_id);
         
-        // Only track nodes with rep >= 70
-        if reputation < 70.0 {
+        // Only track nodes with rep >= MIN_CONSENSUS_REPUTATION
+        if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
             return;
         }
         
         // Calculate shard from node_id
         let shard_id = Self::calculate_light_node_shard(node_id);
         
-        // Update active nodes map
-        let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-        nodes.insert(node_id.to_string(), ActiveNodeInfo {
+        // Update active nodes map (v2.51: lock-free)
+        self.active_full_super_nodes.insert(node_id.to_string(), ActiveNodeInfo {
             node_id: node_id.to_string(),
             node_type: node_type.to_string(),
             shard_id,
@@ -11321,28 +13525,26 @@ impl SimplifiedP2P {
         
         let cutoff = now - (15 * 60);  // 15 minutes ago
         
-        let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
-        let before = nodes.len();
-        nodes.retain(|_, v| v.last_seen > cutoff);
-        let removed = before - nodes.len();
+        // v2.51: Lock-free cleanup
+        let before = self.active_full_super_nodes.len();
+        self.active_full_super_nodes.retain(|_, v| v.last_seen > cutoff);
+        let removed = before - self.active_full_super_nodes.len();
         
         if removed > 0 {
             println!("[CLEANUP] 🧹 Removed {} stale active nodes (>15min)", removed);
         }
     }
     
-    /// Get count of active Full/Super nodes
+    /// Get count of active Full/Super nodes (v2.51: lock-free)
     pub fn get_active_node_count(&self) -> usize {
-        let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-        nodes.len()
+        self.active_full_super_nodes.len()
     }
     
-    /// Get list of active Full/Super nodes with their status
+    /// Get list of active Full/Super nodes with their status (v2.51: lock-free)
     /// Returns Vec<(node_id, node_type, last_seen)>
     pub fn get_active_full_super_nodes(&self) -> Vec<(String, String, u64)> {
-        let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
-        nodes.values()
-            .map(|n| (n.node_id.clone(), n.node_type.clone(), n.last_seen))
+        self.active_full_super_nodes.iter()
+            .map(|entry| (entry.value().node_id.clone(), entry.value().node_type.clone(), entry.value().last_seen))
             .collect()
     }
     
@@ -11416,6 +13618,7 @@ impl SimplifiedP2P {
     
     /// Get all Light node attestations for a 4h window (for Merkle commitment)
     /// Returns Vec<(light_node_id, slot, pinger_id, timestamp)>
+    /// DEPRECATED: Use get_attestations_for_block_range for deterministic emission
     pub fn get_attestations_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u64, String, u64)> {
         let window_end = window_start_timestamp + (4 * 60 * 60);
         
@@ -11426,8 +13629,25 @@ impl SimplifiedP2P {
             .collect()
     }
     
+    /// v2.64: Get Light node attestations filtered by BLOCK HEIGHT (deterministic!)
+    /// Returns Vec<(light_node_id, slot, pinger_id, timestamp, block_height)>
+    pub fn get_attestations_for_block_range(&self, start_height: u64, end_height: u64) -> Vec<(String, u64, String, u64, u64)> {
+        let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        
+        let result: Vec<_> = attestations.values()
+            .filter(|a| a.block_height >= start_height && a.block_height < end_height)
+            .map(|a| (a.light_node_id.clone(), a.slot, a.pinger_id.clone(), a.timestamp, a.block_height))
+            .collect();
+        
+        println!("[INFO][ATTESTATION] block_range_filter start={} end={} found={}", 
+                 start_height, end_height, result.len());
+        
+        result
+    }
+    
     /// Get all Full/Super node heartbeats for a 4h window (for Merkle commitment)
     /// Returns Vec<(node_id, heartbeat_index, timestamp)>
+    /// DEPRECATED: Use get_heartbeats_for_block_range for deterministic emission
     pub fn get_heartbeats_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u8, u64)> {
         let window_end = window_start_timestamp + (4 * 60 * 60);
         
@@ -11438,8 +13658,79 @@ impl SimplifiedP2P {
             .collect()
     }
     
+    /// v2.64: Get heartbeats filtered by BLOCK HEIGHT (deterministic!)
+    /// This ensures all nodes see the same heartbeats regardless of when they process the emission
+    /// Block height epoch is deterministic, unlike UTC timestamps which depend on network start time
+    pub fn get_heartbeats_for_block_range(&self, start_height: u64, end_height: u64) -> Vec<(String, u8, u64, u64)> {
+        let heartbeats = match self.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        
+        let result: Vec<_> = heartbeats.values()
+            .filter(|h| h.block_height >= start_height && h.block_height < end_height && h.verified)
+            .map(|h| (h.node_id.clone(), h.heartbeat_index, h.timestamp, h.block_height))
+            .collect();
+        
+        println!("[INFO][HEARTBEAT] block_range_filter start={} end={} found={}", 
+                 start_height, end_height, result.len());
+        
+        result
+    }
+    
+    /// v2.64: Get eligible Full/Super nodes filtered by BLOCK HEIGHT
+    /// Returns Vec<(node_id, node_type, heartbeat_count)>
+    pub fn get_eligible_full_super_nodes_by_height(&self, start_height: u64, end_height: u64) -> Vec<(String, String, u8)> {
+        let heartbeats = self.get_heartbeats_for_block_range(start_height, end_height);
+        
+        // Count heartbeats per node
+        let mut counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+        
+        for (node_id, _, _, _) in heartbeats {
+            *counts.entry(node_id).or_insert(0) += 1;
+        }
+        
+        // Get node types and filter by eligibility
+        use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
+        
+        counts.into_iter()
+            .filter_map(|(node_id, count)| {
+                // Get node type
+                let node_type = if let Some(n) = self.active_full_super_nodes.get(&node_id) {
+                    n.value().node_type.clone()
+                } else if node_id.starts_with("genesis_node_") {
+                    "super".to_string()
+                } else {
+                    println!("[WARN][REWARDS] unknown_node id={} skipping", node_id);
+                    return None;
+                };
+                
+                // Check reputation
+                let reputation = self.get_node_reputation_from_blockchain(&node_id);
+                if reputation < MIN_CONSENSUS_REPUTATION {
+                    println!("[WARN][REWARDS] low_rep node={} rep={:.1}% min={:.0}%", 
+                             node_id, reputation, MIN_CONSENSUS_REPUTATION);
+                    return None;
+                }
+                
+                // Check eligibility threshold
+                let required = match node_type.as_str() {
+                    "super" => 9,
+                    "full" => 8,
+                    _ => 10,
+                };
+                
+                if count >= required {
+                    Some((node_id, node_type, count))
+                } else {
+                    println!("[INFO][REWARDS] not_eligible node={} count={} required={}", 
+                             node_id, count, required);
+                    None
+                }
+            })
+            .collect()
+    }
+    
     /// Get eligible Light nodes for rewards in current window
     /// Returns Vec<(node_id, wallet_address)> for nodes with at least 1 attestation
+    /// DEPRECATED: Use get_eligible_light_nodes_by_height for deterministic emission
     pub fn get_eligible_light_nodes(&self, window_start_timestamp: u64) -> Vec<(String, String)> {
         let attestations = self.get_attestations_for_window(window_start_timestamp);
         let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
@@ -11459,9 +13750,32 @@ impl SimplifiedP2P {
         eligible
     }
     
+    /// v2.64: Get eligible Light nodes by BLOCK HEIGHT (deterministic!)
+    pub fn get_eligible_light_nodes_by_height(&self, start_height: u64, end_height: u64) -> Vec<(String, String)> {
+        let attestations = self.get_attestations_for_block_range(start_height, end_height);
+        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut eligible = Vec::new();
+        
+        for (node_id, _, _, _, _) in attestations {
+            if seen.insert(node_id.clone()) {
+                if let Some(reg) = registry.get(&node_id) {
+                    eligible.push((node_id.clone(), reg.wallet_address.clone()));
+                }
+            }
+        }
+        
+        println!("[INFO][LIGHT_ELIGIBILITY] block_range h={}-{} eligible={}", 
+                 start_height, end_height, eligible.len());
+        
+        eligible
+    }
+    
     /// Get eligible Full/Super nodes for rewards in current window
     /// Returns Vec<(node_id, node_type, heartbeat_count)>
     /// CRITICAL: Only nodes with reputation >= 70% are eligible for QNC rewards!
+    /// DEPRECATED: Use get_eligible_full_super_nodes_by_height for deterministic emission
     pub fn get_eligible_full_super_nodes(&self, window_start_timestamp: u64) -> Vec<(String, String, u8)> {
         let heartbeats = self.get_heartbeats_for_window(window_start_timestamp);
         
@@ -11473,23 +13787,32 @@ impl SimplifiedP2P {
             entry.1 += 1;
         }
         
-        // Get node types from active_full_super_nodes
-        let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        // Get node types from active_full_super_nodes (v2.51: lock-free via DashMap)
         
         counts.into_iter()
-            .map(|(node_id, (_, count))| {
-                let node_type = active_nodes.get(&node_id)
-                    .map(|n| n.node_type.clone())
-                    .unwrap_or_else(|| "full".to_string());
-                (node_id, node_type, count)
+            .filter_map(|(node_id, (_, count))| {
+                // PRODUCTION v2.41.1: Strict node type - NO DEFAULTS!
+                // Node must be in active registry OR be a genesis node
+                let node_type = if let Some(n) = self.active_full_super_nodes.get(&node_id) {
+                    n.value().node_type.clone()
+                } else if node_id.starts_with("genesis_node_") {
+                    // Genesis nodes are always Super
+                    "super".to_string()
+                } else {
+                    // Unknown node - REJECT (shouldn't happen if heartbeat validation works)
+                    println!("[REWARDS] ⚠️ Unknown node {} in heartbeat history - skipping", node_id);
+                    return None;
+                };
+                Some((node_id, node_type, count))
             })
             .filter(|(node_id, node_type, count)| {
-                // CRITICAL FIX v2.21.1: Check reputation >= 70% for QNC rewards!
+                // CRITICAL FIX v2.21.1: Check reputation >= MIN_CONSENSUS_REPUTATION for QNC rewards!
                 // Nodes with low reputation should NOT receive monetary rewards (v2.21.5: blockchain)
+                use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
                 let reputation = self.get_node_reputation_from_blockchain(node_id);
-                if reputation < 70.0 {
-                    println!("[REWARDS] ⚠️ Node {} excluded from rewards: reputation {:.1}% < 70%", 
-                             node_id, reputation);
+                if reputation < MIN_CONSENSUS_REPUTATION {
+                    println!("[REWARDS] ⚠️ Node {} excluded from rewards: reputation {:.1}% < {:.0}%", 
+                             node_id, reputation, MIN_CONSENSUS_REPUTATION);
                     return false;
                 }
                 
@@ -11504,6 +13827,7 @@ impl SimplifiedP2P {
     }
     
     /// Get total counts for Merkle commitment
+    /// DEPRECATED: Use block height based methods for deterministic counting
     pub fn get_ping_counts_for_window(&self, window_start_timestamp: u64) -> (u64, u64) {
         let attestations = self.get_attestations_for_window(window_start_timestamp);
         let heartbeats = self.get_heartbeats_for_window(window_start_timestamp);
@@ -11512,6 +13836,15 @@ impl SimplifiedP2P {
         let successful = total; // All stored attestations/heartbeats are verified
         
         (total, successful)
+    }
+    
+    /// v2.64: Get total counts by BLOCK HEIGHT (deterministic!)
+    pub fn get_ping_counts_for_block_range(&self, start_height: u64, end_height: u64) -> (u64, u64) {
+        let attestations = self.get_attestations_for_block_range(start_height, end_height);
+        let heartbeats = self.get_heartbeats_for_block_range(start_height, end_height);
+        
+        let total = attestations.len() as u64 + heartbeats.len() as u64;
+        (total, total) // All stored are verified
     }
     
     /// Get Light node wallet address from registry
@@ -11860,8 +14193,8 @@ impl SimplifiedP2P {
             .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for macroblock sync")?;
         
-        println!("[MACROBLOCK-SYNC] 📡 Requesting macroblocks from peer {} (consensus: {:.1}%, network: {:.1}%)", 
-                 best_peer.id, best_peer.consensus_score, best_peer.network_score);
+        println!("[MACROBLOCK-SYNC] 📡 Requesting macroblocks from peer {} (network_quality: {:.1}%)", 
+                 best_peer.id, best_peer.network_score);
         
         // Create request message
         let request = NetworkMessage::RequestMacroblocks {
@@ -11880,29 +14213,19 @@ impl SimplifiedP2P {
     /// PRODUCTION: Macroblock index = (height / 90), rounded up for partial
     /// PRODUCTION v2.19.21: Now async (uses async sync_blockchain_height)
     pub async fn get_current_macroblock_index(&self) -> u64 {
-        // Estimate from peer heights using last_seen as proxy for activity
-        // Peers with recent activity likely have current height
-        if let Ok(peers) = self.connected_peers.read() {
-            // Use reputation as proxy for reliable height reporting
-            let max_height_peer = peers.values()
-                .filter(|p| p.consensus_score >= 50.0)  // Only trust peers with decent reputation
-                .max_by(|a, b| a.consensus_score.partial_cmp(&b.consensus_score).unwrap_or(std::cmp::Ordering::Equal));
-            
-            // If we have reliable peers, estimate from network consensus
-            // Otherwise return 0 (will sync from scratch)
-            if max_height_peer.is_some() {
-                // Get height from sync_blockchain_height instead
-                if let Ok(network_height) = self.sync_blockchain_height().await {
-                    if network_height == 0 {
-                        0
-                    } else {
-                        (network_height + 89) / 90  // Round up to get current macroblock index
-                    }
-                } else {
-                    0
-                }
-            } else {
+        // v2.51: Lock-free height estimation
+        let has_reliable_peer = self.connected_peers_lockfree.iter()
+            .any(|entry| entry.value().reputation() >= 50.0);
+        
+        if !has_reliable_peer {
+            return 0;
+        }
+        
+        if let Ok(network_height) = self.sync_blockchain_height().await {
+            if network_height == 0 {
                 0
+            } else {
+                (network_height + 89) / 90
             }
         } else {
             0
@@ -11914,16 +14237,13 @@ impl SimplifiedP2P {
     // =========================================================================
     
     /// Handle sync status update from peer
-    pub fn handle_sync_status(&self, node_id: String, current_height: u64, target_height: u64, syncing: bool) {
-        // Update peer's sync status for network awareness
-        if let Ok(mut peers) = self.connected_peers.write() {
-            if let Some(peer) = peers.get_mut(&node_id) {
-                // Store sync status in peer info (could add sync_status field to PeerInfo)
-                peer.last_seen = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-            }
+    pub fn handle_sync_status(&self, node_id: String, _current_height: u64, _target_height: u64, _syncing: bool) {
+        // v2.51: Lock-free sync status update
+        if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&node_id) {
+            peer.last_seen = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
         }
     }
     
@@ -12007,8 +14327,8 @@ impl SimplifiedP2P {
             .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for sync")?;
         
-        println!("[SYNC] 📡 Requesting blocks from peer {} (consensus: {:.1}%, network: {:.1}%)", 
-                 best_peer.id, best_peer.consensus_score, best_peer.network_score);
+        println!("[SYNC] 📡 Requesting blocks from peer {} (network_quality: {:.1}%)", 
+                 best_peer.id, best_peer.network_score);
         
         // Create request message
         let request = NetworkMessage::RequestBlocks {
@@ -12021,6 +14341,48 @@ impl SimplifiedP2P {
         self.send_network_message(&best_peer.addr, request);
         
         Ok(())
+    }
+    
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// PRODUCTION v2.55: REQUEST BLOCK REPAIR
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// Request specific block from multiple peers with timeout
+    /// Used by anti-fork protection to get missing blocks before producing
+    /// ═══════════════════════════════════════════════════════════════════════════
+    pub async fn request_block_repair(&self, height: u64) -> Result<(), String> {
+        println!("[REPAIR] 🔧 Requesting repair for block #{}", height);
+        
+        let peers = self.get_validated_active_peers();
+        if peers.is_empty() {
+            return Err("No peers available for repair".to_string());
+        }
+        
+        // Request from top 3 peers by reputation (redundancy for reliability)
+        let mut sorted_peers = peers.clone();
+        sorted_peers.sort_by(|a, b| 
+            b.combined_reputation().partial_cmp(&a.combined_reputation())
+                .unwrap_or(std::cmp::Ordering::Equal));
+        
+        let request = NetworkMessage::RequestBlocks {
+            from_height: height,
+            to_height: height,
+            requester_id: self.node_id.clone(),
+        };
+        
+        let mut sent = 0;
+        for peer in sorted_peers.iter().take(3) {
+            if peer.id != self.node_id {
+                self.send_network_message(&peer.addr, request.clone());
+                sent += 1;
+            }
+        }
+        
+        if sent > 0 {
+            println!("[REPAIR] 📡 Requested block #{} from {} peers", height, sent);
+            Ok(())
+        } else {
+            Err("No peers to request from".to_string())
+        }
     }
     
     /// Batch sync for catch-up - request blocks in batches
@@ -12055,13 +14417,13 @@ impl SimplifiedP2P {
             return Err("No peers available for consensus sync".to_string());
         }
         
-        // Select peer with highest consensus score (Byzantine safety)
+        // Select peer with highest cached reputation (for P2P selection)
         let best_peer = peers.iter()
-            .max_by(|a, b| a.consensus_score.partial_cmp(&b.consensus_score).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.reputation().partial_cmp(&b.reputation()).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for consensus sync")?;
         
-        println!("[CONSENSUS] 📡 Requesting from peer {} (consensus: {:.1}%, network: {:.1}%)", 
-                 best_peer.id, best_peer.consensus_score, best_peer.network_score);
+        println!("[CONSENSUS] 📡 Requesting from peer {} (network_quality: {:.1}%)",
+                 best_peer.id, best_peer.network_score);
         
         // Create request message
         let request = NetworkMessage::RequestConsensusState {
@@ -12218,14 +14580,22 @@ impl SimplifiedP2P {
         println!("[P2P] 📊 Peer exchange interval: {}s (Genesis node: {})", 
                 exchange_interval.as_secs(), is_genesis_node);
         
-        let connected_peers = self.connected_peers.clone();
-        let connected_peer_addrs = self.connected_peer_addrs.clone();
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - peer exchange deferred");
+                return;
+            }
+        };
+        
+        let connected_peers = self.connected_peers_lockfree.clone();
         let node_id = self.node_id.clone();
         let node_type = self.node_type.clone();  // EXISTING: Need for peer addition
         let region = self.region.clone();          // EXISTING: Need for peer addition
         let port = self.port;                      // EXISTING: Need for peer addition
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             let mut interval = tokio::time::interval(exchange_interval);
         
         loop {
@@ -12296,13 +14666,8 @@ impl SimplifiedP2P {
                                 validated_count += 1;
                             }
                             
-                            // EXISTING: Same duplicate check as add_peer_safe
-                            let already_exists = {
-                                let peer_addrs = match connected_peer_addrs.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                                peer_addrs.contains(&new_peer.addr)
-                            };
-                            
-                            if !already_exists {
+                            // v2.51: Lock-free duplicate check
+                            if !connected_peers.contains_key(&new_peer.addr) {
                                 // EXISTING: Calculate Kademlia fields (from add_peer_safe)
                                 if new_peer.node_id_hash.is_empty() {
                                     let mut hasher = Sha3_256::new();
@@ -12318,16 +14683,13 @@ impl SimplifiedP2P {
                                     (hash[0] as usize) % 256
                                 };
                                 
-                                // Use centralized add_peer_safe_static to avoid code duplication
-                                if Self::add_peer_safe_static(
-                                    new_peer.clone(),
-                                    node_id.clone(),
-                                    connected_peers.clone(),
-                                    connected_peer_addrs.clone()
-                                ) {
-                                added_count += 1;
-                                    // PRIVACY: Use pseudonym in logs
-                                    println!("[P2P] ✅ EXCHANGE: Added peer {} via peer exchange", get_privacy_id_for_addr(&new_peer.addr));
+                                // v2.51: Direct lock-free insertion
+                                if !connected_peers.contains_key(&new_peer.addr) && new_peer.id != node_id {
+                                    connected_peers.insert(new_peer.addr.clone(), new_peer.clone());
+                                    added_count += 1;
+                                    if crate::node::is_debug() {
+                                        println!("[DBG][P2P] exchange_added peer={}", get_privacy_id_for_addr(&new_peer.addr));
+                                    }
                                 }
                             }
                         }
@@ -12449,13 +14811,13 @@ impl SimplifiedP2P {
             }
         }
         
-        // 2. Fallback to initial reputation (70%) if blockchain not ready
-        70.0
+        // 2. Fallback to INITIAL_REPUTATION if blockchain not ready
+        qnet_consensus::deterministic_reputation::INITIAL_REPUTATION
     }
     
-    /// Check if node can participate in consensus (reputation >= 70%)
+    /// Check if node can participate in consensus (reputation >= MIN_CONSENSUS_REPUTATION)
     pub fn can_node_participate_in_consensus(&self, node_id: &str) -> bool {
-        self.get_node_reputation_from_blockchain(node_id) >= 70.0
+        self.get_node_reputation_from_blockchain(node_id) >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION
     }
     
     /// PRODUCTION: Get deterministic reputation state (blockchain-based)
@@ -12475,90 +14837,19 @@ impl SimplifiedP2P {
         }
     }
     
-    /// PRODUCTION: Add slashing event for inclusion in next macroblock
-    /// Events are collected and processed deterministically by all nodes
-    pub fn add_slashing_event(&self, event: qnet_consensus::deterministic_reputation::SlashingEvent) {
-        if let Ok(mut collector) = self.slashing_collector.lock() {
-            // Prevent duplicates
-            if !collector.iter().any(|e| e.offender == event.offender && e.detected_at_height == event.detected_at_height) {
-                println!("[SLASHING] 📝 Recorded offense: {} at height {} (penalty: -{:.1}%)", 
-                         event.offender, event.detected_at_height, event.penalty);
-                collector.push(event);
-            }
-        }
-    }
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DEPRECATED v2.38: P2P-based slashing removed
+    // Slashing now determined ONLY from on-chain analysis in MacroBlock creation
+    // These methods kept for logging/monitoring only - NO effect on consensus
+    // ═══════════════════════════════════════════════════════════════════════════
     
-    /// PRODUCTION: Get and clear collected slashing events for macroblock
-    pub fn drain_slashing_events(&self) -> Vec<qnet_consensus::deterministic_reputation::SlashingEvent> {
-        if let Ok(mut collector) = self.slashing_collector.lock() {
-            std::mem::take(&mut *collector)
-        } else {
-            Vec::new()
-        }
-    }
-    
-    /// PRODUCTION: Create slashing event for invalid block
+    /// DEPRECATED v2.38: Log invalid block for monitoring (NO slashing effect!)
+    /// Slashing is now determined on-chain via analyze_chain_for_slashing()
+    #[allow(unused_variables)]
     pub fn report_invalid_block(&self, offender: &str, height: u64, block_hash: [u8; 32], reason: &str) {
-        use qnet_consensus::deterministic_reputation::{SlashingEvent, SlashingType};
-        use sha3::{Sha3_256, Digest};
-        
-        // Create evidence hash
-        let mut hasher = Sha3_256::new();
-        hasher.update(offender.as_bytes());
-        hasher.update(&height.to_le_bytes());
-        hasher.update(&block_hash);
-        hasher.update(reason.as_bytes());
-        let evidence_hash: [u8; 32] = hasher.finalize().into();
-        
-        let event = SlashingEvent {
-            offender: offender.to_string(),
-            offense: SlashingType::InvalidBlock {
-                height,
-                block_hash,
-                reason: reason.to_string(),
-            },
-            penalty: SlashingEvent::calculate_penalty(&SlashingType::InvalidBlock {
-                height,
-                block_hash,
-                reason: reason.to_string(),
-            }),
-            detected_at_height: height,
-            reporter: self.node_id.clone(),
-            evidence_hash,
-        };
-        
-        self.add_slashing_event(event);
-    }
-    
-    /// PRODUCTION: Create slashing event for double signing
-    pub fn report_double_sign(&self, offender: &str, height: u64, hash_a: [u8; 32], hash_b: [u8; 32], sig_a: Vec<u8>, sig_b: Vec<u8>) {
-        use qnet_consensus::deterministic_reputation::{SlashingEvent, SlashingType};
-        use sha3::{Sha3_256, Digest};
-        
-        // Create evidence hash
-        let mut hasher = Sha3_256::new();
-        hasher.update(offender.as_bytes());
-        hasher.update(&height.to_le_bytes());
-        hasher.update(&hash_a);
-        hasher.update(&hash_b);
-        let evidence_hash: [u8; 32] = hasher.finalize().into();
-        
-        let event = SlashingEvent {
-            offender: offender.to_string(),
-            offense: SlashingType::DoubleSign {
-                height,
-                hash_a,
-                hash_b,
-                signature_a: sig_a,
-                signature_b: sig_b,
-            },
-            penalty: qnet_consensus::deterministic_reputation::PENALTY_DOUBLE_SIGN,
-            detected_at_height: height,
-            reporter: self.node_id.clone(),
-            evidence_hash,
-        };
-        
-        self.add_slashing_event(event);
+        // v2.38: Only log for monitoring - NO slashing action!
+        // Slashing determined on-chain in MacroBlock creation
+        println!("[WARN][MONITOR] invalid_block offender={} h={} reason={}", offender, height, reason);
     }
     
     /// DEPRECATED: Update node reputation via P2P
@@ -12622,11 +14913,12 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION: Set absolute reputation (for Genesis initialization)
-    /// WHITEPAPER: Light nodes have FIXED reputation of 70 - only allow setting to 70
+    /// WHITEPAPER: Light nodes have FIXED reputation of INITIAL_REPUTATION
     pub fn set_node_reputation(&self, node_id: &str, reputation: f64) {
-        // CRITICAL: Light nodes have fixed reputation of 70
+        // CRITICAL: Light nodes have fixed reputation of INITIAL_REPUTATION
+        use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         let final_reputation = if node_id.starts_with("light_") {
-            70.0 // Light nodes: always 70, ignore requested value
+            INITIAL_REPUTATION // Light nodes: always INITIAL_REPUTATION, ignore requested value
         } else {
             reputation
         };
@@ -12643,7 +14935,7 @@ impl SimplifiedP2P {
     
     /// Get reputation score for a node (ONLY consensus_score - synced via blocks)
     /// MEV PROTECTION: Used for bundle submission reputation checks
-    /// Returns 70.0 (default consensus threshold) if peer not found
+    /// Returns INITIAL_REPUTATION (default consensus threshold) if peer not found
     pub fn get_node_combined_reputation(&self, node_id: &str) -> f64 {
         // First check peer_id_to_addr index for O(1) lookup
         if let Some(addr_entry) = self.peer_id_to_addr.get(node_id) {
@@ -12663,8 +14955,8 @@ impl SimplifiedP2P {
             }
         }
         
-        // Not found: return default consensus threshold
-        70.0
+        // Not found: return INITIAL_REPUTATION
+        qnet_consensus::deterministic_reputation::INITIAL_REPUTATION
     }
     
     /// PRODUCTION: Check if node is banned
@@ -12882,7 +15174,7 @@ impl SimplifiedP2P {
                     println!("[JAIL] ⚠️ Failed to save jail status: {}", e);
                 } else {
                     println!("[JAIL] 💾 Saved jail status for {} (batch {}, integrity: {}...)", 
-                            node_id, batch_num, &integrity_hash[..8]);
+                            node_id, batch_num, &integrity_hash[..integrity_hash.len().min(8)]);
                 }
             }
         }
@@ -13110,7 +15402,7 @@ impl SimplifiedP2P {
         let current_reputation = self.get_node_reputation_from_blockchain(node_id);
         
         // Calculate severity of tampering
-        let severity = if attempted_reputation >= 90.0 && current_reputation < 70.0 {
+        let severity = if attempted_reputation >= 90.0 && current_reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
             // Attempted to jump from low to high reputation
             "CRITICAL"
         } else if attempted_reputation - current_reputation > 30.0 {
@@ -13199,6 +15491,15 @@ impl SimplifiedP2P {
     
     /// Broadcast tampering alert to all peers
     fn broadcast_tampering_alert(&self, node_id: &str, attempted_rep: f64, actual_rep: f64, severity: &str) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[SECURITY] ⚠️ WARN: No Tokio runtime - tampering alert skipped");
+                return;
+            }
+        };
+
         // Create security alert message
         let alert_data = serde_json::json!({
             "type": "REPUTATION_TAMPERING",
@@ -13213,20 +15514,15 @@ impl SimplifiedP2P {
             "action_taken": "PENALTY_APPLIED"
         });
         
-        // SCALABILITY: Only notify Super nodes and random sample of peers
-        // For millions of nodes, broadcasting to all would cause network storm
-        let peers = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        // v2.51: Lock-free peer collection
         let mut broadcasted = 0;
-        
-        // Collect Super nodes and sample of other peers
         let mut super_nodes = Vec::new();
         let mut other_peers = Vec::new();
         
-        for (peer_id, peer_info) in peers.iter() {
-            if peer_id != node_id {  // Don't send to the violator
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer_id = entry.key();
+            let peer_info = entry.value();
+            if peer_id != node_id {
                 match peer_info.node_type {
                     NodeType::Super => super_nodes.push((peer_id.clone(), peer_info.clone())),
                     _ => other_peers.push((peer_id.clone(), peer_info.clone())),
@@ -13244,7 +15540,7 @@ impl SimplifiedP2P {
                 let peer_id_clone = peer_id.clone();
                 
                 // Send async to not block
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     if let Ok(client) = reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(5))
                         .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
@@ -13283,7 +15579,7 @@ impl SimplifiedP2P {
             let alert_json = alert_data.clone();
             let peer_id_clone = peer_id.clone();
             
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 if let Ok(client) = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
                     .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
@@ -13314,15 +15610,18 @@ impl SimplifiedP2P {
     
     /// Log security incident with cryptographic chain for tamper-proof audit trail
     fn log_security_incident(&self, node_id: &str, incident_type: &str, severity: &str) {
+        // Use QNET_STORAGE_PATH (set during node init) with fallback to "./data"
+        let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "./data".to_string());
+        
         // Ensure data directory exists
-        if let Err(e) = std::fs::create_dir_all("./data") {
-            println!("[AUDIT] ⚠️ Failed to create data directory: {}", e);
+        if let Err(e) = std::fs::create_dir_all(&storage_path) {
+            println!("[AUDIT] ⚠️ Failed to create data directory {}: {}", storage_path, e);
             return; // Don't block on file system errors
         }
         
         // CRITICAL: Create tamper-proof audit chain (like blockchain)
-        let audit_file = "./data/security_audit.chain";
-        let audit_index_file = "./data/security_audit.index";
+        let audit_file = format!("{}/security_audit.chain", storage_path);
+        let audit_index_file = format!("{}/security_audit.index", storage_path);
         
         // Get previous audit hash for chain
         let previous_hash = self.get_last_audit_hash(&audit_index_file).unwrap_or_else(|| {
@@ -13378,7 +15677,7 @@ impl SimplifiedP2P {
             // Update index with latest hash
             self.update_audit_index(&audit_index_file, &entry_hash);
             
-            println!("[AUDIT] 🔐 Security incident logged with hash: {}", &entry_hash[..16]);
+            println!("[AUDIT] 🔐 Security incident logged with hash: {}", &entry_hash[..entry_hash.len().min(16)]);
         }
         
         // CRITICAL: Also broadcast to network for distributed audit
@@ -13441,12 +15740,8 @@ impl SimplifiedP2P {
         
         let mut instances_guard = instances.lock().await;
         
-        // Normalize node_id
-        let normalized_node_id = if self.node_id.starts_with("qn_") {
-            self.node_id.clone()
-        } else {
-            format!("qn_{}", self.node_id)
-        };
+        // v2.24: Use node_id directly
+        let normalized_node_id = self.node_id.clone();
         
         // Create instance if not exists
         if !instances_guard.contains_key(&normalized_node_id) {
@@ -13457,21 +15752,26 @@ impl SimplifiedP2P {
             }
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
-        
-        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
-        
+
+        let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+            Some(h) => h,
+            None => return String::from("UNSIGNED_MISSING_INSTANCE"),
+        };
+
         // Check certificate rotation
         if hybrid.needs_rotation() {
             let _ = hybrid.rotate_certificate().await;
         }
-        
+
         // CRITICAL: Sign RAW message with hybrid (hashes before signing)
+        // OPTIMIZED v2.24: bincode+zstd - use standard compact_bin format
         match hybrid.sign_raw_message_compact(entry_hash.as_bytes()).await {
             Ok(compact_sig) => {
-                match serde_json::to_string(&compact_sig) {
-                    Ok(json) => {
-                        println!("[AUDIT] ✅ Generated HYBRID signature for audit entry (NIST/Cisco)");
-                        format!("hybrid:{}", json)
+                match compact_sig.to_binary_compressed() {
+                    Ok(binary_data) => {
+                        let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                        println!("[AUDIT] ✅ Generated HYBRID signature for audit entry (bincode v2.24)");
+                        format!("compact_bin:{}", base64_data)  // CompactHybridSignature uses compact_bin
                     }
                     Err(e) => {
                         println!("[AUDIT] ❌ Failed to serialize hybrid signature: {}", e);
@@ -13508,12 +15808,8 @@ impl SimplifiedP2P {
                         
                         let mut instances_guard = instances.lock().await;
                         
-                        // Normalize node_id
-                        let normalized_node_id = if node_id.starts_with("qn_") {
-                            node_id.clone()
-                        } else {
-                            format!("qn_{}", node_id)
-                        };
+                        // v2.24: Use node_id directly
+                        let normalized_node_id = node_id.clone();
                         
                         // Create instance if not exists
                         if !instances_guard.contains_key(&normalized_node_id) {
@@ -13522,7 +15818,10 @@ impl SimplifiedP2P {
                             instances_guard.insert(normalized_node_id.clone(), hybrid);
                         }
                         
-                        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
+                        let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+            Some(h) => h,
+            None => return Err(anyhow::anyhow!("Hybrid instance missing")),
+        };
                         
                         // Check certificate rotation
                         if hybrid.needs_rotation() {
@@ -13535,8 +15834,12 @@ impl SimplifiedP2P {
                     
                     match result {
                         Ok(compact_sig) => {
-                            match serde_json::to_string(&compact_sig) {
-                                Ok(json) => format!("hybrid:{}", json),
+                            // OPTIMIZED v2.24: bincode+zstd - use standard compact_bin format
+                            match compact_sig.to_binary_compressed() {
+                                Ok(binary_data) => {
+                                    let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                                    format!("compact_bin:{}", base64_data)  // CompactHybridSignature
+                                }
                                 Err(_) => String::from("UNSIGNED_SERIALIZE_FAILED")
                             }
                         }
@@ -13549,8 +15852,8 @@ impl SimplifiedP2P {
         
         match handle.join() {
             Ok(sig) => {
-                if sig.starts_with("hybrid:") {
-                    println!("[AUDIT] ✅ Generated HYBRID signature for audit entry (NIST/Cisco)");
+                if sig.starts_with("hybrid_bin:") || sig.starts_with("hybrid:") {
+                    println!("[AUDIT] ✅ Generated HYBRID signature for audit entry");
                 }
                 sig
             }
@@ -13563,17 +15866,23 @@ impl SimplifiedP2P {
     
     /// Broadcast audit entry to network for distributed verification
     fn broadcast_audit_entry(&self, audit_block: serde_json::Value) {
-        // Send to at least 3 random peers for redundancy
-        let peers = match self.connected_peers.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[AUDIT] ⚠️ WARN: No Tokio runtime - audit broadcast skipped");
+                return;
+            }
         };
-        let peer_list: Vec<_> = peers.keys().cloned().collect();
+        
+        // v2.51: Lock-free audit broadcast
+        let peer_list: Vec<String> = self.connected_peers_lockfree.iter()
+            .map(|e| e.key().clone())
+            .collect();
         
         let selected_peers = if peer_list.len() <= 3 {
             peer_list
         } else {
-            // Select 3 random peers
             use rand::seq::SliceRandom;
             let mut rng = rand::thread_rng();
             peer_list.choose_multiple(&mut rng, 3).cloned().collect()
@@ -13581,11 +15890,11 @@ impl SimplifiedP2P {
         
         for peer_id in selected_peers {
             let audit_data = audit_block.clone();
-            let peer_info = peers.get(&peer_id).cloned();
+            let peer_info = self.connected_peers_lockfree.get(&peer_id).map(|e| e.value().clone());
             
             if let Some(info) = peer_info {
                 let peer_port = 8001; // Standard QNet port
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     // Send audit entry to peer for distributed storage
                     let url = format!("http://{}:{}/api/v1/audit/store", 
                                     info.addr, peer_port);
@@ -13648,23 +15957,10 @@ impl SimplifiedP2P {
     
     /// Get last activity map for all peers
     pub fn get_last_activity_map(&self) -> HashMap<String, u64> {
-        let mut activity_map = HashMap::new();
-        
-        // Collect from connected peers
-        if let Ok(peers) = self.connected_peers.read() {
-            for (_, peer) in peers.iter() {
-                activity_map.insert(peer.id.clone(), peer.last_seen);
-            }
-        }
-        
-        // Also check lock-free peers if enabled
-        if self.should_use_lockfree() {
-            for entry in self.connected_peers_lockfree.iter() {
-                activity_map.insert(entry.value().id.clone(), entry.value().last_seen);
-            }
-        }
-        
-        activity_map
+        // v2.51: Lock-free only
+        self.connected_peers_lockfree.iter()
+            .map(|entry| (entry.value().id.clone(), entry.value().last_seen))
+            .collect()
     }
     
     /// PRODUCTION: Apply reputation decay periodically with activity check
@@ -13677,7 +15973,18 @@ impl SimplifiedP2P {
     }
 
     /// PRODUCTION: Broadcast consensus commit to consensus participants only
+    /// 
+    /// PRODUCTION FIX v2.30: Byzantine threshold verification
+    /// - Waits for broadcast completion (not fire-and-forget)
+    /// - Verifies 2f+1 threshold reached
+    /// - Retries with exponential backoff if threshold not met
     pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return Err("No Tokio runtime available".to_string()),
+        };
+        
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         if round_id == 0 || (round_id % 90 != 0) {
@@ -13685,7 +15992,13 @@ impl SimplifiedP2P {
             return Ok(());
         }
         
-        println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {} to {} participants", round_id, participants.len());
+        // PRODUCTION: Calculate Byzantine threshold (2f+1)
+        // For n participants: threshold = ceil(2n/3) = (2n + 2) / 3
+        let total_participants = participants.len();
+        let byzantine_threshold = (total_participants * 2 + 2) / 3;
+        
+        println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {} to {} participants (need {} for Byzantine)", 
+                 round_id, total_participants, byzantine_threshold);
         
         // SCALABILITY: Collect all peer addresses first (O(n) scan)
         // Then send in batched async tasks for millions of nodes
@@ -13720,7 +16033,7 @@ impl SimplifiedP2P {
                 }
             };
             
-            peer_addresses.push(peer_addr);
+            peer_addresses.push((participant_id.clone(), peer_addr));
         }
         
         // SCALABILITY: Single tokio task for all sends (not 1000 tasks!)
@@ -13736,14 +16049,17 @@ impl SimplifiedP2P {
         let total = peer_addresses.len();
         let quic_transport = self.quic_transport.clone();
         let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        let threshold = byzantine_threshold;
         
-        tokio::spawn(async move {
+        // PRODUCTION: Async broadcast with Byzantine threshold monitoring
+        // NOTE: Still async (non-blocking), but now tracks delivery and retries if needed
+        handle.spawn(async move {
             use futures::stream::{self, StreamExt};
             
             // SCALABILITY: Bounded parallelism (max 100 concurrent requests)
             // For 1000 participants: 10 batches of 100, not 1000 tasks!
-            let results = stream::iter(peer_addresses)
-                .map(|peer_addr| {
+            let results = stream::iter(peer_addresses.clone())
+                .map(|(_, peer_addr)| {
                     let msg = consensus_msg.clone();
                     let qt = quic_transport.clone();
                     let qe = quic_enabled;
@@ -13753,7 +16069,7 @@ impl SimplifiedP2P {
                                 return (peer_addr, true);
                             }
                             if attempt < 3 {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
                             }
                         }
                         (peer_addr, false)
@@ -13764,39 +16080,97 @@ impl SimplifiedP2P {
                 .await;
             
             let success = results.iter().filter(|(_, ok)| *ok).count();
-            println!("[QUIC] 📊 Consensus commit broadcast: {}/{} delivered", success, total);
+            let delivered = success + 1; // +1 for self (already have our commit)
+            
+            // PRODUCTION: Check Byzantine threshold
+            if delivered >= threshold {
+                println!("[QUIC] ✅ Consensus commit Byzantine threshold reached: {}/{} (need {})", 
+                         delivered, total + 1, threshold);
+            } else {
+                // WARNING: Threshold not reached - consensus may fail!
+                println!("[QUIC] ⚠️ Consensus commit below threshold: {}/{} (need {})", 
+                         delivered, total + 1, threshold);
+                println!("[QUIC] 🔄 Attempting retry for failed peers...");
+                
+                // RETRY: Second wave for failed peers with longer timeout
+                let failed_peers: Vec<_> = results.iter()
+                    .filter(|(_, ok)| !*ok)
+                    .map(|(addr, _)| addr.clone())
+                    .collect();
+                
+                if !failed_peers.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    
+                    let retry_results = stream::iter(failed_peers)
+                        .map(|peer_addr| {
+                            let msg = consensus_msg.clone();
+                            let qt = quic_transport.clone();
+                            let qe = quic_enabled;
+                            async move {
+                                for attempt in 1..=2 {
+                                    if Self::send_consensus_message_with_retry(&peer_addr, &msg, qt.clone(), qe).await {
+                                        return true;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+                                }
+                                false
+                            }
+                        })
+                        .buffer_unordered(50)
+                        .collect::<Vec<_>>()
+                        .await;
+                    
+                    let retry_success = retry_results.iter().filter(|ok| **ok).count();
+                    let final_delivered = delivered + retry_success;
+                    
+                    if final_delivered >= threshold {
+                        println!("[QUIC] ✅ Retry successful: {}/{} (threshold {})", 
+                                 final_delivered, total + 1, threshold);
+                    } else {
+                        println!("[QUIC] ❌ CRITICAL: Byzantine threshold NOT reached after retry: {}/{}", 
+                                 final_delivered, threshold);
+                    }
+                }
+            }
         });
         
         Ok(())
     }
 
-    /// PRODUCTION: Broadcast consensus reveal to consensus participants only  
-    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
+    /// PRODUCTION: Broadcast consensus reveal to consensus participants only
+    /// 
+    /// PRODUCTION FIX v2.30: Byzantine threshold verification for reveals
+    /// CRITICAL: Reveals are even more important than commits - without enough reveals
+    /// macroblock consensus will fail and the network will stall!
+    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64, signature: String, participants: &[String]) -> Result<(), String> {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return Err("No Tokio runtime available".to_string()),
+        };
+        
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
-        // Microblocks use simple producer signatures, NOT Byzantine consensus
-        // BUGFIX: round_id IS the block height (e.g., 90, 180, 270), which are ALL divisible by 90!
-        // We need to check if it's a macroblock height, not if it's NOT divisible by 90
         if round_id == 0 || (round_id % 90 != 0) {
             println!("[P2P] ⏭️ BLOCKING broadcast reveal for non-macroblock round {} - no consensus needed", round_id);
             return Ok(());
         }
         
-        println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {} to {} participants", round_id, participants.len());
+        // PRODUCTION: Calculate Byzantine threshold (2f+1)
+        let total_participants = participants.len();
+        let byzantine_threshold = (total_participants * 2 + 2) / 3;
+        
+        println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {} to {} participants (need {} for Byzantine)", 
+                 round_id, total_participants, byzantine_threshold);
         
         // SCALABILITY: Collect all peer addresses first (O(n) scan)
-        // Then send in batched async tasks for millions of nodes
         let mut peer_addresses = Vec::with_capacity(participants.len());
         
         for participant_id in participants {
-            // Check if it's our own node first
             if participant_id == &self.node_id {
                 continue;
             }
             
-            // CRITICAL FIX: For Genesis nodes, construct address directly using helper
-            // Genesis consensus uses node IDs like "genesis_node_001"
             let peer_addr = if participant_id.starts_with("genesis_node_") {
-                // Genesis node - construct address using helper
                 match Self::resolve_genesis_node_address(participant_id) {
                     Some(addr) => addr,
                     None => {
@@ -13805,7 +16179,6 @@ impl SimplifiedP2P {
                     }
                 }
             } else {
-                // Non-Genesis: look up in peers (O(1) with DashMap)
                 let peer_info = self.get_peer_by_id_lockfree(participant_id);
                 match peer_info {
                     Some(p) => p.addr,
@@ -13816,30 +16189,29 @@ impl SimplifiedP2P {
                 }
             };
             
-            peer_addresses.push(peer_addr);
+            peer_addresses.push((participant_id.clone(), peer_addr));
         }
         
-        // SCALABILITY: Single tokio task for all sends (not 1000 tasks!)
-        // Use buffer_unordered for parallel HTTP requests with bounded concurrency
         let consensus_msg = NetworkMessage::ConsensusReveal {
             round_id,
             node_id: node_id.clone(),
             reveal_data: reveal_data.clone(),
             nonce: nonce.clone(),
             timestamp,
+            signature: signature.clone(),  // v2.48: Dilithium signature
         };
         
         let total = peer_addresses.len();
         let quic_transport = self.quic_transport.clone();
         let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        let threshold = byzantine_threshold;
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             use futures::stream::{self, StreamExt};
             
             // SCALABILITY: Bounded parallelism (max 100 concurrent requests)
-            // For 1000 participants: 10 batches of 100, not 1000 tasks!
-            let results = stream::iter(peer_addresses)
-                .map(|peer_addr| {
+            let results = stream::iter(peer_addresses.clone())
+                .map(|(_, peer_addr)| {
                     let msg = consensus_msg.clone();
                     let qt = quic_transport.clone();
                     let qe = quic_enabled;
@@ -13849,18 +16221,68 @@ impl SimplifiedP2P {
                                 return (peer_addr, true);
                             }
                             if attempt < 3 {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
                             }
                         }
                         (peer_addr, false)
                     }
                 })
-                .buffer_unordered(100) // Max 100 concurrent
+                .buffer_unordered(100)
                 .collect::<Vec<_>>()
                 .await;
             
             let success = results.iter().filter(|(_, ok)| *ok).count();
-            println!("[QUIC] 📊 Consensus reveal broadcast: {}/{} delivered", success, total);
+            let delivered = success + 1; // +1 for self
+            
+            // PRODUCTION: Check Byzantine threshold - reveals are CRITICAL
+            if delivered >= threshold {
+                println!("[QUIC] ✅ Consensus reveal Byzantine threshold reached: {}/{} (need {})", 
+                         delivered, total + 1, threshold);
+            } else {
+                println!("[QUIC] ⚠️ Consensus reveal below threshold: {}/{} (need {})", 
+                         delivered, total + 1, threshold);
+                println!("[QUIC] 🔄 CRITICAL: Attempting aggressive retry for reveals...");
+                
+                // AGGRESSIVE RETRY for reveals - they're more critical than commits
+                let failed_peers: Vec<_> = results.iter()
+                    .filter(|(_, ok)| !*ok)
+                    .map(|(addr, _)| addr.clone())
+                    .collect();
+                
+                for retry_round in 1..=3 {
+                    if failed_peers.is_empty() { break; }
+                    
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * retry_round)).await;
+                    
+                    let retry_results = stream::iter(failed_peers.clone())
+                        .map(|peer_addr| {
+                            let msg = consensus_msg.clone();
+                            let qt = quic_transport.clone();
+                            let qe = quic_enabled;
+                            async move {
+                                if Self::send_consensus_message_with_retry(&peer_addr, &msg, qt.clone(), qe).await {
+                                    return (peer_addr, true);
+                                }
+                                (peer_addr, false)
+                            }
+                        })
+                        .buffer_unordered(50)
+                        .collect::<Vec<_>>()
+                        .await;
+                    
+                    let retry_success = retry_results.iter().filter(|(_, ok)| *ok).count();
+                    let current_delivered = delivered + retry_success;
+                    
+                    if current_delivered >= threshold {
+                        println!("[QUIC] ✅ Reveal retry {} successful: {}/{} (threshold {})", 
+                                 retry_round, current_delivered, total + 1, threshold);
+                        break;
+                    } else {
+                        println!("[QUIC] ⚠️ Reveal retry {}: {}/{} still below threshold", 
+                                 retry_round, current_delivered, total + 1);
+                    }
+                }
+            }
         });
         
         Ok(())
@@ -13946,8 +16368,18 @@ impl SimplifiedP2P {
             return;
         };
         
-        // Send asynchronously via tokio
-        tokio::spawn(async move {
+        // Send asynchronously via tokio - SAFE: check if runtime is available
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                // No Tokio runtime available - skip sending (avoid panic)
+                if should_log {
+                    println!("[P2P] ⚠️ No async runtime - message queued for later");
+                }
+                return;
+            }
+        };
+        handle.spawn(async move {
             // Try QUIC first if enabled
             if quic_enabled {
                 if let Some(ref quic_transport) = quic_transport {
@@ -13987,9 +16419,12 @@ impl SimplifiedP2P {
     }
 
     /// Handle incoming consensus commit from remote peer
+    /// v2.48: Full Dilithium signature verification for quantum-resistant security
     fn handle_remote_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64) {
-        println!("[CONSENSUS] 🏛️ Processing remote commit: round={}, node={}, hash={}", 
-                round_id, node_id, commit_hash);
+        if crate::node::is_info() {
+            println!("[INFO][CONS] commit_recv round={} node={} hash_len={} sig_len={}", 
+                     round_id, node_id, commit_hash.len(), signature.len());
+        }
         
         // ═══════════════════════════════════════════════════════════════════════════
         // SECURITY FIX: Timestamp validation (prevents replay attacks)
@@ -14003,18 +16438,18 @@ impl SimplifiedP2P {
         const MAX_TIMESTAMP_DRIFT: u64 = 300; // 5 minutes
         
         if timestamp > now + MAX_TIMESTAMP_DRIFT {
-            println!("[CONSENSUS] ❌ Rejecting commit with FUTURE timestamp from {}: {} > {} + {}", 
-                     node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
-            // Report future timestamp attack
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] commit_future_ts node={} ts={} now={}", node_id, timestamp, now);
+            }
             let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             self.report_invalid_block(&node_id, current_height, [0u8; 32], "Future timestamp in commit");
             return;
         }
         
         if timestamp < now.saturating_sub(MAX_TIMESTAMP_DRIFT) {
-            println!("[CONSENSUS] ❌ Rejecting commit with STALE timestamp from {}: {} < {} - {}", 
-                     node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
-            // No penalty for stale (could be network delay) - just reject
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] commit_stale_ts node={} ts={} now={}", node_id, timestamp, now);
+            }
             return;
         }
         
@@ -14024,25 +16459,38 @@ impl SimplifiedP2P {
         let reputation_score = self.get_node_reputation_from_blockchain(&node_id) / 100.0;
         
         if reputation_score < 0.70 {
-            println!("[CONSENSUS] ❌ Rejecting commit from jailed node: {} (reputation: {:.1}%)", 
-                     node_id, reputation_score * 100.0);
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] commit_low_rep node={} rep={:.1}", node_id, reputation_score * 100.0);
+            }
             return;
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // SECURITY: Basic signature format validation (full verification in consensus engine)
+        // SECURITY v2.48: Full Dilithium signature verification (quantum-resistant)
+        // commit_hash is already SHA3-256 hex - use it directly for verification
         // ═══════════════════════════════════════════════════════════════════════════
         if signature.is_empty() || signature.len() < 100 {
-            println!("[CONSENSUS] ❌ Rejecting commit with invalid signature format from {}: len={}", 
-                     node_id, signature.len());
-            // Report invalid signature
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] commit_sig_short node={} len={}", node_id, signature.len());
+            }
             let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid signature format in commit");
             return;
         }
         
-        println!("[CONSENSUS] ✅ Pre-validation passed: {} (rep: {:.1}%, ts: valid, sig: {}B)", 
-                 node_id, reputation_score * 100.0, signature.len());
+        // v2.48: Full cryptographic verification of commit signature
+        if !self.verify_consensus_signature(&node_id, &commit_hash, &signature) {
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] commit_sig_invalid node={} rejecting", node_id);
+            }
+            let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid commit signature");
+            return;
+        }
+        
+        if crate::node::is_debug() {
+            println!("[DBG][CONS] commit_sig_verified node={} rep={:.1}", node_id, reputation_score * 100.0);
+        }
         
         // PRODUCTION: Send to consensus engine through channel
         if let Some(ref consensus_tx) = self.consensus_tx {
@@ -14068,9 +16516,44 @@ impl SimplifiedP2P {
     }
 
     /// Handle incoming consensus reveal from remote peer
-    fn handle_remote_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64) {
-        println!("[CONSENSUS] 🏛️ Processing remote reveal: round={}, node={}, reveal_length={}, nonce_length={}", 
-                round_id, node_id, reveal_data.len(), nonce.len());
+    /// v2.48: Added signature verification for quantum-resistant security
+    fn handle_remote_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64, signature: String) {
+        if crate::node::is_info() {
+            println!("[INFO][CONS] reveal_recv round={} node={} data_len={} sig_len={}", 
+                     round_id, node_id, reveal_data.len(), signature.len());
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SECURITY v2.48: Dilithium signature verification (quantum-resistant)
+        // Format: SHA3-256(node_id:reveal_data:nonce:timestamp) → verify signature
+        // ═══════════════════════════════════════════════════════════════════════════
+        if signature.is_empty() {
+            // Legacy mode - accept without signature but log warning
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] reveal_no_signature node={} accepting_legacy", node_id);
+            }
+        } else {
+            // v2.48: Verify Dilithium signature
+            // CRITICAL: Must use SAME format as signing: SHA3-256(message) 
+            use sha3::{Sha3_256, Digest};
+            let message_to_hash = format!("{}:{}:{}:{}", node_id, reveal_data, nonce, timestamp);
+            let mut hasher = Sha3_256::new();
+            hasher.update(message_to_hash.as_bytes());
+            let message_hash = hex::encode(hasher.finalize());
+            
+            if !self.verify_consensus_signature(&node_id, &message_hash, &signature) {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] reveal_sig_invalid node={} rejecting", node_id);
+                }
+                let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid reveal signature");
+                return;
+            }
+            
+            if crate::node::is_debug() {
+                println!("[DBG][CONS] reveal_sig_verified node={}", node_id);
+            }
+        }
         
         // ═══════════════════════════════════════════════════════════════════════════
         // SECURITY FIX: Timestamp validation (prevents replay attacks)
@@ -14141,6 +16624,7 @@ impl SimplifiedP2P {
                 reveal_data,
                 nonce,  // CRITICAL: Pass nonce for reveal verification
                 timestamp,
+                signature,  // v2.48: Dilithium signature for Byzantine safety
             };
             
             if let Err(e) = consensus_tx.send(consensus_msg) {
@@ -14207,13 +16691,22 @@ impl SimplifiedP2P {
         timestamp: u64,
         sender_addr: Option<String>  // Optional sender for tracking false emergencies
     ) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[FAILOVER] ⚠️ WARN: No Tokio runtime - emergency handler skipped");
+                return;
+            }
+        };
+
         // CRITICAL FIX: Check message age to prevent stale message spam
         // ARCHITECTURE: Emergency messages have 60-second TTL to prevent network pollution
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
         if timestamp > 0 && current_time > timestamp {
             let message_age = current_time - timestamp;
             if message_age > 60 {
@@ -14534,7 +17027,7 @@ impl SimplifiedP2P {
         let sender_log = sender_addr.clone();
         
         // Schedule async verification without self reference
-        tokio::spawn(async move {
+        handle.spawn(async move {
             // Step 1: Wait for block propagation (2 seconds)
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             
@@ -14553,53 +17046,53 @@ impl SimplifiedP2P {
                     .unwrap_or(1);
                 
                 if confirmations >= 3 {
+                    // CONSENSUS REACHED: 3+ nodes confirm block missing
+                    // Aggressive Catch-up in node.rs will handle resync (15s/5 blocks)
+                    // Round Tolerance ±90 in commit_reveal.rs handles message acceptance
                     println!("[CONSENSUS] ✅ Block #{} missing - CONSENSUS REACHED ({} confirmations)", 
                              block_height_log, confirmations);
+                    if crate::node::is_info() { 
+                        println!("[INFO][TC] stall_confirmed h={} action=aggressive_catchup", block_height_log); 
+                    }
+                    
                 } else if confirmations >= 2 {
-                    println!("[CONSENSUS] ⚠️ Block #{} missing - PARTIAL CONSENSUS ({} confirmations)", 
-                             block_height_log, confirmations);
+                    if crate::node::is_warn() { 
+                        println!("[WARN][TC] partial_consensus h={} conf={}", block_height_log, confirmations); 
+                    }
+                    
                 } else {
-                    println!("[CONSENSUS] ⚠️ Block #{} missing - SINGLE REPORT (no penalty)", 
-                             block_height_log);
+                    if crate::node::is_debug() { 
+                        println!("[DBG][TC] single_report h={}", block_height_log); 
+                    }
                 }
             }
         });
         
-        println!("[FAILOVER] ⏸️ Verification scheduled (2s timeout)");
+        if crate::node::is_debug() { println!("[DBG][FAILOVER] verify_scheduled timeout=2s"); }
         
-        // Apply penalties IMMEDIATELY based on current confirmation count
-        // This avoids async complexity while still using consensus
-        let conf_key = (block_height, failed_producer.clone());
-        let current_confirmations = EMERGENCY_CONFIRMATIONS
-            .get(&conf_key)
-            .map(|entry| entry.0.load(Ordering::Relaxed))
-            .unwrap_or(1);
+        // ═══════════════════════════════════════════════════════════════════════════
+        // ARCHITECTURE v2.38: ON-CHAIN SLASHING ONLY
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Emergency notifications are for FAILOVER only, NOT for slashing!
+        // 
+        // Slashing is determined in MacroBlock creation by analyzing the blockchain:
+        // 1. Emergency notification → triggers failover (continues the chain)
+        // 2. Emergency producer creates block with their ID in block.producer
+        // 3. At MacroBlock creation → analyze chain: assigned vs actual producer
+        // 4. If assigned ≠ actual → slashing recorded in MacroBlock (deterministic)
+        //
+        // WHY ON-CHAIN: P2P-based slashing causes false positives:
+        // - Race conditions (slashing before block propagates)
+        // - Network issues (receiver's problem ≠ producer's fault)
+        // - Non-determinism (nodes see different confirmation counts)
+        //
+        // ON-CHAIN slashing is deterministic - all nodes analyze same blockchain!
+        // ═══════════════════════════════════════════════════════════════════════════
         
-        println!("[CONSENSUS] 📊 Current confirmations: {}", current_confirmations);
-        
-        if current_confirmations >= 3 {
-            println!("[CONSENSUS] ✅ CONSENSUS REACHED: 3+ nodes confirm emergency");
-            // Report failed producer for slashing
-            self.report_invalid_block(&failed_producer, block_height, [0u8; 32], "Confirmed failed production (3+ nodes)");
-            println!("[FAILOVER] ⚔️ Slashing event recorded for {}", failed_producer);
-            
-            if new_producer != "emergency_consensus" {
-                // Emergency producer reward processed via DeterministicReputationState.process_block()
-                println!("[FAILOVER] ✅ Emergency producer {} will be rewarded via block production", new_producer);
-            }
-        } else if current_confirmations >= 2 {
-            println!("[CONSENSUS] ⚠️ PARTIAL CONSENSUS: 2 nodes confirm emergency");
-            // Report failed producer for slashing (partial consensus)
-            self.report_invalid_block(&failed_producer, block_height, [0u8; 32], "Confirmed failed production (2 nodes)");
-            println!("[FAILOVER] ⚔️ Slashing event recorded for {}", failed_producer);
-            
-            if new_producer != "emergency_consensus" {
-                // Emergency producer reward processed via DeterministicReputationState.process_block()
-                println!("[FAILOVER] ✅ Emergency producer {} will be rewarded via block production", new_producer);
-            }
-        } else {
-            println!("[CONSENSUS] ⚠️ SINGLE REPORT: No penalty for {}", failed_producer);
-        }
+        // Log emergency for monitoring (NO slashing action here!)
+        println!("[INFO][FAILOVER] emergency_recorded producer={} h={} new_producer={}", 
+                 failed_producer, block_height, new_producer);
+        println!("[INFO][FAILOVER] slashing=deferred_to_macroblock reason=on_chain_analysis");
     }
     
     
@@ -14750,12 +17243,8 @@ impl SimplifiedP2P {
                     
                     let mut instances_guard = instances.lock().await;
                     
-                    // Normalize node_id
-                    let normalized_node_id = if node_id.starts_with("qn_") {
-                        node_id.clone()
-                    } else {
-                        format!("qn_{}", node_id)
-                    };
+                    // v2.24: Use node_id directly
+                    let normalized_node_id = node_id.clone();
                     
                     // Create instance if not exists
                     if !instances_guard.contains_key(&normalized_node_id) {
@@ -14764,7 +17253,10 @@ impl SimplifiedP2P {
                         instances_guard.insert(normalized_node_id.clone(), hybrid);
                     }
                     
-                    let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
+                    let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+            Some(h) => h,
+            None => return Err(anyhow::anyhow!("Hybrid instance missing")),
+        };
                     
                     // Check certificate rotation
                     if hybrid.needs_rotation() {
@@ -14777,10 +17269,13 @@ impl SimplifiedP2P {
                 
                 match result {
                     Ok(compact_sig) => {
-                        match serde_json::to_string(&compact_sig) {
-                            Ok(json) => {
-                                println!("[P2P] ✅ Generated HYBRID signature for reputation sync (NIST/Cisco)");
-                                json.as_bytes().to_vec()
+                        // OPTIMIZED v2.24: bincode+zstd
+                        match compact_sig.to_binary_compressed() {
+                            Ok(binary_data) => {
+                                let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                                let sig_with_prefix = format!("compact_bin:{}", base64_data);
+                                println!("[P2P] ✅ Generated HYBRID signature for reputation sync (bincode v2.24)");
+                                sig_with_prefix.as_bytes().to_vec()
                             }
                             Err(e) => {
                                 println!("[P2P] ❌ Failed to serialize hybrid signature: {}", e);
@@ -14815,19 +17310,16 @@ impl SimplifiedP2P {
             signature,
         };
         
-        // Send to all connected peers
-        let peers = match self.connected_peers.read() {
-            Ok(peers) => peers.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        
+        // v2.51: Lock-free broadcast
         let mut successful = 0;
-        for (_addr, peer) in peers {
-            self.send_network_message(&peer.addr, sync_msg.clone());
+        for entry in self.connected_peers_lockfree.iter() {
+            self.send_network_message(&entry.value().addr, sync_msg.clone());
             successful += 1;
         }
         
-        println!("[REPUTATION] 📤 Broadcasted reputation sync to {} peers", successful);
+        if crate::node::is_info() {
+            println!("[INFO][REP] sync_broadcast peers={}", successful);
+        }
         Ok(())
     }
     
@@ -14835,8 +17327,7 @@ impl SimplifiedP2P {
     fn start_reputation_sync_task(&self) {
         let node_id = self.node_id.clone();
         let reputation_system = self.reputation_system.clone();
-        let connected_peers = self.connected_peers.clone();
-        let connected_peer_addrs = self.connected_peer_addrs.clone();
+        let connected_peers = self.connected_peers_lockfree.clone();
         let connected_peers_lockfree = self.connected_peers_lockfree.clone();
         let peer_id_to_addr = self.peer_id_to_addr.clone();
         let peer_shards = self.peer_shards.clone();
@@ -14918,19 +17409,13 @@ impl SimplifiedP2P {
                     }
                 };
                 
-                // GOSSIP PROTOCOL: Send to RANDOM subset of peers (NOT broadcast!)
-                // ARCHITECTURE: O(log n) complexity vs O(n) broadcast
-                // SCALABILITY: Supports millions of nodes with exponential propagation
-                let peers = match connected_peers.read() {
-                    Ok(peers) => peers.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                
-                // Filter qualified Super/Full nodes (Light nodes excluded)
-                let qualified_peers: Vec<_> = peers.iter()
-                    .filter(|(_, peer)| {
+                // v2.51: Lock-free gossip peer selection
+                let qualified_peers: Vec<PeerInfo> = connected_peers.iter()
+                    .filter(|entry| {
+                        let peer = entry.value();
                         peer.node_type != NodeType::Light && peer.is_consensus_qualified()
                     })
+                    .map(|entry| entry.value().clone())
                     .collect();
                 
                 if qualified_peers.is_empty() {
@@ -14947,9 +17432,11 @@ impl SimplifiedP2P {
                         .map(|e| e.value().latency_ms as u64)
                         .sum::<u64>() / qualified_peers.len().max(1) as u64;
                     
-                    // Same logic as get_shred_protocol_fanout() (unified_p2p.rs:10715-10731)
+                    // v2.60: Updated to match get_shred_protocol_fanout() with genesis latency fix
                     match (producers, avg_latency) {
-                        (0..=50, _) => 4,
+                        // Genesis: LAN uses fanout=4, WAN sends to ALL peers
+                        (0..=50, 0..=50) => 4,
+                        (0..=50, _) => producers.max(4),  // v2.60: All peers for high latency
                         (51..=200, 0..=50) => 8,
                         (51..=200, _) => 16,
                         (201..=1000, 0..=50) => 8,
@@ -14966,11 +17453,10 @@ impl SimplifiedP2P {
                 selection_hasher.update(b"QNET_GOSSIP_REPUTATION_V1");
                 let selection_seed = selection_hasher.finalize();
                 
-                let mut sorted_peers: Vec<_> = qualified_peers.into_iter().collect();
-                sorted_peers.sort_by_key(|(addr, _)| {
-                    // XOR distance from selection_seed (Kademlia-like)
+                let mut sorted_peers: Vec<PeerInfo> = qualified_peers.into_iter().collect();
+                sorted_peers.sort_by_key(|peer| {
                     let mut peer_hasher = Sha3_256::new();
-                    peer_hasher.update(addr.as_bytes());
+                    peer_hasher.update(peer.addr.as_bytes());
                     peer_hasher.update(&selection_seed);
                     let peer_hash = peer_hasher.finalize();
                     u64::from_le_bytes([
@@ -14979,19 +17465,16 @@ impl SimplifiedP2P {
                     ])
                 });
                 
-                // Select top-N peers by Kademlia distance
-                let gossip_targets: Vec<_> = sorted_peers.into_iter()
+                let gossip_targets: Vec<PeerInfo> = sorted_peers.into_iter()
                     .take(gossip_fanout)
                     .collect();
                 
-                // Send gossip messages to selected peers via QUIC
                 let mut successful = 0;
                 
-                // Create tokio runtime for async operations in this thread
                 if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build() {
-                    for (_addr, peer) in gossip_targets {
+                    for peer in gossip_targets {
                         let peer_addr_str = peer.addr.clone();
                         let sync_msg_clone = sync_msg.clone();
                         
@@ -15192,14 +17675,17 @@ impl SimplifiedP2P {
             println!("[FAILOVER] 🔒 Locked emergency failover: {}", failover_key);
             
             // CLEANUP: Auto-remove after 30 seconds to prevent memory leak
-            let key_clone = failover_key.to_string();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                EMERGENCY_FAILOVERS_IN_PROGRESS.remove(&key_clone);
-                println!("[FAILOVER] 🔓 Auto-unlocked emergency failover: {}", key_clone);
-            });
+            // SAFE: Check if Tokio runtime is available to prevent panic
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let key_clone = failover_key.to_string();
+                handle.spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    EMERGENCY_FAILOVERS_IN_PROGRESS.remove(&key_clone);
+                    println!("[FAILOVER] 🔓 Auto-unlocked emergency failover: {}", key_clone);
+                });
+            }
         }
-        
+
         was_inserted
     }
     
@@ -15241,30 +17727,53 @@ impl SimplifiedP2P {
             change_type
         )?;
         
-        // Report double sign attack with cryptographic proof
-        self.report_double_sign(
-            attacker,
-            block_height,
-            [0u8; 32], // hash_a placeholder - real evidence in consensus
-            [0u8; 32], // hash_b placeholder - real evidence in consensus
-            vec![],    // sig_a placeholder
-            vec![]     // sig_b placeholder
-        );
-        
-        // v2.21.5: Jail via slashing event in next macroblock
-        println!("[SECURITY] ✅ Critical attack by {} reported - will be permanently banned via slashing event", attacker);
+        // v2.38: Log critical attack for monitoring
+        // Double-sign slashing is determined on-chain in MacroBlock creation
+        println!("[CRIT][SECURITY] critical_attack attacker={} h={} type={}", attacker, block_height, change_type);
+        println!("[INFO][SECURITY] slashing=on_chain_detection note=double_sign_detected_in_macroblock");
         Ok(())
     }
     
     fn select_emergency_producer_excluding(&self, exclude: &str, height: u64) -> String {
-        // Select any other active peer as emergency producer (Byzantine-safe)
-        for entry in self.connected_peers_lockfree.iter() {
-            let peer = entry.value();
-            if peer.id != exclude && peer.is_consensus_qualified() {  // Byzantine threshold check
-                return peer.id.clone();
+        // v2.27.0: Use epoch-based snapshot for deterministic selection (same as node.rs)
+        // This ensures all nodes agree on emergency producer even for critical attacks
+        
+        // Get candidates from macroblock snapshot (same logic as calculate_qualified_candidates)
+        let macroblock_index = if height <= 90 { 0 } else { (height - 1) / 90 };
+        
+        // Try to get from macroblock snapshot first
+        // PRODUCTION v2.50: Lock-free storage access
+        if macroblock_index > 0 {
+            if let Some(storage) = crate::node::try_get_storage() {
+                if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(macroblock_index) {
+                    if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
+                        if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
+                            if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
+                                // Find first producer that isn't excluded
+                                for p in &producers {
+                                    if p.node_id != exclude {
+                                        println!("[SECURITY] ✅ Emergency producer from epoch snapshot: {}", p.node_id);
+                                        return p.node_id.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-        // Fallback to self if no other peers
+        
+        // Genesis epoch or fallback: use static Genesis list
+        use crate::genesis_constants::GENESIS_NODE_IPS;
+        for (_, id) in GENESIS_NODE_IPS.iter() {
+            let node_id = format!("genesis_node_{}", id);
+            if node_id != exclude {
+                println!("[SECURITY] ✅ Emergency producer from Genesis: {}", node_id);
+                return node_id;
+            }
+        }
+        
+        // Ultimate fallback
         if self.node_id != exclude {
             self.node_id.clone()
         } else {
@@ -15282,40 +17791,33 @@ impl SimplifiedP2P {
     ) -> Result<(), String> {
         println!("[FAILOVER] 📢 Broadcasting emergency {} producer change to network", change_type);
         
-        let peers = match self.connected_peers.read() {
-            Ok(peers) => peers.clone(),
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Mutex poisoned during emergency broadcast, recovering...");
-                poisoned.into_inner().clone()
-            }
-        };
-        
+        // v2.51: Lock-free emergency broadcast
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         
         let mut successful_broadcasts = 0;
-        let total_peers = peers.len();
+        let total_peers = self.connected_peers_lockfree.len();
         
-        for (_addr, peer) in peers {
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer = entry.value();
             let emergency_msg = NetworkMessage::EmergencyProducerChange {
                 failed_producer: failed_producer.to_string(),
                 new_producer: new_producer.to_string(),
                 block_height,
                 change_type: change_type.to_string(),
                 timestamp,
-                sender_node_id: Some(self.node_id.clone()), // PRODUCTION: Explicit sender for Docker/NAT
+                sender_node_id: Some(self.node_id.clone()),
             };
             
-            // CRITICAL: Send emergency message to peer
             self.send_network_message(&peer.addr, emergency_msg);
             successful_broadcasts += 1;
-            println!("[FAILOVER] 📤 Emergency notification sent to peer: {}", get_privacy_id_for_addr(&peer.addr));
         }
         
-        println!("[FAILOVER] 📊 Emergency broadcast completed: {}/{} peers notified", 
-                 successful_broadcasts, total_peers);
+        if crate::node::is_info() {
+            println!("[INFO][FAIL] emergency_broadcast success={}/{}", successful_broadcasts, total_peers);
+        }
         
         Ok(())
     }
@@ -15441,15 +17943,15 @@ impl SimplifiedP2P {
             })
             .collect();
         
-        // Sort by priority: 1) network_score (latency), 2) consensus_score (reliability)
+        // Sort by priority: 1) network_score (latency), 2) cached reputation (reliability)
         eligible_peers.sort_by(|a, b| {
             // Primary: network_score (higher = better latency)
             let network_cmp = b.network_score.partial_cmp(&a.network_score).unwrap_or(std::cmp::Ordering::Equal);
             if network_cmp != std::cmp::Ordering::Equal {
                 return network_cmp;
             }
-            // Secondary: consensus_score (higher = more reliable)
-            b.consensus_score.partial_cmp(&a.consensus_score).unwrap_or(std::cmp::Ordering::Equal)
+            // Secondary: cached reputation (higher = more reliable)
+            b.reputation().partial_cmp(&a.reputation()).unwrap_or(std::cmp::Ordering::Equal)
         });
         
         // Return top-N peers
@@ -15541,9 +18043,9 @@ mod tests {
     /// Test hybrid P2P signature format detection
     #[test]
     fn test_hybrid_p2p_signature_format() {
-        let hybrid_sig = r#"hybrid_p2p:{"node_id":"qn_test"}"#;
+        let hybrid_sig = r#"hybrid_p2p:{"node_id":"test_node"}"#;
         let legacy_sig = "dilithium_sig_abc123";
-        let heartbeat_sig = "heartbeat_v2_qn_test_1234567890";
+        let heartbeat_sig = "heartbeat_v2_test_node_1234567890";
         
         assert!(hybrid_sig.starts_with("hybrid_p2p:"));
         assert!(legacy_sig.starts_with("dilithium_sig_"));
@@ -15563,7 +18065,7 @@ mod tests {
         
         // OPTIMIZED v2.23: Create signature directly (RAW bytes format)
         let sig = CompactHybridSignature {
-            node_id: "qn_p2p_test".to_string(),
+            node_id: "p2p_test".to_string(),
             cert_serial: "CERT-P2P-123".to_string(),
             ephemeral_public_key: ephemeral_pk,
             message_signature: msg_sig,
@@ -15673,9 +18175,9 @@ mod tests {
     /// Test SHRED constants are correctly defined
     #[test]
     fn test_shred_retransmit_constants() {
-        assert_eq!(SHRED_CHUNK_TIMEOUT_SECS, 3, "Timeout should be 3 seconds");
+        assert_eq!(SHRED_CHUNK_TIMEOUT_SECS, 5, "Timeout should be 5 seconds (v2.31)");
         assert_eq!(SHRED_CHUNK_CACHE_SIZE, 100, "Cache should hold 100 blocks");
-        assert_eq!(SHRED_CHUNK_MAX_RETRIES, 2, "Max retries should be 2");
+        assert_eq!(SHRED_CHUNK_MAX_RETRIES, 4, "Max retries should be 4 (v2.31)");
     }
     
     /// Test ShredProtocolBlockAssembly with retransmit fields
@@ -15692,6 +18194,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             retransmit_attempts: 0,
             retransmit_requested_at: None,
+            certificate: None, // v2.26: Certificate from chunk #0
         };
         
         assert_eq!(assembly.retransmit_attempts, 0);

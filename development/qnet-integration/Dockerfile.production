@@ -62,15 +62,33 @@ DATA_DIR="${QNET_DATA_DIR:-/app/data}"\n\
 # ════════════════════════════════════════════════════════════════════════════\n\
 echo ""\n\
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
-echo "🔌 QNET v2.19.22 - REQUIRED PORTS (must be open on HOST firewall!)"\n\
+echo "🔌 QNET v2.42.1 - REQUIRED PORTS (must be open on HOST firewall!)"\n\
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
 echo "   TCP 9876  - P2P Network"\n\
 echo "   TCP 9877  - Gossip Protocol"\n\
 echo "   TCP 8001  - REST API"\n\
-echo "   UDP 10876 - QUIC Transport ⚡ (NEW! Required for v2.19.22+)"\n\
+echo "   UDP 10876 - QUIC Transport ⚡ (Required for v2.19.22+)"\n\
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
 echo "⚠️  RUN ON HOST: sudo ufw allow 9876,9877,8001/tcp && sudo ufw allow 10876/udp"\n\
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
+echo ""\n\
+echo "🕐 Checking host time synchronization..."\n\
+LOCAL_TIME=$(date +%s)\n\
+REMOTE_TIME=$(curl -s --max-time 5 http://worldtimeapi.org/api/ip 2>/dev/null | grep -o "\"unixtime\":[0-9]*" | cut -d: -f2 || echo "0")\n\
+if [ "$REMOTE_TIME" != "0" ] && [ "$REMOTE_TIME" != "" ]; then\n\
+  DRIFT=$((LOCAL_TIME > REMOTE_TIME ? LOCAL_TIME - REMOTE_TIME : REMOTE_TIME - LOCAL_TIME))\n\
+  if [ "$DRIFT" -gt 30 ]; then\n\
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
+    echo "🚨 CRITICAL: HOST CLOCK DRIFT = ${DRIFT} SECONDS!"\n\
+    echo "   Block timestamps will be wrong. Network may stall!"\n\
+    echo "   FIX ON HOST: sudo apt install chrony && sudo systemctl enable chrony"\n\
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
+  else\n\
+    echo "   ✅ Host clock synchronized (drift: ${DRIFT}s)"\n\
+  fi\n\
+else\n\
+  echo "   ⚠️  Could not verify NTP. Ensure chrony is installed on host!"\n\
+fi\n\
 echo ""\n\
 \n\
 if [ "$(id -u)" = "0" ]; then\n\

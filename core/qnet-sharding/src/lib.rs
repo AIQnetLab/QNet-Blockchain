@@ -15,24 +15,25 @@ use rayon::prelude::*;
 
 // OPTIMIZED: Dynamic shard configuration based on active Full/Super nodes
 // PRODUCTION: Start with minimal shards, scale up automatically
+// v2.64: Increased to 100K TPS per shard (was 50K)
 pub const DEFAULT_SHARDS: u32 = 1;
-pub const MIN_SHARDS: u32 = 1;       // Single shard for small networks (< 1000 nodes) ~50K TPS
-pub const MAX_SHARDS: u32 = 256;     // Maximum for 12.8M TPS capacity (50K × 256)
+pub const MIN_SHARDS: u32 = 1;       // Single shard for small networks (< 1000 nodes) ~100K TPS
+pub const MAX_SHARDS: u32 = 256;     // Maximum for 25.6M TPS capacity (100K × 256)
 pub const MAX_CROSS_SHARD_TXS: usize = 1000;
 pub const REBALANCE_THRESHOLD: f64 = 1.5; // 50% load difference triggers rebalance
 
 /// Get optimal shard count based on network size (Full/Super nodes only, NOT Light)
 /// PRODUCTION: Gradual scaling based on active consensus-participating nodes
-/// - 1 shard handles ~50K TPS (50K TX/block × 1 block/sec)
+/// - 1 shard handles ~100K TPS (100K TX/block × 1 block/sec)
 /// - Scale up automatically when network grows
 pub fn get_optimal_shard_count(network_size: usize) -> u32 {
     match network_size {
-        0..=1_000 => 1,           // Small network: 1 shard (~50K TPS)
-        1_001..=5_000 => 4,       // Growing: 4 shards (~200K TPS)
-        5_001..=20_000 => 16,     // Medium: 16 shards (~800K TPS)
-        20_001..=50_000 => 64,    // Large: 64 shards (~3.2M TPS)
-        50_001..=100_000 => 128,  // Very large: 128 shards (~6.4M TPS)
-        _ => MAX_SHARDS,          // Massive: 256 shards (~12.8M TPS)
+        0..=1_000 => 1,           // Small network: 1 shard (~100K TPS)
+        1_001..=5_000 => 4,       // Growing: 4 shards (~400K TPS)
+        5_001..=20_000 => 16,     // Medium: 16 shards (~1.6M TPS)
+        20_001..=50_000 => 64,    // Large: 64 shards (~6.4M TPS)
+        50_001..=100_000 => 128,  // Very large: 128 shards (~12.8M TPS)
+        _ => MAX_SHARDS,          // Massive: 256 shards (~25.6M TPS)
     }
 }
 

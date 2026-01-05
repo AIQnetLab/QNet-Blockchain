@@ -5,6 +5,7 @@ import 'react-native-get-random-values'; // Must be imported first
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { derivePath } from 'ed25519-hd-key';
 import * as bip39 from 'bip39';
+import nacl from 'tweetnacl'; // Ed25519 signing for node operations
 
 export class WalletManager {
   constructor() {
@@ -2162,13 +2163,32 @@ export class WalletManager {
     try {
       // BIP44 path for QNet: m/44'/9999'/accountIndex'/0'/0'
       
-      // Step 1: Generate master key from seed (keep as WordArray)
+      // Step 1: Generate master key from seed (SLIP-0010)
+      // HMAC-SHA512(Key = "ed25519 seed", Data = seed)
+      // CRITICAL: Must match browser extension exactly!
       const seedWordArray = CryptoJS.lib.WordArray.create(seed);
-      let currentKey = CryptoJS.HmacSHA512(seedWordArray, "ed25519 seed");
+      const ed25519SeedKey = CryptoJS.enc.Utf8.parse("ed25519 seed");
+      const masterHmac = CryptoJS.HmacSHA512(seedWordArray, ed25519SeedKey);
       
-      // Split into key and chain code using WordArray directly
-      let keyWords = currentKey.words.slice(0, 8); // First 32 bytes (8 words)
-      let chainWords = currentKey.words.slice(8, 16); // Next 32 bytes
+      // Split into key and chain code (64 bytes total = 16 words)
+      let currentKeyBytes = new Uint8Array(32);
+      let currentChainCodeBytes = new Uint8Array(32);
+      
+      // Convert masterHmac (WordArray) to Uint8Array
+      for (let i = 0; i < 8; i++) {
+        const word = masterHmac.words[i];
+        currentKeyBytes[i * 4] = (word >>> 24) & 0xff;
+        currentKeyBytes[i * 4 + 1] = (word >>> 16) & 0xff;
+        currentKeyBytes[i * 4 + 2] = (word >>> 8) & 0xff;
+        currentKeyBytes[i * 4 + 3] = word & 0xff;
+      }
+      for (let i = 0; i < 8; i++) {
+        const word = masterHmac.words[i + 8];
+        currentChainCodeBytes[i * 4] = (word >>> 24) & 0xff;
+        currentChainCodeBytes[i * 4 + 1] = (word >>> 16) & 0xff;
+        currentChainCodeBytes[i * 4 + 2] = (word >>> 8) & 0xff;
+        currentChainCodeBytes[i * 4 + 3] = word & 0xff;
+      }
       
       // Step 2: Derive path m/44'/9999'/accountIndex'/0'/0'
       const levels = [
@@ -2179,51 +2199,53 @@ export class WalletManager {
         0x80000000  // 0' (hardened address index)
       ];
       
-      // Step 3: Derive each level (optimized with WordArray)
+      // Step 3: Derive each level (FIXED: match browser extension format exactly)
       for (const index of levels) {
-        // Build data: 0x00 || key || index (37 bytes total)
-        const dataWords = new Array(10); // 37 bytes = ~10 words
-        dataWords[0] = 0x00000000 | (keyWords[0] >>> 8); // 0x00 prefix + first 3 bytes of key
+        // HMAC-SHA512(Key = chainCode, Data = 0x00 || privateKey || index)
+        // Build data: 0x00 || key (32 bytes) || index (4 bytes) = 37 bytes total
+        const dataBytes = new Uint8Array(37);
+        dataBytes[0] = 0x00; // Prefix byte
+        dataBytes.set(currentKeyBytes, 1); // Copy 32 bytes of key
+        dataBytes[33] = (index >>> 24) & 0xff;
+        dataBytes[34] = (index >>> 16) & 0xff;
+        dataBytes[35] = (index >>> 8) & 0xff;
+        dataBytes[36] = index & 0xff;
         
-        // Copy key bytes (shifted by 1 byte)
-        for (let i = 0; i < 7; i++) {
-          dataWords[i + 1] = ((keyWords[i] << 8) | (keyWords[i + 1] >>> 24)) >>> 0;
+        // HMAC-SHA512 with chainCode as key
+        const dataWordArray = CryptoJS.lib.WordArray.create(dataBytes);
+        const chainCodeWordArray = CryptoJS.lib.WordArray.create(currentChainCodeBytes);
+        const derivedHmac = CryptoJS.HmacSHA512(dataWordArray, chainCodeWordArray);
+        
+        // Extract new key and chain code (64 bytes = 16 words)
+        const derivedBytes = new Uint8Array(64);
+        for (let i = 0; i < 16; i++) {
+          const word = derivedHmac.words[i];
+          derivedBytes[i * 4] = (word >>> 24) & 0xff;
+          derivedBytes[i * 4 + 1] = (word >>> 16) & 0xff;
+          derivedBytes[i * 4 + 2] = (word >>> 8) & 0xff;
+          derivedBytes[i * 4 + 3] = word & 0xff;
         }
-        dataWords[8] = ((keyWords[7] << 8) | (index >>> 24)) >>> 0;
-        dataWords[9] = (index << 8) >>> 0;
         
-        const dataWordArray = CryptoJS.lib.WordArray.create(dataWords, 37);
-        const chainWordArray = CryptoJS.lib.WordArray.create(chainWords);
-        
-        const derived = CryptoJS.HmacSHA512(dataWordArray, chainWordArray);
-        keyWords = derived.words.slice(0, 8);
-        chainWords = derived.words.slice(8, 16);
+        currentKeyBytes = derivedBytes.slice(0, 32);
+        currentChainCodeBytes = derivedBytes.slice(32, 64);
       }
       
-      // Step 4: Generate public key from private key
-      const privateKeyWordArray = CryptoJS.lib.WordArray.create(keyWords);
-      const publicKeyHash = CryptoJS.SHA256(privateKeyWordArray);
-      
-      // Convert to Uint8Array only at the end
+      // Step 4: Generate Ed25519 keypair from seed (private key)
+      // CRITICAL FIX v2.66: Use nacl.sign.keyPair.fromSeed() for proper Ed25519!
+      // Old code used SHA256(privateKey) which is cryptographically WRONG!
+      // Ed25519 public key = privateKey * G (elliptic curve multiplication)
       const privateKey = new Uint8Array(32);
-      const publicKey = new Uint8Array(32);
+      privateKey.set(currentKeyBytes);
       
-      for (let i = 0; i < 8; i++) {
-        const kw = keyWords[i];
-        const pw = publicKeyHash.words[i];
-        privateKey[i * 4] = (kw >>> 24) & 0xff;
-        privateKey[i * 4 + 1] = (kw >>> 16) & 0xff;
-        privateKey[i * 4 + 2] = (kw >>> 8) & 0xff;
-        privateKey[i * 4 + 3] = kw & 0xff;
-        publicKey[i * 4] = (pw >>> 24) & 0xff;
-        publicKey[i * 4 + 1] = (pw >>> 16) & 0xff;
-        publicKey[i * 4 + 2] = (pw >>> 8) & 0xff;
-        publicKey[i * 4 + 3] = pw & 0xff;
-      }
+      // Generate proper Ed25519 keypair
+      const ed25519Keypair = nacl.sign.keyPair.fromSeed(privateKey);
+      
+      // ed25519Keypair.publicKey = 32 bytes (the actual Ed25519 public key)
+      // ed25519Keypair.secretKey = 64 bytes (privateKey + publicKey concatenated)
       
       return {
-        privateKey: privateKey,
-        publicKey: publicKey,
+        privateKey: privateKey,  // 32-byte seed
+        publicKey: ed25519Keypair.publicKey,  // 32-byte Ed25519 public key
         path: `m/44'/9999'/${accountIndex}'/0'/0'`,
         chainCode: new Uint8Array(32) // Not needed for address generation
       };
@@ -4521,8 +4543,9 @@ export class WalletManager {
       
       // Generate node ID from activation code
       // GENESIS NODE SUPPORT: Genesis codes map to genesis_node_XXX format
+      // v2.66: Support both 3-digit (001) and 4-digit (0001) formats
       let nodeId;
-      const genesisMatch = activationCode.match(/^QNET-BOOT-000([1-5])-STRAP$/);
+      const genesisMatch = activationCode.match(/^QNET-BOOT-0*([1-5])-STRAP$/);
       if (genesisMatch) {
         // Genesis node: use predefined node ID format
         const bootstrapId = genesisMatch[1].padStart(3, '0');
@@ -4534,9 +4557,25 @@ export class WalletManager {
       
       // Load wallet for signing
       const walletData = await this.loadWallet(password);
-      if (!walletData || !walletData.secretKey) {
+      if (!walletData) {
         throw new Error('Failed to load wallet for signing');
       }
+      
+      // Get keypair for signing (prefer qnetKeypair, fallback to secretKey)
+      const qnetKeypair = walletData.qnetKeypair;
+      const privateKeyBytes = qnetKeypair?.privateKey 
+        ? new Uint8Array(qnetKeypair.privateKey) 
+        : (walletData.secretKey ? new Uint8Array(walletData.secretKey.slice(0, 32)) : null);
+      
+      if (!privateKeyBytes || privateKeyBytes.length !== 32) {
+        throw new Error('No valid 32-byte private key available in wallet');
+      }
+      
+      // CRITICAL FIX v2.66: ALWAYS regenerate publicKey from privateKey!
+      // Old wallets have WRONG publicKey (SHA256 instead of Ed25519 curve)
+      // nacl.sign.keyPair.fromSeed() generates the CORRECT Ed25519 public key
+      const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
+      const publicKeyBytes = regeneratedKeypair.publicKey;
       
       // PRODUCTION: Create Ed25519 signature (clients use ONLY Ed25519)
       // Post-quantum Dilithium is ONLY for node consensus, NOT for client transactions
@@ -4544,12 +4583,16 @@ export class WalletManager {
       const message = `claim_rewards:${nodeId}:${walletAddress}`;
       const messageBytes = new TextEncoder().encode(message);
       
-      // Ed25519 signature
-      const ed25519Sig = nacl.sign.detached(messageBytes, walletData.secretKey);
+      // Ed25519 signature (nacl needs 64-byte secret key = privateKey + publicKey)
+      const fullSecretKey = privateKeyBytes.length === 64 
+        ? privateKeyBytes 
+        : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
+      
+      const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
       const quantumSignature = Buffer.from(ed25519Sig).toString('hex');
       
       // Get public key for verification (32 bytes hex)
-      const publicKeyHex = Buffer.from(walletData.publicKey).toString('hex');
+      const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
       
       // Submit claim request to official API
       const claimResponse = await fetch(`${apiUrl}/api/v1/rewards/claim`, {
@@ -4574,6 +4617,14 @@ export class WalletManager {
         throw new Error('Invalid JSON response from server');
       });
       
+      // Check if claim was successful
+      if (!claimResult.success) {
+        throw new Error(claimResult.error || 'Claim failed on server');
+      }
+      
+      // Extract amount from server response (server returns reward.total_qnc in QNC, not nanoQNC)
+      const claimedAmount = claimResult.reward?.total_qnc || claimResult.amount || 0;
+      
       // Update local storage with claim time
       const storedRewardsStr = await AsyncStorage.getItem('qnet_node_rewards');
       let storedRewards = {};
@@ -4586,15 +4637,15 @@ export class WalletManager {
       }
       
       storedRewards.lastClaim = Date.now();
-      storedRewards.totalClaimed = (storedRewards.totalClaimed || 0) + claimResult.amount;
+      storedRewards.totalClaimed = (storedRewards.totalClaimed || 0) + claimedAmount;
       await AsyncStorage.setItem('qnet_node_rewards', JSON.stringify(storedRewards));
       
       return {
         success: true,
-        amount: claimResult.amount,
+        amount: claimedAmount,
         timestamp: Date.now(),
-        nextClaim: Date.now() + 24 * 60 * 60 * 1000,
-        txHash: claimResult.tx_hash || claimResult.txHash
+        nextClaim: claimResult.next_claim_time || (Date.now() + 24 * 60 * 60 * 1000),
+        txHash: claimResult.tx_hash
       };
     } catch (error) {
       // console.error('Error claiming rewards:', error);
@@ -4602,12 +4653,40 @@ export class WalletManager {
     }
   }
 
+  // Universal send transaction function (routes to appropriate network)
+  async sendTransaction(fromAddress, toAddress, amount, tokenSymbol, password) {
+    try {
+      // Route to appropriate network handler
+      if (tokenSymbol === 'QNC') {
+        return await this.sendQNC(toAddress, amount, password);
+      } else if (tokenSymbol === 'SOL') {
+        // Solana transactions not supported in this app
+        throw new Error('Solana transactions are not supported. Use a Solana wallet.');
+      } else {
+        throw new Error(`Unknown token: ${tokenSymbol}`);
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
   // Send QNC tokens to another address
   async sendQNC(toAddress, amount, password) {
     try {
-      // Validate inputs
-      if (!toAddress || toAddress.length !== 64) {
-        throw new Error('Invalid recipient address (must be 64 hex characters)');
+      // Validate inputs - EON address: {19 chars}eon{15 chars}{4 checksum} = 41 chars
+      if (!toAddress) {
+        throw new Error('Recipient address is required');
+      }
+      
+      // Accept EON format (41 chars with 'eon') or hex format (64 chars)
+      const isEonFormat = toAddress.includes('eon') && toAddress.length === 41;
+      const isHexFormat = /^[0-9a-fA-F]{64}$/.test(toAddress);
+      
+      if (!isEonFormat && !isHexFormat) {
+        throw new Error('Invalid address. EON (41 chars) or Hex (64 chars) required.');
       }
       
       if (!amount || amount <= 0) {
@@ -4620,64 +4699,84 @@ export class WalletManager {
         throw new Error('Failed to load wallet for signing');
       }
       
-      // Get sender address
-      const fromAddress = Buffer.from(walletData.publicKey).toString('hex');
+      // Get sender address (use QNet EON address from wallet)
+      const fromAddress = walletData.qnetAddress || walletData.address;
+      if (!fromAddress) {
+        throw new Error('Wallet has no QNet address');
+      }
+      
+      // Get QNet keypair for signing (Ed25519)
+      const qnetKeypair = walletData.qnetKeypair;
+      if (!qnetKeypair || !qnetKeypair.privateKey) {
+        // Fallback to legacy secretKey if available
+        if (!walletData.secretKey) {
+          throw new Error('No signing key available in wallet');
+        }
+      }
+      
+      // Get private key bytes (either from qnetKeypair or legacy secretKey, always 32 bytes)
+      const privateKeyBytes = qnetKeypair?.privateKey 
+        ? new Uint8Array(qnetKeypair.privateKey) 
+        : new Uint8Array(walletData.secretKey.slice(0, 32));
+      
+      if (privateKeyBytes.length !== 32) {
+        throw new Error('Invalid private key length');
+      }
+      
+      // CRITICAL FIX v2.66: ALWAYS regenerate publicKey from privateKey!
+      // Old wallets have WRONG publicKey (SHA256 instead of Ed25519 curve)
+      const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
+      const publicKeyBytes = regeneratedKeypair.publicKey;
       
       // PRODUCTION: Create Ed25519 signature for transaction
-      // Client signs BEFORE server sets nonce/timestamp
       // Format matches validator's create_client_signing_message: "transfer:from:to:amount:gas_price:gas_limit"
-      const amountSmallest = amount * 1_000_000_000; // Convert QNC to smallest unit (9 decimals)
+      const amountSmallest = Math.floor(amount * 1_000_000_000); // Convert QNC to smallest unit (9 decimals)
       const gasPrice = 1;
       const gasLimit = 10_000;
       const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${gasPrice}:${gasLimit}`;
       const messageBytes = new TextEncoder().encode(message);
       
-      // Sign with Ed25519
-      const ed25519Sig = nacl.sign.detached(messageBytes, walletData.secretKey);
+      // Sign with Ed25519 (nacl needs 64-byte secret key = privateKey + publicKey)
+      const fullSecretKey = privateKeyBytes.length === 64 
+        ? privateKeyBytes 
+        : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
+      
+      const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
       const signature = Buffer.from(ed25519Sig).toString('hex');
       
       // Get public key for verification (32 bytes hex)
-      const publicKeyHex = Buffer.from(walletData.publicKey).toString('hex');
+      const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
       
       // Get random bootstrap node
       const apiUrl = this.getRandomBootstrapNode();
       
-      // Submit transaction to RPC
-      const response = await fetch(`${apiUrl}/api/v1/rpc`, {
+      // Submit transaction to REST API (uses handle_transaction_submit endpoint)
+      const response = await fetch(`${apiUrl}/api/v1/transaction`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'tx_submit',
-          params: {
-            from: fromAddress,
-            to: toAddress,
-            amount: amountSmallest,
-            signature: signature,
-            public_key: publicKeyHex,
-            gas_price: gasPrice,
-            gas_limit: gasLimit
-          },
-          id: Date.now()
+          from: fromAddress,
+          to: toAddress,
+          amount: amountSmallest,
+          signature: signature,
+          public_key: publicKeyHex,
+          gas_price: gasPrice,
+          gas_limit: gasLimit,
+          nonce: 0 // Server will assign correct nonce from account state
         })
       });
       
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error?.message || 'Failed to send transaction');
-      }
-      
       const result = await response.json();
       
-      if (result.error) {
-        throw new Error(result.error.message || 'Transaction failed');
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || result.details || 'Failed to send transaction');
       }
       
       return {
         success: true,
-        txHash: result.result.hash,
+        txHash: result.tx_hash,
         from: fromAddress,
         to: toAddress,
         amount: amount,
