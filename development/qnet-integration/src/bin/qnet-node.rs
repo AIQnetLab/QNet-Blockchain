@@ -2870,17 +2870,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Persist certificate history before exit
             if node_type != NodeType::Light {
                 if let Some(p2p) = node.get_unified_p2p() {
-                    let data_dir = std::path::Path::new("data");
-                    if let Err(e) = std::fs::create_dir_all(data_dir) {
-                        println!("[SHUTDOWN] ⚠️ Failed to create data dir: {}", e);
+                    // Use QNET_STORAGE_PATH (set during init) with fallback to "data"
+                    let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
+                    let data_dir = std::path::Path::new(&storage_path);
+                    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                        println!("[SHUTDOWN] ⚠️ Failed to create data dir {}: {}", storage_path, e);
                     } else if let Ok(mut cert_manager) = p2p.certificate_manager.write() {
                         let unified_node_type = match node_type {
                             NodeType::Light => qnet_integration::unified_p2p::NodeType::Light,
                             NodeType::Full => qnet_integration::unified_p2p::NodeType::Full,
                             NodeType::Super => qnet_integration::unified_p2p::NodeType::Super,
                         };
-                        match cert_manager.persist_to_disk(data_dir, unified_node_type) {
-                            Ok(_) => println!("[SHUTDOWN] ✅ Certificate history saved"),
+                        match cert_manager.persist_to_disk(&data_dir, unified_node_type) {
+                            Ok(_) => println!("[SHUTDOWN] ✅ Certificate history saved to {}", storage_path),
                             Err(e) => println!("[SHUTDOWN] ⚠️ Failed to save certificates: {}", e),
                         }
                     }

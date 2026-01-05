@@ -15610,15 +15610,18 @@ impl SimplifiedP2P {
     
     /// Log security incident with cryptographic chain for tamper-proof audit trail
     fn log_security_incident(&self, node_id: &str, incident_type: &str, severity: &str) {
+        // Use QNET_STORAGE_PATH (set during node init) with fallback to "./data"
+        let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "./data".to_string());
+        
         // Ensure data directory exists
-        if let Err(e) = std::fs::create_dir_all("./data") {
-            println!("[AUDIT] ⚠️ Failed to create data directory: {}", e);
+        if let Err(e) = std::fs::create_dir_all(&storage_path) {
+            println!("[AUDIT] ⚠️ Failed to create data directory {}: {}", storage_path, e);
             return; // Don't block on file system errors
         }
         
         // CRITICAL: Create tamper-proof audit chain (like blockchain)
-        let audit_file = "./data/security_audit.chain";
-        let audit_index_file = "./data/security_audit.index";
+        let audit_file = format!("{}/security_audit.chain", storage_path);
+        let audit_index_file = format!("{}/security_audit.index", storage_path);
         
         // Get previous audit hash for chain
         let previous_hash = self.get_last_audit_hash(&audit_index_file).unwrap_or_else(|| {

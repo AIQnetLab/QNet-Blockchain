@@ -2610,11 +2610,13 @@ impl BlockchainNode {
         // ONLY for Full/Super nodes - Light nodes don't participate in consensus!
         // ═══════════════════════════════════════════════════════════════════════════
         if node_type != NodeType::Light {
-            let data_dir = std::path::Path::new("data");
+            // Use QNET_STORAGE_PATH (set during init) with fallback to "data"
+            let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
+            let data_dir = std::path::Path::new(&storage_path);
             if data_dir.exists() {
                 if let Ok(mut cert_manager) = unified_p2p_instance.certificate_manager.write() {
                     match cert_manager.load_from_disk(data_dir) {
-                        Ok(_) => { if is_info() { println!("[INFO][NODE] cert_history_loaded"); } }
+                        Ok(_) => { if is_info() { println!("[INFO][NODE] cert_history_loaded path={}", storage_path); } }
                         Err(e) => { if is_warn() { println!("[WARN][NODE] cert_load_fail err={}", e); } }
                     }
                 }
@@ -6878,19 +6880,21 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         // ONLY for Full/Super nodes - Light nodes don't participate in consensus!
                         // ═══════════════════════════════════════════════════════════════════
                         if node_type != NodeType::Light {
-                            let data_dir = std::path::Path::new("data");
+                            // Use QNET_STORAGE_PATH (set during init) with fallback to "data"
+                            let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
+                            let data_dir = std::path::Path::new(&storage_path);
                             // Convert node::NodeType to unified_p2p::NodeType
                             let unified_node_type = match node_type {
                                 NodeType::Light => crate::unified_p2p::NodeType::Light,
                                 NodeType::Full => crate::unified_p2p::NodeType::Full,
                                 NodeType::Super => crate::unified_p2p::NodeType::Super,
                             };
-                            if let Err(e) = std::fs::create_dir_all(data_dir) {
-                                println!("[CERTIFICATE] ⚠️ Failed to create data dir: {}", e);
-                            } else if let Err(e) = cert_manager.persist_to_disk(data_dir, unified_node_type) {
+                            if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                                println!("[CERTIFICATE] ⚠️ Failed to create data dir {}: {}", storage_path, e);
+                            } else if let Err(e) = cert_manager.persist_to_disk(&data_dir, unified_node_type) {
                                 println!("[CERTIFICATE] ⚠️ Failed to persist certificates: {}", e);
                             } else {
-                                println!("[CERTIFICATE] 💾 Certificate history persisted to disk");
+                                if is_debug() { println!("[CERTIFICATE] 💾 Certificate history persisted to {}", storage_path); }
                             }
                         }
                         
@@ -7206,31 +7210,40 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                     };
                                     let height_gap = network_height.saturating_sub(microblock_height);
                                     
-                                    // v2.48: DYNAMIC threshold based on network size
-                                    // Small networks (≤10 nodes): 5 blocks - fast detection
-                                    // Medium networks (11-100): 10 blocks - account for latency
-                                    // Large networks (100+): 20 blocks - high latency tolerance
+                                    // v2.83: MUCH HIGHER threshold to prevent destructive rollbacks
+                                    // Only trigger rollback for SEVERE stalls, not minor sync delays
+                                    // Small networks (≤10 nodes): 50 blocks - allow time for sync
+                                    // Medium networks (11-100): 100 blocks - more tolerance
+                                    // Large networks (100+): 200 blocks - high latency tolerance
                                     let network_size = p2p.get_active_full_super_nodes().len();
                                     let dynamic_threshold = match network_size {
-                                        0..=10 => 5,      // Genesis/small: aggressive
-                                        11..=100 => 10,   // Medium: balanced
-                                        _ => 20,          // Large: conservative (network latency)
+                                        0..=10 => 50,     // Genesis/small: was 5, now 50
+                                        11..=100 => 100,  // Medium: was 10, now 100
+                                        _ => 200,         // Large: was 20, now 200
                                     };
                                     
-                                    if height_gap > dynamic_threshold {
+                                    // v2.83: PROTECTION against infinite rollback loop
+                                    // Only allow ONE rollback per 10 minutes
+                                    static LAST_ROLLBACK_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                    let now_secs = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let last_rollback = LAST_ROLLBACK_TIME.load(std::sync::atomic::Ordering::Relaxed);
+                                    let rollback_cooldown = 600; // 10 minutes cooldown
+                                    
+                                    if height_gap > dynamic_threshold && (now_secs - last_rollback) > rollback_cooldown {
+                                        LAST_ROLLBACK_TIME.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                                        
                                         println!("[ERR][FORK] stuck={}s behind={} blocks threshold={}", 
                                                  time_since_last_block, height_gap, dynamic_threshold);
                                         println!("[INFO][FORK] force_resync local={} network={} nodes={}", 
                                                  microblock_height, network_height, network_size);
                                         
-                                        // Calculate rollback point: last confirmed macroblock boundary
-                                        // Macroblocks are Byzantine-finalized, safe to trust
-                                        let last_macroblock_height = (microblock_height / 90) * 90;
-                                        let rollback_to = if last_macroblock_height > 90 { 
-                                            last_macroblock_height - 90  // Go back one full epoch for safety
-                                        } else { 
-                                            0  // Genesis
-                                        };
+                                        // v2.83: MUCH LESS AGGRESSIVE rollback - only 10 blocks, not 90!
+                                        // This prevents destroying the entire chain on temporary stalls
+                                        let rollback_amount = 10; // Was 90, now only 10 blocks
+                                        let rollback_to = microblock_height.saturating_sub(rollback_amount);
                                         
                                         println!("[INFO][FORK] rollback from={} to={}", microblock_height, rollback_to);
                                         

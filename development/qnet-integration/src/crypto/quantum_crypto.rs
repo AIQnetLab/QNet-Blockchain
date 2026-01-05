@@ -903,8 +903,10 @@ impl QNetQuantumCrypto {
                 drop(cached);
                 KEY_MANAGER_CACHE.remove(&cache_key);
                 
-                let data_dir = Path::new("keys");
-                let manager = Arc::new(DilithiumKeyManager::new(node_id.to_string(), data_dir)?);
+                // Use QNET_STORAGE_PATH for Docker compatibility (fallback to /app/data)
+                let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "/app/data".to_string());
+                let data_dir_path = Path::new(&storage_path).join("keys");
+                let manager = Arc::new(DilithiumKeyManager::new(node_id.to_string(), &data_dir_path)?);
                 manager.initialize().await?;
                 
                 KEY_MANAGER_CACHE.insert(cache_key.clone(), CachedKeyManager {
@@ -917,8 +919,10 @@ impl QNetQuantumCrypto {
             }
         } else {
             // Cache miss - create new manager
-            let data_dir = Path::new("keys");
-            let manager = Arc::new(DilithiumKeyManager::new(node_id.to_string(), data_dir)?);
+            // Use QNET_STORAGE_PATH for Docker compatibility (fallback to /app/data)
+            let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "/app/data".to_string());
+            let data_dir_path = Path::new(&storage_path).join("keys");
+            let manager = Arc::new(DilithiumKeyManager::new(node_id.to_string(), &data_dir_path)?);
             manager.initialize().await?;
             
             KEY_MANAGER_CACHE.insert(cache_key.clone(), CachedKeyManager {

@@ -7,7 +7,7 @@ import { NextRequest, NextResponse } from 'next/server';
 // - Cache survives multiple requests within TTL
 // ============================================================================
 
-const NODE_RPC_URL = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
+const NODE_RPC_URL = process.env.QNET_API_URL || 'http://161.97.86.81:8001';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -223,18 +223,23 @@ async function fallbackFetch(page: number, perPage: number): Promise<{ items: Ac
 }
 
 function mapTxType(type: unknown): ActivityItem['type'] {
-  // Handle object format: { NodeRegistration: {...} } or { "NodeRegistration": null }
+  // Handle different formats:
+  // 1. Object: { NodeRegistration: {...} } or { "NodeRegistration": null }
+  // 2. Simple string: "NodeRegistration" 
+  // 3. Rust Debug format: "NodeRegistration { node_id: \"...\", ... }"
   let typeStr = '';
   
   if (typeof type === 'object' && type !== null) {
     const keys = Object.keys(type as object);
     typeStr = keys[0] || '';
-    // Debug: Log first 3 object-type transactions
-    if (serverTxCache.size < 3) {
-      console.log(`[API] mapTxType object: keys=${JSON.stringify(keys)}, typeStr="${typeStr}"`);
-    }
   } else if (typeof type === 'string') {
     typeStr = type;
+    // Handle Rust Debug format: "TypeName { field: value, ... }"
+    // Extract just the type name (first word before space or brace)
+    const rustDebugMatch = typeStr.match(/^(\w+)\s*\{/);
+    if (rustDebugMatch) {
+      typeStr = rustDebugMatch[1];
+    }
   } else {
     typeStr = '';
   }
@@ -268,9 +273,9 @@ function mapTxType(type: unknown): ActivityItem['type'] {
   
   const result = map[normalized] || 'Transfer';
   
-  // Debug log for unmapped types
-  if (!map[normalized] && typeStr) {
-    console.log(`[API] Unknown tx type: raw=${JSON.stringify(type)}, typeStr="${typeStr}", normalized="${normalized}" -> Transfer`);
+  // Debug log for unmapped types (only first 5)
+  if (!map[normalized] && typeStr && serverTxCache.size < 5) {
+    console.log(`[API] Unknown tx type: "${typeStr}" (normalized: "${normalized}") -> Transfer`);
   }
   
   return result;
@@ -314,11 +319,31 @@ export async function GET(request: NextRequest) {
   if (forceRefresh) {
     console.log('[API] Force refresh - clearing cache');
     serverTxCache.clear();
+    serverCacheHeight = 0;
     lastFetchTime = 0;
   }
   
+  // Check if blockchain was reset (height decreased) - clear cache automatically
+  try {
+    const heightRes = await fetch(`${NODE_RPC_URL}/api/v1/height`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(2000),
+    });
+    if (heightRes.ok) {
+      const { height: currentNetworkHeight } = await heightRes.json();
+      if (currentNetworkHeight > 0 && currentNetworkHeight < serverCacheHeight) {
+        console.log(`[API] Blockchain reset detected! Network height ${currentNetworkHeight} < cache height ${serverCacheHeight}. Clearing cache.`);
+        serverTxCache.clear();
+        serverCacheHeight = 0;
+        lastFetchTime = 0;
+      }
+    }
+  } catch {
+    // Height check failed, continue with existing cache
+  }
+  
   // Fetch from network if cache is stale or empty
-  if (shouldRefetch) {
+  if (shouldRefetch || serverTxCache.size === 0) {
     lastFetchTime = now;
     
     // Try indexed API first (fast), fallback to block scanning

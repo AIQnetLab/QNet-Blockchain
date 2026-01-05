@@ -164,25 +164,38 @@ export default function ExplorerPage() {
       });
       const data = await res.json();
       
-      if (data.success && data.data && data.data.length > 0) {
-        setTransactionMap(prev => {
-          const newMap = new Map(prev);
-          let addedCount = 0;
-          
-          for (const tx of data.data as ActivityItem[]) {
-            if (tx.hash && !newMap.has(tx.hash)) {
-              newMap.set(tx.hash, tx);
-              addedCount++;
-            }
-          }
-          
-          console.log(`[Explorer] Fetched page ${pageNum}: ${data.data.length} items, ${addedCount} new`);
-          saveToCache(newMap, data.pagination?.currentHeight || currentHeight);
-          return newMap;
-        });
+      if (data.success && data.data) {
+        const networkHeight = data.pagination?.currentHeight || 0;
         
-        if (data.pagination?.currentHeight) {
-          setCurrentHeight(data.pagination.currentHeight);
+        // Detect blockchain reset: network height < our cached height
+        if (networkHeight > 0 && networkHeight < currentHeight) {
+          console.log(`[Explorer] Blockchain reset detected! Network ${networkHeight} < cached ${currentHeight}. Clearing cache.`);
+          sessionStorage.removeItem(CACHE_KEY);
+          setTransactionMap(new Map());
+          setCurrentHeight(networkHeight);
+        }
+        
+        if (data.data.length > 0) {
+          setTransactionMap(prev => {
+            // If blockchain was reset, start fresh
+            const newMap = (networkHeight > 0 && networkHeight < currentHeight) ? new Map() : new Map(prev);
+            let addedCount = 0;
+            
+            for (const tx of data.data as ActivityItem[]) {
+              if (tx.hash && !newMap.has(tx.hash)) {
+                newMap.set(tx.hash, tx);
+                addedCount++;
+              }
+            }
+            
+            console.log(`[Explorer] Fetched page ${pageNum}: ${data.data.length} items, ${addedCount} new`);
+            saveToCache(newMap, networkHeight || currentHeight);
+            return newMap;
+          });
+        }
+        
+        if (networkHeight) {
+          setCurrentHeight(networkHeight);
         }
         setHasMore(data.pagination?.hasMore ?? false);
       }
