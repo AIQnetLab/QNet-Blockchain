@@ -72,13 +72,39 @@ const formatTimeAgo = (timestamp: number): string => {
   return `${days}d ago`;
 };
 
-// Format date
-const formatDate = (timestamp: number): string => {
-  return new Date(timestamp).toLocaleDateString('en-US', {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-  });
+// Format date (handle both seconds and milliseconds)
+const formatDate = (timestamp: number | string | undefined): string => {
+  // Convert to number if string
+  const tsNum = typeof timestamp === 'string' ? Number(timestamp) : timestamp;
+  
+  if (!tsNum || tsNum === 0 || !Number.isFinite(tsNum)) return 'N/A';
+  
+  // Convert to milliseconds if needed
+  let msTs: number;
+  if (tsNum < 1e12) {
+    msTs = tsNum * 1000;
+  } else {
+    msTs = tsNum;
+  }
+  
+  // Validate timestamp (must be after 2000-01-01)
+  if (msTs < 946684800000) { // Before 2000-01-01
+    return 'N/A';
+  }
+  
+  try {
+    const date = new Date(msTs);
+    if (isNaN(date.getTime())) {
+      return 'N/A';
+    }
+    return date.toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+  } catch {
+    return 'N/A';
+  }
 };
 
 // Truncate

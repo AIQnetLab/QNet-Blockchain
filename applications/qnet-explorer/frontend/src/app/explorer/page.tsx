@@ -15,13 +15,13 @@ interface ActivityItem {
 }
 
 // ============================================================================
-// v2.82: Explorer with column sorting, type filter, hydration fix
-// - Sort by clicking TIME column header
-// - Filter by transaction type dropdown
-// - Fixed hydration error (no dynamic values in initial render)
+// v2.83: Explorer with stable caching - NO double updates
+// - Data loads ONCE from API (server has persistent cache)
+// - Time field is preserved correctly from server
+// - No client-side cache interference causing double renders
 // ============================================================================
 
-const CACHE_KEY = 'qnet_explorer_cache_v3';
+const CACHE_KEY = 'qnet_explorer_cache_v4';
 const CACHE_TTL = 300000;
 
 function getCachedData(): { transactions: Map<string, ActivityItem>, height: number, timestamp: number } | null {
@@ -64,7 +64,28 @@ function getBadgeClass(type: string): string {
   return classes[type] || 'badge-default';
 }
 
+// Calculate relative time CLIENT-SIDE from absolute timestamp
+// This ensures time display is always consistent and updates naturally
+function formatTimeAgo(timestamp: number): string {
+  if (!timestamp || timestamp === 0) return 'Genesis';
+  
+  const now = Date.now();
+  // Handle both seconds and milliseconds timestamps
+  const ts = timestamp > 1e12 ? timestamp : timestamp * 1000;
+  const diff = now - ts;
+  
+  if (diff < 0) return 'just now';
+  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
 const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) {
+  // Calculate relative time from absolute timestamp CLIENT-SIDE
+  // This ensures time is STABLE and doesn't flicker on data updates
+  const displayTime = formatTimeAgo(item.timestamp);
+  
   return (
     <tr className="activity-row">
       <td className="col-hash">
@@ -88,7 +109,7 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
       <td className="col-block">
         <Link href={`/explorer/block/${item.block}`}>{item.block}</Link>
       </td>
-      <td className="col-time">{item.time}</td>
+      <td className="col-time">{displayTime}</td>
     </tr>
   );
 });
@@ -132,31 +153,32 @@ export default function ExplorerPage() {
       items = items.filter(tx => tx.type === typeFilter);
     }
     
-    // Sort by: 1) block number, 2) timestamp (for same block)
-    // This ensures strict ordering even when timestamps are equal
-    return items.sort((a, b) => {
-      const blockA = typeof a.block === 'number' ? a.block : 0;
-      const blockB = typeof b.block === 'number' ? b.block : 0;
+    // Sort by TIME (timestamp)
+    const sorted = [...items].sort((a, b) => {
+      // Convert to number (handle both number and string timestamps)
+      let tsA = typeof a.timestamp === 'number' ? a.timestamp : Number(a.timestamp) || 0;
+      let tsB = typeof b.timestamp === 'number' ? b.timestamp : Number(b.timestamp) || 0;
       
-      if (sortOrder === 'desc') {
-        // Newest first: higher block = newer
-        if (blockB !== blockA) return blockB - blockA;
-        // Same block: sort by timestamp
-        return (b.timestamp || 0) - (a.timestamp || 0);
-      } else {
-        // Oldest first: lower block = older
-        if (blockA !== blockB) return blockA - blockB;
-        return (a.timestamp || 0) - (b.timestamp || 0);
+      // Normalize to milliseconds: if timestamp < 1e12, it's in seconds
+      if (tsA > 0 && tsA < 1e12) {
+        tsA = tsA * 1000;
       }
+      if (tsB > 0 && tsB < 1e12) {
+        tsB = tsB * 1000;
+      }
+      
+      return sortOrder === 'desc' ? (tsB - tsA) : (tsA - tsB);
     });
+    
+    return sorted;
   }, [transactionMap, sortOrder, typeFilter]);
 
-  // Fetch activity
+  // Fetch activity - STABLE: preserves good data, only adds/updates
   const fetchActivity = useCallback(async (pageNum: number, isLoadMore: boolean = false, forceRefresh: boolean = false) => {
     try {
       if (isLoadMore) setLoadingMore(true);
-      // Only show loading on initial load or force refresh, not on background updates
-      else if (transactionMap.size === 0 || forceRefresh) setLoading(true);
+      // Only show loading on very first load (no data at all)
+      else if (transactionMap.size === 0) setLoading(true);
       
       const refreshParam = forceRefresh ? '&refresh=1' : '';
       const res = await fetch(`/api/activity?page=${pageNum}&limit=${ITEMS_PER_PAGE}&sort=desc${refreshParam}`, {
@@ -180,16 +202,40 @@ export default function ExplorerPage() {
             // If blockchain was reset, start fresh
             const newMap = (networkHeight > 0 && networkHeight < currentHeight) ? new Map() : new Map(prev);
             let addedCount = 0;
+            let updatedCount = 0;
             
             for (const tx of data.data as ActivityItem[]) {
-              if (tx.hash && !newMap.has(tx.hash)) {
+              if (!tx.hash) continue;
+              
+              const existing = newMap.get(tx.hash);
+              if (!existing) {
+                // New transaction - add it
                 newMap.set(tx.hash, tx);
                 addedCount++;
+              } else {
+                // Existing transaction - merge carefully
+                // CRITICAL: Preserve good timestamp, don't replace with bad one
+                const mergedTx: ActivityItem = { ...tx };
+                
+                // If existing has good timestamp but new doesn't, keep existing
+                if (existing.timestamp > 0 && (!tx.timestamp || tx.timestamp === 0)) {
+                  mergedTx.timestamp = existing.timestamp;
+                  mergedTx.time = existing.time;
+                }
+                
+                // Only update if there's actually something better
+                if (mergedTx.timestamp !== existing.timestamp || 
+                    mergedTx.block !== existing.block) {
+                  newMap.set(tx.hash, mergedTx);
+                  updatedCount++;
+                }
               }
             }
             
-            console.log(`[Explorer] Fetched page ${pageNum}: ${data.data.length} items, ${addedCount} new`);
-            saveToCache(newMap, networkHeight || currentHeight);
+            if (addedCount > 0 || updatedCount > 0) {
+              console.log(`[Explorer] Page ${pageNum}: +${addedCount} new, ~${updatedCount} updated`);
+              saveToCache(newMap, networkHeight || currentHeight);
+            }
             return newMap;
           });
         }

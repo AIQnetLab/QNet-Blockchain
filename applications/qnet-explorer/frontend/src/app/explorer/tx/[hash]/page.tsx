@@ -24,9 +24,33 @@ const truncate = (str: string, start = 8, end = 6): string => {
   return `${str.slice(0, start)}...${str.slice(-end)}`;
 };
 
-// Format time
+// Format time (timestamp in ms or seconds)
 const formatTime = (ts: number): string => {
-  return new Date(ts).toUTCString();
+  if (!ts || ts === 0) return '—';
+  
+  // Convert seconds to ms if needed (timestamp < 1e12 means it's in seconds)
+  let msTs: number;
+  if (ts < 1e12) {
+    msTs = ts * 1000;
+  } else {
+    msTs = ts;
+  }
+  
+  // Validate timestamp (must be after 2000-01-01)
+  if (msTs < 946684800000) { // Before 2000-01-01
+    return '—';
+  }
+  
+  try {
+    const date = new Date(msTs);
+    // Check if date is valid
+    if (isNaN(date.getTime())) {
+      return '—';
+    }
+    return date.toUTCString();
+  } catch {
+    return '—';
+  } 
 };
 
 // Copy button
@@ -55,6 +79,32 @@ const CopyBtn = ({ text }: { text: string }) => {
   );
 };
 
+// Check sessionStorage for cached transaction data
+function getCachedTx(hash: string): TransactionData | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const cached = sessionStorage.getItem('qnet_explorer_cache_v3');
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      const txList = parsed.transactions || [];
+      const found = txList.find((t: { hash: string }) => t.hash === hash);
+      if (found) {
+        return {
+          hash: found.hash,
+          type: found.type, // Keep original type from cache
+          status: 'confirmed',
+          block: typeof found.block === 'number' ? found.block : 0,
+          timestamp: found.timestamp || 0,
+          from: found.from || 'unknown',
+          to: found.to || 'N/A',
+          amount: found.amount || '0 QNC',
+        };
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
 export default function TransactionPage() {
   const params = useParams();
   const hash = params.hash as string;
@@ -62,30 +112,77 @@ export default function TransactionPage() {
   const [tx, setTx] = useState<TransactionData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [hasFetched, setHasFetched] = useState(false);
   
   useEffect(() => {
-    if (!hash) return;
+    if (!hash || hasFetched) return;
+    
+    // Try cache first (client-side only)
+    const cachedTx = getCachedTx(hash);
     
     const fetchTransaction = async () => {
       try {
-        setLoading(true);
+        // If have cached data - show it immediately, don't show loading
+        if (cachedTx) {
+          setTx(cachedTx);
+          setLoading(false);
+        }
+        
+        // Always fetch from API for latest data
         const res = await fetch(`/api/tx/${hash}`);
         const data = await res.json();
         
         if (data.success && data.data) {
-          setTx(data.data);
-        } else {
+          const newData = data.data as TransactionData;
+          
+          // CRITICAL: Ensure timestamp is set and valid
+          // Use API timestamp if valid, otherwise try cached
+          const apiTs = Number(newData.timestamp) || 0;
+          let finalTimestamp = apiTs;
+          
+          // Check if API timestamp is valid
+          if (apiTs > 0) {
+            // Convert to milliseconds if needed
+            const tsMs = apiTs < 1e12 ? apiTs * 1000 : apiTs;
+            // If timestamp is valid (after 2000-01-01), use it
+            if (tsMs >= 946684800000) {
+              finalTimestamp = apiTs; // Keep original format (milliseconds)
+            } else if (cachedTx && cachedTx.timestamp) {
+              // API timestamp invalid, try cached
+              const cachedTsMs = Number(cachedTx.timestamp) < 1e12 ? Number(cachedTx.timestamp) * 1000 : Number(cachedTx.timestamp);
+              if (cachedTsMs >= 946684800000) {
+                finalTimestamp = Number(cachedTx.timestamp);
+              }
+            }
+          } else if (cachedTx && cachedTx.timestamp) {
+            // No timestamp from API, use cached if valid
+            const cachedTsMs = Number(cachedTx.timestamp) < 1e12 ? Number(cachedTx.timestamp) * 1000 : Number(cachedTx.timestamp);
+            if (cachedTsMs >= 946684800000) {
+              finalTimestamp = Number(cachedTx.timestamp);
+            }
+          }
+          
+          // Always set timestamp (formatTime will handle validation)
+          newData.timestamp = finalTimestamp;
+          
+          setTx(newData);
+          setError(null);
+        } else if (!cachedTx) {
+          // Only show error if we don't have cached data
           setError(data.error || 'Transaction not found');
         }
       } catch {
-        setError('Transaction not found or backend unavailable');
+        if (!cachedTx) {
+          setError('Transaction not found or backend unavailable');
+        }
       } finally {
         setLoading(false);
+        setHasFetched(true);
       }
     };
     
     fetchTransaction();
-  }, [hash]);
+  }, [hash, hasFetched]);
   
   if (loading) {
     return (
@@ -115,7 +212,9 @@ export default function TransactionPage() {
           <h1>{hash}</h1>
           <CopyBtn text={hash} />
         </div>
-        <div className="block-timestamp">{formatTime(tx.timestamp)}</div>
+        <div className="block-timestamp">
+          {tx.timestamp && tx.timestamp > 0 ? formatTime(tx.timestamp) : '—'}
+        </div>
       </div>
 
       {/* Details */}
