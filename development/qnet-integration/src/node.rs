@@ -4385,7 +4385,9 @@ impl BlockchainNode {
                                 }
                                 
                                 // Apply transaction to state (updates balances, nonces, etc)
-                                let state_guard = state.read().await;
+                                // CRITICAL FIX v2.76: Use WRITE lock to actually update state!
+                                // READ lock prevented state updates - all balances were stuck at 0
+                                let mut state_guard = state.write().await;
                                 if let Err(e) = state_guard.apply_transaction(tx) {
                                     // Don't fail block processing for individual tx failures
                                     // Some transactions may fail validation (insufficient balance, etc)
@@ -9574,6 +9576,18 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     if let Ok(_) = save_result {
                         println!("[Storage] ✅ Microblock {} saved with delta/compression", height_for_storage);
                         
+                        // CRITICAL FIX v2.76: Apply transactions to state when PRODUCER creates block!
+                        // Previously only validators applied TX - producer's own blocks didn't update state!
+                        // This is WHY balances were always 0 - producer created blocks but didn't apply them!
+                        {
+                            let mut state_guard = state.write().await;
+                            for tx in &txs {
+                                if let Err(e) = state_guard.apply_transaction(tx) {
+                                    println!("[WARN][STATE] producer_tx_apply_failed hash={} err={}", tx.hash, e);
+                                }
+                            }
+                        }
+                        
                         // CRITICAL v2.26: Remove included TX from mempool AFTER block is saved!
                         // This prevents re-processing the same TX in future blocks
                         // v2.26: Direct access - SimpleMempool is already thread-safe
@@ -9603,6 +9617,46 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             // Log for significant fees (> 0.01 QNC)
                             if total_fees_collected > 10_000_000 {
                                 println!("[POOL2] 💰 Producer collected {} nanoQNC in fees → Pool #2", total_fees_collected);
+                            }
+                        }
+                        
+                        // CRITICAL FIX v2.76: POOL #3 INTEGRATION for producer's own block
+                        // Producer must also collect Pool #3 (activation payments) like validators do!
+                        // Previously only validators collected Pool #3 - creating asymmetry!
+                        for tx in &txs {
+                            match &tx.tx_type {
+                                qnet_state::TransactionType::NodeActivation { 
+                                    amount, 
+                                    phase: qnet_state::account::ActivationPhase::Phase2, 
+                                    .. 
+                                } => {
+                                    if *amount > 0 {
+                                        // Add activation payment to Pool 3
+                                        // CRITICAL: This is distributed equally to ALL eligible nodes
+                                        if let Some(ref p2p) = p2p_for_reward {
+                                            p2p.add_to_pool3(*amount);
+                                        }
+                                        if is_debug() { println!("[DBG][POOL3] producer_activation_collected amount={} nanoQNC phase2", amount); }
+                                    }
+                                }
+                                qnet_state::TransactionType::BatchNodeActivations { activation_data, .. } => {
+                                    // Batch activations - sum all activation amounts (Phase 2 = amount > 0)
+                                    // Phase 1: activation_amount = 0 (1DEV burned externally)
+                                    // Phase 2: activation_amount > 0 (QNC to Pool 3)
+                                    let total_pool3: u64 = activation_data.iter()
+                                        .filter(|d| d.activation_amount > 0)  // Phase 2 indicator
+                                        .map(|d| d.activation_amount)
+                                        .sum();
+                                    
+                                    if total_pool3 > 0 {
+                                        if let Some(ref p2p) = p2p_for_reward {
+                                            p2p.add_to_pool3(total_pool3);
+                                        }
+                                        if is_debug() { println!("[DBG][POOL3] producer_batch_activation_collected amount={} nanoQNC count={}", 
+                                                 total_pool3, activation_data.len()); }
+                                    }
+                                }
+                                _ => {} // Other transaction types don't contribute to Pool 3
                             }
                         }
                         
