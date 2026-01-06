@@ -4336,6 +4336,11 @@ impl BlockchainNode {
                             // CRITICAL: Save producer_id for reputation update after storage
                             block_producer_id = Some(microblock.producer.clone());
                             if is_debug() { println!("[DBG][REP] block={} producer={}", received_block.height, microblock.producer); }
+                            
+                            // CRITICAL FIX v2.76.1: Take WRITE lock ONCE before loop, not on every iteration!
+                            // Taking lock inside loop caused timeouts and blocked block saving
+                            let mut state_guard = state.write().await;
+                            
                             // Apply ALL transactions from block to state
                             for tx in &microblock.transactions {
                                 // SPECIAL HANDLING: RewardDistribution transactions
@@ -4347,7 +4352,7 @@ impl BlockchainNode {
                                     
                                     // Update total_supply for emission transactions
                                     // This is CRITICAL for state consistency across network
-                                    let state_guard = state.read().await;
+                                    // v2.76.1: Use already-taken state_guard instead of taking lock again
                                     if let Err(e) = state_guard.emit_rewards(tx.amount) {
                                         eprintln!("[WARN][STATE] emission_failed err={}", e);
                                     } else {
@@ -4385,9 +4390,7 @@ impl BlockchainNode {
                                 }
                                 
                                 // Apply transaction to state (updates balances, nonces, etc)
-                                // CRITICAL FIX v2.76: Use WRITE lock to actually update state!
-                                // READ lock prevented state updates - all balances were stuck at 0
-                                let mut state_guard = state.write().await;
+                                // WRITE lock is now taken ONCE before the loop (v2.76.1)
                                 if let Err(e) = state_guard.apply_transaction(tx) {
                                     // Don't fail block processing for individual tx failures
                                     // Some transactions may fail validation (insufficient balance, etc)

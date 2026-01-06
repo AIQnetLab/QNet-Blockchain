@@ -172,7 +172,7 @@ interface BlockData {
 // Fetch block from node with validation
 async function fetchBlock(height: number): Promise<{ block: BlockData; height: number } | null> {
   try {
-    const res = await fetch(`${NODE_RPC_URL}/api/v1/block/${height}`, {
+    const res = await fetch(`${NODE_RPC_URL}/api/v1/blockchain/block/${height}`, {
       cache: 'no-store',
       signal: AbortSignal.timeout(5000),
     });
@@ -264,7 +264,7 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
 async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
   try {
     // Get current height from node
-    const heightRes = await fetch(`${NODE_RPC_URL}/api/v1/height`, {
+    const heightRes = await fetch(`${NODE_RPC_URL}/api/v1/blockchain/height`, {
       cache: 'no-store',
       signal: AbortSignal.timeout(5000),
     });
@@ -513,7 +513,7 @@ async function verifyDataIntegrity(): Promise<void> {
       const dbTx = dbTxResult.rows[0];
 
       // Get from node (source of truth)
-      const nodeRes = await fetch(`${NODE_RPC_URL}/api/v1/transaction/${hash}`, {
+      const nodeRes = await fetch(`${NODE_RPC_URL}/api/v1/blockchain/transaction/${hash}`, {
         cache: 'no-store',
         signal: AbortSignal.timeout(3000),
       });
