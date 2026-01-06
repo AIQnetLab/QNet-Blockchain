@@ -2384,7 +2384,7 @@ const WalletScreen = () => {
       const currentWallet = wallet || await walletManager.getCurrentWallet();
       
       // Load balances in parallel for better performance
-      const [bal, oneDevBalance] = await Promise.all([
+      const [bal, oneDevBalance, qncBalance] = await Promise.all([
         walletManager.getBalance(publicKey, isTestnet),
         walletManager.getTokenBalance(
           currentWallet?.solanaAddress || currentWallet?.address || publicKey,
@@ -2392,14 +2392,12 @@ const WalletScreen = () => {
         ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'  // Testnet/Devnet
             : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump', // Mainnet (pump.fun)
           isTestnet
-        )
+        ),
+        // v2.76: CRITICAL FIX - Load real QNC balance from blockchain
+        walletManager.getQNCBalance(currentWallet?.qnetAddress)
       ]);
       
       setBalance(bal);
-      
-      // For QNC, we'll need the actual mint address when deployed
-      // For now, set to 0 as it's not yet deployed
-      const qncBalance = 0;
       
       // Update all balances
       setTokenBalances({

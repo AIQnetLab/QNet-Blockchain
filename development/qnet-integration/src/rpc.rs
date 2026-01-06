@@ -5635,16 +5635,35 @@ async fn handle_server_node_status(
         
         // Find node by activation_code or node_id
         let target_node_id = if let Some(code) = &activation_code {
-            // CRITICAL: Look up node_id from activation registry
-            // This links the activation_code (from mobile app) to the network node_id
-            let registry = &*GLOBAL_ACTIVATION_REGISTRY;
-            if let Some(found_node_id) = registry.get_node_id_by_activation_code(code).await {
-                Some(found_node_id)
+            // CRITICAL FIX v2.76: Genesis node activation code mapping
+            // Genesis nodes use QNET-BOOT-000X-STRAP format
+            // Map to genesis_node_00X for network identification
+            if code.starts_with("QNET-BOOT-") && code.ends_with("-STRAP") {
+                // Extract bootstrap ID (e.g., "0001" from "QNET-BOOT-0001-STRAP")
+                if let Some(id_part) = code.strip_prefix("QNET-BOOT-").and_then(|s| s.strip_suffix("-STRAP")) {
+                    // Remove leading zeros: "0001" → "001"
+                    let trimmed = id_part.trim_start_matches('0');
+                    if !trimmed.is_empty() {
+                        let genesis_node_id = format!("genesis_node_{:0>3}", trimmed);
+                        Some(genesis_node_id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
-                // Fallback: try to find in active nodes by partial match
-                active_nodes.iter()
-                    .find(|(id, _, _)| id.contains(code) || code.contains(id))
-                    .map(|(id, _, _)| id.clone())
+                // CRITICAL: Look up node_id from activation registry
+                // This links the activation_code (from mobile app) to the network node_id
+                let registry = &*GLOBAL_ACTIVATION_REGISTRY;
+                if let Some(found_node_id) = registry.get_node_id_by_activation_code(code).await {
+                    Some(found_node_id)
+                } else {
+                    // Fallback: try to find in active nodes by partial match
+                    active_nodes.iter()
+                        .find(|(id, _, _)| id.contains(code) || code.contains(id))
+                        .map(|(id, _, _)| id.clone())
+                }
             }
         } else {
             node_id.clone()
@@ -7902,7 +7921,34 @@ async fn handle_activations_by_wallet(
         // Query RewardManager for all nodes owned by this wallet
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
-        let nodes = reward_manager.get_nodes_by_wallet(&wallet_address);
+        let mut nodes = reward_manager.get_nodes_by_wallet(&wallet_address);
+        
+        // CRITICAL FIX v2.76: Genesis nodes are NOT in node_ownership!
+        // Check if this wallet matches any genesis node wallet
+        // Genesis nodes: 001-005, each has a fixed wallet address from genesis_constants.rs
+        let genesis_wallets = vec![
+            ("genesis_node_001", "f36ff465a0944fd06cdeonfca0ad004ff9db46743"), // Genesis Node #1
+            ("genesis_node_002", "0bac6225a082de1f659eond0c96f1706cf19c35eb"), // Genesis Node #2
+            ("genesis_node_003", "d216bb23fbe7f853636eon3f16b378b91922701a6"), // Genesis Node #3
+            ("genesis_node_004", "e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e"), // Genesis Node #4
+            ("genesis_node_005", "02af45d56bd1f5d9002eon0eb1c522f96a2f440b8"), // Genesis Node #5
+        ];
+        
+        for (genesis_id, genesis_wallet) in genesis_wallets {
+            if wallet_address == genesis_wallet {
+                // Get pending rewards for this genesis node
+                let pending = reward_manager.get_pending_reward(genesis_id)
+                    .map(|r| r.total_reward)
+                    .unwrap_or(0);
+                
+                // Add to nodes list (genesis nodes are "super" type)
+                nodes.push((
+                    genesis_id.to_string(),
+                    qnet_consensus::lazy_rewards::NodeType::Super,
+                    pending
+                ));
+            }
+        }
         
         if nodes.is_empty() {
             // No nodes in reward manager - check activation registry for pending activations

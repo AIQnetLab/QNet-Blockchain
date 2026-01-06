@@ -207,18 +207,15 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
     let block: BlockData;
     if (responseData.block) {
       block = responseData.block as BlockData;
-      console.log(`[Sync] Block ${height} using nested structure, transactions: ${Array.isArray(block.transactions) ? block.transactions.length : 0}`);
     } else if (responseData.transactions) {
       // Flat structure with transactions at top level
       block = {
         transactions: responseData.transactions,
         timestamp: responseData.timestamp,
       } as BlockData;
-      console.log(`[Sync] Block ${height} using flat structure, transactions: ${Array.isArray(block.transactions) ? block.transactions.length : 0}`);
     } else {
       // Fallback - use responseData as block
       block = responseData as BlockData;
-      console.warn(`[Sync] Block ${height} no transactions found, using responseData as block`);
     }
     
     // Validate block structure
@@ -316,37 +313,23 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
     // If lastHeight is -1, start from 0. Otherwise start from lastHeight + 1
     const firstBlock = lastHeight < 0 ? 0 : Math.max(startBlock, lastHeight + 1);
     
-    // Debug: verify calculations
-    console.log(`[Sync] Height calc: lastHeight=${lastHeight} (${typeof lastHeight}), startBlock=${startBlock}, firstBlock=${firstBlock}, currentHeight=${currentHeight}`);
-    
+    // Production: 100 blocks per batch for stability
     for (let h = firstBlock; h <= currentHeight && blocksToFetch.length < 100; h++) {
       blocksToFetch.push(h);
-    }
-    
-    if (blocksToFetch.length > 0) {
-      console.log(`[Sync] Will fetch ${blocksToFetch.length} blocks: ${blocksToFetch[0]} to ${blocksToFetch[blocksToFetch.length - 1]}`);
-    } else {
-      console.log(`[Sync] No blocks to fetch (firstBlock: ${firstBlock}, currentHeight: ${currentHeight})`);
     }
 
     if (blocksToFetch.length === 0) {
       return { added: 0, currentHeight };
     }
 
-    console.log(`[Sync] Fetching blocks ${blocksToFetch[0]}-${blocksToFetch[blocksToFetch.length - 1]} (${blocksToFetch.length} blocks)`);
-
-    // Limit parallel fetches to prevent DoS (max 50 concurrent for production)
+    // Limit parallel fetches to prevent DoS (production: 50 blocks/10s = 300 blocks/min)
     const MAX_PARALLEL_FETCHES = 50;
     // IMPORTANT: Only process blocks we actually fetch!
     const blocksToProcess = blocksToFetch.slice(0, MAX_PARALLEL_FETCHES);
     const fetchPromises = blocksToProcess.map(height => fetchBlock(height));
     
-    if (blocksToFetch.length > MAX_PARALLEL_FETCHES) {
-      console.log(`[Sync] Processing ${MAX_PARALLEL_FETCHES} blocks this round, ${blocksToFetch.length - MAX_PARALLEL_FETCHES} blocks will be fetched in next cycle`);
-    }
-    
-    // Add timeout wrapper to prevent hanging (increased timeout for large blocks)
-    const timeoutMs = 120000; // 120 seconds for blocks with up to 100k transactions
+    // Add timeout wrapper to prevent hanging (2 minutes for 50 blocks)
+    const timeoutMs = 120000; // 120 seconds for parallel fetch of 50 blocks
     const timeoutPromise = Promise.race([
       Promise.allSettled(fetchPromises),
       new Promise<PromiseSettledResult<{ block: BlockData; height: number } | null>[]>((_, reject) => {
@@ -398,25 +381,21 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
           transformedCount++;
         } else {
           skippedCount++;
+          // Debug: log why transaction was skipped
+          const txHash = String(tx.hash || '').substring(0, 16);
+          const txFrom = String(tx.from || tx.from_address || 'none');
+          const txType = String(tx.tx_type || tx.type || 'unknown');
+          console.warn(`[Sync] Skipped TX in block ${height}: hash=${txHash}, from=${txFrom}, type=${txType}`);
         }
       }
 
-      if (txs.length > 0) {
+      if (txs.length > 0 && transformedCount > 0) {
         console.log(`[Sync] Block ${height}: ${txs.length} total, ${transformedCount} transformed, ${skippedCount} skipped`);
-        if (transformedCount === 0 && txs.length > 0) {
-          console.warn(`[Sync] Block ${height} has ${txs.length} transactions but none were transformed successfully`);
-          // Log first failed transaction for debugging
-          if (txs.length > 0) {
-            const firstTx = txs[0] as Record<string, unknown>;
-            console.warn(`[Sync] First TX sample: hash=${String(firstTx.hash || '').substring(0, 32)}, type=${firstTx.tx_type || firstTx.type || 'unknown'}`);
-          }
-        }
       }
 
       maxHeight = Math.max(maxHeight, height);
     }
 
-    console.log(`[Sync] Processed ${results.length} blocks, extracted ${transactionsToInsert.length} transactions`);
 
     // Deduplicate transactions by hash (filter out duplicates from genesis block)
     const seenHashes = new Set<string>();
@@ -489,9 +468,6 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
     
     if (finalHeight > lastHeight) {
       await updateSyncState(finalHeight);
-      console.log(`[Sync] Updated sync state: ${lastHeight} -> ${finalHeight}`);
-    } else {
-      console.log(`[Sync] No height update needed (finalHeight: ${finalHeight}, lastHeight: ${lastHeight})`);
     }
 
     return { added: transactionsToInsert.length, currentHeight: finalHeight };
@@ -652,7 +628,6 @@ export function startSyncService(): void {
   // Periodic sync with lock
   syncInterval = setInterval(() => {
     if (isSyncing) {
-      console.log('[Sync] Sync already in progress, skipping...');
       return;
     }
     

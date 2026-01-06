@@ -316,14 +316,15 @@ export async function insertTransactionsBatch(transactions: Omit<TransactionRow,
   }
 
   // Wait if another batch insert is in progress (with timeout)
-  const maxWait = 30000; // 30 seconds
+  const maxWait = 60000; // 60 seconds (increased for large batches)
   const startWait = Date.now();
   while (isBatchInserting && (Date.now() - startWait) < maxWait) {
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   
   if (isBatchInserting) {
-    throw new Error('Batch insert timeout: another insert is in progress');
+    console.warn('[DB] Batch insert timeout, forcing reset of lock');
+    isBatchInserting = false; // Force reset the lock
   }
 
   isBatchInserting = true;

@@ -375,18 +375,6 @@ export default function ExplorerPage() {
             </table>
           )}
         </div>
-        
-        {hasMore && typeFilter === 'All' && (
-          <div className="load-more">
-            <button 
-              onClick={loadMore}
-              disabled={loadingMore}
-              className="load-more-btn"
-            >
-              {loadingMore ? 'Loading...' : `Load More Transactions`}
-            </button>
-          </div>
-        )}
       </div>
     </div>
   );

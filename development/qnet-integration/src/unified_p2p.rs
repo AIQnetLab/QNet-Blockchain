@@ -12724,8 +12724,13 @@ impl SimplifiedP2P {
             // - Network start time alignment with UTC
             // - Clock synchronization between nodes
             // - Emission timing relative to window boundaries
+            // 
+            // CRITICAL FIX v2.76: Changed < to <= for window_end_height
+            // Emission blocks (14400, 28800, etc.) must be INCLUDED in the heartbeat window
+            // Previously: block < 86400 excluded block 86400 (emission block)
+            // Now: block <= 86400 includes block 86400 (correct!)
             if record.block_height >= window_start_height 
-                && record.block_height < window_end_height 
+                && record.block_height <= window_end_height 
                 && record.verified 
             {
                 node_heartbeats

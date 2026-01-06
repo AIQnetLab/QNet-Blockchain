@@ -3066,6 +3066,51 @@ export class WalletManager {
     }
   }
 
+  // Get QNC balance from QNet blockchain
+  // v2.76: CRITICAL FIX - Load real balance after claim transactions
+  async getQNCBalance(address) {
+    try {
+      if (!address || typeof address !== 'string') {
+        return 0;
+      }
+      
+      // Get random bootstrap node for load balancing
+      const apiUrl = this.getRandomBootstrapNode();
+      
+      // Query account balance from blockchain
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout
+      
+      // CORRECTED: Use /api/v1/account/{address}/balance endpoint
+      const response = await fetch(`${apiUrl}/api/v1/account/${address}/balance`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        // Account not found or error - return 0
+        return 0;
+      }
+      
+      const data = await response.json();
+      
+      // Balance is in nanoQNC (1 QNC = 1e9 nanoQNC)
+      const balanceNano = data.balance || 0;
+      const balanceQNC = balanceNano / 1e9;
+      
+      return balanceQNC;
+    } catch (error) {
+      // Network error or timeout - return 0
+      // console.error('Error getting QNC balance:', error);
+      return 0;
+    }
+  }
+
   // CACHE: Network size (avoid spamming bootstrap nodes)
   _networkSizeCache = null;
   _networkSizeCacheTime = 0;
