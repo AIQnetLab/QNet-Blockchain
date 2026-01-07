@@ -125,15 +125,22 @@ function transformTransaction(
   
   // Allow system addresses for reward/emission transactions
   const isSystemAddress = from.startsWith('system_') || from === 'system_emission' || from === 'system_rewards_pool';
-  const txType = String(tx.tx_type || tx.type || '').toLowerCase();
-  const isRewardTx = txType.includes('reward') || txType.includes('emission');
   
-  // For reward transactions, allow system addresses; for others, require valid address format
-  if (!isSystemAddress && !isRewardTx && !/^[a-f0-9]{40,}$/i.test(from)) {
-    // Not a system address and not a reward transaction - validate it's a proper hex address
-    // But don't filter it out - just log a warning
-    console.warn(`[Sync] Non-standard from address: ${from.substring(0, 32)} (tx_type: ${txType})`);
-  }
+  // Handle tx_type as either string or object (e.g. { NodeRegistration: {...} })
+  const txTypeRaw = tx.tx_type || tx.type;
+  const txTypeStr = typeof txTypeRaw === 'string' ? txTypeRaw : (typeof txTypeRaw === 'object' && txTypeRaw ? JSON.stringify(txTypeRaw) : '');
+  const txType = txTypeStr.toLowerCase();
+  
+  const isRewardTx = txType.includes('reward') || txType.includes('emission');
+  const isSystemTx = txType.includes('noderegistration') || txType.includes('smartcontract') || txType.includes('createaccount') || txType.includes('contractcall');
+  
+  // For system transactions, allow any address format (including non-hex)
+  // These transactions may have non-standard addresses and amount = 0
+  // Address validation is too strict for genesis/activation transactions - just accept all valid UTF-8
+  // if (!isSystemAddress && !isRewardTx && !isSystemTx && !/^[a-f0-9]{40,}$/i.test(from)) {
+  //   console.warn(`[Sync] Non-standard from address: ${from.substring(0, 32)} (tx_type: ${txType})`);
+  // }
+  // NOTE: Commented out strict validation - accepting all addresses to capture genesis/activation transactions
 
   const to = tx.to ? String(tx.to) : (tx.to_address ? String(tx.to_address) : null);
   if (to && to.length > 128) {
@@ -172,9 +179,10 @@ interface BlockData {
 // Fetch block from node with validation
 async function fetchBlock(height: number): Promise<{ block: BlockData; height: number } | null> {
   try {
-    const res = await fetch(`${NODE_RPC_URL}/api/v1/blockchain/block/${height}`, {
+    // Увеличен таймаут до 30 секунд для больших блоков (например, block 0 с 1007 транзакциями)
+    const res = await fetch(`${NODE_RPC_URL}/api/v1/block/${height}`, {
       cache: 'no-store',
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(30000),
     });
 
     if (!res.ok) return null;
@@ -242,8 +250,8 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
       block.transactions = block.transactions.slice(0, MAX_TXS_PER_BLOCK);
     }
     
-    // Log transaction count for debugging
-    if (Array.isArray(block.transactions) && block.transactions.length > 0) {
+    // Log transaction count only for blocks with many transactions
+    if (Array.isArray(block.transactions) && block.transactions.length > 100) {
       console.log(`[Sync] Block ${height} has ${block.transactions.length} transactions`);
     }
     
@@ -264,7 +272,7 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
 async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
   try {
     // Get current height from node
-    const heightRes = await fetch(`${NODE_RPC_URL}/api/v1/blockchain/height`, {
+    const heightRes = await fetch(`${NODE_RPC_URL}/api/v1/height`, {
       cache: 'no-store',
       signal: AbortSignal.timeout(5000),
     });
@@ -389,9 +397,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
         }
       }
 
-      if (txs.length > 0 && transformedCount > 0) {
-        console.log(`[Sync] Block ${height}: ${txs.length} total, ${transformedCount} transformed, ${skippedCount} skipped`);
-      }
+      // Silent processing (only log errors via transformTransaction warnings)
 
       maxHeight = Math.max(maxHeight, height);
     }
@@ -409,7 +415,8 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       seenHashes.add(tx.hash);
       uniqueTransactions.push(tx);
     }
-    if (duplicateCount > 0) {
+    // Log only if filtering out many duplicates (e.g., block 0)
+    if (duplicateCount > 100) {
       console.log(`[Sync] Filtered out ${duplicateCount} duplicate transactions`);
     }
 
@@ -489,7 +496,7 @@ async function verifyDataIntegrity(): Promise<void> {
   isVerifying = true;
   
   try {
-    console.log('[Integrity] Starting integrity check...');
+    // Integrity check (silent)
 
     // Limit integrity check to prevent DoS (max 50 transactions per check)
     const MAX_INTEGRITY_CHECK = 50;
@@ -513,7 +520,7 @@ async function verifyDataIntegrity(): Promise<void> {
       const dbTx = dbTxResult.rows[0];
 
       // Get from node (source of truth)
-      const nodeRes = await fetch(`${NODE_RPC_URL}/api/v1/blockchain/transaction/${hash}`, {
+      const nodeRes = await fetch(`${NODE_RPC_URL}/api/v1/transaction/${hash}`, {
         cache: 'no-store',
         signal: AbortSignal.timeout(3000),
       });
@@ -607,25 +614,15 @@ let integrityInterval: NodeJS.Timeout | null = null;
 let isSyncing = false; // Lock to prevent concurrent syncs
 
 export function startSyncService(): void {
-  console.log('[Sync] Starting sync service...');
-  console.log('[Sync] NODE_RPC_URL:', NODE_RPC_URL);
-  console.log('[Sync] SYNC_INTERVAL:', SYNC_INTERVAL);
+  console.log('[Sync] Service started');
 
-  // Initial sync
-  console.log('[Sync] Starting initial sync...');
+  // Initial sync (silent)
   syncBlocks()
-    .then(({ added, currentHeight }) => {
-      console.log(`[Sync] Initial sync complete, added ${added} transactions, current height: ${currentHeight}`);
-    })
     .catch(err => {
       console.error('[Sync] Initial sync failed:', err);
-      if (err instanceof Error) {
-        console.error('[Sync] Error message:', err.message);
-        console.error('[Sync] Error stack:', err.stack);
-      }
     });
 
-  // Periodic sync with lock
+  // Periodic sync with lock (silent, only log new transactions)
   syncInterval = setInterval(() => {
     if (isSyncing) {
       return;
@@ -634,12 +631,13 @@ export function startSyncService(): void {
     isSyncing = true;
     syncBlocks()
       .then(({ added }) => {
+        // Only log if transactions were added
         if (added > 0) {
-          console.log(`[Sync] Synced ${added} new transactions`);
+          console.log(`[Sync] +${added} transactions`);
         }
       })
       .catch(err => {
-        console.error('[Sync] Error in periodic sync:', err);
+        console.error('[Sync] Sync failed:', err);
       })
       .finally(() => {
         isSyncing = false;

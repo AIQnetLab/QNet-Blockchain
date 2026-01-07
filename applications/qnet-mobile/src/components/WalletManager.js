@@ -4774,11 +4774,11 @@ export class WalletManager {
       const publicKeyBytes = regeneratedKeypair.publicKey;
       
       // PRODUCTION: Create Ed25519 signature for transaction
-      // Format matches validator's create_client_signing_message: "transfer:from:to:amount:gas_price:gas_limit"
+      // v2.77: Format includes nonce for replay protection (Ethereum-style)
+      // Format: "transfer:from:to:amount:nonce:gas_price:gas_limit"
       const amountSmallest = Math.floor(amount * 1_000_000_000); // Convert QNC to smallest unit (9 decimals)
       const gasPrice = 1;
       const gasLimit = 10_000;
-      const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${gasPrice}:${gasLimit}`;
       const messageBytes = new TextEncoder().encode(message);
       
       // Sign with Ed25519 (nacl needs 64-byte secret key = privateKey + publicKey)
@@ -4795,6 +4795,23 @@ export class WalletManager {
       // Get random bootstrap node
       const apiUrl = this.getRandomBootstrapNode();
       
+      // CRITICAL v2.77: Get current nonce from blockchain state for replay protection
+      let currentNonce = 0;
+      try {
+        const accountResponse = await fetch(`${apiUrl}/api/v1/account/${fromAddress}`);
+        if (accountResponse.ok) {
+          const accountData = await accountResponse.json();
+          currentNonce = accountData.nonce || 0;
+        }
+      } catch (nonceError) {
+        console.warn('[WalletManager] Failed to fetch nonce, using 0:', nonceError);
+      }
+      
+      // v2.77: Create signature message with nonce (Ethereum-style)
+      // CRITICAL: nonce in TX = account.nonce + 1 (like Ethereum)
+      const txNonce = currentNonce + 1;
+      const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${txNonce}:${gasPrice}:${gasLimit}`;
+      
       // Submit transaction to REST API (uses handle_transaction_submit endpoint)
       const response = await fetch(`${apiUrl}/api/v1/transaction`, {
         method: 'POST',
@@ -4809,7 +4826,7 @@ export class WalletManager {
           public_key: publicKeyHex,
           gas_price: gasPrice,
           gas_limit: gasLimit,
-          nonce: 0 // Server will assign correct nonce from account state
+          nonce: txNonce // v2.77: account.nonce + 1 (Ethereum-style)
         })
       });
       

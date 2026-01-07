@@ -3425,12 +3425,13 @@ async fn handle_transaction_submit(
     // =========================================================================
     
     // Build message to verify (canonical format)
-    // v2.43: Changed from nonce to gas_price:gas_limit for client compatibility
-    // This is MORE secure: different gas params = different signature = replay-resistant
-    let message_to_sign = format!("transfer:{}:{}:{}:{}:{}", 
+    // v2.77: Include nonce in signature for replay protection (Ethereum-style)
+    // Format: "transfer:from:to:amount:nonce:gas_price:gas_limit"
+    let message_to_sign = format!("transfer:{}:{}:{}:{}:{}:{}", 
         tx_request.from, 
         tx_request.to,
         tx_request.amount,
+        tx_request.nonce,
         tx_request.gas_price,
         tx_request.gas_limit
     );
@@ -3488,11 +3489,11 @@ async fn handle_transaction_submit(
         println!("[TX-QUANTUM] 🔐 Transaction with Dilithium signature from {}", &tx_request.from[..16.min(tx_request.from.len())]);
     }
 
-    // PRODUCTION v2.26: Use bincode hash for consistency with mempool
-    // This ensures client receives the SAME hash as stored in mempool
+    // PRODUCTION v2.77: Use BLAKE3 via calculate_hash() for consistency
+    // This ensures client receives the SAME hash as stored in blockchain
     match bincode::serialize(&tx) {
         Ok(tx_bytes) => {
-            let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
+            let tx_hash = tx.calculate_hash();
             
             // Add to mempool using public method
             match blockchain.add_transaction_to_mempool(tx).await {
@@ -6710,17 +6711,11 @@ async fn handle_claim_rewards(
         dilithium_public_key: claim_request.dilithium_public_key.clone(),
     };
     
-    // Calculate transaction hash
-    tx.hash = tx.calculate_hash();
+    // CRITICAL FIX v2.76.2: DON'T calculate hash here!
+    // submit_transaction() will calculate SHA3(bincode) hash and return it
+    // Using tx.calculate_hash() (BLAKE3) creates WRONG hash that doesn't match blockchain!
     
-    println!("[INFO][CLAIM] tx_created node={} wallet={}... amount={} QNC hash={} security={}",
-             claim_request.node_id,
-             &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())],
-             reward_amount / 1_000_000_000,
-             &tx.hash[..16.min(tx.hash.len())],
-             if has_dilithium { "quantum" } else { "standard" });
-    
-    // Submit transaction to blockchain
+    // Submit transaction to blockchain (will calculate correct SHA3(bincode) hash)
     match blockchain.submit_transaction(tx.clone()).await {
         Ok(tx_hash) => {
             println!("[INFO][CLAIM] tx_submitted node={} hash={}", claim_request.node_id, tx_hash);

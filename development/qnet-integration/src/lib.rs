@@ -202,9 +202,9 @@ impl QNetBlockchain {
     
     /// Add transaction to mempool
     pub async fn add_transaction(&self, tx: Transaction) -> IntegrationResult<()> {
-        // PRODUCTION v2.26: Use bincode for consistency with block production
+        // PRODUCTION v2.77: Use BLAKE3 via calculate_hash() for consistency
+        let tx_hash = tx.calculate_hash();
         let tx_bytes = bincode::serialize(&tx).map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-        let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
         
         // PRODUCTION v2.26: Add binary transaction for consistency
         self.mempool.add_binary_transaction(tx_bytes, tx_hash, tx.gas_price);

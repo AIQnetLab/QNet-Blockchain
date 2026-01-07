@@ -8722,9 +8722,9 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // v2.67: CRITICAL - Add emission TX DIRECTLY to block (bypass mempool!)
                     // This is how top L1s work: Bitcoin coinbase, Ethereum block reward
                     let tx_bytes_list: Vec<(String, Vec<u8>)> = if let Some(emission_tx) = direct_emission_tx {
-                        // Serialize emission TX
+                        // v2.77: Use BLAKE3 via calculate_hash() for consistency
+                        let tx_hash = emission_tx.calculate_hash();
                         let tx_bytes = bincode::serialize(&emission_tx).unwrap_or_default();
-                        let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
                         
                         println!("[EMISSION] 📦 Adding emission TX directly to block (hash={})", 
                                 &tx_hash[..16.min(tx_hash.len())]);
@@ -16834,11 +16834,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if is_info() { println!("[INFO][TX] system_tx_bypass_validation from={}", tx.from); }
         }
         
-        // PRODUCTION v2.26: Use bincode for 10-20x faster serialization
-        // CRITICAL: Use SHA3(bincode) hash consistently everywhere
+        // PRODUCTION v2.77: Use BLAKE3 via calculate_hash() for consistency
+        // CRITICAL: calculate_hash() excludes signature - no circular dependency!
+        // This ensures TX hash is the same everywhere (mobile, explorer, blockchain)
+        let tx_hash = tx.calculate_hash();
+        
+        // bincode still used for mempool storage (fast binary serialization)
         let tx_bytes = bincode::serialize(&tx)
             .map_err(|e| QNetError::SerializationError(format!("Failed to serialize transaction: {}", e)))?;
-        let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
         
         // v2.26: Direct access - SimpleMempool is already thread-safe
         // No external lock needed - eliminates 100K TPS bottleneck!
@@ -17251,8 +17254,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // Add to mempool (NO BROADCAST - already received from network)
         // v2.26: Direct access - SimpleMempool is already thread-safe
+        // v2.77: Use BLAKE3 via calculate_hash() for consistency
+        let tx_hash = tx.calculate_hash();
         let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
-        let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
         
         if !self.mempool.add_binary_transaction(tx_bytes, tx_hash, tx.gas_price) {
                 return Err(QNetError::ValidationError("Transaction already in mempool or mempool full".to_string()));
@@ -17292,8 +17296,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // Add to mempool - v2.26: Direct access - SimpleMempool is already thread-safe
+        // v2.77: Use BLAKE3 via calculate_hash() for consistency
+        let tx_hash = tx.calculate_hash();
         let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
-        let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
         self.mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), tx.gas_price);
         
         // PRODUCTION v2.26: Full P2P broadcast for realistic testing
@@ -17355,8 +17360,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
             
             // PRODUCTION v2.25: bincode serialization (10-20x faster than JSON)
+            // v2.77: Use BLAKE3 via calculate_hash() for consistency
             if let Ok(tx_bytes) = bincode::serialize(&tx) {
-                let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
+                let tx_hash = tx.calculate_hash();
                 valid_txs.push((tx_bytes, tx_hash, tx.gas_price));
                 confirmed += 1;
             }
