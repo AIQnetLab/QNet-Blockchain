@@ -6395,6 +6395,42 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                 );
                                                 println!("[GENESIS] 🔒 GLOBAL_GENESIS_TIMESTAMP set to: {}", genesis_microblock.timestamp);
                                                 
+                                                // Display economic information (halving & phase)
+                                                {
+                                                    use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
+                                                    let reward_mgr = PhaseAwareRewardManager::new(genesis_microblock.timestamp);
+                                                    let years = reward_mgr.get_years_since_genesis();
+                                                    let halving_cycle = years / 4;
+                                                    let years_until_halving = 4 - (years % 4);
+                                                    let pool1_emission = (reward_mgr.get_pool1_base_emission() as f64) / 1_000_000_000.0;
+                                                    
+                                                    // Determine halving type (normal ÷2 or sharp ÷10)
+                                                    let next_cycle = halving_cycle + 1;
+                                                    let halving_type = if next_cycle == 5 {
+                                                        "÷10_SHARP"
+                                                    } else {
+                                                        "÷2"
+                                                    };
+                                                    
+                                                    println!("[INFO][ECON] genesis_age={} halving_cycle={} cycle_window={}-{} next_halving={} halving_type={} pool1_emission={:.2}", 
+                                                        years, halving_cycle, halving_cycle * 4, (halving_cycle + 1) * 4, years_until_halving, halving_type, pool1_emission);
+                                                    
+                                                    // Get Phase info (Phase 1 = 1DEV burn, Phase 2 = QNC economy)
+                                                    let burn_pct = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                                                    if burn_pct >= 90.0 || years >= 5 {
+                                                        println!("[INFO][PHASE] phase=2 type=QNC_Economy status=active");
+                                                    } else {
+                                                        let burn_remaining = 90.0 - burn_pct;
+                                                        if years >= 5 {
+                                                            println!("[INFO][PHASE] phase=1 type=1DEV_Burn burn_pct={:.1} time_trigger=READY status=transition_pending", burn_pct);
+                                                        } else {
+                                                            let years_to_phase2 = 5 - years;
+                                                            println!("[INFO][PHASE] phase=1 type=1DEV_Burn burn_pct={:.1} burn_remaining={:.1} years_to_phase2={} status=active", 
+                                                                burn_pct, burn_remaining, years_to_phase2);
+                                                        }
+                                                    }
+                                                }
+                                                
                                                 // CRITICAL FIX v2.21.2: Wait for QUIC connections to be FULLY established
                                                 // Root cause: Node 001 was broadcasting Genesis before Node 005's QUIC listener
                                                 // had fully processed the incoming connection, causing Genesis to be lost

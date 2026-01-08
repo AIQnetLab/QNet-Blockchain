@@ -2835,35 +2835,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📡 Endpoints: P2P={} RPC={} API={}", 
         config.p2p_port, config.rpc_port, std::env::var("QNET_CURRENT_API_PORT").unwrap_or("8001".to_string()));
     
-    // Display economic information (halving & phase) using reward manager
-    let genesis_ts = GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
-    if genesis_ts > 0 {
-        use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
-        let reward_mgr = PhaseAwareRewardManager::new(genesis_ts);
-        let years = reward_mgr.get_years_since_genesis();
-        let halving_cycle = years / 4;
-        let years_until_halving = 4 - (years % 4);
-        let pool1_emission = (reward_mgr.get_pool1_base_emission() as f64) / 1_000_000_000.0;
-        
-        println!("[INFO][ECON] genesis_age={} halving_cycle={} cycle_window={}-{} next_halving={} pool1_emission={:.2}", 
-            years, halving_cycle, halving_cycle * 4, (halving_cycle + 1) * 4, years_until_halving, pool1_emission);
-        
-        let (phase, pricing) = detect_current_phase().await;
-        if phase == 2 {
-            println!("[INFO][PHASE] phase=2 type=QNC_Economy status=active");
-        } else {
-            let burn_remaining = 90.0 - pricing.burn_percentage;
-            if years >= 5 {
-                println!("[INFO][PHASE] phase=1 type=1DEV_Burn burn_pct={:.1} time_trigger=READY status=transition_pending", 
-                    pricing.burn_percentage);
-            } else {
-                let years_to_phase2 = 5 - years;
-                println!("[INFO][PHASE] phase=1 type=1DEV_Burn burn_pct={:.1} burn_remaining={:.1} years_to_phase2={} status=active", 
-                    pricing.burn_percentage, burn_remaining, years_to_phase2);
-            }
-        }
-    }
-    
     println!("");
     println!("📖 View detailed logs: docker logs -f qnet-node");
     println!("🔍 Filter blockchain logs: docker logs qnet-node | grep \"Block #\\|Syncing\\|Macroblock\"");
