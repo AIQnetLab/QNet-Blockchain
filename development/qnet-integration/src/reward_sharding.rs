@@ -151,7 +151,7 @@ impl ShardedRewardManager {
                     // Light nodes: ANY reputation (mobile-friendly)
                     // Full/Super/Genesis: reputation >= 70 (maintain network quality)
                     use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
-                    let eligible = match node_type.as_str() {
+                    let eligible = match node_type.to_lowercase().as_str() {
                         "light" => true, // Light nodes always eligible (just need to answer pings)
                         "full" | "super" => reputation >= MIN_CONSENSUS_REPUTATION,
                         _ => reputation >= MIN_CONSENSUS_REPUTATION,
@@ -159,7 +159,7 @@ impl ShardedRewardManager {
                     
                     if eligible {
                         total_eligible_nodes += 1;
-                        match node_type.as_str() {
+                        match node_type.to_lowercase().as_str() {
                             "super" => eligible_super_nodes += 1,
                             "full" => eligible_full_nodes += 1,
                             "light" => eligible_light_nodes += 1,
@@ -296,7 +296,7 @@ impl ShardedRewardManager {
                 // Load node registration
                 if let Some((node_type, wallet, reputation)) = storage.load_node_registration(&node_id)? {
                     // Check eligibility based on ping requirements
-                    let meets_ping_requirements = match node_type.as_str() {
+                    let meets_ping_requirements = match node_type.to_lowercase().as_str() {
                         "light" => {
                             // Light: binary - must respond to the 1 ping (100%)
                             total_pings == 1 && successful_pings == 1
@@ -315,7 +315,7 @@ impl ShardedRewardManager {
                     // Reputation requirements by node type:
                     // Light: ANY reputation (mobile devices, don't participate in consensus)
                     // Full/Super: >= MIN_CONSENSUS_REPUTATION (must maintain network quality)
-                    let eligible_for_new_rewards = match node_type.as_str() {
+                    let eligible_for_new_rewards = match node_type.to_lowercase().as_str() {
                         "light" => true, // Light nodes: no reputation requirement
                         "full" | "super" => reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION,
                         _ => reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION,
@@ -384,8 +384,8 @@ impl ShardedRewardManager {
                             // Super: 70% divided by ONLY super nodes
                             // Full: 30% divided by ONLY full nodes
                             // Light: 0% (don't process transactions)
-                            // v2.64: No fallbacks - must have real eligible counts
-                            match node_type.as_str() {
+                            // v2.64: No fallbacks - must have real eligible counts (case-insensitive)
+                            match node_type.to_lowercase().as_str() {
                                 "super" => {
                                     let super_pool = (total_fees * 70) / 100;
                                     if let Some(ref counts) = node_counts {

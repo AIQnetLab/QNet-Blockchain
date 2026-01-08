@@ -679,7 +679,7 @@ impl BlockchainActivationRegistry {
         // Determine node type from activation code
         let node_type = self.determine_node_type_from_code(code).await?;
         
-        match node_type.as_str() {
+        match node_type.to_lowercase().as_str() {
             "light" => {
                 // LIGHT NODES: Simple device switching (no rate limiting needed)
                 println!("📱 Light node device switch - simple device management");
@@ -2748,7 +2748,7 @@ impl BlockchainActivationRegistry {
         let mut super_count = 0u64;
         
         for node in active_nodes.values() {
-            match node.node_type.as_str() {
+            match node.node_type.to_lowercase().as_str() {
                 "light" => light_count += 1,
                 "full" => full_count += 1,
                 "super" => super_count += 1,

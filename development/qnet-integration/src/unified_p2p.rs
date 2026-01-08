@@ -6961,13 +6961,13 @@ impl SimplifiedP2P {
         let reputation = self.get_node_reputation_from_blockchain(node_id);
         
         // Use node_type from QUIC handshake (real value from remote node)
-        // UNIFIED: All node_type strings are lowercase ("super", "full", "light")
-        let node_type = match quic_node_type.as_str() {
+        // UNIFIED: All node_type strings normalized to lowercase for comparison
+        let node_type = match quic_node_type.to_lowercase().as_str() {
             "super" => NodeType::Super,
             "full" => NodeType::Full,
             "light" => NodeType::Light, // Light nodes won't be here, but handle for completeness
             _ => {
-                // Fallback for legacy/unknown formats - try lowercase
+                // Fallback for legacy/unknown formats
                 match quic_node_type.to_lowercase().as_str() {
                     "super" => NodeType::Super,
                     "full" => NodeType::Full,
@@ -7555,7 +7555,7 @@ impl SimplifiedP2P {
                             if let Some(active_info_ref) = self.active_full_super_nodes.get(&node_id) {
                                 let active_info = active_info_ref.value();
                                 // Create PeerInfo from ActiveNodeInfo - use REAL data!
-                                let node_type = match active_info.node_type.as_str() {
+                                let node_type = match active_info.node_type.to_lowercase().as_str() {
                                     "super" => NodeType::Super,
                                     "full" => NodeType::Full,
                                     _ => NodeType::Super, // Genesis are Super
@@ -13715,8 +13715,8 @@ impl SimplifiedP2P {
                     return None;
                 }
                 
-                // Check eligibility threshold
-                let required = match node_type.as_str() {
+                // Check eligibility threshold (case-insensitive)
+                let required = match node_type.to_lowercase().as_str() {
                     "super" => 9,
                     "full" => 8,
                     _ => 10,
@@ -13821,8 +13821,8 @@ impl SimplifiedP2P {
                     return false;
                 }
                 
-                // Filter by eligibility: Full >= 8/10, Super >= 9/10
-                match node_type.as_str() {
+                // Filter by eligibility: Full >= 8/10, Super >= 9/10 (case-insensitive)
+                match node_type.to_lowercase().as_str() {
                     "super" => *count >= 9,
                     "full" => *count >= 8,
                     _ => false,

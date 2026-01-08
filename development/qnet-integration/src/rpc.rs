@@ -5684,8 +5684,8 @@ async fn handle_server_node_status(
                 
                 let heartbeat_count = node_heartbeats.len() as u8;
                 
-                // Determine required heartbeats based on node type
-                let required_heartbeats = match node_type.as_str() {
+                // Determine required heartbeats based on node type (case-insensitive)
+                let required_heartbeats = match node_type.to_lowercase().as_str() {
                     "super" => 9,  // Super nodes need 9/10
                     _ => 8,        // Full nodes need 8/10
                 };

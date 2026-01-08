@@ -1553,7 +1553,7 @@ impl BlockchainNode {
                 .map(|(_, wallet, _)| wallet)
                 .unwrap_or_else(|| generate_eon_address_from_id(&node_id));
             
-            let reward_type = match node_type.as_str() {
+            let reward_type = match node_type.to_lowercase().as_str() {
                 "super" => RewardNodeType::Super,
                 _ => RewardNodeType::Full,
             };
@@ -2843,7 +2843,7 @@ impl BlockchainNode {
                             let (node_type, wallet) = match registration {
                                 Ok(Some((node_type_str, wallet, _reputation))) => {
                                     // Normal case: node found in storage
-                                    let nt = match node_type_str.as_str() {
+                                    let nt = match node_type_str.to_lowercase().as_str() {
                                         "light" => RewardNodeType::Light,
                                         "full" => RewardNodeType::Full,
                                         "super" => RewardNodeType::Super,
@@ -11903,7 +11903,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     let validated_peers = p2p.get_validated_active_peers();
                     
                     let mut fallback_list: Vec<(String, f64)> = validated_peers.iter()
-                        .filter(|peer| peer.node_type != NodeType::Light)
+                        .filter(|peer| !matches!(peer.node_type, crate::unified_p2p::NodeType::Light))
                         .map(|peer| {
                             // Get REAL reputation from deterministic state
                             let rep = p2p.get_deterministic_reputation()

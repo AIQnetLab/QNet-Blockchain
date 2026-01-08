@@ -1025,7 +1025,7 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Invalid wallet address"));
         }
 
-        if !["light", "full", "super"].contains(&payload.node_type.as_str()) {
+        if !["light", "full", "super"].contains(&payload.node_type.to_lowercase().as_str()) {
             return Err(anyhow!("Invalid node type: {}", payload.node_type));
         }
 

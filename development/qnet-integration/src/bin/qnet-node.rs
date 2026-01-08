@@ -19,6 +19,7 @@
 use qnet_integration::node::{BlockchainNode, NodeType, Region};
 use qnet_integration::quantum_crypto::{QNetQuantumCrypto, ActivationPayload};
 use qnet_integration::unified_p2p::get_privacy_id_for_addr;
+use qnet_integration::GLOBAL_GENESIS_TIMESTAMP;
 // No clap - fully automatic configuration
 use std::path::PathBuf;
 use std::time::Duration;
@@ -69,8 +70,8 @@ async fn decode_activation_code_quantum_secure(
     let payload = quantum_crypto.decrypt_activation_code(code).await
         .map_err(|e| format!("Quantum decryption failed: {}", e))?;
 
-    // 2. Parse node type from payload
-    let node_type = match payload.node_type.as_str() {
+    // 2. Parse node type from payload (case-insensitive)
+    let node_type = match payload.node_type.to_lowercase().as_str() {
         "light" => NodeType::Light,
         "full" => NodeType::Full,
         "super" => NodeType::Super,
@@ -671,30 +672,19 @@ struct PricingInfo {
     
 // Check if 5 years have passed since QNet mainnet launch
 async fn is_five_years_passed_since_mainnet() -> bool {
-    // QNet mainnet launch timestamp - get from blockchain or use current time
-    let mainnet_launch_timestamp = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or_else(|| {
-            // Network not launched yet or timestamp not set
-            // Use current time as fallback (0 years passed)
-            chrono::Utc::now().timestamp()
-        });
-    
-    let current_timestamp = chrono::Utc::now().timestamp();
-    let five_years_in_seconds = 5 * 365 * 24 * 60 * 60; // 5 years in seconds
-    
-    let years_passed = (current_timestamp - mainnet_launch_timestamp) / (365 * 24 * 60 * 60);
-    
-    println!("📅 Time check: {:.2} years passed since mainnet launch", 
-             years_passed as f64);
-    
-    // Only consider 5 years passed if we have a valid launch timestamp
-    if mainnet_launch_timestamp > 1700000000 { // After 2023-11-14 (sanity check)
-        (current_timestamp - mainnet_launch_timestamp) >= five_years_in_seconds
-    } else {
-        false // Network not launched yet
+    // PRODUCTION v2.85: Use PhaseAwareRewardManager (real Genesis timestamp)
+    let genesis_ts = GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+    if genesis_ts == 0 {
+        return false; // Genesis block not created yet
     }
+    
+    use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
+    let reward_mgr = PhaseAwareRewardManager::new(genesis_ts);
+    let years_passed = reward_mgr.get_years_since_genesis();
+    
+    println!("📅 Time check: {} years passed since Genesis block", years_passed);
+    
+    years_passed >= 5
 }
 
 // Detect current phase with proper transition logic
@@ -807,15 +797,15 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
 
 // Get years since mainnet launch
 async fn get_years_since_mainnet() -> f64 {
-    let mainnet_launch_timestamp = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    // PRODUCTION v2.85: Use PhaseAwareRewardManager (real Genesis timestamp)
+    let genesis_ts = GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+    if genesis_ts == 0 {
+        return 0.0;
+    }
     
-    let current_timestamp = chrono::Utc::now().timestamp();
-    let years_passed = (current_timestamp - mainnet_launch_timestamp) as f64 / (365.0 * 24.0 * 60.0 * 60.0);
-    
-    years_passed
+    use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
+    let reward_mgr = PhaseAwareRewardManager::new(genesis_ts);
+    reward_mgr.get_years_since_genesis() as f64
 }
 
 // Real blockchain data structure
@@ -2844,6 +2834,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         region, node_type, external_ip);
     println!("📡 Endpoints: P2P={} RPC={} API={}", 
         config.p2p_port, config.rpc_port, std::env::var("QNET_CURRENT_API_PORT").unwrap_or("8001".to_string()));
+    
+    // Display economic information (halving & phase) using reward manager
+    let genesis_ts = GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+    if genesis_ts > 0 {
+        use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
+        let reward_mgr = PhaseAwareRewardManager::new(genesis_ts);
+        let years = reward_mgr.get_years_since_genesis();
+        let halving_cycle = years / 4;
+        let years_until_halving = 4 - (years % 4);
+        let pool1_emission = (reward_mgr.get_pool1_base_emission() as f64) / 1_000_000_000.0;
+        
+        println!("[INFO][ECON] genesis_age={} halving_cycle={} cycle_window={}-{} next_halving={} pool1_emission={:.2}", 
+            years, halving_cycle, halving_cycle * 4, (halving_cycle + 1) * 4, years_until_halving, pool1_emission);
+        
+        let (phase, pricing) = detect_current_phase().await;
+        if phase == 2 {
+            println!("[INFO][PHASE] phase=2 type=QNC_Economy status=active");
+        } else {
+            let burn_remaining = 90.0 - pricing.burn_percentage;
+            if years >= 5 {
+                println!("[INFO][PHASE] phase=1 type=1DEV_Burn burn_pct={:.1} time_trigger=READY status=transition_pending", 
+                    pricing.burn_percentage);
+            } else {
+                let years_to_phase2 = 5 - years;
+                println!("[INFO][PHASE] phase=1 type=1DEV_Burn burn_pct={:.1} burn_remaining={:.1} years_to_phase2={} status=active", 
+                    pricing.burn_percentage, burn_remaining, years_to_phase2);
+            }
+        }
+    }
+    
     println!("");
     println!("📖 View detailed logs: docker logs -f qnet-node");
     println!("🔍 Filter blockchain logs: docker logs qnet-node | grep \"Block #\\|Syncing\\|Macroblock\"");
@@ -3815,31 +3835,19 @@ async fn start_reward_claiming_service(wallet_key: String, node_type: String) {
 }
 
 async fn calculate_base_reward() -> Result<f64, String> {
-    // Sharp drop economic model: normal halving (÷2) except 5th halving (÷10)
-    // Years 0-4: 245,100.67 QNC per 4-hour period
-    // Years 4-8: 122,550.33 QNC per 4-hour period (÷2)
-    // Years 8-12: 61,275.17 QNC per 4-hour period (÷2)
-    // Years 12-16: 30,637.58 QNC per 4-hour period (÷2)
-    // Years 16-20: 15,318.79 QNC per 4-hour period (÷2)
-    // Years 20-24: 1,531.88 QNC per 4-hour period (÷10 SHARP DROP!)
-    // Years 24+: Resume normal halving (÷2) but from much lower base
+    // PRODUCTION v2.85: Use PhaseAwareRewardManager (no duplication!)
+    // Real halving logic is in core/qnet-consensus/src/lazy_rewards.rs
+    let genesis_ts = GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+    if genesis_ts == 0 {
+        return Ok(0.0);
+    }
     
-    let years_since_genesis = 0; // In production: Calculate from genesis block
-    let halving_cycles = years_since_genesis / 4;
+    use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
+    let reward_manager = PhaseAwareRewardManager::new(genesis_ts);
+    let pool1_emission = reward_manager.get_pool1_base_emission();
     
-    let base_rate = if halving_cycles == 5 {
-        // 5th halving (year 20-24): Sharp drop by 10x instead of 2x
-        251_432.34 / (2.0_f64.powi(4) * 10.0) // Previous 4 halvings (÷2) then sharp drop (÷10)
-    } else if halving_cycles > 5 {
-        // After sharp drop: Resume normal halving from new low base
-        let normal_halvings = halving_cycles - 5;
-        251_432.34 / (2.0_f64.powi(4) * 10.0 * 2.0_f64.powi(normal_halvings as i32))
-    } else {
-        // Normal halving for first 5 cycles (20 years) - CORRECTED to match whitepaper
-        251_432.34 / (2.0_f64.powi(halving_cycles as i32))
-    };
-    
-    Ok(base_rate)
+    // Convert from nanoQNC to QNC
+    Ok((pool1_emission as f64) / 1_000_000_000.0)
 }
 
 async fn calculate_fee_share(node_type_str: &str) -> Result<f64, String> {
@@ -3909,12 +3917,13 @@ async fn try_query_node(addr: &str) -> Result<NodeInfo, String> {
         Ok(response) => {
             if response.status().is_success() {
                 if let Ok(text) = response.text().await {
-                    // Simple parsing of node type from response
-                    let node_type = if text.contains("Light") {
+                    // Simple parsing of node type from response (case-insensitive)
+                    let text_lower = text.to_lowercase();
+                    let node_type = if text_lower.contains("light") {
                         "Light".to_string()
-                    } else if text.contains("Super") {
+                    } else if text_lower.contains("super") {
                         "Super".to_string()
-                    } else if text.contains("Full") {
+                    } else if text_lower.contains("full") {
                         "Full".to_string()
                     } else {
                         "Unknown".to_string()
@@ -4077,10 +4086,10 @@ async fn scan_active_qnet_nodes() -> (RealNodeCounts, Vec<String>) {
     
     for peer_addr in discovered_peers.clone() {
         if let Ok(node_info) = query_node_info(&peer_addr).await {
-            match node_info.node_type.as_str() {
-                "Light" => counts.light += 1,
-                "Full" => counts.full += 1,
-                "Super" => counts.super_nodes += 1,
+            match node_info.node_type.to_lowercase().as_str() {
+                "light" => counts.light += 1,
+                "full" => counts.full += 1,
+                "super" => counts.super_nodes += 1,
                 _ => {}
             }
             counts.total += 1;

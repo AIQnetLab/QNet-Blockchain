@@ -2203,7 +2203,7 @@ impl Storage {
         // - Super/Bootstrap: Full blocks, NO pruning (~2TB, complete history)
         // ============================================================================
         
-        let (storage_mode, max_storage_gb, base_window, tier_config) = match node_type.as_str() {
+        let (storage_mode, max_storage_gb, base_window, tier_config) = match node_type.to_lowercase().as_str() {
             "light" => (
                 StorageMode::Light, 
                 1,  // ~100 MB
