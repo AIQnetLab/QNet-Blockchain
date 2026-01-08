@@ -2280,6 +2280,23 @@ impl BlockchainNode {
                 std::env::set_var("QNET_STORAGE_PATH", data_dir);
                 if is_debug() { println!("[DBG][NODE] storage_path_env={}", data_dir); }
                 
+                // CRITICAL FIX v2.64: Verify and repair chain_height desync at startup
+                // Detects if metadata CF is stuck but blocks CF has newer blocks
+                // Uses binary search O(log n) - only runs once at startup
+                if is_info() { println!("[INFO][NODE] verify_chain_height_start"); }
+                match storage_arc.as_ref().verify_and_repair_chain_height() {
+                    Ok(repaired) => {
+                        if repaired {
+                            println!("[INFO][NODE] chain_height_repaired desync_fixed=true");
+                        } else if is_debug() {
+                            println!("[DBG][NODE] chain_height_ok no_desync");
+                        }
+                    }
+                    Err(e) => {
+                        println!("[WARN][NODE] chain_height_verify_failed error={}", e);
+                    }
+                }
+                
                 // POH STATE MIGRATION (v2.19.13): Migrate existing blocks to have separate PoH state
                 // This enables O(1) PoH validation without loading full blocks
                 // Migration is idempotent and only runs once per block
@@ -11252,6 +11269,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 NodeType::Light => false, // Light nodes never participate in emergency production (same as consensus)
             };
             
+            // CRITICAL FIX v2.64: Exclude ONLY failed_producer from emergency selection
+            // Emergency uses same deterministic SHA3-512 algorithm as normal selection
+            // but with failed_producer removed from candidate list
             if own_node_id != failed_producer && can_participate_emergency {
                 let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
                 
@@ -11289,30 +11309,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                          own_node_id, own_node_type);
             };
             
-            // CRITICAL: Re-calculate correct producer to ensure all nodes agree
-            // This fixes race conditions where different nodes have stale/cached producer values
-            let correct_producer = Self::select_microblock_producer(
-                current_height,
-                unified_p2p,
-                own_node_id,
-                own_node_type,
-                storage.as_ref(),
-                &None  // Don't pass PoH to avoid race conditions
-            ).await;
-            
-            // CRITICAL FIX v2.44: If correct_producer is empty, node is DESYNC'd
-            // Node MUST NOT participate in emergency selection - it would cause FORK!
-            if correct_producer.is_empty() {
-                println!("[ERR][EMERGENCY] correct_producer=EMPTY node_desync=true h={}", current_height);
-                println!("[ERR][EMERGENCY] Node is NOT synchronized - CANNOT participate in emergency selection!");
-                println!("[ERR][EMERGENCY] Returning failed_producer to avoid fork: {}", failed_producer);
-                // Return failed producer - this node should NOT produce
-                // Other synchronized nodes will select proper emergency producer
-                return failed_producer.to_string();
-            }
-            
-            println!("[EMERGENCY_SELECTION] 🔄 Recalculated correct producer for block #{}: {}", current_height, correct_producer);
-            println!("[EMERGENCY_SELECTION] ℹ️  Reported failed producer: {} (may be stale)", failed_producer);
+            println!("[EMERGENCY_SELECTION] ℹ️  Failed producer being excluded: {}", failed_producer);
             
             // Use same candidate source as normal production
             {
@@ -11337,9 +11334,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 let sync_threshold = current_height.saturating_sub(1); // Must have prev block!
                 
                 for (node_id, reputation) in qualified {
-                    // Exclude the CORRECT producer (not the stale failed_producer)
-                    if node_id == correct_producer {
-                        println!("[INFO][EMERGENCY] peer={} status=excluded reason=actual_producer", node_id);
+                    // CRITICAL FIX v2.64: Exclude ONLY failed_producer from emergency selection
+                    // Emergency uses same deterministic SHA3-512 selection as normal production
+                    // but failed_producer is removed from candidate pool
+                    if node_id == failed_producer {
+                        println!("[INFO][EMERGENCY] peer={} status=excluded reason=failed_producer", node_id);
                         continue;
                     }
                     
@@ -11379,8 +11378,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 .collect();
             
             println!("[INFO][EMERGENCY] candidates={} excluded={}", 
-                     valid_candidates.len(), correct_producer);
-            println!("[INFO][EMERGENCY] reported_failed={}", failed_producer);
+                     valid_candidates.len(), failed_producer);
             
             if valid_candidates.is_empty() {
                 println!("[WARN][EMERGENCY] no_valid_candidates=true");
@@ -11515,11 +11513,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         // CRITICAL: Sort peers to ensure ALL nodes boost SAME peer (network recovery consensus)
                         peers.sort_by(|a, b| a.id.cmp(&b.id));
                         
-                        // Select first available peer (deterministic across all nodes)
-                        let emergency_peer = &peers[0];
-                        // Reward processed via DeterministicReputationState when block is produced
-                        println!("[EMERGENCY] 💊 Selecting {} for network recovery", emergency_peer.id);
-                        return emergency_peer.id.clone();
+                        // CRITICAL FIX v2.64: Exclude only failed_producer from emergency recovery
+                        for peer in &peers {
+                            if peer.id != failed_producer {
+                                // Reward processed via DeterministicReputationState when block is produced
+                                println!("[EMERGENCY] 💊 Selecting {} for network recovery", peer.id);
+                                return peer.id.clone();
+                            }
+                        }
+                        println!("[WARN][EMERGENCY] All peers excluded (failed producer)");
                     }
                     
                     // Ultimate fallback: Return failed producer to prevent complete halt
@@ -11584,13 +11586,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // Create deterministic entropy for emergency selection
             // CRITICAL: Include finality_hash for cross-node determinism!
+            // CRITICAL FIX v2.64: Emergency entropy uses ONLY deterministic data
+            // - finality_hash: All synchronized nodes have same finality block
+            // - current_height: All nodes agree on height
+            // - sorted_candidates: All nodes have same list (minus failed_producer)
+            // This ensures ALL nodes select SAME emergency producer
             let emergency_entropy = {
                 use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
-                hasher.update(b"EMERGENCY_VRF_ENTROPY_V7"); // Version bump for new algorithm
+                hasher.update(b"EMERGENCY_VRF_ENTROPY_V8"); // Version bump for new algorithm
                 hasher.update(&finality_hash);  // CRITICAL: Finality window block hash!
                 hasher.update(&current_height.to_le_bytes());
-                hasher.update(correct_producer.as_bytes());
+                hasher.update(failed_producer.as_bytes()); // Include failed producer for entropy variation
                 for (node_id, _) in &sorted_candidates {
                     hasher.update(node_id.as_bytes());
                 }
@@ -11861,13 +11868,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
                 Ok(None) => {
-                    // v2.47: NODE IS BEHIND - MUST SYNC BEFORE PARTICIPATING!
+                    // v2.65: CRITICAL FIX - EMERGENCY FALLBACK
                     // If MB#N-2 is missing, this node is DESYNCHRONIZED.
-                    // Return EMPTY list = node does NOT participate in production.
-                    // Network continues with synchronized nodes.
-                    // This prevents FORKS from different producer lists!
+                    // OLD BEHAVIOR: Return empty list → emergency failover fails → network DEADLOCK
+                    // NEW BEHAVIOR: Return Genesis list → emergency can continue → network RECOVERS
                     
-                    println!("[WARN][CAND] mb={} NOT_FOUND h={} - node MUST SYNC! Not participating.", 
+                    println!("[WARN][CAND] mb={} NOT_FOUND h={} - using Genesis fallback for emergency!", 
                              required_macroblock, current_height);
                     
                     // Trigger background sync for missing MacroBlock
@@ -11894,8 +11900,51 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         });
                     }
                     
-                    // Return EMPTY - node must sync first!
-                    return Vec::new();
+                    let validated_peers = p2p.get_validated_active_peers();
+                    
+                    let mut fallback_list: Vec<(String, f64)> = validated_peers.iter()
+                        .filter(|peer| peer.node_type != NodeType::Light)
+                        .map(|peer| {
+                            // Get REAL reputation from deterministic state
+                            let rep = p2p.get_deterministic_reputation()
+                                .and_then(|rep_arc| {
+                                    rep_arc.read().ok().map(|state| {
+                                        state.get_reputation(&peer.id, 
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs())
+                                    })
+                                })
+                                .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
+                            
+                            (peer.id.clone(), rep / 100.0)
+                        })
+                        .collect();
+                    
+                    // Ensure own node included if qualified
+                    if !fallback_list.iter().any(|(id, _)| id == own_node_id) && own_node_type != NodeType::Light {
+                        let own_rep = p2p.get_deterministic_reputation()
+                            .and_then(|rep_arc| {
+                                rep_arc.read().ok().map(|state| {
+                                    state.get_reputation(own_node_id, 
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs())
+                                })
+                            })
+                            .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
+                        
+                        fallback_list.push((own_node_id.to_string(), own_rep / 100.0));
+                    }
+                    
+                    fallback_list.sort_by(|a, b| a.0.cmp(&b.0));
+                    fallback_list.dedup_by(|a, b| a.0 == b.0);
+                    
+                    if is_info() { println!("[INFO][CAND] fallback=all_peers n={} mb={}", fallback_list.len(), required_macroblock); }
+                    
+                    return fallback_list;
                 }
                 Err(e) => {
                     // v2.47: Storage error = node is broken, cannot participate
@@ -12451,12 +12500,48 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let we_are_initiator = consensus_initiator == &our_consensus_id;
         
         if we_are_initiator {
-            if is_info() { println!("[INFO][CONS] initiator=true"); }
-        } else {
-            // Not initiator, will participate in consensus
+            // CRITICAL v2.65: If we're initiator but desynced, we CANNOT create MacroBlock
+            // Other nodes will wait → need fallback to next candidate
+            if network_height > 0 && stored_height + 50 < network_height {
+                if is_warn() { println!("[WARN][CONS] initiator_desynced local={} network={} gap={} fallback=next", 
+                         stored_height, network_height, network_height - stored_height); }
+                return false;  // Next node in circle will become initiator
+            }
+            
+            if is_info() { println!("[INFO][CONS] initiator=true synced=true"); }
+            return true;  // I'm initiator and synced - create MacroBlock!
         }
         
-        we_are_initiator
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL v2.65: FALLBACK INITIATOR LOGIC
+        // If primary initiator is unavailable/desynced, next node in circle takes over
+        // This prevents network stall when initiator node has issues
+        // ═══════════════════════════════════════════════════════════════════════════
+        
+        // Check if primary initiator is available as active peer
+        let initiator_available = p2p.get_validated_active_peers()
+            .iter()
+            .any(|peer| peer.id == *consensus_initiator);
+        
+        if !initiator_available {
+            // Primary initiator unavailable - check if we're next in circle
+            let our_index = sorted_candidates.iter()
+                .position(|(id, _)| id == &our_consensus_id);
+            
+            if let Some(our_idx) = our_index {
+                // Next candidate after primary initiator (circular)
+                let next_index = (initiator_index + 1) % sorted_candidates.len();
+                
+                if our_idx == next_index {
+                    if is_info() { println!("[INFO][CONS] fallback_initiator=true primary={} reason=unavailable", 
+                             consensus_initiator); }
+                    return true;  // I'm fallback initiator!
+                }
+            }
+        }
+        
+        // I'm participant (not initiator)
+        false
     }
     
     /// PRODUCTION v2.34: Event-based MacroBlock consensus listener

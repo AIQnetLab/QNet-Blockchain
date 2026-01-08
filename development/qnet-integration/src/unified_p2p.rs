@@ -14319,31 +14319,41 @@ impl SimplifiedP2P {
     }
     
     /// Request blocks from peers for sync
+    /// v2.65: Multi-peer redundancy - request from top 3 peers for reliability
     pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), String> {
-        println!("[SYNC] 🔄 Starting block sync from {} to {}", from_height, to_height);
         
-        let peers = self.get_validated_active_peers();
+        let mut peers = self.get_validated_active_peers();
         if peers.is_empty() {
             return Err("No peers available for sync".to_string());
         }
         
-        // Select best peer for sync (highest combined reputation)
-        let best_peer = peers.iter()
-            .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or("No valid peer for sync")?;
+        // Sort by combined reputation (best first)
+        peers.sort_by(|a, b| b.combined_reputation().partial_cmp(&a.combined_reputation())
+            .unwrap_or(std::cmp::Ordering::Equal));
         
-        println!("[SYNC] 📡 Requesting blocks from peer {} (network_quality: {:.1}%)", 
-                 best_peer.id, best_peer.network_score);
-        
-        // Create request message
+        // CRITICAL FIX v2.65: Request from TOP 3 peers for redundancy
+        // If one peer has network issues (UDP fragmentation, packet loss),
+        // others will deliver blocks successfully
         let request = NetworkMessage::RequestBlocks {
             from_height,
             to_height,
             requester_id: self.node_id.clone(),
         };
         
-        // Send request
-        self.send_network_message(&best_peer.addr, request);
+        let mut sent_count = 0;
+        for peer in peers.iter().take(3) {
+            if peer.id != self.node_id {
+                self.send_network_message(&peer.addr, request.clone());
+                sent_count += 1;
+            }
+        }
+        
+        if sent_count == 0 {
+            return Err("No valid peers to sync from".to_string());
+        }
+        
+        println!("[SYNC] blocks={}-{} peers={} mode=redundancy", 
+                 from_height, to_height, sent_count);
         
         Ok(())
     }
