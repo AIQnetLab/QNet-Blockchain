@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { Pool } from 'pg';
 
 // ============================================================================
 // PRODUCTION v2.74: Direct Node RPC with RocksDB
@@ -6,6 +7,12 @@ import { NextResponse } from 'next/server';
 
 // Node RPC for real-time data
 const NODE_RPC_URL = process.env.QNET_API_URL || 'http://154.38.160.39:8001';
+
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+});
 
 // Disable ALL caching
 export const dynamic = 'force-dynamic';
@@ -38,6 +45,31 @@ export async function GET() {
       // Time until reward in seconds (1 block = 1 second)
       const secondsUntilReward = blocksUntilReward;
       
+      // Calculate actual circulating supply from reward transactions in DB
+      let circulatingSupply = 0;
+      let circulatingFormatted = '0';
+      try {
+        const result = await pool.query(
+          `SELECT COALESCE(SUM(amount), 0) as total_rewards 
+           FROM transactions 
+           WHERE tx_type = 'RewardDistribution'`
+        );
+        // amount is in nanoQNC, convert to QNC
+        const totalRewardsNano = BigInt(result.rows[0]?.total_rewards || 0);
+        circulatingSupply = Number(totalRewardsNano) / 1_000_000_000;
+        
+        // Format for display
+        circulatingFormatted = circulatingSupply >= 1_000_000_000 
+          ? `${(circulatingSupply / 1_000_000_000).toFixed(2)}B`
+          : circulatingSupply >= 1_000_000
+          ? `${(circulatingSupply / 1_000_000).toFixed(2)}M`
+          : circulatingSupply >= 1_000
+          ? `${(circulatingSupply / 1_000).toFixed(2)}K`
+          : `${Math.floor(circulatingSupply).toLocaleString()}`;
+      } catch (dbError) {
+        console.error('[API] Failed to fetch circulating supply from DB:', dbError);
+      }
+      
       const response = NextResponse.json({
         success: true,
         source: 'rocksdb',
@@ -46,7 +78,9 @@ export async function GET() {
           currentRound: rewardEpoch,
           height: height,
           blocksUntilReward: blocksUntilReward,
-          secondsUntilReward: secondsUntilReward
+          secondsUntilReward: secondsUntilReward,
+          circulatingSupply: Math.floor(circulatingSupply),
+          circulatingFormatted: circulatingFormatted
         }
       });
       

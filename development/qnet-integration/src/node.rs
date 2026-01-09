@@ -12618,6 +12618,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Subscribe to block events (event-based, not polling!)
         let mut block_event_rx = self.block_event_tx.subscribe();
         
+        // v2.91: Clone reward_manager for nested tokio::spawn (INITIATOR reward processing)
+        let reward_manager_outer = self.reward_manager.clone();
+        
         tokio::spawn(async move {
             println!("[CONSENSUS-LISTENER] 🎧 Starting EVENT-BASED macroblock consensus listener for node: {}", node_id);
             
@@ -12820,6 +12823,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 let node_id_cons = node_id.clone();
                                 let consensus_rx_cons = consensus_rx.clone();
                                 let mb_idx = macroblock_index;
+                                let reward_manager_cons = reward_manager_outer.clone();
                                 
                                 tokio::spawn(async move {
                                     let cons_start = std::time::Instant::now();
@@ -12869,6 +12873,88 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 if is_info() { 
                                                     println!("[INFO][ASYNC-CONS] mb={} result=ok saved=true round={} time={:?}", 
                                                              mb_idx, round, cons_time); 
+                                                }
+                                                
+                                                // v2.91: CRITICAL FIX - INITIATOR must process rewards too!
+                                                // Previously only PARTICIPANTS processed rewards via broadcast
+                                                // This caused INITIATOR to skip reward processing, leading to:
+                                                // 1. Missing pending_rewards in RocksDB for INITIATOR
+                                                // 2. Missing processed_emission_macroblocks marker
+                                                // 3. Double-processing on restart (INITIATOR reprocesses same emission MB)
+                                                if should_initiate {
+                                                    if let Ok(Some(macroblock_bytes)) = storage_cons.get_macroblock_by_height(mb_idx) {
+                                                        // Deserialize MacroBlock from storage
+                                                        if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_bytes) {
+                                                            // Process rewards for emission MacroBlocks (every 160 MBs = 4 hours)
+                                                            const EMISSION_MACROBLOCK_INTERVAL: u64 = 160;
+                                                            let is_emission_macroblock = mb_idx > 0 && mb_idx % EMISSION_MACROBLOCK_INTERVAL == 0;
+                                                            
+                                                            if is_emission_macroblock {
+                                                                if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
+                                                                    if !heartbeats_data.is_empty() {
+                                                                    if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
+                                                                        let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = heartbeat_summaries.iter()
+                                                                            .map(|s| qnet_consensus::HeartbeatSummaryData {
+                                                                                node_id: s.node_id.clone(),
+                                                                                node_type: s.node_type,
+                                                                                heartbeat_count: s.heartbeat_count,
+                                                                                first_heartbeat: s.first_heartbeat,
+                                                                                last_heartbeat: s.last_heartbeat,
+                                                                                is_eligible: s.is_eligible,
+                                                                            })
+                                                                            .collect();
+                                                                        
+                                                                        let mut reward_manager = reward_manager_cons.write().await;
+                                                                        let pool2_total = macroblock.consensus_data.pool2_total_fees;
+                                                                        let pool3_total = macroblock.consensus_data.pool3_total_activations;
+                                                                        
+                                                                        match reward_manager.process_macroblock_heartbeats_deterministic(
+                                                                            mb_idx,
+                                                                            &summary_data,
+                                                                            pool2_total,
+                                                                            pool3_total,
+                                                                        ) {
+                                                                            Ok(_) => {
+                                                                                let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
+                                                                                println!("[INFO][REWARDS] EMISSION_MACROBLOCK mb={} epoch={} nodes={} eligible={} pool2={:?} pool3={:?}", 
+                                                                                         mb_idx, mb_idx / EMISSION_MACROBLOCK_INTERVAL, 
+                                                                                         heartbeat_summaries.len(), eligible,
+                                                                                         pool2_total, pool3_total);
+                                                                                
+                                                                                // Save pending rewards to RocksDB
+                                                                                let pending = reward_manager.get_all_pending_rewards();
+                                                                                let mut saved_count = 0;
+                                                                                for (node_id, _amount) in &pending {
+                                                                                    if let Some(reward) = reward_manager.get_pending_reward(node_id) {
+                                                                                        if let Err(e) = storage_cons.save_pending_reward(node_id, reward) {
+                                                                                            eprintln!("[WARN][REWARDS] save_fail node={} err={}", node_id, e);
+                                                                                        } else {
+                                                                                            saved_count += 1;
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                if saved_count > 0 {
+                                                                                    println!("[INFO][REWARDS] pending_saved count={}", saved_count);
+                                                                                }
+                                                                                
+                                                                                // Save processed emission macroblocks set
+                                                                                let processed = reward_manager.get_processed_emission_macroblocks();
+                                                                                if let Err(e) = storage_cons.save_processed_emission_macroblocks(&processed) {
+                                                                                    eprintln!("[WARN][REWARDS] processed_save_fail err={}", e);
+                                                                                } else {
+                                                                                    println!("[INFO][REWARDS] processed_macroblocks_saved mb={} total={}", mb_idx, processed.len());
+                                                                                }
+                                                                            }
+                                                                            Err(e) => {
+                                                                                eprintln!("[ERROR][REWARDS] process_fail mb={} err={}", mb_idx, e);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             } else {
                                                 // MB not saved - DO NOT update round, will retry!

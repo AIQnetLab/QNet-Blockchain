@@ -179,10 +179,10 @@ interface BlockData {
 // Fetch block from node with validation
 async function fetchBlock(height: number): Promise<{ block: BlockData; height: number } | null> {
   try {
-    // Timeout increased to 60s for large blocks (e.g. block 0 with 1007 transactions = 612KB)
+    // Timeout increased to 120s for Genesis block (block 0 with 1007 transactions = 612KB)
     const res = await fetch(`${NODE_RPC_URL}/api/v1/block/${height}`, {
       cache: 'no-store',
-      signal: AbortSignal.timeout(60000),
+      signal: AbortSignal.timeout(120000), // 120 seconds for Genesis block
     });
 
     if (!res.ok) return null;
@@ -313,7 +313,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       return { added: 0, currentHeight };
     }
 
-    // Fetch new blocks (limit to 100 per sync for stability)
+    // Fetch new blocks (limit to 500 per sync for high performance)
     const blocksToFetch: number[] = [];
     // Start from block 0 if lastHeight is -1 or 0, otherwise re-fetch last 10 for reorgs
     const startBlock = lastHeight < 0 ? 0 : Math.max(0, lastHeight - 10);
@@ -321,8 +321,8 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
     // If lastHeight is -1, start from 0. Otherwise start from lastHeight + 1
     const firstBlock = lastHeight < 0 ? 0 : Math.max(startBlock, lastHeight + 1);
     
-    // Production: 100 blocks per batch for stability
-    for (let h = firstBlock; h <= currentHeight && blocksToFetch.length < 100; h++) {
+    // Production: 500 blocks per batch for high performance
+    for (let h = firstBlock; h <= currentHeight && blocksToFetch.length < 500; h++) {
       blocksToFetch.push(h);
     }
 
@@ -330,14 +330,14 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       return { added: 0, currentHeight };
     }
 
-    // Limit parallel fetches (100 blocks in parallel for stability)
-    const MAX_PARALLEL_FETCHES = 100;
+    // Limit parallel fetches (500 blocks in parallel for high performance)
+    const MAX_PARALLEL_FETCHES = 500;
     // IMPORTANT: Only process blocks we actually fetch!
     const blocksToProcess = blocksToFetch.slice(0, MAX_PARALLEL_FETCHES);
     const fetchPromises = blocksToProcess.map(height => fetchBlock(height));
     
-    // Add timeout wrapper to prevent hanging (2 minutes for 100 blocks)
-    const timeoutMs = 120000; // 120 seconds for parallel fetch of 100 blocks
+    // Add timeout wrapper to prevent hanging (10 minutes for 500 blocks)
+    const timeoutMs = 600000; // 600 seconds for parallel fetch of 500 blocks
     const timeoutPromise = Promise.race([
       Promise.allSettled(fetchPromises),
       new Promise<PromiseSettledResult<{ block: BlockData; height: number } | null>[]>((_, reject) => {
@@ -727,4 +727,3 @@ export async function getSyncServiceStatus(): Promise<{
     };
   }
 }
-

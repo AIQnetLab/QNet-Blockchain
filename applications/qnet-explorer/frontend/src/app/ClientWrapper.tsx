@@ -86,6 +86,27 @@ export default function ClientWrapper({
   const totalPhase1Supply = 1_000_000_000;        // 1 billion 1DEV total supply (pump.fun standard)
   const activeNodes = 156;                          // TODO: fetch real active node count
   
+  // Circulating supply state
+  const [circulatingSupply, setCirculatingSupply] = useState('—');
+  
+  // Fetch circulating supply
+  useEffect(() => {
+    const fetchCirculatingSupply = async () => {
+      try {
+        const res = await fetch('/api/network/stats', { cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json();
+          setCirculatingSupply(data.data?.circulatingFormatted || '0');
+        }
+      } catch (err) {
+        console.error('Failed to fetch circulating supply:', err);
+      }
+    };
+    fetchCirculatingSupply();
+    const interval = setInterval(fetchCirculatingSupply, 60000);
+    return () => clearInterval(interval);
+  }, []);
+  
   // Fetch real-time pricing data
   useEffect(() => {
     fetch('/api/node/activate')
@@ -261,9 +282,9 @@ export default function ClientWrapper({
                       <div className="stat-trend">24h average</div>
                     </div>
                     <div className="stat-card">
-                      <div className="stat-number">4.29B</div>
+                      <div className="stat-number">{circulatingSupply}</div>
                       <div className="stat-label">QNC SUPPLY</div>
-                      <div className="stat-trend">Max Supply</div>
+                      <div className="stat-trend">Circulating / Max: 4.29B</div>
                     </div>
                     {/* GitHub Code Verification Section */}
                     <div className="code-verification-banner">

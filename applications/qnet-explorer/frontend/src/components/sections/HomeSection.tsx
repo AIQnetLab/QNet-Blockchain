@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 // Custom hook to manage animations with Intersection Observer
 const useAnimateOnScroll = () => {
@@ -37,6 +37,27 @@ const useAnimateOnScroll = () => {
 // Memoized functional component for the Home section
 const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setActiveSection: (section: string) => void }) {
   const animatedContainerRef = useAnimateOnScroll();
+  const [circulatingSupply, setCirculatingSupply] = useState('Loading...');
+  
+  useEffect(() => {
+    const fetchCirculatingSupply = async () => {
+      try {
+        const res = await fetch('/api/network/stats', { cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json();
+          setCirculatingSupply(data.data?.circulatingFormatted || '0');
+        }
+      } catch (err) {
+        console.error('Failed to fetch circulating supply:', err);
+        setCirculatingSupply('N/A');
+      }
+    };
+
+    fetchCirculatingSupply();
+    // Update every 60 seconds
+    const interval = setInterval(fetchCirculatingSupply, 60000);
+    return () => clearInterval(interval);
+  }, []);
   
   return (
     <div ref={animatedContainerRef}>
@@ -89,9 +110,9 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
               <div className="stat-trend">24h average</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">4.29B</div>
+              <div className="stat-number">{circulatingSupply}</div>
               <div className="stat-label">QNC SUPPLY</div>
-              <div className="stat-trend">Max Supply</div>
+              <div className="stat-trend">Circulating / Max: 4.29B</div>
             </div>
             {/* GitHub Code Verification Section */}
             <div className="code-verification-banner">

@@ -9,6 +9,8 @@ interface NetworkStats {
   height: number;
   blocksUntilReward: number;
   secondsUntilReward: number;
+  circulatingSupply?: number;
+  circulatingFormatted?: string;
 }
 
 export default function HomePage() {
@@ -86,9 +88,9 @@ export default function HomePage() {
               </div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">4.29B</div>
+              <div className="stat-number">{stats?.circulatingFormatted || '—'}</div>
               <div className="stat-label">QNC SUPPLY</div>
-              <div className="stat-trend">Max Supply</div>
+              <div className="stat-trend">Circulating / Max: 4.29B</div>
             </div>
             <div className="code-verification-banner">
               <div className="verification-text-container">
