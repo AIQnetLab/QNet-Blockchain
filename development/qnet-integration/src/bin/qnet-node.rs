@@ -3817,8 +3817,22 @@ async fn calculate_base_reward() -> Result<f64, String> {
     let reward_manager = PhaseAwareRewardManager::new(genesis_ts);
     let pool1_emission = reward_manager.get_pool1_base_emission();
     
+    // v2.87: Log halving/phase status every 4h (with reward claims)
+    let years = reward_manager.get_years_since_genesis();
+    let halving_cycle = years / 4;
+    let years_until_halving = 4 - (years % 4);
+    let next_cycle = halving_cycle + 1;
+    let halving_type = if next_cycle == 5 { "÷10_SHARP" } else { "÷2" };
+    let emission_qnc = (pool1_emission as f64) / 1_000_000_000.0;
+    
+    let burn_pct = qnet_integration::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+    let phase = if burn_pct >= 90.0 || years >= 5 { 2 } else { 1 };
+    
+    println!("[REWARD][ECON] 4h_window phase={} years={} halving_cycle={} next_halving={}y halving_type={} pool1_emission={:.2}", 
+        phase, years, halving_cycle, years_until_halving, halving_type, emission_qnc);
+    
     // Convert from nanoQNC to QNC
-    Ok((pool1_emission as f64) / 1_000_000_000.0)
+    Ok(emission_qnc)
 }
 
 async fn calculate_fee_share(node_type_str: &str) -> Result<f64, String> {

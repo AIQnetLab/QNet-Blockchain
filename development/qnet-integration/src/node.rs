@@ -2881,6 +2881,22 @@ impl BlockchainNode {
                     if is_warn() { println!("[WARN][REWARDS] pending_load_fail err={}", e); }
                 }
             }
+            
+            // v2.90: Load processed emission MacroBlocks to prevent double-processing
+            match storage.load_processed_emission_macroblocks() {
+                Ok(processed) => {
+                    if !processed.is_empty() {
+                        reward_manager_guard.set_processed_emission_macroblocks(processed);
+                        if is_info() { println!("[INFO][REWARDS] loaded_processed_macroblocks count={}", 
+                                                reward_manager_guard.get_processed_emission_macroblocks().len()); }
+                    } else {
+                        if is_debug() { println!("[DBG][REWARDS] no_processed_macroblocks_yet"); }
+                    }
+                }
+                Err(e) => {
+                    if is_warn() { println!("[WARN][REWARDS] processed_macroblocks_load_fail err={}", e); }
+                }
+            }
         }
         
         // Get node IP for archive registration - use ENV or auto-detect
@@ -16999,7 +17015,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             });
         }
         
-        // PRODUCTION v2.26: Return SHA3(bincode) hash - same as stored in mempool
+        // v2.90: Return BLAKE3 hash (calculated via tx.calculate_hash())
+        // ARCHITECTURE: TX must have hash set BEFORE calling submit_transaction()
+        // because tx.validate() (line 16789) checks: self.hash == self.calculate_hash()
         Ok(tx_hash)
     }
     
@@ -18116,7 +18134,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         let pool2_total = macroblock.consensus_data.pool2_total_fees;
                         let pool3_total = macroblock.consensus_data.pool3_total_activations;
                         
+                        // v2.90: Pass macroblock_index to prevent double-processing
                         match reward_manager.process_macroblock_heartbeats_deterministic(
+                            index,  // MacroBlock index for duplicate detection
                             &summary_data,
                             pool2_total,
                             pool3_total,
@@ -18143,6 +18163,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     }
                                 }
                                 println!("[INFO][REWARDS] pending_saved count={}", saved_count);
+                                
+                                // v2.90: CRITICAL - Save processed emission MacroBlocks to prevent double-processing!
+                                // This set is persisted to RocksDB so node restarts don't duplicate rewards
+                                let processed = reward_manager.get_processed_emission_macroblocks();
+                                if let Err(e) = self.storage.save_processed_emission_macroblocks(processed) {
+                                    eprintln!("[WARN][REWARDS] processed_macroblocks_save_fail err={}", e);
+                                } else {
+                                    println!("[INFO][REWARDS] processed_macroblocks_saved mb={} total={}", index, processed.len());
+                                }
                             }
                             Err(e) => {
                                 println!("[WARN][REWARDS] emission_failed mb={} err={}", index, e);

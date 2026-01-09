@@ -6711,11 +6711,14 @@ async fn handle_claim_rewards(
         dilithium_public_key: claim_request.dilithium_public_key.clone(),
     };
     
-    // CRITICAL FIX v2.76.2: DON'T calculate hash here!
-    // submit_transaction() will calculate SHA3(bincode) hash and return it
-    // Using tx.calculate_hash() (BLAKE3) creates WRONG hash that doesn't match blockchain!
+    // v2.90: CRITICAL - Calculate BLAKE3 hash BEFORE submit!
+    // ARCHITECTURE: submit_transaction() calls tx.validate() FIRST (line 16789)
+    // tx.validate() checks: self.hash != self.calculate_hash() (line 431)
+    // If hash not set, validation fails with "Invalid transaction hash"
+    // Then submit_transaction() uses this hash for mempool (line 16977)
+    tx.hash = tx.calculate_hash();
     
-    // Submit transaction to blockchain (will calculate correct SHA3(bincode) hash)
+    // Submit transaction to blockchain
     match blockchain.submit_transaction(tx.clone()).await {
         Ok(tx_hash) => {
             println!("[INFO][CLAIM] tx_submitted node={} hash={}", claim_request.node_id, tx_hash);

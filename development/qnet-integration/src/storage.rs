@@ -4214,6 +4214,45 @@ impl Storage {
         Ok(())
     }
     
+    // ============================================
+    // v2.90: PROCESSED EMISSION MACROBLOCKS
+    // Prevent double-processing on node restart
+    // ============================================
+    
+    /// Save processed emission MacroBlocks set
+    /// CRITICAL: Prevents duplicate reward distribution after node restart
+    pub fn save_processed_emission_macroblocks(&self, processed: &std::collections::HashSet<u64>) -> IntegrationResult<()> {
+        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        
+        let key = b"processed_emission_macroblocks";
+        let data = bincode::serialize(processed)
+            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+        
+        self.persistent.db.put_cf(&rewards_cf, key, &data)?;
+        Ok(())
+    }
+    
+    /// Load processed emission MacroBlocks set from storage
+    /// Returns empty set if not found (new node or first run)
+    pub fn load_processed_emission_macroblocks(&self) -> IntegrationResult<std::collections::HashSet<u64>> {
+        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        
+        let key = b"processed_emission_macroblocks";
+        match self.persistent.db.get_cf(&rewards_cf, key)? {
+            Some(data) => {
+                let processed = bincode::deserialize(&data)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                Ok(processed)
+            },
+            None => {
+                // First run or new node - return empty set
+                Ok(std::collections::HashSet::new())
+            }
+        }
+    }
+    
     /// Get all pending rewards (for batch processing)
     pub fn get_all_pending_rewards(&self) -> IntegrationResult<Vec<(String, qnet_consensus::lazy_rewards::PhaseAwareReward)>> {
         let rewards_cf = self.persistent.db.cf_handle("pending_rewards")

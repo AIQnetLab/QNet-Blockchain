@@ -5,7 +5,7 @@
 //! Pool 2: Transaction fees (70% Super, 30% Full, 0% Light)
 //! Pool 3: Activation pool (ONLY in Phase 2)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use crate::errors::ConsensusError;
@@ -215,6 +215,17 @@ pub struct PhaseAwareRewardManager {
     /// This is separate from pending_rewards which accumulates for claiming
     /// Reset at each emission, used for blockchain emission TX
     last_epoch_emission: u64,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v2.90: PREVENT DOUBLE-PROCESSING OF EMISSION MACROBLOCKS
+    // CRITICAL BUG FIX: Without this, node restarts cause duplicate rewards!
+    // Each emission MacroBlock (160, 320, 480...) must be processed EXACTLY ONCE
+    // This set tracks which MacroBlocks have been processed to prevent accumulation bugs
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Set of processed emission MacroBlock indices (160, 320, 480, 640...)
+    /// Prevents double-processing on node restart or MacroBlock re-sync
+    processed_emission_macroblocks: HashSet<u64>,
 }
 
 impl PhaseAwareRewardManager {
@@ -242,6 +253,8 @@ impl PhaseAwareRewardManager {
             pool3_remainder: 0,
             // v2.84: Track current epoch emission separately
             last_epoch_emission: 0,
+            // v2.90: Track processed emission MacroBlocks to prevent duplicates
+            processed_emission_macroblocks: HashSet::new(),
         }
     }
     
@@ -393,7 +406,9 @@ impl PhaseAwareRewardManager {
         self.ping_histories.clear();
         
         // Use unified deterministic processing with remainder accumulation
+        // v2.90: macroblock_index=0 means legacy path (not from MacroBlock)
         self.process_macroblock_heartbeats_deterministic(
+            0,  // Legacy: not from MacroBlock, use 0 as sentinel
             &heartbeat_summaries,
             Some(self.pool2_transaction_fees),
             Some(self.pool3_activation_pool),
@@ -666,6 +681,18 @@ impl PhaseAwareRewardManager {
         self.last_epoch_emission = 0;
     }
     
+    /// v2.90: Get processed emission MacroBlocks (for persistence to RocksDB)
+    pub fn get_processed_emission_macroblocks(&self) -> &HashSet<u64> {
+        &self.processed_emission_macroblocks
+    }
+    
+    /// v2.90: Set processed emission MacroBlocks (load from RocksDB on startup)
+    /// This prevents double-processing of MacroBlocks after node restart
+    pub fn set_processed_emission_macroblocks(&mut self, processed: HashSet<u64>) {
+        self.processed_emission_macroblocks = processed;
+        println!("[INFO][REWARDS] loaded_processed_macroblocks count={}", self.processed_emission_macroblocks.len());
+    }
+    
     /// Get wallet address for a node
     pub fn get_node_wallet_address(&self, node_id: &str) -> Option<String> {
         self.node_ownership.get(node_id).cloned()
@@ -714,7 +741,9 @@ impl PhaseAwareRewardManager {
     /// This method uses LOCAL pool2/pool3 values which are non-deterministic
     pub fn process_macroblock_heartbeats(&mut self, heartbeat_summaries: &[HeartbeatSummaryData]) -> Result<(), ConsensusError> {
         // Use local values (legacy behavior - non-deterministic!)
+        // v2.90: macroblock_index=0 means legacy path (not from MacroBlock)
         self.process_macroblock_heartbeats_deterministic(
+            0,  // Legacy: not from MacroBlock, use 0 as sentinel
             heartbeat_summaries,
             Some(self.pool2_transaction_fees),
             Some(self.pool3_activation_pool),
@@ -735,10 +764,19 @@ impl PhaseAwareRewardManager {
     /// - pool3_total: Total activation QNC from MacroBlock (None = use local, Phase 2 only)
     pub fn process_macroblock_heartbeats_deterministic(
         &mut self,
+        macroblock_index: u64,
         heartbeat_summaries: &[HeartbeatSummaryData],
         pool2_total: Option<u64>,
         pool3_total: Option<u64>,
     ) -> Result<(), ConsensusError> {
+        // v2.90: CRITICAL - Prevent double-processing of emission MacroBlocks!
+        // Without this check, node restarts cause duplicate rewards
+        // macroblock_index=0 is sentinel for legacy path (skip duplicate check)
+        if macroblock_index > 0 && self.processed_emission_macroblocks.contains(&macroblock_index) {
+            println!("[WARN][REWARDS] mb={} ALREADY_PROCESSED skipping (prevents duplicate rewards)", macroblock_index);
+            return Ok(());
+        }
+        
         let current_phase = self.get_current_phase();
         
         // Use MacroBlock values if provided, otherwise fall back to local (legacy)
@@ -903,6 +941,14 @@ impl PhaseAwareRewardManager {
         // Reset LOCAL Pool 3 if Phase 2 (distributed via MacroBlock)
         if current_phase == QNetPhase::Phase2 {
             self.pool3_activation_pool = 0;
+        }
+        
+        // v2.90: Mark MacroBlock as processed to prevent double-processing
+        // Only for real MacroBlocks (index > 0), not legacy path
+        if macroblock_index > 0 {
+            self.processed_emission_macroblocks.insert(macroblock_index);
+            println!("[INFO][REWARDS] mb={} MARKED_AS_PROCESSED (total_processed={})", 
+                     macroblock_index, self.processed_emission_macroblocks.len());
         }
         
         Ok(())

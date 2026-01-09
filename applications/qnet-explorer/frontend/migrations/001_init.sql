@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     from_address TEXT NOT NULL,
     to_address TEXT,
     amount BIGINT NOT NULL,
-    nonce BIGINT NOT NULL,
+    nonce NUMERIC(20,0) NOT NULL,
     block BIGINT NOT NULL,
     timestamp BIGINT NOT NULL,
     gas_price BIGINT NOT NULL DEFAULT 0,

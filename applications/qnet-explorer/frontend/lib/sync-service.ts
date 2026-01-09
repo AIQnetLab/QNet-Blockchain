@@ -179,10 +179,10 @@ interface BlockData {
 // Fetch block from node with validation
 async function fetchBlock(height: number): Promise<{ block: BlockData; height: number } | null> {
   try {
-    // Увеличен таймаут до 30 секунд для больших блоков (например, block 0 с 1007 транзакциями)
+    // Timeout increased to 60s for large blocks (e.g. block 0 with 1007 transactions = 612KB)
     const res = await fetch(`${NODE_RPC_URL}/api/v1/block/${height}`, {
       cache: 'no-store',
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(60000),
     });
 
     if (!res.ok) return null;
@@ -313,7 +313,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       return { added: 0, currentHeight };
     }
 
-    // Fetch new blocks (limit to 100 per sync to avoid timeout)
+    // Fetch new blocks (limit to 100 per sync for stability)
     const blocksToFetch: number[] = [];
     // Start from block 0 if lastHeight is -1 or 0, otherwise re-fetch last 10 for reorgs
     const startBlock = lastHeight < 0 ? 0 : Math.max(0, lastHeight - 10);
@@ -330,14 +330,14 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       return { added: 0, currentHeight };
     }
 
-    // Limit parallel fetches to prevent DoS (production: 50 blocks/10s = 300 blocks/min)
-    const MAX_PARALLEL_FETCHES = 50;
+    // Limit parallel fetches (100 blocks in parallel for stability)
+    const MAX_PARALLEL_FETCHES = 100;
     // IMPORTANT: Only process blocks we actually fetch!
     const blocksToProcess = blocksToFetch.slice(0, MAX_PARALLEL_FETCHES);
     const fetchPromises = blocksToProcess.map(height => fetchBlock(height));
     
-    // Add timeout wrapper to prevent hanging (2 minutes for 50 blocks)
-    const timeoutMs = 120000; // 120 seconds for parallel fetch of 50 blocks
+    // Add timeout wrapper to prevent hanging (2 minutes for 100 blocks)
+    const timeoutMs = 120000; // 120 seconds for parallel fetch of 100 blocks
     const timeoutPromise = Promise.race([
       Promise.allSettled(fetchPromises),
       new Promise<PromiseSettledResult<{ block: BlockData; height: number } | null>[]>((_, reject) => {
@@ -380,20 +380,10 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
         break; // Stop processing more blocks
       }
 
-      let transformedCount = 0;
-      let skippedCount = 0;
       for (const tx of txs as Record<string, unknown>[]) {
         const transformed = transformTransaction(tx, height, blockTs);
         if (transformed) {
           transactionsToInsert.push(transformed);
-          transformedCount++;
-        } else {
-          skippedCount++;
-          // Debug: log why transaction was skipped
-          const txHash = String(tx.hash || '').substring(0, 16);
-          const txFrom = String(tx.from || tx.from_address || 'none');
-          const txType = String(tx.tx_type || tx.type || 'unknown');
-          console.warn(`[Sync] Skipped TX in block ${height}: hash=${txHash}, from=${txFrom}, type=${txType}`);
         }
       }
 
@@ -430,39 +420,44 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       }
       
       for (const batch of batches) {
-        await insertTransactionsBatch(batch.map(tx => ({
-        hash: tx.hash,
-        from_address: tx.from,
-        to_address: tx.to,
-        amount: tx.amount,
-        nonce: tx.nonce,
-        block: tx.block,
-        timestamp: tx.timestamp,
-        gas_price: tx.gas_price,
-        gas_limit: tx.gas_limit,
-        signature: tx.signature,
-        public_key: tx.public_key,
-        dilithium_signature: tx.dilithium_signature,
-        dilithium_public_key: tx.dilithium_public_key,
-        tx_type: typeof tx.tx_type === 'string' ? tx.tx_type : JSON.stringify(tx.tx_type),
-        tx_type_data: typeof tx.tx_type === 'object' ? (() => {
-          try {
-            // Validate and limit object size
-            const obj = tx.tx_type as Record<string, unknown>;
-            const json = JSON.stringify(obj);
-            if (json.length > 100000) { // 100KB max
-              console.warn('[Sync] tx_type_data too large, truncating');
-              return JSON.parse(json.substring(0, 100000)) as Record<string, unknown>;
+        try {
+          await insertTransactionsBatch(batch.map(tx => ({
+          hash: tx.hash,
+          from_address: tx.from,
+          to_address: tx.to,
+          amount: tx.amount,
+          nonce: tx.nonce,
+          block: tx.block,
+          timestamp: tx.timestamp,
+          gas_price: tx.gas_price,
+          gas_limit: tx.gas_limit,
+          signature: tx.signature,
+          public_key: tx.public_key,
+          dilithium_signature: tx.dilithium_signature,
+          dilithium_public_key: tx.dilithium_public_key,
+          tx_type: typeof tx.tx_type === 'string' ? tx.tx_type : JSON.stringify(tx.tx_type),
+          tx_type_data: typeof tx.tx_type === 'object' ? (() => {
+            try {
+              // Validate and limit object size
+              const obj = tx.tx_type as Record<string, unknown>;
+              const json = JSON.stringify(obj);
+              if (json.length > 100000) { // 100KB max
+                console.warn('[Sync] tx_type_data too large, truncating');
+                return JSON.parse(json.substring(0, 100000)) as Record<string, unknown>;
+              }
+              return obj;
+            } catch {
+              return null;
             }
-            return obj;
-          } catch {
-            return null;
-          }
-        })() : null,
-        data: tx.data,
-        status: tx.status,
-          is_quantum_signed: tx.is_quantum_signed
-        })));
+          })() : null,
+          data: tx.data,
+          status: tx.status,
+            is_quantum_signed: tx.is_quantum_signed
+          })));
+        } catch (err) {
+          console.error(`[Sync] Failed to insert batch of ${batch.length} transactions:`, err);
+          throw err;
+        }
       }
 
       console.log(`[Sync] Inserted ${uniqueTransactions.length} transactions in ${batches.length} batch(es)`);
