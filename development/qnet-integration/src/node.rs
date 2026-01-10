@@ -4636,6 +4636,10 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 }
                             }
                             
+                            // v2.92: PARTICIPANT P2P path - ONLY saves MacroBlock
+                            // Rewards are processed in SYNC path (process_received_macroblock) to avoid duplication
+                            // This ensures single code path for reward processing
+                            
                             // save_macroblock IS async
                             let mb_height = macroblock.height;
                             let save_result = storage.save_macroblock(mb_height, &macroblock).await
@@ -8677,28 +8681,16 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     let is_emission_block = next_block_height % EMISSION_INTERVAL_BLOCKS == 0 && next_block_height > 0;
                     
                     // v2.67: Store emission TX to add DIRECTLY to block (bypass mempool!)
-                    let mut direct_emission_tx: Option<qnet_state::Transaction> = None;
-                    
-                    if is_emission_block {
-                        // v2.65: Epoch = block / 14400 (epoch 1 = blocks 0-14399, epoch 2 = 14400-28799)
-                        println!("[EMISSION] 🎯 Block #{} is EMISSION BLOCK (epoch #{})", 
-                                next_block_height, next_block_height / EMISSION_INTERVAL_BLOCKS);
-                        println!("[EMISSION] 💰 Processing reward window as block producer...");
-                        
-                        // v2.67: process_reward_window now RETURNS emission TX instead of adding to mempool
-                        match blockchain_for_emission.process_reward_window_v2(next_block_height).await {
-                            Ok(Some(emission_tx)) => {
-                                println!("[EMISSION] ✅ Emission TX created (will add directly to block)");
-                                direct_emission_tx = Some(emission_tx);
-                            }
-                            Ok(None) => {
-                                println!("[EMISSION] ⚠️ No eligible nodes in window - emission skipped");
-                            }
-                            Err(e) => {
-                                eprintln!("[EMISSION] ❌ Failed to process emission: {}", e);
-                            }
-                        }
-                    }
+                    // v2.92: REMOVED OLD EMISSION LOGIC - MacroBlocks now handle ALL rewards!
+                    // OLD: Block producer processed rewards every 14,400 blocks (emission blocks)
+                    // NEW: ALL nodes process rewards via MacroBlocks every 160 MBs (consensus-based)
+                    // 
+                    // This eliminates:
+                    // - Duplicate reward processing (block producer got rewards twice)
+                    // - Non-deterministic timing (emission blocks vs MacroBlocks)
+                    // - Race conditions between old and new systems
+                    // 
+                    // MacroBlock reward processing (lines 12911, 18224) is sufficient!
                     
                     // MEV PROTECTION: Get transactions with bundle priority
                     // ARCHITECTURE: Dynamic 0-20% allocation for bundles, 80-100% for public TXs
@@ -8788,23 +8780,9 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         mempool.get_pending_transactions_with_hashes(max_tx_per_microblock)
                     };
                     
-                    // v2.67: CRITICAL - Add emission TX DIRECTLY to block (bypass mempool!)
-                    // This is how top L1s work: Bitcoin coinbase, Ethereum block reward
-                    let tx_bytes_list: Vec<(String, Vec<u8>)> = if let Some(emission_tx) = direct_emission_tx {
-                        // v2.77: Use BLAKE3 via calculate_hash() for consistency
-                        let tx_hash = emission_tx.calculate_hash();
-                        let tx_bytes = bincode::serialize(&emission_tx).unwrap_or_default();
-                        
-                        println!("[EMISSION] 📦 Adding emission TX directly to block (hash={})", 
-                                &tx_hash[..16.min(tx_hash.len())]);
-                        
-                        // Emission TX FIRST, then mempool TX
-                        let mut all_txs = vec![(tx_hash, tx_bytes)];
-                        all_txs.extend(mempool_txs);  // v2.67: Use renamed variable
-                        all_txs
-                    } else {
-                        mempool_txs  // v2.67: Use renamed variable
-                    };
+                    // v2.92: Emission TX now handled by MacroBlocks (every 160 MBs)
+                    // No need to add emission TX here - MacroBlocks are consensus-based!
+                    let tx_bytes_list: Vec<(String, Vec<u8>)> = mempool_txs;
                     
                     // ═══════════════════════════════════════════════════════════════════════════
                     // PRODUCTION v2.63: Block size limit to prevent ShredProtocol overflow
@@ -12618,8 +12596,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Subscribe to block events (event-based, not polling!)
         let mut block_event_rx = self.block_event_tx.subscribe();
         
-        // v2.91: Clone reward_manager for nested tokio::spawn (INITIATOR reward processing)
+        // v2.91: Clone reward_manager + state_manager for nested tokio::spawn (INITIATOR reward processing)
         let reward_manager_outer = self.reward_manager.clone();
+        let state_manager_outer = self.state.clone();
         
         tokio::spawn(async move {
             println!("[CONSENSUS-LISTENER] 🎧 Starting EVENT-BASED macroblock consensus listener for node: {}", node_id);
@@ -12824,6 +12803,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 let consensus_rx_cons = consensus_rx.clone();
                                 let mb_idx = macroblock_index;
                                 let reward_manager_cons = reward_manager_outer.clone();
+                                let state_manager_cons = state_manager_outer.clone();
                                 
                                 tokio::spawn(async move {
                                     let cons_start = std::time::Instant::now();
@@ -12921,7 +12901,27 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                                                          heartbeat_summaries.len(), eligible,
                                                                                          pool2_total, pool3_total);
                                                                                 
+                                                                                // v2.92: CRITICAL - INITIATOR updates total_supply HERE
+                                                                                // (broadcast_macroblock excludes self, so INITIATOR won't receive via P2P)
+                                                                                let total_emission = reward_manager.get_last_epoch_emission();
+                                                                                drop(reward_manager);  // Release before async
+                                                                                
+                                                                                if total_emission > 0 {
+                                                                                    let state = state_manager_cons.read().await;
+                                                                                    match (*state).emit_rewards(total_emission) {
+                                                                                        Ok(actual) => {
+                                                                                            let new_supply = (*state).get_total_supply();
+                                                                                            println!("[INFO][REWARDS] supply_updated emission={} total={} QNC", 
+                                                                                                     actual / 1_000_000_000, new_supply / 1_000_000_000);
+                                                                                        }
+                                                                                        Err(e) => {
+                                                                                            eprintln!("[ERROR][REWARDS] supply_update_failed err={}", e);
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                
                                                                                 // Save pending rewards to RocksDB
+                                                                                let mut reward_manager = reward_manager_cons.write().await;
                                                                                 let pending = reward_manager.get_all_pending_rewards();
                                                                                 let mut saved_count = 0;
                                                                                 for (node_id, _amount) in &pending {
@@ -18234,6 +18234,24 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                          index, index / EMISSION_MACROBLOCK_INTERVAL, 
                                          heartbeat_summaries.len(), eligible,
                                          pool2_total, pool3_total);
+                                
+                                // v2.92: CRITICAL - Update total_supply (replaces old emission TX logic)
+                                // OLD: emission TX (system_emission → system_rewards_pool) updated supply on validation
+                                // NEW: Update supply directly here (MacroBlock-based rewards)
+                                let total_emission = reward_manager.get_last_epoch_emission();
+                                if total_emission > 0 {
+                                    let state_for_supply = self.state.read().await;
+                                    match (*state_for_supply).emit_rewards(total_emission) {
+                                        Ok(actual) => {
+                                            let new_supply = (*state_for_supply).get_total_supply();
+                                            println!("[INFO][REWARDS] supply_updated emission={} total={} QNC", 
+                                                     actual / 1_000_000_000, new_supply / 1_000_000_000);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[ERROR][REWARDS] supply_update_failed err={}", e);
+                                        }
+                                    }
+                                }
                                 
                                 // v2.75: CRITICAL - Save pending rewards to RocksDB for persistence!
                                 // This enables lazy claims to work after node restarts
