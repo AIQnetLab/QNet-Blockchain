@@ -8681,118 +8681,40 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // 
                     // Validation: All nodes verify emission TX presence after emission MacroBlock
                     
-                    let mut direct_emission_tx: Option<qnet_state::Transaction> = None;
-                    
-                    // v2.93: CRITICAL - Create emission TX after emission MacroBlock (resilient to skipped blocks)
-                    // Industry standard: deterministic TX placement with failover
+                    // v2.95: FIXED - Synchronous emission processing (no race condition, no duplication)
+                    // Architecture: INITIATOR processes rewards synchronously in emission blocks
+                    //               PARTICIPANTS process rewards via MacroBlock listener (P2P path)
                     // 
                     // Flow:
-                    //   - MacroBlock 160 finalized at round 14400 (height 14400)
-                    //   - Next microblock (14401, 14402...) checks: need emission TX?
-                    //   - If TX not yet created → create in THIS block
-                    //   - If TX already in blockchain → skip
+                    //   - Block 14,400: INITIATOR calculates rewards synchronously, creates TX
+                    //   - Block 14,400: PARTICIPANTS receive MacroBlock via P2P, process rewards async
+                    //   - TX in blocks: 14,400, 28,800, 43,200 (deterministic emission events)
                     // 
-                    // Resilient: works even if blocks 14401-14410 were skipped!
-                    const EMISSION_MACROBLOCK_INTERVAL: u64 = 160;
-                    const MICROBLOCKS_PER_MACROBLOCK: u64 = 90;
+                    // No race conditions: INITIATOR uses synchronous processing
+                    // No duplication: INITIATOR skips MacroBlock listener for rewards
                     
-                    let chain_height = storage.get_chain_height().unwrap_or(0);
-                    let last_mb_index = chain_height / MICROBLOCKS_PER_MACROBLOCK;
-                    let next_mb_index = next_block_height / MICROBLOCKS_PER_MACROBLOCK;
+                    let is_emission_block = next_block_height % EMISSION_INTERVAL_BLOCKS == 0 && next_block_height > 0;
+                    let mut direct_emission_tx: Option<qnet_state::Transaction> = None;
                     
-                    // Check if we're in window after emission MacroBlock (but before next MB)
-                    let is_after_emission_mb = last_mb_index > 0 
-                        && last_mb_index % EMISSION_MACROBLOCK_INTERVAL == 0
-                        && last_mb_index == next_mb_index;  // Still in same MB window
-                    
-                    if is_after_emission_mb {
-                        // Check if emission TX already created for this MacroBlock
-                        // Use static tracking to prevent duplicate TX across blocks
-                        use std::sync::atomic::{AtomicU64, Ordering};
-                        static LAST_EMISSION_TX_CREATED: AtomicU64 = AtomicU64::new(0);
+                    if is_emission_block {
+                        println!("[EMISSION] Emission block detected");
+                        if is_info() { println!("[INFO][EMISSION] block={} epoch={}", 
+                                next_block_height, next_block_height / EMISSION_INTERVAL_BLOCKS); }
                         
-                        let last_created = LAST_EMISSION_TX_CREATED.load(Ordering::SeqCst);
-                        
-                        // CRITICAL: After restart, check blockchain history for existing TX
-                        let mut tx_exists_in_history = false;
-                        if last_created == 0 {
-                            // First time checking - scan blocks after emission MB
-                            let start_block = (last_mb_index * MICROBLOCKS_PER_MACROBLOCK) + 1;
-                            let end_block = next_block_height;
-                            
-                            for h in start_block..end_block {
-                                if let Ok(Some(block_bytes)) = storage.load_microblock(h) {
-                                    if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_bytes) {
-                                        // Check if emission TX exists in this block
-                                        if block.transactions.iter().any(|tx| 
-                                            tx.from == "system_emission" 
-                                            && tx.to.as_deref() == Some("system_rewards_pool")
-                                        ) {
-                                            tx_exists_in_history = true;
-                                            LAST_EMISSION_TX_CREATED.store(last_mb_index, Ordering::SeqCst);
-                                            break;
-                                        }
-                                    }
-                                }
+                        // SYNCHRONOUS reward processing (returns TX directly)
+                        match blockchain_for_emission.process_reward_window_v2(next_block_height).await {
+                            Ok(Some(emission_tx)) => {
+                                println!("[EMISSION] Transaction created successfully");
+                                if is_info() { println!("[INFO][EMISSION] tx_hash={} status=ready_for_block", &emission_tx.hash[..16]); }
+                                direct_emission_tx = Some(emission_tx);
                             }
-                        }
-                        
-                        if last_created < last_mb_index && !tx_exists_in_history {
-                            // TX not yet created - create now!
-                            let reward_manager = reward_manager_for_spawn.read().await;
-                            let processed = reward_manager.get_processed_emission_macroblocks();
-                            
-                            // Double-check: rewards must be processed for this MacroBlock
-                            if processed.contains(&last_mb_index) {
-                                let total_emission = reward_manager.get_last_epoch_emission();
-                                drop(reward_manager);
-                                
-                                if total_emission > 0 {
-                                    // Mark as created BEFORE creating TX (prevent race)
-                                    LAST_EMISSION_TX_CREATED.store(last_mb_index, Ordering::SeqCst);
-                                    
-                                    let current_time = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    
-                                    let state_reader = state.read().await;
-                                    let total_supply = (*state_reader).get_total_supply();
-                                    drop(state_reader);
-                                    
-                                    let mut emission_tx = qnet_state::Transaction {
-                                    from: "system_emission".to_string(),
-                                    to: Some("system_rewards_pool".to_string()),
-                                    amount: total_emission,
-                                    tx_type: qnet_state::TransactionType::RewardDistribution,
-                                    timestamp: current_time,
-                                    hash: String::new(),
-                                    signature: None,
-                                    public_key: None,
-                                    gas_price: 0,
-                                    gas_limit: 0,
-                                    nonce: 0,
-                                    data: Some(format!(
-                                        "Emission: {} QNC | MacroBlock: {} | Epoch: {} | Supply: {} QNC",
-                                        total_emission / 1_000_000_000,
-                                        last_mb_index,
-                                        last_mb_index / EMISSION_MACROBLOCK_INTERVAL,
-                                        total_supply / 1_000_000_000
-                                    )),
-                                        dilithium_signature: None,
-                                        dilithium_public_key: None,
-                                    };
-                                    
-                                    emission_tx.hash = emission_tx.calculate_hash();
-                                    
-                                    println!("[EMISSION][PRODUCER] tx_created mb={} block={} amount={} QNC hash={}", 
-                                            last_mb_index,
-                                            next_block_height,
-                                            total_emission / 1_000_000_000,
-                                            &emission_tx.hash[..16]);
-                                    
-                                    direct_emission_tx = Some(emission_tx);
-                                }
+                            Ok(None) => {
+                                println!("[EMISSION] No transaction created");
+                                if is_warn() { println!("[WARN][EMISSION] reason=no_emission amount=0"); }
+                            }
+                            Err(e) => {
+                                println!("[EMISSION] Processing failed");
+                                eprintln!("[ERR][EMISSION] operation=reward_window err={}", e);
                             }
                         }
                     }
@@ -12987,13 +12909,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                              mb_idx, round, cons_time); 
                                                 }
                                                 
-                                                // v2.91: CRITICAL FIX - INITIATOR must process rewards too!
-                                                // Previously only PARTICIPANTS processed rewards via broadcast
-                                                // This caused INITIATOR to skip reward processing, leading to:
-                                                // 1. Missing pending_rewards in RocksDB for INITIATOR
-                                                // 2. Missing processed_emission_macroblocks marker
-                                                // 3. Double-processing on restart (INITIATOR reprocesses same emission MB)
-                                                if should_initiate {
+                                                // v2.95: Skip if already processed in emission block
+                                                // Block producer processes rewards SYNCHRONOUSLY in emission blocks
+                                                // All other nodes process via MacroBlock listener
+                                                // Check processed_emission_macroblocks to prevent duplication
+                                                
+                                                let already_processed = {
+                                                    let reward_mgr_check = reward_manager_cons.read().await;
+                                                    reward_mgr_check.get_processed_emission_macroblocks().contains(&mb_idx)
+                                                };
+                                                
+                                                if !already_processed {
                                                     if let Ok(Some(macroblock_bytes)) = storage_cons.get_macroblock_by_height(mb_idx) {
                                                         // Deserialize MacroBlock from storage
                                                         if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_bytes) {
