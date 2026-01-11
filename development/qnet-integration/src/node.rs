@@ -4,7 +4,7 @@ use crate::{
     errors::QNetError,
     storage::Storage,
     // validator::Validator, // disabled for compilation
-    unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, ConsensusMessage, NetworkMessage, ReputationEvent},
+    unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, ConsensusMessage, NetworkMessage, ReputationEvent, BlockExistenceResult},
 };
 use once_cell::sync::Lazy;
 
@@ -8530,38 +8530,77 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             
                             false // Cannot produce
                         } else {
-                            // We are synchronized - check if block already exists
-                            println!("[EMERGENCY] ✅ Node synchronized at height {} - checking if block exists", local_height);
-                            // CRITICAL v2.19.20: Wait 10 seconds for original producer delivery
-                            // Fire-and-forget broadcast takes 3-5 seconds, so 2s was too short
-                            // This prevents premature emergency production causing forks
-                            println!("[EMERGENCY] ⏰ Waiting 10 seconds to allow original producer to deliver...");
-                            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            // PRODUCTION v2.59: Optimized wait loop for global network
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            // BALANCED: 7.5s timeout covers 99% cases including high-latency routes
+                            // Check every 300ms for fast reaction time
+                            // If block arrives early → cancel emergency immediately
+                            // This minimizes fork risk while accommodating Asia-US latency
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            println!("[EMERGENCY][WAIT] h={} strategy=continuous_check interval=300ms max_wait=7.5s", 
+                                     next_block_height);
                             
-                            let block_exists = {
+                            let mut block_arrived = false;
+                            let max_attempts = 25;  // 25 × 300ms = 7.5 seconds (optimized for global network)
+                            let check_interval_ms = 300;
+                            
+                            for attempt in 1..=max_attempts {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(check_interval_ms)).await;
+                                
+                                // Check storage for block arrival
                                 match storage.load_microblock(next_block_height) {
                                     Ok(Some(_)) => {
-                                        println!("[EMERGENCY] ✅ Block #{} already exists from original producer! Skipping emergency production.", next_block_height);
+                                        let elapsed = (attempt as f32 * check_interval_ms as f32) / 1000.0;
+                                        println!("[EMERGENCY][WAIT] h={} attempt={}/{} status=arrived elapsed={:.1}s action=canceling_emergency", 
+                                                 next_block_height, attempt, max_attempts, elapsed);
                                         
-                                        // Clear emergency flag since block exists
-                                        if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                                            *emergency_flag = None;
-                                            println!("[EMERGENCY] 🔧 Cleared emergency flag - block delivered by original producer");
+                                        // Clear emergency flag - use force clear to handle poisoned mutex
+                                        let flag_cleared = match EMERGENCY_PRODUCER_FLAG.lock() {
+                                            Ok(mut flag) => {
+                                                *flag = None;
+                                                true
+                                            },
+                                            Err(poisoned) => {
+                                                let mut flag = poisoned.into_inner();
+                                                *flag = None;
+                                                true
+                                            }
+                                        };
+                                        
+                                        if flag_cleared {
+                                            println!("[EMERGENCY][WAIT] h={} flag_cleared reason=block_delivered_by_original", 
+                                                     next_block_height);
                                         }
-                                        true
+                                        
+                                        block_arrived = true;
+                                        break;
                                     },
                                     Ok(None) => {
-                                        println!("[EMERGENCY] ❌ Block #{} still missing after wait - proceeding with emergency production", next_block_height);
-                                        false
+                                        // Log progress every 1.8 seconds (every 6 attempts)
+                                        if attempt % 6 == 0 {
+                                            let elapsed = (attempt as f32 * check_interval_ms as f32) / 1000.0;
+                                            println!("[EMERGENCY][WAIT] h={} attempt={}/{} status=missing elapsed={:.1}s", 
+                                                     next_block_height, attempt, max_attempts, elapsed);
+                                        }
                                     },
                                     Err(e) => {
-                                        println!("[EMERGENCY] ⚠️ Error checking block existence: {} - proceeding with emergency production", e);
-                                        false
+                                        // Storage error - log but continue checking
+                                        let elapsed = (attempt as f32 * check_interval_ms as f32) / 1000.0;
+                                        println!("[EMERGENCY][WAIT] h={} attempt={}/{} status=storage_error elapsed={:.1}s error={}", 
+                                                 next_block_height, attempt, max_attempts, elapsed, e);
+                                        
+                                        // On storage error, assume block not arrived and continue
                                     }
                                 }
-                            };
+                            }
                             
-                            !block_exists  // Can produce only if block doesn't exist
+                            if !block_arrived {
+                                println!("[EMERGENCY][WAIT] h={} status=timeout max_wait=6s action=proceeding_with_emergency", 
+                                         next_block_height);
+                            }
+                            
+                            !block_arrived  // Can produce only if block didn't arrive
                         }
                     } else {
                         // CRITICAL: Check emergency stop flag first
@@ -10391,12 +10430,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             FAILOVER_FOR_HEIGHT.store(expected_height_timeout, Ordering::Relaxed);
                             
                             // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
+                            let storage_check = storage_timeout.clone();
+                            let p2p_check = p2p_timeout.clone();
+                            
                             tokio::spawn(async move {
                                 tokio::time::sleep(actual_timeout).await;
                                 
                                 // CRITICAL: Double-check if block was received during timeout period
                                 // This prevents race condition where block arrives just as timeout triggers
-                                let block_exists = match storage_timeout.load_microblock(expected_height_timeout) {
+                                let block_exists = match storage_check.load_microblock(expected_height_timeout) {
                                     Ok(Some(_)) => {
                                         if is_debug() { println!("[DBG][FAIL] block_arrived h={}", expected_height_timeout); }
                                         true
@@ -10406,40 +10448,124 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 
                                 if !block_exists {
                                     // ═══════════════════════════════════════════════════════════════════════════
-                                    // PRODUCTION v2.56: CONSENSUS CHECK BEFORE EMERGENCY
+                                    // PRODUCTION v2.56: TWO-LEVEL CONSENSUS CHECK BEFORE EMERGENCY
                                     // ═══════════════════════════════════════════════════════════════════════════
-                                    // CRITICAL: Check if OTHER nodes have the block before triggering emergency.
-                                    // If 2/3+ peers have the block → it's OUR sync problem, not producer failure.
+                                    // CRITICAL: Smart check with cache + HTTP verify
+                                    // 1. FAST PATH: 2/3+ peers have block per heartbeat cache → TRUST (sync issue)
+                                    // 2. SLOW PATH: Cache uncertain → HTTP verify 3 random peers
                                     // This prevents FALSE EMERGENCY that causes FORKS.
                                     // ═══════════════════════════════════════════════════════════════════════════
                                     
-                                    let (peers_with_block, total_peers) = p2p_timeout
+                                    println!("[EMERGENCY][FAILOVER] h={} step=check_network strategy=two_level", 
+                                             expected_height_timeout);
+                                    
+                                    let check_result = p2p_check
                                         .check_block_exists_on_network(expected_height_timeout).await;
                                     
-                                    // If 2/3+ peers have the block, it's OUR problem - sync instead of emergency
-                                    let network_has_block = total_peers > 0 && 
-                                        peers_with_block * 3 >= total_peers * 2;
-                                    
-                                    if network_has_block {
-                                        println!("[WARN][SYNC] block_on_network h={} peers={}/{} - syncing instead of emergency", 
-                                                 expected_height_timeout, peers_with_block, total_peers);
-                                        
-                                        // Try to sync the block from network
-                                        if let Err(e) = p2p_timeout.sync_blocks(expected_height_timeout, expected_height_timeout).await {
-                                            println!("[WARN][SYNC] sync_failed h={} err={}", expected_height_timeout, e);
+                                    // If block exists on network, it's OUR problem - sync instead of emergency
+                                    if check_result.exists() {
+                                        match &check_result {
+                                            BlockExistenceResult::MajorityHas { peers_with, total_peers } => {
+                                                println!("[EMERGENCY][FAILOVER] h={} result=majority_has peers={}/{} action=sync_attempt", 
+                                                         expected_height_timeout, peers_with, total_peers);
+                                            },
+                                            BlockExistenceResult::VerifiedExists { peer_addr } => {
+                                                println!("[EMERGENCY][FAILOVER] h={} result=http_verified peer={} action=sync_attempt", 
+                                                         expected_height_timeout, peer_addr);
+                                            },
+                                            _ => {}
                                         }
                                         
-                                        // Clear failover flag - no emergency needed
-                                        FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);
-                                        return; // Exit - sync instead of emergency
+                                        // CRITICAL FIX v2.61: NEVER do emergency if network HAS block
+                                        // Previous logic: 1 retry → fallback to emergency → FORK!
+                                        // New logic: 3 retries with wait → if all fail → SKIP emergency (prevent fork)
+                                        // Reasoning: If 2/3+ network has block, emergency production would create duplicate → FORK
+                                        let mut sync_success = false;
+                                        let max_sync_attempts = 3;  // Increased from 1
+                                        
+                                        for sync_attempt in 1..=max_sync_attempts {
+                                            match p2p_check.sync_blocks(expected_height_timeout, expected_height_timeout).await {
+                                                Ok(_) => {
+                                                    // CRITICAL FIX: Wait for block to arrive (sync_blocks is fire-and-forget!)
+                                                    // sync_blocks() returns Ok immediately after sending request
+                                                    // Block arrives asynchronously via gossip/response
+                                                    // Wait up to 2 seconds for block to appear in storage
+                                                    let mut block_arrived = false;
+                                                    let max_wait_attempts = 20;  // 20 * 100ms = 2s
+                                                    
+                                                    for wait_attempt in 0..max_wait_attempts {
+                                                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                                        
+                                                        match storage_check.load_microblock(expected_height_timeout) {
+                                                            Ok(Some(_)) => {
+                                                                println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} wait={}ms result=success action=exit", 
+                                                                         expected_height_timeout, sync_attempt, max_sync_attempts, wait_attempt * 100);
+                                                                block_arrived = true;
+                                                                break;
+                                                            },
+                                                            _ => {
+                                                                // Block not in storage yet, keep waiting
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    if block_arrived {
+                                                        sync_success = true;
+                                                        break;
+                                                    } else {
+                                                        println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} result=timeout wait=2s", 
+                                                                 expected_height_timeout, sync_attempt, max_sync_attempts);
+                                                    }
+                                                },
+                                                Err(e) => {
+                                                    println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} result=failed error={}", 
+                                                             expected_height_timeout, sync_attempt, max_sync_attempts, e);
+                                                }
+                                            }
+                                            
+                                            // Backoff between retries (exponential: 1s, 2s)
+                                            if sync_attempt < max_sync_attempts && !sync_success {
+                                                let backoff_ms = 1000 * sync_attempt;  // 1s, 2s
+                                                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                                            }
+                                        }
+                                        
+                                        if sync_success {
+                                            // Sync succeeded - no emergency needed
+                                            println!("[EMERGENCY][FAILOVER] h={} sync_result=success action=clearing_failover", 
+                                                     expected_height_timeout);
+                                            FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);
+                                            return; // Exit - sync resolved the issue
+                                        } else {
+                                            // CRITICAL v2.61: Network HAS block but ALL sync attempts failed!
+                                            // DO NOT produce emergency block - this would cause FORK!
+                                            // Possible reasons: severe network partition, all peers down, storage corruption
+                                            // SAFER: Skip this block height and let network continue
+                                            // Block will be recovered via background gap sync when network stabilizes
+                                            println!("[EMERGENCY][FAILOVER] h={} sync_result=all_failed network_has_block=true action=skip_emergency reason=prevent_fork", 
+                                                     expected_height_timeout);
+                                            println!("[EMERGENCY][FAILOVER] h={} analysis=network_2/3+_has_block emergency_would_cause_fork skipping_block", 
+                                                     expected_height_timeout);
+                                            FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);
+                                            return; // EXIT without emergency - prevent fork!
+                                        }
                                     }
                                     
                                     // ═══════════════════════════════════════════════════════════════════════════
                                     // Network does NOT have the block - proceed with emergency
                                     // ═══════════════════════════════════════════════════════════════════════════
                                     
-                                    println!("[INFO][FAIL] network_missing_block h={} peers={}/{} - proceeding with emergency", 
-                                             expected_height_timeout, peers_with_block, total_peers);
+                                    match &check_result {
+                                        BlockExistenceResult::Uncertain { cache_peers_with, cache_total } => {
+                                            println!("[EMERGENCY][FAILOVER] h={} result=uncertain cache={}/{} http=all_failed action=emergency_needed", 
+                                                     expected_height_timeout, cache_peers_with, cache_total);
+                                        },
+                                        BlockExistenceResult::NoPeers => {
+                                            println!("[EMERGENCY][FAILOVER] h={} result=no_peers action=emergency_needed", 
+                                                     expected_height_timeout);
+                                        },
+                                        _ => {}
+                                    }
                                     
                                     // Use the actual timeout duration for logging (calculated above)
                                     let timeout_duration = actual_timeout.as_secs();
@@ -10448,12 +10574,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     if is_rotation_boundary {
                                         if is_warn() { println!("[WARN][FAIL] rotation_deadlock h={} timeout={}s producer={}", 
                                                  expected_height_timeout, timeout_duration, current_producer_timeout); }
-                                        // Invalidate producer cache to force new selection
-                                        crate::node::BlockchainNode::invalidate_producer_cache();
                                     } else {
-                                    if is_warn() { println!("[WARN][FAIL] timeout h={} secs={} producer={}", 
-                                             expected_height_timeout, timeout_duration, current_producer_timeout); }
+                                        if is_warn() { println!("[WARN][FAIL] timeout h={} secs={} producer={}", 
+                                                 expected_height_timeout, timeout_duration, current_producer_timeout); }
                                     }
+                                    
+                                    // ✅ CRITICAL FIX v2.62: DO NOT invalidate cache on failover!
+                                    // WHY: Emergency producer should TAKE OVER the rotation cycle
+                                    // MECHANISM: Cache will be UPDATED below to emergency producer
+                                    // RESULT: Emergency producer completes the 30-block rotation period
                                     
                                     // EXISTING: Use same emergency selection as implemented in select_emergency_producer
                                     let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
@@ -10466,6 +10595,32 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     ).await;
                                     
                                     if is_info() { println!("[INFO][FAIL] emergency_producer={}", emergency_producer); }
+                                    
+                                    // ✅ CRITICAL FIX v2.62: UPDATE CACHE to emergency producer!
+                                    // WHY: Emergency producer should TAKE OVER the rotation cycle (30 blocks)
+                                    // MECHANISM: Update producer cache so next block uses emergency producer
+                                    // RESULT: Emergency producer completes the 30-block rotation period
+                                    let rotation_interval = 30u64;
+                                    let leadership_round = if expected_height_timeout <= 30 {
+                                        0
+                                    } else {
+                                        (expected_height_timeout - 1) / rotation_interval
+                                    };
+                                    
+                                    use producer_cache::CACHED_PRODUCER_SELECTION;
+                                    if let Some(cache) = CACHED_PRODUCER_SELECTION.get() {
+                                        if let Ok(mut cache_guard) = cache.lock() {
+                                            // Get existing candidates (or empty list - doesn't matter, just need producer ID!)
+                                            let existing_candidates = cache_guard.get(&leadership_round)
+                                                .map(|(_, cands)| cands.clone())
+                                                .unwrap_or_default();
+                                            
+                                            // Update cache: emergency producer takes over this rotation!
+                                            cache_guard.insert(leadership_round, (emergency_producer.clone(), existing_candidates));
+                                            println!("[EMERGENCY][FAILOVER] h={} cache_updated=true round={} new_producer={} reason=emergency_takeover", 
+                                                     expected_height_timeout, leadership_round, emergency_producer);
+                                        }
+                                    }
                                     
                                     // EXISTING: Use same emergency broadcast as macroblock (line 2114)
                                     if let Err(e) = p2p_timeout.broadcast_emergency_producer_change(
@@ -11458,10 +11613,45 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 })
                 .collect();
             
-            println!("[INFO][EMERGENCY] candidates={} excluded={}", 
-                     valid_candidates.len(), failed_producer);
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL: Filter out recently failed producers using EXISTING function!
+            // ═══════════════════════════════════════════════════════════════════════════
+            // WHY: Emergency should select MOST STABLE node, not one that's also failing
+            // EXAMPLE: Node002 failed 3 times recently → don't select as emergency!
+            // USES: get_recent_producer_failures() with CHECK_RANGE=30 blocks
+            let stable_candidates = if let Some(store) = &storage {
+                let mut filtered = Vec::new();
+                for (node_id, reputation) in &valid_candidates {
+                    let failure_count = Self::get_recent_producer_failures(
+                        &node_id, 
+                        current_height, 
+                        store
+                    ).await;
+                    
+                    if failure_count >= 3 {
+                        println!("[INFO][EMERGENCY] h={} peer={} status=excluded reason=unstable failures={}/30blocks", 
+                                 current_height, node_id, failure_count);
+                    } else {
+                        filtered.push((node_id.clone(), *reputation));
+                    }
+                }
+                
+                if filtered.is_empty() && !valid_candidates.is_empty() {
+                    // ALL candidates are unstable - use original list to prevent deadlock
+                    println!("[WARN][EMERGENCY] h={} all_candidates_unstable=true using_original_list", 
+                             current_height);
+                    valid_candidates.clone()
+                } else {
+                    filtered
+                }
+            } else {
+                valid_candidates
+            };
             
-            if valid_candidates.is_empty() {
+            println!("[INFO][EMERGENCY] candidates={} excluded={}", 
+                     stable_candidates.len(), failed_producer);
+            
+            if stable_candidates.is_empty() {
                 println!("[WARN][EMERGENCY] no_valid_candidates=true");
                 
                 // EMERGENCY MODE: Use existing Progressive Degradation Protocol
@@ -11612,7 +11802,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             
-            let candidates = valid_candidates;
+            let candidates = stable_candidates;
             
             // CRITICAL: Apply MAX_VALIDATORS limit BEFORE sorting (for scalability)
             // Same limit as normal consensus to prevent O(n log n) on millions of nodes
@@ -12909,17 +13099,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                              mb_idx, round, cons_time); 
                                                 }
                                                 
-                                                // v2.95: Skip if already processed in emission block
-                                                // Block producer processes rewards SYNCHRONOUSLY in emission blocks
-                                                // All other nodes process via MacroBlock listener
-                                                // Check processed_emission_macroblocks to prevent duplication
+                                                // v2.95: FIXED - PARTICIPANTS only process rewards via MacroBlock listener
+                                                // INITIATOR processes rewards SYNCHRONOUSLY in emission blocks
+                                                // Simple role check prevents duplication without slow lock
+                                                // 
+                                                // CRITICAL: This prevents the deadlock/lag issue where read() lock
+                                                // on reward_manager slowed down MacroBlock processing
                                                 
-                                                let already_processed = {
-                                                    let reward_mgr_check = reward_manager_cons.read().await;
-                                                    reward_mgr_check.get_processed_emission_macroblocks().contains(&mb_idx)
-                                                };
-                                                
-                                                if !already_processed {
+                                                if !should_initiate {
                                                     if let Ok(Some(macroblock_bytes)) = storage_cons.get_macroblock_by_height(mb_idx) {
                                                         // Deserialize MacroBlock from storage
                                                         if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_bytes) {

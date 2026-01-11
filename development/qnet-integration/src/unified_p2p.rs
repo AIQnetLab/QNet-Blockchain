@@ -56,6 +56,34 @@ const RETENTION_PERIOD_SECS: u64 = 24 * 60 * 60;
 
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
+// ═══════════════════════════════════════════════════════════════════════════
+// BLOCK EXISTENCE CHECK RESULT - Emergency Production Logic
+// ═══════════════════════════════════════════════════════════════════════════
+/// Result of checking if block exists on network
+#[derive(Debug, Clone)]
+pub enum BlockExistenceResult {
+    /// 2/3+ peers have block per cache → TRUST (majority consensus)
+    MajorityHas { peers_with: usize, total_peers: usize },
+    /// HTTP verified that block exists on network
+    VerifiedExists { peer_addr: String },
+    /// Cache uncertain AND HTTP verify failed/timeout
+    Uncertain { cache_peers_with: usize, cache_total: usize },
+    /// No peers available to check
+    NoPeers,
+}
+
+impl BlockExistenceResult {
+    /// Block definitely exists on network (no emergency needed)
+    pub fn exists(&self) -> bool {
+        matches!(self, Self::MajorityHas { .. } | Self::VerifiedExists { .. })
+    }
+    
+    /// Should proceed with emergency production
+    pub fn should_produce_emergency(&self) -> bool {
+        !self.exists()
+    }
+}
+
 // IMPROVED CACHING SYSTEM - Actor-based with versioning
 #[derive(Debug, Clone)]
 struct CachedData<T: Clone> {
@@ -5266,15 +5294,29 @@ impl SimplifiedP2P {
     /// If 2/3+ peers have the block → it's OUR problem (sync issue), not producer failure.
     /// This prevents FALSE EMERGENCY that causes FORKS.
     /// 
-    /// SECURITY: Uses PeerInfo.last_block_height from SIGNED heartbeats (Dilithium)
-    /// ZERO network overhead - instant local check
+    /// TWO-LEVEL STRATEGY:
+    /// 1. FAST PATH (Cache): Check peer heights from NetworkMessage::Block
+    ///    - If 2/3+ peers have block → TRUST (majority consensus)
+    ///    - ZERO network overhead - instant local check
+    ///    - Heights updated every ~10s from Block messages (Dilithium-signed)
+    /// 
+    /// 2. SLOW PATH (HTTP Verify): If cache uncertain, verify via HTTP
+    ///    - Query random peers: GET /api/v1/microblock/{height}
+    ///    - Dynamic scaling: 3 peers (small network) to 7 peers (large network)
+    ///    - 5s timeout total with parallel queries
+    /// 
+    /// SECURITY v2.60: Heights from NetworkMessage::Block ONLY (Dilithium-signed)
+    /// HealthPing is NOT used (not signed), NodeHeartbeat is ONLY for rewards
     /// ═══════════════════════════════════════════════════════════════════════════
-    pub async fn check_block_exists_on_network(&self, block_height: u64) -> (usize, usize) {
-        // Use already-verified peer heights from Dilithium-signed heartbeats
-        // NO HTTP requests needed - data is in connected_peers_lockfree
+    pub async fn check_block_exists_on_network(&self, block_height: u64) -> BlockExistenceResult {
+        // ═══════════════════════════════════════════════════════════════════════════
+        // LEVEL 1: Cache check (FAST PATH - 0ms)
+        // ═══════════════════════════════════════════════════════════════════════════
         let mut total_peers = 0usize;
         let mut peers_with_block = 0usize;
         
+        // OPTIMIZATION: Don't clone addresses yet - only if HTTP verify needed
+        // This saves memory when fast path succeeds (majority of cases)
         for entry in self.connected_peers_lockfree.iter() {
             let peer = entry.value();
             
@@ -5291,19 +5333,226 @@ impl SimplifiedP2P {
             total_peers += 1;
             
             // Check if peer's last known height >= our target
-            // This height comes from Dilithium-signed heartbeats - VERIFIED!
+            // v2.60: Heights from NetworkMessage::Block (~10s interval, Dilithium-signed)
+            // HealthPing NOT used (no signature), NodeHeartbeat ONLY for rewards (not heights)
             if peer.last_block_height >= block_height {
                 peers_with_block += 1;
             }
         }
         
-        if total_peers > 0 {
-            let ratio = (peers_with_block as f64 / total_peers as f64 * 100.0) as u32;
-            println!("[INFO][CONSENSUS] block_check h={} peers_with_block={}/{} ({}%)", 
-                     block_height, peers_with_block, total_peers, ratio);
+        // No peers to check
+        if total_peers == 0 {
+            println!("[EMERGENCY][BLOCK_CHECK] h={} check=cache result=no_peers", block_height);
+            return BlockExistenceResult::NoPeers;
         }
         
-        (peers_with_block, total_peers)
+        let cache_ratio = (peers_with_block as f64 / total_peers as f64 * 100.0) as u32;
+        
+        // FAST PATH SUCCESS: 2/3+ majority has block per cache
+        if peers_with_block * 3 >= total_peers * 2 {
+            println!("[EMERGENCY][BLOCK_CHECK] h={} check=cache result=majority peers={}/{} ratio={}%", 
+                     block_height, peers_with_block, total_peers, cache_ratio);
+            return BlockExistenceResult::MajorityHas { 
+                peers_with: peers_with_block, 
+                total_peers 
+            };
+        }
+        
+        println!("[EMERGENCY][BLOCK_CHECK] h={} check=cache result=uncertain peers={}/{} ratio={}% http_verify=starting", 
+                 block_height, peers_with_block, total_peers, cache_ratio);
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // OPTIMIZATION: Collect peer addresses ONLY if HTTP verify needed
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Efficiently select 3 random peers without cloning all addresses
+        let candidate_peers: Vec<String> = self.connected_peers_lockfree.iter()
+            .filter(|entry| {
+                let peer = entry.value();
+                peer.id != self.node_id && peer.is_consensus_qualified()
+            })
+            .map(|entry| entry.value().addr.clone())
+            .collect();
+        
+        if candidate_peers.is_empty() {
+            println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=no_candidates status=uncertain", 
+                     block_height);
+            return BlockExistenceResult::Uncertain { 
+                cache_peers_with: peers_with_block, 
+                cache_total: total_peers 
+            };
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // LEVEL 2: HTTP verify (SLOW PATH - PARALLEL queries, max 5s total)
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX v2.60: DYNAMIC SCALING for network size
+        // Small network (5 nodes) → query 3 peers (60% of network)
+        // Medium network (50 nodes) → query 5 peers
+        // Large network (1000+ nodes) → query 7 peers (better Sybil resistance)
+        let num_peers_to_query = if total_peers <= 5 {
+            std::cmp::min(3, candidate_peers.len()) // Small network: 60% coverage
+        } else if total_peers <= 100 {
+            std::cmp::min(5, candidate_peers.len()) // Medium network: balanced
+        } else {
+            std::cmp::min(7, candidate_peers.len()) // Large network: max Sybil resistance
+        };
+        
+        println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify strategy=dynamic_scaling total_peers={} query_count={} timeout=5s_total", 
+                 block_height, total_peers, num_peers_to_query);
+        
+        // Select random peers efficiently (no full shuffle, partial shuffle only if needed)
+        use rand::seq::SliceRandom;
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha8Rng::from_entropy(); // Send-safe RNG
+        let peers_to_query: Vec<String> = if candidate_peers.len() <= num_peers_to_query {
+            candidate_peers
+        } else {
+            let mut sample = candidate_peers;
+            sample.partial_shuffle(&mut rng, num_peers_to_query);
+            sample.into_iter().take(num_peers_to_query).collect()
+        };
+        
+        // CRITICAL FIX: Launch parallel HTTP queries with 5s global timeout
+        // Cannot move self into async closures, so we collect futures directly
+        let futures: Vec<_> = peers_to_query.iter()
+            .map(|peer| self.query_peer_has_block(peer, block_height))
+            .collect();
+        
+        let results = match tokio::time::timeout(
+            Duration::from_secs(5),
+            future::join_all(futures)
+        ).await {
+            Ok(results) => results,
+            Err(_) => {
+                println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=global_timeout status=uncertain", 
+                         block_height);
+                return BlockExistenceResult::Uncertain { 
+                    cache_peers_with: peers_with_block, 
+                    cache_total: total_peers 
+                };
+            }
+        };
+        
+        // CRITICAL FIX: Analyze results - peers_to_query and results must align
+        let mut exists_count = 0usize;
+        let mut not_found_count = 0usize;
+        let mut error_count = 0usize;
+        let mut verified_peer: Option<String> = None;
+        
+        for (idx, result) in results.iter().enumerate() {
+            let peer_addr = &peers_to_query[idx];
+            match result {
+                Ok(true) => {
+                    exists_count += 1;
+                    if verified_peer.is_none() {
+                        verified_peer = Some(peer_addr.clone());
+                    }
+                    println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=exists", 
+                             block_height, peer_addr);
+                },
+                Ok(false) => {
+                    not_found_count += 1;
+                    println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=not_found", 
+                             block_height, peer_addr);
+                },
+                Err(e) => {
+                    error_count += 1;
+                    println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=error error={}", 
+                             block_height, peer_addr, e);
+                }
+            }
+        }
+        
+        let total_responses = results.len();
+        println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify summary exists={} not_found={} errors={} total={}", 
+                 block_height, exists_count, not_found_count, error_count, total_responses);
+        
+        // 2/3+ consensus: block exists
+        if exists_count * 3 >= total_responses * 2 {
+            println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=consensus_exists ratio={}/{}", 
+                     block_height, exists_count, total_responses);
+            return BlockExistenceResult::VerifiedExists { 
+                peer_addr: verified_peer.unwrap_or_else(|| "unknown".to_string())
+            };
+        }
+        
+        // All failed or majority says "not found"
+        println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=no_consensus status=uncertain", 
+                 block_height);
+        
+        BlockExistenceResult::Uncertain { 
+            cache_peers_with: peers_with_block, 
+            cache_total: total_peers 
+        }
+    }
+    
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// HTTP API: Query if peer has specific block with validation
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// GET /api/v1/microblock/{height} with 3s timeout
+    /// CRITICAL: Using microblock endpoint (verified to exist in rpc.rs)
+    /// SECURITY: Validates response body to prevent malicious peer attacks
+    /// Returns Ok(true) if block exists AND valid, Ok(false) if not found, Err on errors
+    async fn query_peer_has_block(&self, peer_addr: &str, block_height: u64) -> Result<bool, String> {
+        // Extract IP:PORT from peer address (robust parsing)
+        let ip_port = peer_addr.rsplit_once('@')
+            .map(|(_, addr)| addr)
+            .unwrap_or(peer_addr);
+        
+        let url = format!("http://{}/api/v1/microblock/{}", ip_port, block_height);
+        
+        // Use global HTTP client (shared connection pool)
+        match HTTP_CLIENT.get(&url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await 
+        {
+            Ok(response) if response.status().is_success() => {
+                // CRITICAL: Validate response body to prevent malicious peer exploit
+                // Malicious peer could return 200 OK with fake/empty data
+                match response.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        // Verify response contains valid height field matching our query
+                        match json.get("height").and_then(|h| h.as_u64()) {
+                            Some(h) if h == block_height => {
+                                // Block exists AND height matches
+                                Ok(true)
+                            },
+                            Some(h) => {
+                                // Height mismatch - peer is malicious or buggy
+                                Err(format!("height_mismatch_expected_{}_got_{}", block_height, h))
+                            },
+                            None => {
+                                // Missing or invalid height field
+                                Err("invalid_response_no_height".to_string())
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        // Failed to parse JSON - invalid response
+                        Err(format!("invalid_json_{}", e))
+                    }
+                }
+            },
+            Ok(response) if response.status() == 404 => {
+                // Block not found (legitimate response)
+                Ok(false)
+            },
+            Ok(response) => {
+                // Other HTTP errors
+                Err(format!("http_{}", response.status().as_u16()))
+            },
+            Err(e) => {
+                // Network errors
+                if e.is_timeout() {
+                    Err("timeout".to_string())
+                } else if e.is_connect() {
+                    Err("connect_failed".to_string())
+                } else {
+                    Err(format!("network_{}", e))
+                }
+            }
+        }
     }
     
     /// PRODUCTION v2.56: Trigger chunk repair for a block
@@ -9970,17 +10219,20 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::HealthPing { from, timestamp: _, height } => {
-                // PRODUCTION v2.58: Direct height update from Dilithium-signed heartbeats
-                // v2.43.3-v2.57 used MAX_TRUSTED_HEIGHT_JUMP=100 which broke check_block_exists_on_network
-                // and caused false emergency triggers when nodes fell behind.
+                // SECURITY WARNING v2.60: HealthPing is NOT Dilithium-signed!
+                // DO NOT use this for critical decisions (emergency, fork detection, etc)
                 // 
-                // NOW: Heartbeats are Dilithium-signed → cryptographically verified → trust height directly
-                // Fake height claims are impossible without the private key.
-                self.update_peer_last_seen_with_height(&from, Some(height));
+                // HealthPing is ONLY for connection health monitoring (zombie detection).
+                // For critical decisions, use NetworkMessage::Block (Dilithium-signed, ~10s interval).
+                // 
+                // We update last_seen for connection health, but DO NOT trust height value
+                // for consensus decisions without cryptographic proof.
+                self.update_peer_last_seen_with_height(&from, None); // NO height update!
+                
                 // Simple acknowledgment - no complex processing
                 // NOTE: This is P2P health check, NOT reward system ping!
                 if crate::node::is_debug() && height % 100 == 0 {
-                    println!("[DBG][P2P] health_ping from={} h={}", from, height);
+                    println!("[DBG][P2P] health_ping from={} h={} status=not_trusted", from, height);
                 }
             }
 
@@ -10836,11 +11088,10 @@ impl SimplifiedP2P {
             NetworkMessage::NodeHeartbeat {
                 node_id, node_type, timestamp, block_height, signature, heartbeat_index, gossip_hop
             } => {
-                // PRODUCTION v2.58: Direct height update from gossip blocks
-                // v2.43.3-v2.57 used MAX_TRUSTED_HEIGHT_JUMP=100 which caused sync issues.
-                // GossipBlock contains block_height from actual produced block.
-                // Producer signature is verified before processing → trust height directly.
-                self.update_peer_last_seen_with_height(from_peer, Some(block_height));
+                // CRITICAL v2.60: DO NOT update from_peer height here!
+                // from_peer is just the GOSSIP RELAY (retransmitter), not the heartbeat AUTHOR
+                // Real height update happens AFTER Dilithium signature verification (line ~11190)
+                // where we trust node_id (actual author) after cryptographic proof.
                 
                 // GOSSIP TTL: Max 3 hops
                 if gossip_hop >= 3 {
@@ -10933,6 +11184,9 @@ impl SimplifiedP2P {
                 
                 // Update active nodes list (proves node is online)
                 self.update_active_nodes_from_heartbeat(&node_id, &node_type, timestamp);
+                
+                // NOTE: NodeHeartbeat is ONLY for REWARD eligibility tracking!
+                // Peer heights are updated by NetworkMessage::Block (~10s interval) - sufficient for emergency logic
                 
                 if crate::node::is_info() && heartbeat_index == 0 {
                     // Log only first heartbeat of each 4h window to reduce spam
