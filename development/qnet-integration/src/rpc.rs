@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use warp::{Filter, Rejection, Reply};
 use warp::ws::{Message, WebSocket};
-use crate::node::BlockchainNode;
+use crate::node::{BlockchainNode, is_info, is_warn};
 use qnet_state::transaction::BatchTransferData;
 use chrono;
 use sha3::{Sha3_256, Digest}; // Add missing Digest trait
@@ -19,6 +19,45 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use futures::{StreamExt, SinkExt};
 use tokio::sync::broadcast;
+
+// ============================================================================
+// v2.96: HELPER FUNCTIONS FOR BLOCKCHAIN CONSENSUS DATA
+// ============================================================================
+
+/// Get node reputation from latest MacroBlock snapshot (blockchain consensus)
+/// This ensures ALL nodes return SAME value regardless of local state
+async fn get_reputation_from_snapshot(blockchain: &Arc<BlockchainNode>, node_id: &str) -> f64 {
+    use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
+    
+    // Get latest MacroBlock index
+    let current_height = blockchain.get_height().await;
+    let mb_index = current_height / 90; // 90 microblocks per macroblock
+    
+    // Try to load snapshot from latest macroblock
+    if mb_index > 0 {
+        match blockchain.get_storage().get_macroblock_by_height(mb_index) {
+            Ok(Some(mb_bytes)) => {
+                match bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
+                    Ok(macroblock) => {
+                        if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
+                            // Deserialize snapshot and get reputation
+                            match bincode::deserialize::<std::collections::HashMap<String, f64>>(snapshot_data) {
+                                Ok(reputation_map) => {
+                                    return *reputation_map.get(node_id).unwrap_or(&INITIAL_REPUTATION);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    INITIAL_REPUTATION // Initial reputation or fallback (70.0 from consensus config)
+}
 
 // ============================================================================
 // WEBSOCKET: Real-time event broadcasting
@@ -5696,19 +5735,41 @@ async fn handle_server_node_status(
                 // Calculate if eligible for rewards
                 let is_reward_eligible = heartbeat_count >= required_heartbeats;
                 
-                // Get reputation from blockchain (v2.21.5)
-                let reputation = p2p.get_node_reputation_from_blockchain(found_id);
+                // v2.96: CRITICAL FIX - Get reputation from LAST MACROBLOCK SNAPSHOT (not local state)
+                // This ensures ALL nodes return SAME value (blockchain consensus)
+                let reputation = get_reputation_from_snapshot(&blockchain, found_id).await;
                 
                 // Get block height if available
                 let block_height = blockchain.get_height().await;
                 
-                // Get rewards info from reward manager
+                // v2.96: CRITICAL SECURITY FIX - Read pending rewards from BLOCKCHAIN, NOT RocksDB!
+                // v2.97: CRITICAL FIX - Get wallet from BLOCKCHAIN (not memory)
+                // This ensures ALL nodes return same value (on-chain consensus)
+                // Prevents manipulation of local RocksDB to show fraudulent rewards
+                // Memory can be lost on restart, blockchain is source of truth
                 let pending_rewards = {
-                    let reward_manager = blockchain.get_reward_manager();
-                    let rm = reward_manager.read().await;
-                    rm.get_pending_reward(found_id)
-                        .map(|r| r.total_reward)
-                        .unwrap_or(0)
+                    // Get wallet from blockchain (on-chain registration with Genesis fallback)
+                    let wallet_from_blockchain = blockchain.get_node_wallet(found_id).await;
+                    
+                    match wallet_from_blockchain {
+                        Some(wallet) => {
+                            // Read pending_rewards from BLOCKCHAIN state (not RocksDB!)
+                            if is_info() {
+                                println!("[INFO][API] node_status wallet_source=blockchain node={}", found_id);
+                            }
+                            let state = blockchain.get_state_manager();
+                            let state_guard = state.read().await;
+                            (*state_guard).get_pending_rewards(&wallet)
+                        }
+                        None => {
+                            // Node not registered on-chain = no pending rewards
+                            if is_warn() {
+                                println!("[WARN][API] node_status node_not_registered_onchain node={}", found_id);
+                                println!("[INFO][API] hint: NodeRegistration TX must be in block before rewards visible");
+                            }
+                            0
+                        }
+                    }
                 };
                 
                 return Ok(warp::reply::json(&json!({
@@ -6645,38 +6706,25 @@ async fn handle_claim_rewards(
         }
     };
     
-    // PRODUCTION: Check pending rewards BEFORE creating transaction
-    // v2.75: Try memory first, fallback to RocksDB (lazy rewards survive restarts!)
+    // v2.96: CRITICAL SECURITY FIX - Check pending rewards from BLOCKCHAIN (not memory/RocksDB)!
+    // This is the ONLY source of truth that all nodes agree on
     let reward_amount = {
-        let reward_manager_arc = blockchain.get_reward_manager();
-        let reward_manager = reward_manager_arc.read().await;
-        match reward_manager.get_pending_reward(&claim_request.node_id) {
-            Some(reward) => reward.total_reward,
-            None => {
-                // FALLBACK: Check RocksDB for persisted pending rewards
-                let storage = blockchain.get_storage();
-                match storage.load_pending_reward(&claim_request.node_id) {
-                    Ok(Some(stored_reward)) => {
-                        println!("[INFO][CLAIM] loaded_from_rocksdb node={} amount={}", 
-                                 claim_request.node_id, stored_reward.total_reward);
-                        stored_reward.total_reward
-                    }
-                    Ok(None) => {
-                        return Ok(warp::reply::json(&json!({
-                            "success": false,
-                            "error": "No pending rewards available"
-                        })));
-                    }
-                    Err(e) => {
-                        eprintln!("[ERR][CLAIM] rocksdb_load_fail node={} err={}", claim_request.node_id, e);
-                        return Ok(warp::reply::json(&json!({
-                            "success": false,
-                            "error": "Failed to load pending rewards from storage"
-                        })));
-                    }
-                }
-            }
+        // Use wallet_address from previous check (already verified with fallback for Genesis)
+        // No need to call load_node_registration again - we already have verified wallet!
+        
+        // Read pending_rewards from blockchain state
+        let state = blockchain.get_state_manager();
+        let state_guard = state.read().await;
+        let amount = (*state_guard).get_pending_rewards(&wallet_address);
+        
+        if amount == 0 {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "No pending rewards available"
+            })));
         }
+        
+        amount
     };
     
     // Check minimum claim amount (1 QNC = 1_000_000_000 smallest units)
@@ -9614,21 +9662,9 @@ async fn handle_reputation_history(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
     
-    // Get actual reputation from deterministic blockchain system
-    let current_reputation = if let Some(p2p) = blockchain.get_unified_p2p() {
-        // Use deterministic reputation from blockchain (not cached P2P value)
-        p2p.get_node_reputation_from_blockchain(&node_id)
-    } else {
-        // Fallback: try deterministic_reputation directly
-        let current_ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        blockchain.get_deterministic_reputation()
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_reputation(&node_id, current_ts)
-    };
+    // v2.96: Get reputation from latest MacroBlock snapshot (blockchain consensus)
+    // This ensures ALL nodes return SAME value
+    let current_reputation = get_reputation_from_snapshot(&blockchain, &node_id).await;
     
     // Get reputation history from persistent storage
     let history_records = blockchain.get_storage()

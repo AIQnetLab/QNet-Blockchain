@@ -818,18 +818,32 @@ impl Transaction {
                     return Err(StateError::InvalidTransaction("Only system can distribute rewards".to_string()));
                 }
                 
-                // EMISSION: This is where QNC is created from Pool #1 Base Emission
-                // The total_supply is updated in node.rs when creating these transactions
-                // This transaction just distributes the already-emitted QNC
+                // v2.96: CRITICAL SECURITY FIX - Validate amount against pending_rewards!
+                // This prevents manipulation of local RocksDB to claim fraudulent rewards
+                // ALL nodes validate this when applying TX from blocks
                 
                 // Reward distribution logic
                 if let Some(to) = &self.to {
                     let recipient = accounts.entry(to.clone())
                         .or_insert_with(|| Account::new(to.clone()));
+                    
+                    // v2.96: SECURITY - Check if recipient has sufficient pending rewards
+                    if self.amount > recipient.pending_rewards {
+                        return Err(StateError::InvalidTransaction(
+                            format!("Insufficient pending rewards: attempted {} QNC, available {} QNC", 
+                                    self.amount / 1_000_000_000, 
+                                    recipient.pending_rewards / 1_000_000_000)
+                        ));
+                    }
+                    
+                    // Transfer from pending_rewards to balance (claim)
+                    recipient.pending_rewards -= self.amount;
                     recipient.balance += self.amount;
                     
-                    println!("[EMISSION] 💰 Reward distributed: {} QNC to {} (lazy claim)", 
-                             self.amount, to);
+                    println!("[EMISSION] 💰 Reward claimed: {} QNC to {} (pending: {} → {})", 
+                             self.amount / 1_000_000_000, to,
+                             (recipient.pending_rewards + self.amount) / 1_000_000_000,
+                             recipient.pending_rewards / 1_000_000_000);
                 }
             }
             TransactionType::BatchRewardClaims { node_ids, .. } => {

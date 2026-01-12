@@ -21,6 +21,13 @@ pub struct Account {
     pub reputation: f64,
     pub created_at: u64,
     pub updated_at: u64,
+    
+    // v2.96: CRITICAL SECURITY FIX - Store pending rewards in blockchain!
+    // This prevents manipulation of local RocksDB to claim fraudulent rewards
+    // All nodes can validate RewardDistribution TXs against this on-chain value
+    // CRITICAL: #[serde(default)] is MANDATORY for backward compatibility with old blocks!
+    #[serde(default)]
+    pub pending_rewards: u64,
 }
 
 /// Account state (alias for compatibility)
@@ -69,6 +76,7 @@ impl Default for AccountState {
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
+            pending_rewards: 0, // v2.96: Initialize pending rewards to 0
         }
     }
 }
@@ -133,6 +141,7 @@ impl Account {
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
+            pending_rewards: 0, // v2.96: Initialize pending rewards to 0
         }
     }
     
@@ -148,6 +157,7 @@ impl Account {
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
+            pending_rewards: 0, // v2.96: Initialize pending rewards to 0
         }
     }
     

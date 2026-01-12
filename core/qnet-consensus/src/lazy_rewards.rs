@@ -407,12 +407,13 @@ impl PhaseAwareRewardManager {
         
         // Use unified deterministic processing with remainder accumulation
         // v2.90: macroblock_index=0 means legacy path (not from MacroBlock)
+        // v2.96: Returns bool (was_processed), but legacy path always processes
         self.process_macroblock_heartbeats_deterministic(
             0,  // Legacy: not from MacroBlock, use 0 as sentinel
             &heartbeat_summaries,
             Some(self.pool2_transaction_fees),
             Some(self.pool3_activation_pool),
-        )
+        ).map(|_| ()) // Convert Result<bool, _> to Result<(), _> for compatibility
     }
     
     /// Calculate reward for a single node
@@ -742,12 +743,13 @@ impl PhaseAwareRewardManager {
     pub fn process_macroblock_heartbeats(&mut self, heartbeat_summaries: &[HeartbeatSummaryData]) -> Result<(), ConsensusError> {
         // Use local values (legacy behavior - non-deterministic!)
         // v2.90: macroblock_index=0 means legacy path (not from MacroBlock)
+        // v2.96: Returns bool (was_processed), but legacy path always processes
         self.process_macroblock_heartbeats_deterministic(
             0,  // Legacy: not from MacroBlock, use 0 as sentinel
             heartbeat_summaries,
             Some(self.pool2_transaction_fees),
             Some(self.pool3_activation_pool),
-        )
+        ).map(|_| ()) // Convert Result<bool, _> to Result<(), _> for compatibility
     }
     
     /// v2.50.0: Process heartbeats with DETERMINISTIC pool values from MacroBlock
@@ -768,13 +770,14 @@ impl PhaseAwareRewardManager {
         heartbeat_summaries: &[HeartbeatSummaryData],
         pool2_total: Option<u64>,
         pool3_total: Option<u64>,
-    ) -> Result<(), ConsensusError> {
+    ) -> Result<bool, ConsensusError> {
         // v2.90: CRITICAL - Prevent double-processing of emission MacroBlocks!
         // Without this check, node restarts cause duplicate rewards
         // macroblock_index=0 is sentinel for legacy path (skip duplicate check)
+        // v2.96: Return false to signal "already processed" vs true for "processed now"
         if macroblock_index > 0 && self.processed_emission_macroblocks.contains(&macroblock_index) {
             println!("[WARN][REWARDS] mb={} ALREADY_PROCESSED skipping (prevents duplicate rewards)", macroblock_index);
-            return Ok(());
+            return Ok(false); // Return false = already processed, don't update supply/storage again
         }
         
         let current_phase = self.get_current_phase();
@@ -811,7 +814,8 @@ impl PhaseAwareRewardManager {
             self.pool2_full_remainder = pool2_fees * 30 / 100;
             self.pool2_super_remainder = pool2_fees * 70 / 100;
             self.pool3_remainder = pool3_activations;
-            return Ok(());
+            // v2.96: Return true = processed (even though no rewards distributed)
+            return Ok(true);
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
@@ -951,7 +955,8 @@ impl PhaseAwareRewardManager {
                      macroblock_index, self.processed_emission_macroblocks.len());
         }
         
-        Ok(())
+        // v2.96: Return true = processed successfully (caller should update supply/storage)
+        Ok(true)
     }
     
     /// v2.50.0: Calculate node reward with explicit pool values (deterministic)

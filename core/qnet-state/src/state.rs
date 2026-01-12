@@ -121,6 +121,30 @@ impl StateManager {
         self.chain_state.read().clone()
     }
     
+    /// v2.96: Update pending rewards for a node (after emission processing)
+    /// CRITICAL SECURITY: This ensures all nodes have same pending_rewards on-chain
+    /// Prevents manipulation of local RocksDB to claim fraudulent rewards
+    pub fn update_pending_rewards(&self, node_wallet: &str, reward_amount: u64) -> StateResult<()> {
+        let mut account = self.accounts.entry(node_wallet.to_string())
+            .or_insert_with(|| Account::new(node_wallet.to_string()));
+        
+        account.pending_rewards += reward_amount;
+        
+        println!("[STATE] pending_rewards_updated wallet={} amount={} QNC total={} QNC",
+                 &node_wallet[..node_wallet.len().min(16)],
+                 reward_amount / 1_000_000_000,
+                 account.pending_rewards / 1_000_000_000);
+        
+        Ok(())
+    }
+    
+    /// v2.96: Get pending rewards for an account
+    pub fn get_pending_rewards(&self, wallet: &str) -> u64 {
+        self.accounts.get(wallet)
+            .map(|acc| acc.pending_rewards)
+            .unwrap_or(0)
+    }
+    
     /// Calculate state root hash
     pub fn calculate_state_root(&self) -> Result<[u8; 32], StateError> {
         let mut hasher = Sha3_256::new();

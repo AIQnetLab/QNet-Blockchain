@@ -77,6 +77,7 @@ impl StateDB {
                     reputation: 0.0,
                     created_at: timestamp,
                     updated_at: timestamp,
+                    pending_rewards: 0, // v2.96: Initialize pending rewards
                 }
             });
             
@@ -120,6 +121,7 @@ impl StateDB {
                     reputation: 0.0,
                     created_at: timestamp,
                     updated_at: timestamp,
+                    pending_rewards: 0, // v2.96: Initialize pending rewards
                 }
             });
             
