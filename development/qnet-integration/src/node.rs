@@ -1323,26 +1323,17 @@ impl BlockchainNode {
         txs
     }
     
-    /// Get wallet for node from on-chain registration (PRIMARY) or fallback
+    /// v2.98: SECURITY FIX - Get wallet ONLY from on-chain registration!
+    /// NO FALLBACK! This prevents reward manipulation.
     /// This is the SINGLE SOURCE OF TRUTH for node→wallet mapping
     pub async fn get_node_wallet(&self, node_id: &str) -> Option<String> {
-        // 1. Check on-chain registration (PRIMARY)
+        // Check on-chain registration ONLY
         if let Some((_, wallet)) = self.find_node_registration(node_id).await {
             return Some(wallet);
         }
         
-        // 2. Fallback for Genesis nodes (if not yet in blockchain)
-        if node_id.starts_with("genesis_node_") {
-            let bootstrap_id = node_id.strip_prefix("genesis_node_").unwrap_or("001");
-            if let Some(wallet) = crate::genesis_constants::get_genesis_wallet_by_id(bootstrap_id) {
-                if is_debug() { 
-                    println!("[DBG][REG] genesis_fallback node={} wallet={}...", 
-                             node_id, &wallet[..16.min(wallet.len())]); 
-                }
-                return Some(wallet.to_string());
-            }
-        }
-        
+        // NO FALLBACK! Node MUST be registered on-chain!
+        // Genesis nodes are registered in genesis block at height 0
         None
     }
 
@@ -1922,136 +1913,116 @@ impl BlockchainNode {
         
         let mut reward_manager = self.reward_manager.write().await;
         
-        // CRITICAL: Build Merkle commitment with sampling for scalable deterministic emission
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let window_start = current_time - (current_time % (4 * 60 * 60));
+        // v2.98: CRITICAL FIX - INITIATOR must use MacroBlock snapshot data, not P2P memory!
+        // PROBLEM: P2P memory only has 10 heartbeats from self, but MacroBlock has all 5 nodes
+        // SOLUTION: Load MacroBlock and use reward_heartbeats snapshot
+        const MICROBLOCKS_PER_MACROBLOCK: u64 = 90;
+        let macroblock_index = emission_block_height / MICROBLOCKS_PER_MACROBLOCK;
         
-        let window_end_height = emission_block_height;
-        let window_start_height = emission_block_height.saturating_sub(EMISSION_INTERVAL_BLOCKS);
+        if is_info() { println!("[INFO][REWARDS] loading_macroblock mb={} for_emission", macroblock_index); }
         
-        if is_debug() { println!("[DBG][REWARDS] merkle_build window={}-{}", window_start_height, window_end_height); }
+        // v2.98: Wait for MacroBlock to be finalized (async consensus creates it in parallel)
+        // MacroBlock is created at same time as emission processing, so we may need to wait
+        let mut macroblock_bytes = None;
+        for attempt in 1..=10 {
+            match self.storage.get_macroblock_by_height(macroblock_index) {
+                Ok(Some(bytes)) => {
+                    macroblock_bytes = Some(bytes);
+                    if is_info() { println!("[INFO][REWARDS] macroblock_loaded mb={} attempt={}", macroblock_index, attempt); }
+                    break;
+                }
+                Ok(None) | Err(_) => {
+                    if attempt < 10 {
+                        if is_info() { println!("[INFO][REWARDS] waiting_for_macroblock mb={} attempt={}/10", macroblock_index, attempt); }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    } else {
+                        eprintln!("[ERR][REWARDS] macroblock_timeout mb={} attempts=10", macroblock_index);
+                        return Err(QNetError::ConsensusError(format!("MacroBlock {} not available after 5s", macroblock_index)));
+                    }
+                }
+            }
+        }
         
-        // Get P2P for gossip-synced data
-        let p2p = match self.get_unified_p2p() {
-            Some(p2p) => p2p,
-            None => {
-                if is_warn() { println!("[WARN][REWARDS] p2p_unavailable fallback=local_storage"); }
-                self.process_reward_window_local(&mut reward_manager, window_start, emission_block_height).await?;
-                
-                // v2.84: Use epoch emission, not accumulated pending rewards
-                let total_emission: u64 = reward_manager.get_last_epoch_emission();
-                return Ok(total_emission);
+        let macroblock_bytes = macroblock_bytes.ok_or_else(|| {
+            QNetError::ConsensusError(format!("MacroBlock {} not found", macroblock_index))
+        })?;
+        
+        // Deserialize MacroBlock
+        let macroblock: qnet_state::MacroBlock = match bincode::deserialize(&macroblock_bytes) {
+            Ok(mb) => mb,
+            Err(e) => {
+                eprintln!("[ERR][REWARDS] macroblock_deserialize_fail mb={} err={}", macroblock_index, e);
+                return Err(QNetError::SerializationError(format!("Failed to deserialize MacroBlock {}: {}", macroblock_index, e)));
             }
         };
         
-        // STEP 1A: Collect Light node attestations
-        let light_attestations = p2p.get_attestations_for_block_range(window_start_height, window_end_height);
-        if is_info() { println!("[INFO][ATTESTATION] block_range_filter start={} end={} found={}", 
-                                window_start_height, window_end_height, light_attestations.len()); }
-        
-        // Process Light node attestations  
-        // Light nodes are ALWAYS Light type (they only submit attestations, not heartbeats)
-        for (light_node_id, _slot, _pinger_id, _timestamp, _block_height) in &light_attestations {
-            // Get wallet from storage registration, fallback to generated
-            let wallet = self.storage.load_node_registration(light_node_id)
-                .ok()
-                .flatten()
-                .map(|(_, w, _)| w)
-                .unwrap_or_else(|| generate_eon_address_from_id(light_node_id));
-            
-            let _ = reward_manager.register_node(light_node_id.clone(), qnet_consensus::NodeType::Light, wallet);
-            // Light nodes: attestation = 1 successful ping, latency not measured (use 0)
-            let _ = reward_manager.record_ping_attempt(light_node_id, true, 0);
-        }
-        
-        // STEP 1B: Collect Full/Super node heartbeats
-        // v2.75: Try P2P memory first, fallback to RocksDB for persistence across restarts
-        let mut heartbeats = p2p.get_heartbeats_for_block_range(window_start_height, window_end_height);
-        if is_info() { println!("[INFO][HEARTBEAT] p2p_memory start={} end={} found={}", 
-                                window_start_height, window_end_height, heartbeats.len()); }
-        
-        // FALLBACK: If P2P memory is empty, load from persistent storage (RocksDB)
-        if heartbeats.is_empty() {
-            if is_info() { println!("[INFO][HEARTBEAT] p2p_empty fallback=rocksdb"); }
-            match self.storage.get_heartbeats_for_block_range(window_start_height, window_end_height) {
-                Ok(stored) => {
-                    if is_info() { println!("[INFO][HEARTBEAT] rocksdb_loaded count={}", stored.len()); }
-                    heartbeats = stored;
-                }
-                Err(e) => {
-                    eprintln!("[ERR][HEARTBEAT] rocksdb_fallback_fail err={}", e);
-                }
-            }
-        }
-        
-        // Count heartbeats per node
-        let mut heartbeat_counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
-        for (node_id, _, _, _) in &heartbeats {
-            *heartbeat_counts.entry(node_id.clone()).or_insert(0) += 1;
-        }
-        
-        // Register Full/Super nodes from heartbeats
-        for (node_id, count) in &heartbeat_counts {
-            // Get node type from STORAGE registration (REQUIRED - no defaults!)
-            // Storage has: (node_type_str, wallet, reputation)
-            let registration = match self.storage.load_node_registration(node_id) {
-                Ok(Some((type_str, wallet, _reputation))) => {
-                    let nt = match type_str.to_lowercase().as_str() {
-                        "super" => qnet_consensus::NodeType::Super,
-                        "full" => qnet_consensus::NodeType::Full,
-                        "light" => qnet_consensus::NodeType::Light,
-                        unknown => {
-                            eprintln!("[ERR][REWARDS] invalid_node_type node={} type={} SKIPPING", node_id, unknown);
-                            continue; // Skip this node - invalid type!
+        // Extract reward_heartbeats from MacroBlock
+        let heartbeat_summaries = match &macroblock.consensus_data.reward_heartbeats {
+            Some(ref heartbeats_data) if !heartbeats_data.is_empty() => {
+                match bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
+                    Ok(summaries) => {
+                        if is_info() { 
+                            println!("[INFO][REWARDS] macroblock_heartbeats mb={} nodes={}", 
+                                     macroblock_index, summaries.len()); 
                         }
-                    };
-                    Some((nt, wallet))
-                }
-                Ok(None) => {
-                    // Node not registered - check if genesis (they're pre-registered)
-                    if node_id.starts_with("genesis_node_") {
-                        // Genesis nodes - use PREDEFINED wallets from genesis_constants.rs!
-                        let bootstrap_id = node_id.strip_prefix("genesis_node_").unwrap_or("001");
-                        let wallet = crate::genesis_constants::get_genesis_wallet_by_id(bootstrap_id)
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| generate_eon_address_from_id(node_id));
-                        Some((qnet_consensus::NodeType::Super, wallet))
-                    } else {
-                        eprintln!("[ERR][REWARDS] node_not_registered node={} SKIPPING", node_id);
-                        continue; // Skip - node must be registered to receive rewards!
+                        summaries
+                    }
+                    Err(e) => {
+                        eprintln!("[ERR][REWARDS] heartbeat_deserialize_fail mb={} err={}", macroblock_index, e);
+                        return Err(QNetError::SerializationError(format!("Failed to deserialize heartbeats: {}", e)));
                     }
                 }
-                Err(e) => {
-                    eprintln!("[ERR][REWARDS] storage_error node={} err={} SKIPPING", node_id, e);
-                    continue;
-                }
-            };
-            
-            let (node_type, wallet) = match registration {
-                Some(r) => r,
-                None => continue,
-            };
-            
-            let _ = reward_manager.register_node(node_id.clone(), node_type, wallet);
-            
-            // Record heartbeats as successful pings
-            // Heartbeat latency is not stored in current format, use 0 (not measured)
-            for _ in 0..*count {
-                let _ = reward_manager.record_ping_attempt(node_id, true, 0);
             }
+            _ => {
+                eprintln!("[WARN][REWARDS] no_heartbeats_in_macroblock mb={}", macroblock_index);
+                Vec::new()
+            }
+        };
+        
+        if heartbeat_summaries.is_empty() {
+            if is_warn() { println!("[WARN][REWARDS] no_eligible_nodes mb={}", macroblock_index); }
+            return Ok(0);
         }
+        
+        // Convert to HeartbeatSummaryData for reward_manager
+        let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = heartbeat_summaries.iter()
+            .map(|s| qnet_consensus::HeartbeatSummaryData {
+                node_id: s.node_id.clone(),
+                node_type: s.node_type,
+                heartbeat_count: s.heartbeat_count,
+                first_heartbeat: s.first_heartbeat,
+                last_heartbeat: s.last_heartbeat,
+                is_eligible: s.is_eligible,
+            })
+            .collect();
+        
+        // Get pool totals from MacroBlock
+        let pool2_total = macroblock.consensus_data.pool2_total_fees;
+        let pool3_total = macroblock.consensus_data.pool3_total_activations;
         
         if is_info() { 
-            println!("[INFO][REWARDS] heartbeats_found n={} source=block_range h={}-{}", 
-                    heartbeats.len(), window_start_height, window_end_height); 
+            let eligible = summary_data.iter().filter(|s| s.is_eligible).count();
+            println!("[INFO][REWARDS] processing_macroblock_heartbeats mb={} nodes={} eligible={} pool2={:?} pool3={:?}", 
+                     macroblock_index, summary_data.len(), eligible, pool2_total, pool3_total);
         }
         
-        // Force process window to calculate rewards
-        if let Err(e) = reward_manager.force_process_window() {
-            eprintln!("[ERR][REWARDS] force_process_fail err={}", e);
+        // Process heartbeats using deterministic MacroBlock data
+        match reward_manager.process_macroblock_heartbeats_deterministic(
+            macroblock_index,
+            &summary_data,
+            pool2_total,
+            pool3_total,
+        ) {
+            Ok(was_processed) => {
+                if !was_processed {
+                    if is_warn() { println!("[WARN][REWARDS] macroblock_already_processed mb={}", macroblock_index); }
+                    return Ok(0);
+                }
+            }
+            Err(e) => {
+                eprintln!("[ERR][REWARDS] process_macroblock_fail mb={} err={}", macroblock_index, e);
+                return Err(QNetError::ConsensusError(format!("Failed to process MacroBlock heartbeats: {}", e)));
+            }
         }
         
         // Get pending rewards
@@ -2085,7 +2056,45 @@ impl BlockchainNode {
             }
         };
         
-        // Save pending rewards to storage
+        // v2.98: CRITICAL - Update pending_rewards in blockchain state (ON-CHAIN)
+        // This ensures API returns correct data and all nodes have same state
+        let state = self.state.read().await;
+        let mut updated_count = 0;
+        
+        for (node_id, amount) in &pending_rewards {
+            // v2.98: CRITICAL SECURITY - Get wallet ONLY from blockchain registration!
+            // NO FALLBACK! If node not registered on-chain, it CANNOT receive rewards!
+            // This prevents reward manipulation and ensures all nodes follow same rules
+            match self.storage.load_node_registration(node_id) {
+                Ok(Some((_, wallet_addr, _))) => {
+                    // Node registered on-chain → update pending_rewards
+                    if let Err(e) = (*state).update_pending_rewards(&wallet_addr, *amount) {
+                        eprintln!("[ERR][REWARDS] blockchain_update_fail node={} err={}", node_id, e);
+                    } else {
+                        updated_count += 1;
+                    }
+                }
+                Ok(None) => {
+                    // Node NOT registered on-chain → NO rewards!
+                    // This is CORRECT behavior - registration TX must be in blockchain first
+                    if is_warn() {
+                        eprintln!("[WARN][REWARDS] node_not_registered node={} skipping_blockchain_update", node_id);
+                        eprintln!("[INFO][REWARDS] hint: NodeRegistration TX must be in block before rewards");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[ERR][REWARDS] registration_load_fail node={} err={}", node_id, e);
+                }
+            }
+        }
+        
+        drop(state);
+        
+        if updated_count > 0 {
+            if is_info() { println!("[INFO][REWARDS] blockchain_pending_updated count={}", updated_count); }
+        }
+        
+        // Save pending rewards to RocksDB (for persistence)
         for (node_id, _amount) in &pending_rewards {
             if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
                 if let Err(e) = self.storage.save_pending_reward(&node_id, reward) {
@@ -2364,6 +2373,59 @@ impl BlockchainNode {
         
         // Initialize state manager
         let state = Arc::new(RwLock::new(StateManager::new()));
+        
+        // v2.98: CRITICAL - Restore state from latest snapshot (blockchain persistence)
+        // This ensures pending_rewards and balances survive node restarts
+        // SCALABILITY: Snapshot load is O(n) but happens ONCE at startup (acceptable even for 1M accounts)
+        if is_info() { println!("[INFO][STATE] loading_latest_snapshot"); }
+        
+        match storage.load_latest_state_snapshot().await {
+            Ok(Some((snapshot_height, state_root, accounts_data))) => {
+                if !accounts_data.is_empty() {
+                    match bincode::deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_data) {
+                        Ok(accounts) => {
+                            let state_guard = state.write().await;
+                            match (*state_guard).restore_accounts(accounts.clone()) {
+                                Ok(_) => {
+                                    println!("[INFO][STATE] snapshot_restored height={} accounts={} size={}KB", 
+                                             snapshot_height, accounts.len(), accounts_data.len() / 1024);
+                                    
+                                    // Verify state_root matches
+                                    match (*state_guard).calculate_state_root() {
+                                        Ok(calculated_root) => {
+                                            if calculated_root == state_root {
+                                                println!("[INFO][STATE] state_root_verified root={}...", 
+                                                         hex::encode(&state_root[..8]));
+                                            } else {
+                                                eprintln!("[WARN][STATE] state_root_mismatch expected={} calculated={}", 
+                                                          hex::encode(&state_root[..8]), hex::encode(&calculated_root[..8]));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[ERR][STATE] state_root_calc_fail err={}", e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[ERR][STATE] restore_fail err={}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[ERR][STATE] deserialize_fail err={}", e);
+                        }
+                    }
+                } else {
+                    if is_info() { println!("[INFO][STATE] snapshot_empty height={}", snapshot_height); }
+                }
+            }
+            Ok(None) => {
+                if is_info() { println!("[INFO][STATE] no_snapshot fresh_start"); }
+            }
+            Err(e) => {
+                eprintln!("[WARN][STATE] snapshot_load_fail err={} starting_fresh", e);
+            }
+        }
         
         // Initialize production-ready mempool with AUTO-SCALING
         // v2.27.2: BENCHMARK MODE gets 10x larger mempool for 100K+ TPS testing
@@ -13127,6 +13189,50 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                              mb_idx, round, cons_time); 
                                                 }
                                                 
+                                                // v2.98: CRITICAL - Save state snapshot for blockchain persistence
+                                                // This allows nodes to restore state after restart and sync with network
+                                                // SCALABILITY: Only save every 160 MBs (emission blocks) to reduce storage
+                                                const EMISSION_MACROBLOCK_INTERVAL: u64 = 160;
+                                                let is_emission_macroblock = mb_idx > 0 && mb_idx % EMISSION_MACROBLOCK_INTERVAL == 0;
+                                                
+                                                if is_emission_macroblock {
+                                                    // Get state_root and serialize accounts
+                                                    let state = state_manager_cons.read().await;
+                                                    
+                                                    // Calculate state_root for verification
+                                                    let state_root = match (*state).calculate_state_root() {
+                                                        Ok(root) => root,
+                                                        Err(e) => {
+                                                            eprintln!("[ERR][SNAPSHOT] state_root_calc_fail mb={} err={}", mb_idx, e);
+                                                            [0u8; 32]
+                                                        }
+                                                    };
+                                                    
+                                                    // Serialize all accounts (for large networks, this could be optimized with delta compression)
+                                                    let state_data = match bincode::serialize(&(*state).get_all_accounts()) {
+                                                        Ok(data) => data,
+                                                        Err(e) => {
+                                                            eprintln!("[ERR][SNAPSHOT] serialize_fail mb={} err={}", mb_idx, e);
+                                                            Vec::new()
+                                                        }
+                                                    };
+                                                    
+                                                    drop(state);
+                                                    
+                                                    if !state_data.is_empty() {
+                                                        // Save snapshot to RocksDB
+                                                        let snapshot_height = mb_idx * 90; // Convert MB index to block height
+                                                        if let Err(e) = storage_cons.save_state_snapshot(snapshot_height, state_root, state_data.clone()).await {
+                                                            eprintln!("[ERR][SNAPSHOT] save_fail mb={} h={} err={}", mb_idx, snapshot_height, e);
+                                                        } else {
+                                                            if is_info() {
+                                                                println!("[INFO][SNAPSHOT] saved mb={} h={} size={}KB", 
+                                                                         mb_idx, snapshot_height, state_data.len() / 1024);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                
                                                 // v2.95: FIXED - PARTICIPANTS only process rewards via MacroBlock listener
                                                 // INITIATOR processes rewards SYNCHRONOUSLY in emission blocks
                                                 // Simple role check prevents duplication without slow lock
@@ -13204,16 +13310,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                                                 drop(reward_manager); // Release for updates
                                                                                 
                                                                                 // Step 1: Get all wallets from blockchain (using storage directly)
+                                                                                // v2.98: SECURITY FIX - NO FALLBACK! Only on-chain registrations accepted!
                                                                                 let mut node_wallets = Vec::new();
                                                                                 for (node_id, amount) in &pending {
-                                                                                    // Get wallet from on-chain registration
+                                                                                    // Get wallet from on-chain registration ONLY
                                                                                     let wallet = if let Ok(Some((_, wallet_addr, _))) = storage_cons.load_node_registration(node_id) {
                                                                                         Some(wallet_addr)
-                                                                                    } else if node_id.starts_with("genesis_node_") {
-                                                                                        // Genesis fallback
-                                                                                        let bootstrap_id = node_id.strip_prefix("genesis_node_").unwrap_or("001");
-                                                                                        crate::genesis_constants::get_genesis_wallet_by_id(bootstrap_id).map(|s| s.to_string())
                                                                                     } else {
+                                                                                        // NO FALLBACK! Node MUST be registered on-chain to receive rewards!
                                                                                         None
                                                                                     };
                                                                                     node_wallets.push((node_id.clone(), wallet, *amount));

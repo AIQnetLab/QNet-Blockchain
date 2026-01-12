@@ -2648,22 +2648,27 @@ impl Storage {
     }
     
     /// Save state snapshot for efficient storage
+    /// v2.98: Fixed to use snapshot_{height} key format (was state_{height}) for consistency with load methods
     pub async fn save_state_snapshot(&self, height: u64, state_root: [u8; 32], state_data: Vec<u8>) -> IntegrationResult<()> {
         // State snapshots are saved separately for efficient retrieval
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
         
-        let key = format!("state_{}", height);
+        // v2.98: Use snapshot_ prefix to match load_state_snapshot() and load_latest_state_snapshot()
+        let key = format!("snapshot_{}", height);
+        
+        // Format: [state_root(32) | data_len(8) | compressed_data]
+        let mut value = Vec::new();
+        value.extend_from_slice(&state_root);
+        value.extend_from_slice(&(state_data.len() as u64).to_le_bytes());
         
         // Compress state data aggressively (Zstd-15)
         let compressed = zstd::encode_all(&state_data[..], 15)
             .map_err(|e| IntegrationError::Other(format!("State compression error: {}", e)))?;
         
-        self.persistent.db.put_cf(&snapshots_cf, key.as_bytes(), &compressed)?;
+        value.extend_from_slice(&compressed);
         
-        // Store state root for verification
-        let root_key = format!("state_root_{}", height);
-        self.persistent.db.put_cf(&snapshots_cf, root_key.as_bytes(), &state_root)?;
+        self.persistent.db.put_cf(&snapshots_cf, key.as_bytes(), &value)?;
         
         println!("[STATE] 💾 Saved state snapshot at height {} ({} KB compressed)", 
                 height, compressed.len() / 1024);
@@ -5035,6 +5040,44 @@ impl Storage {
     }
     
     /// Load state snapshot from specified height
+    /// v2.98: Load latest state snapshot for node startup
+    /// Returns (height, state_root, accounts_data) or None if no snapshot exists
+    pub async fn load_latest_state_snapshot(&self) -> IntegrationResult<Option<(u64, [u8; 32], Vec<u8>)>> {
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        
+        // Find latest snapshot by iterating (RocksDB stores keys sorted)
+        let mut iter = self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::End);
+        
+        if let Some(Ok((key, value))) = iter.next() {
+            // Parse key: "snapshot_{height}"
+            let key_str = String::from_utf8_lossy(&key);
+            if let Some(height_str) = key_str.strip_prefix("snapshot_") {
+                if let Ok(height) = height_str.parse::<u64>() {
+                    // Parse value: [state_root(32) | data_len(8) | compressed_data]
+                    if value.len() >= 40 {
+                        let state_root: [u8; 32] = value[..32].try_into()
+                            .map_err(|_| IntegrationError::StorageError("Invalid state_root size".to_string()))?;
+                        let _data_len = u64::from_le_bytes(value[32..40].try_into()
+                            .map_err(|_| IntegrationError::StorageError("Invalid data_len size".to_string()))?);
+                        let compressed_data = &value[40..];
+                        
+                        // Decompress with Zstd (matches save_state_snapshot compression)
+                        let accounts_data = zstd::decode_all(compressed_data)
+                            .map_err(|e| IntegrationError::Other(format!("State decompression error: {}", e)))?;
+                        
+                        println!("[STATE] 📂 Loaded state snapshot height={} size={} KB", 
+                                height, accounts_data.len() / 1024);
+                        
+                        return Ok(Some((height, state_root, accounts_data)));
+                    }
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+    
     pub async fn load_state_snapshot(&self, height: u64) -> IntegrationResult<()> {
         println!("[SNAPSHOT] 📂 Loading state snapshot from height {}", height);
         

@@ -145,6 +145,37 @@ impl StateManager {
             .unwrap_or(0)
     }
     
+    /// v2.98: Get all accounts for state snapshot (blockchain persistence)
+    /// 
+    /// SCALABILITY:
+    /// - Snapshots saved ONLY every 160 MacroBlocks (4 hours) - not every block
+    /// - DashMap provides O(1) concurrent access
+    /// - Zstd-15 compression in storage layer (already implemented)
+    /// - Delta snapshots for incremental changes (already implemented in storage.rs)
+    /// 
+    /// SIZE ESTIMATES:
+    /// - 1K accounts: ~100 KB → ~20 KB compressed
+    /// - 10K accounts: ~1 MB → ~200 KB compressed
+    /// - 100K accounts: ~10 MB → ~2 MB compressed
+    /// - 1M accounts: ~100 MB → ~20 MB compressed (5s save, once per 4h)
+    /// - 10M accounts: ~1 GB → ~200 MB compressed (30s save, acceptable)
+    pub fn get_all_accounts(&self) -> Vec<(String, Account)> {
+        self.accounts.iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+    
+    /// v2.98: Restore accounts from snapshot (after node restart or sync)
+    /// This replaces in-memory DashMap with persisted blockchain state
+    pub fn restore_accounts(&self, accounts: Vec<(String, Account)>) -> StateResult<()> {
+        self.accounts.clear();
+        for (address, account) in accounts {
+            self.accounts.insert(address, account);
+        }
+        println!("[STATE] restored_accounts count={}", self.accounts.len());
+        Ok(())
+    }
+    
     /// Calculate state root hash
     pub fn calculate_state_root(&self) -> Result<[u8; 32], StateError> {
         let mut hasher = Sha3_256::new();
