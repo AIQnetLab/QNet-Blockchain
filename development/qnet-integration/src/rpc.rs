@@ -649,7 +649,7 @@ struct TransactionHistoryQuery {
     /// Transactions per page (default: 20, max: 100)
     #[serde(default = "default_per_page")]
     per_page: usize,
-    /// Filter by transaction type: "transfer", "reward", "activation", "all" (default: "all")
+    /// Filter by transaction type: "transfer", "reward", "activation", "heartbeat_commitment", "ping_commitment", "node_registration", "swap", "system", "all" (default: "all")
     #[serde(default = "default_tx_type")]
     tx_type: String,
     /// Filter by direction: "sent", "received", "all" (default: "all")
@@ -3007,6 +3007,15 @@ async fn handle_transaction_history(
                         "transfer" => matches!(tx.tx_type, qnet_state::TransactionType::Transfer { .. }),
                         "reward" => matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution),
                         "activation" => matches!(tx.tx_type, qnet_state::TransactionType::NodeActivation { .. }),
+                        "heartbeat_commitment" => matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. }),
+                        "ping_commitment" => matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. }),
+                        "node_registration" => matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }),
+                        "swap" => matches!(tx.tx_type, qnet_state::TransactionType::Swap { .. }),
+                        "system" => matches!(tx.tx_type, 
+                            qnet_state::TransactionType::HeartbeatCommitment { .. } |
+                            qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
+                            qnet_state::TransactionType::RewardDistribution
+                        ),
                         _ => true, // "all" or unknown
                     };
                     
@@ -3047,6 +3056,10 @@ async fn handle_transaction_history(
                     qnet_state::TransactionType::BatchTransfers { .. } => "batch_transfer",
                     qnet_state::TransactionType::BatchRewardClaims { .. } => "batch_reward",
                     qnet_state::TransactionType::BatchNodeActivations { .. } => "batch_activation",
+                    qnet_state::TransactionType::HeartbeatCommitment { .. } => "heartbeat_commitment",
+                    qnet_state::TransactionType::PingCommitmentWithSampling { .. } => "ping_commitment",
+                    qnet_state::TransactionType::NodeRegistration { .. } => "node_registration",
+                    qnet_state::TransactionType::Swap { .. } => "swap",
                     _ => "other",
                 };
                 

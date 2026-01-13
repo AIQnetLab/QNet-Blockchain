@@ -595,6 +595,97 @@ impl BlockValidator {
                 
                 // Ping commitments are FREE system operations
             }
+            TransactionType::HeartbeatCommitment {
+                node_id,
+                window_start_height,
+                window_end_height,
+                merkle_root,
+                heartbeat_count,
+                sample_seed,
+                heartbeat_samples,
+                ..
+            } => {
+                // Validate node_id format
+                if node_id.is_empty() {
+                    return Err(IntegrationError::ValidationError("Node ID cannot be empty".to_string()));
+                }
+                if !node_id.starts_with("light_") && !node_id.starts_with("full_") 
+                    && !node_id.starts_with("super_") && !node_id.starts_with("genesis_node_") {
+                    return Err(IntegrationError::ValidationError(format!("Invalid node_id format: {}", node_id)));
+                }
+                
+                // Validate window heights
+                if *window_end_height <= *window_start_height {
+                    return Err(IntegrationError::ValidationError("Window end height must be greater than start".to_string()));
+                }
+                
+                // Validate window size (4 hours = 14400 blocks)
+                const EXPECTED_WINDOW: u64 = 14400;
+                if window_end_height - window_start_height != EXPECTED_WINDOW {
+                    return Err(IntegrationError::ValidationError(format!(
+                        "Invalid window size: expected {} blocks", EXPECTED_WINDOW
+                    )));
+                }
+                
+                // Validate Merkle root format (64 hex chars = 32 bytes)
+                if merkle_root.len() != 64 || !merkle_root.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(IntegrationError::ValidationError("Merkle root must be 64 hex characters".to_string()));
+                }
+                
+                // Validate sample seed format (64 hex chars = 32 bytes)
+                if sample_seed.len() != 64 {
+                    return Err(IntegrationError::ValidationError("Sample seed must be 64 hex characters".to_string()));
+                }
+                
+                // Validate heartbeat_count (0-10)
+                if *heartbeat_count > 10 {
+                    return Err(IntegrationError::ValidationError("Heartbeat count cannot exceed 10".to_string()));
+                }
+                
+                // Validate sample size (20-30% of heartbeat_count, minimum 1)
+                if *heartbeat_count > 0 {
+                    let min_samples = ((*heartbeat_count as usize * 20) / 100).max(1);
+                    let max_samples = ((*heartbeat_count as usize * 30) / 100).max(1);
+                    if heartbeat_samples.len() < min_samples || heartbeat_samples.len() > max_samples {
+                        return Err(IntegrationError::ValidationError(format!(
+                            "Invalid sample size: got {}, expected {}-{}",
+                            heartbeat_samples.len(), min_samples, max_samples
+                        )));
+                    }
+                }
+                
+                // Validate each sample
+                for sample in heartbeat_samples {
+                    if sample.heartbeat_index >= 10 {
+                        return Err(IntegrationError::ValidationError("Heartbeat index must be 0-9".to_string()));
+                    }
+                    if sample.signature.is_empty() {
+                        return Err(IntegrationError::ValidationError("Sample signature cannot be empty".to_string()));
+                    }
+                    if sample.merkle_proof.is_empty() {
+                        return Err(IntegrationError::ValidationError("Sample must include Merkle proof".to_string()));
+                    }
+                    
+                    // SECURITY v2.77: Pre-validation of sample data format
+                    // Full cryptographic verification (Dilithium + Merkle proof) happens in node.rs
+                    // during MacroBlock creation when collecting commitments from blockchain
+                    
+                    // Layer 1 (here): Format validation
+                    // Layer 2 (node.rs): Dilithium signature verification
+                    // Layer 3 (node.rs): Merkle proof verification against merkle_root
+                    
+                    // Validate signature format (must be hybrid_p2p_bin or similar)
+                    if !sample.signature.starts_with("hybrid_p2p_bin:") 
+                        && !sample.signature.starts_with("hybrid_p2p:")
+                        && !sample.signature.starts_with("compact_bin:") {
+                        return Err(IntegrationError::ValidationError(
+                            format!("Invalid signature format for sample {}", sample.heartbeat_index)
+                        ));
+                    }
+                }
+                
+                // Heartbeat commitments are FREE system operations
+            }
             TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, pool_address, .. } => {
                 // v2.50.0: DEX Swap transaction validation
                 if from.is_empty() {

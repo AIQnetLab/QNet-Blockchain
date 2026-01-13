@@ -807,6 +807,10 @@ pub struct BlockchainNode {
     // Reward manager for lazy rewards system
     reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
     
+    // PRODUCTION v2.77: Track sent HeartbeatCommitment TXs by epoch (to avoid duplicates)
+    // HashSet of epoch numbers for which commitment was already sent
+    sent_heartbeat_commitments: Arc<RwLock<std::collections::HashSet<u64>>>,
+    
     // Verifiable Time Sequence (VTS) for time synchronization
     quantum_poh: Option<Arc<crate::quantum_poh::QuantumPoH>>,
     quantum_poh_receiver: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::quantum_poh::PoHEntry>>>>,
@@ -1819,6 +1823,439 @@ impl BlockchainNode {
         Ok(true) // v2.53: Emission created successfully
     }
     
+    /// PRODUCTION v2.77: Create HeartbeatCommitment TX for this node
+    /// Called 50 blocks before epoch end (e.g., blocks 14350-14399)
+    /// 
+    /// Arguments:
+    /// - current_epoch: Epoch number (e.g., 1 for blocks 0-14399)
+    /// 
+    /// Returns: Ok(()) if TX created and added to mempool
+    async fn create_heartbeat_commitment_tx(&self, current_epoch: u64) -> Result<(), QNetError> {
+        const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+        
+        // Calculate block window for this epoch (epochs start from 0)
+        let window_start_height = current_epoch * EMISSION_BLOCK_INTERVAL;
+        let window_end_height = (current_epoch + 1) * EMISSION_BLOCK_INTERVAL;
+        
+        // Get P2P instance
+        let p2p = match &self.unified_p2p {
+            Some(p2p) => p2p.clone(),
+            None => {
+                return Err(QNetError::NetworkError("P2P not available".to_string()));
+            }
+        };
+        
+        // Compute Merkle root and samples for this node's heartbeats
+        let (merkle_root, heartbeat_data, sample_indices) = p2p
+            .compute_heartbeat_merkle_root_for_commitment(
+                &self.node_id,
+                window_start_height,
+                window_end_height,
+            )
+            .map_err(|e| QNetError::ConsensusError(format!("Failed to compute Merkle root: {}", e)))?;
+        
+        let heartbeat_count = heartbeat_data.len() as u8;
+        
+        if heartbeat_count == 0 {
+            if is_warn() {
+                println!("[WARN][HEARTBEAT-COMMITMENT] no_heartbeats node={} epoch={}", 
+                         self.node_id, current_epoch);
+            }
+            // Still create TX with count=0 (node was offline)
+        }
+        
+        // Get first and last heartbeat times
+        let (first_heartbeat_time, last_heartbeat_time) = if heartbeat_count > 0 {
+            (heartbeat_data[0].1, heartbeat_data[heartbeat_data.len() - 1].1)
+        } else {
+            (0, 0)
+        };
+        
+        // Create deterministic sample seed
+        use sha3::{Sha3_256, Digest};
+        let mut seed_hasher = Sha3_256::new();
+        seed_hasher.update(b"QNet_Heartbeat_Sampling_v1");
+        seed_hasher.update(self.node_id.as_bytes());
+        seed_hasher.update(&window_start_height.to_le_bytes());
+        let sample_seed = seed_hasher.finalize();
+        let sample_seed_hex = hex::encode(&sample_seed[..]);
+        
+        // Create samples with Merkle proofs
+        let mut heartbeat_samples = Vec::new();
+        for &sample_idx in &sample_indices {
+            if sample_idx >= heartbeat_data.len() {
+                continue;
+            }
+            
+            let (index, timestamp, block_height, signature, hash) = &heartbeat_data[sample_idx];
+            
+            // Generate Merkle proof
+            let hashes: Vec<String> = heartbeat_data.iter().map(|(_, _, _, _, h)| h.clone()).collect();
+            let merkle_proof = qnet_core::crypto::merkle::generate_merkle_proof(&hashes, sample_idx)
+                .map_err(|e| QNetError::SecurityError(format!("Failed to generate Merkle proof: {}", e)))?;
+            
+            heartbeat_samples.push(qnet_state::HeartbeatSampleData {
+                heartbeat_index: *index,
+                timestamp: *timestamp,
+                block_height: *block_height,
+                signature: signature.clone(),
+                merkle_proof,
+            });
+        }
+        
+        // Create HeartbeatCommitment transaction
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let mut commitment_tx = qnet_state::Transaction {
+            from: self.node_id.clone(),
+            to: None,
+            amount: 0,
+            tx_type: qnet_state::TransactionType::HeartbeatCommitment {
+                node_id: self.node_id.clone(),
+                window_start_height,
+                window_end_height,
+                merkle_root: merkle_root.clone(),
+                heartbeat_count,
+                first_heartbeat_time,
+                last_heartbeat_time,
+                sample_seed: sample_seed_hex,
+                heartbeat_samples,
+            },
+            timestamp: current_time,
+            hash: String::new(),
+            signature: None, // System TX - no signature needed
+            public_key: None,
+            gas_price: u64::MAX, // MAX priority - must be included before emission
+            gas_limit: 0, // FREE system operation
+            nonce: 0,
+            data: Some(format!(
+                "Heartbeat Commitment: {} heartbeats, epoch {}, root: {}",
+                heartbeat_count, current_epoch, &merkle_root[..16]
+            )),
+            dilithium_signature: None,
+            dilithium_public_key: None,
+        };
+        
+        // Calculate hash
+        commitment_tx.hash = commitment_tx.calculate_hash();
+        
+        // Add to mempool
+        if let Err(e) = self.add_transaction_to_mempool(commitment_tx).await {
+            eprintln!("[ERR][HEARTBEAT-COMMITMENT] mempool_add_failed node={} epoch={} err={}",
+                     self.node_id, current_epoch, e);
+            return Err(e);
+        }
+        
+        if is_info() {
+            println!("[INFO][HEARTBEAT-COMMITMENT] TX_created node={} epoch={} hb_count={} samples={} root={}",
+                     self.node_id, current_epoch, heartbeat_count, sample_indices.len(), &merkle_root[..16]);
+        }
+        
+        Ok(())
+    }
+    
+    /// PRODUCTION v2.77: Collect HeartbeatCommitment TXs from blockchain with SHARD AGGREGATION
+    /// Reads all HeartbeatCommitment TXs from blocks and aggregates by 256 shards
+    /// 
+    /// SCALABILITY: For 10M nodes:
+    /// - Individual approach: 10M × 100 bytes = 1 GB MacroBlock ❌
+    /// - Shard approach: 256 × 5 KB = 1.3 MB MacroBlock ✅
+    /// PRODUCTION v2.77: Collect HeartbeatCommitment TXs from blockchain (SCALABLE!)
+    /// 
+    /// This method scans blocks for HeartbeatCommitment transactions and aggregates them.
+    /// Used for deterministic reward calculation in MacroBlocks.
+    /// 
+    /// Arguments:
+    /// - storage: Arc reference to blockchain storage
+    /// - p2p: Arc reference to P2P layer (for Dilithium signature verification)
+    /// - window_start_height: Start of epoch (e.g., 0)
+    /// - window_end_height: End of epoch (e.g., 14400)
+    /// - use_shards: If true, return shard summaries (scalable). If false, return individual summaries (legacy)
+    /// 
+    /// Returns: (Vec<HeartbeatSummary>, Vec<ShardHeartbeatSummary>)
+    ///
+    /// SECURITY: Full 2-layer verification (Dilithium + Merkle proofs)
+    async fn collect_heartbeat_commitments_from_blocks(
+        storage: &Arc<Storage>,
+        p2p: &Arc<SimplifiedP2P>,
+        window_start_height: u64,
+        window_end_height: u64,
+        use_shards: bool,
+    ) -> Result<(Vec<qnet_state::HeartbeatSummary>, Vec<qnet_state::ShardHeartbeatSummary>), QNetError> {
+        use sha3::{Sha3_256, Digest};
+        use std::collections::HashMap;
+        
+        if is_info() {
+            println!("[INFO][HEARTBEAT-COLLECTION] Reading HeartbeatCommitment TXs from blocks {}-{} shards={}",
+                     window_start_height, window_end_height, use_shards);
+        }
+        
+        // Collect all HeartbeatCommitment TXs from blocks
+        let mut commitments: HashMap<String, qnet_state::TransactionType> = HashMap::new();
+        let mut blocks_scanned = 0;
+        let mut txs_found = 0;
+        
+        // Scan blocks for HeartbeatCommitment TXs
+        for height in window_start_height..=window_end_height {
+            if let Ok(Some(block_bytes)) = storage.load_microblock(height) {
+                if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_bytes) {
+                    blocks_scanned += 1;
+                    
+                    for tx in &block.transactions {
+                        if let qnet_state::TransactionType::HeartbeatCommitment { 
+                            node_id, 
+                            heartbeat_samples,
+                            merkle_root,
+                            heartbeat_count,
+                            ..
+                        } = &tx.tx_type {
+                            // Only keep first commitment from each node (ignore duplicates)
+                            if commitments.contains_key(node_id) {
+                                continue;
+                            }
+                            
+                            // SECURITY v2.77: Verify Dilithium signatures AND Merkle proofs for samples
+                            let mut valid_samples = 0;
+                            for sample in heartbeat_samples {
+                                let expected_msg = format!("{}:{}:{}:{}", 
+                                    node_id, sample.timestamp, sample.block_height, sample.heartbeat_index);
+                                
+                                // LAYER 1: Verify Dilithium signature
+                                let signature_valid = p2p.verify_dilithium_heartbeat_signature(&expected_msg, &sample.signature, node_id);
+                                
+                                if !signature_valid {
+                                    if is_warn() {
+                                        println!("[WARN][HEARTBEAT-COLLECTION] Invalid Dilithium signature for {} sample #{} - rejecting commitment",
+                                                 node_id, sample.heartbeat_index);
+                                    }
+                                    continue;
+                                }
+                                
+                                // LAYER 2: Verify Merkle proof
+                                use blake3::Hasher as Blake3Hasher;
+                                let mut hasher = Blake3Hasher::new();
+                                hasher.update(node_id.as_bytes());
+                                hasher.update(&[sample.heartbeat_index]);
+                                hasher.update(&sample.timestamp.to_le_bytes());
+                                hasher.update(&sample.block_height.to_le_bytes());
+                                hasher.update(sample.signature.as_bytes());
+                                let hash = hasher.finalize();
+                                let heartbeat_hash = hash.to_hex().to_string();
+                                
+                                let merkle_valid = qnet_core::crypto::merkle::verify_merkle_proof(
+                                    &heartbeat_hash,
+                                    merkle_root,
+                                    &sample.merkle_proof
+                                );
+                                
+                                if !merkle_valid {
+                                    if is_warn() {
+                                        println!("[WARN][HEARTBEAT-COLLECTION] Invalid Merkle proof for {} sample #{} - rejecting commitment",
+                                                 node_id, sample.heartbeat_index);
+                                    }
+                                    continue;
+                                }
+                                
+                                valid_samples += 1;
+                            }
+                            
+                            // Require ALL samples to have valid signatures
+                            if valid_samples == heartbeat_samples.len() || heartbeat_samples.is_empty() {
+                                commitments.insert(node_id.clone(), tx.tx_type.clone());
+                                txs_found += 1;
+                            } else {
+                                if is_warn() {
+                                    println!("[WARN][HEARTBEAT-COLLECTION] Commitment from {} rejected: {}/{} valid signatures",
+                                             node_id, valid_samples, heartbeat_samples.len());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Progress logging every 1000 blocks
+            if blocks_scanned % 1000 == 0 && is_debug() {
+                println!("[DBG][HEARTBEAT-COLLECTION] progress blocks={}/{} txs={}",
+                         blocks_scanned, window_end_height - window_start_height + 1, txs_found);
+            }
+        }
+        
+        if is_info() {
+            println!("[INFO][HEARTBEAT-COLLECTION] scan_complete blocks={} txs={} unique_nodes={}",
+                     blocks_scanned, txs_found, commitments.len());
+        }
+        
+        if use_shards {
+            Self::aggregate_commitments_by_shards(commitments).await
+        } else {
+            Self::commitments_to_individual_summaries(commitments).await
+        }
+    }
+    
+    /// Convert HeartbeatCommitment TXs to individual HeartbeatSummary (legacy mode)
+    async fn commitments_to_individual_summaries(
+        commitments: HashMap<String, qnet_state::TransactionType>,
+    ) -> Result<(Vec<qnet_state::HeartbeatSummary>, Vec<qnet_state::ShardHeartbeatSummary>), QNetError> {
+        let mut summaries = Vec::new();
+        
+        for (node_id, tx_type) in commitments {
+            if let qnet_state::TransactionType::HeartbeatCommitment {
+                heartbeat_count,
+                first_heartbeat_time,
+                last_heartbeat_time,
+                ..
+            } = tx_type {
+                let node_type = if node_id.starts_with("light_") {
+                    0
+                } else if node_id.starts_with("full_") {
+                    1
+                } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
+                    2
+                } else {
+                    continue;
+                };
+                
+                let required = match node_type {
+                    0 => 1,
+                    1 => 8,
+                    2 => 9,
+                    _ => 10,
+                };
+                let is_eligible = heartbeat_count >= required;
+                
+                summaries.push(qnet_state::HeartbeatSummary {
+                    node_id,
+                    node_type,
+                    heartbeat_count,
+                    first_heartbeat: first_heartbeat_time,
+                    last_heartbeat: last_heartbeat_time,
+                    is_eligible,
+                });
+            }
+        }
+        
+        if is_info() {
+            println!("[INFO][HEARTBEAT-COLLECTION] individual_summaries count={} eligible={}",
+                     summaries.len(), summaries.iter().filter(|s| s.is_eligible).count());
+        }
+        
+        Ok((summaries, Vec::new()))
+    }
+    
+    /// PRODUCTION v2.77: Aggregate HeartbeatCommitment TXs by 256 shards (SCALABLE!)
+    /// Reduces MacroBlock size from 1 GB to 1.3 MB for 10M nodes
+    async fn aggregate_commitments_by_shards(
+        commitments: HashMap<String, qnet_state::TransactionType>,
+    ) -> Result<(Vec<qnet_state::HeartbeatSummary>, Vec<qnet_state::ShardHeartbeatSummary>), QNetError> {
+        use sha3::{Sha3_256, Digest};
+        use std::collections::HashMap;
+        
+        let mut shards: HashMap<u8, Vec<(String, qnet_state::TransactionType)>> = HashMap::new();
+        
+        for (node_id, tx_type) in commitments {
+            let mut hasher = Sha3_256::new();
+            hasher.update(node_id.as_bytes());
+            let hash = hasher.finalize();
+            let shard_id = hash[0];
+            
+            shards.entry(shard_id).or_insert_with(Vec::new).push((node_id, tx_type));
+        }
+        
+        if is_info() {
+            println!("[INFO][HEARTBEAT-COLLECTION] shard_distribution shards={} avg_per_shard={}",
+                     shards.len(), 
+                     shards.values().map(|v| v.len()).sum::<usize>() / shards.len().max(1));
+        }
+        
+        let mut shard_summaries = Vec::new();
+        
+        for shard_id in 0..=255u8 {
+            let shard_nodes = shards.get(&shard_id).cloned().unwrap_or_default();
+            
+            let mut total_nodes = 0;
+            let mut eligible_light = 0;
+            let mut eligible_full = 0;
+            let mut eligible_super = 0;
+            let mut commitment_hashes = Vec::new();
+            
+            for (node_id, tx_type) in &shard_nodes {
+                if let qnet_state::TransactionType::HeartbeatCommitment {
+                    heartbeat_count,
+                    merkle_root,
+                    ..
+                } = tx_type {
+                    total_nodes += 1;
+                    
+                    let node_type = if node_id.starts_with("light_") {
+                        0
+                    } else if node_id.starts_with("full_") {
+                        1
+                    } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
+                        2
+                    } else {
+                        continue;
+                    };
+                    
+                    let required = match node_type {
+                        0 => 1,
+                        1 => 8,
+                        2 => 9,
+                        _ => 10,
+                    };
+                    let is_eligible = *heartbeat_count >= required;
+                    
+                    if is_eligible {
+                        match node_type {
+                            0 => eligible_light += 1,
+                            1 => eligible_full += 1,
+                            2 => eligible_super += 1,
+                            _ => {}
+                        }
+                    }
+                    
+                    commitment_hashes.push(merkle_root.clone());
+                }
+            }
+            
+            if total_nodes > 0 {
+                let total_eligible = eligible_light + eligible_full + eligible_super;
+                
+                let sample_count = (commitment_hashes.len() * 10 / 100).max(1).min(commitment_hashes.len());
+                let sample_hashes: Vec<String> = commitment_hashes.iter().take(sample_count).cloned().collect();
+                
+                let mut hasher = Sha3_256::new();
+                for hash in &commitment_hashes {
+                    hasher.update(hash.as_bytes());
+                }
+                let commitments_root = hex::encode(hasher.finalize());
+                
+                shard_summaries.push(qnet_state::ShardHeartbeatSummary {
+                    shard_id,
+                    total_nodes,
+                    eligible_light,
+                    eligible_full,
+                    eligible_super,
+                    total_eligible,
+                    commitments_merkle_root: commitments_root,
+                    sample_commitment_hashes: sample_hashes,
+                });
+            }
+        }
+        
+        if is_info() {
+            let total_nodes: u32 = shard_summaries.iter().map(|s| s.total_nodes).sum();
+            let total_eligible: u32 = shard_summaries.iter().map(|s| s.total_eligible).sum();
+            println!("[INFO][HEARTBEAT-COLLECTION] shard_summaries count={} nodes={} eligible={}",
+                     shard_summaries.len(), total_nodes, total_eligible);
+        }
+        
+        Ok((Vec::new(), shard_summaries))
+    }
+    
     /// v2.68: Process reward window and RETURN emission TX (don't add to mempool)
     /// 
     /// Uses process_reward_window_internal() which does all the heavy lifting:
@@ -2694,6 +3131,9 @@ impl BlockchainNode {
             p2p_port,
         );
         
+        // v2.76: Set storage reference for scalable heartbeat persistence (millions of nodes)
+        unified_p2p_instance.set_storage(storage.clone());
+        
         // Set consensus channel for real integration
         unified_p2p_instance.set_consensus_channel(consensus_tx);
         
@@ -3265,6 +3705,7 @@ impl BlockchainNode {
             parallel_validator,
             archive_manager: Arc::new(tokio::sync::RwLock::new(archive_manager)),
             reward_manager,
+            sent_heartbeat_commitments: Arc::new(RwLock::new(std::collections::HashSet::new())),
             quantum_poh,  // Already Option - None for Light nodes, Some for Full/Super
             quantum_poh_receiver: poh_receiver,  // Already Option
             parallel_executor,
@@ -6369,11 +6810,14 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
         // 3. NODE_IS_SYNCHRONIZED flag - global sync status
         // No additional monitoring task needed (existing mechanisms are sufficient)
         
-        // Clone self for emission processing inside spawn
-        let blockchain_for_emission = self.clone();
-        
         // Clone shard_coordinator for use inside spawn (avoid self reference)
         let shard_coordinator_opt = self.shard_coordinator.clone();
+        
+        // CRITICAL: Clone sent_heartbeat_commitments for HeartbeatCommitment TX tracking
+        let sent_heartbeat_commitments_clone = self.sent_heartbeat_commitments.clone();
+        
+        // Clone self for emission/heartbeat processing inside spawn
+        let blockchain_for_spawn = self.clone();
         
         tokio::spawn(async move {
             // CRITICAL FIX: Start from current global height, not 0
@@ -8830,40 +9274,78 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     
                     let mut emission_tx_opt: Option<(String, Vec<u8>)> = None;
                     
-                    // Check if this is an emission block (every 14400 blocks = 4 hours)
+                    // PRODUCTION v2.77: Create HeartbeatCommitment TX before epoch end
+                    // Nodes submit commitment 50 blocks before emission (14350-14399)
+                    // This ensures TX is included in blockchain BEFORE emission at 14400
                     const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+                    const COMMITMENT_WINDOW_START: u64 = 50; // Submit 50 blocks before epoch end
+                    
+                    let blocks_until_epoch_end = EMISSION_BLOCK_INTERVAL - (next_block_height % EMISSION_BLOCK_INTERVAL);
+                    let should_create_heartbeat_commitment = blocks_until_epoch_end <= COMMITMENT_WINDOW_START 
+                        && blocks_until_epoch_end > 0;
+                    
+                    if should_create_heartbeat_commitment {
+                        // Check if we already sent commitment for this epoch
+                        let current_epoch = next_block_height / EMISSION_BLOCK_INTERVAL;
+                        let commitment_key = format!("heartbeat_commitment_epoch_{}", current_epoch);
+                        
+                        // Thread-safe check if commitment already sent (tokio::sync::RwLock)
+                        let already_sent = {
+                            let sent_commitments = sent_heartbeat_commitments_clone.read().await;
+                            sent_commitments.contains(&current_epoch)
+                        };
+                        
+                        if !already_sent {
+                            if is_info() {
+                                println!("[INFO][HEARTBEAT-COMMITMENT] Creating TX epoch={} block={} window_end={}",
+                                         current_epoch, next_block_height, current_epoch * EMISSION_BLOCK_INTERVAL);
+                            }
+                            
+                            // Create HeartbeatCommitment TX for THIS node
+                            if let Err(e) = blockchain_for_spawn.create_heartbeat_commitment_tx(current_epoch).await {
+                                eprintln!("[WARN][HEARTBEAT-COMMITMENT] Failed to create TX: {}", e);
+                            } else {
+                                // Mark as sent (tokio::sync::RwLock)
+                                let mut sent_commitments = sent_heartbeat_commitments_clone.write().await;
+                                sent_commitments.insert(current_epoch);
+                                
+                                if is_info() {
+                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX created and sent epoch={}", current_epoch);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Check if this is an emission block (every 14400 blocks = 4 hours)
                     let is_emission_block = next_block_height > 0 && next_block_height % EMISSION_BLOCK_INTERVAL == 0;
                     
                     if is_emission_block {
-                        // Calculate MacroBlock index for this emission
-                        let macroblock_index = next_block_height / 90; // 14400 / 90 = 160
+                        // ARCHITECTURE v2.77: DELAYED REWARD - emission TX for PREVIOUS epoch
+                        // This eliminates deadlock between emission block and MacroBlock finalization
+                        // 
+                        // Timeline:
+                        //   Block 14400 (epoch 0): NO emission TX (no previous epoch)
+                        //   Block 28800 (epoch 1): Emission TX for epoch 0 (blocks 0-14400) using MacroBlock 160
+                        //   Block 43200 (epoch 2): Emission TX for epoch 1 (blocks 14400-28800) using MacroBlock 320
+                        // 
+                        // Delayed reward by 1 epoch (4 hours) - ensures MacroBlock is finalized
                         
-                        if is_info() {
-                            println!("[INFO][EMISSION] block={} mb={} loading_macroblock", 
-                                     next_block_height, macroblock_index);
-                        }
+                        let current_epoch = next_block_height / EMISSION_BLOCK_INTERVAL;
                         
-                        // Wait for MacroBlock to be finalized (with timeout)
-                        let macroblock_result = {
-                            let max_wait = 60; // 60 iterations * 100ms = 6 seconds max
-                            let mut attempts = 0;
-                            let mut mb_opt = None;
+                        // Skip first emission block (epoch 0 has no previous epoch to reward)
+                        if current_epoch > 0 {
+                            let prev_epoch = current_epoch - 1;
+                            let prev_epoch_end_block = (prev_epoch + 1) * EMISSION_BLOCK_INTERVAL;
+                            let prev_macroblock_index = prev_epoch_end_block / 90;
                             
-                            while attempts < max_wait {
-                                if let Ok(Some(mb_bytes)) = storage.get_macroblock_by_height(macroblock_index) {
-                                    if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
-                                        mb_opt = Some(mb);
-                                        break;
-                                    }
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                attempts += 1;
+                            if is_info() {
+                                println!("[INFO][EMISSION] block={} epoch={} rewarding_prev_epoch={} mb={}", 
+                                         next_block_height, current_epoch, prev_epoch, prev_macroblock_index);
                             }
                             
-                            mb_opt
-                        };
-                        
-                        if let Some(macroblock) = macroblock_result {
+                            // Load PREVIOUS MacroBlock (always ready - no waiting!)
+                            if let Ok(Some(mb_bytes)) = storage.get_macroblock_by_height(prev_macroblock_index) {
+                                if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
                             // Extract reward_heartbeats from MacroBlock
                             if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
                                 if !heartbeats_data.is_empty() {
@@ -8934,7 +9416,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                                     
                                                     if is_info() {
                                                         println!("[INFO][EMISSION] tx_created block={} mb={} amount={} QNC eligible={} hash={}", 
-                                                                 next_block_height, macroblock_index,
+                                                                 next_block_height, prev_macroblock_index,
                                                                  total_emission / 1_000_000_000,
                                                                  eligible_count,
                                                                  &emission_tx.hash[..16.min(emission_tx.hash.len())]);
@@ -8943,24 +9425,26 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                                     eprintln!("[ERR][EMISSION] tx_serialize_fail block={}", next_block_height);
                                                 }
                                             } else {
-                                                eprintln!("[WARN][EMISSION] zero_emission block={} mb={}", next_block_height, macroblock_index);
+                                                eprintln!("[WARN][EMISSION] zero_emission block={} mb={}", next_block_height, prev_macroblock_index);
                                             }
                                         } else {
-                                            eprintln!("[WARN][EMISSION] no_eligible_nodes block={} mb={}", next_block_height, macroblock_index);
+                                            eprintln!("[WARN][EMISSION] no_eligible_nodes block={} mb={}", next_block_height, prev_macroblock_index);
                                         }
                                     } else {
-                                        eprintln!("[ERR][EMISSION] heartbeat_deserialize_fail block={} mb={}", next_block_height, macroblock_index);
+                                        eprintln!("[ERR][EMISSION] heartbeat_deserialize_fail block={} mb={}", next_block_height, prev_macroblock_index);
                                     }
                                 } else {
-                                    eprintln!("[WARN][EMISSION] empty_heartbeats block={} mb={}", next_block_height, macroblock_index);
+                                    eprintln!("[WARN][EMISSION] empty_heartbeats block={} mb={}", next_block_height, prev_macroblock_index);
                                 }
                             } else {
-                                eprintln!("[WARN][EMISSION] no_heartbeat_data block={} mb={}", next_block_height, macroblock_index);
+                                eprintln!("[WARN][EMISSION] no_heartbeat_data block={} mb={}", next_block_height, prev_macroblock_index);
                             }
-                        } else {
-                            eprintln!("[ERR][EMISSION] macroblock_not_found block={} mb={} timeout=6s", 
-                                     next_block_height, macroblock_index);
-                        }
+                                } // Close if let Ok(macroblock)
+                            } else {
+                                eprintln!("[ERR][EMISSION] macroblock_not_found block={} mb={}", 
+                                         next_block_height, prev_macroblock_index);
+                            }
+                        } // Close if current_epoch > 0
                     }
                     
                     // MEV PROTECTION: Get transactions with bundle priority
@@ -16859,17 +17343,60 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     let is_emission_mb = mb_index > 0 && mb_index % EMISSION_MB_INTERVAL == 0;
                     
                     if is_emission_mb {
-                        // EMISSION MacroBlock - collect heartbeats for entire 4h window
-                        let heartbeat_summaries = p2p.get_heartbeat_summaries_for_macroblock(start_height);
-                        if !heartbeat_summaries.is_empty() {
-                            let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
-                            println!("[INFO][MB] EMISSION_HEARTBEATS mb={} window={} nodes={} eligible={}",
-                                     mb_index, mb_index / EMISSION_MB_INTERVAL,
-                                     heartbeat_summaries.len(), eligible);
-                            bincode::serialize(&heartbeat_summaries).ok()
-                        } else {
-                            println!("[WARN][MB] EMISSION_NO_HEARTBEATS mb={}", mb_index);
-                            None
+                        // EMISSION MacroBlock - collect heartbeats from BLOCKCHAIN (v2.77: scalable!)
+                        // ARCHITECTURE: Read HeartbeatCommitment TXs from blocks
+                        // Use shard aggregation for scalability (1.3 MB for 10M nodes vs 1 GB)
+                        
+                        let window_start = (mb_index / EMISSION_MB_INTERVAL - 1) * 14400;
+                        let window_end = window_start + 14400;
+                        let use_shards = true; // v2.77: Always use shards for future-proofing
+                        
+                        // Try blockchain-based collection first
+                        // CRITICAL: Must pass storage and p2p explicitly (static method context)
+                        let storage_clone = storage.clone();
+                        let p2p_clone = p2p.clone();
+                        match tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                Self::collect_heartbeat_commitments_from_blocks(
+                                    &storage_clone,
+                                    &p2p_clone,
+                                    window_start,
+                                    window_end,
+                                    use_shards
+                                ).await
+                            })
+                        }) {
+                            Ok((heartbeat_summaries, shard_summaries)) => {
+                                if use_shards && !shard_summaries.is_empty() {
+                                    // SCALABLE: Store shard summaries
+                                    let total_nodes: u32 = shard_summaries.iter().map(|s| s.total_nodes).sum();
+                                    let total_eligible: u32 = shard_summaries.iter().map(|s| s.total_eligible).sum();
+                                    
+                                    println!("[INFO][MB] EMISSION_HEARTBEATS_SHARDS mb={} shards={} nodes={} eligible={}",
+                                             mb_index, shard_summaries.len(), total_nodes, total_eligible);
+                                    
+                                    bincode::serialize(&shard_summaries).ok()
+                                } else if !heartbeat_summaries.is_empty() {
+                                    // LEGACY: Individual summaries
+                                    let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
+                                    println!("[INFO][MB] EMISSION_HEARTBEATS_INDIVIDUAL mb={} nodes={} eligible={}",
+                                             mb_index, heartbeat_summaries.len(), eligible);
+                                    bincode::serialize(&heartbeat_summaries).ok()
+                                } else {
+                                    println!("[WARN][MB] EMISSION_NO_HEARTBEATS mb={}", mb_index);
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[ERR][MB] heartbeat_collection_failed mb={} err={}", mb_index, e);
+                                // FALLBACK: RAM-based collection
+                                let heartbeat_summaries = p2p.get_heartbeat_summaries_for_macroblock(start_height);
+                                if !heartbeat_summaries.is_empty() {
+                                    bincode::serialize(&heartbeat_summaries).ok()
+                                } else {
+                                    None
+                                }
+                            }
                         }
                     } else {
                         // Regular MacroBlock - no heartbeats (saves space)
@@ -17542,9 +18069,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // DECENTRALIZED: System transactions don't need signature
         // Bitcoin-style: validated through deterministic consensus rules, not crypto signature
         // v2.53: Added PingCommitmentWithSampling to system transactions
+        // v2.77: Added HeartbeatCommitment to system transactions
         let is_system_transaction = matches!(tx.tx_type, 
             qnet_state::TransactionType::RewardDistribution | 
-            qnet_state::TransactionType::PingCommitmentWithSampling { .. }
+            qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
+            qnet_state::TransactionType::HeartbeatCommitment { .. }
         );
         
         if is_system_transaction {
@@ -18082,6 +18611,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             // PingCommitmentWithSampling from system_ping_commitment - no signature needed
+            // HeartbeatCommitment from node_id - no signature needed (validated by Merkle proofs)
         } else {
             if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
                 return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
@@ -20723,6 +21253,7 @@ impl Clone for BlockchainNode {
             bootstrap_peers: self.bootstrap_peers.clone(),
             perf_config: self.perf_config.clone(),
             security_config: self.security_config.clone(),
+            sent_heartbeat_commitments: self.sent_heartbeat_commitments.clone(),
             height: self.height.clone(),
             is_running: self.is_running.clone(),
             current_microblocks: self.current_microblocks.clone(),

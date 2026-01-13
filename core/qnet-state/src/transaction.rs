@@ -194,6 +194,25 @@ pub enum TransactionType {
         sample_seed: String,                // Deterministic sampling seed (hex)
         ping_samples: Vec<PingSampleData>,  // Random sample with proofs (1% or 10K min)
     },
+    
+    /// Heartbeat Commitment with Merkle Tree + Sampling (PRODUCTION-READY SCALABILITY)
+    /// Self-attestation for Full/Super nodes (10 heartbeats per 4-hour epoch)
+    /// Similar to PingCommitment but for node liveness tracking instead of ping responses
+    /// ARCHITECTURE: Each node submits ONE commitment TX per epoch containing:
+    /// - Merkle root of all 10 heartbeats (deterministically timed)
+    /// - Samples with proofs for Byzantine verification
+    /// This scales to 10M+ nodes (694 TX/block) while maintaining deterministic rewards
+    HeartbeatCommitment {
+        node_id: String,                           // Node submitting commitment
+        window_start_height: u64,                  // Start of epoch (e.g., 0, 14400, 28800)
+        window_end_height: u64,                    // End of epoch (e.g., 14400, 28800, 43200)
+        merkle_root: String,                       // Merkle root of ALL heartbeat hashes (hex)
+        heartbeat_count: u8,                       // Total heartbeats in window (0-10)
+        first_heartbeat_time: u64,                 // Timestamp of first heartbeat
+        last_heartbeat_time: u64,                  // Timestamp of last heartbeat
+        sample_seed: String,                       // Deterministic sampling seed (hex)
+        heartbeat_samples: Vec<HeartbeatSampleData>, // Samples with Merkle proofs
+    },
 }
 
 /// Individual ping sample with Merkle proof
@@ -205,6 +224,33 @@ pub struct PingSampleData {
     pub success: bool,
     pub timestamp: u64,
     pub merkle_proof: Vec<(String, bool)>, // (hash, is_left) - proof of inclusion
+}
+
+/// Individual heartbeat sample with Merkle proof
+/// Used in HeartbeatCommitment TX for Byzantine-safe verification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeartbeatSampleData {
+    pub heartbeat_index: u8,               // Index in epoch (0-9)
+    pub timestamp: u64,                    // Unix timestamp
+    pub block_height: u64,                 // Block height when sent
+    pub signature: String,                 // Dilithium HYBRID signature
+    pub merkle_proof: Vec<(String, bool)>, // (hash, is_left) - proof of inclusion
+}
+
+/// PRODUCTION v2.77: Shard-aggregated heartbeat summary for SCALABILITY
+/// Instead of storing 10M+ individual HeartbeatSummary in MacroBlock,
+/// aggregate by 256 shards (shard_id = sha3_256(node_id)[0])
+/// This reduces MacroBlock from 1 GB to 1.3 MB for 10M nodes!
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShardHeartbeatSummary {
+    pub shard_id: u8,                      // Shard 0-255
+    pub total_nodes: u32,                  // Total nodes in shard
+    pub eligible_light: u32,               // Eligible Light nodes
+    pub eligible_full: u32,                // Eligible Full nodes  
+    pub eligible_super: u32,               // Eligible Super nodes
+    pub total_eligible: u32,               // Sum of eligible nodes
+    pub commitments_merkle_root: String,   // Merkle root of all HeartbeatCommitment TXs in shard
+    pub sample_commitment_hashes: Vec<String>, // Sample of 10-20 commitment hashes for verification
 }
 
 /// Batch node activation data for transactions
@@ -602,6 +648,96 @@ impl Transaction {
                     }
                 }
             }
+            TransactionType::HeartbeatCommitment {
+                node_id,
+                window_start_height,
+                window_end_height,
+                merkle_root,
+                heartbeat_count,
+                first_heartbeat_time,
+                last_heartbeat_time,
+                sample_seed,
+                heartbeat_samples,
+            } => {
+                // CRITICAL: Heartbeat commitments are FREE (system operation)
+                if self.gas_limit != gas_limits::PING {
+                    return Err("Heartbeat commitment must have gas_limit = 0 (FREE operation)".to_string());
+                }
+                
+                // Validate node_id format (light_*, full_*, super_*, genesis_node_*)
+                if node_id.is_empty() {
+                    return Err("Node ID cannot be empty".to_string());
+                }
+                if !node_id.starts_with("light_") 
+                    && !node_id.starts_with("full_") 
+                    && !node_id.starts_with("super_") 
+                    && !node_id.starts_with("genesis_node_") {
+                    return Err(format!("Invalid node_id format: {}", node_id));
+                }
+                
+                // Validate window heights
+                if *window_end_height <= *window_start_height {
+                    return Err("Window end height must be greater than start height".to_string());
+                }
+                
+                // Validate window size (must be 4 hours = 14400 blocks)
+                let expected_window = 14400u64;
+                let actual_window = window_end_height - window_start_height;
+                if actual_window != expected_window {
+                    return Err(format!(
+                        "Invalid window size: expected {} blocks, got {}",
+                        expected_window, actual_window
+                    ));
+                }
+                
+                // Validate Merkle root (must be 64 hex characters = 32 bytes)
+                if merkle_root.len() != 64 || !merkle_root.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err("Merkle root must be 64 hex characters (32 bytes)".to_string());
+                }
+                
+                // Validate sample seed (must be 64 hex characters = 32 bytes)
+                if sample_seed.len() != 64 {
+                    return Err("Sample seed must be 64 hex characters (32 bytes)".to_string());
+                }
+                
+                // Validate heartbeat_count (0-10)
+                if *heartbeat_count > 10 {
+                    return Err("Heartbeat count cannot exceed 10".to_string());
+                }
+                
+                // Validate timestamps
+                if *heartbeat_count > 0 && *last_heartbeat_time < *first_heartbeat_time {
+                    return Err("Last heartbeat time cannot be before first heartbeat time".to_string());
+                }
+                
+                // Validate sample size: 20-30% of heartbeat_count (minimum 1 if count > 0)
+                if *heartbeat_count > 0 {
+                    let min_samples = ((*heartbeat_count as usize * 20) / 100).max(1);
+                    let max_samples = ((*heartbeat_count as usize * 30) / 100).max(1);
+                    if heartbeat_samples.len() < min_samples || heartbeat_samples.len() > max_samples {
+                        return Err(format!(
+                            "Invalid sample size: got {}, expected {}-{} (20-30% of {})",
+                            heartbeat_samples.len(), min_samples, max_samples, heartbeat_count
+                        ));
+                    }
+                }
+                
+                // Validate each sample
+                for sample in heartbeat_samples {
+                    if sample.heartbeat_index >= 10 {
+                        return Err(format!("Invalid heartbeat_index: {}, must be 0-9", sample.heartbeat_index));
+                    }
+                    if sample.block_height < *window_start_height || sample.block_height > *window_end_height {
+                        return Err("Sample block_height outside window range".to_string());
+                    }
+                    if sample.signature.is_empty() {
+                        return Err("Heartbeat sample signature cannot be empty".to_string());
+                    }
+                    if sample.merkle_proof.is_empty() {
+                        return Err("Heartbeat sample must include Merkle proof".to_string());
+                    }
+                }
+            }
             TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } => {
                 // System transaction: validate node registration data
                 if node_id.is_empty() {
@@ -982,6 +1118,26 @@ impl Transaction {
                 println!("[PING-COMMITMENT] 📊 Total: {}, Successful: {}, Samples: {}, Root: {}",
                          total_ping_count, successful_ping_count, ping_samples.len(), 
                          &merkle_root[..16]);
+                // No state modification needed - commitment will be validated during emission check
+            }
+            TransactionType::HeartbeatCommitment {
+                node_id,
+                window_start_height,
+                window_end_height,
+                merkle_root,
+                heartbeat_count,
+                first_heartbeat_time,
+                last_heartbeat_time,
+                heartbeat_samples,
+                ..
+            } => {
+                // Heartbeat commitments are FREE system operations (gas = 0)
+                // They don't modify account balances, only provide deterministic data for emission
+                println!("[HEARTBEAT-COMMITMENT] 🌳 Merkle commitment node={} window={}-{}", 
+                         node_id, window_start_height, window_end_height);
+                println!("[HEARTBEAT-COMMITMENT] 📊 Count: {}, Samples: {}, Root: {}, Time: {}-{}",
+                         heartbeat_count, heartbeat_samples.len(), &merkle_root[..16],
+                         first_heartbeat_time, last_heartbeat_time);
                 // No state modification needed - commitment will be validated during emission check
             }
             TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } => {
