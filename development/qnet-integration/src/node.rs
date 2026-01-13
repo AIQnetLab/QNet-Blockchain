@@ -8810,21 +8810,158 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // 
                     // Validation: All nodes verify emission TX presence after emission MacroBlock
                     
-                    // v2.99: EMISSION MOVED TO MACROBLOCK CREATION!
-                    // Architecture: INITIATOR calculates rewards during MacroBlock consensus (in trigger_macroblock_consensus)
-                    //               PARTICIPANTS load state snapshot from MacroBlock
+                    // v2.99: EMISSION TX CREATION
+                    // CRITICAL: Emission TX MUST be in emission block (14400, 28800, 43200...)
+                    // NOT in the next block!
                     // 
                     // Flow:
-                    //   - MacroBlock 160 (for blocks 14311-14400): INITIATOR creates MacroBlock with reward_heartbeats
-                    //   - INITIATOR calculates rewards AFTER MacroBlock creation, updates state, saves snapshot
-                    //   - INITIATOR broadcasts MacroBlock with snapshot  
-                    //   - PARTICIPANTS receive MacroBlock, load state snapshot
+                    //   1. Production loop for block 14400 starts
+                    //   2. Check: is this an emission block?
+                    //   3. Load MacroBlock 160 from storage (wait if needed)
+                    //   4. Extract reward_heartbeats from MacroBlock
+                    //   5. Calculate total emission amount
+                    //   6. Create emission TX
+                    //   7. Add emission TX as FIRST transaction in block
+                    //   8. Continue with normal mempool TXs
                     // 
-                    // No race conditions: MacroBlock created BEFORE rewards processing
-                    // No duplication: Only INITIATOR calculates, PARTICIPANTS load snapshot
-                    // No emission TX needed: State snapshots synchronize total_supply
+                    // NOTE: Rewards were ALREADY processed by INITIATOR/PARTICIPANTS in MacroBlock consensus
+                    // This TX is ONLY for blockchain record (transparency/audit)
+                    // apply_to_state() will detect system_emission→system_rewards_pool and skip processing
                     
-                    // REMOVED: Emission processing moved to trigger_macroblock_consensus()
+                    let mut emission_tx_opt: Option<(String, Vec<u8>)> = None;
+                    
+                    // Check if this is an emission block (every 14400 blocks = 4 hours)
+                    const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+                    let is_emission_block = next_block_height > 0 && next_block_height % EMISSION_BLOCK_INTERVAL == 0;
+                    
+                    if is_emission_block {
+                        // Calculate MacroBlock index for this emission
+                        let macroblock_index = next_block_height / 90; // 14400 / 90 = 160
+                        
+                        if is_info() {
+                            println!("[INFO][EMISSION] block={} mb={} loading_macroblock", 
+                                     next_block_height, macroblock_index);
+                        }
+                        
+                        // Wait for MacroBlock to be finalized (with timeout)
+                        let macroblock_result = {
+                            let max_wait = 60; // 60 iterations * 100ms = 6 seconds max
+                            let mut attempts = 0;
+                            let mut mb_opt = None;
+                            
+                            while attempts < max_wait {
+                                if let Ok(Some(mb_bytes)) = storage.get_macroblock_by_height(macroblock_index) {
+                                    if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
+                                        mb_opt = Some(mb);
+                                        break;
+                                    }
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                attempts += 1;
+                            }
+                            
+                            mb_opt
+                        };
+                        
+                        if let Some(macroblock) = macroblock_result {
+                            // Extract reward_heartbeats from MacroBlock
+                            if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
+                                if !heartbeats_data.is_empty() {
+                                    if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
+                                        // Calculate total emission amount FROM MACROBLOCK DATA
+                                        // CRITICAL: Do NOT use reward_mgr.get_last_epoch_emission() - it may be 0
+                                        // if this node hasn't processed MacroBlock via P2P yet (race condition!)
+                                        // Instead, calculate emission deterministically from MacroBlock data
+                                        
+                                        let eligible_count = heartbeat_summaries.iter().filter(|s| s.is_eligible).count() as u64;
+                                        
+                                        if eligible_count > 0 {
+                                            // Calculate Pool 1 base emission using reward_manager's dynamic function
+                                            // This correctly handles halving every 4 years + sharp drop at year 20
+                                            let pool1_base_emission = {
+                                                let reward_mgr = reward_manager_for_spawn.read().await;
+                                                reward_mgr.get_pool1_base_emission()
+                                            };
+                                            
+                                            // Extract pool2 and pool3 from MacroBlock
+                                            let pool2_total = macroblock.consensus_data.pool2_total_fees.unwrap_or(0);
+                                            let pool3_total = macroblock.consensus_data.pool3_total_activations.unwrap_or(0);
+                                            
+                                            // Total emission = Pool1 + Pool2 + Pool3
+                                            // Pool1: Dynamic base emission (halves every 4 years)
+                                            //   Year 0-4:   251,432 QNC/epoch
+                                            //   Year 4-8:   125,716 QNC/epoch (÷2)
+                                            //   Year 8-12:  62,858 QNC/epoch (÷2)
+                                            //   Year 12-16: 31,429 QNC/epoch (÷2)
+                                            //   Year 16-20: 15,714 QNC/epoch (÷2)
+                                            //   Year 20-24: 1,571 QNC/epoch (÷10 sharp drop!)
+                                            //   Year 24+:   continues halving from low base
+                                            // Pool2: Transaction fees (70% Super, 30% Full, 0% Light)
+                                            // Pool3: Activation bonuses (equal to all, Phase 2 only)
+                                            let total_emission = pool1_base_emission + pool2_total + pool3_total;
+                                            
+                                            if total_emission > 0 {
+                                                let current_time = SystemTime::now()
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs();
+                                                
+                                                let mut emission_tx = qnet_state::Transaction {
+                                                    from: "system_emission".to_string(),
+                                                    to: Some("system_rewards_pool".to_string()),
+                                                    amount: total_emission,
+                                                    tx_type: qnet_state::TransactionType::RewardDistribution,
+                                                    timestamp: current_time,
+                                                    hash: String::new(),
+                                                    signature: None,
+                                                    public_key: None,
+                                                    gas_price: u64::MAX, // MAX priority - FIRST in block
+                                                    gas_limit: 0,
+                                                    nonce: 0,
+                                                    data: Some(format!("Emission Block {}: {} QNC distributed to {} eligible nodes", 
+                                                                     next_block_height, 
+                                                                     total_emission / 1_000_000_000,
+                                                                     eligible_count)),
+                                                    dilithium_signature: None,
+                                                    dilithium_public_key: None,
+                                                };
+                                                
+                                                emission_tx.hash = emission_tx.calculate_hash();
+                                                
+                                                // Serialize TX
+                                                if let Ok(tx_bytes) = bincode::serialize(&emission_tx) {
+                                                    emission_tx_opt = Some((emission_tx.hash.clone(), tx_bytes));
+                                                    
+                                                    if is_info() {
+                                                        println!("[INFO][EMISSION] tx_created block={} mb={} amount={} QNC eligible={} hash={}", 
+                                                                 next_block_height, macroblock_index,
+                                                                 total_emission / 1_000_000_000,
+                                                                 eligible_count,
+                                                                 &emission_tx.hash[..16.min(emission_tx.hash.len())]);
+                                                    }
+                                                } else {
+                                                    eprintln!("[ERR][EMISSION] tx_serialize_fail block={}", next_block_height);
+                                                }
+                                            } else {
+                                                eprintln!("[WARN][EMISSION] zero_emission block={} mb={}", next_block_height, macroblock_index);
+                                            }
+                                        } else {
+                                            eprintln!("[WARN][EMISSION] no_eligible_nodes block={} mb={}", next_block_height, macroblock_index);
+                                        }
+                                    } else {
+                                        eprintln!("[ERR][EMISSION] heartbeat_deserialize_fail block={} mb={}", next_block_height, macroblock_index);
+                                    }
+                                } else {
+                                    eprintln!("[WARN][EMISSION] empty_heartbeats block={} mb={}", next_block_height, macroblock_index);
+                                }
+                            } else {
+                                eprintln!("[WARN][EMISSION] no_heartbeat_data block={} mb={}", next_block_height, macroblock_index);
+                            }
+                        } else {
+                            eprintln!("[ERR][EMISSION] macroblock_not_found block={} mb={} timeout=6s", 
+                                     next_block_height, macroblock_index);
+                        }
+                    }
                     
                     // MEV PROTECTION: Get transactions with bundle priority
                     // ARCHITECTURE: Dynamic 0-20% allocation for bundles, 80-100% for public TXs
@@ -8914,8 +9051,16 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         mempool.get_pending_transactions_with_hashes(max_tx_per_microblock)
                     };
                     
-                    // v2.99: Emission TX removed - state updates happen directly in MacroBlock processing
-                    let tx_bytes_list: Vec<(String, Vec<u8>)> = mempool_txs;
+                    // v2.99: Prepend emission TX if this is an emission block
+                    let mut tx_bytes_list: Vec<(String, Vec<u8>)> = Vec::new();
+                    
+                    // Add emission TX FIRST (if present)
+                    if let Some(emission_tx) = emission_tx_opt {
+                        tx_bytes_list.push(emission_tx);
+                    }
+                    
+                    // Add mempool TXs
+                    tx_bytes_list.extend(mempool_txs);
                     
                     // ═══════════════════════════════════════════════════════════════════════════
                     // PRODUCTION v2.63: Block size limit to prevent ShredProtocol overflow
@@ -16949,6 +17094,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             if is_info() && updated_count > 0 {
                                                 println!("[INFO][EMISSION] pending_rewards_updated count={}", updated_count);
                                             }
+                                            
+                            // v2.99: Emission TX is created in production loop (for block 14400)
+                            // NOT here in trigger_macroblock_consensus (would be in block 14401)
+                            // This ensures TX is in the EMISSION BLOCK, not the next block
                                             
                             // Save state snapshot for PARTICIPANTS
                             // CRITICAL: Use MacroBlock index as key, not emission_height!

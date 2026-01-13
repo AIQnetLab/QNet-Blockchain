@@ -818,11 +818,20 @@ impl Transaction {
                     return Err(StateError::InvalidTransaction("Only system can distribute rewards".to_string()));
                 }
                 
-                // v2.96: CRITICAL SECURITY FIX - Validate amount against pending_rewards!
-                // This prevents manipulation of local RocksDB to claim fraudulent rewards
-                // ALL nodes validate this when applying TX from blocks
+                // v2.99: CRITICAL - EMISSION TX vs CLAIM TX distinction
+                // EMISSION TX: system_emission → system_rewards_pool (record-keeping only)
+                // CLAIM TX: system_rewards_pool → user_wallet (actual claim)
                 
-                // Reward distribution logic
+                if self.from == "system_emission" && self.to.as_ref().map(|t| t.as_str()) == Some("system_rewards_pool") {
+                    // v2.99: EMISSION TX - blockchain record ONLY!
+                    // Rewards ALREADY distributed via emit_rewards() + update_pending_rewards()
+                    // This TX is ONLY for transparency/auditing - DO NOT process rewards again!
+                    println!("[INFO][EMISSION] emission_tx_recorded amount={} QNC", self.amount / 1_000_000_000);
+                    return Ok(()); // ✅ No account changes - already handled!
+                }
+                
+                // v2.96: CLAIM TX - validate and process reward claim
+                // This happens when user calls /api/v1/claim_rewards
                 if let Some(to) = &self.to {
                     let recipient = accounts.entry(to.clone())
                         .or_insert_with(|| Account::new(to.clone()));
@@ -840,9 +849,9 @@ impl Transaction {
                     recipient.pending_rewards -= self.amount;
                     recipient.balance += self.amount;
                     
-                    println!("[EMISSION] 💰 Reward claimed: {} QNC to {} (pending: {} → {})", 
-                             self.amount / 1_000_000_000, to,
-                             (recipient.pending_rewards + self.amount) / 1_000_000_000,
+                    println!("[INFO][REWARDS] reward_claimed amount={} QNC to={} pending_remaining={} QNC", 
+                             self.amount / 1_000_000_000, 
+                             &to[..to.len().min(16)],
                              recipient.pending_rewards / 1_000_000_000);
                 }
             }
