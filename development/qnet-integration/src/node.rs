@@ -8810,43 +8810,21 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // 
                     // Validation: All nodes verify emission TX presence after emission MacroBlock
                     
-                    // v2.95: FIXED - Synchronous emission processing (no race condition, no duplication)
-                    // Architecture: INITIATOR processes rewards synchronously in emission blocks
-                    //               PARTICIPANTS process rewards via MacroBlock listener (P2P path)
+                    // v2.99: EMISSION MOVED TO MACROBLOCK CREATION!
+                    // Architecture: INITIATOR calculates rewards during MacroBlock consensus (in trigger_macroblock_consensus)
+                    //               PARTICIPANTS load state snapshot from MacroBlock
                     // 
                     // Flow:
-                    //   - Block 14,400: INITIATOR calculates rewards synchronously, creates TX
-                    //   - Block 14,400: PARTICIPANTS receive MacroBlock via P2P, process rewards async
-                    //   - TX in blocks: 14,400, 28,800, 43,200 (deterministic emission events)
+                    //   - MacroBlock 160 (for blocks 14311-14400): INITIATOR creates MacroBlock with reward_heartbeats
+                    //   - INITIATOR calculates rewards AFTER MacroBlock creation, updates state, saves snapshot
+                    //   - INITIATOR broadcasts MacroBlock with snapshot  
+                    //   - PARTICIPANTS receive MacroBlock, load state snapshot
                     // 
-                    // No race conditions: INITIATOR uses synchronous processing
-                    // No duplication: INITIATOR skips MacroBlock listener for rewards
+                    // No race conditions: MacroBlock created BEFORE rewards processing
+                    // No duplication: Only INITIATOR calculates, PARTICIPANTS load snapshot
+                    // No emission TX needed: State snapshots synchronize total_supply
                     
-                    let is_emission_block = next_block_height % EMISSION_INTERVAL_BLOCKS == 0 && next_block_height > 0;
-                    let mut direct_emission_tx: Option<qnet_state::Transaction> = None;
-                    
-                    if is_emission_block {
-                        println!("[EMISSION] Emission block detected");
-                        if is_info() { println!("[INFO][EMISSION] block={} epoch={}", 
-                                next_block_height, next_block_height / EMISSION_INTERVAL_BLOCKS); }
-                        
-                        // SYNCHRONOUS reward processing (returns TX directly)
-                        match blockchain_for_emission.process_reward_window_v2(next_block_height).await {
-                            Ok(Some(emission_tx)) => {
-                                println!("[EMISSION] Transaction created successfully");
-                                if is_info() { println!("[INFO][EMISSION] tx_hash={} status=ready_for_block", &emission_tx.hash[..16]); }
-                                direct_emission_tx = Some(emission_tx);
-                            }
-                            Ok(None) => {
-                                println!("[EMISSION] No transaction created");
-                                if is_warn() { println!("[WARN][EMISSION] reason=no_emission amount=0"); }
-                            }
-                            Err(e) => {
-                                println!("[EMISSION] Processing failed");
-                                eprintln!("[ERR][EMISSION] operation=reward_window err={}", e);
-                            }
-                        }
-                    }
+                    // REMOVED: Emission processing moved to trigger_macroblock_consensus()
                     
                     // MEV PROTECTION: Get transactions with bundle priority
                     // ARCHITECTURE: Dynamic 0-20% allocation for bundles, 80-100% for public TXs
@@ -8936,33 +8914,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         mempool.get_pending_transactions_with_hashes(max_tx_per_microblock)
                     };
                     
-                    // v2.93: Add emission TX FIRST if present (industry standard: system TX before user TX)
-                    let tx_bytes_list: Vec<(String, Vec<u8>)> = if let Some(emission_tx) = direct_emission_tx {
-                        let tx_hash = emission_tx.calculate_hash();
-                        let tx_bytes = match bincode::serialize(&emission_tx) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                eprintln!("[EMISSION][ERROR] serialization_failed err={}", e);
-                                Vec::new()
-                            }
-                        };
-                        
-                        if !tx_bytes.is_empty() {
-                            println!("[EMISSION][BLOCK] included_first block={} hash={} size_kb={:.2}",
-                                    next_block_height,
-                                    &tx_hash[..16],
-                                    tx_bytes.len() as f64 / 1024.0);
-                            
-                            // Emission TX FIRST, then mempool TX
-                            let mut all_txs = vec![(tx_hash, tx_bytes)];
-                            all_txs.extend(mempool_txs);
-                            all_txs
-                        } else {
-                            mempool_txs
-                        }
-                    } else {
-                        mempool_txs
-                    };
+                    // v2.99: Emission TX removed - state updates happen directly in MacroBlock processing
+                    let tx_bytes_list: Vec<(String, Vec<u8>)> = mempool_txs;
                     
                     // ═══════════════════════════════════════════════════════════════════════════
                     // PRODUCTION v2.63: Block size limit to prevent ShredProtocol overflow
@@ -13158,6 +13111,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             &node_id_cons,
                                             node_type,
                                             &consensus_rx_cons,
+                                            state_manager_cons.clone(), // v2.99: For emission processing
+                                            reward_manager_cons.clone(), // v2.99: For emission processing
                                         ).await
                                     } else {
                                         Self::participate_in_macroblock_consensus(
@@ -13249,133 +13204,116 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                             let is_emission_macroblock = mb_idx > 0 && mb_idx % EMISSION_MACROBLOCK_INTERVAL == 0;
                                                             
                                                             if is_emission_macroblock {
+                                                                // v2.99: ALL nodes process rewards from MacroBlock (deterministic!)
+                                                                // MacroBlock contains reward_heartbeats → ALL nodes use SAME data → SAME result
                                                                 if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
                                                                     if !heartbeats_data.is_empty() {
-                                                                    if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
-                                                                        let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = heartbeat_summaries.iter()
-                                                                            .map(|s| qnet_consensus::HeartbeatSummaryData {
-                                                                                node_id: s.node_id.clone(),
-                                                                                node_type: s.node_type,
-                                                                                heartbeat_count: s.heartbeat_count,
-                                                                                first_heartbeat: s.first_heartbeat,
-                                                                                last_heartbeat: s.last_heartbeat,
-                                                                                is_eligible: s.is_eligible,
-                                                                            })
-                                                                            .collect();
-                                                                        
-                                                                        let mut reward_manager = reward_manager_cons.write().await;
-                                                                        let pool2_total = macroblock.consensus_data.pool2_total_fees;
-                                                                        let pool3_total = macroblock.consensus_data.pool3_total_activations;
-                                                                        
-                                                                        match reward_manager.process_macroblock_heartbeats_deterministic(
-                                                                            mb_idx,
-                                                                            &summary_data,
-                                                                            pool2_total,
-                                                                            pool3_total,
-                                                                        ) {
-                                                                            Ok(was_processed) => {
-                                                                                let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
-                                                                                println!("[INFO][REWARDS] EMISSION_MACROBLOCK mb={} epoch={} nodes={} eligible={} pool2={:?} pool3={:?} processed={}", 
-                                                                                         mb_idx, mb_idx / EMISSION_MACROBLOCK_INTERVAL, 
-                                                                                         heartbeat_summaries.len(), eligible,
-                                                                                         pool2_total, pool3_total, was_processed);
-                                                                                
-                                                                                // v2.96: CRITICAL FIX - Only update supply/storage if newly processed!
-                                                                                // If was_processed=false, MacroBlock was already processed → skip to prevent duplication
-                                                                                if was_processed {
-                                                                                // v2.92: CRITICAL - INITIATOR updates total_supply HERE
-                                                                                // (broadcast_macroblock excludes self, so INITIATOR won't receive via P2P)
-                                                                                let total_emission = reward_manager.get_last_epoch_emission();
-                                                                                drop(reward_manager);  // Release before async
-                                                                                
-                                                                                if total_emission > 0 {
-                                                                                    let state = state_manager_cons.read().await;
-                                                                                    match (*state).emit_rewards(total_emission) {
-                                                                                        Ok(actual) => {
-                                                                                            let new_supply = (*state).get_total_supply();
-                                                                                            println!("[INFO][REWARDS] supply_updated emission={} total={} QNC", 
-                                                                                                     actual / 1_000_000_000, new_supply / 1_000_000_000);
+                                                                        if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
+                                                                            let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = heartbeat_summaries.iter()
+                                                                                .map(|s| qnet_consensus::HeartbeatSummaryData {
+                                                                                    node_id: s.node_id.clone(),
+                                                                                    node_type: s.node_type,
+                                                                                    heartbeat_count: s.heartbeat_count,
+                                                                                    first_heartbeat: s.first_heartbeat,
+                                                                                    last_heartbeat: s.last_heartbeat,
+                                                                                    is_eligible: s.is_eligible,
+                                                                                })
+                                                                                .collect();
+                                                                            
+                                                                            let mut reward_mgr = reward_manager_cons.write().await;
+                                                                            let pool2_total = macroblock.consensus_data.pool2_total_fees;
+                                                                            let pool3_total = macroblock.consensus_data.pool3_total_activations;
+                                                                            
+                                                                            match reward_mgr.process_macroblock_heartbeats_deterministic(
+                                                                                mb_idx,
+                                                                                &summary_data,
+                                                                                pool2_total,
+                                                                                pool3_total,
+                                                                            ) {
+                                                                                Ok(was_processed) => {
+                                                                                    if was_processed {
+                                                                                        let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
+                                                                                        if is_info() {
+                                                                                            println!("[INFO][REWARDS] PARTICIPANT rewards_calculated mb={} nodes={} eligible={}", 
+                                                                                                     mb_idx, heartbeat_summaries.len(), eligible);
                                                                                         }
-                                                                                        Err(e) => {
-                                                                                            eprintln!("[ERROR][REWARDS] supply_update_failed err={}", e);
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                                
-                                                                                // v2.97: CRITICAL FIX - Get wallet from BLOCKCHAIN (not memory)
-                                                                                // Save pending rewards to BLOCKCHAIN (not RocksDB)!
-                                                                                // This ensures ALL nodes have same pending_rewards and can validate claims
-                                                                                let mut reward_manager = reward_manager_cons.write().await;
-                                                                                let pending = reward_manager.get_all_pending_rewards();
-                                                                                drop(reward_manager); // Release for updates
-                                                                                
-                                                                                // Step 1: Get all wallets from blockchain (using storage directly)
-                                                                                // v2.98: SECURITY FIX - NO FALLBACK! Only on-chain registrations accepted!
-                                                                                let mut node_wallets = Vec::new();
-                                                                                for (node_id, amount) in &pending {
-                                                                                    // Get wallet from on-chain registration ONLY
-                                                                                    let wallet = if let Ok(Some((_, wallet_addr, _))) = storage_cons.load_node_registration(node_id) {
-                                                                                        Some(wallet_addr)
-                                                                                    } else {
-                                                                                        // NO FALLBACK! Node MUST be registered on-chain to receive rewards!
-                                                                                        None
-                                                                                    };
-                                                                                    node_wallets.push((node_id.clone(), wallet, *amount));
-                                                                                }
-                                                                                
-                                                                                // Step 2: Update pending_rewards in blockchain state
-                                                                                let state = state_manager_cons.read().await;
-                                                                                let mut saved_count = 0;
-                                                                                
-                                                                                for (node_id, wallet_opt, amount) in node_wallets {
-                                                                                    if let Some(wallet_addr) = wallet_opt {
-                                                                                        // Update pending_rewards in BLOCKCHAIN state (not local RocksDB)
-                                                                                        if let Err(e) = (*state).update_pending_rewards(&wallet_addr, amount) {
-                                                                                            if is_warn() {
-                                                                                                println!("[WARN][REWARDS] blockchain_update_fail node={} err={}", node_id, e);
+                                                                                        
+                                                                                        // Update total_supply
+                                                                                        let total_emission = reward_mgr.get_last_epoch_emission();
+                                                                                        drop(reward_mgr);
+                                                                                        
+                                                                                        if total_emission > 0 {
+                                                                                            let state = state_manager_cons.read().await;
+                                                                                            if let Err(e) = (*state).emit_rewards(total_emission) {
+                                                                                                eprintln!("[ERR][REWARDS] supply_update_fail err={}", e);
+                                                                                            } else {
+                                                                                                let new_supply = (*state).get_total_supply();
+                                                                                                if is_info() {
+                                                                                                    println!("[INFO][REWARDS] PARTICIPANT supply_updated emission={} total={} QNC", 
+                                                                                                             total_emission / 1_000_000_000, new_supply / 1_000_000_000);
+                                                                                                }
                                                                                             }
-                                                                                        } else {
-                                                                                            saved_count += 1;
+                                                                                            drop(state);
+                                                                                        }
+                                                                                        
+                                                                                        // Update pending_rewards
+                                                                                        let mut reward_mgr = reward_manager_cons.write().await;
+                                                                                        let pending = reward_mgr.get_all_pending_rewards();
+                                                                                        drop(reward_mgr);
+                                                                                        
+                                                                                        let state = state_manager_cons.read().await;
+                                                                                        let mut updated_count = 0;
+                                                                                        for (node_id, amount) in &pending {
+                                                                                            if let Ok(Some((_, wallet_addr, _))) = storage_cons.load_node_registration(node_id) {
+                                                                                                if let Err(e) = (*state).update_pending_rewards(&wallet_addr, *amount) {
+                                                                                                    eprintln!("[WARN][REWARDS] pending_update_fail node={} err={}", node_id, e);
+                                                                                                } else {
+                                                                                                    updated_count += 1;
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                        drop(state);
+                                                                                        
+                                                                                        if is_info() && updated_count > 0 {
+                                                                                            println!("[INFO][REWARDS] PARTICIPANT pending_updated count={}", updated_count);
+                                                                                        }
+                                                                                        
+                                                                                        // Save state snapshot for persistence across restarts
+                                                                                        let state = state_manager_cons.read().await;
+                                                                                        let state_root = (*state).calculate_state_root().unwrap_or([0u8; 32]);
+                                                                                        let state_data = bincode::serialize(&(*state).get_all_accounts()).unwrap_or_default();
+                                                                                        drop(state);
+                                                                                        
+                                                                                        if !state_data.is_empty() {
+                                                                                            if let Err(e) = storage_cons.save_state_snapshot(mb_idx, state_root, state_data).await {
+                                                                                                eprintln!("[ERR][REWARDS] snapshot_save_fail mb={} err={}", mb_idx, e);
+                                                                                            } else if is_info() {
+                                                                                                println!("[INFO][REWARDS] PARTICIPANT snapshot_saved mb={}", mb_idx);
+                                                                                            }
+                                                                                        }
+                                                                                        
+                                                                                        // Mark as processed
+                                                                                        let mut reward_mgr = reward_manager_cons.write().await;
+                                                                                        let mut processed_set = reward_mgr.get_processed_emission_macroblocks().clone();
+                                                                                        processed_set.insert(mb_idx);
+                                                                                        reward_mgr.set_processed_emission_macroblocks(processed_set.clone());
+                                                                                        drop(reward_mgr);
+                                                                                        
+                                                                                        if let Err(e) = storage_cons.save_processed_emission_macroblocks(&processed_set) {
+                                                                                            eprintln!("[WARN][REWARDS] processed_save_fail mb={} err={}", mb_idx, e);
                                                                                         }
                                                                                     } else {
-                                                                                        // Node not registered on-chain → skip rewards (will get them after registration)
                                                                                         if is_warn() {
-                                                                                            println!("[WARN][REWARDS] node_not_registered_onchain node={} skipping_rewards", node_id);
-                                                                                            println!("[INFO][REWARDS] hint: NodeRegistration TX must be in block before rewards");
+                                                                                            println!("[WARN][REWARDS] PARTICIPANT already_processed mb={}", mb_idx);
                                                                                         }
                                                                                     }
                                                                                 }
-                                                                                
-                                                                                drop(state);
-                                                                                if saved_count > 0 {
-                                                                                    println!("[INFO][REWARDS] blockchain_pending_updated count={}", saved_count);
+                                                                                Err(e) => {
+                                                                                    eprintln!("[ERR][REWARDS] PARTICIPANT process_fail mb={} err={}", mb_idx, e);
                                                                                 }
-                                                                                
-                                                                                // Re-acquire reward_manager lock for next step
-                                                                                reward_manager = reward_manager_cons.write().await;
-                                                                                
-                                                                                // Save processed emission macroblocks set
-                                                                                let processed = reward_manager.get_processed_emission_macroblocks();
-                                                                                if let Err(e) = storage_cons.save_processed_emission_macroblocks(&processed) {
-                                                                                    eprintln!("[WARN][REWARDS] processed_save_fail err={}", e);
-                                                                                } else {
-                                                                                    println!("[INFO][REWARDS] processed_macroblocks_saved mb={} total={}", mb_idx, processed.len());
-                                                                                }
-                                                                                
-                                                                                // v2.93: INITIATOR does NOT create emission TX here!
-                                                                                // TX will be created by block producer in NEXT microblock
-                                                                                // This follows industry standard: rewards → state update, TX → next block
-                                                                                } else {
-                                                                                    // v2.96: MacroBlock already processed - skip supply/storage updates
-                                                                                    println!("[INFO][REWARDS] mb={} SKIPPED_POST_PROCESSING (already processed)", mb_idx);
-                                                                                }
-                                                                            }
-                                                                            Err(e) => {
-                                                                                eprintln!("[ERROR][REWARDS] process_fail mb={} err={}", mb_idx, e);
                                                                             }
                                                                         }
                                                                     }
-                                                                }
                                                                 }
                                                             }
                                                         }
@@ -13535,6 +13473,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                     let p2p_retry = p2p_ref.clone();
                                                     let node_id_retry = node_id.clone();
                                                     let consensus_rx_retry = consensus_rx.clone();
+                                                    let state_manager_retry = state_manager_outer.clone(); // v2.99
+                                                    let reward_manager_retry = reward_manager_outer.clone(); // v2.99
                                                     
                                                     tokio::spawn(async move {
                                                         // Small delay to not overload
@@ -13569,6 +13509,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                                 &node_id_retry,
                                                                 node_type,
                                                                 &consensus_rx_retry,
+                                                                state_manager_retry.clone(), // v2.99
+                                                                reward_manager_retry.clone(), // v2.99
                                                             ).await
                                                         } else {
                                                             if is_info() { 
@@ -16225,7 +16167,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         p2p: &Arc<SimplifiedP2P>,
         node_id: &str,
         node_type: NodeType,
-        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // CRITICAL: REAL channel
+        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>,
+        state_manager: Arc<RwLock<StateManager>>, // v2.99: For emission processing
+        reward_manager: Arc<RwLock<qnet_consensus::PhaseAwareRewardManager>>, // v2.99: For emission processing
     ) -> Result<(), String> {
         let macroblock_index = end_height / 90;
         
@@ -16916,6 +16860,151 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 println!("[REPUTATION] 🏆 Consensus leader {} - reward via macroblock", consensus_data.leader_id);
                 println!("[REPUTATION] ✅ {} participants - rewards via macroblock", consensus_data.participants.len());
+                
+                // v2.99: CRITICAL - INITIATOR processes emission rewards AFTER MacroBlock creation
+                // This ensures MacroBlock exists BEFORE rewards are calculated
+                // Snapshot is saved BEFORE broadcast so PARTICIPANTS can load it
+                const EMISSION_MB_INTERVAL: u64 = 160;
+                let is_emission_mb = macroblock.height > 0 && macroblock.height % EMISSION_MB_INTERVAL == 0;
+                
+                if is_emission_mb {
+                    if is_info() {
+                        println!("[INFO][EMISSION] processing_rewards mb={} epoch={}", 
+                                 macroblock.height, macroblock.height / EMISSION_MB_INTERVAL);
+                    }
+                    
+                    // Calculate emission height (last microblock of this MacroBlock)
+                    let emission_height = macroblock.height * 90;
+                    
+                    // Extract reward_heartbeats from MacroBlock
+                    if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
+                        if !heartbeats_data.is_empty() {
+                            if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
+                                let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = heartbeat_summaries.iter()
+                                    .map(|s| qnet_consensus::HeartbeatSummaryData {
+                                        node_id: s.node_id.clone(),
+                                        node_type: s.node_type,
+                                        heartbeat_count: s.heartbeat_count,
+                                        first_heartbeat: s.first_heartbeat,
+                                        last_heartbeat: s.last_heartbeat,
+                                        is_eligible: s.is_eligible,
+                                    })
+                                    .collect();
+                                
+                                let mut reward_mgr = reward_manager.write().await;
+                                let pool2_total = macroblock.consensus_data.pool2_total_fees;
+                                let pool3_total = macroblock.consensus_data.pool3_total_activations;
+                                
+                                // Process heartbeats for rewards
+                                match reward_mgr.process_macroblock_heartbeats_deterministic(
+                                    macroblock.height,
+                                    &summary_data,
+                                    pool2_total,
+                                    pool3_total,
+                                ) {
+                                    Ok(was_processed) => {
+                                        if was_processed {
+                                            let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
+                                            if is_info() {
+                                                println!("[INFO][EMISSION] rewards_calculated nodes={} eligible={}", 
+                                                         heartbeat_summaries.len(), eligible);
+                                            }
+                                            
+                                            // Update total_supply
+                                            let total_emission = reward_mgr.get_last_epoch_emission();
+                                            drop(reward_mgr); // Release lock
+                                            
+                                            if total_emission > 0 {
+                                                let state = state_manager.read().await;
+                                                if let Err(e) = (*state).emit_rewards(total_emission) {
+                                                    eprintln!("[ERR][EMISSION] supply_update_fail err={}", e);
+                                                } else {
+                                                    let new_supply = (*state).get_total_supply();
+                                                    if is_info() {
+                                                        println!("[INFO][EMISSION] supply_updated emission={} total={} QNC", 
+                                                                 total_emission / 1_000_000_000, new_supply / 1_000_000_000);
+                                                    }
+                                                }
+                                                drop(state);
+                                            }
+                                            
+                                            // Update pending_rewards in blockchain state
+                                            let mut reward_mgr = reward_manager.write().await;
+                                            let pending = reward_mgr.get_all_pending_rewards();
+                                            drop(reward_mgr);
+                                            
+                                            let state = state_manager.read().await;
+                                            let mut updated_count = 0;
+                                            for (node_id, amount) in &pending {
+                                                if let Ok(Some((_, wallet_addr, _))) = storage.load_node_registration(node_id) {
+                                                    if let Err(e) = (*state).update_pending_rewards(&wallet_addr, *amount) {
+                                                        eprintln!("[WARN][EMISSION] pending_update_fail node={} err={}", node_id, e);
+                                                    } else {
+                                                        updated_count += 1;
+                                                    }
+                                                }
+                                            }
+                                            drop(state);
+                                            
+                                            if is_info() && updated_count > 0 {
+                                                println!("[INFO][EMISSION] pending_rewards_updated count={}", updated_count);
+                                            }
+                                            
+                            // Save state snapshot for PARTICIPANTS
+                            // CRITICAL: Use MacroBlock index as key, not emission_height!
+                            let state = state_manager.read().await;
+                            let state_root = (*state).calculate_state_root().unwrap_or([0u8; 32]);
+                            let state_data = bincode::serialize(&(*state).get_all_accounts()).unwrap_or_default();
+                            drop(state);
+                            
+                            if !state_data.is_empty() {
+                                // v2.99: Save by MacroBlock index (160), not emission height (14400)
+                                // This ensures PARTICIPANTS can load using same key
+                                if let Err(e) = storage.save_state_snapshot(macroblock.height, state_root, state_data.clone()).await {
+                                    eprintln!("[ERR][EMISSION] snapshot_save_fail mb={} err={}", macroblock.height, e);
+                                } else {
+                                    if is_info() {
+                                        println!("[INFO][EMISSION] snapshot_saved mb={} size={}KB", 
+                                                 macroblock.height, state_data.len() / 1024);
+                                    }
+                                }
+                            }
+                                            
+                                            // Mark as processed
+                                            let mut reward_mgr = reward_manager.write().await;
+                                            let mut processed_set = reward_mgr.get_processed_emission_macroblocks().clone();
+                                            processed_set.insert(macroblock.height);
+                                            reward_mgr.set_processed_emission_macroblocks(processed_set.clone());
+                                            drop(reward_mgr);
+                                            
+                                            if let Err(e) = storage.save_processed_emission_macroblocks(&processed_set) {
+                                                eprintln!("[WARN][EMISSION] processed_save_fail mb={} err={}", macroblock.height, e);
+                                            } else {
+                                                if is_info() {
+                                                    println!("[INFO][EMISSION] marked_processed mb={} total={}", 
+                                                             macroblock.height, processed_set.len());
+                                                }
+                                            }
+                                        } else {
+                                            if is_warn() {
+                                                println!("[WARN][EMISSION] already_processed mb={}", macroblock.height);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[ERR][EMISSION] process_fail mb={} err={}", macroblock.height, e);
+                                    }
+                                }
+                            } else {
+                                eprintln!("[ERR][EMISSION] heartbeat_deserialize_fail mb={}", macroblock.height);
+                            }
+                        } else {
+                            eprintln!("[WARN][EMISSION] empty_heartbeats mb={}", macroblock.height);
+                        }
+                    } else {
+                        eprintln!("[WARN][EMISSION] no_heartbeat_data mb={}", macroblock.height);
+                    }
+                }
                 
                 // PRODUCTION v2.37: Broadcast macroblock via dedicated channel (NOT ShredProtocol!)
                 // WHY: ShredProtocol uses height as dedup key → collision with microblocks
@@ -18620,11 +18709,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let is_emission_macroblock = index > 0 && index % EMISSION_MACROBLOCK_INTERVAL == 0;
         
         if is_emission_macroblock {
+            // v2.99: ALL nodes process rewards from MacroBlock (deterministic!)
+            // MacroBlock contains reward_heartbeats → ALL nodes use SAME data → SAME result!
             if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
                 if !heartbeats_data.is_empty() {
-                    // Deserialize heartbeat summaries
                     if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
-                        // Convert to reward manager format
                         let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = heartbeat_summaries.iter()
                             .map(|s| qnet_consensus::HeartbeatSummaryData {
                                 node_id: s.node_id.clone(),
@@ -18636,124 +18725,103 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             })
                             .collect();
                         
-                        // Process heartbeats for rewards - ONLY at emission macroblocks!
-                        // v2.50.0: Use DETERMINISTIC pool2/pool3 values from MacroBlock
                         let reward_manager_arc = self.get_reward_manager();
-                        let mut reward_manager = reward_manager_arc.write().await;
-                        
-                        // Get deterministic pool values from MacroBlock (all nodes see same!)
+                        let mut reward_mgr = reward_manager_arc.write().await;
                         let pool2_total = macroblock.consensus_data.pool2_total_fees;
                         let pool3_total = macroblock.consensus_data.pool3_total_activations;
                         
-                        // v2.90: Pass macroblock_index to prevent double-processing
-                        match reward_manager.process_macroblock_heartbeats_deterministic(
-                            index,  // MacroBlock index for duplicate detection
+                        match reward_mgr.process_macroblock_heartbeats_deterministic(
+                            index,
                             &summary_data,
                             pool2_total,
                             pool3_total,
                         ) {
                             Ok(was_processed) => {
-                                let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
-                                // v2.65: Windows are 1-based: mb=160 → epoch=1, mb=320 → epoch=2
-                                println!("[INFO][REWARDS] EMISSION_MACROBLOCK mb={} epoch={} nodes={} eligible={} pool2={:?} pool3={:?} processed={}", 
-                                         index, index / EMISSION_MACROBLOCK_INTERVAL, 
-                                         heartbeat_summaries.len(), eligible,
-                                         pool2_total, pool3_total, was_processed);
-                                
-                                // v2.96: CRITICAL FIX - Only update supply/storage if newly processed!
                                 if was_processed {
-                                // v2.92: CRITICAL - Update total_supply (replaces old emission TX logic)
-                                // OLD: emission TX (system_emission → system_rewards_pool) updated supply on validation
-                                // NEW: Update supply directly here (MacroBlock-based rewards)
-                                let total_emission = reward_manager.get_last_epoch_emission();
-                                if total_emission > 0 {
-                                    let state_for_supply = self.state.read().await;
-                                    match (*state_for_supply).emit_rewards(total_emission) {
-                                        Ok(actual) => {
-                                            let new_supply = (*state_for_supply).get_total_supply();
-                                            println!("[INFO][REWARDS] supply_updated emission={} total={} QNC", 
-                                                     actual / 1_000_000_000, new_supply / 1_000_000_000);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[ERROR][REWARDS] supply_update_failed err={}", e);
-                                        }
+                                    let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
+                                    if is_info() {
+                                        println!("[INFO][REWARDS] SYNC rewards_calculated mb={} nodes={} eligible={}", 
+                                                 index, heartbeat_summaries.len(), eligible);
                                     }
-                                }
-                                
-                                // v2.97: CRITICAL FIX - Get wallet from BLOCKCHAIN (not memory)
-                                // Save pending rewards to BLOCKCHAIN (not RocksDB)!
-                                // This ensures ALL nodes have same pending_rewards and can validate claims
-                                // Prevents manipulation of local RocksDB to claim fraudulent rewards
-                                let pending = reward_manager.get_all_pending_rewards();
-                                drop(reward_manager); // Release for async calls
-                                
-                                // Step 1: Get all wallets from blockchain (async)
-                                let mut node_wallets = Vec::new();
-                                for (node_id, amount) in &pending {
-                                    let wallet = self.get_node_wallet(node_id).await;
-                                    node_wallets.push((node_id.clone(), wallet, *amount));
-                                }
-                                
-                                // Step 2: Update pending_rewards in blockchain state
-                                let state_for_pending = self.state.read().await;
-                                let mut saved_count = 0;
-                                
-                                for (node_id, wallet_opt, amount) in node_wallets {
-                                    if let Some(wallet_addr) = wallet_opt {
-                                        // Update pending_rewards in BLOCKCHAIN state (not local RocksDB)
-                                        if let Err(e) = (*state_for_pending).update_pending_rewards(&wallet_addr, amount) {
-                                            if is_warn() {
-                                                println!("[WARN][REWARDS] blockchain_update_fail node={} err={}", node_id, e);
-                                            }
+                                    
+                                    // Update total_supply
+                                    let total_emission = reward_mgr.get_last_epoch_emission();
+                                    drop(reward_mgr);
+                                    
+                                    if total_emission > 0 {
+                                        let state = self.state.read().await;
+                                        if let Err(e) = (*state).emit_rewards(total_emission) {
+                                            eprintln!("[ERR][REWARDS] supply_update_fail err={}", e);
                                         } else {
-                                            saved_count += 1;
+                                            let new_supply = (*state).get_total_supply();
+                                            if is_info() {
+                                                println!("[INFO][REWARDS] SYNC supply_updated emission={} total={} QNC", 
+                                                         total_emission / 1_000_000_000, new_supply / 1_000_000_000);
+                                            }
                                         }
-                                    } else {
-                                        // Node not registered on-chain → skip rewards
-                                        if is_warn() {
-                                            println!("[WARN][REWARDS] node_not_registered_onchain node={} skipping_rewards", node_id);
-                                            println!("[INFO][REWARDS] hint: NodeRegistration TX must be in block before rewards");
+                                        drop(state);
+                                    }
+                                    
+                                    // Update pending_rewards
+                                    let reward_manager_arc = self.get_reward_manager();
+                                    let mut reward_mgr = reward_manager_arc.write().await;
+                                    let pending = reward_mgr.get_all_pending_rewards();
+                                    drop(reward_mgr);
+                                    
+                                    let state = self.state.read().await;
+                                    let mut updated_count = 0;
+                                    for (node_id, amount) in &pending {
+                                        if let Ok(Some((_, wallet_addr, _))) = self.storage.load_node_registration(node_id) {
+                                            if let Err(e) = (*state).update_pending_rewards(&wallet_addr, *amount) {
+                                                eprintln!("[WARN][REWARDS] pending_update_fail node={} err={}", node_id, e);
+                                            } else {
+                                                updated_count += 1;
+                                            }
                                         }
                                     }
-                                }
-                                
-                                drop(state_for_pending);
-                                if saved_count > 0 {
-                                    println!("[INFO][REWARDS] blockchain_pending_updated count={}", saved_count);
-                                }
-                                
-                                // Re-acquire reward_manager lock for next step
-                                reward_manager = self.reward_manager.write().await;
-                                
-                                // v2.90: CRITICAL - Save processed emission MacroBlocks to prevent double-processing!
-                                // This set is persisted to RocksDB so node restarts don't duplicate rewards
-                                let processed = reward_manager.get_processed_emission_macroblocks();
-                                if let Err(e) = self.storage.save_processed_emission_macroblocks(processed) {
-                                    eprintln!("[WARN][REWARDS] processed_macroblocks_save_fail err={}", e);
+                                    drop(state);
+                                    
+                                    if is_info() && updated_count > 0 {
+                                        println!("[INFO][REWARDS] SYNC pending_updated count={}", updated_count);
+                                    }
+                                    
+                                    // Save state snapshot for persistence across restarts
+                                    let state = self.state.read().await;
+                                    let state_root = (*state).calculate_state_root().unwrap_or([0u8; 32]);
+                                    let state_data = bincode::serialize(&(*state).get_all_accounts()).unwrap_or_default();
+                                    drop(state);
+                                    
+                                    if !state_data.is_empty() {
+                                        if let Err(e) = self.storage.save_state_snapshot(index, state_root, state_data).await {
+                                            eprintln!("[ERR][REWARDS] snapshot_save_fail mb={} err={}", index, e);
+                                        } else if is_info() {
+                                            println!("[INFO][REWARDS] SYNC snapshot_saved mb={}", index);
+                                        }
+                                    }
+                                    
+                                    // Mark as processed
+                                    let reward_manager_arc = self.get_reward_manager();
+                                    let mut reward_mgr = reward_manager_arc.write().await;
+                                    let mut processed_set = reward_mgr.get_processed_emission_macroblocks().clone();
+                                    processed_set.insert(index);
+                                    reward_mgr.set_processed_emission_macroblocks(processed_set.clone());
+                                    drop(reward_mgr);
+                                    
+                                    if let Err(e) = self.storage.save_processed_emission_macroblocks(&processed_set) {
+                                        eprintln!("[WARN][REWARDS] processed_save_fail mb={} err={}", index, e);
+                                    }
                                 } else {
-                                    println!("[INFO][REWARDS] processed_macroblocks_saved mb={} total={}", index, processed.len());
-                                }
-                                
-                                // v2.93: PARTICIPANT does NOT create emission TX!
-                                // Only INITIATOR creates TX to avoid duplication (5 nodes = 5 TXs!)
-                                // PARTICIPANT just processes rewards and updates supply (already done above)
-                                } else {
-                                    // v2.96: MacroBlock already processed - skip supply/storage updates
-                                    println!("[INFO][REWARDS] mb={} SKIPPED_POST_PROCESSING (already processed)", index);
+                                    if is_warn() {
+                                        println!("[WARN][REWARDS] SYNC already_processed mb={}", index);
+                                    }
                                 }
                             }
                             Err(e) => {
-                                println!("[WARN][REWARDS] emission_failed mb={} err={}", index, e);
+                                eprintln!("[ERR][REWARDS] SYNC process_fail mb={} err={}", index, e);
                             }
                         }
-                    } else {
-                        println!("[WARN][REWARDS] emission_deserialize_failed mb={}", index);
                     }
-                } else {
-                    println!("[WARN][REWARDS] emission_no_heartbeats mb={}", index);
                 }
-            } else {
-                println!("[WARN][REWARDS] emission_no_data mb={}", index);
             }
         }
         

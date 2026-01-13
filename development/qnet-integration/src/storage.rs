@@ -5066,7 +5066,7 @@ impl Storage {
                         let accounts_data = zstd::decode_all(compressed_data)
                             .map_err(|e| IntegrationError::Other(format!("State decompression error: {}", e)))?;
                         
-                        println!("[STATE] 📂 Loaded state snapshot height={} size={} KB", 
+                        println!("[STATE] loaded_snapshot height={} size={}KB", 
                                 height, accounts_data.len() / 1024);
                         
                         return Ok(Some((height, state_root, accounts_data)));
@@ -5076,6 +5076,37 @@ impl Storage {
         }
         
         Ok(None)
+    }
+    
+    /// v2.99: Load state snapshot by height and restore into StateManager
+    /// Returns (state_root, accounts_data) for direct StateManager restoration
+    pub async fn load_state_snapshot_by_height(&self, height: u64) -> IntegrationResult<Option<([u8; 32], Vec<u8>)>> {
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        
+        let snapshot_key = format!("snapshot_{}", height);
+        
+        match self.persistent.db.get_cf(&snapshots_cf, snapshot_key.as_bytes())? {
+            Some(value) => {
+                // Parse value: [state_root(32) | data_len(8) | compressed_data]
+                if value.len() >= 40 {
+                    let state_root: [u8; 32] = value[..32].try_into()
+                        .map_err(|_| IntegrationError::StorageError("Invalid state_root size".to_string()))?;
+                    let _data_len = u64::from_le_bytes(value[32..40].try_into()
+                        .map_err(|_| IntegrationError::StorageError("Invalid data_len size".to_string()))?);
+                    let compressed_data = &value[40..];
+                    
+                    // Decompress with Zstd
+                    let accounts_data = zstd::decode_all(compressed_data)
+                        .map_err(|e| IntegrationError::Other(format!("State decompression error: {}", e)))?;
+                    
+                    Ok(Some((state_root, accounts_data)))
+                } else {
+                    Err(IntegrationError::StorageError(format!("Invalid snapshot format at height {}", height)))
+                }
+            }
+            None => Ok(None)
+        }
     }
     
     pub async fn load_state_snapshot(&self, height: u64) -> IntegrationResult<()> {
