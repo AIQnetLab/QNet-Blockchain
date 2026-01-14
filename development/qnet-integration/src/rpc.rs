@@ -4540,6 +4540,61 @@ async fn verify_ed25519_client_signature(
     }
 }
 
+/// PRODUCTION v2.78: Verify Dilithium signature (for registration/reactivation)
+/// ARCHITECTURE: Pure Dilithium verification using quantum crypto system
+async fn verify_dilithium_signature(node_id: &str, message: &str, signature: &str) -> bool {
+    use crate::quantum_crypto::QNetQuantumCrypto;
+    use crate::node::try_get_quantum_crypto;
+    
+    // Basic validation
+    if node_id.is_empty() || message.is_empty() || signature.is_empty() || signature.len() < 32 {
+        if crate::node::is_warn() {
+            println!("[WARN][DILITHIUM] sig_invalid reason=empty_params node={}", node_id);
+        }
+        return false;
+    }
+    
+    // PRODUCTION: Lock-free quantum crypto
+    let crypto = match try_get_quantum_crypto() {
+        Some(c) => c,
+        None => {
+            if crate::node::is_warn() {
+                println!("[WARN][DILITHIUM] crypto_not_initialized node={}", node_id);
+            }
+            return false;
+        }
+    };
+    
+    // Create DilithiumSignature struct
+    let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
+        signature: signature.to_string(),
+        algorithm: "CRYSTALS-Dilithium3".to_string(),
+        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        strength: "quantum-resistant".to_string(),
+    };
+    
+    match crypto.verify_dilithium_signature(message, &dilithium_sig, node_id).await {
+        Ok(is_valid) => {
+            if is_valid {
+                if crate::node::is_info() {
+                    println!("[INFO][DILITHIUM] sig_verified node={}", node_id);
+                }
+            } else {
+                if crate::node::is_warn() {
+                    println!("[WARN][DILITHIUM] sig_verify_failed node={}", node_id);
+                }
+            }
+            is_valid
+        }
+        Err(e) => {
+            if crate::node::is_warn() {
+                println!("[WARN][DILITHIUM] verify_error err={} node={}", e, node_id);
+            }
+            false
+        }
+    }
+}
+
 /// PRODUCTION v2.78: Verify Light node signature (HYBRID - Ed25519+Dilithium)
 /// ARCHITECTURE: Light nodes use compact_bin HYBRID signature format
 /// Same format as Full/Super nodes for consistency and quantum resistance
