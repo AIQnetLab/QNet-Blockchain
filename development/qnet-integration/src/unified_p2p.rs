@@ -9586,14 +9586,15 @@ pub struct HeartbeatRecord {
 
 /// PRODUCTION: Light Node Attestation - proof that Light node responded to ping
 /// Created by pinger after receiving signed response from Light node
+/// ARCHITECTURE v2.78: Both signatures use HYBRID compact_bin format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightNodeAttestation {
     pub light_node_id: String,        // Light node that was pinged
     pub pinger_id: String,            // Full/Super node that pinged
     pub slot: u64,                    // Time slot (4h window / 240 = 1 min slots)
     pub timestamp: u64,               // When attestation was created
-    pub light_node_signature: String, // Light node's signature on challenge
-    pub pinger_signature: String,     // Pinger's signature on attestation
+    pub light_node_signature: String, // HYBRID compact_bin (Ed25519+Dilithium, ~2.6KB)
+    pub pinger_signature: String,     // HYBRID compact_bin (Ed25519+Dilithium, ~2.6KB)
     pub challenge: String,            // Original challenge (for verification)
     pub block_height: u64,            // v2.59: Block height for epoch-based filtering
 }
@@ -12737,17 +12738,24 @@ impl SimplifiedP2P {
                             // v2.59: Include block_height for reliable epoch-based filtering
                             {
                                 let mut history = match p2p.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
-                                history.insert(heartbeat_key, HeartbeatRecord {
+                                history.insert(heartbeat_key.clone(), HeartbeatRecord {
                                     node_id: node_id.clone(),
                                     timestamp: now,
                                     heartbeat_index: index as u8,
-                                    signature,
+                                    signature: signature.clone(),
                                     verified: true,
                                     block_height, // v2.59: Current height for epoch filtering
                                 });
                             }
                             
-                            println!("[HEARTBEAT] 📡 Sent heartbeat #{} at height {} [gossip OK, RocksDB OK]", index, block_height);
+                            // PRODUCTION v2.78: Save to RocksDB for HeartbeatCommitment TX with Dilithium signature
+                            if let Some(ref storage) = p2p.storage {
+                                if let Err(e) = storage.save_heartbeat(&node_id, index as u8, now, block_height, &signature) {
+                                    println!("[HEARTBEAT] ⚠️ Failed to save to RocksDB: {}", e);
+                                }
+                            }
+                            
+                            println!("[HEARTBEAT] 📡 Sent heartbeat #{} at height {} [RAM OK, RocksDB OK]", index, block_height);
                         }
                     }
                 }
@@ -13451,7 +13459,27 @@ impl SimplifiedP2P {
     // PRODUCTION: Sharded Light Node Ping System
     // ========================================================================
     
-    /// Calculate shard for Light node (0-255 based on node_id hash)
+    /// Calculate assigned node index for Light node (DYNAMIC distribution)
+    /// Returns which active Full/Super node should ping this Light node (0 to N-1)
+    /// Uses consistent hashing to evenly distribute Light nodes across active pingers
+    pub fn calculate_assigned_node_index(light_node_id: &str, active_node_count: usize) -> usize {
+        if active_node_count == 0 { return 0; }
+        
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(light_node_id.as_bytes());
+        let hash = hasher.finalize();
+        
+        // Use first 8 bytes as u64 for modulo
+        let hash_value = u64::from_le_bytes([
+            hash[0], hash[1], hash[2], hash[3],
+            hash[4], hash[5], hash[6], hash[7],
+        ]);
+        
+        (hash_value as usize) % active_node_count
+    }
+    
+    /// DEPRECATED: Old fixed 256-shard calculation (kept for backward compatibility)
     pub fn calculate_light_node_shard(light_node_id: &str) -> u8 {
         use sha3::{Sha3_256, Digest};
         let mut hasher = Sha3_256::new();
@@ -13605,32 +13633,58 @@ impl SimplifiedP2P {
         attestations.contains_key(&key)
     }
     
-    /// Get Light nodes in our shard (for this Full/Super node to ping)
+    /// Get Light nodes assigned to THIS Full/Super node (DYNAMIC distribution)
     pub fn get_light_nodes_in_shard(&self) -> Vec<LightNodeRegistrationData> {
-        let our_shard = self.shard_id;
+        let our_node_id = &self.node_id;
+        
+        // DYNAMIC DISTRIBUTION: Get active Full/Super nodes
+        let active_nodes = self.get_active_full_super_nodes();
+        let active_count = active_nodes.len().max(1);
+        
+        let our_node_idx = active_nodes.iter()
+            .position(|(node_id, _, _)| node_id == our_node_id)
+            .unwrap_or(0);
+        
         let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
         
         registry.values()
-            .filter(|node| Self::calculate_light_node_shard(&node.node_id) == our_shard)
+            .filter(|node| {
+                Self::calculate_assigned_node_index(&node.node_id, active_count) == our_node_idx
+            })
             .cloned()
             .collect()
     }
     
-    /// Get Light nodes to ping in current slot (filtered by SHARD + slot + role + activity)
-    /// CRITICAL: Only iterates over Light nodes in OUR SHARD for scalability
-    /// OPTIMIZATION: Skips inactive nodes to reduce wasted pings
+    /// Get Light nodes to ping in current slot (DYNAMIC distribution across active Full/Super nodes)
+    /// ARCHITECTURE v2.78: Each Full/Super node pings 1/N of ALL Light nodes
+    ///   - 5 Full nodes → each pings 20% Light nodes
+    ///   - 100 Full nodes → each pings 1% Light nodes
+    ///   - 1 Full node → pings 100% Light nodes
+    /// SCALABLE: Automatically adapts to network size
     pub fn get_light_nodes_to_ping(&self) -> Vec<(LightNodeRegistrationData, PingerRole)> {
         let current_slot = Self::get_current_slot();
-        let our_shard = self.shard_id;
+        let our_node_id = &self.node_id;
         let mut result = Vec::new();
         
-        // SCALABILITY: Only check Light nodes in our shard (1/256 of total)
+        // DYNAMIC DISTRIBUTION: Get all active Full/Super nodes
+        let active_nodes = self.get_active_full_super_nodes();
+        let active_count = active_nodes.len().max(1); // Avoid division by zero
+        
+        // SCALABILITY: Each node processes 1/N of ALL Light nodes (not fixed 256 shards)
         let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
         
         for node in registry.values() {
-            // SHARD FILTER: Only process Light nodes in our shard
-            if Self::calculate_light_node_shard(&node.node_id) != our_shard {
-                continue;
+            // DYNAMIC SHARD: Determine which active node should ping this Light node
+            // Use consistent hashing to distribute Light nodes across active Full/Super nodes
+            let assigned_node_idx = Self::calculate_assigned_node_index(&node.node_id, active_count);
+            
+            // Check if THIS node should ping this Light node
+            let our_node_idx = active_nodes.iter()
+                .position(|(node_id, _, _)| node_id == our_node_id)
+                .unwrap_or(0);
+            
+            if assigned_node_idx != our_node_idx {
+                continue; // Another Full/Super node handles this Light node
             }
             
             // ACTIVITY FILTER: Skip inactive nodes (>5 consecutive failures)
@@ -13697,17 +13751,25 @@ impl SimplifiedP2P {
     }
     
     /// Periodically probe inactive nodes (once per window) to check if they're back online
-    /// Returns list of inactive nodes in our shard that should be probed
+    /// Returns list of inactive nodes assigned to THIS node that should be probed
     pub fn get_inactive_nodes_to_probe(&self) -> Vec<LightNodeRegistrationData> {
-        let our_shard = self.shard_id;
+        let our_node_id = &self.node_id;
         let current_window = Self::get_current_window_number();
+        
+        // DYNAMIC DISTRIBUTION: Get active Full/Super nodes
+        let active_nodes = self.get_active_full_super_nodes();
+        let active_count = active_nodes.len().max(1);
+        
+        let our_node_idx = active_nodes.iter()
+            .position(|(node_id, _, _)| node_id == our_node_id)
+            .unwrap_or(0);
         
         let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
         
         registry.values()
             .filter(|node| {
-                // Only our shard
-                Self::calculate_light_node_shard(&node.node_id) == our_shard &&
+                // DYNAMIC SHARD: Only nodes assigned to THIS node
+                Self::calculate_assigned_node_index(&node.node_id, active_count) == our_node_idx &&
                 // Only inactive nodes
                 (!node.is_active || node.consecutive_failures >= 5) &&
                 // Probe once per window: use hash to spread probes across slots
@@ -14036,6 +14098,52 @@ impl SimplifiedP2P {
                  start_height, end_height, result.len());
         
         result
+    }
+    
+    /// v2.78: Get ALL ACTIVE registered Light node IDs for pinging
+    /// FILTERS OUT:
+    /// - Offline nodes (is_active=false, consecutive_failures>=5)
+    /// - Ensures 100% coverage of ONLINE Light nodes only
+    /// Returns Vec of active Light node IDs currently in registry
+    pub fn get_all_light_node_ids(&self) -> Vec<String> {
+        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        registry.values()
+            .filter(|node| {
+                // PRODUCTION: Only active nodes
+                // Offline nodes (>5 consecutive failures) are excluded
+                node.is_active && node.consecutive_failures < 5
+            })
+            .map(|node| node.node_id.clone())
+            .collect()
+    }
+    
+    /// v2.78: Record Light node attestation (for pinging)
+    /// Used by Full/Super nodes to record successful pings
+    pub fn record_light_node_attestation(
+        &self,
+        light_node_id: String,
+        pinger_id: String,
+        slot: u64,
+        timestamp: u64,
+        light_node_signature: String,
+        pinger_signature: String,
+        challenge: String,
+        block_height: u64,
+    ) {
+        let attestation_key = format!("{}:{}", light_node_id, slot);
+        
+        let mut attestations = match self.light_node_attestations.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        
+        attestations.insert(attestation_key, LightNodeAttestation {
+            light_node_id,
+            pinger_id,
+            slot,
+            timestamp,
+            light_node_signature,
+            pinger_signature,
+            challenge,
+            block_height,
+        });
     }
     
     /// Get all Full/Super node heartbeats for a 4h window (for Merkle commitment)

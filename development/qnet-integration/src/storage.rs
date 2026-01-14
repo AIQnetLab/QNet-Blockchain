@@ -4601,7 +4601,8 @@ impl Storage {
     // ============================================
     
     /// Save Full/Super node heartbeat (persistent for reward calculation)
-    pub fn save_heartbeat(&self, node_id: &str, heartbeat_index: u8, timestamp: u64, block_height: u64) -> IntegrationResult<()> {
+    /// PRODUCTION v2.78: Now includes Dilithium signature for HeartbeatCommitment TX
+    pub fn save_heartbeat(&self, node_id: &str, heartbeat_index: u8, timestamp: u64, block_height: u64, dilithium_signature: &str) -> IntegrationResult<()> {
         let hb_cf = self.persistent.db.cf_handle("heartbeats")
             .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
         
@@ -4613,7 +4614,8 @@ impl Storage {
             "heartbeat_index": heartbeat_index,
             "timestamp": timestamp,
             "block_height": block_height,
-            "window": window
+            "window": window,
+            "dilithium_signature": dilithium_signature
         });
         
         self.persistent.db.put_cf(&hb_cf, key.as_bytes(), data.to_string().as_bytes())?;
@@ -4674,8 +4676,9 @@ impl Storage {
     }
     
     /// v2.75: Get all heartbeats for a block height range (for emission fallback)
-    /// Returns Vec<(node_id, heartbeat_index, timestamp, block_height)>
-    pub fn get_heartbeats_for_block_range(&self, start_height: u64, end_height: u64) -> IntegrationResult<Vec<(String, u8, u64, u64)>> {
+    /// PRODUCTION v2.78: Now returns Dilithium signatures for HeartbeatCommitment TX
+    /// Returns Vec<(node_id, heartbeat_index, timestamp, block_height, dilithium_signature)>
+    pub fn get_heartbeats_for_block_range(&self, start_height: u64, end_height: u64) -> IntegrationResult<Vec<(String, u8, u64, u64, String)>> {
         let hb_cf = self.persistent.db.cf_handle("heartbeats")
             .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
         
@@ -4690,7 +4693,8 @@ impl Storage {
                     let node_id = parsed["node_id"].as_str().unwrap_or("").to_string();
                     let heartbeat_index = parsed["heartbeat_index"].as_u64().unwrap_or(0) as u8;
                     let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
-                    result.push((node_id, heartbeat_index, timestamp, block_height));
+                    let dilithium_signature = parsed["dilithium_signature"].as_str().unwrap_or("").to_string();
+                    result.push((node_id, heartbeat_index, timestamp, block_height, dilithium_signature));
                 }
             }
         }

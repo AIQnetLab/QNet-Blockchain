@@ -111,9 +111,12 @@ impl BlockValidator {
         }
     }
     
-    /// Verify transaction signature (Ed25519 or Hybrid)
+    /// PRODUCTION v2.78: Verify transaction signature (Ed25519 or Hybrid ONLY)
+    /// ARCHITECTURE: Two signature types for optimal balance:
+    /// - Ed25519: Fast, classical (64 bytes, standard gas)
+    /// - Hybrid: Quantum-resistant, Ed25519+Dilithium (~2.6KB, +50% gas)
     fn verify_ed25519_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
-        // PRODUCTION: Support multiple signature formats
+        // PRODUCTION: Support TWO signature formats only
         // v2.24: Prioritize binary formats (bincode+zstd)
         if signature_hex.starts_with("hybrid_bin:") {
             // OPTIMIZED v2.24: Binary hybrid signature (bincode+zstd)
@@ -121,11 +124,9 @@ impl BlockValidator {
         } else if signature_hex.starts_with("hybrid:") {
             // Legacy: Node hybrid signature JSON (with certificate)
             self.verify_hybrid_signature(tx, signature_hex)
-        } else if signature_hex.starts_with("dilithium_sig_") {
-            // Pure Dilithium signature
-            self.verify_dilithium_signature(tx, signature_hex)
         } else {
             // Ed25519 signature - requires public_key in transaction
+            // PRODUCTION: Classical signature (64 bytes, fast verification)
             self.verify_ed25519_with_pubkey(tx, signature_hex)
         }
     }
@@ -586,10 +587,42 @@ impl BlockValidator {
                     )));
                 }
                 
-                // Validate each sample has Merkle proof
+                // SECURITY v2.78: Validate each sample and verify Merkle proofs
                 for sample in ping_samples {
+                    // Validate Light node ID format
+                    if sample.from_node.is_empty() {
+                        return Err(IntegrationError::ValidationError("Sample from_node cannot be empty".to_string()));
+                    }
+                    if !sample.from_node.starts_with("light_") {
+                        return Err(IntegrationError::ValidationError(format!("Invalid Light node ID format: {}", sample.from_node)));
+                    }
+                    
+                    // Validate Merkle proof is present
                     if sample.merkle_proof.is_empty() {
                         return Err(IntegrationError::ValidationError("Sample must include Merkle proof".to_string()));
+                    }
+                    
+                    // CRITICAL: Verify Merkle proof cryptographically
+                    // Reconstruct ping hash and verify it's in Merkle tree
+                    use blake3::Hasher as Blake3Hasher;
+                    let mut hasher = Blake3Hasher::new();
+                    hasher.update(sample.from_node.as_bytes());
+                    hasher.update(&sample.timestamp.to_le_bytes());
+                    hasher.update(sample.to_node.as_bytes());
+                    let hash = hasher.finalize();
+                    let ping_hash = hash.to_hex().to_string();
+                    
+                    // Verify Merkle proof
+                    let merkle_valid = qnet_core::crypto::merkle::verify_merkle_proof(
+                        &ping_hash,
+                        merkle_root,
+                        &sample.merkle_proof
+                    );
+                    
+                    if !merkle_valid {
+                        return Err(IntegrationError::ValidationError(format!(
+                            "Invalid Merkle proof for Light node {}", sample.from_node
+                        )));
                     }
                 }
                 

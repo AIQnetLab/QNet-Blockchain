@@ -175,6 +175,19 @@ pub struct ConsensusData {
     pub heartbeats_merkle_root: Option<[u8; 32]>,
     
     // ═══════════════════════════════════════════════════════════════════════════
+    // v2.78: LIGHT NODE ATTESTATIONS - Collected from PingCommitment TXs
+    // Each Full/Super node submits PingCommitment TX with Light nodes it pinged
+    // MacroBlock aggregates all to count unique Light nodes for Pool 3 rewards
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Aggregated Light node attestations from all Full/Super PingCommitment TXs
+    /// Format: bincode serialized HashMap<light_node_id: String, ping_count: u32>
+    /// Deterministic: all nodes see same Light node data from blockchain
+    /// Used for reward calculation at emission blocks (every 4 hours)
+    #[serde(default)]
+    pub reward_light_nodes: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
     // POOL 2 & POOL 3 TOTALS (v2.50.0)
     // Deterministic fee totals for reward calculation
     // Leader aggregates all transaction fees in epoch → all nodes use same value

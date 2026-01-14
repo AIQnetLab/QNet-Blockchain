@@ -4540,51 +4540,134 @@ async fn verify_ed25519_client_signature(
     }
 }
 
-async fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &str) -> bool {
-    // Use existing QNet quantum crypto system for real Dilithium verification
-    use crate::quantum_crypto::QNetQuantumCrypto;
-    use crate::node::GLOBAL_QUANTUM_CRYPTO;
-    
-    // Basic format validation first
-    if node_id.is_empty() || challenge.is_empty() || signature.is_empty() || signature.len() < 32 {
-        println!("[CRYPTO] ❌ Invalid signature format: node_id={}, challenge_len={}, sig_len={}", 
-                 node_id, challenge.len(), signature.len());
+/// PRODUCTION v2.78: Verify Light node signature (HYBRID - Ed25519+Dilithium)
+/// ARCHITECTURE: Light nodes use compact_bin HYBRID signature format
+/// Same format as Full/Super nodes for consistency and quantum resistance
+async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: &str, blockchain: &Arc<BlockchainNode>) -> bool {
+    // Basic validation
+    if node_id.is_empty() || challenge.is_empty() || signature.is_empty() {
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] sig_invalid reason=empty_params node={}", node_id);
+        }
         return false;
     }
     
-    // PRODUCTION v2.50: Lock-free quantum crypto
-    use crate::node::try_get_quantum_crypto;
-    let crypto = match try_get_quantum_crypto() {
-        Some(c) => c,
-        None => {
+    // PRODUCTION v2.78: Full HYBRID signature verification (compact_bin format)
+    // Format: "compact_bin:<base64_bincode_zstd>" - same as pinger attestations
+    // This provides quantum resistance for Light node attestations
+    if signature.starts_with("compact_bin:") {
+        // Use unified P2P verification (same as Full/Super nodes)
+        if let Some(p2p) = blockchain.get_unified_p2p() {
+            // verify_dilithium_heartbeat_signature supports compact_bin format
+            let is_valid = p2p.verify_dilithium_heartbeat_signature(challenge, signature, node_id);
+            
+            if is_valid {
+                if crate::node::is_info() {
+                    println!("[INFO][LIGHT] hybrid_verified format=compact_bin node={}", node_id);
+                }
+            } else {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] hybrid_verify_failed format=compact_bin node={}", node_id);
+                }
+            }
+            
+            return is_valid;
+        } else {
             if crate::node::is_warn() {
-                println!("[WARN][RPC] dilithium_verify_skip reason=crypto_not_initialized");
+                println!("[WARN][LIGHT] p2p_unavailable node={}", node_id);
             }
             return false;
         }
-    };
+    }
     
-    // Create DilithiumSignature struct from string signature
-    let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
-        signature: signature.to_string(),
-        algorithm: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204 standard name
-        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-        strength: "quantum-resistant".to_string(),
-    };
-    
-    match crypto.verify_dilithium_signature(challenge, &dilithium_sig, node_id).await {
-        Ok(is_valid) => {
-            if is_valid {
-                println!("[CRYPTO] ✅ Dilithium signature verified for node {}", node_id);
-            } else {
-                println!("[CRYPTO] ❌ Dilithium signature verification failed for node {}", node_id);
+    // FALLBACK: Accept Ed25519-only during mobile migration period
+    // Format: "light_hybrid_pending:<hex>" - temporary until Dilithium library added
+    if signature.starts_with("light_hybrid_pending:") {
+        let sig_hex = &signature[21..]; // Skip "light_hybrid_pending:" prefix
+        
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        
+        // Decode signature (64 bytes)
+        let sig_bytes = match hex::decode(sig_hex) {
+            Ok(bytes) if bytes.len() == 64 => bytes,
+            Ok(bytes) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] ed25519_invalid_len len={} node={}", bytes.len(), node_id);
+                }
+                return false;
             }
-            is_valid
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] ed25519_decode_failed err={} node={}", e, node_id);
+                }
+                return false;
+            }
+        };
+        
+        let signature_obj = match Signature::from_slice(&sig_bytes) {
+            Ok(sig) => sig,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] ed25519_parse_failed err={} node={}", e, node_id);
+                }
+                return false;
+            }
+        };
+        
+        // Get public key from node_id (Light nodes use their wallet address as node_id)
+        let wallet_address = if node_id.starts_with("light_") {
+            &node_id[6..]
+        } else {
+            node_id
+        };
+        
+        // Decode public key from wallet address (first 32 bytes)
+        let pubkey_bytes = match hex::decode(wallet_address) {
+            Ok(bytes) if bytes.len() >= 32 => bytes[..32].to_vec(),
+            Ok(bytes) if bytes.len() == 32 => bytes,
+            _ => {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] pubkey_decode_failed node={}", node_id);
+                }
+                return false;
+            }
+        };
+        
+        let verifying_key = match VerifyingKey::from_bytes(&pubkey_bytes.try_into().unwrap_or([0u8; 32])) {
+            Ok(key) => key,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] pubkey_parse_failed err={} node={}", e, node_id);
+                }
+                return false;
+            }
+        };
+        
+        // Verify signature against challenge
+        match verifying_key.verify(challenge.as_bytes(), &signature_obj) {
+            Ok(_) => {
+                if crate::node::is_info() {
+                    println!("[INFO][LIGHT] ed25519_verified_fallback node={}", node_id);
+                }
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] fallback_mode action=upgrade_to_hybrid node={}", node_id);
+                }
+                true
+            }
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] ed25519_verify_failed err={} node={}", e, node_id);
+                }
+                false
+            }
         }
-        Err(e) => {
-            println!("[CRYPTO] ❌ Dilithium verification error for node {}: {}", node_id, e);
-            false
+    } else {
+        // Unknown signature format
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] unknown_sig_format prefix={} expected=compact_bin node={}", 
+                     &signature[..20.min(signature.len())], node_id);
         }
+        false
     }
 }
 
@@ -5133,8 +5216,8 @@ async fn handle_light_node_ping_response(
     let signature = params.get("signature").unwrap_or(&"".to_string()).clone();
     let challenge = params.get("challenge").unwrap_or(&"".to_string()).clone();
     
-    // Verify quantum signature from Light node
-    let signature_valid = verify_dilithium_signature(&node_id, &challenge, &signature).await;
+    // PRODUCTION v2.78: Verify Light node HYBRID signature (Ed25519+Dilithium)
+    let signature_valid = verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await;
     
     if !signature_valid {
         println!("[LIGHT] ❌ Invalid signature from Light node {}", node_id);
@@ -6244,8 +6327,12 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                 
                 // Cleanup old attestations every hour
                 if current_slot % 60 == 0 {
+                    // RAM cleanup
                     p2p.cleanup_old_attestations();
                     p2p.cleanup_old_heartbeats();
+                    
+                    // PRODUCTION v2.78: RocksDB cleanup (persistent storage)
+                    blockchain_for_pings.cleanup_old_storage_data().await;
                 }
             }
             

@@ -674,7 +674,7 @@ QNet implements a **Hybrid Merkle + Sampling** architecture for on-chain ping co
 
 ### Light Node Attestations
 
-Light nodes are pinged by Full/Super nodes and respond with Ed25519 signatures:
+**ARCHITECTURE v2.78:** Light nodes use HYBRID signatures for quantum resistance.
 
 ```rust
 struct LightNodeAttestation {
@@ -682,18 +682,23 @@ struct LightNodeAttestation {
     pinger_node_id: String,
     slot: u64,
     timestamp: u64,
-    light_node_signature: Vec<u8>,      // Ed25519 (64 bytes) - Light node signs challenge
-    pinger_dilithium_signature: String, // Dilithium (2420 bytes) - Pinger attests
+    light_node_signature: String,       // HYBRID compact_bin (Ed25519 + Dilithium3, ~2.6KB)
+    pinger_signature: String,           // HYBRID compact_bin (Ed25519 + Dilithium3, ~2.6KB)
 }
 ```
 
-**Dual Signature Requirement**:
-- Light node signs the challenge with Ed25519 (proves liveness)
-- Pinger signs the attestation with Dilithium (proves observation)
+**Dual Signature Requirement (Both HYBRID)**:
+- ✅ Light node signs challenge with HYBRID `compact_bin` format (quantum-resistant)
+- ✅ Pinger signs attestation with HYBRID `compact_bin` format (quantum-resistant)
+
+**Implementation Status**:
+- ✅ **Server:** Full HYBRID verification ready (`compact_bin` format supported)
+- ⚠️ **Mobile:** Ed25519 fallback (`light_hybrid_pending`) until Dilithium3 library added
+- 🎯 **Target:** Mobile app with Dilithium3 WASM for full HYBRID signatures
 
 ### Full/Super Node Heartbeats
 
-Full/Super nodes self-attest via heartbeats:
+Full/Super nodes self-attest via heartbeats with HYBRID signatures:
 
 ```rust
 struct FullNodeHeartbeat {
@@ -701,7 +706,7 @@ struct FullNodeHeartbeat {
     node_type: String,      // "full" or "super"
     heartbeat_index: u8,    // 0-9 (10 per 4-hour window)
     timestamp: u64,
-    dilithium_signature: String, // Dilithium (2420 bytes)
+    signature: String,      // HYBRID (Ed25519 + Dilithium3, ~2.6KB bincode)
 }
 ```
 

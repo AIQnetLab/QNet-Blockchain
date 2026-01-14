@@ -228,12 +228,13 @@ pub struct PingSampleData {
 
 /// Individual heartbeat sample with Merkle proof
 /// Used in HeartbeatCommitment TX for Byzantine-safe verification
+/// ARCHITECTURE v2.78: All server nodes use HYBRID signatures
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HeartbeatSampleData {
     pub heartbeat_index: u8,               // Index in epoch (0-9)
     pub timestamp: u64,                    // Unix timestamp
     pub block_height: u64,                 // Block height when sent
-    pub signature: String,                 // Dilithium HYBRID signature
+    pub signature: String,                 // HYBRID signature (Ed25519 + Dilithium3, ~2.6KB bincode)
     pub merkle_proof: Vec<(String, bool)>, // (hash, is_left) - proof of inclusion
 }
 
@@ -416,8 +417,9 @@ impl Transaction {
         tx
     }
     
-    /// QUANTUM v2.25.2: Set quantum signature fields after creation
-    /// This allows adding Dilithium signature to an existing transaction
+    /// QUANTUM v2.78: Set quantum signature fields after creation (HYBRID ONLY)
+    /// ARCHITECTURE: For HYBRID signatures (Ed25519 + Dilithium)
+    /// Pure Dilithium not supported - use Hybrid for quantum resistance
     pub fn with_quantum_signature(mut self, dilithium_sig: Option<String>, dilithium_pk: Option<String>) -> Self {
         self.dilithium_signature = dilithium_sig;
         self.dilithium_public_key = dilithium_pk;
@@ -430,16 +432,19 @@ impl Transaction {
         self
     }
     
-    /// QUANTUM v2.25: Check if transaction has Dilithium signature (quantum-resistant)
+    /// QUANTUM v2.78: Check if transaction uses HYBRID signature (quantum-resistant)
+    /// ARCHITECTURE: Two TX signature types:
+    /// - Ed25519 only: Fast, classical (64 bytes, standard gas)
+    /// - Hybrid (Ed25519+Dilithium): Quantum-resistant (~2.6KB, +50% gas)
     pub fn is_quantum_signed(&self) -> bool {
         self.dilithium_signature.is_some() && self.dilithium_public_key.is_some()
     }
     
-    /// QUANTUM v2.25: Get effective gas price (50% higher for Dilithium TX)
-    /// This compensates for larger TX size and verification cost
+    /// QUANTUM v2.78: Get effective gas price (50% higher for HYBRID TX)
+    /// This compensates for larger TX size (~2.6KB vs 64 bytes) and verification cost
     pub fn effective_gas_price(&self) -> u64 {
         if self.is_quantum_signed() {
-            // 50% gas premium for quantum-resistant TX
+            // 50% gas premium for quantum-resistant HYBRID TX
             self.gas_price + (self.gas_price / 2)
         } else {
             self.gas_price

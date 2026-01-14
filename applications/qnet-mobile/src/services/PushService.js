@@ -277,6 +277,9 @@ export async function getNextPingTime() {
 
 /**
  * Respond to ping challenge (sign and send)
+ * ARCHITECTURE v2.78: Light nodes use HYBRID signature (Ed25519 + Dilithium)
+ * TEMPORARY: Using Ed25519 fallback until Dilithium3 library is integrated
+ * Server ready to accept compact_bin format when available
  */
 export async function respondToChallenge(nodeId, challenge) {
   try {
@@ -300,15 +303,20 @@ export async function respondToChallenge(nodeId, challenge) {
     const decrypted = CryptoJS.AES.decrypt(walletDataStr, passwordHash);
     const walletData = JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
 
-    // Sign challenge with Ed25519
+    // TEMPORARY: Ed25519-only signature until Dilithium3 library is available
+    // Server accepts this as fallback but expects compact_bin format
     const challengeBytes = new TextEncoder().encode(challenge);
     const signature = nacl.sign.detached(challengeBytes, new Uint8Array(walletData.secretKey));
     const signatureHex = Buffer.from(signature).toString('hex');
+    
+    // Format: "light_hybrid_pending:<hex>" - temporary fallback mode
+    // Target format: "compact_bin:<base64_bincode>" when Dilithium3 available
+    const formattedSignature = `light_hybrid_pending:${signatureHex}`;
 
     // Send response
     const apiUrl = getRandomBootstrapNode();
     const response = await fetch(
-      `${apiUrl}/api/v1/light-node/ping-response?node_id=${encodeURIComponent(nodeId)}&challenge=${encodeURIComponent(challenge)}&signature=${encodeURIComponent(signatureHex)}`,
+      `${apiUrl}/api/v1/light-node/ping-response?node_id=${encodeURIComponent(nodeId)}&challenge=${encodeURIComponent(challenge)}&signature=${encodeURIComponent(formattedSignature)}`,
       { method: 'GET' }
     );
 
