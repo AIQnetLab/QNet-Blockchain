@@ -2098,16 +2098,33 @@ impl BlockchainNode {
         let window_start_height = current_epoch * EMISSION_BLOCK_INTERVAL;
         let window_end_height = (current_epoch + 1) * EMISSION_BLOCK_INTERVAL;
         
+        if is_info() {
+            println!("[INFO][HB-COMMIT-CREATE] Starting creation node={} epoch={} window={}..{}", 
+                     node_id, current_epoch, window_start_height, window_end_height);
+        }
+        
         // Get heartbeats from Storage (for this node only)
         let all_heartbeats = storage.get_heartbeats_for_block_range(window_start_height, window_end_height)
             .unwrap_or_default();
+        
+        if is_info() {
+            println!("[INFO][HB-COMMIT-CREATE] Retrieved {} total heartbeats from storage", all_heartbeats.len());
+        }
+        
         let my_heartbeats: Vec<_> = all_heartbeats.into_iter()
             .filter(|(sender_id, _, _, _, _)| sender_id == node_id)
             .collect();
         
         let heartbeat_count = my_heartbeats.len() as u8;
         
+        if is_info() {
+            println!("[INFO][HB-COMMIT-CREATE] Filtered to {} heartbeats for node={}", heartbeat_count, node_id);
+        }
+        
         if heartbeat_count == 0 {
+            if is_warn() {
+                println!("[WARN][HB-COMMIT-CREATE] No heartbeats found! node={} epoch={}", node_id, current_epoch);
+            }
             return Err(QNetError::ValidationError("No heartbeats to commit".to_string()));
         }
         
@@ -2217,15 +2234,32 @@ impl BlockchainNode {
         let window_start_height = current_epoch * EMISSION_BLOCK_INTERVAL;
         let window_end_height = (current_epoch + 1) * EMISSION_BLOCK_INTERVAL;
         
+        if is_info() {
+            println!("[INFO][PING-COMMIT-CREATE] Starting creation node={} epoch={} window={}..{}", 
+                     node_id, current_epoch, window_start_height, window_end_height);
+        }
+        
         // Get attestations from P2P storage (for this pinger only)
         let all_attestations = p2p.get_attestations_for_block_range(window_start_height, window_end_height);
+        
+        if is_info() {
+            println!("[INFO][PING-COMMIT-CREATE] Retrieved {} total attestations from P2P", all_attestations.len());
+        }
+        
         let my_pings: Vec<_> = all_attestations.into_iter()
             .filter(|(_, _, pinger_id, _, _)| pinger_id == node_id)
             .collect();
         
         let ping_count = my_pings.len() as u32;
         
+        if is_info() {
+            println!("[INFO][PING-COMMIT-CREATE] Filtered to {} pings for node={}", ping_count, node_id);
+        }
+        
         if ping_count == 0 {
+            if is_warn() {
+                println!("[WARN][PING-COMMIT-CREATE] No pings found! node={} epoch={}", node_id, current_epoch);
+            }
             return Err(QNetError::ValidationError("No pings to commit".to_string()));
         }
         
@@ -7387,6 +7421,10 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
             const EMISSION_BLOCK_INTERVAL: u64 = 14400;
             const COMMITMENT_WINDOW_START: u64 = 50;
             
+            if is_info() {
+                println!("[INFO][COMMIT-LOOP] Commitment TX loop started");
+            }
+            
             while *is_running.read().await {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 
@@ -7400,6 +7438,12 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 
                 let current_epoch = current_height / EMISSION_BLOCK_INTERVAL;
                 
+                // DEBUG: Log when entering commitment window
+                if is_info() {
+                    println!("[INFO][COMMIT-LOOP] Entering commitment window height={} epoch={} blocks_until_end={}", 
+                             current_height, current_epoch, blocks_until_epoch_end);
+                }
+                
                 // HeartbeatCommitment TX
                 {
                     let already_sent = {
@@ -7407,24 +7451,65 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         sent.contains(&current_epoch)
                     };
                     
-                    if !already_sent {
-                        if let Some(ref p2p) = unified_p2p {
-                            if let Ok(tx) = Self::create_heartbeat_commitment_tx_static(
+                    if already_sent {
+                        if is_info() {
+                            println!("[INFO][HEARTBEAT-COMMITMENT] Already sent for epoch={}", current_epoch);
+                        }
+                    } else {
+                        if is_info() {
+                            println!("[INFO][HEARTBEAT-COMMITMENT] Creating TX for epoch={}", current_epoch);
+                        }
+                        
+                        if unified_p2p.is_none() {
+                            if is_warn() {
+                                println!("[WARN][HEARTBEAT-COMMITMENT] unified_p2p is None! Cannot create TX");
+                            }
+                        } else if let Some(ref p2p) = unified_p2p {
+                            match Self::create_heartbeat_commitment_tx_static(
                                 &storage,
                                 p2p,
                                 &node_id,
                                 current_epoch,
                             ).await {
-                                // Add to mempool
-                                if let Ok(tx_bytes) = bincode::serialize(&tx) {
-                                    let gas_price = tx.gas_price;
-                                    if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
-                                        let mut sent = sent_heartbeat_commitments.write().await;
-                                        sent.insert(current_epoch);
-                                        if is_info() {
-                                            println!("[INFO][HEARTBEAT-COMMITMENT] TX submitted epoch={} hash={}", 
-                                                     current_epoch, &tx.hash[..16]);
+                                Ok(tx) => {
+                                    if is_info() {
+                                        println!("[INFO][HEARTBEAT-COMMITMENT] TX created successfully epoch={} hash={}", 
+                                                 current_epoch, &tx.hash[..16]);
+                                    }
+                                    
+                                    match bincode::serialize(&tx) {
+                                        Ok(tx_bytes) => {
+                                            let gas_price = tx.gas_price;
+                                            if is_info() {
+                                                println!("[INFO][HEARTBEAT-COMMITMENT] TX serialized size={} bytes", tx_bytes.len());
+                                            }
+                                            
+                                            if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
+                                                let mut sent = sent_heartbeat_commitments.write().await;
+                                                sent.insert(current_epoch);
+                                                if is_info() {
+                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX submitted to mempool epoch={} hash={}", 
+                                                             current_epoch, &tx.hash[..16]);
+                                                }
+                                            } else {
+                                                if is_warn() {
+                                                    println!("[WARN][HEARTBEAT-COMMITMENT] Mempool rejected TX epoch={} hash={}", 
+                                                             current_epoch, &tx.hash[..16]);
+                                                }
+                                            }
                                         }
+                                        Err(e) => {
+                                            if is_warn() {
+                                                println!("[WARN][HEARTBEAT-COMMITMENT] Failed to serialize TX epoch={} error={}", 
+                                                         current_epoch, e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    if is_warn() {
+                                        println!("[WARN][HEARTBEAT-COMMITMENT] Failed to create TX epoch={} error={:?}", 
+                                                 current_epoch, e);
                                     }
                                 }
                             }
@@ -7439,24 +7524,65 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         sent.contains(&current_epoch)
                     };
                     
-                    if !already_sent {
-                        if let Some(ref p2p) = unified_p2p {
-                            if let Ok(tx) = Self::create_ping_commitment_tx_static(
+                    if already_sent {
+                        if is_info() {
+                            println!("[INFO][PING-COMMITMENT] Already sent for epoch={}", current_epoch);
+                        }
+                    } else {
+                        if is_info() {
+                            println!("[INFO][PING-COMMITMENT] Creating TX for epoch={}", current_epoch);
+                        }
+                        
+                        if unified_p2p.is_none() {
+                            if is_warn() {
+                                println!("[WARN][PING-COMMITMENT] unified_p2p is None! Cannot create TX");
+                            }
+                        } else if let Some(ref p2p) = unified_p2p {
+                            match Self::create_ping_commitment_tx_static(
                                 &storage,
                                 p2p,
                                 &node_id,
                                 current_epoch,
                             ).await {
-                                // Add to mempool
-                                if let Ok(tx_bytes) = bincode::serialize(&tx) {
-                                    let gas_price = tx.gas_price;
-                                    if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
-                                        let mut sent = sent_ping_commitments.write().await;
-                                        sent.insert(current_epoch);
-                                        if is_info() {
-                                            println!("[INFO][PING-COMMITMENT] TX submitted epoch={} hash={}", 
-                                                     current_epoch, &tx.hash[..16]);
+                                Ok(tx) => {
+                                    if is_info() {
+                                        println!("[INFO][PING-COMMITMENT] TX created successfully epoch={} hash={}", 
+                                                 current_epoch, &tx.hash[..16]);
+                                    }
+                                    
+                                    match bincode::serialize(&tx) {
+                                        Ok(tx_bytes) => {
+                                            let gas_price = tx.gas_price;
+                                            if is_info() {
+                                                println!("[INFO][PING-COMMITMENT] TX serialized size={} bytes", tx_bytes.len());
+                                            }
+                                            
+                                            if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
+                                                let mut sent = sent_ping_commitments.write().await;
+                                                sent.insert(current_epoch);
+                                                if is_info() {
+                                                    println!("[INFO][PING-COMMITMENT] TX submitted to mempool epoch={} hash={}", 
+                                                             current_epoch, &tx.hash[..16]);
+                                                }
+                                            } else {
+                                                if is_warn() {
+                                                    println!("[WARN][PING-COMMITMENT] Mempool rejected TX epoch={} hash={}", 
+                                                             current_epoch, &tx.hash[..16]);
+                                                }
+                                            }
                                         }
+                                        Err(e) => {
+                                            if is_warn() {
+                                                println!("[WARN][PING-COMMITMENT] Failed to serialize TX epoch={} error={}", 
+                                                         current_epoch, e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    if is_warn() {
+                                        println!("[WARN][PING-COMMITMENT] Failed to create TX epoch={} error={:?}", 
+                                                 current_epoch, e);
                                     }
                                 }
                             }
