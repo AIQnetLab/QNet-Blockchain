@@ -12659,31 +12659,27 @@ impl SimplifiedP2P {
         };
         
         handle.spawn(async move {
-            println!("[HEARTBEAT] 🕐 Starting heartbeat service for {} ({}) [tokio v2.42.2]", node_id, node_type_str);
+            if crate::node::is_info() {
+                println!("[INFO][HEARTBEAT] service_started node={} type={} mode=height_based version=v2.79", 
+                         node_id, node_type_str);
+            }
             
             loop {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                // PRODUCTION v2.79: Use block height instead of timestamp
+                let block_height = get_height();
+                let current_epoch = block_height / 14400;
                 
-                // Calculate deterministic heartbeat times for this node
-                let heartbeat_times = calculate_heartbeat_times_for_node(&node_id);
+                // Calculate deterministic heartbeat heights for this node
+                let heartbeat_heights = calculate_heartbeat_heights_for_node(&node_id, block_height);
                 
-                // Check if any heartbeat is due (within 60 second window)
-                for (index, heartbeat_time) in heartbeat_times.iter().enumerate() {
-                    if now >= *heartbeat_time && now < *heartbeat_time + 60 {
-                        // Check if we already sent this heartbeat
-                        let heartbeat_key = format!("{}:{}", node_id, index);
+                // Check if any heartbeat is due (within ±1 block tolerance)
+                for (index, target_height) in heartbeat_heights.iter().enumerate() {
+                    if block_height >= *target_height && block_height <= *target_height + 1 {
+                        // Check if we already sent this heartbeat for current epoch
+                        let heartbeat_key = format!("{}:{}:{}", node_id, index, current_epoch);
                         let already_sent = {
                             let history = match p2p.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                            if let Some(record) = history.get(&heartbeat_key) {
-                                let current_4h = now - (now % (4 * 60 * 60));
-                                let record_4h = record.timestamp - (record.timestamp % (4 * 60 * 60));
-                                current_4h == record_4h
-                            } else {
-                                false
-                            }
+                            history.contains_key(&heartbeat_key)
                         };
                         
                         if !already_sent {
@@ -12691,15 +12687,19 @@ impl SimplifiedP2P {
                             // Nodes with low reputation should NOT participate in reward pings (v2.21.5: blockchain)
                             let our_reputation = p2p.get_node_reputation_from_blockchain(&node_id);
                             if our_reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
-                                // Log once per window (first heartbeat only)
-                                if index == 0 {
-                                    println!("[HEARTBEAT] ⚠️ Skipping heartbeats: reputation {:.1}% < 70%", 
-                                             our_reputation);
+                                // Log once per epoch (first heartbeat only)
+                                if index == 0 && crate::node::is_warn() {
+                                    println!("[WARN][HEARTBEAT] skipping_low_reputation node={} reputation={:.1}% min=70.0%", 
+                                             node_id, our_reputation);
                                 }
                                 continue; // Skip this heartbeat slot
                             }
                             
-                            let block_height = get_height();
+                            // Get current timestamp for signature and storage
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
                             
                             // SECURITY v2.23: HYBRID signature for heartbeats (NIST/Cisco compliant)
                             // CRITICAL: Dilithium signs ephemeral Ed25519 key for EVERY heartbeat
@@ -12721,7 +12721,10 @@ impl SimplifiedP2P {
                             }).await {
                                 Ok(Some(sig)) => sig,
                                 Ok(None) | Err(_) => {
-                                    println!("[HEARTBEAT] ⚠️ HYBRID signing failed for heartbeat #{} - skipping", index);
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][HEARTBEAT] signing_failed node={} index={} height={}", 
+                                                 node_id, index, block_height);
+                                    }
                                     continue; // Skip this heartbeat if signing fails
                                 }
                             };
@@ -12751,11 +12754,17 @@ impl SimplifiedP2P {
                             // PRODUCTION v2.78: Save to RocksDB for HeartbeatCommitment TX with Dilithium signature
                             if let Some(ref storage) = p2p.storage {
                                 if let Err(e) = storage.save_heartbeat(&node_id, index as u8, now, block_height, &signature) {
-                                    println!("[HEARTBEAT] ⚠️ Failed to save to RocksDB: {}", e);
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][HEARTBEAT] rocksdb_save_failed node={} index={} height={} error={}", 
+                                                 node_id, index, block_height, e);
+                                    }
                                 }
                             }
                             
-                            println!("[HEARTBEAT] 📡 Sent heartbeat #{} at height {} [RAM OK, RocksDB OK]", index, block_height);
+                            if crate::node::is_info() {
+                                println!("[INFO][HEARTBEAT] sent node={} index={} height={} target={} epoch={}", 
+                                         node_id, index, block_height, target_height, current_epoch);
+                            }
                         }
                     }
                 }
@@ -12763,8 +12772,55 @@ impl SimplifiedP2P {
                 // Cleanup old heartbeats (>24h)
                 p2p.cleanup_old_heartbeats();
                 
-                // v2.42.2: Use tokio::time::sleep instead of std::thread::sleep
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                // PRODUCTION v2.79: Dynamic sleep interval based on proximity to next target
+                // Optimizes CPU usage while guaranteeing accurate heartbeat timing
+                let sleep_seconds = {
+                    // Find next target height
+                    let mut next_target: Option<u64> = None;
+                    for target_height in &heartbeat_heights {
+                        if *target_height > block_height {
+                            next_target = Some(*target_height);
+                            break;
+                        }
+                    }
+                    
+                    if let Some(target) = next_target {
+                        let blocks_until_target = target.saturating_sub(block_height);
+                        
+                        if blocks_until_target <= 2 {
+                            // CRITICAL: Very close to target - check frequently
+                            2
+                        } else if blocks_until_target <= 10 {
+                            // APPROACHING: Medium frequency
+                            5
+                        } else if blocks_until_target <= 100 {
+                            // NEAR: Check every 15 seconds
+                            15
+                        } else {
+                            // FAR: Check every 30 seconds
+                            30
+                        }
+                    } else {
+                        // All targets passed - sleep until next epoch
+                        let blocks_until_epoch_end = 14400 - (block_height % 14400);
+                        if blocks_until_epoch_end <= 50 {
+                            // In commitment window - check frequently
+                            5
+                        } else {
+                            // Far from epoch end - check rarely
+                            30
+                        }
+                    }
+                };
+                
+                if sleep_seconds >= 30 && crate::node::is_info() {
+                    if let Some(target) = heartbeat_heights.iter().find(|&&h| h > block_height) {
+                        println!("[INFO][HEARTBEAT] idle node={} height={} next_target={} sleep={}s", 
+                                 node_id, block_height, target, sleep_seconds);
+                    }
+                }
+                
+                tokio::time::sleep(tokio::time::Duration::from_secs(sleep_seconds)).await;
             }
         });
     }
@@ -14355,38 +14411,48 @@ impl SimplifiedP2P {
     }
 }
 
-/// Calculate deterministic heartbeat times for a node (10 times per 4h window)
-fn calculate_heartbeat_times_for_node(node_id: &str) -> Vec<u64> {
+/// PRODUCTION v2.79: Calculate deterministic heartbeat HEIGHTS for a node (10 per epoch)
+/// CRITICAL FIX: Use block height instead of timestamp to guarantee commitment window coverage
+/// Architecture:
+/// - Epoch = 14400 blocks (4 hours)
+/// - 10 heartbeats per epoch
+/// - Last heartbeat ALWAYS in commitment window (last 50 blocks)
+/// - Deterministic based on node_id hash
+fn calculate_heartbeat_heights_for_node(node_id: &str, current_height: u64) -> Vec<u64> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    const EPOCH_BLOCKS: u64 = 14400;  // 4 hours = 14400 blocks
+    const HEARTBEATS_PER_EPOCH: u64 = 10;
+    const BLOCKS_PER_HEARTBEAT: u64 = EPOCH_BLOCKS / HEARTBEATS_PER_EPOCH;  // 1440 blocks
+    const COMMITMENT_WINDOW_SIZE: u64 = 50;  // Last 50 blocks before epoch end
     
-    let current_4h_window = now - (now % (4 * 60 * 60));
+    // Current epoch
+    let current_epoch = current_height / EPOCH_BLOCKS;
+    let epoch_start = current_epoch * EPOCH_BLOCKS;
     
-    // Deterministic base slot from node_id hash
+    // Deterministic base offset from node_id hash (0-1439)
     let mut hasher = DefaultHasher::new();
     node_id.hash(&mut hasher);
     let hash = hasher.finish();
-    let base_slot = (hash % 240) as u64; // 0-239 slots
+    let base_offset = (hash % BLOCKS_PER_HEARTBEAT) as u64;
     
-    // Offset within slot (0-59 seconds)
-    let slot_offset = (node_id.len() % 60) as u64;
+    let mut heights = Vec::with_capacity(HEARTBEATS_PER_EPOCH as usize);
     
-    let mut times = Vec::with_capacity(10);
-    
-    // 10 heartbeats distributed evenly (every 24 minutes average)
-    for i in 0..10u64 {
-        let slot = (base_slot + i * 24) % 240;
-        let time = current_4h_window + (slot * 60) + slot_offset;
-        times.push(time);
+    // First 9 heartbeats: distributed evenly across epoch
+    for i in 0..9 {
+        let heartbeat_height = epoch_start + base_offset + (i * BLOCKS_PER_HEARTBEAT);
+        heights.push(heartbeat_height);
     }
     
-    times.sort();
-    times
+    // CRITICAL: Last heartbeat MUST be in commitment window (last 50 blocks)
+    // This guarantees that HeartbeatCommitment TX will have at least 1 heartbeat
+    let window_offset = (hash % COMMITMENT_WINDOW_SIZE) as u64;  // Deterministic 0-49
+    let last_heartbeat = epoch_start + EPOCH_BLOCKS - COMMITMENT_WINDOW_SIZE + window_offset;
+    heights.push(last_heartbeat);
+    
+    heights.sort();
+    heights
 }
 
 /// Implementation of sync and catch-up methods for SimplifiedP2P

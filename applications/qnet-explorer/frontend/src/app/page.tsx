@@ -81,7 +81,7 @@ export default function HomePage() {
               <div className="stat-trend">256 shards available</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">{stats?.currentRound || '—'}</div>
+              <div className="stat-number">{stats?.currentRound !== undefined ? stats.currentRound : '—'}</div>
               <div className="stat-label">REWARD EPOCH</div>
               <div className="stat-trend">
                 {stats ? `Next: ${stats.blocksUntilReward.toLocaleString()} blocks (${formatTimeRemaining(stats.secondsUntilReward)})` : 'Loading...'}

@@ -38,8 +38,8 @@ export async function GET() {
       const statsData = statsRes?.ok ? await statsRes.json() : {};
       
       const height = heightData.height || 0;
-      // Reward epoch = 1-based (epoch 1 starts at block 0)
-      const rewardEpoch = Math.floor(height / 14400) + 1;
+      // Reward epoch = 0-based (epoch 0 starts at block 0)
+      const rewardEpoch = Math.floor(height / 14400);
       // Blocks until next reward
       const blocksUntilReward = 14400 - (height % 14400);
       // Time until reward in seconds (1 block = 1 second)
