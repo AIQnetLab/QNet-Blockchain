@@ -453,20 +453,24 @@ impl Transaction {
     }
     
     /// Calculate transaction hash as hex string
+    /// Get canonical serialization for hash calculation (excludes hash and signatures)
+    /// PRODUCTION: Deterministic bincode serialization ensures consistent hashing
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        // Create canonical version: all fields except hash and signatures
+        let mut canonical = self.clone();
+        canonical.hash = String::new();
+        canonical.signature = None;
+        canonical.dilithium_signature = None;
+        
+        // Deterministic canonical serialization (includes tx_type, data, all fields)
+        bincode::serialize(&canonical).unwrap_or_default()
+    }
+    
     /// NIST FIPS 202 compliant (SHA3-256) for transaction signatures
+    /// Hash is calculated from canonical serialized bytes
     pub fn calculate_hash(&self) -> TxHash {
-        let mut hasher = Sha3_256::new();
-        
-        // Hash all fields except hash and signature
-        hasher.update(self.from.as_bytes());
-        hasher.update(self.to.as_ref().map(|s| s.as_bytes()).unwrap_or_default());
-        hasher.update(&self.amount.to_le_bytes());
-        hasher.update(&self.nonce.to_le_bytes());
-        hasher.update(&self.gas_price.to_le_bytes());
-        hasher.update(&self.gas_limit.to_le_bytes());
-        hasher.update(&self.timestamp.to_le_bytes());
-        
-        format!("{:x}", hasher.finalize())
+        let canonical_bytes = self.canonical_bytes();
+        format!("{:x}", Sha3_256::digest(&canonical_bytes))
     }
     
     /// Get transaction value

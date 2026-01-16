@@ -5,9 +5,11 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::{VecDeque, BTreeMap};
 use serde::{Serialize, Deserialize};
+use serde_json;
 use bincode;
 use hex;
 use sha3::{Sha3_256, Digest};
+use qnet_state::Transaction;
 
 /// Simple mempool configuration
 #[derive(Debug, Clone)]
@@ -76,12 +78,24 @@ impl SimpleMempool {
             return false;
         }
         
-        // SECURITY: Verify hash matches transaction data
-        let computed_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
-        if computed_hash != hash {
-            eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}", 
-                     &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
-            return false; // Reject tampered transaction
+        // SECURITY: Verify hash matches canonical transaction data
+        // Parse JSON, compute canonical bytes (excludes hash/signatures), verify
+        match serde_json::from_str::<Transaction>(&tx_json) {
+            Ok(tx) => {
+                let canonical_bytes = tx.canonical_bytes();
+                let computed_hash = format!("{:x}", Sha3_256::digest(&canonical_bytes));
+                
+                if computed_hash != hash {
+                    eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}", 
+                             &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
+                    return false; // Reject tampered transaction
+                }
+            }
+            Err(e) => {
+                eprintln!("[ERR][MEMPOOL] parse_failed hash={} error={}", 
+                         &hash[..16.min(hash.len())], e);
+                return false; // Reject malformed transaction
+            }
         }
         
         // Store as binary if enabled (50% space saving)
@@ -131,12 +145,24 @@ impl SimpleMempool {
             return false;
         }
         
-        // SECURITY: Verify hash matches binary data
-        let computed_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
-        if computed_hash != hash {
-            eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}", 
-                     &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
-            return false; // Reject tampered data
+        // SECURITY: Verify hash matches canonical transaction data
+        // Deserialize, compute canonical bytes (excludes hash/signatures), verify
+        match bincode::deserialize::<Transaction>(&tx_bytes) {
+            Ok(tx) => {
+                let canonical_bytes = tx.canonical_bytes();
+                let computed_hash = format!("{:x}", Sha3_256::digest(&canonical_bytes));
+                
+                if computed_hash != hash {
+                    eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}", 
+                             &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
+                    return false; // Reject tampered transaction
+                }
+            }
+            Err(e) => {
+                eprintln!("[ERR][MEMPOOL] deserialize_failed hash={} error={}", 
+                         &hash[..16.min(hash.len())], e);
+                return false; // Reject malformed transaction
+            }
         }
         
         // v2.67: CRITICAL - Add to BOTH structures atomically under priority queue lock
