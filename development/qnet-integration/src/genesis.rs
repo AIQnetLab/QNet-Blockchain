@@ -75,7 +75,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
     // This account is the source for all initial token distributions
     // Without this, Transfer TX fail with "Account not found: genesis"
     let total_distribution: u64 = config.accounts.iter().map(|(_, amt)| amt).sum();
-    let genesis_account_tx = Transaction {
+    let mut genesis_account_tx = Transaction {
         hash: String::new(),
         from: "system".to_string(), // System creates genesis account
         to: Some("genesis".to_string()),
@@ -94,6 +94,8 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
         dilithium_signature: None,
         dilithium_public_key: None,
     };
+    // CRITICAL: Calculate SHA3-256 hash for transaction
+    genesis_account_tx.hash = genesis_account_tx.calculate_hash();
     transactions.push(genesis_account_tx);
     
     // Track nonce for "genesis" account - starts at 0, increments for each TX
@@ -101,7 +103,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
     
     // CRITICAL: Create system_rewards_pool account for reward distribution
     // This account is used as "from" address for RewardDistribution transactions
-    let rewards_pool_tx = Transaction {
+    let mut rewards_pool_tx = Transaction {
         hash: String::new(), // will be calculated
         from: "genesis".to_string(),
         to: Some("system_rewards_pool".to_string()),
@@ -120,13 +122,15 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
         dilithium_signature: None,   // Genesis TX - no quantum sig
         dilithium_public_key: None,
     };
+    // CRITICAL: Calculate SHA3-256 hash for transaction
+    rewards_pool_tx.hash = rewards_pool_tx.calculate_hash();
     transactions.push(rewards_pool_tx);
     genesis_nonce += 1; // nonce=1 for next TX
     
     // Create initial distribution transactions (now "genesis" account exists!)
     // v2.74.2: Sequential nonce to prevent "Invalid nonce" errors on other nodes
     for (address, amount) in config.accounts {
-        let tx = Transaction {
+        let mut tx = Transaction {
             hash: String::new(), // will be calculated
             from: "genesis".to_string(),
             to: Some(address.clone()),
@@ -146,6 +150,8 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
             dilithium_signature: None,   // Genesis TX - no quantum sig
             dilithium_public_key: None,
         };
+        // CRITICAL: Calculate SHA3-256 hash for transaction
+        tx.hash = tx.calculate_hash();
         transactions.push(tx);
         genesis_nonce += 1; // Increment for next TX
     }

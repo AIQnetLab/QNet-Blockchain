@@ -12672,9 +12672,10 @@ impl SimplifiedP2P {
                 // Calculate deterministic heartbeat heights for this node
                 let heartbeat_heights = calculate_heartbeat_heights_for_node(&node_id, block_height);
                 
-                // Check if any heartbeat is due (within ±1 block tolerance)
+                // PRODUCTION v2.80: Check if any heartbeat is due (expanded window for reliability)
+                // Window: target to target+10 blocks (prevents misses due to sleep timing)
                 for (index, target_height) in heartbeat_heights.iter().enumerate() {
-                    if block_height >= *target_height && block_height <= *target_height + 1 {
+                    if block_height >= *target_height && block_height <= *target_height + 10 {
                         // Check if we already sent this heartbeat for current epoch
                         let heartbeat_key = format!("{}:{}:{}", node_id, index, current_epoch);
                         let already_sent = {
@@ -12769,6 +12770,87 @@ impl SimplifiedP2P {
                     }
                 }
                 
+                // PRODUCTION v2.80: FALLBACK for missed heartbeats (late send 11-50 blocks)
+                // If main window missed the heartbeat due to timing issues, send it late
+                // Better late than never - ensures 9-10/10 heartbeats for eligibility
+                for (index, target_height) in heartbeat_heights.iter().enumerate() {
+                    // Check if we're in fallback window (11-50 blocks after target)
+                    if block_height > *target_height + 10 && block_height <= *target_height + 50 {
+                        let heartbeat_key = format!("{}:{}:{}", node_id, index, current_epoch);
+                        let already_sent = {
+                            let history = match p2p.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
+                            history.contains_key(&heartbeat_key)
+                        };
+                        
+                        if !already_sent {
+                            // Check reputation before late send
+                            let our_reputation = p2p.get_node_reputation_from_blockchain(&node_id);
+                            if our_reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
+                                continue; // Skip if low reputation
+                            }
+                            
+                            // Log late send for monitoring
+                            let delay_blocks = block_height - target_height;
+                            if crate::node::is_warn() {
+                                println!("[WARN][HEARTBEAT] fallback_send node={} index={} target={} current={} delay={}blocks", 
+                                         node_id, index, target_height, block_height, delay_blocks);
+                            }
+                            
+                            // Get current timestamp for signature and storage
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            
+                            // Sign heartbeat with Dilithium
+                            let heartbeat_message = format!("{}:{}:{}:{}", node_id, now, block_height, index);
+                            let p2p_for_sign = p2p.clone();
+                            let message_for_sign = heartbeat_message.clone();
+                            let node_id_for_sign = node_id.clone();
+                            let signature = match tokio::task::spawn_blocking(move || {
+                                p2p_for_sign.sign_heartbeat_dilithium(&message_for_sign, &node_id_for_sign)
+                            }).await {
+                                Ok(Some(sig)) => sig,
+                                Ok(None) | Err(_) => {
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][HEARTBEAT] fallback_signing_failed node={} index={} height={}", 
+                                                 node_id, index, block_height);
+                                    }
+                                    continue;
+                                }
+                            };
+                            
+                            // Record locally in RAM
+                            {
+                                let mut history = match p2p.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                                history.insert(heartbeat_key.clone(), HeartbeatRecord {
+                                    node_id: node_id.clone(),
+                                    timestamp: now,
+                                    heartbeat_index: index as u8,
+                                    signature: signature.clone(),
+                                    verified: true,
+                                    block_height,
+                                });
+                            }
+                            
+                            // Save to RocksDB
+                            if let Some(ref storage) = p2p.storage {
+                                if let Err(e) = storage.save_heartbeat(&node_id, index as u8, now, block_height, &signature) {
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][HEARTBEAT] fallback_rocksdb_save_failed node={} index={} error={}", 
+                                                 node_id, index, e);
+                                    }
+                                }
+                            }
+                            
+                            if crate::node::is_info() {
+                                println!("[INFO][HEARTBEAT] fallback_sent node={} index={} height={} target={} delay={}blocks epoch={}", 
+                                         node_id, index, block_height, target_height, delay_blocks, current_epoch);
+                            }
+                        }
+                    }
+                }
+                
                 // Cleanup old heartbeats (>24h)
                 p2p.cleanup_old_heartbeats();
                 
@@ -12787,10 +12869,12 @@ impl SimplifiedP2P {
                     if let Some(target) = next_target {
                         let blocks_until_target = target.saturating_sub(block_height);
                         
-                        if blocks_until_target <= 2 {
-                            // CRITICAL: Very close to target - check frequently
-                            2
-                        } else if blocks_until_target <= 10 {
+                        // PRODUCTION v2.80: Reduced sleep for better timing accuracy
+                        // Sleep 1s when close ensures we don't miss the 10-block window
+                        if blocks_until_target <= 10 {
+                            // CRITICAL: Close to target - check every second
+                            1
+                        } else if blocks_until_target <= 50 {
                             // APPROACHING: Medium frequency
                             5
                         } else if blocks_until_target <= 100 {

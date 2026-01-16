@@ -20822,14 +20822,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Phase 1: 1DEV burn on Solana, Phase 2: QNC transfer to Pool 3
         let phase = if burn_tx_hash.starts_with("genesis_") || burn_tx_hash.starts_with("QNET-BOOT") {
             1 // Genesis nodes are always Phase 1
+        } else if burn_tx_hash.starts_with("pool3_transfer_") || burn_tx_hash.starts_with("qnet_") {
+            // Phase 2: Pool 3 transfer transactions (start with "pool3_transfer_" or "qnet_")
+            2 // Phase 2 - QNC transfer to Pool 3
         } else if burn_tx_hash.len() == 88 || burn_tx_hash.len() == 87 {
             // Solana transaction signatures are 87-88 base58 chars
             1 // Phase 1 - Solana burn
-        } else if burn_tx_hash.starts_with("qnet_tx_") || burn_tx_hash.len() == 64 {
-            // QNet transaction hashes are 64 hex chars
+        } else if burn_tx_hash.len() == 64 {
+            // Could be QNet tx hash (64 hex chars) - assume Phase 2
             2 // Phase 2 - QNet transfer
         } else {
-            1 // Default to Phase 1
+            1 // Default to Phase 1 for unknown formats
         };
         
         // Get burn_amount from registry (was stored when code was generated)
@@ -20839,7 +20842,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 Some(qnet_rpc.clone())
             );
             let code_hash_temp = registry_temp.hash_activation_code_for_blockchain(code)
-                .unwrap_or_else(|_| blake3::hash(code.as_bytes()).to_hex().to_string());
+                .unwrap_or_else(|_| {
+                    use sha3::{Sha3_256, Digest};
+                    format!("{:x}", Sha3_256::digest(code.as_bytes()))
+                });
             
             match registry_temp.get_activation_record_by_hash(&code_hash_temp).await {
                 Ok(Some(record)) => {
@@ -20861,12 +20867,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("   Phase: {}", phase);
         println!("   Burn Amount: {}", burn_amount);
             
-        // Create node info for blockchain registry with secure hash
+        // Create node info for blockchain registry with secure hash (SHA3-256 for NIST compliance)
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(
             Some(qnet_rpc.clone())
         );
         let code_hash = registry.hash_activation_code_for_blockchain(code)
-            .unwrap_or_else(|_| blake3::hash(code.as_bytes()).to_hex().to_string());
+            .unwrap_or_else(|_| {
+                use sha3::{Sha3_256, Digest};
+                format!("{:x}", Sha3_256::digest(code.as_bytes()))
+            });
         
         let node_info = crate::activation_validation::NodeInfo {
             activation_code: code_hash, // Use hash for secure blockchain storage
