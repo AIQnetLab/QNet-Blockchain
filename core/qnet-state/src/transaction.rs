@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use blake3::Hasher;
+use sha3::{Sha3_256, Digest};
 use crate::errors::StateResult;
 use crate::StateError;
 use std::collections::HashMap;
@@ -452,8 +453,9 @@ impl Transaction {
     }
     
     /// Calculate transaction hash as hex string
+    /// NIST FIPS 202 compliant (SHA3-256) for transaction signatures
     pub fn calculate_hash(&self) -> TxHash {
-        let mut hasher = Hasher::new();
+        let mut hasher = Sha3_256::new();
         
         // Hash all fields except hash and signature
         hasher.update(self.from.as_bytes());
@@ -464,7 +466,7 @@ impl Transaction {
         hasher.update(&self.gas_limit.to_le_bytes());
         hasher.update(&self.timestamp.to_le_bytes());
         
-        hex::encode(hasher.finalize().as_bytes())
+        format!("{:x}", hasher.finalize())
     }
     
     /// Get transaction value

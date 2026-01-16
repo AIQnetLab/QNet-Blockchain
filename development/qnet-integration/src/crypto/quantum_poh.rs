@@ -4,8 +4,8 @@
 // implementing a Verifiable Delay Function (VDF) for temporal ordering.
 // 
 // This implementation is designed for production use with:
-// - 500K hashes/sec for strong VDF property (non-parallelizable)
-// - Hybrid SHA3-512/Blake3 for post-quantum security + performance
+// - 500K+ hashes/sec for strong VDF property (non-parallelizable)
+// - Blake3 for maximum performance (sequential = VDF property)
 // - Thread-safe operation with atomic state updates
 // - Integration with QNet's microblock/macroblock architecture
 //
@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, mpsc, Mutex};
-use sha3::{Sha3_512, Digest};
 use blake3;
 use serde::{Serialize, Deserialize};
 use prometheus::{register_counter, register_gauge, Counter, Gauge};
@@ -242,33 +241,24 @@ impl QuantumPoH {
                 let base_count = hash_count.load(Ordering::SeqCst);
                 let mut hash_bytes = *current_hash.read().await;
                 
-                // Generate HASHES_PER_TICK hashes using hybrid SHA3-512/Blake3
-                // Every 4th hash uses SHA3-512 for VDF property (prevents parallelization)
-                // Other hashes use Blake3 for speed (3x faster)
+                // Generate HASHES_PER_TICK hashes using Blake3 (100%)
+                // Sequential hashing provides VDF property (non-parallelizable)
+                // Blake3 is 3x faster than SHA3, sufficient for VDF
                 for i in 0..HASHES_PER_TICK {
                     let counter_value = base_count + i;
                     
-                    if i % 4 == 0 {
-                        // SHA3-512 for VDF property
-                        let mut hasher = Sha3_512::new();
-                        hasher.update(&hash_bytes);
-                        hasher.update(&counter_value.to_le_bytes());
-                        let result = hasher.finalize();
-                        hash_bytes.copy_from_slice(&result);
-                    } else {
-                        // Blake3 for speed (produces 32 bytes, we extend to 64)
-                        let mut hasher = blake3::Hasher::new();
-                        hasher.update(&hash_bytes);
-                        hasher.update(&counter_value.to_le_bytes());
-                        let result = hasher.finalize();
-                        hash_bytes[..32].copy_from_slice(result.as_bytes());
-                        
-                        // Second Blake3 hash to fill remaining 32 bytes
-                        let mut hasher2 = blake3::Hasher::new();
-                        hasher2.update(result.as_bytes());
-                        let result2 = hasher2.finalize();
-                        hash_bytes[32..].copy_from_slice(result2.as_bytes());
-                    }
+                    // Blake3 for all hashes (produces 32 bytes, we extend to 64)
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(&hash_bytes);
+                    hasher.update(&counter_value.to_le_bytes());
+                    let result = hasher.finalize();
+                    hash_bytes[..32].copy_from_slice(result.as_bytes());
+                    
+                    // Second Blake3 hash to fill remaining 32 bytes
+                    let mut hasher2 = blake3::Hasher::new();
+                    hasher2.update(result.as_bytes());
+                    let result2 = hasher2.finalize();
+                    hash_bytes[32..].copy_from_slice(result2.as_bytes());
                 }
                 
                 // Update state atomically
@@ -371,13 +361,19 @@ impl QuantumPoH {
         let base_count = self.hash_count.load(Ordering::SeqCst);
         let mut hash_bytes = *self.current_hash.read().await;
         
-        // Mix data using SHA3-512 (deterministic, verifiable)
-        let mut hasher = Sha3_512::new();
+        // Mix data using Blake3 (deterministic, verifiable, fast)
+        let mut hasher = blake3::Hasher::new();
         hasher.update(&hash_bytes);
         hasher.update(&tx_data);
         hasher.update(&base_count.to_le_bytes());
         let result = hasher.finalize();
-        hash_bytes.copy_from_slice(&result);
+        hash_bytes[..32].copy_from_slice(result.as_bytes());
+        
+        // Second Blake3 hash to fill remaining 32 bytes
+        let mut hasher2 = blake3::Hasher::new();
+        hasher2.update(result.as_bytes());
+        let result2 = hasher2.finalize();
+        hash_bytes[32..].copy_from_slice(result2.as_bytes());
         
         // Update state
         let new_count = base_count + 1;
@@ -451,34 +447,24 @@ impl QuantumPoH {
                 let is_last = i == hashes_to_compute - 1;
                 let has_data = entry.data.is_some() && is_last;
                 
+                // Blake3 for all hashes (100%)
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&hash_bytes);
+                
+                // Mix in data if this is the last hash with data
                 if has_data {
-                    // Last hash with data: use SHA3-512 with data mixed in
-                    let mut hasher = Sha3_512::new();
-                    hasher.update(&hash_bytes);
                     hasher.update(entry.data.as_ref().expect("Checked is_some above"));
-                    hasher.update(&counter_value.to_le_bytes());
-                    let result = hasher.finalize();
-                    hash_bytes.copy_from_slice(&result);
-                } else if i % 4 == 0 {
-                    // Every 4th hash: SHA3-512
-                    let mut hasher = Sha3_512::new();
-                    hasher.update(&hash_bytes);
-                    hasher.update(&counter_value.to_le_bytes());
-                    let result = hasher.finalize();
-                    hash_bytes.copy_from_slice(&result);
-                } else {
-                    // Other hashes: Blake3 extended to 64 bytes
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(&hash_bytes);
-                    hasher.update(&counter_value.to_le_bytes());
-                    let result = hasher.finalize();
-                    hash_bytes[..32].copy_from_slice(result.as_bytes());
-                    
-                    let mut hasher2 = blake3::Hasher::new();
-                    hasher2.update(result.as_bytes());
-                    let result2 = hasher2.finalize();
-                    hash_bytes[32..].copy_from_slice(result2.as_bytes());
                 }
+                
+                hasher.update(&counter_value.to_le_bytes());
+                let result = hasher.finalize();
+                hash_bytes[..32].copy_from_slice(result.as_bytes());
+                
+                // Second Blake3 hash to fill remaining 32 bytes
+                let mut hasher2 = blake3::Hasher::new();
+                hasher2.update(result.as_bytes());
+                let result2 = hasher2.finalize();
+                hash_bytes[32..].copy_from_slice(result2.as_bytes());
             }
             
             // Verify hash matches
