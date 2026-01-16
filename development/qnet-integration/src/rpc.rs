@@ -10381,7 +10381,7 @@ async fn handle_contract_call(
         request.gas_price,                         // gas_price
         request.gas_limit,                         // gas_limit
         chrono::Utc::now().timestamp() as u64,     // timestamp
-        Some(request.signature.clone()),           // signature
+        request.signature.clone(),                 // signature
         qnet_state::TransactionType::ContractCall, // tx_type
         Some(serde_json::to_string(&json!({        // data
             "contract": request.contract_address,
