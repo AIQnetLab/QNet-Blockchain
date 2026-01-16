@@ -19208,7 +19208,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             });
         }
         
-        // v2.90: Return BLAKE3 hash (calculated via tx.calculate_hash())
+        // v2.90: Return SHA3-256 hash (calculated via tx.calculate_hash())
         // ARCHITECTURE: TX must have hash set BEFORE calling submit_transaction()
         // because tx.validate() (line 16789) checks: self.hash == self.calculate_hash()
         Ok(tx_hash)
@@ -19587,7 +19587,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // Add to mempool (NO BROADCAST - already received from network)
         // v2.26: Direct access - SimpleMempool is already thread-safe
-        // v2.77: Use BLAKE3 via calculate_hash() for consistency
+        // v2.77: Use SHA3-256 via calculate_hash() for NIST compliance
         let tx_hash = tx.calculate_hash();
         let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
         
@@ -19629,7 +19629,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // Add to mempool - v2.26: Direct access - SimpleMempool is already thread-safe
-        // v2.77: Use BLAKE3 via calculate_hash() for consistency
+        // v2.77: Use SHA3-256 via calculate_hash() for NIST compliance
         let tx_hash = tx.calculate_hash();
         let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
         self.mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), tx.gas_price);
@@ -19693,7 +19693,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
             
             // PRODUCTION v2.25: bincode serialization (10-20x faster than JSON)
-            // v2.77: Use BLAKE3 via calculate_hash() for consistency
+            // v2.77: Use SHA3-256 via calculate_hash() for NIST compliance
             if let Ok(tx_bytes) = bincode::serialize(&tx) {
                 let tx_hash = tx.calculate_hash();
                 valid_txs.push((tx_bytes, tx_hash, tx.gas_price));

@@ -202,7 +202,7 @@ impl QNetBlockchain {
     
     /// Add transaction to mempool
     pub async fn add_transaction(&self, tx: Transaction) -> IntegrationResult<()> {
-        // PRODUCTION v2.77: Use BLAKE3 via calculate_hash() for consistency
+        // PRODUCTION v2.77: Use SHA3-256 via calculate_hash() for NIST compliance
         let tx_hash = tx.calculate_hash();
         let tx_bytes = bincode::serialize(&tx).map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
         
