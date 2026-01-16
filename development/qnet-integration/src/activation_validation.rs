@@ -1694,17 +1694,6 @@ impl BlockchainActivationRegistry {
             timestamp: record.activated_at,
         };
         
-        // Create transaction hash
-        let tx_data = format!("{}:{}:{}:{}", 
-            activation_tx.code_hash,
-            activation_tx.node_type,
-            activation_tx.wallet_address,
-            activation_tx.timestamp
-        );
-        
-        let tx_hash_bytes = blake3::hash(tx_data.as_bytes());
-        let tx_hash = format!("qnet_activation_{}", &tx_hash_bytes.to_hex()[..16]);
-        
         // PRODUCTION: Create real blockchain transaction
         use qnet_state::{Transaction, TransactionType};
         
@@ -1725,8 +1714,8 @@ impl BlockchainActivationRegistry {
         let nonce_hash = blake3::hash(nonce_data.as_bytes());
         let nonce = u64::from_le_bytes(nonce_hash.as_bytes()[0..8].try_into().expect("Blake3 hash is 32 bytes"));
         
-        let transaction = Transaction {
-            hash: tx_hash.clone(),
+        let mut transaction = Transaction {
+            hash: String::new(), // Will be calculated via canonical_bytes()
             from: record.wallet_address.clone(),
             to: Some("qnet_activation_registry".to_string()), // Registry contract address
             amount: 0, // No value transfer, just registration
@@ -1742,8 +1731,11 @@ impl BlockchainActivationRegistry {
             dilithium_public_key: None,
         };
         
+        // Calculate hash using canonical serialization (SHA3-256 NIST compliant)
+        transaction.hash = transaction.calculate_hash();
+        
         // PRODUCTION: Submit to blockchain through GLOBAL mempool
-        println!("[REGISTRY] 🔗 Submitting activation transaction to mempool: {}", tx_hash);
+        println!("[REGISTRY] 🔗 Submitting activation transaction to mempool: {}", &transaction.hash[..16.min(transaction.hash.len())]);
         
         // CRITICAL: Use GLOBAL_MEMPOOL_INSTANCE to add transaction to mempool
         // This ensures transaction will be included in next microblock
@@ -1754,13 +1746,10 @@ impl BlockchainActivationRegistry {
             // PRODUCTION v2.26: Use bincode for consistency with block production
             match bincode::serialize(&transaction) {
                 Ok(tx_bytes) => {
-                    // Calculate transaction hash for mempool (using SHA3-256 of bincode)
-                    use sha3::{Sha3_256, Digest};
-                    let tx_hash_for_mempool = format!("{:x}", Sha3_256::digest(&tx_bytes));
-                    
                     // v2.26: Direct access - SimpleMempool is already thread-safe
-                    if mempool_arc.add_binary_transaction(tx_bytes, tx_hash_for_mempool.clone(), transaction.gas_price) {
-                        println!("[REGISTRY] ✅ Activation transaction added to mempool: {}", tx_hash_for_mempool);
+                    // Use transaction.hash which was calculated via canonical_bytes()
+                    if mempool_arc.add_binary_transaction(tx_bytes, transaction.hash.clone(), transaction.gas_price) {
+                        println!("[REGISTRY] ✅ Activation transaction added to mempool: {}", &transaction.hash[..16.min(transaction.hash.len())]);
                     } else {
                         println!("[REGISTRY] ⚠️ Failed to add activation transaction to mempool (may be full or duplicate)");
                     }
@@ -1775,7 +1764,7 @@ impl BlockchainActivationRegistry {
         
         // Also store in transaction_pool for backward compatibility and quick lookup
         if let Some(ref storage) = self.storage {
-            let tx_hash_bytes = hex::decode(&tx_hash).unwrap_or_else(|_| vec![0u8; 32]);
+            let tx_hash_bytes = hex::decode(&transaction.hash).unwrap_or_else(|_| vec![0u8; 32]);
             if tx_hash_bytes.len() == 32 {
                 let mut hash_array = [0u8; 32];
                 hash_array.copy_from_slice(&tx_hash_bytes);
@@ -1783,7 +1772,7 @@ impl BlockchainActivationRegistry {
             }
         }
         
-        Ok(tx_hash)
+        Ok(transaction.hash)
     }
     
     /// Broadcast activation transaction to P2P network
