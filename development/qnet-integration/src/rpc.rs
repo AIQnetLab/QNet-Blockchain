@@ -4010,7 +4010,7 @@ async fn handle_batch_claim_rewards(
                     dilithium_public_key: None,
                 };
                 
-                // Calculate hash using blake3 (EXISTING method)
+                // Calculate hash using SHA3-256 (NIST compliant)
                 reward_tx.hash = reward_tx.calculate_hash();
                 
                 println!("[REWARDS] 📝 Reward claim transaction created (no signature, validated through claim)");
@@ -4143,15 +4143,15 @@ async fn handle_batch_transfer(
              request.batch_id, &from_address[..8.min(from_address.len())]);
     
     let batch_tx = qnet_state::Transaction::new(
-        from_address.clone(),
-        Some(request.signature.clone()), // CRITICAL: Include verified signature
-        total_amount,
-        nonce,
-        100_000, // Base gas price
-        request.transfers.len() as u64 * 10_000, // Gas per transfer (optimized)
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-        None, // block_hash
-        qnet_state::TransactionType::BatchTransfers { 
+        from_address.clone(),                      // from
+        Some("batch_transfers".to_string()),       // to: batch marker address
+        total_amount,                              // amount: total of all transfers
+        nonce,                                     // nonce
+        100_000,                                   // gas_price: base gas price
+        request.transfers.len() as u64 * 10_000,   // gas_limit: per transfer (optimized)
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),  // timestamp
+        Some(request.signature.clone()),           // signature
+        qnet_state::TransactionType::BatchTransfers {  // tx_type
             transfers: request.transfers.iter().map(|t| BatchTransferData {
                 to_address: t.to_address.clone(),
                 amount: t.amount,
@@ -4159,7 +4159,7 @@ async fn handle_batch_transfer(
             }).collect(),
             batch_id: request.batch_id.clone()
         },
-        Some(serde_json::to_string(&json!({
+        Some(serde_json::to_string(&json!({        // data
             "signature_verified": true,
             "public_key": request.public_key,
             "standard": "NIST FIPS 186-5 (Ed25519)"
@@ -10082,16 +10082,16 @@ async fn handle_contract_deploy(
     
     // Create ContractDeploy transaction with security metadata
     let tx = qnet_state::Transaction::new(
-        request.from.clone(),
-        Some(request.signature.clone()),
-        request.nonce,
-        request.gas_price,
-        request.gas_limit,
-        chrono::Utc::now().timestamp() as u64,
-        0,
-        None,
-        qnet_state::TransactionType::ContractDeploy,
-        Some(serde_json::to_string(&json!({
+        request.from.clone(),                      // from
+        Some(contract_address.clone()),            // to: contract address
+        0,                                         // amount: 0 for deployment
+        request.nonce,                             // nonce
+        request.gas_price,                         // gas_price
+        request.gas_limit,                         // gas_limit
+        chrono::Utc::now().timestamp() as u64,     // timestamp
+        Some(request.signature.clone()),           // signature
+        qnet_state::TransactionType::ContractDeploy,  // tx_type
+        Some(serde_json::to_string(&json!({        // data
             "code_hash": code_hash,
             "code_size": wasm_code.len(),
             "constructor_args": request.constructor_args,
@@ -10105,10 +10105,13 @@ async fn handle_contract_deploy(
     );
     
     // Submit to mempool
+    let tx_hash = tx.hash.clone();  // Transaction::new() already calculated SHA3-256 hash
     match blockchain.add_transaction_to_mempool(tx).await {
         Ok(_) => {
-            println!("📜 Contract deployment submitted: {}", &contract_address[..16.min(contract_address.len())]);
-            println!("   Security: Ed25519 ✅ | Dilithium: {}", if is_quantum_secure { "✅" } else { "N/A" });
+            println!("[CONTRACT] ✅ deployment_submitted contract={} hash={}", 
+                     &contract_address[..16.min(contract_address.len())], 
+                     &tx_hash[..16.min(tx_hash.len())]);
+            println!("[CONTRACT] 🔒 security ed25519=✅ dilithium={}", if is_quantum_secure { "✅" } else { "N/A" });
             Ok(warp::reply::json(&json!({
                 "success": true,
                 "contract_address": contract_address,
@@ -10371,16 +10374,16 @@ async fn handle_contract_call(
     
     // Create ContractCall transaction with security metadata
     let tx = qnet_state::Transaction::new(
-        request.from.clone(),
-        request.signature.clone(),
-        request.nonce,
-        request.gas_price,
-        request.gas_limit,
-        chrono::Utc::now().timestamp() as u64,
-        0,
-        None,
-        qnet_state::TransactionType::ContractCall,
-        Some(serde_json::to_string(&json!({
+        request.from.clone(),                      // from
+        Some(request.contract_address.clone()),    // to: contract address
+        0,                                         // amount: 0 for call (unless payable)
+        request.nonce,                             // nonce
+        request.gas_price,                         // gas_price
+        request.gas_limit,                         // gas_limit
+        chrono::Utc::now().timestamp() as u64,     // timestamp
+        Some(request.signature.clone()),           // signature
+        qnet_state::TransactionType::ContractCall, // tx_type
+        Some(serde_json::to_string(&json!({        // data
             "contract": request.contract_address,
             "method": request.method,
             "args": request.args,
@@ -10391,11 +10394,8 @@ async fn handle_contract_call(
         })).unwrap_or_default()),
     );
     
-    // PRODUCTION v2.26: Use bincode hash for consistency with mempool
-    let tx_hash = match bincode::serialize(&tx) {
-        Ok(tx_bytes) => format!("{:x}", Sha3_256::digest(&tx_bytes)),
-        Err(_) => hex::encode(&tx.hash), // Fallback to tx.hash
-    };
+    // Transaction::new() already calculated SHA3-256 hash via canonical_bytes()
+    let tx_hash = tx.hash.clone();
     
     // Submit to mempool
     match blockchain.add_transaction_to_mempool(tx).await {
