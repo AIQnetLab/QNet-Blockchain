@@ -124,10 +124,10 @@ export default function ExplorerPage() {
   const [transactionMap, setTransactionMap] = useState<Map<string, ActivityItem>>(new Map());
   const [currentHeight, setCurrentHeight] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [page, setPage] = useState(1);
-  const [hasMore, setHasMore] = useState(true);
+  const [totalPages, setTotalPages] = useState(1);
+  const [totalCount, setTotalCount] = useState(0);
   const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
   const [typeFilter, setTypeFilter] = useState('All');
   const [mounted, setMounted] = useState(false);
@@ -173,12 +173,10 @@ export default function ExplorerPage() {
     return sorted;
   }, [transactionMap, sortOrder, typeFilter]);
 
-  // Fetch activity - STABLE: preserves good data, only adds/updates
-  const fetchActivity = useCallback(async (pageNum: number, isLoadMore: boolean = false, forceRefresh: boolean = false) => {
+  // Fetch activity for specific page
+  const fetchActivity = useCallback(async (pageNum: number, forceRefresh: boolean = false) => {
     try {
-      if (isLoadMore) setLoadingMore(true);
-      // Only show loading on very first load (no data at all)
-      else if (transactionMap.size === 0) setLoading(true);
+      setLoading(true);
       
       const refreshParam = forceRefresh ? '&refresh=1' : '';
       const res = await fetch(`/api/activity?page=${pageNum}&limit=${ITEMS_PER_PAGE}&sort=desc${refreshParam}`, {
@@ -188,70 +186,29 @@ export default function ExplorerPage() {
       
       if (data.success && data.data) {
         const networkHeight = data.pagination?.currentHeight || 0;
+        const total = data.pagination?.total || 0;
+        const pages = Math.ceil(total / ITEMS_PER_PAGE) || 1;
         
-        // Detect blockchain reset: network height < our cached height
-        if (networkHeight > 0 && networkHeight < currentHeight) {
-          console.log(`[Explorer] Blockchain reset detected! Network ${networkHeight} < cached ${currentHeight}. Clearing cache.`);
-          sessionStorage.removeItem(CACHE_KEY);
-          setTransactionMap(new Map());
-          setCurrentHeight(networkHeight);
+        // Set transactions for current page only
+        const newMap = new Map<string, ActivityItem>();
+        for (const tx of data.data as ActivityItem[]) {
+          if (tx.hash) {
+            newMap.set(tx.hash, tx);
+          }
         }
         
-        if (data.data.length > 0) {
-          setTransactionMap(prev => {
-            // If blockchain was reset, start fresh
-            const newMap = (networkHeight > 0 && networkHeight < currentHeight) ? new Map() : new Map(prev);
-            let addedCount = 0;
-            let updatedCount = 0;
-            
-            for (const tx of data.data as ActivityItem[]) {
-              if (!tx.hash) continue;
-              
-              const existing = newMap.get(tx.hash);
-              if (!existing) {
-                // New transaction - add it
-                newMap.set(tx.hash, tx);
-                addedCount++;
-              } else {
-                // Existing transaction - merge carefully
-                // CRITICAL: Preserve good timestamp, don't replace with bad one
-                const mergedTx: ActivityItem = { ...tx };
-                
-                // If existing has good timestamp but new doesn't, keep existing
-                if (existing.timestamp > 0 && (!tx.timestamp || tx.timestamp === 0)) {
-                  mergedTx.timestamp = existing.timestamp;
-                  mergedTx.time = existing.time;
-                }
-                
-                // Only update if there's actually something better
-                if (mergedTx.timestamp !== existing.timestamp || 
-                    mergedTx.block !== existing.block) {
-                  newMap.set(tx.hash, mergedTx);
-                  updatedCount++;
-                }
-              }
-            }
-            
-            if (addedCount > 0 || updatedCount > 0) {
-              console.log(`[Explorer] Page ${pageNum}: +${addedCount} new, ~${updatedCount} updated`);
-              saveToCache(newMap, networkHeight || currentHeight);
-            }
-            return newMap;
-          });
-        }
-        
-        if (networkHeight) {
-          setCurrentHeight(networkHeight);
-        }
-        setHasMore(data.pagination?.hasMore ?? false);
+        setTransactionMap(newMap);
+        setCurrentHeight(networkHeight);
+        setTotalCount(total);
+        setTotalPages(pages);
+        saveToCache(newMap, networkHeight);
       }
     } catch (err) {
       console.error('[Explorer] Fetch error:', err);
     } finally {
       setLoading(false);
-      setLoadingMore(false);
     }
-  }, [transactionMap.size, currentHeight]);
+  }, []);
 
   // Initial fetch after mount
   useEffect(() => {
@@ -261,18 +218,50 @@ export default function ExplorerPage() {
     }
   }, [mounted, fetchActivity]);
 
-  // Background refresh every 10 seconds
+  // Fetch when page changes
   useEffect(() => {
-    if (!mounted) return;
-    const interval = setInterval(() => fetchActivity(1), 10000);
-    return () => clearInterval(interval);
-  }, [mounted, fetchActivity]);
+    if (mounted && initialLoadDone.current) {
+      fetchActivity(page);
+    }
+  }, [page, mounted, fetchActivity]);
 
-  const loadMore = () => {
-    if (!hasMore || loadingMore) return;
-    const nextPage = page + 1;
-    setPage(nextPage);
-    fetchActivity(nextPage, true);
+  // Background refresh every 30 seconds (only if on page 1)
+  useEffect(() => {
+    if (!mounted || page !== 1) return;
+    const interval = setInterval(() => fetchActivity(1), 30000);
+    return () => clearInterval(interval);
+  }, [mounted, page, fetchActivity]);
+
+  const goToPage = (newPage: number) => {
+    if (newPage >= 1 && newPage <= totalPages && newPage !== page) {
+      setPage(newPage);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  // Generate page numbers to display
+  const getPageNumbers = () => {
+    const pages: (number | string)[] = [];
+    const maxVisible = 7;
+    
+    if (totalPages <= maxVisible) {
+      for (let i = 1; i <= totalPages; i++) pages.push(i);
+    } else {
+      pages.push(1);
+      
+      if (page > 3) pages.push('...');
+      
+      const start = Math.max(2, page - 1);
+      const end = Math.min(totalPages - 1, page + 1);
+      
+      for (let i = start; i <= end; i++) pages.push(i);
+      
+      if (page < totalPages - 2) pages.push('...');
+      
+      pages.push(totalPages);
+    }
+    
+    return pages;
   };
 
   // Toggle sort by clicking TIME header
@@ -373,6 +362,52 @@ export default function ExplorerPage() {
                 ))}
               </tbody>
             </table>
+          )}
+          
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div className="pagination-controls">
+              <button 
+                className="page-btn page-arrow"
+                onClick={() => goToPage(page - 1)}
+                disabled={page === 1 || loading}
+              >
+                ←
+              </button>
+              
+              {getPageNumbers().map((p, idx) => (
+                typeof p === 'number' ? (
+                  <button
+                    key={idx}
+                    className={`page-btn ${p === page ? 'active' : ''}`}
+                    onClick={() => goToPage(p)}
+                    disabled={loading}
+                  >
+                    {p}
+                  </button>
+                ) : (
+                  <span key={idx} className="page-ellipsis">...</span>
+                )
+              ))}
+              
+              <button 
+                className="page-btn page-arrow"
+                onClick={() => goToPage(page + 1)}
+                disabled={page === totalPages || loading}
+              >
+                →
+              </button>
+              
+              <span className="page-info">
+                Page {page} of {totalPages} ({totalCount} total)
+              </span>
+            </div>
+          )}
+          
+          {totalPages <= 1 && filteredAndSortedActivity.length > 0 && (
+            <div className="pagination-info">
+              {totalCount} transactions
+            </div>
           )}
         </div>
       </div>

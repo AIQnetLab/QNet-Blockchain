@@ -148,6 +148,13 @@ function transformTransaction(
     return null;
   }
 
+  // FILTER: Skip genesis benchmark transactions (1000 transfers from genesis to EON1be... addresses)
+  // These are test/benchmark transactions created at genesis (block 0) and should not pollute the explorer
+  if (blockHeight === 0 && from === 'genesis' && to && to.startsWith('EON1be')) {
+    // Skip benchmark transfers: genesis → EON1be...0000 to EON1be...0999 with 1M QNC each
+    return null;
+  }
+
   return {
     hash,
     from,

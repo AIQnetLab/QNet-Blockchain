@@ -2217,8 +2217,6 @@ impl BlockchainNode {
             dilithium_public_key: None,  // Node ID used for pubkey lookup
         };
         
-        commitment_tx.hash = commitment_tx.calculate_hash();
-        
         // PRODUCTION v2.82: Add HYBRID signature (Ed25519 + Dilithium) for L1 security
         // CRITICAL: Use SAME format as verify functions expect!
         // - Ed25519: verify_ed25519_tx_signature_async expects canonical message
@@ -2242,28 +2240,29 @@ impl BlockchainNode {
         commitment_tx.public_key = Some(hex::encode(ephemeral_public_key.as_bytes()));
         
         // Step 2: Dilithium signature (quantum-resistant) using quantum_crypto
+        // CRITICAL v2.85: Dilithium is MANDATORY for commitment TX (L1 security requirement)
         // This provides post-quantum security linked to node identity
-        if let Some(crypto) = try_get_quantum_crypto() {
-            match crypto.create_consensus_signature(node_id, &canonical_message).await {
-                Ok(dilithium_sig) => {
-                    commitment_tx.dilithium_signature = Some(dilithium_sig.signature);
-                    commitment_tx.dilithium_public_key = Some(node_id.to_string());
-                    
-                    if is_info() {
-                        println!("[INFO][HB-COMMIT] TX signed with HYBRID crypto: Ed25519(ephemeral) + Dilithium(node) node={}", node_id);
-                    }
-                }
-                Err(e) => {
-                    if is_warn() {
-                        println!("[WARN][HB-COMMIT] Dilithium signing failed: {} - Ed25519 only", e);
-                    }
+        let crypto = try_get_quantum_crypto()
+            .ok_or_else(|| QNetError::SecurityError("Quantum crypto not initialized - REQUIRED for commitment TX".to_string()))?;
+        
+        match crypto.create_consensus_signature(node_id, &canonical_message).await {
+            Ok(dilithium_sig) => {
+                commitment_tx.dilithium_signature = Some(dilithium_sig.signature);
+                commitment_tx.dilithium_public_key = Some(node_id.to_string());
+                
+                if is_info() {
+                    println!("[INFO][HB-COMMIT] TX signed with HYBRID crypto: Ed25519(ephemeral) + Dilithium(node) node={}", node_id);
                 }
             }
-        } else {
-            if is_warn() {
-                println!("[WARN][HB-COMMIT] Quantum crypto not available - Ed25519 only");
+            Err(e) => {
+                return Err(QNetError::SecurityError(format!("Dilithium signing REQUIRED but failed: {}", e)));
             }
         }
+        
+        // CRITICAL FIX v2.85: Calculate hash AFTER adding signatures and public keys
+        // canonical_bytes() includes public_key/dilithium_public_key in hash calculation
+        // Hash must be computed when all signature-related fields are set
+        commitment_tx.hash = commitment_tx.calculate_hash();
         
         Ok(commitment_tx)
     }
@@ -2391,8 +2390,6 @@ impl BlockchainNode {
             dilithium_public_key: None,  // Node ID used for pubkey lookup
         };
         
-        commitment_tx.hash = commitment_tx.calculate_hash();
-        
         // PRODUCTION v2.82: Add HYBRID signature (Ed25519 + Dilithium) for L1 security
         // CRITICAL: Use SAME format as verify functions expect!
         // - Ed25519: verify_ed25519_tx_signature_async expects canonical message
@@ -2416,28 +2413,29 @@ impl BlockchainNode {
         commitment_tx.public_key = Some(hex::encode(ephemeral_public_key.as_bytes()));
         
         // Step 2: Dilithium signature (quantum-resistant) using quantum_crypto
+        // CRITICAL v2.85: Dilithium is MANDATORY for commitment TX (L1 security requirement)
         // This provides post-quantum security linked to node identity
-        if let Some(crypto) = try_get_quantum_crypto() {
-            match crypto.create_consensus_signature(node_id, &canonical_message).await {
-                Ok(dilithium_sig) => {
-                    commitment_tx.dilithium_signature = Some(dilithium_sig.signature);
-                    commitment_tx.dilithium_public_key = Some(node_id.to_string());
-                    
-                    if is_info() {
-                        println!("[INFO][PING-COMMIT] TX signed with HYBRID crypto: Ed25519(ephemeral) + Dilithium(node) node={}", node_id);
-                    }
-                }
-                Err(e) => {
-                    if is_warn() {
-                        println!("[WARN][PING-COMMIT] Dilithium signing failed: {} - Ed25519 only", e);
-                    }
+        let crypto = try_get_quantum_crypto()
+            .ok_or_else(|| QNetError::SecurityError("Quantum crypto not initialized - REQUIRED for commitment TX".to_string()))?;
+        
+        match crypto.create_consensus_signature(node_id, &canonical_message).await {
+            Ok(dilithium_sig) => {
+                commitment_tx.dilithium_signature = Some(dilithium_sig.signature);
+                commitment_tx.dilithium_public_key = Some(node_id.to_string());
+                
+                if is_info() {
+                    println!("[INFO][PING-COMMIT] TX signed with HYBRID crypto: Ed25519(ephemeral) + Dilithium(node) node={}", node_id);
                 }
             }
-        } else {
-            if is_warn() {
-                println!("[WARN][PING-COMMIT] Quantum crypto not available - Ed25519 only");
+            Err(e) => {
+                return Err(QNetError::SecurityError(format!("Dilithium signing REQUIRED but failed: {}", e)));
             }
         }
+        
+        // CRITICAL FIX v2.85: Calculate hash AFTER adding signatures and public keys
+        // canonical_bytes() includes public_key/dilithium_public_key in hash calculation
+        // Hash must be computed when all signature-related fields are set
+        commitment_tx.hash = commitment_tx.calculate_hash();
         
         Ok(commitment_tx)
     }
@@ -19757,26 +19755,38 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             
-            // PRODUCTION v2.82: Verify hybrid signature on commitment TXs if present
-            // This ensures cryptographic proof that commitment was created by the claimed node
+            // PRODUCTION v2.85: MANDATORY hybrid signature verification for commitment TXs
+            // L1 security requirement: Both Ed25519 AND Dilithium signatures MUST be present and valid
             if matches!(tx.tx_type, 
                 qnet_state::TransactionType::HeartbeatCommitment { .. } | 
                 qnet_state::TransactionType::PingCommitmentWithSampling { .. }
             ) {
-                // Verify Ed25519 signature if present
-                if let (Some(ref sig), Some(ref pubkey)) = (&tx.signature, &tx.public_key) {
-                    if !sig.is_empty() && !pubkey.is_empty() {
-                        if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
-                            return Err(QNetError::ValidationError("Invalid Ed25519 signature on commitment TX".to_string()));
-                        }
-                    }
+                // MANDATORY: Ed25519 signature REQUIRED
+                let (sig, pubkey) = match (&tx.signature, &tx.public_key) {
+                    (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => (s, p),
+                    _ => return Err(QNetError::ValidationError(
+                        "Commitment TX REQUIRES Ed25519 signature (hybrid security)".to_string()
+                    )),
+                };
+                
+                if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
+                    return Err(QNetError::ValidationError("Invalid Ed25519 signature on commitment TX".to_string()));
                 }
                 
-                // Verify Dilithium signature if present
-                if tx.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty()) {
-                    if !Self::verify_dilithium_tx_signature_async(&tx).await? {
-                        return Err(QNetError::ValidationError("Invalid Dilithium signature on commitment TX".to_string()));
-                    }
+                // MANDATORY: Dilithium signature REQUIRED for post-quantum security
+                if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+                    return Err(QNetError::ValidationError(
+                        "Commitment TX REQUIRES Dilithium signature (post-quantum security)".to_string()
+                    ));
+                }
+                
+                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                    return Err(QNetError::ValidationError("Invalid Dilithium signature on commitment TX".to_string()));
+                }
+                
+                if is_info() {
+                    println!("[INFO][VERIFY] commitment_tx_hybrid_verified type={:?}", 
+                             std::mem::discriminant(&tx.tx_type));
                 }
             }
         } else {

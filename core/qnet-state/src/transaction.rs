@@ -455,8 +455,11 @@ impl Transaction {
     /// Calculate transaction hash as hex string
     /// Get canonical serialization for hash calculation (excludes hash and signatures)
     /// PRODUCTION: Deterministic bincode serialization ensures consistent hashing
+    /// NOTE: public_key/dilithium_public_key ARE included in canonical_bytes
+    /// because they're set BEFORE hash calculation (client-side signing)
     pub fn canonical_bytes(&self) -> Vec<u8> {
         // Create canonical version: all fields except hash and signatures
+        // public_key IS included - must be set before calculate_hash()!
         let mut canonical = self.clone();
         canonical.hash = String::new();
         canonical.signature = None;
