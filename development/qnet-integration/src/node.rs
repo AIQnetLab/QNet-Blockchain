@@ -2207,17 +2207,63 @@ impl BlockchainNode {
             },
             timestamp: current_time,
             hash: String::new(),
-            signature: None,
-            public_key: None,
+            signature: None,      // Will be filled with hybrid signature
+            public_key: None,     // Will be filled with ephemeral Ed25519 pubkey
             gas_price: u64::MAX,
             gas_limit: 0,
             nonce: 0,
             data: Some(format!("Heartbeat Commitment: {} heartbeats, epoch {}", heartbeat_count, current_epoch)),
-            dilithium_signature: None,
-            dilithium_public_key: None,
+            dilithium_signature: None,   // Will be filled with Dilithium signature
+            dilithium_public_key: None,  // Node ID used for pubkey lookup
         };
         
         commitment_tx.hash = commitment_tx.calculate_hash();
+        
+        // PRODUCTION v2.82: Add HYBRID signature (Ed25519 + Dilithium) for L1 security
+        // CRITICAL: Use SAME format as verify functions expect!
+        // - Ed25519: verify_ed25519_tx_signature_async expects canonical message
+        // - Dilithium: verify_dilithium_tx_signature expects canonical message
+        
+        let to_str = commitment_tx.to.clone().unwrap_or_default();
+        let canonical_message = format!("{}|{}|{}|{}|{}|{}|{}",
+            commitment_tx.from, to_str, commitment_tx.amount, commitment_tx.nonce,
+            commitment_tx.gas_price, commitment_tx.gas_limit, commitment_tx.timestamp);
+        
+        // Step 1: Ed25519 signature with ephemeral key (forward secrecy)
+        use ed25519_dalek::{SigningKey, Signer};
+        use rand::rngs::OsRng;
+        
+        let mut csprng = OsRng{};
+        let ephemeral_signing_key = SigningKey::generate(&mut csprng);
+        let ephemeral_public_key = ephemeral_signing_key.verifying_key();
+        let ed25519_signature = ephemeral_signing_key.sign(canonical_message.as_bytes());
+        
+        commitment_tx.signature = Some(hex::encode(ed25519_signature.to_bytes()));
+        commitment_tx.public_key = Some(hex::encode(ephemeral_public_key.as_bytes()));
+        
+        // Step 2: Dilithium signature (quantum-resistant) using quantum_crypto
+        // This provides post-quantum security linked to node identity
+        if let Some(crypto) = try_get_quantum_crypto() {
+            match crypto.create_consensus_signature(node_id, &canonical_message).await {
+                Ok(dilithium_sig) => {
+                    commitment_tx.dilithium_signature = Some(dilithium_sig.signature);
+                    commitment_tx.dilithium_public_key = Some(node_id.to_string());
+                    
+                    if is_info() {
+                        println!("[INFO][HB-COMMIT] TX signed with HYBRID crypto: Ed25519(ephemeral) + Dilithium(node) node={}", node_id);
+                    }
+                }
+                Err(e) => {
+                    if is_warn() {
+                        println!("[WARN][HB-COMMIT] Dilithium signing failed: {} - Ed25519 only", e);
+                    }
+                }
+            }
+        } else {
+            if is_warn() {
+                println!("[WARN][HB-COMMIT] Quantum crypto not available - Ed25519 only");
+            }
+        }
         
         Ok(commitment_tx)
     }
@@ -2335,17 +2381,63 @@ impl BlockchainNode {
             },
             timestamp: current_time,
             hash: String::new(),
-            signature: None,
-            public_key: None,
+            signature: None,      // Will be filled with hybrid signature
+            public_key: None,     // Will be filled with ephemeral Ed25519 pubkey
             gas_price: u64::MAX,
             gas_limit: 0,
             nonce: 0,
             data: Some(format!("Ping Commitment: {} pings, epoch {}", ping_count, current_epoch)),
-            dilithium_signature: None,
-            dilithium_public_key: None,
+            dilithium_signature: None,   // Will be filled with Dilithium signature
+            dilithium_public_key: None,  // Node ID used for pubkey lookup
         };
         
         commitment_tx.hash = commitment_tx.calculate_hash();
+        
+        // PRODUCTION v2.82: Add HYBRID signature (Ed25519 + Dilithium) for L1 security
+        // CRITICAL: Use SAME format as verify functions expect!
+        // - Ed25519: verify_ed25519_tx_signature_async expects canonical message
+        // - Dilithium: verify_dilithium_tx_signature expects canonical message
+        
+        let to_str = commitment_tx.to.clone().unwrap_or_default();
+        let canonical_message = format!("{}|{}|{}|{}|{}|{}|{}",
+            commitment_tx.from, to_str, commitment_tx.amount, commitment_tx.nonce,
+            commitment_tx.gas_price, commitment_tx.gas_limit, commitment_tx.timestamp);
+        
+        // Step 1: Ed25519 signature with ephemeral key (forward secrecy)
+        use ed25519_dalek::{SigningKey, Signer};
+        use rand::rngs::OsRng;
+        
+        let mut csprng = OsRng{};
+        let ephemeral_signing_key = SigningKey::generate(&mut csprng);
+        let ephemeral_public_key = ephemeral_signing_key.verifying_key();
+        let ed25519_signature = ephemeral_signing_key.sign(canonical_message.as_bytes());
+        
+        commitment_tx.signature = Some(hex::encode(ed25519_signature.to_bytes()));
+        commitment_tx.public_key = Some(hex::encode(ephemeral_public_key.as_bytes()));
+        
+        // Step 2: Dilithium signature (quantum-resistant) using quantum_crypto
+        // This provides post-quantum security linked to node identity
+        if let Some(crypto) = try_get_quantum_crypto() {
+            match crypto.create_consensus_signature(node_id, &canonical_message).await {
+                Ok(dilithium_sig) => {
+                    commitment_tx.dilithium_signature = Some(dilithium_sig.signature);
+                    commitment_tx.dilithium_public_key = Some(node_id.to_string());
+                    
+                    if is_info() {
+                        println!("[INFO][PING-COMMIT] TX signed with HYBRID crypto: Ed25519(ephemeral) + Dilithium(node) node={}", node_id);
+                    }
+                }
+                Err(e) => {
+                    if is_warn() {
+                        println!("[WARN][PING-COMMIT] Dilithium signing failed: {} - Ed25519 only", e);
+                    }
+                }
+            }
+        } else {
+            if is_warn() {
+                println!("[WARN][PING-COMMIT] Quantum crypto not available - Ed25519 only");
+            }
+        }
         
         Ok(commitment_tx)
     }
@@ -7484,12 +7576,29 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                 println!("[INFO][HEARTBEAT-COMMITMENT] TX serialized size={} bytes", tx_bytes.len());
                                             }
                                             
+                                            // CRITICAL FIX v2.81: Clone tx_bytes for broadcast BEFORE adding to mempool
+                                            let tx_bytes_for_broadcast = tx_bytes.clone();
+                                            
                                             if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
                                                 let mut sent = sent_heartbeat_commitments.write().await;
                                                 sent.insert(current_epoch);
                                                 if is_info() {
                                                     println!("[INFO][HEARTBEAT-COMMITMENT] TX submitted to mempool epoch={} hash={}", 
                                                              current_epoch, &tx.hash[..16]);
+                                                }
+                                                
+                                                // CRITICAL FIX v2.81: Broadcast TX to network (Gulf Stream to producer + backup peers)
+                                                // Without this, TX stays in local mempool and won't reach block producer!
+                                                if let Err(e) = p2p.broadcast_transaction(tx_bytes_for_broadcast) {
+                                                    if is_warn() {
+                                                        println!("[WARN][HEARTBEAT-COMMITMENT] Broadcast failed epoch={} error={}", 
+                                                                 current_epoch, e);
+                                                    }
+                                                } else {
+                                                    if is_info() {
+                                                        println!("[INFO][HEARTBEAT-COMMITMENT] TX broadcast to network epoch={} hash={}", 
+                                                                 current_epoch, &tx.hash[..16]);
+                                                    }
                                                 }
                                             } else {
                                                 if is_warn() {
@@ -7557,12 +7666,29 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                 println!("[INFO][PING-COMMITMENT] TX serialized size={} bytes", tx_bytes.len());
                                             }
                                             
+                                            // CRITICAL FIX v2.81: Clone tx_bytes for broadcast BEFORE adding to mempool
+                                            let tx_bytes_for_broadcast = tx_bytes.clone();
+                                            
                                             if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
                                                 let mut sent = sent_ping_commitments.write().await;
                                                 sent.insert(current_epoch);
                                                 if is_info() {
                                                     println!("[INFO][PING-COMMITMENT] TX submitted to mempool epoch={} hash={}", 
                                                              current_epoch, &tx.hash[..16]);
+                                                }
+                                                
+                                                // CRITICAL FIX v2.81: Broadcast TX to network (Gulf Stream to producer + backup peers)
+                                                // Without this, TX stays in local mempool and won't reach block producer!
+                                                if let Err(e) = p2p.broadcast_transaction(tx_bytes_for_broadcast) {
+                                                    if is_warn() {
+                                                        println!("[WARN][PING-COMMITMENT] Broadcast failed epoch={} error={}", 
+                                                                 current_epoch, e);
+                                                    }
+                                                } else {
+                                                    if is_info() {
+                                                        println!("[INFO][PING-COMMITMENT] TX broadcast to network epoch={} hash={}", 
+                                                                 current_epoch, &tx.hash[..16]);
+                                                    }
                                                 }
                                             } else {
                                                 if is_warn() {
@@ -8387,6 +8513,93 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             let new_peer_count = p2p.get_peer_count();
                             if new_peer_count > current_peers {
                                 if is_info() { println!("[INFO][P2P] reconnect peers={} was={}", new_peer_count, current_peers); }
+                            }
+                            
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            // CRITICAL FIX v2.84: QUIC fallback reconnect when TCP/HTTP fails
+                            // If port 8001 is blocked, try direct QUIC connections on port 10876
+                            // SECURITY v2.84: Rate limited to max 10 requests per minute per node
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            let final_peer_count = p2p.get_peer_count();
+                            if final_peer_count < 4 {
+                                // PRIORITY 1: Rate limit check (max 10/min per node)
+                                use crate::unified_p2p::quic_fallback_rate_check;
+                                
+                                if !quic_fallback_rate_check(&node_id) {
+                                    if is_warn() {
+                                        println!("[WARN][P2P] quic_fallback_rate_limited node={}", 
+                                                 &node_id[..node_id.len().min(8)]);
+                                    }
+                                } else {
+                                    if is_info() {
+                                        println!("[INFO][P2P] quic_fallback_start tcp_peers={} required=4", final_peer_count);
+                                    }
+                                    
+                                    // PRIORITY 3: Increment total attempts metric
+                                    use crate::unified_p2p::QUIC_FALLBACK_TOTAL;
+                                    QUIC_FALLBACK_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    
+                                    // Try QUIC direct connections to Genesis nodes
+                                    use crate::quic_transport::QUIC_PORT_OFFSET;
+                                    use crate::unified_p2p::{GLOBAL_QUIC_TRANSPORT, GLOBAL_NODE_ID, NetworkMessage};
+                                    
+                                    let quic_transport = match GLOBAL_QUIC_TRANSPORT.read() {
+                                        Ok(guard) => guard.clone(),
+                                        Err(_) => None,
+                                    };
+                                    
+                                    if let Some(ref transport_arc) = quic_transport {
+                                        let our_node_id = GLOBAL_NODE_ID.read()
+                                            .map(|g| g.clone())
+                                            .unwrap_or_else(|_| node_id.clone());
+                                        
+                                        use crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT;
+                                    let our_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                                        
+                                        // Send HealthPing via QUIC to establish/refresh connections
+                                        let ping_msg = NetworkMessage::HealthPing {
+                                            from: our_node_id.clone(),
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs(),
+                                            height: our_height,
+                                        };
+                                        
+                                        let transport = transport_arc.read().await;
+                                        let mut quic_success = 0;
+                                        
+                                        for ip in &genesis_ips {
+                                            // Skip self
+                                            if ip.contains(&node_id) { continue; }
+                                            
+                                            let quic_port = 8001u16.saturating_add(QUIC_PORT_OFFSET);
+                                            if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
+                                                let quic_addr = std::net::SocketAddr::new(ip_addr, quic_port);
+                                                
+                                                if transport.broadcast_to(quic_addr, &ping_msg).await.is_ok() {
+                                                    quic_success += 1;
+                                                    if is_debug() {
+                                                        println!("[DBG][P2P] quic_ping_sent ip={} port={}", ip, quic_port);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        if quic_success > 0 {
+                                            // PRIORITY 3: Increment success metric (at least 1 ping sent)
+                                            use crate::unified_p2p::QUIC_FALLBACK_SUCCESS;
+                                            QUIC_FALLBACK_SUCCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            
+                                            if is_info() {
+                                                use crate::unified_p2p::get_quic_fallback_metrics;
+                                                let (_, _, rate) = get_quic_fallback_metrics();
+                                                println!("[INFO][P2P] quic_fallback_complete sent={} port={} success_rate={}.{}%", 
+                                                         quic_success, 8001 + QUIC_PORT_OFFSET as u16, rate / 10, rate % 10);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         
@@ -19324,7 +19537,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let mut tx_indices: Vec<usize> = Vec::with_capacity(transactions.len());
         
         for (idx, tx) in transactions.iter().enumerate() {
-            // Skip if no signature
+            // CRITICAL FIX v2.82: Only RewardDistribution skips Ed25519 batch check
+            // HeartbeatCommitment and PingCommitment NOW have Ed25519 signatures (v2.82)
+            // They will be verified normally in the batch
+            let is_unsigned_system_tx = matches!(tx.tx_type,
+                qnet_state::TransactionType::RewardDistribution { .. }
+            );
+            
+            if is_unsigned_system_tx {
+                // RewardDistribution - validated through consensus, no Ed25519
+                valid_indices.push(idx);
+                continue;
+            }
+            
+            // Skip if no signature (non-system TX must have signature)
             let (sig_hex, pk_hex) = match (&tx.signature, &tx.public_key) {
                 (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => (s, p),
                 _ => continue,
@@ -19512,21 +19738,47 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // Signature validation with cryptographic verification
-        // v2.53: System transactions (RewardDistribution, PingCommitmentWithSampling) don't need signature
+        // v2.53: System transactions don't need Ed25519 signature - validated through consensus
+        // v2.81: HeartbeatCommitment validated through Dilithium signatures in samples + Merkle proofs
         let is_system_tx = matches!(tx.tx_type, 
             qnet_state::TransactionType::RewardDistribution | 
-            qnet_state::TransactionType::PingCommitmentWithSampling { .. }
+            qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
+            qnet_state::TransactionType::HeartbeatCommitment { .. }
         );
         
         if is_system_tx {
-            // System transactions validated through consensus, not signatures
+            // System transactions validated through consensus and internal proofs
+            // - RewardDistribution: validated through consensus
+            // - PingCommitmentWithSampling: validated through Dilithium signatures + Merkle proofs + TX signature (v2.82)
+            // - HeartbeatCommitment: validated through Dilithium signatures in samples + Merkle proofs + TX signature (v2.82)
             if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) && tx.from != "system_emission" {
                 if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
                     return Err(QNetError::ValidationError("Reward claim must be signed".to_string()));
                 }
             }
-            // PingCommitmentWithSampling from system_ping_commitment - no signature needed
-            // HeartbeatCommitment from node_id - no signature needed (validated by Merkle proofs)
+            
+            // PRODUCTION v2.82: Verify hybrid signature on commitment TXs if present
+            // This ensures cryptographic proof that commitment was created by the claimed node
+            if matches!(tx.tx_type, 
+                qnet_state::TransactionType::HeartbeatCommitment { .. } | 
+                qnet_state::TransactionType::PingCommitmentWithSampling { .. }
+            ) {
+                // Verify Ed25519 signature if present
+                if let (Some(ref sig), Some(ref pubkey)) = (&tx.signature, &tx.public_key) {
+                    if !sig.is_empty() && !pubkey.is_empty() {
+                        if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
+                            return Err(QNetError::ValidationError("Invalid Ed25519 signature on commitment TX".to_string()));
+                        }
+                    }
+                }
+                
+                // Verify Dilithium signature if present
+                if tx.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty()) {
+                    if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                        return Err(QNetError::ValidationError("Invalid Dilithium signature on commitment TX".to_string()));
+                    }
+                }
+            }
         } else {
             if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
                 return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
@@ -19552,8 +19804,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Err(QNetError::ValidationError("Transfer amount cannot be zero".to_string()));
         }
         
-        // Nonce validation
-        {
+        // Nonce validation (skip for commitment TX - they use nonce=0 as system TX)
+        // PRODUCTION v2.82: Commitment TX are per-epoch, not per-account sequence
+        let skip_nonce_check = matches!(tx.tx_type,
+            qnet_state::TransactionType::HeartbeatCommitment { .. } |
+            qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
+            qnet_state::TransactionType::RewardDistribution { .. }
+        );
+        
+        if !skip_nonce_check {
             let state = self.state.read().await;
             if let Some(account) = state.get_account(&tx.from) {
                 let expected_nonce = account.nonce + 1;

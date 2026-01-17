@@ -477,6 +477,70 @@ static PEER_BLACKLIST: Lazy<Arc<DashMap<String, BlacklistEntry>>> =
 static PEER_RETRY_COOLDOWN: Lazy<Arc<DashMap<String, (u32, std::time::Instant)>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
 
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// PRODUCTION v2.84: QUIC Fallback Rate Limiter and Metrics
+// SECURITY: Prevents DoS via excessive QUIC fallback requests (max 10/min per node)
+// MONITORING: Tracks success rate for production alerts
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+/// QUIC Fallback Rate Limiter (per-node): max 10 requests per minute
+/// Key: node_id, Value: (request_count, window_start_timestamp_secs)
+static QUIC_FALLBACK_RATE_LIMITER: Lazy<Arc<DashMap<String, (u32, u64)>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Rate limit constants
+const QUIC_FALLBACK_MAX_PER_MIN: u32 = 10;  // Max 10 QUIC fallback requests per minute
+const QUIC_FALLBACK_WINDOW_SECS: u64 = 60;  // Rolling window: 60 seconds
+
+/// QUIC Fallback Metrics (global counters for monitoring)
+pub static QUIC_FALLBACK_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static QUIC_FALLBACK_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static QUIC_FALLBACK_RATE_LIMITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Check if QUIC fallback is allowed for given node (rate limiting)
+/// Returns true if request is allowed, false if rate limited
+pub fn quic_fallback_rate_check(node_id: &str) -> bool {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    let mut entry = QUIC_FALLBACK_RATE_LIMITER
+        .entry(node_id.to_string())
+        .or_insert((0, now_secs));
+    
+    let (count, window_start) = entry.value_mut();
+    
+    // Reset window if expired
+    if now_secs - *window_start >= QUIC_FALLBACK_WINDOW_SECS {
+        *count = 0;
+        *window_start = now_secs;
+    }
+    
+    // Check limit
+    if *count >= QUIC_FALLBACK_MAX_PER_MIN {
+        QUIC_FALLBACK_RATE_LIMITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    
+    // Increment counter and allow
+    *count += 1;
+    true
+}
+
+/// Get QUIC fallback success rate (percentage × 1000 for precision)
+/// Returns: (success_count, total_count, success_rate_permille)
+pub fn get_quic_fallback_metrics() -> (u64, u64, u64) {
+    let success = QUIC_FALLBACK_SUCCESS.load(std::sync::atomic::Ordering::Relaxed);
+    let total = QUIC_FALLBACK_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+    let rate_permille = if total > 0 {
+        (success * 1000) / total
+    } else {
+        0
+    };
+    (success, total, rate_permille)
+}
+
 // Cooldown constants
 const PEER_COOLDOWN_BASE_SECS: u64 = 2;    // Base cooldown: 2 seconds
 const PEER_COOLDOWN_MAX_SECS: u64 = 30;    // Max cooldown: 30 seconds
@@ -3598,8 +3662,13 @@ impl SimplifiedP2P {
                     let total_chunks = assembly.total_chunks;
                     let required = ((total_chunks as f32) * 0.67).ceil() as usize;
                     
-                    // If we have enough - reconstruction should happen, skip
-                    if total_received >= required {
+                    // CRITICAL FIX v2.83: Check if chunk#0 is present (required for reconstruction!)
+                    // Without chunk#0, block CANNOT be reconstructed even if we have enough parity
+                    let chunk0_received = assembly.chunks_received.get(0).map(|c| c.is_some()).unwrap_or(false);
+                    
+                    // If we have enough AND chunk#0 - reconstruction should happen, skip
+                    // BUT if chunk#0 is missing - MUST request repair!
+                    if total_received >= required && chunk0_received {
                         continue;
                     }
                     
@@ -4980,65 +5049,79 @@ impl SimplifiedP2P {
         let should_forward = is_new_chunk && !should_reconstruct_all && (!should_reconstruct_parity || !chunk0_received);
         if should_forward {
             self.forward_shred_protocol_chunk(from_peer, chunk.clone());
-            
-            // PRODUCTION v2.21.3 + v2.45.1: Check for timeout and request missing chunks
-            // PRIORITY: If chunk #0 is missing after 500ms, request it FIRST!
+        }
+        
+        // CRITICAL FIX v2.83: Priority request for chunk#0 OUTSIDE of should_forward!
+        // Problem: When parity received but chunk#0 missing, should_forward=false and repair never triggers
+        // Solution: ALWAYS check for missing chunk#0 regardless of forward decision
+        if !chunk0_received {
             if let Some(mut assembly) = self.shred_protocol_assemblies.get_mut(&height) {
                 let elapsed_ms = assembly.started_at.elapsed().as_millis();
-                let elapsed_secs = assembly.started_at.elapsed().as_secs();
                 
-                // v2.45.1: PRIORITY REQUEST for chunk #0 after 500ms
-                // Certificate is critical - request it before other chunks!
+                // Priority request for chunk#0 after 500ms (every 2 seconds, max 4 attempts)
                 let chunk0_missing = assembly.chunks_received.get(0).map(|c| c.is_none()).unwrap_or(true);
-                if chunk0_missing && elapsed_ms >= 500 && assembly.retransmit_attempts == 0 {
+                let can_request_chunk0 = chunk0_missing 
+                    && elapsed_ms >= 500 
+                    && assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
+                    && assembly.retransmit_requested_at
+                        .map(|t| t.elapsed().as_secs() >= 2)
+                        .unwrap_or(true);
+                
+                if can_request_chunk0 {
                     assembly.retransmit_attempts += 1;
                     assembly.retransmit_requested_at = Some(Instant::now());
                     drop(assembly);
                     
-                    println!("[INFO][REPAIR] priority_request h={} chunk=0 elapsed={}ms", height, elapsed_ms);
+                    println!("[INFO][REPAIR] priority_chunk0_request h={} elapsed={}ms can_reconstruct={}", 
+                             height, elapsed_ms, should_reconstruct_parity);
                     self.request_missing_chunks(height, vec![0], from_peer);
                 }
-                // Standard timeout for other missing chunks
-                else {
-                    let can_request = assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
-                        && assembly.retransmit_requested_at
-                            .map(|t| t.elapsed().as_secs() > SHRED_CHUNK_TIMEOUT_SECS)
-                            .unwrap_or(true);
+            }
+        }
+        
+        // Standard timeout for other missing chunks (only when forwarding)
+        if should_forward {
+            if let Some(mut assembly) = self.shred_protocol_assemblies.get_mut(&height) {
+                let elapsed_secs = assembly.started_at.elapsed().as_secs();
+                
+                let can_request = assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
+                    && assembly.retransmit_requested_at
+                        .map(|t| t.elapsed().as_secs() > SHRED_CHUNK_TIMEOUT_SECS)
+                        .unwrap_or(true);
+                
+                if elapsed_secs >= SHRED_CHUNK_TIMEOUT_SECS && can_request {
+                    // Find missing chunk indices
+                    let missing_data: Vec<usize> = assembly.chunks_received.iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.is_none())
+                        .map(|(i, _)| i)
+                        .collect();
                     
-                    if elapsed_secs >= SHRED_CHUNK_TIMEOUT_SECS && can_request {
-                        // Find missing chunk indices
-                        let missing_data: Vec<usize> = assembly.chunks_received.iter()
-                            .enumerate()
-                            .filter(|(_, c)| c.is_none())
-                            .map(|(i, _)| i)
-                            .collect();
+                    let missing_parity: Vec<usize> = assembly.parity_chunks.iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.is_none())
+                        .map(|(i, _)| assembly.total_chunks + i)
+                        .collect();
+                    
+                    let total_missing = missing_data.len() + missing_parity.len();
+                    
+                    if total_missing > 0 {
+                        assembly.retransmit_attempts += 1;
+                        assembly.retransmit_requested_at = Some(Instant::now());
                         
-                        let missing_parity: Vec<usize> = assembly.parity_chunks.iter()
-                            .enumerate()
-                            .filter(|(_, c)| c.is_none())
-                            .map(|(i, _)| assembly.total_chunks + i)
-                            .collect();
+                        let mut missing_indices = missing_data;
+                        missing_indices.extend(missing_parity);
                         
-                        let total_missing = missing_data.len() + missing_parity.len();
+                        // Drop the lock before requesting
+                        drop(assembly);
                         
-                        if total_missing > 0 {
-                            assembly.retransmit_attempts += 1;
-                            assembly.retransmit_requested_at = Some(Instant::now());
-                            
-                            let mut missing_indices = missing_data;
-                            missing_indices.extend(missing_parity);
-                            
-                            // Drop the lock before requesting
-                            drop(assembly);
-                            
-                            let attempt = self.shred_protocol_assemblies.get(&height)
-                                .map(|a| a.retransmit_attempts)
-                                .unwrap_or(0);
-                            println!("[INFO][REPAIR] chunk_request h={} missing={} attempt={}", 
-                                     height, total_missing, attempt);
-                        
-                            self.request_missing_chunks(height, missing_indices, from_peer);
-                        }
+                        let attempt = self.shred_protocol_assemblies.get(&height)
+                            .map(|a| a.retransmit_attempts)
+                            .unwrap_or(0);
+                        println!("[INFO][REPAIR] chunk_request h={} missing={} attempt={}", 
+                                 height, total_missing, attempt);
+                    
+                        self.request_missing_chunks(height, missing_indices, from_peer);
                     }
                 }
             }
@@ -5495,6 +5578,119 @@ impl SimplifiedP2P {
             return BlockExistenceResult::VerifiedExists { 
                 peer_addr: verified_peer.unwrap_or_else(|| "unknown".to_string())
             };
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX v2.84: QUIC fallback when HTTP fails (port 8001 blocked scenario)
+        // HTTP may be blocked by DDoS protection/rate limiting, but QUIC (UDP 10876) often works
+        // Strategy: Request block via QUIC, wait briefly, check if it arrived in storage
+        // SECURITY v2.84: Rate limited to max 10 requests per minute per node
+        // ═══════════════════════════════════════════════════════════════════════════
+        if error_count > 0 && error_count >= total_responses / 2 {
+            // Get node ID for rate limiting
+            let node_id = GLOBAL_NODE_ID.read()
+                .map(|g| g.clone())
+                .unwrap_or_else(|_| "unknown".to_string());
+            
+            // PRIORITY 1: Rate limit check (max 10/min per node)
+            if !quic_fallback_rate_check(&node_id) {
+                if crate::node::is_warn() {
+                    println!("[WARN][EMERGENCY] quic_fallback_rate_limited h={} node={}", 
+                             block_height, &node_id[..node_id.len().min(8)]);
+                }
+                // Skip QUIC fallback due to rate limit
+            } else {
+                if crate::node::is_info() {
+                    println!("[INFO][EMERGENCY] quic_fallback_start h={} http_errors={}", block_height, error_count);
+                }
+                
+                // Increment total attempts metric (PRIORITY 3)
+                QUIC_FALLBACK_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                
+                // Get QUIC transport
+                let quic_transport = match GLOBAL_QUIC_TRANSPORT.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => None,
+                };
+                
+                if let Some(ref transport_arc) = quic_transport {
+                    use crate::quic_transport::QUIC_PORT_OFFSET;
+                    
+                    // Create RequestBlocks for single block
+                    let request = NetworkMessage::RequestBlocks {
+                        from_height: block_height,
+                        to_height: block_height,
+                        requester_id: node_id.clone(),
+                    };
+                    
+                    // Try to send via QUIC to available peers
+                    let mut quic_success = false;
+                    for peer_addr in peers_to_query.iter().take(3) {
+                        let parts: Vec<&str> = peer_addr.split(':').collect();
+                        if parts.len() != 2 { continue; }
+                        
+                        let ip = match parts[0].parse::<std::net::IpAddr>() {
+                            Ok(ip) => ip,
+                            Err(_) => continue,
+                        };
+                        let port = match parts[1].parse::<u16>() {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        
+                        let quic_port = port.saturating_add(QUIC_PORT_OFFSET);
+                        let quic_addr = std::net::SocketAddr::new(ip, quic_port);
+                        
+                        let transport = transport_arc.read().await;
+                        if transport.broadcast_to(quic_addr, &request).await.is_ok() {
+                            if crate::node::is_debug() {
+                                println!("[DBG][EMERGENCY] quic_fallback_sent h={} peer={}", 
+                                         block_height, get_privacy_id_for_addr(peer_addr));
+                            }
+                            quic_success = true;
+                            break;
+                        }
+                    }
+                    
+                    if quic_success {
+                        // PRIORITY 2: Wait for QUIC response (blocks come async via handle_blocks_batch)
+                        // Increased to 3000ms for high-latency networks (Asia, Australia, satellite)
+                        const QUIC_WAIT_MS: u64 = 3000;
+                        const POLL_INTERVAL_MS: u64 = 100;
+                        
+                        let start = std::time::Instant::now();
+                        while start.elapsed().as_millis() < QUIC_WAIT_MS as u128 {
+                            tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+                            
+                            // Check if block arrived in storage
+                            if let Some(storage) = crate::node::try_get_storage() {
+                                if storage.load_microblock(block_height).unwrap_or(None).is_some() {
+                                    // PRIORITY 3: Increment success metric
+                                    QUIC_FALLBACK_SUCCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    
+                                    if crate::node::is_info() {
+                                        let (succ, total, rate) = get_quic_fallback_metrics();
+                                        println!("[INFO][EMERGENCY] quic_fallback_success h={} elapsed={}ms success_rate={}.{}%", 
+                                                 block_height, start.elapsed().as_millis(), rate / 10, rate % 10);
+                                    }
+                                    return BlockExistenceResult::VerifiedExists {
+                                        peer_addr: "quic_fallback".to_string()
+                                    };
+                                }
+                            }
+                        }
+                        
+                        if crate::node::is_warn() {
+                            println!("[WARN][EMERGENCY] quic_fallback_timeout h={} wait={}ms", 
+                                     block_height, QUIC_WAIT_MS);
+                        }
+                    }
+                } else {
+                    if crate::node::is_warn() {
+                        println!("[WARN][EMERGENCY] quic_fallback_no_transport h={}", block_height);
+                    }
+                }
+            } // End of rate limit check
         }
         
         // All failed or majority says "not found"
