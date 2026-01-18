@@ -10697,10 +10697,14 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             
                             // v2.66: System TX bypass nonce/balance validation (like submit_transaction)
                             // v2.71: NodeRegistration TX also bypasses (nonce=0, gas=0, no balance needed)
+                            // v2.87: System TX bypass nonce/balance validation
+                            // HeartbeatCommitment/PingCommitment are validator rewards - MUST be included!
                             let is_system_tx = tx.from == "system_emission" 
                                 || tx.from == "system_ping_commitment"
                                 || tx.from.starts_with("system_")
-                                || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. });
+                                || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. })
+                                || matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. })
+                                || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. });
                             
                             let is_valid = if is_benchmark || is_system_tx {
                                 // Benchmark OR System TX: skip balance/nonce validation
@@ -10743,10 +10747,13 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         if is_valid {
                             // v2.68: Separate system TX from user TX
                             // v2.71: NodeRegistration is also system TX (no state execution needed)
+                            // v2.87: HeartbeatCommitment/PingCommitment are validator reward TX
                             let is_system = tx.from == "system_emission" 
                                 || tx.from == "system_ping_commitment"
                                 || tx.from.starts_with("system_")
-                                || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. });
+                                || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. })
+                                || matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. })
+                                || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. });
                             
                             if is_system {
                                 system_txs.push(tx);

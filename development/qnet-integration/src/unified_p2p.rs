@@ -3305,8 +3305,15 @@ impl SimplifiedP2P {
                             // Real reputation will be loaded from blockchain after sync
                             let real_rep = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                             
+                            // v2.87: Use canonical genesis node ID format for Gulf Stream producer forwarding
+                            // CRITICAL: ID must match producer selection format (genesis_node_XXX)
+                            use crate::genesis_constants::get_genesis_id_by_ip;
+                            let canonical_id = get_genesis_id_by_ip(&ip)
+                                .map(|id| format!("genesis_node_{}", id))
+                                .unwrap_or_else(|| format!("genesis_{}", target_addr.replace(":", "_")));
+                            
                             let peer_info = PeerInfo {
-                                id: format!("genesis_{}", target_addr.replace(":", "_")),
+                                id: canonical_id,
                                 addr: target_addr.clone(),
                                 node_type: NodeType::Super,
                                 region: peer_region,
@@ -17205,9 +17212,11 @@ impl SimplifiedP2P {
         let quic_transport = self.quic_transport.clone();
         
         // Log only important messages (consensus) and every 10th block
+        // CRITICAL FIX v2.86: Also log Transaction errors to diagnose delivery issues
         let should_log = match &message {
             NetworkMessage::Block { height, .. } => height % 10 == 0,
             NetworkMessage::ConsensusCommit { .. } | NetworkMessage::ConsensusReveal { .. } => true,
+            NetworkMessage::Transaction { .. } => true, // DEBUG: Log TX delivery
             _ => false,
         };
         
