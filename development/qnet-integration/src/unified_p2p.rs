@@ -13998,59 +13998,86 @@ impl SimplifiedP2P {
             .collect()
     }
     
-    /// Get Light nodes to ping in current slot (DYNAMIC distribution across active Full/Super nodes)
-    /// ARCHITECTURE v2.78: Each Full/Super node pings 1/N of ALL Light nodes
-    ///   - 5 Full nodes → each pings 20% Light nodes
-    ///   - 100 Full nodes → each pings 1% Light nodes
-    ///   - 1 Full node → pings 100% Light nodes
-    /// SCALABLE: Automatically adapts to network size
+    /// Get Light nodes to ping in current slot
+    /// ARCHITECTURE v2.89: ONLY Genesis nodes ping Light nodes (reliability guarantee)
+    ///   - 5 Genesis nodes → each pings 20% of ALL Light nodes (2M each for 10M total)
+    ///   - Genesis nodes are ALWAYS online → 100% coverage guaranteed
+    ///   - Non-Genesis nodes return empty list
+    /// 
+    /// RELIABILITY: Genesis nodes are stable infrastructure under our control
+    /// If ANY Full/Super node could ping, node failures = lost pings = lost rewards
+    /// With Genesis-only pinging: 100% reliability, 100% coverage
+    /// 
+    /// SCALABILITY: 2M pings per Genesis per epoch = 139 pings/sec = easily handled
     pub fn get_light_nodes_to_ping(&self) -> Vec<(LightNodeRegistrationData, PingerRole)> {
         let current_slot = Self::get_current_slot();
         let our_node_id = &self.node_id;
         let mut result = Vec::new();
         
-        // DYNAMIC DISTRIBUTION: Get all active Full/Super nodes
-        let active_nodes = self.get_active_full_super_nodes();
-        let active_count = active_nodes.len().max(1); // Avoid division by zero
+        // v2.89: ONLY Genesis nodes can ping Light nodes
+        // This ensures 100% reliability - Genesis never goes offline
+        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false);
         
-        // SCALABILITY: Each node processes 1/N of ALL Light nodes (not fixed 256 shards)
+        if !is_genesis_node {
+            // Non-Genesis nodes don't ping Light nodes anymore
+            // This prevents data loss when regular nodes go offline
+            return result;
+        }
+        
+        // Get our Genesis index (0-4) for shard assignment
+        let our_genesis_idx = std::env::var("QNET_BOOTSTRAP_ID")
+            .ok()
+            .and_then(|id| id.parse::<usize>().ok())
+            .map(|id| id.saturating_sub(1)) // Convert 001-005 to 0-4
+            .unwrap_or(0);
+        
+        const GENESIS_COUNT: usize = 5;
+        
+        if crate::node::is_info() {
+            println!("[INFO][GENESIS-PING] Genesis node {} (idx={}) checking Light nodes to ping slot={}",
+                     our_node_id, our_genesis_idx, current_slot);
+        }
+        
+        // Get all Light nodes from registry SORTED for consistent linear sharding
+        // v2.89 CRITICAL: Must use same ordering as bitmap creation!
         let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut all_nodes: Vec<_> = registry.values().cloned().collect();
+        all_nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id)); // Sort by node_id
+        let total_light_nodes = all_nodes.len();
         
-        for node in registry.values() {
-            // DYNAMIC SHARD: Determine which active node should ping this Light node
-            // Use consistent hashing to distribute Light nodes across active Full/Super nodes
-            let assigned_node_idx = Self::calculate_assigned_node_index(&node.node_id, active_count);
-            
-            // Check if THIS node should ping this Light node
-            let our_node_idx = active_nodes.iter()
-                .position(|(node_id, _, _)| node_id == our_node_id)
-                .unwrap_or(0);
-            
-            if assigned_node_idx != our_node_idx {
-                continue; // Another Full/Super node handles this Light node
-            }
+        // v2.89: LINEAR SHARDING - each Genesis gets sequential range of indices
+        // This matches bitmap creation logic exactly!
+        let nodes_per_genesis = (total_light_nodes + GENESIS_COUNT - 1) / GENESIS_COUNT; // Ceiling division
+        let my_start = our_genesis_idx * nodes_per_genesis;
+        let my_end = std::cmp::min(my_start + nodes_per_genesis, total_light_nodes);
+        
+        for idx in my_start..my_end {
+            let node = &all_nodes[idx];
             
             // ACTIVITY FILTER: Skip inactive nodes (>5 consecutive failures)
-            // They will be reactivated when they re-register or respond to a probe ping
             if !node.is_active || node.consecutive_failures >= 5 {
                 continue;
             }
             
-            // Check if this is the node's ping slot
+            // Check if this is the node's ping slot (randomized per window)
             if !Self::is_light_node_ping_slot(&node.node_id) {
                 continue;
             }
             
-            // Check if attestation already exists
+            // Check if attestation already exists (prevent duplicate pings)
             if self.has_attestation(&node.node_id, current_slot) {
                 continue;
             }
             
-            // Check our role for this node
-            let role = self.get_pinger_role(&node.node_id);
-            if role != PingerRole::None {
-                result.push((node.clone(), role));
-            }
+            // Genesis is always Primary pinger (no backup needed - Genesis is reliable)
+            result.push((node.clone(), PingerRole::Primary));
+        }
+        
+        if crate::node::is_debug() && !result.is_empty() {
+            println!("[DBG][GENESIS-PING] Genesis {} has {} Light nodes to ping this slot (total registry: {})",
+                     our_genesis_idx + 1, result.len(), total_light_nodes);
         }
         
         result
@@ -14145,6 +14172,48 @@ impl SimplifiedP2P {
         
         // Gossip to peers
         self.gossip_to_random_peers(msg, 5);
+    }
+    
+    /// v2.89: Get total registered Light node count
+    pub fn get_light_node_count(&self) -> usize {
+        let registry = match self.light_node_registry.read() { 
+            Ok(g) => g, 
+            Err(p) => p.into_inner() 
+        };
+        registry.len()
+    }
+    
+    /// v2.89: Get Light node index by ID (for bitmap creation)
+    /// Returns deterministic index based on sorted order of node IDs
+    pub fn get_light_node_index(&self, node_id: &str) -> Option<u32> {
+        let registry = match self.light_node_registry.read() { 
+            Ok(g) => g, 
+            Err(p) => p.into_inner() 
+        };
+        
+        // Get sorted list of all node IDs for deterministic ordering
+        let mut ids: Vec<_> = registry.keys().collect();
+        ids.sort();
+        
+        // Find index of this node
+        ids.iter().position(|&id| id == node_id).map(|i| i as u32)
+    }
+    
+    /// v2.89: Get ALL Light node IDs sorted (for bitmap index mapping)
+    /// CRITICAL: Returns ALL registered nodes, NOT just active ones!
+    /// This ensures bitmap indices are consistent between creation and reading.
+    /// Inactive nodes simply have bit=0 in bitmap (no reward).
+    pub fn get_all_light_node_ids_sorted(&self) -> Vec<String> {
+        let registry = match self.light_node_registry.read() { 
+            Ok(g) => g, 
+            Err(p) => p.into_inner() 
+        };
+        
+        // Return ALL node IDs, sorted for deterministic ordering
+        // NO FILTER - this must match get_light_node_index() ordering!
+        let mut ids: Vec<_> = registry.keys().cloned().collect();
+        ids.sort();
+        ids
     }
     
     /// Register this node as active Full/Super node and broadcast announcement (ASYNC)

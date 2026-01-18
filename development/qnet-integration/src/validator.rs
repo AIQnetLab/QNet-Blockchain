@@ -750,6 +750,20 @@ impl BlockValidator {
                 }
                 // System transaction - no gas fees
             }
+            TransactionType::LightNodeEligibilityBitmap { genesis_id, total_assigned, eligible_count, .. } => {
+                // v2.89: Light Node Eligibility Bitmap validation
+                if !genesis_id.starts_with("genesis_node_") {
+                    return Err(IntegrationError::ValidationError(
+                        format!("Invalid genesis_id format: {}", genesis_id)
+                    ));
+                }
+                if *eligible_count > *total_assigned {
+                    return Err(IntegrationError::ValidationError(
+                        format!("eligible_count ({}) exceeds total_assigned ({})", eligible_count, total_assigned)
+                    ));
+                }
+                // System transaction from Genesis - no gas fees
+            }
         }
         
         Ok(())

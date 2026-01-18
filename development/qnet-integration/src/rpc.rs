@@ -6310,16 +6310,30 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
     use futures::stream::{FuturesUnordered, StreamExt};
     use crate::unified_p2p::{SimplifiedP2P, PingerRole, LightNodeAttestation};
     
-    // SCALABILITY: Max concurrent pings to prevent OOM
-    const MAX_CONCURRENT_PINGS: usize = 100;
+    // v2.89: GENESIS-ONLY PINGING
+    // Genesis nodes need higher concurrency for 2M Light nodes each
+    // Regular nodes don't ping at all anymore (return early from get_light_nodes_to_ping)
+    let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+        .unwrap_or(false);
+    
+    // SCALABILITY: Genesis handles 139 pings/sec = 8340 pings/min
+    // At 50ms avg latency, need 139 * 0.05 = 7 concurrent minimum
+    // Use 500 concurrent for headroom and burst handling
+    let max_concurrent_pings: usize = if is_genesis_node { 500 } else { 100 };
     
     let blockchain_for_pings = blockchain.clone();
     
     tokio::spawn(async move {
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PINGS));
+        let semaphore = Arc::new(Semaphore::new(max_concurrent_pings));
         let mut check_interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         
-        println!("[PING] 🚀 Sharded ping service started (max {} concurrent)", MAX_CONCURRENT_PINGS);
+        if is_genesis_node {
+            println!("[GENESIS-PING] 🚀 Genesis ping service started (max {} concurrent, ~2M Light nodes)", 
+                     max_concurrent_pings);
+        } else {
+            println!("[PING] 💤 Non-Genesis node - ping service passive (Genesis handles all pinging)");
+        }
         
         // ================================================================
         // BOOTSTRAP SYNC: Wait for active nodes list to populate
@@ -6392,17 +6406,25 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             }
             
             // ================================================================
-            // LIGHT NODE PINGING (Sharded + Deterministic)
+            // LIGHT NODE PINGING (v2.89: Genesis-only)
             // ================================================================
             
             if let Some(p2p) = blockchain_for_pings.get_unified_p2p() {
                 
-                // Get Light nodes to ping (filtered by slot + role + no existing attestation)
+                // Get Light nodes to ping (ONLY Genesis nodes get results now)
                 let nodes_to_ping = p2p.get_light_nodes_to_ping();
                 
                 if !nodes_to_ping.is_empty() {
-                    println!("[LIGHT] 📡 Slot {}: {} Light nodes to ping (sharded)", 
-                             current_slot, nodes_to_ping.len());
+                    // v2.89: Batch logging for Genesis (avoid 139 logs/sec)
+                    if is_genesis_node {
+                        if is_info() {
+                            println!("[INFO][GENESIS-PING] Slot {}: {} Light nodes to ping", 
+                                     current_slot, nodes_to_ping.len());
+                        }
+                    } else {
+                        println!("[LIGHT] 📡 Slot {}: {} Light nodes to ping", 
+                                 current_slot, nodes_to_ping.len());
+                    }
                     
                     let mut futures = FuturesUnordered::new();
                     

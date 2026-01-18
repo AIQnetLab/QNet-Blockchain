@@ -2331,8 +2331,15 @@ impl BlockchainNode {
         seed_hasher.update(merkle_root.as_bytes());
         let sample_seed_hex = hex::encode(&seed_hasher.finalize()[..]);
         
+        // v2.89: FIXED sampling limit to prevent TX bloat (30MB → 750KB)
+        // Genesis nodes ping 2M Light nodes each, 1% = 20K samples = 30MB TX!
+        // Instead: max 500 samples × 1.5KB = 750KB (acceptable)
         const MIN_SAMPLES: usize = 10;
-        let sample_size = ((ping_count as usize * 1) / 100).max(MIN_SAMPLES.min(ping_count as usize));
+        const MAX_SAMPLES: usize = 500;
+        let sample_size = std::cmp::min(
+            MAX_SAMPLES,
+            std::cmp::max(MIN_SAMPLES, ping_count as usize)
+        );
         
         let mut ping_samples = Vec::new();
         for i in 0..sample_size {
@@ -2521,9 +2528,15 @@ impl BlockchainNode {
             let sample_seed = seed_hasher.finalize();
             let sample_seed_hex = hex::encode(&sample_seed[..]);
             
-            // Deterministic sampling: 10 samples or 1% (whichever is larger)
+            // v2.89: FIXED sampling limit to prevent TX bloat (30MB → 750KB)
+            // Genesis nodes ping 2M Light nodes each, 1% = 20K samples = 30MB TX!
+            // Instead: max 500 samples × 1.5KB = 750KB (acceptable)
             const MIN_SAMPLES: usize = 10;
-            let sample_size = ((ping_count as usize * 1) / 100).max(MIN_SAMPLES.min(ping_count as usize));
+            const MAX_SAMPLES: usize = 500;
+            let sample_size = std::cmp::min(
+                MAX_SAMPLES,
+                std::cmp::max(MIN_SAMPLES, ping_count as usize)
+            );
             
             let mut ping_samples = Vec::new();
             for i in 0..sample_size {
@@ -2613,6 +2626,84 @@ impl BlockchainNode {
         }
         
         Ok(())
+    }
+    
+    /// PRODUCTION v2.89: Create LightNodeEligibilityBitmap TX
+    /// Ultra-compact bitmap representation of eligible Light nodes
+    /// 
+    /// SCALABILITY:
+    /// - 2M Light nodes = 250KB bitmap (1 bit per node)
+    /// - zstd compression: ~50KB per TX
+    /// - One TX per Genesis (not 200+ TX for samples!)
+    /// 
+    /// ARCHITECTURE:
+    /// - Genesis collects attestations for assigned Light nodes
+    /// - Creates bitmap: bit[i] = 1 if Light node #i responded
+    /// - Compresses with zstd and sends as single TX
+    /// - MacroBlock merges all 5 Genesis bitmaps for rewards
+    fn create_light_node_bitmap_tx(
+        genesis_id: &str,
+        epoch: u64,
+        eligible_indices: &[u32],  // Indices of Light nodes that responded
+        total_assigned: u32,        // Total Light nodes assigned to this Genesis
+    ) -> Result<qnet_state::Transaction, QNetError> {
+        // Create bitmap: 1 bit per Light node
+        let bitmap_size = (total_assigned as usize + 7) / 8;
+        let mut bitmap = vec![0u8; bitmap_size];
+        
+        // Set bits for eligible nodes
+        for &idx in eligible_indices {
+            if idx < total_assigned {
+                let byte_idx = idx as usize / 8;
+                let bit_idx = idx as usize % 8;
+                bitmap[byte_idx] |= 1 << bit_idx;
+            }
+        }
+        
+        // Compress with zstd (already used in project)
+        let bitmap_compressed = zstd::encode_all(&bitmap[..], 3)
+            .map_err(|e| QNetError::SerializationError(format!("zstd compress failed: {}", e)))?;
+        
+        let eligible_count = eligible_indices.len() as u32;
+        
+        if is_info() {
+            println!("[INFO][LIGHT-BITMAP] Creating TX genesis={} epoch={} eligible={}/{} raw={}KB compressed={}KB",
+                     genesis_id, epoch, eligible_count, total_assigned,
+                     bitmap.len() / 1024, bitmap_compressed.len() / 1024);
+        }
+        
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let mut tx = qnet_state::Transaction {
+            from: genesis_id.to_string(),
+            to: None,
+            amount: 0,
+            tx_type: qnet_state::TransactionType::LightNodeEligibilityBitmap {
+                genesis_id: genesis_id.to_string(),
+                epoch,
+                total_assigned,
+                eligible_count,
+                bitmap_compressed,
+            },
+            timestamp: current_time,
+            hash: String::new(),
+            signature: None,
+            public_key: None,
+            gas_price: u64::MAX, // System TX priority
+            gas_limit: 0,        // FREE operation
+            nonce: 0,            // System TX
+            data: Some(format!("Light Node Bitmap: {} eligible / {} assigned, epoch {}", 
+                              eligible_count, total_assigned, epoch)),
+            dilithium_signature: None,
+            dilithium_public_key: None,
+        };
+        
+        tx.hash = tx.calculate_hash();
+        
+        Ok(tx)
     }
     
     /// PRODUCTION v2.77: Collect HeartbeatCommitment TXs from blockchain with SHARD AGGREGATION
@@ -2930,6 +3021,10 @@ impl BlockchainNode {
     /// - window_end_height: End of EPOCH (e.g., 14400 for epoch 0)
     /// 
     /// Returns: HashMap<light_node_id, ping_count=1> - deduplicated Light nodes
+    /// 
+    /// v2.89 HYBRID APPROACH:
+    /// 1. PRIMARY: Read LightNodeEligibilityBitmap TXs from blockchain (on-chain proof)
+    /// 2. FALLBACK: If no bitmap TXs, use P2P RAM attestations (backward compat)
     async fn collect_ping_commitments_from_blocks(
         storage: &Arc<Storage>,
         p2p: &Arc<SimplifiedP2P>,
@@ -2939,52 +3034,118 @@ impl BlockchainNode {
         use std::collections::HashMap;
         
         if is_info() {
-            println!("[INFO][PING-COLLECTION] Reading Light node attestations from P2P RAM epoch blocks {}-{}",
+            println!("[INFO][PING-COLLECTION] Collecting Light node data for blocks {}-{}",
                      window_start_height, window_end_height);
         }
         
-        // ARCHITECTURE v2.78: Read attestations directly from P2P RAM storage
-        // PingCommitment TXs contain only samples (10%) for Merkle proof verification
-        // Full Light node list stored in P2P attestations (continuous pinging system)
+        // v2.89: PRIMARY - Read LightNodeEligibilityBitmap TXs from blockchain
+        let mut bitmap_eligible: HashMap<String, u32> = HashMap::new();
+        let mut found_bitmap_txs = 0u32;
         
-        let all_attestations = p2p.get_attestations_for_block_range(window_start_height, window_end_height);
-        
-        // Deduplicate: Each Light node counted ONCE even if pinged by multiple Full/Super nodes
-        let mut light_node_pings: HashMap<String, u32> = HashMap::new();
-        
-        for (light_node_id, _slot, _pinger_id, _timestamp, _block_height) in all_attestations {
-            // Each Light node gets exactly 1 ping per epoch (slot-based)
-            // Multiple Full nodes may ping same Light node (dynamic distribution overlap)
-            // We count it as 1 for rewards (dedupe)
-            light_node_pings.insert(light_node_id, 1);
-        }
+        // v2.89 CRITICAL: Get registry ONCE at start - must be consistent for all TX!
+        // This is the "epoch snapshot" - all bitmap TX in this window use same registry
+        let registry = p2p.get_all_light_node_ids_sorted();
+        let total_light_nodes = registry.len();
+        let nodes_per_genesis = (total_light_nodes + 4) / 5; // Same for all Genesis
         
         if is_info() {
-            println!("[INFO][PING-COLLECTION] Unique Light nodes with attestations: {}",
-                     light_node_pings.len());
+            println!("[INFO][PING-COLLECTION] Registry snapshot: {} Light nodes, {} per Genesis",
+                     total_light_nodes, nodes_per_genesis);
         }
         
-        // OPTIONAL: Verify samples from PingCommitment TXs match attestations (security check)
-        if is_debug() {
-            let mut commitment_samples = Vec::new();
-            for height in window_start_height..=window_end_height {
-                if let Ok(Some(block_bytes)) = storage.load_microblock(height) {
-                    if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_bytes) {
-                        for tx in &block.transactions {
-                            if let qnet_state::TransactionType::PingCommitmentWithSampling { 
-                                ping_samples, total_ping_count, ..
-                            } = &tx.tx_type {
-                                commitment_samples.extend(ping_samples.iter().map(|s| s.from_node.clone()));
-                                if is_debug() {
-                                    println!("[DBG][PING-COLLECTION] PingCommitment TX: total={} samples={}", 
-                                             total_ping_count, ping_samples.len());
+        // Scan commitment window (last 50 blocks before epoch end)
+        let scan_start = if window_end_height >= 50 { window_end_height - 50 } else { window_start_height };
+        
+        // v2.89: Track processed Genesis to prevent duplicate TX processing
+        let mut processed_genesis: std::collections::HashSet<String> = std::collections::HashSet::new();
+        
+        for height in scan_start..=window_end_height {
+            if let Ok(Some(block_bytes)) = storage.load_microblock(height) {
+                if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_bytes) {
+                    for tx in &block.transactions {
+                        if let qnet_state::TransactionType::LightNodeEligibilityBitmap {
+                            genesis_id,
+                            epoch: _,
+                            total_assigned,
+                            eligible_count,
+                            bitmap_compressed,
+                        } = &tx.tx_type {
+                            // v2.89: Skip duplicate TX from same Genesis (only process first)
+                            if processed_genesis.contains(genesis_id) {
+                                if is_warn() {
+                                    println!("[WARN][LIGHT-BITMAP] Skipping duplicate TX from {}", genesis_id);
                                 }
+                                continue;
+                            }
+                            processed_genesis.insert(genesis_id.clone());
+                            
+                            // Decompress bitmap
+                            if let Ok(bitmap) = zstd::decode_all(&bitmap_compressed[..]) {
+                                // Parse genesis_id to get shard assignment
+                                let genesis_idx = genesis_id.strip_prefix("genesis_node_")
+                                    .and_then(|s| s.parse::<u32>().ok())
+                                    .map(|n| n.saturating_sub(1))
+                                    .unwrap_or(0) as usize;
+                                
+                                let shard_start = genesis_idx * nodes_per_genesis;
+                                
+                                // Read bitmap and add eligible nodes
+                                let mut local_count = 0u32;
+                                for (bit_idx, byte) in bitmap.iter().enumerate() {
+                                    for bit in 0..8 {
+                                        let local_idx = bit_idx * 8 + bit;
+                                        if local_idx >= *total_assigned as usize {
+                                            break;
+                                        }
+                                        if (byte >> bit) & 1 == 1 {
+                                            let global_idx = shard_start + local_idx;
+                                            if global_idx < total_light_nodes {
+                                                let node_id = &registry[global_idx];
+                                                bitmap_eligible.insert(node_id.clone(), 1);
+                                                local_count += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                if is_info() {
+                                    println!("[INFO][LIGHT-BITMAP] Parsed {} bitmap: {} eligible (expected {})",
+                                             genesis_id, local_count, eligible_count);
+                                }
+                                found_bitmap_txs += 1;
+                            } else if is_warn() {
+                                println!("[WARN][LIGHT-BITMAP] Failed to decompress bitmap from {}", genesis_id);
                             }
                         }
                     }
                 }
             }
-            println!("[DBG][PING-COLLECTION] Total commitment samples: {}", commitment_samples.len());
+        }
+        
+        // If bitmap TXs found, use them (on-chain proof!)
+        if found_bitmap_txs > 0 {
+            if is_info() {
+                println!("[INFO][PING-COLLECTION] ON-CHAIN: {} bitmap TXs, {} unique Light nodes",
+                         found_bitmap_txs, bitmap_eligible.len());
+            }
+            return Ok(bitmap_eligible);
+        }
+        
+        // FALLBACK: No bitmap TXs, use P2P RAM attestations (backward compat)
+        if is_warn() {
+            println!("[WARN][PING-COLLECTION] No bitmap TXs found, falling back to P2P RAM attestations");
+        }
+        
+        let all_attestations = p2p.get_attestations_for_block_range(window_start_height, window_end_height);
+        let mut light_node_pings: HashMap<String, u32> = HashMap::new();
+        
+        for (light_node_id, _slot, _pinger_id, _timestamp, _block_height) in all_attestations {
+            light_node_pings.insert(light_node_id, 1);
+        }
+        
+        if is_info() {
+            println!("[INFO][PING-COLLECTION] FALLBACK: {} unique Light nodes from RAM",
+                     light_node_pings.len());
         }
         
         Ok(light_node_pings)
@@ -6729,15 +6890,21 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         
                         if is_debug() { println!("[DBG][PING-COMMIT] merkle_proofs_ok count={}", verified_count); }
                         
-                        // Step 4: Verify sample size is sufficient - ADAPTIVE!
-                        // Small network (<10K): verify ALL pings (min_samples = total)
-                        // Large network (10K+): 1% sampling (min_samples = 10K)
-                        let min_samples = ((*total_ping_count / 100).max(MIN_PING_SAMPLES.min(*total_ping_count as usize) as u32)) as usize;
-                        if ping_samples.len() < min_samples {
+                        // Step 4: Verify sample size is sufficient
+                        // v2.89: Fixed sampling - min 10, max 500 (regardless of total pings)
+                        // This prevents TX bloat for Genesis nodes with 2M+ pings
+                        const MIN_SAMPLES: usize = 10;
+                        const MAX_SAMPLES: usize = 500;
+                        let expected_samples = std::cmp::min(
+                            MAX_SAMPLES,
+                            std::cmp::max(MIN_SAMPLES, *total_ping_count as usize)
+                        );
+                        
+                        if ping_samples.len() < expected_samples {
                             if is_warn() { println!("[WARN][PING-COMMIT] insufficient_samples got={} need={} total={}", 
-                                     ping_samples.len(), min_samples, total_ping_count); }
+                                     ping_samples.len(), expected_samples, total_ping_count); }
                             return Err(format!("Insufficient ping samples: {} < {} (total={})", 
-                                             ping_samples.len(), min_samples, total_ping_count));
+                                             ping_samples.len(), expected_samples, total_ping_count));
                         }
                         
                         if is_debug() { println!("[DBG][PING-COMMIT] sample_size_ok count={} total={} pct={:.1}%",
@@ -7624,89 +7791,141 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     }
                 }
                 
-                // PingCommitment TX
+                // v2.89: LightNodeEligibilityBitmap TX (replaces PingCommitment)
+                // ONLY Genesis nodes create bitmap TX with eligible Light nodes
                 {
-                    let already_sent = {
-                        let sent = sent_ping_commitments.read().await;
-                        sent.contains(&current_epoch)
-                    };
+                    let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+                        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                        .unwrap_or(false);
                     
-                    if already_sent {
-                        if is_info() {
-                            println!("[INFO][PING-COMMITMENT] Already sent for epoch={}", current_epoch);
+                    if !is_genesis_node {
+                        // Non-Genesis nodes don't create Light node TX
+                        if is_debug() {
+                            println!("[DBG][LIGHT-BITMAP] Skipping - not a Genesis node");
                         }
                     } else {
-                        if is_info() {
-                            println!("[INFO][PING-COMMITMENT] Creating TX for epoch={}", current_epoch);
-                        }
+                        let already_sent = {
+                            let sent = sent_ping_commitments.read().await;
+                            sent.contains(&current_epoch)
+                        };
                         
-                        if unified_p2p.is_none() {
-                            if is_warn() {
-                                println!("[WARN][PING-COMMITMENT] unified_p2p is None! Cannot create TX");
+                        if already_sent {
+                            if is_info() {
+                                println!("[INFO][LIGHT-BITMAP] Already sent for epoch={}", current_epoch);
                             }
-                        } else if let Some(ref p2p) = unified_p2p {
-                            match Self::create_ping_commitment_tx_static(
-                                &storage,
-                                p2p,
-                                &node_id,
-                                current_epoch,
-                            ).await {
-                                Ok(tx) => {
-                                    if is_info() {
-                                        println!("[INFO][PING-COMMITMENT] TX created successfully epoch={} hash={}", 
-                                                 current_epoch, &tx.hash[..16]);
-                                    }
-                                    
-                                    match bincode::serialize(&tx) {
-                                        Ok(tx_bytes) => {
-                                            let gas_price = tx.gas_price;
-                                            if is_info() {
-                                                println!("[INFO][PING-COMMITMENT] TX serialized size={} bytes", tx_bytes.len());
-                                            }
-                                            
-                                            // CRITICAL FIX v2.81: Clone tx_bytes for broadcast BEFORE adding to mempool
-                                            let tx_bytes_for_broadcast = tx_bytes.clone();
-                                            
-                                            if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
-                                                let mut sent = sent_ping_commitments.write().await;
-                                                sent.insert(current_epoch);
+                        } else {
+                            if is_info() {
+                                println!("[INFO][LIGHT-BITMAP] Creating bitmap TX for epoch={}", current_epoch);
+                            }
+                            
+                            if let Some(ref p2p) = unified_p2p {
+                                // Get attestations for this epoch
+                                let epoch_start = current_epoch * EMISSION_BLOCK_INTERVAL;
+                                let epoch_end = (current_epoch + 1) * EMISSION_BLOCK_INTERVAL;
+                                let all_attestations = p2p.get_attestations_for_block_range(epoch_start, epoch_end);
+                                
+                                // Filter to only pings from THIS Genesis node
+                                let my_pings: Vec<_> = all_attestations.into_iter()
+                                    .filter(|(_, _, pinger_id, _, _)| pinger_id == &node_id)
+                                    .collect();
+                                
+                                // Get total assigned Light nodes for this Genesis
+                                // Genesis nodes divide Light nodes: each gets 1/5 of registry
+                                let genesis_idx = std::env::var("QNET_BOOTSTRAP_ID")
+                                    .ok()
+                                    .and_then(|id| id.parse::<u32>().ok())
+                                    .map(|id| id.saturating_sub(1))
+                                    .unwrap_or(0);
+                                
+                                // v2.89 OPTIMIZATION: Get sorted registry ONCE and build index map
+                                // This is O(n log n) instead of O(n * m log m) for each lookup!
+                                let sorted_registry = p2p.get_all_light_node_ids_sorted();
+                                let total_light_nodes = sorted_registry.len() as u32;
+                                
+                                // Build index lookup map: node_id -> global_index
+                                let index_map: std::collections::HashMap<String, u32> = sorted_registry
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, id)| (id.clone(), idx as u32))
+                                    .collect();
+                                
+                                let nodes_per_genesis = (total_light_nodes + 4) / 5; // Ceiling division
+                                let my_start = genesis_idx * nodes_per_genesis;
+                                let my_end = std::cmp::min(my_start + nodes_per_genesis, total_light_nodes);
+                                let total_assigned = my_end - my_start;
+                                
+                                // Convert pings to local indices (0-based within this Genesis shard)
+                                // Light node registry index → local index
+                                // v2.89: Use index_map for O(1) lookup instead of O(n log n)
+                                let eligible_indices: Vec<u32> = my_pings.iter()
+                                    .filter_map(|(light_node_id, _, _, _, _)| {
+                                        // Get global index from index_map (O(1) lookup)
+                                        index_map.get(light_node_id)
+                                            .map(|&global_idx| global_idx.saturating_sub(my_start))
+                                            .filter(|&local_idx| local_idx < total_assigned)
+                                    })
+                                    .collect();
+                                
+                                if is_info() {
+                                    println!("[INFO][LIGHT-BITMAP] Genesis {} has {} eligible / {} assigned Light nodes",
+                                             genesis_idx + 1, eligible_indices.len(), total_assigned);
+                                }
+                                
+                                // Create bitmap TX
+                                match Self::create_light_node_bitmap_tx(
+                                    &node_id,
+                                    current_epoch,
+                                    &eligible_indices,
+                                    total_assigned,
+                                ) {
+                                    Ok(tx) => {
+                                        if is_info() {
+                                            println!("[INFO][LIGHT-BITMAP] TX created hash={}", &tx.hash[..16]);
+                                        }
+                                        
+                                        match bincode::serialize(&tx) {
+                                            Ok(tx_bytes) => {
+                                                let gas_price = tx.gas_price;
+                                                let tx_bytes_for_broadcast = tx_bytes.clone();
+                                                
                                                 if is_info() {
-                                                    println!("[INFO][PING-COMMITMENT] TX submitted to mempool epoch={} hash={}", 
-                                                             current_epoch, &tx.hash[..16]);
+                                                    println!("[INFO][LIGHT-BITMAP] TX size={} bytes", tx_bytes.len());
                                                 }
                                                 
-                                                // CRITICAL FIX v2.81: Broadcast TX to network (Gulf Stream to producer + backup peers)
-                                                // Without this, TX stays in local mempool and won't reach block producer!
-                                                if let Err(e) = p2p.broadcast_transaction(tx_bytes_for_broadcast) {
-                                                    if is_warn() {
-                                                        println!("[WARN][PING-COMMITMENT] Broadcast failed epoch={} error={}", 
-                                                                 current_epoch, e);
+                                                if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
+                                                    let mut sent = sent_ping_commitments.write().await;
+                                                    sent.insert(current_epoch);
+                                                    
+                                                    if is_info() {
+                                                        println!("[INFO][LIGHT-BITMAP] TX submitted to mempool epoch={}", current_epoch);
+                                                    }
+                                                    
+                                                    if let Err(e) = p2p.broadcast_transaction(tx_bytes_for_broadcast) {
+                                                        if is_warn() {
+                                                            println!("[WARN][LIGHT-BITMAP] Broadcast failed: {}", e);
+                                                        }
+                                                    } else {
+                                                        if is_info() {
+                                                            println!("[INFO][LIGHT-BITMAP] TX broadcast to network");
+                                                        }
                                                     }
                                                 } else {
-                                                    if is_info() {
-                                                        println!("[INFO][PING-COMMITMENT] TX broadcast to network epoch={} hash={}", 
-                                                                 current_epoch, &tx.hash[..16]);
+                                                    if is_warn() {
+                                                        println!("[WARN][LIGHT-BITMAP] Mempool rejected TX");
                                                     }
                                                 }
-                                            } else {
-                                                if is_warn() {
-                                                    println!("[WARN][PING-COMMITMENT] Mempool rejected TX epoch={} hash={}", 
-                                                             current_epoch, &tx.hash[..16]);
-                                                }
                                             }
-                                        }
-                                        Err(e) => {
-                                            if is_warn() {
-                                                println!("[WARN][PING-COMMITMENT] Failed to serialize TX epoch={} error={}", 
-                                                         current_epoch, e);
+                                            Err(e) => {
+                                                if is_warn() {
+                                                    println!("[WARN][LIGHT-BITMAP] Serialize failed: {}", e);
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    if is_warn() {
-                                        println!("[WARN][PING-COMMITMENT] Failed to create TX epoch={} error={:?}", 
-                                                 current_epoch, e);
+                                    Err(e) => {
+                                        if is_warn() {
+                                            println!("[WARN][LIGHT-BITMAP] Create TX failed: {:?}", e);
+                                        }
                                     }
                                 }
                             }
@@ -10699,12 +10918,14 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             // v2.71: NodeRegistration TX also bypasses (nonce=0, gas=0, no balance needed)
                             // v2.87: System TX bypass nonce/balance validation
                             // HeartbeatCommitment/PingCommitment are validator rewards - MUST be included!
+                            // v2.89: LightNodeEligibilityBitmap (Genesis bitmap TX)
                             let is_system_tx = tx.from == "system_emission" 
                                 || tx.from == "system_ping_commitment"
                                 || tx.from.starts_with("system_")
                                 || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. })
                                 || matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. })
-                                || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. });
+                                || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. })
+                                || matches!(tx.tx_type, qnet_state::TransactionType::LightNodeEligibilityBitmap { .. });
                             
                             let is_valid = if is_benchmark || is_system_tx {
                                 // Benchmark OR System TX: skip balance/nonce validation
@@ -19823,9 +20044,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // Nonce validation (skip for commitment TX - they use nonce=0 as system TX)
         // PRODUCTION v2.82: Commitment TX are per-epoch, not per-account sequence
+        // v2.89: Added LightNodeEligibilityBitmap (Genesis bitmap TX)
         let skip_nonce_check = matches!(tx.tx_type,
             qnet_state::TransactionType::HeartbeatCommitment { .. } |
             qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
+            qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
             qnet_state::TransactionType::RewardDistribution { .. }
         );
         
