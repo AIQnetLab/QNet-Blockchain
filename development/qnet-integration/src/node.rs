@@ -2152,8 +2152,10 @@ impl BlockchainNode {
         seed_hasher.update(merkle_root.as_bytes());
         let sample_seed = hex::encode(&seed_hasher.finalize()[..]);
         
-        const MIN_SAMPLES: usize = 10;
-        let sample_size = ((heartbeat_count as usize * 1) / 100).max(MIN_SAMPLES.min(heartbeat_count as usize));
+        // FIXED v2.90: Match validation formula (20-30% of heartbeat_count)
+        // Previous bug: used 1% + MIN=10 which NEVER matched validation!
+        let min_samples = ((heartbeat_count as usize * 20) / 100).max(1);
+        let sample_size = min_samples; // Use minimum to reduce TX size
         
         let mut heartbeat_samples = Vec::new();
         for i in 0..sample_size {
