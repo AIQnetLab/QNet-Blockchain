@@ -13460,68 +13460,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         storage: Option<Arc<Storage>>, // Pass storage for failover tracking
     ) -> String {
         if let Some(p2p) = unified_p2p {
-            // ARCHITECTURE: Always use unified candidate source
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL FIX v2.92: FULLY DETERMINISTIC emergency candidate selection
+            // ═══════════════════════════════════════════════════════════════════════════
+            // Use ONLY calculate_qualified_candidates which returns:
+            // - Genesis epoch (1-180): Static Genesis node list (same for ALL nodes)
+            // - Normal epoch (181+): Macroblock N-2 snapshot (same for ALL nodes)
+            //
+            // NO separate own_node handling - all candidates from qualified list!
+            // NO peer_heights filtering - it's non-deterministic during network split!
+            // ═══════════════════════════════════════════════════════════════════════════
             
-            // EXISTING: Get qualified candidates excluding the failed producer
             let mut candidates = Vec::new();
-            
-            // EXISTING: Use SAME emergency eligibility logic as normal microblock production
-            let can_participate_emergency = match own_node_type {
-                NodeType::Super => {
-                    // Super nodes always eligible for emergency (if reputation ≥ 70%)
-                    let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                    own_reputation >= 0.70
-                },
-                NodeType::Full => {
-                    // Full nodes eligible for emergency (same as normal production)
-                    let validated_peers = p2p.get_validated_active_peers();
-                    let has_peers = validated_peers.len() >= 3; // EXISTING: 3f+1 Byzantine formula
-                    let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                    let has_reputation = own_reputation >= 0.70;
-                    has_peers && has_reputation
-                },
-                NodeType::Light => false, // Light nodes never participate in emergency production (same as consensus)
-            };
-            
-            // CRITICAL FIX v2.64: Exclude ONLY failed_producer from emergency selection
-            // Emergency uses same deterministic SHA3-512 algorithm as normal selection
-            // but with failed_producer removed from candidate list
-            if own_node_id != failed_producer && can_participate_emergency {
-                let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                
-                // CRITICAL FIX v2.61: Strict sync check for emergency production
-                // Emergency producer MUST have prev block to create next block!
-                // To create block N, node MUST have block N-1
-                // No time for sync during emergency - need immediate production
-                // If no synced nodes → Progressive Degradation fallback
-                let is_synchronized = if let Some(ref store) = storage {
-                    let stored_height = store.get_chain_height().unwrap_or(0);
-                    // Strict: must have prev block (current_height - 1)
-                    stored_height >= current_height.saturating_sub(1)
-                } else {
-                    true // If no storage, assume synced (shouldn't happen)
-                };
-                
-                // CRITICAL FIX v2.51: Only add SYNCHRONIZED nodes as candidates!
-                // This prevents selecting lagging nodes that cannot produce blocks
-                if is_synchronized {
-                    candidates.push((own_node_id.to_string(), own_reputation));
-                    println!("[INFO][EMERGENCY] own_node={} status=synced reputation={:.1}", 
-                             own_node_id, own_reputation * 100.0);
-                } else {
-                    // EXCLUDED: Node is behind, cannot produce blocks for this height
-                    let stored_height = storage.as_ref()
-                        .map(|s| s.get_chain_height().unwrap_or(0))
-                        .unwrap_or(0);
-                    println!("[INFO][EMERGENCY] own_node={} status=excluded reason=not_synced local_h={} need_h={} lag={}", 
-                             own_node_id, stored_height, current_height, current_height.saturating_sub(stored_height));
-                }
-            } else if own_node_id == failed_producer {
-                println!("[INFO][EMERGENCY] own_node={} status=excluded reason=failed_producer", own_node_id);
-            } else {
-                println!("[INFO][EMERGENCY] own_node={} status=excluded reason=node_type type={:?}", 
-                         own_node_id, own_node_type);
-            };
             
             println!("[EMERGENCY_SELECTION] ℹ️  Failed producer being excluded: {}", failed_producer);
             
@@ -13540,38 +13490,39 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     return failed_producer.to_string();
                 }
                 
-                // CRITICAL FIX v2.61: Strict sync check for emergency candidates
-                // To create block N, node MUST have block N-1
-                // Strict threshold: peer_height >= current_height - 1
-                // No time for sync during emergency - need immediate production
-                let peer_heights = p2p.get_peer_heights();
-                let sync_threshold = current_height.saturating_sub(1); // Must have prev block!
+                // ═══════════════════════════════════════════════════════════════════════════
+                // CRITICAL FIX v2.92: DETERMINISTIC emergency candidate selection
+                // ═══════════════════════════════════════════════════════════════════════════
+                // REMOVED: peer_heights filtering - it's NON-DETERMINISTIC!
+                // 
+                // PROBLEM: Each node sees DIFFERENT peer_heights during network split
+                //   → Different nodes exclude different candidates
+                //   → Different candidate lists → SHA3 produces different results
+                //   → Each node selects ITSELF as emergency producer → FORK!
+                //
+                // SOLUTION: Use ONLY deterministic data for candidate list:
+                //   1. qualified list from macroblock N-2 snapshot (SAME for all nodes)
+                //   2. Exclude ONLY failed_producer (DETERMINISTIC)
+                //   3. SHA3-512 selection from finality block (DETERMINISTIC)
+                //
+                // If selected emergency producer is not synced:
+                //   → It will SELF-EXCLUDE (not produce block)
+                //   → Timeout triggers NEXT emergency selection
+                //   → All nodes again select SAME next producer (deterministic)
+                // ═══════════════════════════════════════════════════════════════════════════
                 
                 for (node_id, reputation) in qualified {
-                    // CRITICAL FIX v2.64: Exclude ONLY failed_producer from emergency selection
-                    // Emergency uses same deterministic SHA3-512 selection as normal production
-                    // but failed_producer is removed from candidate pool
+                    // Exclude ONLY the failed producer - this is deterministic
+                    // All nodes know who failed (from timeout/broadcast)
                     if node_id == failed_producer {
                         println!("[INFO][EMERGENCY] peer={} status=excluded reason=failed_producer", node_id);
                         continue;
                     }
                     
-                    // CRITICAL FIX v2.61: Check if peer is synchronized before adding as candidate
-                    // Uses height from Dilithium-signed HealthPing (Byzantine-resistant)
-                    if let Some(&peer_height) = peer_heights.get(&node_id) {
-                        if peer_height < sync_threshold {
-                            println!("[INFO][EMERGENCY] peer={} status=excluded reason=not_synced h={} need={}", 
-                                     node_id, peer_height, sync_threshold);
-                            continue;
-                        }
-                        println!("[INFO][EMERGENCY] peer={} status=synced h={} rep={:.1}", 
-                                 node_id, peer_height, reputation * 100.0);
-                    } else {
-                        // No height info - node might be unresponsive, exclude for safety
-                        println!("[INFO][EMERGENCY] peer={} status=excluded reason=no_height_info", node_id);
-                        continue;
-                    }
-                    
+                    // Add ALL other qualified candidates without sync filtering
+                    // Sync check happens on the SELECTED node (self-exclude if not ready)
+                    println!("[INFO][EMERGENCY] peer={} status=candidate rep={:.1}", 
+                             node_id, reputation * 100.0);
                     candidates.push((node_id.clone(), reputation));
                 }
             }

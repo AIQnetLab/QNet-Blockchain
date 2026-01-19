@@ -3869,12 +3869,27 @@ impl SimplifiedP2P {
                     
                     if effective_alive < min_connections {
                         // Get known peers from P2P layer (not just bootstrap)
-                        let peers_to_try: Vec<String> = connected_peers_lockfree
+                        let mut peers_to_try: Vec<String> = connected_peers_lockfree
                             .iter()
                             .filter(|entry| entry.value().id != node_id)
                             .take(10) // Limit reconnection attempts
                             .map(|entry| entry.key().clone())
                             .collect();
+                        
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        // CRITICAL FIX v2.93: Fallback to Genesis bootstrap when NO peers available
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        // Without this, a node that loses ALL connections can NEVER rejoin the network!
+                        // Genesis nodes are always available as bootstrap points for recovery.
+                        if peers_to_try.is_empty() {
+                            println!("[CRIT][P2P] no_known_peers action=genesis_fallback");
+                            
+                            // Use Genesis IPs as recovery bootstrap
+                            let genesis_ips = crate::genesis_constants::GENESIS_NODE_IPS;
+                            for (ip, _id) in genesis_ips.iter() {
+                                peers_to_try.push(format!("{}:8001", ip));
+                            }
+                        }
                         
                         if !peers_to_try.is_empty() {
                             println!("[QUIC] 🔄 Low connections ({}/{}), attempting reconnect to {} peers...", 
@@ -3933,7 +3948,7 @@ impl SimplifiedP2P {
                 let mut to_remove: Vec<String> = Vec::new();
 
                 // Collect peers for parallel checking
-                let all_peers: Vec<(String, String, bool)> = connected_peers.iter()
+                let mut all_peers: Vec<(String, String, bool)> = connected_peers.iter()
                     .map(|entry| {
                         let peer = entry.value();
                         let is_genesis = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
@@ -3941,8 +3956,29 @@ impl SimplifiedP2P {
                     })
                     .collect();
 
+                // ═══════════════════════════════════════════════════════════════════════════
+                // CRITICAL FIX v2.93: Auto-reconnect to Genesis when ALL peers lost
+                // ═══════════════════════════════════════════════════════════════════════════
+                // Without this fix, a node that loses all connections can NEVER rejoin!
                 if all_peers.is_empty() {
-                    continue;
+                    println!("[CRIT][P2P] no_peers_connected action=genesis_recovery");
+                    
+                    // Try to reconnect to Genesis nodes
+                    for (i, ip) in genesis_ips.iter().enumerate() {
+                        let addr = format!("{}:8001", ip);
+                        
+                        // Add Genesis as peer for reconnection attempt
+                        all_peers.push((addr.clone(), ip.clone(), true));
+                        
+                        if crate::node::is_debug() {
+                            println!("[DBG][P2P] genesis_recovery_target idx={} ip={}", i + 1, ip);
+                        }
+                    }
+                    
+                    // If still empty after adding Genesis, skip this iteration
+                    if all_peers.is_empty() {
+                        continue;
+                    }
                 }
 
                 // Parallel connectivity checks
@@ -4107,10 +4143,18 @@ impl SimplifiedP2P {
                     Err(p) => p.into_inner().clone(),
                 };
                 
-                // Broadcast via QUIC to each peer (parallel, binary)
-                let mut results: Vec<crate::p2p_transport::BroadcastResult> = Vec::new();
+                // ═══════════════════════════════════════════════════════════════════════════
+                // CRITICAL FIX v2.93: PARALLEL broadcast to all peers
+                // ═══════════════════════════════════════════════════════════════════════════
+                // SOLUTION: Parallel broadcast with individual timeouts
+                // - All peers receive simultaneously
+                // - One bad peer doesn't block others
+                // - Total time = max(individual times), not sum
+                // ═══════════════════════════════════════════════════════════════════════════
+                
+                // Prepare broadcast targets (filter self and parse addresses)
+                let mut broadcast_targets: Vec<(String, std::net::SocketAddr)> = Vec::new();
                 for peer in &filtered_peers {
-                    // Skip self
                     if peer.id == self.node_id {
                         continue;
                     }
@@ -4118,7 +4162,6 @@ impl SimplifiedP2P {
                     let parts: Vec<&str> = peer.addr.split(':').collect();
                     if parts.len() != 2 { continue; }
                     
-                    // Skip our own IP
                     if let Some(ref own_ip) = our_ip {
                         if parts[0] == own_ip {
                             continue;
@@ -4128,29 +4171,59 @@ impl SimplifiedP2P {
                     if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
                         let quic_port = port.saturating_add(QUIC_PORT_OFFSET);
                         let quic_addr = std::net::SocketAddr::new(ip, quic_port);
+                        broadcast_targets.push((peer.addr.clone(), quic_addr));
+                    }
+                }
+                
+                // Release read lock before spawning tasks
+                drop(transport);
+                
+                // Spawn parallel broadcast tasks
+                let transport_arc = quic_transport.clone();
+                let block_msg_arc = Arc::new(block_msg.clone());
+                
+                let tasks: Vec<_> = broadcast_targets.into_iter()
+                    .map(|(peer_addr, quic_addr)| {
+                        let transport_clone = transport_arc.clone();
+                        let msg_clone = block_msg_arc.clone();
                         
-                        let start = std::time::Instant::now();
-                        match transport.broadcast_to(quic_addr, &block_msg).await {
-                            Ok(_) => {
-                                results.push(crate::p2p_transport::BroadcastResult {
-                                    peer_addr: peer.addr.clone(),
+                        tokio::spawn(async move {
+                            let start = std::time::Instant::now();
+                            let transport = transport_clone.read().await;
+                            
+                            match transport.broadcast_to(quic_addr, &msg_clone).await {
+                                Ok(_) => crate::p2p_transport::BroadcastResult {
+                                    peer_addr,
                                     success: true,
                                     rtt_ms: Some(start.elapsed().as_millis() as u64),
                                     error: None,
-                                });
-                            }
-                            Err(e) => {
-                                results.push(crate::p2p_transport::BroadcastResult {
-                                    peer_addr: peer.addr.clone(),
+                                },
+                                Err(e) => crate::p2p_transport::BroadcastResult {
+                                    peer_addr,
                                     success: false,
                                     rtt_ms: None,
                                     error: Some(format!("{}", e)),
-                                });
+                                },
                             }
-                        }
+                        })
+                    })
+                    .collect();
+                
+                // Wait for all broadcasts with global timeout (prevents infinite hang)
+                let results: Vec<crate::p2p_transport::BroadcastResult> = match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),  // 10s global timeout for all broadcasts
+                    join_all(tasks)
+                ).await {
+                    Ok(task_results) => {
+                        task_results.into_iter()
+                            .filter_map(|r| r.ok())
+                            .collect()
                     }
-                }
-                let results = results;
+                    Err(_) => {
+                        println!("[WARN][BROADCAST] h={} global_timeout=10s", height);
+                        Vec::new()
+                    }
+                };
                 
                 // Count successes
                 let success_count = results.iter().filter(|r| r.success).count();
@@ -18678,11 +18751,13 @@ impl SimplifiedP2P {
     }
     
     fn select_emergency_producer_excluding(&self, exclude: &str, height: u64) -> String {
-        // v2.27.0: Use epoch-based snapshot for deterministic selection (same as node.rs)
+        // v2.92: Use N-2 epoch-based snapshot for deterministic selection (SAME as node.rs!)
         // This ensures all nodes agree on emergency producer even for critical attacks
         
-        // Get candidates from macroblock snapshot (same logic as calculate_qualified_candidates)
-        let macroblock_index = if height <= 90 { 0 } else { (height - 1) / 90 };
+        // Get candidates from macroblock snapshot (MUST use N-2 for consistency!)
+        // FIX v2.92: Was N-1, now N-2 to match calculate_qualified_candidates in node.rs
+        let current_epoch = if height <= 90 { 1 } else { (height - 1) / 90 + 1 };
+        let macroblock_index = current_epoch.saturating_sub(2);  // N-2!
         
         // Try to get from macroblock snapshot first
         // PRODUCTION v2.50: Lock-free storage access

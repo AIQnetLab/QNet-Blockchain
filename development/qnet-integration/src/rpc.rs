@@ -1176,40 +1176,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::header::headers_cloned())
-        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
-        .and_then(|headers: warp::http::HeaderMap, remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>| async move {
-            // Register requester as peer
-            if let Some(addr) = remote_addr {
-                let requester_ip = addr.ip().to_string();
-                
-                // Only register if it's a real external IP (not localhost or Docker internal)
-                if !requester_ip.starts_with("127.") 
-                    && !requester_ip.starts_with("::1") 
-                    && requester_ip != "0.0.0.0"
-                    && !requester_ip.starts_with("172.17.")  // Docker bridge network
-                    && !requester_ip.starts_with("172.18.")  // Docker custom networks
-                    && !requester_ip.starts_with("10.")       // Private network range
-                    && !requester_ip.starts_with("192.168.")  // Private network range
-                {
-                    let requester_addr = format!("{}:8001", requester_ip);
-                    
-                    // SCALABILITY FIX: Use existing P2P system with built-in rate limiting and peer limits
-                    // System already handles max_peers_per_region through load balancing (8 peers per region max)
-                    if let Some(p2p) = blockchain.get_unified_p2p() {
-                        // CRITICAL: Don't add if this is our own external IP (self-connection via public IP)
-                        // This check is now done inside add_discovered_peers()
-                        // QUANTUM: Unlimited peer scalability with cryptographic validation
-                        // Use EXISTING add_discovered_peers() with built-in quantum-resistant verification
-                        p2p.add_discovered_peers(&[requester_addr.clone()]);
-                        // Use privacy ID instead of IP
-                        let privacy_id = crate::unified_p2p::get_privacy_id_for_addr(&requester_addr);
-                        println!("[API] 🔄 QUANTUM: Registered peer via cryptographic verification: {}", privacy_id);
-                    }
-                }
-            }
+        .and_then(|headers: warp::http::HeaderMap, blockchain: Arc<BlockchainNode>| async move {
+            // FIX v2.92: REMOVED auto-registration of API clients as peers
+            // PROBLEM: Any browser/explorer making API request was added as P2P peer
+            // This caused nodes to endlessly try connecting to non-node IPs (node_80e2b6c2 bug)
+            // leading to network split and emergency failover cascade
+            // 
+            // CORRECT BEHAVIOR: Only nodes that explicitly register via /api/v1/register 
+            // with valid signatures should become peers
             
-            // Return current peer list as before
+            // Return current peer list
             let peers = blockchain.get_connected_peers().await.unwrap_or_default();
             
             // API FIX: Filter out invalid peers and calculate correct last_seen
