@@ -181,7 +181,7 @@ export default function Page() {
               <div className="download-grid">
                 <div className="download-card">
                   <div className="app-logo">
-                    <img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" alt="Download on App Store" style={{width: '120px', height: 'auto'}} />
+                    <img src="/badges/app-store.svg" alt="Download on App Store" style={{width: '120px', height: 'auto'}} />
                   </div>
                   <h3>iOS App</h3>
                   <p>iPhone and iPad compatible wallet with biometric security</p>
@@ -193,7 +193,7 @@ export default function Page() {
                 
                 <div className="download-card">
                   <div className="app-logo">
-                    <img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" alt="Get it on Google Play" style={{width: '120px', height: 'auto'}} />
+                    <img src="/badges/google-play.png" alt="Get it on Google Play" style={{width: '120px', height: 'auto'}} />
                   </div>
                   <h3>Android App</h3>
                   <p>Full-featured wallet with hardware security module support</p>
@@ -279,8 +279,8 @@ export default function Page() {
           </div>
           <div className="footer-right">
             <div style={{marginBottom: '1rem'}}>
-              <img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" alt="App Store" style={{width: '100px', marginRight: '10px'}} />
-              <img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" alt="Google Play" style={{width: '100px'}} />
+              <img src="/badges/app-store.svg" alt="App Store" style={{width: '100px', marginRight: '10px'}} />
+              <img src="/badges/google-play.png" alt="Google Play" style={{width: '100px'}} />
             </div>
             <p style={{fontSize: '0.8rem'}}>July 2025 Launch</p>
           </div>

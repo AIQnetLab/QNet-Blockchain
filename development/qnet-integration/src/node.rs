@@ -2750,9 +2750,12 @@ impl BlockchainNode {
         let mut txs_found = 0;
         
         // Scan blocks for HeartbeatCommitment TXs
+        // CRITICAL FIX v2.99: Use load_microblock_auto_format() instead of load_microblock()
+        // EfficientMicroBlock stores TX hashes only - full TXs are in separate CF
+        // load_microblock_auto_format() reconstructs full block WITH transactions
         for height in window_start_height..=window_end_height {
-            if let Ok(Some(block_bytes)) = storage.load_microblock(height) {
-                if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_bytes) {
+            // v2.99: Auto-format loader handles both EfficientMicroBlock and legacy MicroBlock
+            if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
                     blocks_scanned += 1;
                     
                     for tx in &block.transactions {
@@ -2821,7 +2824,6 @@ impl BlockchainNode {
                                 if is_warn() {
                                     println!("[WARN][HEARTBEAT-COLLECTION] Commitment from {} rejected: {}/{} valid signatures",
                                              node_id, valid_samples, heartbeat_samples.len());
-                                }
                             }
                         }
                     }
@@ -4843,49 +4845,11 @@ impl BlockchainNode {
                 }
             }
             
-            // CRITICAL FIX: Register Genesis node in BlockchainActivationRegistry
-            // This ensures ALL nodes see Genesis in Registry for deterministic consensus
-            {
-                // PRODUCTION v2.50: Lock-free storage access
-                let storage_ref = try_get_storage().cloned();
-                let registry = crate::activation_validation::BlockchainActivationRegistry::new_with_storage(
-                    None, // Use default RPC
-                    storage_ref
-                );
-                
-                let genesis_node_id = format!("genesis_node_{}", bootstrap_id);
-                let genesis_wallet = crate::genesis_constants::get_genesis_wallet_by_id(&bootstrap_id)
-                    .expect("Genesis wallet must exist")
-                    .to_string();
-                
-                let current_time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                
-                let genesis_node_id = format!("genesis_node_{}", bootstrap_id);
-                let node_info = crate::activation_validation::NodeInfo {
-                    activation_code: format!("genesis_activation_{}", bootstrap_id),
-                    wallet_address: genesis_wallet.clone(),
-                    device_signature: format!("genesis_device_{}", bootstrap_id),
-                    node_type: "Super".to_string(),
-                    activated_at: current_time,
-                    last_seen: current_time,
-                    migration_count: 0,
-                    node_id: genesis_node_id.clone(), // CRITICAL: Link to network node
-                    burn_tx_hash: format!("genesis_burn_{}", bootstrap_id), // Genesis nodes have special burn_tx
-                    phase: 1, // Genesis nodes are Phase 1
-                    burn_amount: 0, // Genesis nodes don't use XOR encryption
-                };
-                
-                if let Err(e) = registry.register_activation_on_blockchain(
-                    &format!("genesis_activation_{}", bootstrap_id), 
-                    node_info
-                ).await {
-                    println!("[WARN][REGISTRY] genesis_register_failed err={}", e);
-                } else {
-                    if is_info() { println!("[INFO][REGISTRY] genesis_registered node={}", genesis_node_id); }
-                }
+            // v2.95: Genesis nodes are ALREADY registered in block 0 via NodeRegistration TX
+            // DO NOT create duplicate Activation TX - this was causing spurious TX on block ~61
+            // Genesis registration is handled by genesis block creation, not runtime activation
+            if is_info() { 
+                println!("[INFO][REGISTRY] genesis_node_{} already registered in genesis block (no duplicate TX)", bootstrap_id); 
             }
             
             // Reward processing is handled by RPC system, not by individual nodes
@@ -7666,12 +7630,17 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
     /// PRODUCTION v2.78: Start commitment TX submission loop
     /// Runs in parallel with block production to submit HeartbeatCommitment and PingCommitment TXs
     /// Submission window: last 50 blocks before epoch end (e.g., blocks 14350-14399)
+    /// 
+    /// v3.0 FIX: Uses select_microblock_producer to determine CURRENT producer
+    /// This fixes race condition where current_producer_info was stale
     async fn start_commitment_tx_loop(&self) {
         let storage = self.storage.clone();
         let height = self.height.clone();
         let unified_p2p = self.unified_p2p.clone();
         let mempool = self.mempool.clone();
         let node_id = self.node_id.clone();
+        let node_type = self.node_type.clone(); // v3.0: For producer selection
+        let quantum_poh = self.quantum_poh.clone(); // v3.0: For producer selection
         let sent_heartbeat_commitments = self.sent_heartbeat_commitments.clone();
         let sent_ping_commitments = self.sent_ping_commitments.clone();
         let is_running = self.is_running.clone();
@@ -7754,8 +7723,98 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                              current_epoch, &tx.hash[..16]);
                                                 }
                                                 
-                                                // CRITICAL FIX v2.81: Broadcast TX to network (Gulf Stream to producer + backup peers)
-                                                // Without this, TX stays in local mempool and won't reach block producer!
+                                                // ═══════════════════════════════════════════════════════════════════
+                                                // v3.0 FIX: Deterministic producer forwarding (scalable Gulf Stream)
+                                                // ═══════════════════════════════════════════════════════════════════
+                                                // PROBLEM: Old code used current_producer_info which was stale (race condition)
+                                                // SOLUTION: Calculate producers for NEXT blocks using same deterministic algorithm
+                                                // SCALABILITY: O(1) via CACHED_PRODUCER_SELECTION, works with thousands of producers
+                                                // 
+                                                // CRITICAL: TX will be included in block (current_height + 1) or later
+                                                // Must send to producer of NEXT block, not current!
+                                                // Also handle rotation boundary: if next block is new round, send to both!
+                                                // ═══════════════════════════════════════════════════════════════════
+                                                
+                                                // Step 1: Determine producer for NEXT block (current_height + 1)
+                                                let next_height = current_height + 1;
+                                                let producer_next = Self::select_microblock_producer(
+                                                    next_height,
+                                                    &unified_p2p,
+                                                    &node_id,
+                                                    node_type.clone(),
+                                                    Some(&storage),
+                                                    &quantum_poh,
+                                                ).await;
+                                                
+                                                // Step 2: Check if we're near rotation boundary (next 2 blocks may have different producers)
+                                                let producer_next_plus_one = Self::select_microblock_producer(
+                                                    next_height + 1,
+                                                    &unified_p2p,
+                                                    &node_id,
+                                                    node_type.clone(),
+                                                    Some(&storage),
+                                                    &quantum_poh,
+                                                ).await;
+                                                
+                                                // Step 3: Forward TX to producer(s) - handle rotation boundary
+                                                let mut forwarded_to_producer = false;
+                                                let mut sent_to: Vec<String> = Vec::new();
+                                                
+                                                // Forward to producer of next block
+                                                if !producer_next.is_empty() && producer_next != node_id {
+                                                    if let Some(producer_addr) = p2p.get_peer_addr_by_id(&producer_next) {
+                                                        let tx_msg = NetworkMessage::Transaction { 
+                                                            data: tx_bytes_for_broadcast.clone() 
+                                                        };
+                                                        p2p.send_network_message(&producer_addr, tx_msg);
+                                                        forwarded_to_producer = true;
+                                                        sent_to.push(producer_next.clone());
+                                                    }
+                                                }
+                                                
+                                                // If rotation boundary (different producer for +2), also forward to that producer
+                                                if producer_next_plus_one != producer_next && 
+                                                   !producer_next_plus_one.is_empty() && 
+                                                   producer_next_plus_one != node_id {
+                                                    if let Some(producer_addr) = p2p.get_peer_addr_by_id(&producer_next_plus_one) {
+                                                        let tx_msg = NetworkMessage::Transaction { 
+                                                            data: tx_bytes_for_broadcast.clone() 
+                                                        };
+                                                        p2p.send_network_message(&producer_addr, tx_msg);
+                                                        forwarded_to_producer = true;
+                                                        sent_to.push(producer_next_plus_one.clone());
+                                                    }
+                                                }
+                                                
+                                                // Step 4: Check for emergency producer (failover scenario)
+                                                // If network stalled and emergency producer was activated, send to them too
+                                                if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                                                    if let Some((emergency_height, emergency_producer)) = &*emergency_flag {
+                                                        // Emergency producer for next blocks?
+                                                        if *emergency_height >= next_height && 
+                                                           emergency_producer != &node_id &&
+                                                           !sent_to.contains(emergency_producer) {
+                                                            if let Some(producer_addr) = p2p.get_peer_addr_by_id(emergency_producer) {
+                                                                let tx_msg = NetworkMessage::Transaction { 
+                                                                    data: tx_bytes_for_broadcast.clone() 
+                                                                };
+                                                                p2p.send_network_message(&producer_addr, tx_msg);
+                                                                forwarded_to_producer = true;
+                                                                sent_to.push(emergency_producer.clone());
+                                                                if is_info() {
+                                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX forwarded to EMERGENCY producer={}", emergency_producer);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                if is_info() && forwarded_to_producer {
+                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX forwarded to producers={:?} next_h={}", 
+                                                             sent_to, next_height);
+                                                }
+                                                
+                                                // Step 3: Backup gossip (reliability - if producer fails or network issues)
                                                 if let Err(e) = p2p.broadcast_transaction(tx_bytes_for_broadcast) {
                                                     if is_warn() {
                                                         println!("[WARN][HEARTBEAT-COMMITMENT] Broadcast failed epoch={} error={}", 
@@ -7763,8 +7822,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                     }
                                                 } else {
                                                     if is_info() {
-                                                        println!("[INFO][HEARTBEAT-COMMITMENT] TX broadcast to network epoch={} hash={}", 
-                                                                 current_epoch, &tx.hash[..16]);
+                                                        println!("[INFO][HEARTBEAT-COMMITMENT] TX broadcast to network epoch={} hash={} direct_fwd={}", 
+                                                                 current_epoch, &tx.hash[..16], forwarded_to_producer);
                                                     }
                                                 }
                                             } else {
@@ -7902,6 +7961,75 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                         println!("[INFO][LIGHT-BITMAP] TX submitted to mempool epoch={}", current_epoch);
                                                     }
                                                     
+                                                    // v3.0: Deterministic producer forwarding with rotation boundary handling
+                                                    let next_height = current_height + 1;
+                                                    let producer_next = Self::select_microblock_producer(
+                                                        next_height,
+                                                        &unified_p2p,
+                                                        &node_id,
+                                                        node_type.clone(),
+                                                        Some(&storage),
+                                                        &quantum_poh,
+                                                    ).await;
+                                                    
+                                                    let producer_next_plus_one = Self::select_microblock_producer(
+                                                        next_height + 1,
+                                                        &unified_p2p,
+                                                        &node_id,
+                                                        node_type.clone(),
+                                                        Some(&storage),
+                                                        &quantum_poh,
+                                                    ).await;
+                                                    
+                                                    // Forward to producer of next block
+                                                    if !producer_next.is_empty() && producer_next != node_id {
+                                                        if let Some(producer_addr) = p2p.get_peer_addr_by_id(&producer_next) {
+                                                            let tx_msg = NetworkMessage::Transaction { 
+                                                                data: tx_bytes_for_broadcast.clone() 
+                                                            };
+                                                            p2p.send_network_message(&producer_addr, tx_msg);
+                                                            if is_info() {
+                                                                println!("[INFO][LIGHT-BITMAP] TX forwarded to producer={}", producer_next);
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    // Handle rotation boundary
+                                                    if producer_next_plus_one != producer_next && 
+                                                       !producer_next_plus_one.is_empty() && 
+                                                       producer_next_plus_one != node_id {
+                                                        if let Some(producer_addr) = p2p.get_peer_addr_by_id(&producer_next_plus_one) {
+                                                            let tx_msg = NetworkMessage::Transaction { 
+                                                                data: tx_bytes_for_broadcast.clone() 
+                                                            };
+                                                            p2p.send_network_message(&producer_addr, tx_msg);
+                                                            if is_info() {
+                                                                println!("[INFO][LIGHT-BITMAP] TX forwarded to next_producer={} (rotation)", producer_next_plus_one);
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    // Handle emergency producer (failover)
+                                                    if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                                                        if let Some((emergency_height, emergency_producer)) = &*emergency_flag {
+                                                            if *emergency_height >= next_height && 
+                                                               emergency_producer != &node_id &&
+                                                               emergency_producer != &producer_next &&
+                                                               emergency_producer != &producer_next_plus_one {
+                                                                if let Some(producer_addr) = p2p.get_peer_addr_by_id(emergency_producer) {
+                                                                    let tx_msg = NetworkMessage::Transaction { 
+                                                                        data: tx_bytes_for_broadcast.clone() 
+                                                                    };
+                                                                    p2p.send_network_message(&producer_addr, tx_msg);
+                                                                    if is_info() {
+                                                                        println!("[INFO][LIGHT-BITMAP] TX forwarded to EMERGENCY producer={}", emergency_producer);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    // Backup gossip
                                                     if let Err(e) = p2p.broadcast_transaction(tx_bytes_for_broadcast) {
                                                         if is_warn() {
                                                             println!("[WARN][LIGHT-BITMAP] Broadcast failed: {}", e);
@@ -10560,15 +10688,21 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         
                         let current_epoch = next_block_height / EMISSION_BLOCK_INTERVAL;
                         
-                        // Skip first emission block (epoch 0 has no previous epoch to reward)
-                        if current_epoch > 0 {
-                            let prev_epoch = current_epoch - 1;
-                            let prev_epoch_end_block = (prev_epoch + 1) * EMISSION_BLOCK_INTERVAL;
-                            let prev_macroblock_index = prev_epoch_end_block / 90;
+                        // CRITICAL FIX v2.99: DELAYED REWARD by 1 full epoch
+                        // - Block 14400 (current_epoch=1): SKIP - MacroBlock 160 still being created (race!)
+                        // - Block 28800 (current_epoch=2): Emission for epoch 0, using MacroBlock 160
+                        // - Block 43200 (current_epoch=3): Emission for epoch 1, using MacroBlock 320
+                        // 
+                        // Formula: rewarding_epoch = current_epoch - 2 (delayed by 1 full epoch)
+                        // This ensures MacroBlock is FINALIZED before emission reads it (4 hours gap!)
+                        if current_epoch > 1 {
+                            let rewarding_epoch = current_epoch - 2;  // Delayed by 1 epoch
+                            let rewarding_epoch_end_block = (rewarding_epoch + 1) * EMISSION_BLOCK_INTERVAL;
+                            let prev_macroblock_index = rewarding_epoch_end_block / 90;
                             
                             if is_info() {
-                                println!("[INFO][EMISSION] block={} epoch={} rewarding_prev_epoch={} mb={}", 
-                                         next_block_height, current_epoch, prev_epoch, prev_macroblock_index);
+                                println!("[INFO][EMISSION] block={} current_epoch={} rewarding_epoch={} mb={}", 
+                                         next_block_height, current_epoch, rewarding_epoch, prev_macroblock_index);
                             }
                             
                             // Load PREVIOUS MacroBlock (always ready - no waiting!)

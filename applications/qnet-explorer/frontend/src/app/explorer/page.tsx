@@ -60,6 +60,8 @@ function getBadgeClass(type: string): string {
     'Smart Contract': 'badge-contract',
     'System': 'badge-system',
     'Registration': 'badge-registration',
+    'Heartbeat': 'badge-heartbeat',
+    'Validator': 'badge-validator',
   };
   return classes[type] || 'badge-default';
 }
@@ -117,7 +119,7 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
 const ITEMS_PER_PAGE = 50;
 
 // All available transaction types for filter
-const TX_TYPES = ['All', 'Transfer', 'Reward', 'Registration', 'Node Activation', 'Smart Contract', 'System', 'Swap'];
+const TX_TYPES = ['Transfer', 'Heartbeat', 'Validator', 'Reward', 'Registration', 'Node Activation', 'Smart Contract', 'System', 'Swap'];
 
 export default function ExplorerPage() {
   // Initialize state without cache to avoid hydration mismatch
@@ -129,7 +131,7 @@ export default function ExplorerPage() {
   const [totalPages, setTotalPages] = useState(1);
   const [totalCount, setTotalCount] = useState(0);
   const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
-  const [typeFilter, setTypeFilter] = useState('All');
+  const [typeFilters, setTypeFilters] = useState<string[]>([]); // Empty = show all
   const [mounted, setMounted] = useState(false);
   const initialLoadDone = useRef(false);
 
@@ -148,30 +150,31 @@ export default function ExplorerPage() {
   const filteredAndSortedActivity = useMemo(() => {
     let items = Array.from(transactionMap.values());
     
-    // Filter by type
-    if (typeFilter !== 'All') {
-      items = items.filter(tx => tx.type === typeFilter);
+    // Filter by types (multiple selection)
+    if (typeFilters.length > 0) {
+      items = items.filter(tx => typeFilters.includes(tx.type));
     }
     
-    // Sort by TIME (timestamp)
+    // PRIMARY SORT: By BLOCK HEIGHT (newest blocks first when desc)
+    // SECONDARY SORT: By timestamp within same block
     const sorted = [...items].sort((a, b) => {
-      // Convert to number (handle both number and string timestamps)
+      // Primary sort by block height
+      const blockA = typeof a.block === 'number' ? a.block : Number(a.block) || 0;
+      const blockB = typeof b.block === 'number' ? b.block : Number(b.block) || 0;
+      
+      if (blockA !== blockB) {
+        return sortOrder === 'desc' ? (blockB - blockA) : (blockA - blockB);
+      }
+      
+      // Secondary sort by timestamp within same block
       let tsA = typeof a.timestamp === 'number' ? a.timestamp : Number(a.timestamp) || 0;
       let tsB = typeof b.timestamp === 'number' ? b.timestamp : Number(b.timestamp) || 0;
-      
-      // Normalize to milliseconds: if timestamp < 1e12, it's in seconds
-      if (tsA > 0 && tsA < 1e12) {
-        tsA = tsA * 1000;
-      }
-      if (tsB > 0 && tsB < 1e12) {
-        tsB = tsB * 1000;
-      }
       
       return sortOrder === 'desc' ? (tsB - tsA) : (tsA - tsB);
     });
     
     return sorted;
-  }, [transactionMap, sortOrder, typeFilter]);
+  }, [transactionMap, sortOrder, typeFilters]);
 
   // Fetch activity for specific page
   const fetchActivity = useCallback(async (pageNum: number, forceRefresh: boolean = false) => {
@@ -314,18 +317,36 @@ export default function ExplorerPage() {
         <div className="activity-header">
           <h2>All Transactions</h2>
           <div className="activity-controls">
-            <select 
-              className="type-filter"
-              value={typeFilter}
-              onChange={(e) => setTypeFilter(e.target.value)}
-            >
-              {TX_TYPES.map(type => (
-                <option key={type} value={type}>{type}</option>
-              ))}
-            </select>
+            <div className="type-filter-multi">
+              <div className="filter-chips">
+                {TX_TYPES.map(type => (
+                  <button
+                    key={type}
+                    className={`filter-chip ${typeFilters.includes(type) ? 'active' : ''}`}
+                    onClick={() => {
+                      setTypeFilters(prev => 
+                        prev.includes(type) 
+                          ? prev.filter(t => t !== type)
+                          : [...prev, type]
+                      );
+                    }}
+                  >
+                    {type}
+                  </button>
+                ))}
+                {typeFilters.length > 0 && (
+                  <button 
+                    className="filter-chip clear-btn"
+                    onClick={() => setTypeFilters([])}
+                  >
+                    ✕ Clear
+                  </button>
+                )}
+              </div>
+            </div>
             <span className="tx-count">
               {filteredAndSortedActivity.length} transactions
-              {typeFilter !== 'All' && ` (${typeFilter})`}
+              {typeFilters.length > 0 && ` (${typeFilters.join(', ')})`}
             </span>
           </div>
         </div>
@@ -336,7 +357,7 @@ export default function ExplorerPage() {
           ) : filteredAndSortedActivity.length === 0 ? (
             <div className="empty-state">
               <p>No transactions found</p>
-              <span>{typeFilter !== 'All' ? `No ${typeFilter} transactions yet` : 'Waiting for network activity...'}</span>
+              <span>{typeFilters.length > 0 ? `No ${typeFilters.join('/')} transactions yet` : 'Waiting for network activity...'}</span>
             </div>
           ) : (
             <table className="activity-table">
@@ -346,14 +367,14 @@ export default function ExplorerPage() {
                   <th>TYPE</th>
                   <th>FROM → TO</th>
                   <th>AMOUNT</th>
-                  <th>BLOCK</th>
                   <th 
                     className="sortable-header"
                     onClick={toggleSort}
-                    title="Click to sort"
+                    title="Click to sort by block height"
                   >
-                    TIME {sortOrder === 'desc' ? '↓' : '↑'}
+                    BLOCK {sortOrder === 'desc' ? '↓' : '↑'}
                   </th>
+                  <th>TIME</th>
                 </tr>
               </thead>
               <tbody>

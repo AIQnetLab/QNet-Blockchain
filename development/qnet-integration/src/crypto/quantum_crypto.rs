@@ -1097,6 +1097,16 @@ impl QNetQuantumCrypto {
         payload: &ActivationPayload,
         node_pubkey: &str
     ) -> Result<()> {
+        // v2.95: Genesis nodes are ALREADY registered in block 0 via NodeRegistration TX
+        // Skip duplicate activation TX for genesis bootstrap codes
+        if activation_code.starts_with("QNET-BOOT-") {
+            println!("Genesis node already registered in genesis block (skipping duplicate activation TX)");
+            println!("   Node: {}...", safe_preview(node_pubkey, 8));
+            println!("   Wallet: {}...", safe_preview(&payload.wallet, 8));
+            println!("   Type: {}", payload.node_type);
+            return Ok(());
+        }
+        
         println!("📝 Recording activation in QNet blockchain...");
         
         // Use existing activation validation infrastructure

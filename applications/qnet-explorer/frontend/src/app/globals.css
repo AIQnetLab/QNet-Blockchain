@@ -1629,8 +1629,10 @@ main.qnet-container {
 }
 
 .google-play-badge img {
-  height: 44px; 
+  height: 66px !important; 
   width: auto;
+  margin-top: -11px;
+  margin-bottom: -11px;
 }
 
 .activation-card {
@@ -1697,8 +1699,10 @@ a[href*="play.google.com"] {
 }
 
 a[href*="play.google.com"] img {
-  height: 100% !important;
+  height: 66px !important;
   width: auto !important;
+  margin-top: -11px !important;
+  margin-bottom: -11px !important;
 }
 
 .activation-card .activation-content {
@@ -3303,6 +3307,55 @@ a[href*="play.google.com"] img {
   padding: 8px;
 }
 
+/* Multi-select filter chips */
+.type-filter-multi {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0.5rem;
+}
+
+.filter-chips {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0.4rem;
+  align-items: center;
+  overflow-x: auto;
+}
+
+.filter-chip {
+  padding: 0.35rem 0.7rem;
+  background: rgba(0, 20, 30, 0.6);
+  border: 1px solid rgba(0, 220, 240, 0.2);
+  border-radius: 20px;
+  color: #8b9caa;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.filter-chip:hover {
+  border-color: rgba(0, 220, 240, 0.5);
+  color: #00e5f0;
+}
+
+.filter-chip.active {
+  background: rgba(0, 220, 240, 0.15);
+  border-color: #00e5f0;
+  color: #00e5f0;
+}
+
+.filter-chip.clear-btn {
+  background: rgba(240, 100, 100, 0.1);
+  border-color: rgba(240, 100, 100, 0.3);
+  color: #f06464;
+}
+
+.filter-chip.clear-btn:hover {
+  background: rgba(240, 100, 100, 0.2);
+  border-color: #f06464;
+}
+
 /* Sortable table header */
 .sortable-header {
   cursor: pointer;
@@ -3389,6 +3442,8 @@ a[href*="play.google.com"] img {
 .badge-contract { background: rgba(240,130,130,0.15); color: #f09090; }
 .badge-system { background: rgba(160,100,240,0.15); color: #a080f0; }
 .badge-registration { background: rgba(0,200,255,0.15); color: #00c8ff; } /* Node Registration - cyan */
+.badge-heartbeat { background: rgba(255,100,150,0.2); color: #ff6496; } /* Heartbeat - pink/red pulse */
+.badge-validator { background: rgba(100,255,200,0.2); color: #64ffc8; } /* Validator - green */
 .badge-default { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.55); }
 
 .col-type {

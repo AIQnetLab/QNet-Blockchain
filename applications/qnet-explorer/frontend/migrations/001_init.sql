@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     nonce NUMERIC(20,0) NOT NULL,
     block BIGINT NOT NULL,
     timestamp BIGINT NOT NULL,
-    gas_price BIGINT NOT NULL DEFAULT 0,
+    gas_price NUMERIC(20,0) NOT NULL DEFAULT 0,
     gas_limit BIGINT NOT NULL DEFAULT 0,
     signature TEXT,
     public_key TEXT,
