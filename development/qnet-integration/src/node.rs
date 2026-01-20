@@ -11616,11 +11616,19 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             validation_futures.push(tokio::spawn(async move {
                                 // Validate each transaction in parallel
                                 for tx in batch {
-                                    // v2.69: System TX bypass signature/amount validation
-                                    // Like Bitcoin coinbase, Ethereum block rewards - no user signature needed
+                                    // v2.93: System TX bypass signature/amount validation
+                                    // CRITICAL FIX: Check by tx_type NOT just by from field!
+                                    // HeartbeatCommitment has from=node_id, not "system_*"
                                     let is_system_tx = tx.from == "system_emission" 
                                         || tx.from == "system_ping_commitment"
-                                        || tx.from.starts_with("system_");
+                                        || tx.from.starts_with("system_")
+                                        || matches!(tx.tx_type, 
+                                            qnet_state::TransactionType::HeartbeatCommitment { .. } |
+                                            qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
+                                            qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
+                                            qnet_state::TransactionType::RewardDistribution { .. } |
+                                            qnet_state::TransactionType::NodeRegistration { .. }
+                                        );
                                     
                                     if is_system_tx {
                                         // System TX: only basic validation (no signature/amount check)
@@ -11632,7 +11640,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                         return false;
                                     }
                                     // Additional parallel checks: signature, balance, nonce
-                                    // v2.69: Only for USER transactions (system TX already skipped above)
+                                    // v2.93: Only for USER transactions (system TX already skipped above)
                                     if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
                                         return false;
                                     }
@@ -19502,10 +19510,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // CRITICAL SECURITY: Check nonce BEFORE adding to mempool
         // This prevents DoS attacks where attacker floods mempool with invalid nonces
-        // v2.65: System transactions bypass nonce check
+        // v2.93: System transactions bypass nonce check - use tx_type NOT from field!
+        // HeartbeatCommitment has from=node_id, not "system_*"
         let is_system_tx = tx.from == "system_emission" 
             || tx.from == "system_ping_commitment"
-            || tx.from.starts_with("system_");
+            || tx.from.starts_with("system_")
+            || matches!(tx.tx_type,
+                qnet_state::TransactionType::HeartbeatCommitment { .. } |
+                qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
+                qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
+                qnet_state::TransactionType::RewardDistribution |
+                qnet_state::TransactionType::NodeRegistration { .. }
+            );
         
         if !is_system_tx {
             let state = self.state.read().await;
