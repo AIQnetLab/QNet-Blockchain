@@ -1182,7 +1182,8 @@ impl BlockchainNode {
             eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         }
         
-        if is_info() { println!("[INFO][SNAP] eligible={} source=consensus_participants", eligible.len()); }
+        // NOTE: This is consensus_participants, NOT heartbeat eligible! For rewards see reward_heartbeats
+        if is_debug() { println!("[DBG][SNAP] consensus_participants={} (NOT heartbeat eligible!)", eligible.len()); }
         eligible
     }
     
@@ -7737,6 +7738,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                 
                                                 // Step 1: Determine producer for NEXT block (current_height + 1)
                                                 let next_height = current_height + 1;
+                                                // v3.1: Deterministic producer selection for Gulf Stream
                                                 let producer_next = Self::select_microblock_producer(
                                                     next_height,
                                                     &unified_p2p,
@@ -7756,6 +7758,11 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                     &quantum_poh,
                                                 ).await;
                                                 
+                                                if is_info() {
+                                                    println!("[INFO][GULF-STREAM] HeartbeatCommitment selecting producers: next_h={} prod_next={} prod_next+1={}", 
+                                                             next_height, producer_next, producer_next_plus_one);
+                                                }
+                                                
                                                 // Step 3: Forward TX to producer(s) - handle rotation boundary
                                                 let mut forwarded_to_producer = false;
                                                 let mut sent_to: Vec<String> = Vec::new();
@@ -7766,9 +7773,31 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                         let tx_msg = NetworkMessage::Transaction { 
                                                             data: tx_bytes_for_broadcast.clone() 
                                                         };
-                                                        p2p.send_network_message(&producer_addr, tx_msg);
-                                                        forwarded_to_producer = true;
-                                                        sent_to.push(producer_next.clone());
+                                                        // v2.94: Use ACK for critical TX - guarantees delivery confirmation
+                                                        match p2p.send_critical_tx_with_ack(&producer_addr, tx_msg).await {
+                                                            Ok(()) => {
+                                                                forwarded_to_producer = true;
+                                                                sent_to.push(producer_next.clone());
+                                                                if is_info() {
+                                                                    println!("[INFO][GULF-STREAM] HeartbeatCommitment TX ACK_CONFIRMED producer={}", 
+                                                                             producer_next);
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                println!("[WARN][GULF-STREAM] HeartbeatCommitment TX ACK_FAILED producer={} error={}", 
+                                                                         producer_next, e);
+                                                                // Will fall through to gossip backup
+                                                            }
+                                                        }
+                                                    } else {
+                                                        // CRITICAL: Producer address not found - TX won't be forwarded directly!
+                                                        println!("[WARN][GULF-STREAM] producer_addr_not_found producer={} - relying on gossip only!", 
+                                                                 producer_next);
+                                                    }
+                                                } else if producer_next == node_id {
+                                                    // We ARE the producer - TX already in our mempool
+                                                    if is_info() {
+                                                        println!("[INFO][GULF-STREAM] HeartbeatCommitment TX - WE are the producer, no forwarding needed");
                                                     }
                                                 }
                                                 
@@ -7780,29 +7809,43 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                         let tx_msg = NetworkMessage::Transaction { 
                                                             data: tx_bytes_for_broadcast.clone() 
                                                         };
-                                                        p2p.send_network_message(&producer_addr, tx_msg);
-                                                        forwarded_to_producer = true;
-                                                        sent_to.push(producer_next_plus_one.clone());
+                                                        // v2.94: Use ACK for rotation boundary producer too
+                                                        if let Ok(()) = p2p.send_critical_tx_with_ack(&producer_addr, tx_msg).await {
+                                                            forwarded_to_producer = true;
+                                                            sent_to.push(producer_next_plus_one.clone());
+                                                            if is_info() {
+                                                                println!("[INFO][GULF-STREAM] HeartbeatCommitment TX ACK_CONFIRMED rotation_producer={}", 
+                                                                         producer_next_plus_one);
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 
                                                 // Step 4: Check for emergency producer (failover scenario)
                                                 // If network stalled and emergency producer was activated, send to them too
-                                                if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                                                    if let Some((emergency_height, emergency_producer)) = &*emergency_flag {
-                                                        // Emergency producer for next blocks?
-                                                        if *emergency_height >= next_height && 
-                                                           emergency_producer != &node_id &&
-                                                           !sent_to.contains(emergency_producer) {
-                                                            if let Some(producer_addr) = p2p.get_peer_addr_by_id(emergency_producer) {
-                                                                let tx_msg = NetworkMessage::Transaction { 
-                                                                    data: tx_bytes_for_broadcast.clone() 
-                                                                };
-                                                                p2p.send_network_message(&producer_addr, tx_msg);
+                                                // v2.94 FIX: Extract data before await to avoid MutexGuard across await point
+                                                let emergency_target: Option<(u64, String)> = {
+                                                    if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                                                        emergency_flag.clone()
+                                                    } else {
+                                                        None
+                                                    }
+                                                };
+                                                
+                                                if let Some((emergency_height, emergency_producer)) = emergency_target {
+                                                    if emergency_height >= next_height && 
+                                                       emergency_producer != node_id &&
+                                                       !sent_to.contains(&emergency_producer) {
+                                                        if let Some(producer_addr) = p2p.get_peer_addr_by_id(&emergency_producer) {
+                                                            let tx_msg = NetworkMessage::Transaction { 
+                                                                data: tx_bytes_for_broadcast.clone() 
+                                                            };
+                                                            // v2.94: Use ACK for emergency producer
+                                                            if p2p.send_critical_tx_with_ack(&producer_addr, tx_msg).await.is_ok() {
                                                                 forwarded_to_producer = true;
                                                                 sent_to.push(emergency_producer.clone());
                                                                 if is_info() {
-                                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX forwarded to EMERGENCY producer={}", emergency_producer);
+                                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX ACK_CONFIRMED emergency_producer={}", emergency_producer);
                                                                 }
                                                             }
                                                         }
@@ -7902,6 +7945,17 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 // This is O(n log n) instead of O(n * m log m) for each lookup!
                                 let sorted_registry = p2p.get_all_light_node_ids_sorted();
                                 let total_light_nodes = sorted_registry.len() as u32;
+                                
+                                // v2.95 FIX: Skip TX creation if no Light nodes registered
+                                // Genesis nodes should REST when there's nothing to ping
+                                if total_light_nodes == 0 {
+                                    // Mark as "sent" to avoid repeated checks this epoch
+                                    let mut sent = sent_ping_commitments.write().await;
+                                    sent.insert(current_epoch);
+                                    if is_debug() {
+                                        println!("[DBG][LIGHT-BITMAP] No Light nodes registered - skipping epoch={}", current_epoch);
+                                    }
+                                } else {
                                 
                                 // Build index lookup map: node_id -> global_index
                                 let index_map: std::collections::HashMap<String, u32> = sorted_registry
@@ -8058,6 +8112,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                         }
                                     }
                                 }
+                                } // Close else block for total_light_nodes > 0
                             }
                         }
                     }
@@ -10712,6 +10767,14 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
                                 if !heartbeats_data.is_empty() {
                                     if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
+                                        // v3.1: Log REAL heartbeat data from MacroBlock (THIS IS THE TRUTH!)
+                                        let eligible_nodes: Vec<_> = heartbeat_summaries.iter()
+                                            .filter(|s| s.is_eligible)
+                                            .map(|s| s.node_id.clone())
+                                            .collect();
+                                        println!("[INFO][EMISSION] REAL heartbeat_eligible={} from mb={}: {:?}",
+                                                 eligible_nodes.len(), prev_macroblock_index, eligible_nodes);
+                                        
                                         // PRODUCTION v2.78: Extract reward_light_nodes from MacroBlock (Light nodes)
                                         let light_node_rewards: std::collections::HashMap<String, u32> = 
                                             if let Some(ref light_data) = macroblock.consensus_data.reward_light_nodes {
@@ -11044,7 +11107,17 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // STEP 2: Parallel validation (read-only state access is thread-safe)
                     // StateSnapshot uses DashMap internally which allows concurrent reads
                     let valid_start = std::time::Instant::now();
-                    let validated: Vec<(String, qnet_state::Transaction, bool)> = deserialized
+                    
+                    // v3.1: Track deserialization failures separately
+                    let deser_failed_count = deserialized.iter()
+                        .filter(|(_, tx_opt)| tx_opt.is_none())
+                        .count();
+                    if deser_failed_count > 0 {
+                        eprintln!("[WARN][BLOCK] deser_failed_count={} (TX dropped silently)", deser_failed_count);
+                    }
+                    
+                    // v3.1: Include rejection reason in tuple for better diagnostics
+                    let validated: Vec<(String, qnet_state::Transaction, bool, Option<String>)> = deserialized
                         .into_par_iter()
                         .filter_map(|(hash, tx_opt)| tx_opt.map(|tx| (hash, tx)))
                         .map(|(hash, tx)| {
@@ -11063,10 +11136,23 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                 || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. })
                                 || matches!(tx.tx_type, qnet_state::TransactionType::LightNodeEligibilityBitmap { .. });
                             
-                            let is_valid = if is_benchmark || is_system_tx {
+                            let (is_valid, reject_reason) = if is_benchmark || is_system_tx {
                                 // Benchmark OR System TX: skip balance/nonce validation
                                 // System TX are validated through consensus rules, not account state
-                                tx.validate().is_ok()
+                                // v3.1: Capture validation error for diagnostics
+                                match tx.validate() {
+                                    Ok(()) => (true, None),
+                                    Err(e) => {
+                                        // v3.1: Log system TX validation failure with details
+                                        eprintln!("[ERR][BLOCK] system_tx_validate_failed type={:?} from={} hash={}.. err={}",
+                                            std::mem::discriminant(&tx.tx_type),
+                                            &tx.from[..tx.from.len().min(20)],
+                                            &hash[..hash.len().min(16)],
+                                            e
+                                        );
+                                        (false, Some(format!("validate: {}", e)))
+                                    }
+                                }
                             } else {
                                 // Production: full state validation (thread-safe read)
                                 let nonce_valid = if let Some(account) = state_snapshot.get_account(&tx.from) {
@@ -11083,10 +11169,16 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                     true
                                 };
                                 
-                                nonce_valid && balance_valid
+                                if !nonce_valid {
+                                    (false, Some("bad_nonce".to_string()))
+                                } else if !balance_valid {
+                                    (false, Some("insufficient_balance".to_string()))
+                                } else {
+                                    (true, None)
+                                }
                             };
                             
-                            (hash, tx, is_valid)
+                            (hash, tx, is_valid, reject_reason)
                         })
                         .collect();
                     
@@ -11099,8 +11191,9 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // v2.68: System TX bypass ParallelExecutor (it doesn't support them!)
                     let mut system_txs: Vec<qnet_state::Transaction> = Vec::new();
                     let mut user_txs: Vec<qnet_state::Transaction> = Vec::new();
+                    let mut rejection_reasons: Vec<(String, String)> = Vec::new(); // v3.1: Track reasons
                     
-                    for (hash, tx, is_valid) in validated {
+                    for (hash, tx, is_valid, reject_reason) in validated {
                         if is_valid {
                             // v2.68: Separate system TX from user TX
                             // v2.71: NodeRegistration is also system TX (no state execution needed)
@@ -11119,6 +11212,10 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             }
                             included_tx_hashes.push(hash);
                         } else {
+                            // v3.1: Track rejection reason
+                            if let Some(reason) = reject_reason {
+                                rejection_reasons.push((hash.clone(), reason));
+                            }
                             invalid_tx_hashes.push(hash);
                         }
                     }
@@ -11126,9 +11223,15 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     drop(state_snapshot);  // Release read lock
                     
                     // CRITICAL v2.26: Remove invalid transactions from mempool immediately!
+                    // v3.1: Log actual rejection reasons instead of generic message
                     if !invalid_tx_hashes.is_empty() {
                         mempool.batch_remove_transactions(&invalid_tx_hashes);
-                        println!("[MEMPOOL] 🗑️ Removed {} invalid TX (bad nonce/balance)", invalid_tx_hashes.len());
+                        // v3.1: Show detailed rejection reasons
+                        for (hash, reason) in &rejection_reasons {
+                            eprintln!("[MEMPOOL] 🗑️ TX rejected: hash={}.. reason={}", 
+                                     &hash[..hash.len().min(16)], reason);
+                        }
+                        println!("[MEMPOOL] 🗑️ Removed {} invalid TX", invalid_tx_hashes.len());
                     }
                     
                     // v2.68: Log separation
@@ -18718,10 +18821,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     ).await;
                     
                     if !snapshot.is_empty() {
-                        println!("[INFO][MB] eligible_snapshot nodes={}", snapshot.len());
+                        // NOTE: This is producer snapshot, NOT heartbeat eligible! See reward_heartbeats for emission
+                        if is_debug() { println!("[DBG][MB] producer_snapshot nodes={}", snapshot.len()); }
                         bincode::serialize(&snapshot).ok()
                     } else {
-                        println!("[WARN][MB] Empty eligible producers snapshot - using participants");
+                        if is_debug() { println!("[DBG][MB] Empty producer snapshot - using consensus participants"); }
                         // Fallback: use consensus participants
                         let fallback: Vec<qnet_state::EligibleProducer> = consensus_data.participants.iter()
                             .map(|id| qnet_state::EligibleProducer {
@@ -18767,20 +18871,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 ).await
                             })
                         }) {
-                            Ok((heartbeat_summaries, shard_summaries)) => {
-                                if use_shards && !shard_summaries.is_empty() {
-                                    // SCALABLE: Store shard summaries
-                                    let total_nodes: u32 = shard_summaries.iter().map(|s| s.total_nodes).sum();
-                                    let total_eligible: u32 = shard_summaries.iter().map(|s| s.total_eligible).sum();
-                                    
-                                    println!("[INFO][MB] EMISSION_HEARTBEATS_SHARDS mb={} shards={} nodes={} eligible={}",
-                                             mb_index, shard_summaries.len(), total_nodes, total_eligible);
-                                    
-                                    bincode::serialize(&shard_summaries).ok()
-                                } else if !heartbeat_summaries.is_empty() {
-                                    // LEGACY: Individual summaries
+                            Ok((heartbeat_summaries, _shard_summaries)) => {
+                                // CRITICAL FIX v3.1: ALWAYS use HeartbeatSummary for reward_heartbeats!
+                                // ShardSummary only has aggregates (total_nodes, total_eligible)
+                                // but emission needs INDIVIDUAL node_ids to distribute rewards!
+                                // Deserialize expects Vec<HeartbeatSummary>, NOT Vec<ShardSummary>
+                                if !heartbeat_summaries.is_empty() {
                                     let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
-                                    println!("[INFO][MB] EMISSION_HEARTBEATS_INDIVIDUAL mb={} nodes={} eligible={}",
+                                    println!("[INFO][MB] EMISSION_HEARTBEATS mb={} nodes={} eligible={}",
                                              mb_index, heartbeat_summaries.len(), eligible);
                                     bincode::serialize(&heartbeat_summaries).ok()
                                 } else {

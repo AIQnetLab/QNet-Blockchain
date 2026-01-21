@@ -14579,8 +14579,11 @@ impl SimplifiedP2P {
             .map(|a| (a.light_node_id.clone(), a.slot, a.pinger_id.clone(), a.timestamp, a.block_height))
             .collect();
         
-        println!("[INFO][ATTESTATION] block_range_filter start={} end={} found={}", 
-                 start_height, end_height, result.len());
+        // v2.95: Only log when there are attestations (avoid spam when no Light nodes)
+        if !result.is_empty() && crate::node::is_info() {
+            println!("[INFO][ATTESTATION] block_range_filter start={} end={} found={}", 
+                     start_height, end_height, result.len());
+        }
         
         result
     }
@@ -17343,6 +17346,35 @@ impl SimplifiedP2P {
         // This is not truly synchronous but provides compatibility
         self.send_network_message(peer_addr, message);
         Ok(())
+    }
+    
+    /// v2.94: Send critical TX with ACK confirmation (guaranteed delivery)
+    /// Uses bidirectional QUIC stream and waits for ACK from receiver
+    /// Use for HeartbeatCommitment, LightNodeEligibilityBitmap, and other critical TX
+    pub async fn send_critical_tx_with_ack(&self, peer_addr: &str, message: NetworkMessage) -> Result<(), String> {
+        if !self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("QUIC not enabled".into());
+        }
+        
+        let quic_transport = self.quic_transport.as_ref()
+            .ok_or("QUIC transport not initialized")?;
+        
+        // Parse address and convert to QUIC port
+        let parts: Vec<&str> = peer_addr.split(':').collect();
+        if parts.len() != 2 {
+            return Err(format!("Invalid peer address: {}", peer_addr));
+        }
+        
+        let ip: std::net::IpAddr = parts[0].parse()
+            .map_err(|e| format!("Invalid IP: {}", e))?;
+        let port: u16 = parts[1].parse()
+            .map_err(|e| format!("Invalid port: {}", e))?;
+        
+        let quic_port = port.saturating_add(crate::quic_transport::QUIC_PORT_OFFSET);
+        let quic_addr = std::net::SocketAddr::new(ip, quic_port);
+        
+        let transport = quic_transport.read().await;
+        transport.send_with_ack(quic_addr, &message).await
     }
 
     /// PRODUCTION v2.19.21: Send network message via QUIC (binary protocol)

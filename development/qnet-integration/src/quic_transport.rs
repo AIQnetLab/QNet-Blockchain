@@ -566,7 +566,15 @@ impl QuicTransport {
             h(peer_addr, msg);
         }
         
-        // Send empty response (acknowledgment)
+        // v2.94: Send ACK byte (0x06) to confirm receipt
+        // This enables send_with_ack() to know message was received
+        let ack_byte = [0x06u8]; // ASCII ACK
+        if let Err(e) = send.write_all(&ack_byte).await {
+            if crate::node::is_warn() {
+                println!("[WARN][QUIC] ack_send_failed peer={} err={}", 
+                    get_privacy_id_for_addr(&peer_addr.to_string()), e);
+            }
+        }
         let _ = send.finish();
     }
     
@@ -865,13 +873,13 @@ impl QuicTransport {
             match self.try_send_once(peer_addr, &wire_data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    last_error = e;
-                    // Cleanup dead connection on error
-                    if let Some(conn) = self.connections.get(&peer_addr) {
-                        if conn.connection.close_reason().is_some() {
-                            self.connections.remove(&peer_addr);
-                            println!("[QUIC] 🧹 Removed dead connection to {} after send error",
-                                get_privacy_id_for_addr(&peer_addr.to_string()));
+                    last_error = e.clone();
+                    // v2.94 FIX: Remove connection on ANY error, not just close_reason().is_some()
+                    // Zombie connections have close_reason() = None but are still dead!
+                    if self.connections.remove(&peer_addr).is_some() {
+                        if crate::node::is_warn() {
+                            println!("[WARN][QUIC] conn_removed_send_fail peer={} err={}", 
+                                get_privacy_id_for_addr(&peer_addr.to_string()), e);
                         }
                     }
                     if attempt < CONNECT_RETRY_ATTEMPTS {
@@ -923,6 +931,83 @@ impl QuicTransport {
         Ok(())
     }
     
+    /// v2.94: Send message with ACK confirmation (for critical TX like HeartbeatCommitment)
+    /// Uses bidirectional stream and waits for 1-byte ACK from receiver
+    /// Returns error if no ACK received within timeout - guarantees delivery confirmation
+    pub async fn send_with_ack(&self, peer_addr: SocketAddr, msg: &NetworkMessage) -> Result<(), String> {
+        let wire_data = Self::serialize_message(msg)?;
+        
+        // Retry loop with reconnect on failure
+        let mut last_error = String::new();
+        for attempt in 1..=CONNECT_RETRY_ATTEMPTS {
+            match self.try_send_with_ack_once(peer_addr, &wire_data).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_error = e.clone();
+                    // v2.94: Remove connection on ANY error for fresh reconnect
+                    if self.connections.remove(&peer_addr).is_some() {
+                        if crate::node::is_warn() {
+                            println!("[WARN][QUIC] conn_removed_no_ack peer={}", 
+                                get_privacy_id_for_addr(&peer_addr.to_string()));
+                        }
+                    }
+                    if attempt < CONNECT_RETRY_ATTEMPTS {
+                        let delay = Duration::from_millis(RETRY_DELAY_MS * (1 << (attempt - 1)));
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        
+        Err(format!("Send with ACK failed after {} attempts: {}", CONNECT_RETRY_ATTEMPTS, last_error))
+    }
+    
+    /// v2.94: Single attempt to send with ACK
+    async fn try_send_with_ack_once(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
+        let conn = self.connect(peer_addr).await?;
+        
+        // Open bidirectional stream
+        let (mut send, mut recv) = tokio::time::timeout(
+            Duration::from_secs(MESSAGE_TIMEOUT_SECS),
+            conn.connection.open_bi()
+        )
+            .await
+            .map_err(|_| "Open bi stream timeout")?
+            .map_err(|e| format!("Open bi stream failed: {}", e))?;
+        
+        // Send message
+        tokio::time::timeout(
+            Duration::from_secs(MESSAGE_TIMEOUT_SECS),
+            send.write_all(wire_data)
+        )
+            .await
+            .map_err(|_| "Write timeout")?
+            .map_err(|e| format!("Write failed: {}", e))?;
+        
+        send.finish().map_err(|e| format!("Finish failed: {}", e))?;
+        
+        // Wait for ACK (1 byte) with shorter timeout
+        const ACK_TIMEOUT_MS: u64 = 500; // 500ms for ACK
+        let mut ack_buf = [0u8; 1];
+        
+        match tokio::time::timeout(
+            Duration::from_millis(ACK_TIMEOUT_MS),
+            recv.read_exact(&mut ack_buf)
+        ).await {
+            Ok(Ok(_)) => {
+                if ack_buf[0] == 0x06 { // ACK byte
+                    conn.bytes_sent.fetch_add(wire_data.len() as u64, Ordering::Relaxed);
+                    conn.messages_sent.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                } else {
+                    Err(format!("Invalid ACK byte: {}", ack_buf[0]))
+                }
+            }
+            Ok(Err(e)) => Err(format!("ACK read failed: {}", e)),
+            Err(_) => Err("ACK timeout - message may not have been received".to_string()),
+        }
+    }
+    
     /// Broadcast message (unidirectional, no response) with retry
     pub async fn broadcast_to(&self, peer_addr: SocketAddr, msg: &NetworkMessage) -> Result<(), String> {
         // Serialize message once
@@ -934,13 +1019,13 @@ impl QuicTransport {
             match self.try_broadcast_once(peer_addr, &wire_data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    last_error = e;
-                    // Cleanup dead connection on error
-                    if let Some(conn) = self.connections.get(&peer_addr) {
-                        if conn.connection.close_reason().is_some() {
-                            self.connections.remove(&peer_addr);
-                            println!("[QUIC] 🧹 Removed dead connection to {} after broadcast error",
-                                get_privacy_id_for_addr(&peer_addr.to_string()));
+                    last_error = e.clone();
+                    // v2.94 FIX: Remove connection on ANY error, not just close_reason().is_some()
+                    // Zombie connections have close_reason() = None but are still dead!
+                    if self.connections.remove(&peer_addr).is_some() {
+                        if crate::node::is_warn() {
+                            println!("[WARN][QUIC] conn_removed_send_fail peer={} err={}", 
+                                get_privacy_id_for_addr(&peer_addr.to_string()), e);
                         }
                     }
                     if attempt < CONNECT_RETRY_ATTEMPTS {
@@ -1106,16 +1191,36 @@ impl QuicTransport {
             .collect()
     }
     
-    /// v2.24: Health check - cleanup dead connections and return count of alive connections
+    /// v2.94: Health check - cleanup dead AND stale connections
     /// Call this periodically (every 15s) to maintain healthy connection pool
+    /// 
+    /// Detects:
+    /// 1. Explicitly closed connections (close_reason().is_some())
+    /// 2. Zombie connections (idle > 60s without activity)
     pub fn health_check(&self) -> (usize, usize) {
         let mut alive = 0;
         let mut removed = 0;
         let mut dead_addrs = Vec::new();
+        let now = Instant::now();
+        
+        // v2.94: Stale connection threshold - if no activity for 60s, consider dead
+        // This catches zombie connections where close_reason() = None
+        const STALE_THRESHOLD_SECS: u64 = 60;
         
         for entry in self.connections.iter() {
-            if entry.value().connection.close_reason().is_some() {
+            let conn = entry.value();
+            let is_explicitly_closed = conn.connection.close_reason().is_some();
+            let is_stale = now.duration_since(conn.last_activity) > Duration::from_secs(STALE_THRESHOLD_SECS);
+            
+            if is_explicitly_closed || is_stale {
                 dead_addrs.push(*entry.key());
+                if is_stale && !is_explicitly_closed {
+                    if crate::node::is_warn() {
+                        println!("[WARN][QUIC] stale_conn_detected peer={} inactive_secs={}",
+                            get_privacy_id_for_addr(&entry.key().to_string()),
+                            now.duration_since(conn.last_activity).as_secs());
+                    }
+                }
             } else {
                 alive += 1;
             }
@@ -1127,7 +1232,9 @@ impl QuicTransport {
         }
         
         if removed > 0 {
-            println!("[QUIC] 🧹 Health check: removed {} dead connections, {} alive", removed, alive);
+            if crate::node::is_info() {
+                println!("[INFO][QUIC] health_check removed={} alive={}", removed, alive);
+            }
         }
         
         (alive, removed)
