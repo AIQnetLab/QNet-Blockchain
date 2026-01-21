@@ -114,7 +114,8 @@ pub struct QuicConnection {
     pub remote_cert_serial: Option<String>,
     pub remote_node_type: Option<String>,  // "super", "full", or "light" (lowercase)
     pub connected_at: Instant,
-    pub last_activity: Instant,
+    /// v2.95.1: Atomic timestamp (ms since UNIX epoch) - can be updated from Arc
+    pub last_activity_ms: AtomicU64,
     pub messages_sent: AtomicU64,
     pub messages_received: AtomicU64,
     pub bytes_sent: AtomicU64,
@@ -389,7 +390,7 @@ impl QuicTransport {
                                 remote_cert_serial: Some(remote_cert_serial),
                                 remote_node_type: Some(remote_node_type.clone()),
                                 connected_at: Instant::now(),
-                                last_activity: Instant::now(),
+                                last_activity_ms: AtomicU64::new(Self::current_time_ms()),
                                 messages_sent: AtomicU64::new(0),
                                 messages_received: AtomicU64::new(0),
                                 bytes_sent: AtomicU64::new(0),
@@ -556,12 +557,11 @@ impl QuicTransport {
         ).await {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
-                // v2.95: Fallback to read_to_end for legacy senders
-                if crate::node::is_debug() {
-                    println!("[DBG][QUIC] length_prefix_read_failed peer={} err={:?}, trying legacy read",
+                // v2.95.1: All bidi senders now use length-prefix, so this is a real error
+                if crate::node::is_warn() {
+                    println!("[WARN][QUIC] bidi_read_failed peer={} err={:?}",
                         get_privacy_id_for_addr(&peer_addr.to_string()), e);
                 }
-                // Try legacy read with fresh stream (can't reuse after partial read)
                 return;
             }
             Err(_) => {
@@ -574,6 +574,8 @@ impl QuicTransport {
         
         conn.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
         conn.messages_received.fetch_add(1, Ordering::Relaxed);
+        // v2.95.1: Update last_activity on message receipt (confirmed delivery TO us)
+        conn.last_activity_ms.store(Self::current_time_ms(), Ordering::Relaxed);
         
         // Parse message
         let msg = match Self::parse_message(&data) {
@@ -628,6 +630,8 @@ impl QuicTransport {
         
         conn.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
         let msg_count = conn.messages_received.fetch_add(1, Ordering::Relaxed) + 1;
+        // v2.95.1: Update last_activity on message receipt
+        conn.last_activity_ms.store(Self::current_time_ms(), Ordering::Relaxed);
         
         // Log every 100th message or first 5 for debugging
         if msg_count <= 5 || msg_count % 100 == 0 {
@@ -808,7 +812,7 @@ impl QuicTransport {
             remote_cert_serial: Some(remote_cert_serial),
             remote_node_type: Some(remote_node_type),
             connected_at: Instant::now(),
-            last_activity: Instant::now(),
+            last_activity_ms: AtomicU64::new(Self::current_time_ms()),
             messages_sent: AtomicU64::new(0),
             messages_received: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
@@ -919,7 +923,7 @@ impl QuicTransport {
     }
     
     /// Single send attempt (internal helper)
-    /// v2.24.1: Added timeout on open_bi to match try_broadcast_once protection
+    /// v2.95.1: Uses length-prefixed protocol for compatibility with handle_bidi_stream
     async fn try_send_once(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
         let conn = self.connect(peer_addr).await?;
         
@@ -932,10 +936,15 @@ impl QuicTransport {
             .map_err(|_| "Open bi stream timeout")?
             .map_err(|e| format!("Open stream failed: {}", e))?;
         
-        // Send with timeout
+        // v2.95.1: Send length-prefixed message (4 bytes length + data)
+        // CRITICAL: Must match handle_bidi_stream expectation
+        let len_bytes = (wire_data.len() as u32).to_be_bytes();
         tokio::time::timeout(
             Duration::from_secs(MESSAGE_TIMEOUT_SECS),
-            send.write_all(wire_data)
+            async {
+                send.write_all(&len_bytes).await?;
+                send.write_all(wire_data).await
+            }
         )
             .await
             .map_err(|_| "Write timeout")?
@@ -1037,8 +1046,8 @@ impl QuicTransport {
                 if ack_buf[0] == 0x06 { // ACK byte
                     conn.bytes_sent.fetch_add(wire_data.len() as u64, Ordering::Relaxed);
                     conn.messages_sent.fetch_add(1, Ordering::Relaxed);
-                    // v2.95: ACK received - delivery confirmed
-                    // Note: last_activity tracked via messages_sent counter
+                    // v2.95.1: Update last_activity ONLY on confirmed delivery (ACK received)
+                    conn.last_activity_ms.store(Self::current_time_ms(), Ordering::Relaxed);
                     Ok(())
                 } else {
                     Err(format!("Invalid ACK byte: {}", ack_buf[0]))
@@ -1189,11 +1198,13 @@ impl QuicTransport {
     
     /// Cleanup idle connections
     pub fn cleanup_idle(&self) {
-        let now = Instant::now();
+        let now_ms = Self::current_time_ms();
         let mut to_remove = Vec::new();
         
         for entry in self.connections.iter() {
-            if now.duration_since(entry.last_activity) > Duration::from_secs(IDLE_TIMEOUT_SECS) {
+            let last_ms = entry.value().last_activity_ms.load(Ordering::Relaxed);
+            let idle_secs = (now_ms.saturating_sub(last_ms)) / 1000;
+            if idle_secs > IDLE_TIMEOUT_SECS {
                 to_remove.push(*entry.key());
             }
         }
@@ -1201,6 +1212,14 @@ impl QuicTransport {
         for addr in to_remove {
             self.disconnect(&addr);
         }
+    }
+    
+    /// v2.95.1: Get current time in milliseconds since UNIX epoch
+    fn current_time_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
     
     /// Check if connected
@@ -1232,7 +1251,7 @@ impl QuicTransport {
             .collect()
     }
     
-    /// v2.95: Health check with ACTIVE ping verification
+    /// v2.95.1: Health check with ACTIVE ping verification
     /// Call this periodically (every 15s) to maintain healthy connection pool
     /// 
     /// Detects:
@@ -1243,25 +1262,27 @@ impl QuicTransport {
         let mut alive = 0;
         let mut removed = 0;
         let mut dead_addrs = Vec::new();
-        let now = Instant::now();
+        let now_ms = Self::current_time_ms();
         
-        // v2.95: Reduced threshold - connections idle for 30s get ping-tested
+        // v2.95.1: Reduced threshold - connections idle for 30s get ping-tested
         const STALE_THRESHOLD_SECS: u64 = 30;
         
         for entry in self.connections.iter() {
             let conn = entry.value();
             let is_explicitly_closed = conn.connection.close_reason().is_some();
-            let is_stale = now.duration_since(conn.last_activity) > Duration::from_secs(STALE_THRESHOLD_SECS);
+            let last_ms = conn.last_activity_ms.load(Ordering::Relaxed);
+            let idle_secs = (now_ms.saturating_sub(last_ms)) / 1000;
+            let is_stale = idle_secs > STALE_THRESHOLD_SECS;
             
             if is_explicitly_closed {
                 dead_addrs.push(*entry.key());
             } else if is_stale {
-                // v2.95: Mark for potential removal - will be verified by active_health_check
+                // v2.95.1: Mark for potential removal - will be verified by active_health_check
                 dead_addrs.push(*entry.key());
                 if crate::node::is_debug() {
                     println!("[DBG][QUIC] stale_conn_candidate peer={} inactive_secs={}",
                         get_privacy_id_for_addr(&entry.key().to_string()),
-                        now.duration_since(conn.last_activity).as_secs());
+                        idle_secs);
                 }
             } else {
                 alive += 1;
