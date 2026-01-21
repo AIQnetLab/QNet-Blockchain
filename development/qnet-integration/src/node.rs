@@ -2900,14 +2900,17 @@ impl BlockchainNode {
         Ok((summaries, Vec::new()))
     }
     
-    /// PRODUCTION v2.77: Aggregate HeartbeatCommitment TXs by 256 shards (SCALABLE!)
-    /// Reduces MacroBlock size from 1 GB to 1.3 MB for 10M nodes
+    /// PRODUCTION v2.95: Aggregate HeartbeatCommitment TXs by 256 shards (SCALABLE!)
+    /// Returns BOTH individual summaries (for reward distribution) AND shard summaries (for verification)
+    /// CRITICAL: Individual summaries needed for emission TX creation - cannot be empty!
     async fn aggregate_commitments_by_shards(
         commitments: HashMap<String, qnet_state::TransactionType>,
     ) -> Result<(Vec<qnet_state::HeartbeatSummary>, Vec<qnet_state::ShardHeartbeatSummary>), QNetError> {
         use sha3::{Sha3_256, Digest};
         use std::collections::HashMap;
         
+        // v2.95: Collect BOTH individual summaries AND shard aggregates
+        let mut individual_summaries = Vec::new();
         let mut shards: HashMap<u8, Vec<(String, qnet_state::TransactionType)>> = HashMap::new();
         
         for (node_id, tx_type) in commitments {
@@ -2915,6 +2918,43 @@ impl BlockchainNode {
             hasher.update(node_id.as_bytes());
             let hash = hasher.finalize();
             let shard_id = hash[0];
+            
+            // v2.95: Build individual summary for reward distribution
+            if let qnet_state::TransactionType::HeartbeatCommitment {
+                heartbeat_count,
+                first_heartbeat_time,
+                last_heartbeat_time,
+                ..
+            } = &tx_type {
+                let node_type = if node_id.starts_with("light_") {
+                    0
+                } else if node_id.starts_with("full_") {
+                    1
+                } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
+                    2
+                } else {
+                    // Unknown node type - still track for shards but skip individual
+                    shards.entry(shard_id).or_insert_with(Vec::new).push((node_id, tx_type));
+                    continue;
+                };
+                
+                let required = match node_type {
+                    0 => 1,   // Light: 1 heartbeat per 4h
+                    1 => 8,   // Full: 8 heartbeats per 4h
+                    2 => 9,   // Super/Genesis: 9 heartbeats per 4h
+                    _ => 10,
+                };
+                let is_eligible = *heartbeat_count >= required;
+                
+                individual_summaries.push(qnet_state::HeartbeatSummary {
+                    node_id: node_id.clone(),
+                    node_type,
+                    heartbeat_count: *heartbeat_count,
+                    first_heartbeat: *first_heartbeat_time,
+                    last_heartbeat: *last_heartbeat_time,
+                    is_eligible,
+                });
+            }
             
             shards.entry(shard_id).or_insert_with(Vec::new).push((node_id, tx_type));
         }
@@ -2925,6 +2965,7 @@ impl BlockchainNode {
                      shards.values().map(|v| v.len()).sum::<usize>() / shards.len().max(1));
         }
         
+        // Build shard summaries for Merkle verification (scalability)
         let mut shard_summaries = Vec::new();
         
         for shard_id in 0..=255u8 {
@@ -3000,14 +3041,16 @@ impl BlockchainNode {
             }
         }
         
+        let eligible_count = individual_summaries.iter().filter(|s| s.is_eligible).count();
         if is_info() {
             let total_nodes: u32 = shard_summaries.iter().map(|s| s.total_nodes).sum();
             let total_eligible: u32 = shard_summaries.iter().map(|s| s.total_eligible).sum();
-            println!("[INFO][HEARTBEAT-COLLECTION] shard_summaries count={} nodes={} eligible={}",
-                     shard_summaries.len(), total_nodes, total_eligible);
+            println!("[INFO][HEARTBEAT-COLLECTION] individual_summaries={} eligible={} shard_summaries={} shard_nodes={} shard_eligible={}",
+                     individual_summaries.len(), eligible_count, shard_summaries.len(), total_nodes, total_eligible);
         }
         
-        Ok((Vec::new(), shard_summaries))
+        // v2.95: Return BOTH - individual for rewards, shards for verification
+        Ok((individual_summaries, shard_summaries))
     }
     
     /// PRODUCTION v2.78: Collect Light node attestations from P2P RAM storage
