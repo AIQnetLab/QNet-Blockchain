@@ -4779,15 +4779,6 @@ export class WalletManager {
       const amountSmallest = Math.floor(amount * 1_000_000_000); // Convert QNC to smallest unit (9 decimals)
       const gasPrice = 1;
       const gasLimit = 10_000;
-      const messageBytes = new TextEncoder().encode(message);
-      
-      // Sign with Ed25519 (nacl needs 64-byte secret key = privateKey + publicKey)
-      const fullSecretKey = privateKeyBytes.length === 64 
-        ? privateKeyBytes 
-        : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
-      
-      const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
-      const signature = Buffer.from(ed25519Sig).toString('hex');
       
       // Get public key for verification (32 bytes hex)
       const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
@@ -4809,8 +4800,18 @@ export class WalletManager {
       
       // v2.77: Create signature message with nonce (Ethereum-style)
       // CRITICAL: nonce in TX = account.nonce + 1 (like Ethereum)
+      // CRITICAL FIX v2.95.3: message MUST be defined BEFORE signing!
       const txNonce = currentNonce + 1;
       const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${txNonce}:${gasPrice}:${gasLimit}`;
+      const messageBytes = new TextEncoder().encode(message);
+      
+      // Sign with Ed25519 (nacl needs 64-byte secret key = privateKey + publicKey)
+      const fullSecretKey = privateKeyBytes.length === 64 
+        ? privateKeyBytes 
+        : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
+      
+      const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
+      const signature = Buffer.from(ed25519Sig).toString('hex');
       
       // Submit transaction to REST API (uses handle_transaction_submit endpoint)
       const response = await fetch(`${apiUrl}/api/v1/transaction`, {

@@ -3474,7 +3474,7 @@ async fn handle_transaction_submit(
     ).await;
     
     if !signature_valid {
-        println!("[TX] ❌ SECURITY: Invalid signature for transaction from {}", 
+        println!("[WARN][TX] ed25519_verify_failed from={}", 
                  &tx_request.from[..16.min(tx_request.from.len())]);
         return Ok(warp::reply::json(&json!({
             "success": false,
@@ -3484,9 +3484,48 @@ async fn handle_transaction_submit(
         })));
     }
     
-    println!("[TX] ✅ Ed25519 signature verified for {} -> {}", 
+    println!("[INFO][TX] ed25519_verified from={} to={}", 
              &tx_request.from[..8.min(tx_request.from.len())],
              &tx_request.to[..8.min(tx_request.to.len())]);
+    
+    // v2.95.3: Verify Dilithium signature if present (quantum-resistant)
+    // CRITICAL: Must verify BEFORE setting signature_verified flag!
+    let dilithium_verified = if let (Some(ref dil_sig), Some(ref dil_pk)) = 
+        (&tx_request.dilithium_signature, &tx_request.dilithium_public_key) 
+    {
+        if !dil_sig.is_empty() && !dil_pk.is_empty() {
+            // Verify Dilithium signature on same message
+            match verify_dilithium_client_signature(&message_to_sign, dil_sig, dil_pk).await {
+                Ok(valid) => {
+                    if !valid {
+                        println!("[WARN][TX] dilithium_verify_failed from={}", 
+                                 &tx_request.from[..16.min(tx_request.from.len())]);
+                        return Ok(warp::reply::json(&json!({
+                            "success": false,
+                            "error": "Dilithium signature verification failed",
+                            "details": "Post-quantum signature does not match transaction data"
+                        })));
+                    }
+                    println!("[INFO][TX] dilithium_verified from={}", 
+                             &tx_request.from[..16.min(tx_request.from.len())]);
+                    true
+                }
+                Err(e) => {
+                    println!("[WARN][TX] dilithium_verify_error from={} err={}", 
+                             &tx_request.from[..16.min(tx_request.from.len())], e);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Dilithium signature verification error",
+                        "details": e
+                    })));
+                }
+            }
+        } else {
+            false // Empty Dilithium signature - not quantum TX
+        }
+    } else {
+        false // No Dilithium signature provided
+    };
     
     // Create transaction from request WITH verified signature
     // QUANTUM v2.25.2: Full support for both Ed25519 and Ed25519+Dilithium TX
@@ -3506,8 +3545,9 @@ async fn handle_transaction_submit(
         },
         Some(serde_json::to_string(&json!({
             "signature_verified": true,
+            "dilithium_verified": dilithium_verified,
             "public_key": tx_request.public_key,
-            "standard": "NIST FIPS 186-5 (Ed25519)"
+            "standard": if dilithium_verified { "NIST FIPS 186-5 + CRYSTALS-Dilithium3" } else { "NIST FIPS 186-5 (Ed25519)" }
         })).unwrap_or_default()),
     )
     .with_public_key(Some(tx_request.public_key.clone()))
@@ -3515,7 +3555,7 @@ async fn handle_transaction_submit(
 
     // Log quantum TX if present
     if tx.is_quantum_signed() {
-        println!("[TX-QUANTUM] 🔐 Transaction with Dilithium signature from {}", &tx_request.from[..16.min(tx_request.from.len())]);
+        println!("[INFO][TX] quantum_signed from={}", &tx_request.from[..16.min(tx_request.from.len())]);
     }
 
     // PRODUCTION v2.77: Use BLAKE3 via calculate_hash() for consistency
@@ -4513,6 +4553,76 @@ async fn verify_ed25519_client_signature(
             println!("[CRYPTO] ❌ Ed25519 signature verification failed: {}", e);
             println!("[CRYPTO]    Message was: {}", message);
             false
+        }
+    }
+}
+
+/// v2.95.3: Verify Dilithium client signature (for quantum-safe transactions)
+/// Uses raw public key from client (not node_id lookup)
+async fn verify_dilithium_client_signature(
+    message: &str,
+    signature_hex: &str,
+    public_key_hex: &str
+) -> Result<bool, String> {
+    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_traits::sign::*;
+    
+    // Basic validation
+    if signature_hex.is_empty() || public_key_hex.is_empty() {
+        return Err("Empty signature or public key".to_string());
+    }
+    
+    // Dilithium3 public key is 1952 bytes = 3904 hex chars
+    if public_key_hex.len() != 3904 {
+        println!("[DBG][DILITHIUM] unexpected_pubkey_len len={} expected=3904", public_key_hex.len());
+        // Don't fail - some implementations may use different encoding
+    }
+    
+    // Decode public key
+    let pk_bytes = match hex::decode(public_key_hex) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Err(format!("Invalid public key hex: {}", e));
+        }
+    };
+    
+    let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
+        Ok(pk) => pk,
+        Err(e) => {
+            return Err(format!("Invalid Dilithium3 public key: {:?}", e));
+        }
+    };
+    
+    // Decode signature (Dilithium3 signature is 3293 bytes)
+    let sig_bytes = match hex::decode(signature_hex) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Err(format!("Invalid signature hex: {}", e));
+        }
+    };
+    
+    // Create signed message (signature + message for verification)
+    let mut signed_msg = sig_bytes.clone();
+    signed_msg.extend_from_slice(message.as_bytes());
+    
+    let signed_message = match dilithium3::SignedMessage::from_bytes(&signed_msg) {
+        Ok(sm) => sm,
+        Err(e) => {
+            return Err(format!("Invalid signed message format: {:?}", e));
+        }
+    };
+    
+    // Verify signature
+    match dilithium3::open(&signed_message, &public_key) {
+        Ok(_) => {
+            if crate::node::is_info() {
+                println!("[INFO][DILITHIUM] client_sig_verified");
+            }
+            Ok(true)
+        }
+        Err(_) => {
+            println!("[WARN][DILITHIUM] client_sig_invalid");
+            Ok(false)
         }
     }
 }

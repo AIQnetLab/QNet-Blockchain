@@ -51,19 +51,10 @@ function saveToCache(transactions: Map<string, ActivityItem>, height: number) {
   } catch {}
 }
 
+// v2.95.3: Unified type badges
 function getBadgeClass(type: string): string {
-  const classes: Record<string, string> = {
-    'Transfer': 'badge-transfer',
-    'Swap': 'badge-swap',
-    'Node Activation': 'badge-activation',
-    'Reward': 'badge-reward',
-    'Smart Contract': 'badge-contract',
-    'System': 'badge-system',
-    'Registration': 'badge-registration',
-    'Heartbeat': 'badge-heartbeat',
-    'Validator': 'badge-validator',
-  };
-  return classes[type] || 'badge-default';
+  const normalized = type.toLowerCase().replace(/\s+/g, '-');
+  return `type-${normalized}`;
 }
 
 // Calculate relative time CLIENT-SIDE from absolute timestamp
@@ -119,7 +110,8 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
 const ITEMS_PER_PAGE = 50;
 
 // All available transaction types for filter
-const TX_TYPES = ['Transfer', 'Heartbeat', 'Validator', 'Reward', 'Registration', 'Node Activation', 'Smart Contract', 'System', 'Swap'];
+// v2.95.3: Unified types - removed "Validator", added "Contract"
+const TX_TYPES = ['Transfer', 'Heartbeat', 'Reward', 'Registration', 'Activation', 'Contract', 'System', 'Swap'];
 
 export default function ExplorerPage() {
   // Initialize state without cache to avoid hydration mismatch
@@ -334,19 +326,10 @@ export default function ExplorerPage() {
                     {type}
                   </button>
                 ))}
-                {typeFilters.length > 0 && (
-                  <button 
-                    className="filter-chip clear-btn"
-                    onClick={() => setTypeFilters([])}
-                  >
-                    ✕ Clear
-                  </button>
-                )}
               </div>
             </div>
             <span className="tx-count">
               {filteredAndSortedActivity.length} transactions
-              {typeFilters.length > 0 && ` (${typeFilters.join(', ')})`}
             </span>
           </div>
         </div>

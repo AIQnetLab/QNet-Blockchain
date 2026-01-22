@@ -19,35 +19,47 @@ function formatAmount(amount: number): string {
 }
 
 // Map transaction type to display string
+// v2.95.3: Unified heartbeat types, removed "Validator" category
 function mapTxType(type: string): string {
   const normalized = type.toLowerCase().replace(/_/g, '');
   
   const map: Record<string, string> = {
+    // User transactions
     'transfer': 'Transfer',
-    'nodeactivation': 'Node Activation',
-    'noderegistration': 'Registration',
-    'swap': 'Swap',
-    'rewarddistribution': 'Reward',
-    'contractdeploy': 'Smart Contract',
-    'contractcall': 'Smart Contract',
     'batchtransfers': 'Transfer',
-    'batchnodeactivations': 'Node Activation',
+    'swap': 'Swap',
+    
+    // Node lifecycle
+    'nodeactivation': 'Activation',
+    'batchnodeactivations': 'Activation',
+    'noderegistration': 'Registration',
+    'registration': 'Registration',
+    
+    // Rewards
+    'rewarddistribution': 'Reward',
     'batchrewardclaims': 'Reward',
-    'pingattestation': 'System',
-    'pingcommitmentwithsampling': 'Validator',
-    'heartbeatcommitment': 'Heartbeat',
-    'lightnodeeligibilitybitmap': 'Validator',
     'systemreward': 'Reward',
     'systemrewards': 'Reward',
     'systememission': 'Reward',
     'emission': 'Reward',
-    'createaccount': 'System',
-    'registration': 'Registration',
     'reward': 'Reward',
+    
+    // Heartbeat (ALL node activity attestations)
+    'heartbeatcommitment': 'Heartbeat',           // Full/Super nodes
+    'pingcommitmentwithsampling': 'Heartbeat',    // Light nodes (legacy)
+    'lightnodeeligibilitybitmap': 'Heartbeat',    // Light nodes (bitmap)
+    'pingattestation': 'Heartbeat',               // Legacy ping
+    
+    // Smart Contracts
+    'contractdeploy': 'Contract',
+    'contractcall': 'Contract',
+    
+    // System
+    'createaccount': 'System',
     'system': 'System',
   };
   
-  return map[normalized] || 'Transfer';
+  return map[normalized] || 'Other';
 }
 
 export async function GET(request: NextRequest) {

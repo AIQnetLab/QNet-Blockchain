@@ -2410,8 +2410,8 @@ a[href*="play.google.com"] img {
   color: #b0b0b0;
 }
 
-/* Type badges for transactions */
-.type-badge.type-send {
+/* Type badges for transactions - v2.95.3 unified types */
+.type-badge.type-transfer {
   background: rgba(0,220,240,0.15);
   color: #00e5f0;
 }
@@ -2421,9 +2421,14 @@ a[href*="play.google.com"] img {
   color: #cbb0ff;
 }
 
-.type-badge.type-node_activation {
+.type-badge.type-activation {
   background: rgba(0,240,150,0.15);
   color: #00f090;
+}
+
+.type-badge.type-registration {
+  background: rgba(100,180,255,0.15);
+  color: #80c0ff;
 }
 
 .type-badge.type-reward {
@@ -2431,14 +2436,24 @@ a[href*="play.google.com"] img {
   color: #f0d040;
 }
 
-.type-badge.type-batch_activation {
-  background: rgba(0,240,150,0.2);
-  color: #00f090;
+.type-badge.type-heartbeat {
+  background: rgba(255,100,180,0.15);
+  color: #ff80b0;
 }
 
-.type-badge.type-smart_contract {
+.type-badge.type-contract {
   background: rgba(240,130,130,0.15);
   color: #f09090;
+}
+
+.type-badge.type-system {
+  background: rgba(150,150,150,0.15);
+  color: #b0b0b0;
+}
+
+.type-badge.type-other {
+  background: rgba(100,100,100,0.15);
+  color: #909090;
 }
 
 /* Loading and error states */

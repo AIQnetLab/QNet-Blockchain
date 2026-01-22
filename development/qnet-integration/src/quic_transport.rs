@@ -605,45 +605,64 @@ impl QuicTransport {
         let _ = send.finish();
     }
     
-    /// Handle unidirectional stream (broadcast)
+    /// Handle unidirectional stream (broadcast/fire-and-forget messages)
+    /// v2.95.2: Updated to read length-prefixed messages (matches try_send_once)
     async fn handle_uni_stream(
         peer_addr: SocketAddr,
         mut recv: RecvStream,
         handler: Option<MessageHandler>,
         conn: Arc<QuicConnection>,
     ) {
-        // Read message
+        // v2.95.2: Read length-prefixed message (4 bytes length + data)
+        let mut len_buf = [0u8; 4];
         let data = match tokio::time::timeout(
             Duration::from_secs(MESSAGE_TIMEOUT_SECS),
-            recv.read_to_end(MAX_MESSAGE_SIZE)
+            async {
+                // Read length prefix
+                recv.read_exact(&mut len_buf).await?;
+                let msg_len = u32::from_be_bytes(len_buf) as usize;
+                
+                // Sanity check
+                if msg_len > MAX_MESSAGE_SIZE {
+                    return Err(quinn::ReadExactError::FinishedEarly(0));
+                }
+                
+                // Read message body
+                let mut data = vec![0u8; msg_len];
+                recv.read_exact(&mut data).await?;
+                Ok(data)
+            }
         ).await {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
-                println!("[QUIC] ⚠️ Uni read failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                if crate::node::is_warn() {
+                    println!("[WARN][QUIC] uni_read_failed peer={} err={:?}", 
+                        get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                }
                 return;
             }
             Err(_) => {
-                println!("[QUIC] ⚠️ Uni read timeout from {}", get_privacy_id_for_addr(&peer_addr.to_string()));
+                if crate::node::is_warn() {
+                    println!("[WARN][QUIC] uni_read_timeout peer={}", 
+                        get_privacy_id_for_addr(&peer_addr.to_string()));
+                }
                 return;
             }
         };
         
         conn.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
-        let msg_count = conn.messages_received.fetch_add(1, Ordering::Relaxed) + 1;
+        conn.messages_received.fetch_add(1, Ordering::Relaxed);
         // v2.95.1: Update last_activity on message receipt
         conn.last_activity_ms.store(Self::current_time_ms(), Ordering::Relaxed);
-        
-        // Log every 100th message or first 5 for debugging
-        if msg_count <= 5 || msg_count % 100 == 0 {
-            println!("[QUIC] 📨 Received uni message #{} from {} ({} bytes)", 
-                msg_count, get_privacy_id_for_addr(&peer_addr.to_string()), data.len());
-        }
         
         // Parse message
         let msg = match Self::parse_message(&data) {
             Ok(m) => m,
             Err(e) => {
-                println!("[QUIC] ⚠️ Uni parse failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                if crate::node::is_warn() {
+                    println!("[WARN][QUIC] uni_parse_failed peer={} err={}", 
+                        get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                }
                 return;
             }
         };
@@ -651,8 +670,6 @@ impl QuicTransport {
         // Call handler
         if let Some(ref h) = handler {
             h(peer_addr, msg);
-        } else {
-            println!("[QUIC] ❌ CRITICAL: handler is None! Message from {} lost!", get_privacy_id_for_addr(&peer_addr.to_string()));
         }
     }
     
@@ -923,21 +940,23 @@ impl QuicTransport {
     }
     
     /// Single send attempt (internal helper)
-    /// v2.95.1: Uses length-prefixed protocol for compatibility with handle_bidi_stream
+    /// v2.95.2: Uses UNIDIRECTIONAL stream for non-critical messages (no ACK needed)
+    /// This avoids "sending stopped by peer" errors since receiver won't try to send ACK
     async fn try_send_once(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
         let conn = self.connect(peer_addr).await?;
         
-        // v2.24.1: Timeout on open_bi to detect zombie connections
-        let (mut send, _recv) = tokio::time::timeout(
+        // v2.95.2: Use unidirectional stream for fire-and-forget messages
+        // Bidi streams are reserved for send_with_ack (critical TX)
+        let mut send = tokio::time::timeout(
             Duration::from_secs(MESSAGE_TIMEOUT_SECS),
-            conn.connection.open_bi()
+            conn.connection.open_uni()
         )
             .await
-            .map_err(|_| "Open bi stream timeout")?
+            .map_err(|_| "Open uni stream timeout")?
             .map_err(|e| format!("Open stream failed: {}", e))?;
         
-        // v2.95.1: Send length-prefixed message (4 bytes length + data)
-        // CRITICAL: Must match handle_bidi_stream expectation
+        // v2.95.2: Send length-prefixed message (4 bytes length + data)
+        // Consistent protocol across all stream types
         let len_bytes = (wire_data.len() as u32).to_be_bytes();
         tokio::time::timeout(
             Duration::from_secs(MESSAGE_TIMEOUT_SECS),
