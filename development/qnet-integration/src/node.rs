@@ -5016,8 +5016,20 @@ impl BlockchainNode {
                                         .map_err(|e| e.to_string())
                                 });
                         
-                        if let Ok(tx) = tx_result {
-                            tx_batch.push((received_tx, tx));
+                        match tx_result {
+                            Ok(tx) => {
+                                if is_info() {
+                                    println!("[INFO][TX-RECV] OK type={:?} sig={} from={}", 
+                                        std::mem::discriminant(&tx.tx_type),
+                                        tx.signature.as_ref().map_or(0, |s| s.len()),
+                                        received_tx.from_peer);
+                                }
+                                tx_batch.push((received_tx, tx));
+                            }
+                            Err(e) => {
+                                println!("[WARN][TX-RECV] deserialize_failed from={} err={}", 
+                                    received_tx.from_peer, e);
+                            }
                         }
                     }
                     Ok(None) => break, // Channel closed
@@ -5034,14 +5046,27 @@ impl BlockchainNode {
                         .map(|(_, tx)| tx.clone())
                         .collect();
                     
+                    let batch_count = transactions.len();
                     let valid_indices = BlockchainNode::verify_ed25519_batch(&transactions);
                     let valid_set: std::collections::HashSet<usize> = valid_indices.into_iter().collect();
                     
+                    // DIAGNOSTIC: Log batch verification results
+                    if is_info() && batch_count > 0 {
+                        println!("[INFO][TX-SYNC] batch_verify total={} valid={}", batch_count, valid_set.len());
+                    }
+                    
                     // Process only verified transactions
                     let mut added = 0usize;
+                    let mut rejected_sig = 0usize;
+                    let mut rejected_val = 0usize;
                     for (idx, (received_tx, tx)) in tx_batch.drain(..).enumerate() {
                         if !valid_set.contains(&idx) {
-                            continue; // Skip invalid signature
+                            rejected_sig += 1;
+                            if is_warn() {
+                                println!("[WARN][TX-SYNC] ed25519_invalid hash={} type={:?} from={}", 
+                                    &received_tx.tx_hash[..16], std::mem::discriminant(&tx.tx_type), received_tx.from_peer);
+                            }
+                            continue;
                         }
                         
                         // Full validation (nonce, balance, etc.) and add to mempool
@@ -5050,8 +5075,12 @@ impl BlockchainNode {
                                 processed_txs.insert(received_tx.tx_hash.clone());
                                 added += 1;
                             }
-                            Err(_e) => {
-                                // Silent reject for common cases
+                            Err(e) => {
+                                rejected_val += 1;
+                                if is_warn() {
+                                    println!("[WARN][TX-SYNC] validation_failed hash={} err={}", 
+                                        &received_tx.tx_hash[..16], e);
+                                }
                             }
                         }
                     }
@@ -20104,17 +20133,31 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         match ed25519_dalek::verify_batch(&message_refs, &signatures, &verifying_keys) {
             Ok(()) => {
                 // All signatures valid
+                if crate::node::is_info() {
+                    println!("[INFO][ED25519] batch_ok count={}", tx_indices.len());
+                }
                 valid_indices.extend(tx_indices);
             }
-            Err(_) => {
+            Err(e) => {
                 // Batch failed - some signatures invalid, verify individually
+                if crate::node::is_warn() {
+                    println!("[WARN][ED25519] batch_failed count={} err={:?}", tx_indices.len(), e);
+                }
                 for (i, ((msg, sig), vk)) in messages.iter()
                     .zip(signatures.iter())
                     .zip(verifying_keys.iter())
                     .enumerate() 
                 {
-                    if vk.verify(msg, sig).is_ok() {
-                        valid_indices.push(tx_indices[i]);
+                    match vk.verify(msg, sig) {
+                        Ok(()) => {
+                            valid_indices.push(tx_indices[i]);
+                        }
+                        Err(e) => {
+                            if crate::node::is_warn() {
+                                println!("[WARN][ED25519] individual_fail idx={} msg_len={} err={:?}", 
+                                    tx_indices[i], msg.len(), e);
+                            }
+                        }
                     }
                 }
             }
