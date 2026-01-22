@@ -655,6 +655,12 @@ impl QuicTransport {
         // v2.95.1: Update last_activity on message receipt
         conn.last_activity_ms.store(Self::current_time_ms(), Ordering::Relaxed);
         
+        // v2.95.3: Check for ping message (single 0xFF byte) - just update activity, no handler call
+        if data.len() == 1 && data[0] == 0xFF {
+            // Ping received - activity already updated above, nothing else to do
+            return;
+        }
+        
         // Parse message
         let msg = match Self::parse_message(&data) {
             Ok(m) => m,
@@ -1109,7 +1115,7 @@ impl QuicTransport {
     }
     
     /// Single broadcast attempt (internal helper)
-    /// v2.24.1: Added timeouts to prevent hanging on zombie connections
+    /// v2.95.3: Added length-prefix to match handle_uni_stream protocol
     async fn try_broadcast_once(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
         let conn = self.connect(peer_addr).await?;
         
@@ -1122,10 +1128,14 @@ impl QuicTransport {
             .map_err(|_| "Open uni stream timeout")?
             .map_err(|e| format!("Open uni stream failed: {}", e))?;
         
-        // v2.24.1: Timeout on write to detect zombie connections
+        // v2.95.3: Send length-prefixed message (must match handle_uni_stream)
+        let len_bytes = (wire_data.len() as u32).to_be_bytes();
         tokio::time::timeout(
             Duration::from_secs(MESSAGE_TIMEOUT_SECS),
-            send.write_all(wire_data)
+            async {
+                send.write_all(&len_bytes).await?;
+                send.write_all(wire_data).await
+            }
         )
             .await
             .map_err(|_| "Write timeout")?
@@ -1366,11 +1376,18 @@ impl QuicTransport {
             conn.connection.open_uni()
         ).await {
             Ok(Ok(mut send)) => {
-                // Send a minimal ping byte
-                if send.write_all(&[0xFFu8]).await.is_ok() {
+                // v2.95.3: Send length-prefixed ping (must match handle_uni_stream protocol)
+                // Ping payload is single 0xFF byte, but with 4-byte length prefix
+                let ping_data = [0xFFu8];
+                let len_bytes = (ping_data.len() as u32).to_be_bytes();
+                let write_result = async {
+                    send.write_all(&len_bytes).await?;
+                    send.write_all(&ping_data).await
+                }.await;
+                
+                if write_result.is_ok() {
                     let _ = send.finish();
-                    // v2.95: Ping successful - connection is alive
-                    // Activity tracked via successful open_uni + write
+                    // v2.95.3: Ping successful - connection is alive
                     true
                 } else {
                     false
