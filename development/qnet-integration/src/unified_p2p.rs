@@ -912,7 +912,7 @@ pub struct SimplifiedP2P {
     
     /// PRODUCTION: Deterministic reputation state (shared with BlockchainNode)
     /// Set via set_deterministic_reputation() after BlockchainNode creation
-    deterministic_reputation: Arc<std::sync::RwLock<Option<Arc<std::sync::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>>>>,
+    deterministic_reputation: Arc<parking_lot::RwLock<Option<Arc<parking_lot::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>>>>,
     
     /// Consensus message channel
     consensus_tx: Option<tokio::sync::mpsc::UnboundedSender<ConsensusMessage>>,
@@ -1764,7 +1764,7 @@ impl SimplifiedP2P {
                 
                 Arc::new(Mutex::new(reputation_sys))
             },
-            deterministic_reputation: Arc::new(std::sync::RwLock::new(None)),
+            deterministic_reputation: Arc::new(parking_lot::RwLock::new(None)),
             consensus_tx: None,
             block_tx: Arc::new(Mutex::new(None)),
             sync_request_tx: None,
@@ -4018,17 +4018,16 @@ impl SimplifiedP2P {
                     let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
 
                     let reputation = {
-                        let rep_result = deterministic_rep.read();
-                        if let Ok(outer) = rep_result {
-                            if let Some(ref inner_arc) = *outer {
-                                if let Ok(state) = inner_arc.read() {
-                                    state.get_reputation(&peer.id, std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs())
-                                } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
-                            } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
-                        } else { qnet_consensus::deterministic_reputation::INITIAL_REPUTATION }
+                        let outer = deterministic_rep.read();
+                        if let Some(ref inner_arc) = *outer {
+                            let state = inner_arc.read();
+                            state.get_reputation(&peer.id, std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs())
+                        } else { 
+                            qnet_consensus::deterministic_reputation::INITIAL_REPUTATION 
+                        }
                     };
 
                     if reputation < 10.0 && !is_genesis_peer {
@@ -10826,10 +10825,8 @@ impl SimplifiedP2P {
                 // Before: just logged -> never stored -> "no_entropy_responses" fallback
                 // After: store in ENTROPY_RESPONSES for consensus verification
                 
-                // Store response in global ENTROPY_RESPONSES map (used by node.rs)
-                if let Ok(mut responses) = crate::node::ENTROPY_RESPONSES.lock() {
-                    responses.insert((block_height, responder_id.clone()), entropy_hash);
-                }
+                // v2.96: Lock-free insert with DashMap - no blocking!
+                crate::node::ENTROPY_RESPONSES.insert((block_height, responder_id.clone()), entropy_hash);
                 
                 // Log only significant responses (not zeros)
                 if entropy_hash != [0u8; 32] {
@@ -15170,30 +15167,50 @@ impl SimplifiedP2P {
     
     /// Request macroblocks from network for sync
     /// PRODUCTION: Used during initial sync and catch-up
+    /// v2.96: Filter by failover cache + retry to next peer on failure
     pub async fn sync_macroblocks(&self, from_index: u64, to_index: u64) -> Result<(), String> {
-        println!("[MACROBLOCK-SYNC] 🔄 Starting macroblock sync from index {} to {}", from_index, to_index);
+        if crate::node::is_info() {
+            println!("[INFO][MB-SYNC] start from={} to={}", from_index, to_index);
+        }
         
         let peers = self.get_validated_active_peers();
         if peers.is_empty() {
             return Err("No peers available for macroblock sync".to_string());
         }
         
-        // CRITICAL: Only request from Super/Full nodes (Light nodes don't have full macroblocks)
-        let eligible_peers: Vec<_> = peers.iter()
+        // v2.96: Get LIVE genesis nodes from failover cache (updated every 20s)
+        let working_genesis_ips = Self::filter_working_genesis_nodes_static(get_genesis_bootstrap_ips());
+        
+        // CRITICAL: Only request from Super/Full nodes that are ACTUALLY ONLINE
+        let mut eligible_peers: Vec<_> = peers.iter()
             .filter(|p| matches!(p.node_type, NodeType::Super | NodeType::Full))
+            .filter(|p| {
+                // v2.96: Filter by failover connectivity cache
+                let peer_ip = p.addr.split(':').next().unwrap_or("");
+                working_genesis_ips.iter().any(|ip| ip == peer_ip)
+            })
+            .cloned()
             .collect();
+        
+        // Fallback: if no peers pass failover filter, use all (network might be starting)
+        if eligible_peers.is_empty() {
+            if crate::node::is_warn() {
+                println!("[WARN][MB-SYNC] no_live_peers fallback=all_eligible");
+            }
+            eligible_peers = peers.iter()
+                .filter(|p| matches!(p.node_type, NodeType::Super | NodeType::Full))
+                .cloned()
+                .collect();
+        }
         
         if eligible_peers.is_empty() {
             return Err("No Super/Full nodes available for macroblock sync".to_string());
         }
         
-        // Select best peer for sync (highest combined reputation)
-        let best_peer = eligible_peers.iter()
-            .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or("No valid peer for macroblock sync")?;
-        
-        println!("[MACROBLOCK-SYNC] 📡 Requesting macroblocks from peer {} (network_quality: {:.1}%)", 
-                 best_peer.id, best_peer.network_score);
+        // v2.96: Sort by reputation (best first) for retry order
+        eligible_peers.sort_by(|a, b| b.combined_reputation()
+            .partial_cmp(&a.combined_reputation())
+            .unwrap_or(std::cmp::Ordering::Equal));
         
         // Create request message
         let request = NetworkMessage::RequestMacroblocks {
@@ -15202,8 +15219,31 @@ impl SimplifiedP2P {
             requester_id: self.node_id.clone(),
         };
         
-        // Send request
-        self.send_network_message(&best_peer.addr, request);
+        // v2.96: Try each peer until one succeeds (retry on failure)
+        let mut success = false;
+        for peer in eligible_peers.iter().take(3) {
+            if crate::node::is_debug() {
+                println!("[DBG][MB-SYNC] try peer={} rep={:.1}", peer.id, peer.combined_reputation());
+            }
+            
+            // Send request and check if peer is reachable
+            if Self::test_peer_connectivity_static(&peer.addr) {
+                self.send_network_message(&peer.addr, request.clone());
+                if crate::node::is_info() {
+                    println!("[INFO][MB-SYNC] sent to={} idx={}-{}", peer.id, from_index, to_index);
+                }
+                success = true;
+                break;
+            } else {
+                if crate::node::is_warn() {
+                    println!("[WARN][MB-SYNC] peer_unreachable id={} retry=next", peer.id);
+                }
+            }
+        }
+        
+        if !success {
+            return Err("All peers unreachable for macroblock sync".to_string());
+        }
         
         Ok(())
     }
@@ -15314,20 +15354,39 @@ impl SimplifiedP2P {
     
     /// Request blocks from peers for sync
     /// v2.65: Multi-peer redundancy - request from top 3 peers for reliability
+    /// v2.96: Filter by failover cache to exclude offline peers
     pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), String> {
         
-        let mut peers = self.get_validated_active_peers();
+        let peers = self.get_validated_active_peers();
         if peers.is_empty() {
             return Err("No peers available for sync".to_string());
         }
         
+        // v2.96: Get LIVE genesis nodes from failover cache (updated every 20s)
+        let working_genesis_ips = Self::filter_working_genesis_nodes_static(get_genesis_bootstrap_ips());
+        
+        // v2.96: Filter peers by failover connectivity cache
+        let mut live_peers: Vec<_> = peers.iter()
+            .filter(|p| {
+                let peer_ip = p.addr.split(':').next().unwrap_or("");
+                working_genesis_ips.iter().any(|ip| ip == peer_ip)
+            })
+            .cloned()
+            .collect();
+        
+        // Fallback: if no peers pass filter, use all (network might be starting)
+        if live_peers.is_empty() {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] no_live_peers fallback=all");
+            }
+            live_peers = peers;
+        }
+        
         // Sort by combined reputation (best first)
-        peers.sort_by(|a, b| b.combined_reputation().partial_cmp(&a.combined_reputation())
+        live_peers.sort_by(|a, b| b.combined_reputation().partial_cmp(&a.combined_reputation())
             .unwrap_or(std::cmp::Ordering::Equal));
         
-        // CRITICAL FIX v2.65: Request from TOP 3 peers for redundancy
-        // If one peer has network issues (UDP fragmentation, packet loss),
-        // others will deliver blocks successfully
+        // CRITICAL FIX v2.65: Request from TOP 3 LIVE peers for redundancy
         let request = NetworkMessage::RequestBlocks {
             from_height,
             to_height,
@@ -15335,7 +15394,7 @@ impl SimplifiedP2P {
         };
         
         let mut sent_count = 0;
-        for peer in peers.iter().take(3) {
+        for peer in live_peers.iter().take(3) {
             if peer.id != self.node_id {
                 self.send_network_message(&peer.addr, request.clone());
                 sent_count += 1;
@@ -15346,8 +15405,10 @@ impl SimplifiedP2P {
             return Err("No valid peers to sync from".to_string());
         }
         
-        println!("[SYNC] blocks={}-{} peers={} mode=redundancy", 
-                 from_height, to_height, sent_count);
+        if crate::node::is_info() {
+            println!("[INFO][SYNC] blocks h={}-{} sent={} live={}", 
+                     from_height, to_height, sent_count, live_peers.len());
+        }
         
         Ok(())
     }
@@ -15811,13 +15872,12 @@ impl SimplifiedP2P {
     pub fn get_node_reputation_from_blockchain(&self, node_id: &str) -> f64 {
         // 1. Try DeterministicReputationState first (primary source)
         if let Some(rep_arc) = self.get_deterministic_reputation() {
-            if let Ok(state) = rep_arc.read() {
-                let current_ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                return state.get_reputation(node_id, current_ts);
-            }
+            let state = rep_arc.read();
+            let current_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            return state.get_reputation(node_id, current_ts);
         }
         
         // 2. Fallback to INITIAL_REPUTATION if blockchain not ready
@@ -15831,19 +15891,16 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Get deterministic reputation state (blockchain-based)
     /// Shared with BlockchainNode for unified reputation access
-    pub fn get_deterministic_reputation(&self) -> Option<Arc<std::sync::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>> {
-        match self.deterministic_reputation.read() {
-            Ok(guard) => guard.clone(),
-            Err(_) => None,
-        }
+    pub fn get_deterministic_reputation(&self) -> Option<Arc<parking_lot::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>> {
+        let guard = self.deterministic_reputation.read();
+        guard.clone()
     }
     
     /// PRODUCTION: Set deterministic reputation state (called by BlockchainNode after creation)
-    pub fn set_deterministic_reputation(&self, state: Arc<std::sync::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>) {
-        if let Ok(mut guard) = self.deterministic_reputation.write() {
-            *guard = Some(state);
-            println!("[P2P] ✅ Deterministic reputation state linked (blockchain-based)");
-        }
+    pub fn set_deterministic_reputation(&self, state: Arc<parking_lot::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>) {
+        let mut guard = self.deterministic_reputation.write();
+        *guard = Some(state);
+        println!("[P2P] Deterministic reputation state linked (blockchain-based)");
     }
     
     /// v2.76: Set storage reference for persistent heartbeat storage (scalability)

@@ -1,9 +1,9 @@
-import { getDbPool, insertTransactionsBatch, updateSyncState, getSyncState, query } from './db';
+import { getDbPool, insertTransactionsBatch, updateSyncState, getSyncState, query, insertBlock } from './db';
 import { verifyTransactionHash, verifyTransactionIntegrity, logSecurityEvent } from './security';
 
 // Validate and sanitize NODE_RPC_URL to prevent SSRF
 function getNodeRpcUrl(): string {
-  const url = process.env.QNET_API_URL || 'http://161.97.86.81:8001';
+  const url = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
   try {
     const parsed = new URL(url);
     // Only allow http/https
@@ -23,12 +23,12 @@ function getNodeRpcUrl(): string {
         hostname.startsWith('172.28.') || hostname.startsWith('172.29.') ||
         hostname.startsWith('172.30.') || hostname.startsWith('172.31.')) {
       console.error('[Sync] NODE_RPC_URL points to private IP, using default');
-      return 'http://161.97.86.81:8001';
+      return 'http://162.244.25.114:8001';
     }
     return url;
   } catch {
     console.error('[Sync] Invalid NODE_RPC_URL format, using default');
-    return 'http://161.97.86.81:8001';
+    return 'http://162.244.25.114:8001';
   }
 }
 
@@ -178,9 +178,31 @@ function transformTransaction(
 
 // Block structure interface
 interface BlockData {
+  hash?: string;
+  height?: number;
   transactions?: unknown[];
   timestamp?: number | string;
+  previous_hash?: unknown;
+  merkle_root?: unknown;
+  producer?: string;
+  producer_address?: string;
+  poh_hash?: unknown;
+  poh_count?: number;
+  signature_type?: string;
+  signature?: string;
+  cert_serial?: string;
+  qrb_output?: unknown;
+  consensus_data?: Record<string, unknown>;
   [key: string]: unknown;
+}
+
+// Convert byte array to hex string
+function bytesToHex(bytes: unknown): string {
+  if (typeof bytes === 'string') return bytes;
+  if (Array.isArray(bytes)) {
+    return bytes.map((b: number) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return '';
 }
 
 // Fetch block from node with validation
@@ -362,12 +384,69 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
     let maxHeight = lastHeight;
     const MAX_TOTAL_TXS_PER_SYNC = 50000; // Limit total transactions per sync to prevent memory issues
 
+    // Blocks to save to PostgreSQL (L1 structure)
+    const blocksToSave: Array<{
+      height: number;
+      hash: string;
+      block_type: string;
+      version: number;
+      timestamp: number;
+      previous_hash: string | null;
+      merkle_root: string | null;
+      state_root: string | null;
+      producer: string;
+      producer_address: string | null;
+      tx_count: number;
+      total_gas_used: number;
+      poh_hash: string | null;
+      poh_count: number;
+      signature_type: string | null;
+      signature: string | null;
+      cert_serial: string | null;
+      qrb_output: string | null;
+      size_bytes: number;
+      consensus_data: Record<string, unknown> | null;
+      micro_blocks: string[] | null;
+    }> = [];
+
     for (const result of results) {
       if (result.status !== 'fulfilled' || !result.value) continue;
 
       const { block, height } = result.value;
       const txs = Array.isArray(block.transactions) ? block.transactions : [];
       const blockTs = Number(block.timestamp) || 0;
+
+      // Calculate total gas used from transactions
+      let totalGasUsed = 0;
+      for (const tx of txs as Record<string, unknown>[]) {
+        const gasUsed = Number(tx.gas_used) || (Number(tx.gas_price || 0) * Number(tx.gas_limit || 1));
+        totalGasUsed += gasUsed;
+      }
+
+      // Save block metadata to PostgreSQL (L1 structure)
+      blocksToSave.push({
+        height,
+        hash: block.hash || `block_${height}`,
+        block_type: (block.block_type as string) || 'MICROBLOCK',
+        version: (block.version as number) || 1,
+        timestamp: blockTs > 1e12 ? blockTs : blockTs * 1000,
+        previous_hash: bytesToHex(block.previous_hash) || null,
+        merkle_root: bytesToHex(block.merkle_root) || null,
+        state_root: bytesToHex(block.state_root) || null,
+        producer: (block.producer as string) || 'unknown',
+        producer_address: (block.producer_address as string) || null,
+        tx_count: txs.length,
+        total_gas_used: totalGasUsed,
+        poh_hash: bytesToHex(block.poh_hash) || null,
+        poh_count: (block.poh_count as number) || 0,
+        signature_type: (block.signature_type as string) || 'Dilithium3',
+        signature: (block.signature as string) || null,
+        cert_serial: (block.cert_serial as string) || null,
+        qrb_output: bytesToHex(block.qrb_output) || null,
+        size_bytes: (block.size_bytes as number) || 0,
+        consensus_data: (block.consensus_data as Record<string, unknown>) || null,
+        micro_blocks: Array.isArray(block.micro_blocks) ? (block.micro_blocks as string[]) : null,
+      });
 
       // Check if we're approaching memory limit
       if (transactionsToInsert.length + txs.length > MAX_TOTAL_TXS_PER_SYNC) {
@@ -397,6 +476,15 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       // Silent processing (only log errors via transformTransaction warnings)
 
       maxHeight = Math.max(maxHeight, height);
+    }
+
+    // Save blocks to PostgreSQL
+    for (const blockData of blocksToSave) {
+      try {
+        await insertBlock(blockData);
+      } catch (err) {
+        console.error(`[Sync] Failed to save block ${blockData.height}:`, err);
+      }
     }
 
 

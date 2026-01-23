@@ -1232,7 +1232,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 
                 // Get deterministic reputation for real values
                 let det_rep = blockchain.get_deterministic_reputation();
-                let rep_guard = det_rep.read().unwrap_or_else(|p| p.into_inner());
+                let rep_guard = det_rep.read();
                 
                 for (idx, ip) in genesis_ips.iter().enumerate().take(max_genesis_to_return) {
                     let genesis_addr = format!("{}:8001", ip);
@@ -9716,12 +9716,10 @@ async fn handle_producer_status(
     
     // CRITICAL FIX: Check emergency producer flag (same as node.rs line 3147-3155)
     // If emergency producer is set for this height, use it instead
-    use crate::node::EMERGENCY_PRODUCER_FLAG;
-    if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-        if let Some((height, producer)) = &*emergency_flag {
-            if *height == next_height {
-                current_producer = producer.clone();
-            }
+    use crate::node::get_emergency_producer;
+    if let Some((height, producer)) = get_emergency_producer() {
+        if height == next_height {
+            current_producer = producer;
         }
     }
     

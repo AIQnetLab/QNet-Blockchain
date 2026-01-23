@@ -76,13 +76,16 @@ impl PingData {
 }
 
 // CRITICAL: Module for shared producer cache to prevent duplicate static declarations
+// v2.96: Using DashMap for lock-free access in hot path
 mod producer_cache {
-    use std::sync::{Mutex, OnceLock};
-    use std::collections::HashMap;
+    use dashmap::DashMap;
+    use once_cell::sync::Lazy;
     
-    // PRODUCTION: Single shared cache for producer selection across entire module
+    // PRODUCTION v2.96: Lock-free cache for producer selection
     // This cache stores (producer_id, candidates) per leadership round
-    pub static CACHED_PRODUCER_SELECTION: OnceLock<Mutex<HashMap<u64, (String, Vec<(String, f64)>)>>> = OnceLock::new();
+    // DashMap provides concurrent read/write without blocking tokio runtime
+    pub static CACHED_PRODUCER_SELECTION: Lazy<DashMap<u64, (String, Vec<(String, f64)>)>> = 
+        Lazy::new(|| DashMap::new());
 }
 
 use qnet_state::{State as StateManager, Account, Transaction, Block, BlockType, MicroBlock, MacroBlock, LightMicroBlock, ConsensusData};
@@ -111,18 +114,46 @@ fn get_timestamp_safe() -> u64 {
         .as_secs()
 }
 use std::env;
-use std::sync::Mutex;
 
-// CRITICAL: Global flag for emergency producer activation
+// ═══════════════════════════════════════════════════════════════════════════════
+// v2.96: Lock-free emergency producer flag using atomics
+// Replaces std::sync::Mutex to avoid blocking in async context
+// ═══════════════════════════════════════════════════════════════════════════════
+use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as StdOrdering};
+use parking_lot::RwLock as ParkingRwLock;
+
+// CRITICAL: Global flag for emergency producer activation (lock-free)
+// Height stored atomically, producer string in fast parking_lot lock
+static EMERGENCY_PRODUCER_HEIGHT: StdAtomicU64 = StdAtomicU64::new(0);
 lazy_static::lazy_static! {
-    pub static ref EMERGENCY_PRODUCER_FLAG: Mutex<Option<(u64, String)>> = Mutex::new(None);
+    static ref EMERGENCY_PRODUCER_ID: ParkingRwLock<String> = ParkingRwLock::new(String::new());
 }
 
 // CRITICAL: Public function to set emergency producer flag from other modules
 pub fn set_emergency_producer_flag(block_height: u64, producer: String) {
-    if let Ok(mut flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-        *flag = Some((block_height, producer));
+    EMERGENCY_PRODUCER_HEIGHT.store(block_height, StdOrdering::SeqCst);
+    *EMERGENCY_PRODUCER_ID.write() = producer;
+}
+
+// Helper to get emergency producer (returns None if height is 0)
+pub fn get_emergency_producer() -> Option<(u64, String)> {
+    let height = EMERGENCY_PRODUCER_HEIGHT.load(StdOrdering::SeqCst);
+    if height == 0 {
+        None
+    } else {
+        let producer = EMERGENCY_PRODUCER_ID.read().clone();
+        if producer.is_empty() {
+            None
+        } else {
+            Some((height, producer))
+        }
     }
+}
+
+// Helper to clear emergency producer flag
+pub fn clear_emergency_producer() {
+    EMERGENCY_PRODUCER_HEIGHT.store(0, StdOrdering::SeqCst);
+    *EMERGENCY_PRODUCER_ID.write() = String::new();
 }
 
 // CRITICAL: Global synchronization flags for API access
@@ -248,21 +279,19 @@ pub fn init_logging() {
 // NOTE: Removed ROTATION_NOTIFY - simple 1-second timing is more reliable
 // Testing showed that natural timing without interrupts prevents race conditions
 
-// CRITICAL: Global storage for entropy responses during consensus verification
-// PRODUCTION v2.51: Made public for unified_p2p.rs to store incoming entropy responses
-lazy_static::lazy_static! {
-    pub static ref ENTROPY_RESPONSES: Mutex<std::collections::HashMap<(u64, String), [u8; 32]>> = Mutex::new(std::collections::HashMap::new());
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// CRITICAL FIX v2.96: Lock-free entropy responses using DashMap
+// PROBLEM: std::sync::Mutex blocked tokio runtime during async operations
+// SOLUTION: DashMap provides lock-free concurrent access - no blocking!
+// ═══════════════════════════════════════════════════════════════════════════════
+use dashmap::DashMap;
 
-/// Helper: Safe lock for ENTROPY_RESPONSES with poisoned lock recovery
-fn entropy_responses_lock() -> std::sync::MutexGuard<'static, std::collections::HashMap<(u64, String), [u8; 32]>> {
-    match ENTROPY_RESPONSES.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            println!("[WARN][CONS] ENTROPY_RESPONSES mutex poisoned, recovering...");
-            poisoned.into_inner()
-        }
-    }
+lazy_static::lazy_static! {
+    /// Lock-free concurrent HashMap for entropy responses
+    /// - insert/get/contains_key are all lock-free
+    /// - No tokio runtime blocking
+    /// - Safe for high-frequency access from multiple async tasks
+    pub static ref ENTROPY_RESPONSES: DashMap<(u64, String), [u8; 32]> = DashMap::new();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -400,36 +429,26 @@ impl std::fmt::Display for NodeState {
     }
 }
 
-// Global node state with atomic updates
+// v2.96: Global node state with fast parking_lot lock (never poisons, 2-3x faster)
 lazy_static::lazy_static! {
-    pub static ref GLOBAL_NODE_STATE: std::sync::RwLock<NodeState> = 
-        std::sync::RwLock::new(NodeState::Initializing);
+    pub static ref GLOBAL_NODE_STATE: ParkingRwLock<NodeState> = 
+        ParkingRwLock::new(NodeState::Initializing);
 }
 
 /// Update node state with logging
 pub fn set_node_state(new_state: NodeState) {
-    let old_state = match GLOBAL_NODE_STATE.read() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
+    let old_state = GLOBAL_NODE_STATE.read().clone();
     
     // Only log if state actually changed
     if old_state != new_state {
         if is_info() { println!("[INFO][STATE] {} → {}", old_state, new_state); }
-        
-        match GLOBAL_NODE_STATE.write() {
-            Ok(mut guard) => *guard = new_state,
-            Err(poisoned) => *poisoned.into_inner() = new_state,
-        }
+        *GLOBAL_NODE_STATE.write() = new_state;
     }
 }
 
 /// Get current node state
 pub fn get_node_state() -> NodeState {
-    match GLOBAL_NODE_STATE.read() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
+    GLOBAL_NODE_STATE.read().clone()
 }
 
 // CRITICAL: Global mempool instance for activation registry integration
@@ -465,8 +484,9 @@ pub fn try_get_mempool() -> Option<&'static Arc<qnet_mempool::SimpleMempool>> {
 
 // CRITICAL: Track certificate requests to prevent DDoS (request flooding)
 // Maps certificate_serial -> last_request_timestamp
+// v2.96: Using DashMap for lock-free operations
 lazy_static::lazy_static! {
-    static ref REQUESTED_CERTIFICATES: Mutex<std::collections::HashMap<String, u64>> = Mutex::new(std::collections::HashMap::new());
+    static ref REQUESTED_CERTIFICATES: DashMap<String, u64> = DashMap::new();
 }
 
 use sha3::{Sha3_256, Digest};
@@ -740,6 +760,52 @@ impl RotationTracker {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// v2.96: HeartbeatCommitment TX tracking with confirmation and retry support
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Status of HeartbeatCommitment TX - tracks from creation to confirmation
+#[derive(Debug, Clone)]
+pub struct HeartbeatCommitmentStatus {
+    /// TX hash for tracking
+    pub tx_hash: String,
+    /// Block height when TX was created and sent
+    pub sent_at_height: u64,
+    /// Block height when TX was confirmed (included in block), None if pending
+    pub confirmed_at_height: Option<u64>,
+    /// Number of retry attempts
+    pub retry_count: u8,
+    /// Timestamp when TX was created
+    pub created_at: u64,
+}
+
+impl HeartbeatCommitmentStatus {
+    pub fn new(tx_hash: String, sent_at_height: u64) -> Self {
+        Self {
+            tx_hash,
+            sent_at_height,
+            confirmed_at_height: None,
+            retry_count: 0,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }
+    }
+    
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed_at_height.is_some()
+    }
+    
+    pub fn mark_confirmed(&mut self, block_height: u64) {
+        self.confirmed_at_height = Some(block_height);
+    }
+    
+    pub fn increment_retry(&mut self) {
+        self.retry_count += 1;
+    }
+}
+
 /// Main blockchain node with unified P2P and regional clustering
 pub struct BlockchainNode {
     storage: Arc<Storage>,
@@ -807,9 +873,10 @@ pub struct BlockchainNode {
     // Reward manager for lazy rewards system
     reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
     
-    // PRODUCTION v2.77: Track sent HeartbeatCommitment TXs by epoch (to avoid duplicates)
-    // HashSet of epoch numbers for which commitment was already sent
-    sent_heartbeat_commitments: Arc<RwLock<std::collections::HashSet<u64>>>,
+    // PRODUCTION v2.96: Track HeartbeatCommitment TXs with confirmation status
+    // DashMap: epoch -> HeartbeatCommitmentStatus (pending/confirmed + retry tracking)
+    // Replaces simple HashSet for retry mechanism support
+    heartbeat_commitment_tracker: Arc<DashMap<u64, HeartbeatCommitmentStatus>>,
     
     // PRODUCTION v2.78: Track sent PingCommitment TXs by epoch (Full/Super nodes ping Light nodes)
     // HashSet of epoch numbers for which ping commitment was already sent
@@ -834,8 +901,8 @@ pub struct BlockchainNode {
     
     // DETERMINISTIC REPUTATION: Reputation calculated from blockchain data only
     // Replaces old P2P gossip-based reputation system (eliminated Sybil attacks)
-    // NOTE: Uses std::sync::RwLock for compatibility with SimplifiedP2P
-    deterministic_reputation: Arc<std::sync::RwLock<DeterministicReputationState>>,
+    // v2.96: Uses parking_lot::RwLock for 2-3x faster access (no poisoning)
+    deterministic_reputation: Arc<ParkingRwLock<DeterministicReputationState>>,
 }
 
 impl BlockchainNode {
@@ -891,7 +958,8 @@ impl BlockchainNode {
     
     /// Get deterministic reputation system (blockchain-based)
     /// SECURITY: Replaces P2P gossip-based reputation (eliminated Sybil attacks)
-    pub fn get_deterministic_reputation(&self) -> Arc<std::sync::RwLock<DeterministicReputationState>> {
+    /// v2.96: Uses parking_lot::RwLock for 2-3x faster access
+    pub fn get_deterministic_reputation(&self) -> Arc<ParkingRwLock<DeterministicReputationState>> {
         self.deterministic_reputation.clone()
     }
     
@@ -1095,16 +1163,15 @@ impl BlockchainNode {
         
         // Try to get REAL reputation from DeterministicReputationState
         if let Some(rep_state) = p2p.get_deterministic_reputation() {
-            if let Ok(rep_guard) = rep_state.read() {
-                return GENESIS_NODE_IPS.iter()
-                    .map(|(_, id)| {
-                        let node_id = format!("genesis_node_{}", id);
-                        let real_rep = rep_guard.get_reputation(&node_id, current_ts);
-                        // 0-100 → 0.0-1.0, minimum is MIN_CONSENSUS_REPUTATION
-                        (node_id, (real_rep / 100.0).clamp(min_rep, 1.0))
-                    })
-                    .collect();
-            }
+            let rep_guard = rep_state.read();
+            return GENESIS_NODE_IPS.iter()
+                .map(|(_, id)| {
+                    let node_id = format!("genesis_node_{}", id);
+                    let real_rep = rep_guard.get_reputation(&node_id, current_ts);
+                    // 0-100 → 0.0-1.0, minimum is MIN_CONSENSUS_REPUTATION
+                    (node_id, (real_rep / 100.0).clamp(min_rep, 1.0))
+                })
+                .collect();
         }
         
         // Fallback: use INITIAL_REPUTATION (without P2P access)
@@ -1146,11 +1213,8 @@ impl BlockchainNode {
         
         let reputation_map: std::collections::HashMap<String, f64> = 
             if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                if let Ok(rep_state) = rep_arc.read() {
-                    rep_state.get_all_reputations(current_timestamp)
-                } else {
-                    std::collections::HashMap::new()
-                }
+                let rep_state = rep_arc.read();
+                rep_state.get_all_reputations(current_timestamp)
             } else {
                 std::collections::HashMap::new()
             };
@@ -4593,23 +4657,23 @@ impl BlockchainNode {
         
         // DETERMINISTIC REPUTATION: Initialize blockchain-based reputation state
         // All reputation is calculated from on-chain data (no P2P gossip vulnerabilities)
-        // NOTE: Uses std::sync::RwLock for compatibility with SimplifiedP2P
-        let deterministic_reputation = Arc::new(std::sync::RwLock::new(DeterministicReputationState::new()));
+        // v2.96: Uses parking_lot::RwLock for 2-3x faster access
+        let deterministic_reputation = Arc::new(ParkingRwLock::new(DeterministicReputationState::new()));
         
         // FIX v2.21.5: Initialize Genesis nodes with starting reputation (70%)
         // This ensures get_reputation returns proper value before first macroblock
+        // v2.96: parking_lot never panics on poisoned lock
         {
-            if let Ok(mut rep_state) = deterministic_reputation.write() {
-                let genesis_nodes = vec![
-                    "genesis_node_001".to_string(),
-                    "genesis_node_002".to_string(),
-                    "genesis_node_003".to_string(),
-                    "genesis_node_004".to_string(),
-                    "genesis_node_005".to_string(),
-                ];
-                rep_state.init_genesis_nodes(&genesis_nodes);
-                if is_info() { println!("[INFO][REP] genesis_nodes={} reputation=70%", genesis_nodes.len()); }
-            }
+            let mut rep_state = deterministic_reputation.write();
+            let genesis_nodes = vec![
+                "genesis_node_001".to_string(),
+                "genesis_node_002".to_string(),
+                "genesis_node_003".to_string(),
+                "genesis_node_004".to_string(),
+                "genesis_node_005".to_string(),
+            ];
+            rep_state.init_genesis_nodes(&genesis_nodes);
+            if is_info() { println!("[INFO][REP] genesis_nodes={} reputation=70%", genesis_nodes.len()); }
         }
         if is_info() { println!("[INFO][REP] deterministic_system=ready source=blockchain"); }
         
@@ -4675,7 +4739,8 @@ impl BlockchainNode {
             parallel_validator,
             archive_manager: Arc::new(tokio::sync::RwLock::new(archive_manager)),
             reward_manager,
-            sent_heartbeat_commitments: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            // v2.96: DashMap for confirmation tracking + retry
+            heartbeat_commitment_tracker: Arc::new(DashMap::new()),
             sent_ping_commitments: Arc::new(RwLock::new(std::collections::HashSet::new())),
             quantum_poh,  // Already Option - None for Light nodes, Some for Full/Super
             quantum_poh_receiver: poh_receiver,  // Already Option
@@ -4702,7 +4767,8 @@ impl BlockchainNode {
             if current_height > 0 {
                 if is_info() { println!("[INFO][REP] replay_start blocks={}", current_height); }
                 
-                if let Ok(mut rep_state) = blockchain.deterministic_reputation.write() {
+                {
+                    let mut rep_state = blockchain.deterministic_reputation.write();
                     let start_time = std::time::Instant::now();
                     let mut blocks_processed = 0;
                     let mut macroblocks_processed = 0;
@@ -5024,7 +5090,7 @@ impl BlockchainNode {
                                         tx.signature.as_ref().map_or(0, |s| s.len()),
                                         received_tx.from_peer);
                                 }
-                                tx_batch.push((received_tx, tx));
+                            tx_batch.push((received_tx, tx));
                             }
                             Err(e) => {
                                 println!("[WARN][TX-RECV] deserialize_failed from={} err={}", 
@@ -5381,7 +5447,7 @@ impl BlockchainNode {
         node_type: NodeType,
         block_event_tx: tokio::sync::broadcast::Sender<u64>,
         reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
-        deterministic_reputation: Arc<std::sync::RwLock<DeterministicReputationState>>,
+        deterministic_reputation: Arc<ParkingRwLock<DeterministicReputationState>>,
     ) {
         // CRITICAL FIX: Buffer for out-of-order blocks
         // Key: block height, Value: (block data, retry count, timestamp)
@@ -6091,40 +6157,45 @@ impl BlockchainNode {
                                 };
                                 
                                 // 4. Update deterministic reputation state (in-memory)
+                                // v2.96: parking_lot - no poisoning possible
                                 {
-                                    if let Ok(mut rep_state) = deterministic_reputation.write() {
-                                        // v2.24: Apply reputation snapshot if present
-                                        // This is AUTHORITATIVE - blockchain is source of truth!
-                                        if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
-                                            if !snapshot_data.is_empty() {
-                                                match rep_state.apply_snapshot(snapshot_data) {
-                                                    Ok(count) => {
-                                                        if is_debug() { println!("[DBG][REP] snapshot_applied mb={} nodes={}", 
-                                                                 macroblock.height, count); }
-                                                    }
-                                                    Err(e) => {
-                                                        println!("[WARN][REP] snapshot_apply_failed err={} fallback=process_macroblock", e);
-                                                        rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                                    let mut rep_state = deterministic_reputation.write();
+                                    // v2.24: Apply reputation snapshot if present
+                                    // This is AUTHORITATIVE - blockchain is source of truth!
+                                    if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
+                                        if !snapshot_data.is_empty() {
+                                            match rep_state.apply_snapshot(snapshot_data) {
+                                                Ok(count) => {
+                                                    if is_debug() { 
+                                                        println!("[DBG][REP] snapshot_applied mb={} nodes={}", 
+                                                            macroblock.height, count); 
                                                     }
                                                 }
-                                            } else {
-                                                // No snapshot - use traditional method
-                                                rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                                                Err(e) => {
+                                                    println!("[WARN][REP] snapshot_apply_failed err={} fallback=process_macroblock", e);
+                                                    rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                                                }
                                             }
                                         } else {
-                                            // Legacy macroblock without snapshot
+                                            // No snapshot - use traditional method
                                             rep_state.process_macroblock(&macro_data, macroblock.timestamp);
                                         }
-                                        
-                                        // PASSIVE RECOVERY: Apply to online nodes with rep 10-69%
-                                        let online_nodes: Vec<String> = if let Some(ref p2p) = unified_p2p {
-                                            p2p.get_online_node_ids()
-                                        } else {
-                                            Vec::new()
-                                        };
-                                        rep_state.apply_passive_recovery(&online_nodes, macroblock.timestamp);
-                                        
-if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.consensus_data.reveals.len(), online_nodes.len()); }
+                                    } else {
+                                        // Legacy macroblock without snapshot
+                                        rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                                    }
+                                    
+                                    // PASSIVE RECOVERY: Apply to online nodes with rep 10-69%
+                                    let online_nodes: Vec<String> = if let Some(ref p2p) = unified_p2p {
+                                        p2p.get_online_node_ids()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    rep_state.apply_passive_recovery(&online_nodes, macroblock.timestamp);
+                                    
+                                    if is_info() { 
+                                        println!("[INFO][MB] rep participants={} online={}", 
+                                            macroblock.consensus_data.reveals.len(), online_nodes.len()); 
                                     }
                                 }
                             }
@@ -6244,21 +6315,22 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                     blocks_in_rotation: blocks_by_producer,
                                 };
 
-                                // Update deterministic reputation state (std::sync::RwLock - no await)
+                                // Update deterministic reputation state (v2.96: parking_lot - no await)
                                 // ARCHITECTURE: State is in-memory, can be rebuilt from blockchain
                                 // No P2P Storage sync needed - reputation is deterministic!
                                 {
-                                    if let Ok(mut rep_state) = deterministic_reputation.write() {
-                                        rep_state.process_block(&block_data);
-                                        
-                                        let new_rep = rep_state.get_reputation(producer_id, 
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs());
-                                        
-                                        if is_debug() { println!("[DBG][REP] rotation={} node={} rep={:.1}%", 
-                                                 received_block.height / 30, producer_id, new_rep); }
+                                    let mut rep_state = deterministic_reputation.write();
+                                    rep_state.process_block(&block_data);
+                                    
+                                    let new_rep = rep_state.get_reputation(producer_id, 
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs());
+                                    
+                                    if is_debug() { 
+                                        println!("[DBG][REP] rotation={} node={} rep={:.1}%", 
+                                            received_block.height / 30, producer_id, new_rep); 
                                     }
                                 }
                             }
@@ -7741,16 +7813,18 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
         let node_id = self.node_id.clone();
         let node_type = self.node_type.clone(); // v3.0: For producer selection
         let quantum_poh = self.quantum_poh.clone(); // v3.0: For producer selection
-        let sent_heartbeat_commitments = self.sent_heartbeat_commitments.clone();
+        let heartbeat_tracker = self.heartbeat_commitment_tracker.clone();
         let sent_ping_commitments = self.sent_ping_commitments.clone();
         let is_running = self.is_running.clone();
         
         tokio::spawn(async move {
             const EMISSION_BLOCK_INTERVAL: u64 = 14400;
             const COMMITMENT_WINDOW_START: u64 = 50;
+            const RETRY_AFTER_BLOCKS: u64 = 10; // Retry if not confirmed after 10 blocks
+            const MAX_RETRIES: u8 = 3; // Maximum retry attempts
             
             if is_info() {
-                println!("[INFO][COMMIT-LOOP] Commitment TX loop started");
+                println!("[INFO][COMMIT-LOOP] Commitment TX loop started with retry support");
             }
             
             while *is_running.read().await {
@@ -7772,17 +7846,39 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                              current_height, current_epoch, blocks_until_epoch_end);
                 }
                 
-                // HeartbeatCommitment TX
+                // HeartbeatCommitment TX with confirmation tracking + retry
                 {
-                    let already_sent = {
-                        let sent = sent_heartbeat_commitments.read().await;
-                        sent.contains(&current_epoch)
+                    // v2.96: Check if already sent AND confirmed, or needs retry
+                    let should_send = if let Some(status) = heartbeat_tracker.get(&current_epoch) {
+                        if status.is_confirmed() {
+                            // Already confirmed - skip
+                            if is_info() {
+                                println!("[INFO][HEARTBEAT-COMMITMENT] Already confirmed for epoch={} at block={}", 
+                                         current_epoch, status.confirmed_at_height.unwrap_or(0));
+                            }
+                            false
+                        } else {
+                            // Pending - check if retry needed
+                            let blocks_since_sent = current_height.saturating_sub(status.sent_at_height);
+                            if blocks_since_sent >= RETRY_AFTER_BLOCKS && status.retry_count < MAX_RETRIES {
+                                println!("[WARN][HEARTBEAT-COMMITMENT] TX not confirmed after {} blocks, retry #{} epoch={}", 
+                                         blocks_since_sent, status.retry_count + 1, current_epoch);
+                                true // Need retry
+                            } else if status.retry_count >= MAX_RETRIES {
+                                println!("[ERR][HEARTBEAT-COMMITMENT] Max retries ({}) reached for epoch={}", MAX_RETRIES, current_epoch);
+                                false
+                            } else {
+                                // Still waiting for confirmation
+                                false
+                            }
+                        }
+                    } else {
+                        // Not sent yet - send now
+                        true
                     };
                     
-                    if already_sent {
-                        if is_info() {
-                            println!("[INFO][HEARTBEAT-COMMITMENT] Already sent for epoch={}", current_epoch);
-                        }
+                    if !should_send {
+                        // Skip - already handled above
                     } else {
                         if is_info() {
                             println!("[INFO][HEARTBEAT-COMMITMENT] Creating TX for epoch={}", current_epoch);
@@ -7816,11 +7912,25 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                             let tx_bytes_for_broadcast = tx_bytes.clone();
                                             
                                             if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
-                                                let mut sent = sent_heartbeat_commitments.write().await;
-                                                sent.insert(current_epoch);
-                                                if is_info() {
-                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX submitted to mempool epoch={} hash={}", 
-                                                             current_epoch, &tx.hash[..16]);
+                                                // v2.96: Track with HeartbeatCommitmentStatus (pending until confirmed)
+                                                let tx_hash_clone = tx.hash.clone();
+                                                if let Some(mut existing) = heartbeat_tracker.get_mut(&current_epoch) {
+                                                    // Retry case - increment counter
+                                                    existing.increment_retry();
+                                                    existing.value_mut().sent_at_height = current_height;
+                                                    existing.value_mut().tx_hash = tx_hash_clone.clone();
+                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX retry #{} submitted epoch={} hash={}", 
+                                                             existing.retry_count, current_epoch, &tx_hash_clone[..16]);
+                                                } else {
+                                                    // First send
+                                                    heartbeat_tracker.insert(
+                                                        current_epoch, 
+                                                        HeartbeatCommitmentStatus::new(tx_hash_clone.clone(), current_height)
+                                                    );
+                                                    if is_info() {
+                                                        println!("[INFO][HEARTBEAT-COMMITMENT] TX submitted to mempool epoch={} hash={}", 
+                                                                 current_epoch, &tx_hash_clone[..16]);
+                                                    }
                                                 }
                                                 
                                                 // ═══════════════════════════════════════════════════════════════════
@@ -7922,14 +8032,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                 
                                                 // Step 4: Check for emergency producer (failover scenario)
                                                 // If network stalled and emergency producer was activated, send to them too
-                                                // v2.94 FIX: Extract data before await to avoid MutexGuard across await point
-                                                let emergency_target: Option<(u64, String)> = {
-                                                    if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                                                        emergency_flag.clone()
-                                                    } else {
-                                                        None
-                                                    }
-                                                };
+                                                // v2.96: Lock-free emergency producer check
+                                                let emergency_target: Option<(u64, String)> = get_emergency_producer();
                                                 
                                                 if let Some((emergency_height, emergency_producer)) = emergency_target {
                                                     if emergency_height >= next_height && 
@@ -7988,6 +8092,43 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                         println!("[WARN][HEARTBEAT-COMMITMENT] Failed to create TX epoch={} error={:?}", 
                                                  current_epoch, e);
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // ═══════════════════════════════════════════════════════════════════════════
+                // v2.96: CONFIRMATION CHECK - scan recent blocks for our HeartbeatCommitment TX
+                // ═══════════════════════════════════════════════════════════════════════════
+                {
+                    // Check pending (unconfirmed) commitments
+                    let pending_epochs: Vec<u64> = heartbeat_tracker.iter()
+                        .filter(|entry| !entry.value().is_confirmed())
+                        .map(|entry| *entry.key())
+                        .collect();
+                    
+                    for epoch in pending_epochs {
+                        if let Some(mut status) = heartbeat_tracker.get_mut(&epoch) {
+                            // Scan blocks from sent_at_height to current_height
+                            let scan_start = status.sent_at_height;
+                            let scan_end = current_height.min(scan_start + 20); // Scan up to 20 blocks
+                            
+                            for check_height in scan_start..=scan_end {
+                                if let Ok(Some(block_data)) = storage.load_microblock_auto_format(check_height) {
+                                    // Check if our TX is in this block
+                                    for tx in &block_data.transactions {
+                                        if let qnet_state::TransactionType::HeartbeatCommitment { node_id: tx_node_id, .. } = &tx.tx_type {
+                                            if tx_node_id == &node_id && tx.hash == status.tx_hash {
+                                                // Found our TX! Mark as confirmed
+                                                status.mark_confirmed(check_height);
+                                                println!("[INFO][HEARTBEAT-COMMITMENT] TX CONFIRMED epoch={} block={} hash={}", 
+                                                         epoch, check_height, &status.tx_hash[..16]);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if status.is_confirmed() { break; }
                                 }
                             }
                         }
@@ -8162,21 +8303,19 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                                         }
                                                     }
                                                     
-                                                    // Handle emergency producer (failover)
-                                                    if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                                                        if let Some((emergency_height, emergency_producer)) = &*emergency_flag {
-                                                            if *emergency_height >= next_height && 
-                                                               emergency_producer != &node_id &&
-                                                               emergency_producer != &producer_next &&
-                                                               emergency_producer != &producer_next_plus_one {
-                                                                if let Some(producer_addr) = p2p.get_peer_addr_by_id(emergency_producer) {
-                                                                    let tx_msg = NetworkMessage::Transaction { 
-                                                                        data: tx_bytes_for_broadcast.clone() 
-                                                                    };
-                                                                    p2p.send_network_message(&producer_addr, tx_msg);
-                                                                    if is_info() {
-                                                                        println!("[INFO][LIGHT-BITMAP] TX forwarded to EMERGENCY producer={}", emergency_producer);
-                                                                    }
+                                                    // Handle emergency producer (failover) - v2.96: lock-free
+                                                    if let Some((emergency_height, emergency_producer)) = get_emergency_producer() {
+                                                        if emergency_height >= next_height && 
+                                                           emergency_producer != node_id &&
+                                                           emergency_producer != producer_next &&
+                                                           emergency_producer != producer_next_plus_one {
+                                                            if let Some(producer_addr) = p2p.get_peer_addr_by_id(&emergency_producer) {
+                                                                let tx_msg = NetworkMessage::Transaction { 
+                                                                    data: tx_bytes_for_broadcast.clone() 
+                                                                };
+                                                                p2p.send_network_message(&producer_addr, tx_msg);
+                                                                if is_info() {
+                                                                    println!("[INFO][LIGHT-BITMAP] TX forwarded to EMERGENCY producer={}", emergency_producer);
                                                                 }
                                                             }
                                                         }
@@ -8276,9 +8415,6 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
         
         // Clone shard_coordinator for use inside spawn (avoid self reference)
         let shard_coordinator_opt = self.shard_coordinator.clone();
-        
-        // CRITICAL: Clone sent_heartbeat_commitments for HeartbeatCommitment TX tracking
-        let sent_heartbeat_commitments_clone = self.sent_heartbeat_commitments.clone();
         
         tokio::spawn(async move {
             // CRITICAL FIX: Start from current global height, not 0
@@ -9483,22 +9619,24 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     // CRITICAL FIX: Force network height update if we're stuck at low height
                     // This prevents Node_005 stuck at block 30 issue
                     // Also force update every 30 seconds if no new blocks received
-                    static LAST_BLOCK_TIME: Lazy<Arc<Mutex<Instant>>> = Lazy::new(|| Arc::new(Mutex::new(Instant::now())));
-                    static LAST_HEIGHT_CHECK: Lazy<Arc<Mutex<u64>>> = Lazy::new(|| Arc::new(Mutex::new(0)));
+                    // v2.96: Lock-free atomics instead of Mutex
+                    static LAST_BLOCK_TIME_SECS: StdAtomicU64 = StdAtomicU64::new(0);
+                    static LAST_HEIGHT_CHECK: StdAtomicU64 = StdAtomicU64::new(0);
                     
                     let should_force_update = {
-                        // SECURITY: Handle poisoned locks gracefully to prevent node crash
-                        let last_height = LAST_HEIGHT_CHECK.lock()
-                            .map(|guard| *guard)
-                            .unwrap_or(0);
-                        let time_since_block = LAST_BLOCK_TIME.lock()
-                            .map(|guard| guard.elapsed())
-                            .unwrap_or(Duration::from_secs(0));
+                        // v2.96: Lock-free read
+                        let last_height = LAST_HEIGHT_CHECK.load(StdOrdering::Relaxed);
+                        let last_time = LAST_BLOCK_TIME_SECS.load(StdOrdering::Relaxed);
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let time_since_block = if last_time > 0 { now_secs.saturating_sub(last_time) } else { 0 };
                         
                         // Force update ONLY if stuck (no progress for 30 seconds)
                         // Don't force update during normal operation (blocks <=30)
                         // This was causing 800-1200ms delay every iteration!
-                        time_since_block.as_secs() > 30 && last_height == microblock_height
+                        time_since_block > 30 && last_height == microblock_height
                     };
                     
                     let network_height = if should_force_update {
@@ -9506,14 +9644,14 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         match p2p.sync_blockchain_height().await {
                             Ok(h) => {
                                 if is_debug() { println!("[DBG][SYNC] forced_h_update net={} local={}", h, microblock_height); }
-                                // Update tracking - handle poisoned locks gracefully
-                                if let Ok(mut guard) = LAST_HEIGHT_CHECK.lock() {
-                                    *guard = microblock_height;
-                                }
+                                // Update tracking - v2.96: lock-free
+                                LAST_HEIGHT_CHECK.store(microblock_height, StdOrdering::Relaxed);
                                 if h > microblock_height {
-                                    if let Ok(mut guard) = LAST_BLOCK_TIME.lock() {
-                                        *guard = Instant::now();
-                                    }
+                                    let now_secs = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    LAST_BLOCK_TIME_SECS.store(now_secs, StdOrdering::Relaxed);
                                 }
                                 h
                             },
@@ -10003,25 +10141,24 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 
                 // CRITICAL FIX: Check if we're emergency producer for this block
                 // Emergency producer MUST create block even if not originally scheduled
+                // v2.96: Lock-free emergency check
                 if !is_my_turn_to_produce {
-                    if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                        if let Some((height, producer)) = &*emergency_flag {
-                            if *height == next_block_height && *producer == node_id {
-                                println!("[EMERGENCY] 🚨 OVERRIDING: WE ARE EMERGENCY PRODUCER FOR BLOCK #{}", height);
-                                println!("[EMERGENCY] 🔥 FORCING IMMEDIATE BLOCK PRODUCTION!");
-                                
-                                // STATE MACHINE: Emergency producer mode
-                                set_node_state(NodeState::Producing { 
-                                    round: (*height - 1) / 30, 
-                                    current_height: *height,
-                                });
-                                
-                                current_producer = node_id.clone();
-                                is_my_turn_to_produce = true;
-                                
-                                // CRITICAL: Skip all waiting and produce block NOW
-                                // Emergency producer doesn't wait for sync or anything
-                            }
+                    if let Some((height, producer)) = get_emergency_producer() {
+                        if height == next_block_height && producer == node_id {
+                            println!("[EMERGENCY] 🚨 OVERRIDING: WE ARE EMERGENCY PRODUCER FOR BLOCK #{}", height);
+                            println!("[EMERGENCY] 🔥 FORCING IMMEDIATE BLOCK PRODUCTION!");
+                            
+                            // STATE MACHINE: Emergency producer mode
+                            set_node_state(NodeState::Producing { 
+                                round: (height - 1) / 30, 
+                                current_height: height,
+                            });
+                            
+                            current_producer = node_id.clone();
+                            is_my_turn_to_produce = true;
+                            
+                            // CRITICAL: Skip all waiting and produce block NOW
+                            // Emergency producer doesn't wait for sync or anything
                         }
                     }
                 }
@@ -10117,32 +10254,24 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 u64::from_le_bytes([our_entropy[0], our_entropy[1], our_entropy[2], our_entropy[3],
                                                    our_entropy[4], our_entropy[5], our_entropy[6], our_entropy[7]]));
                         
-                        // CRITICAL FIX: Check if we already have enough responses before sending new requests
-                        let already_have_responses = {
-                            let responses = entropy_responses_lock();
-                            responses.iter()
-                                .filter(|((h, _), _)| *h == entropy_height)
-                                .count()
-                        };
+                        // CRITICAL FIX v2.96: Lock-free entropy response counting with DashMap
+                        let already_have_responses = ENTROPY_RESPONSES.iter()
+                            .filter(|entry| entry.key().0 == entropy_height)
+                            .count();
                         
                         // Only send requests if we don't have enough responses
                         if already_have_responses < sample_size {
-                            // Clear old responses for this height only if they're stale (>10 seconds)
-                            {
-                                let mut responses = entropy_responses_lock();
-                                // Keep recent responses, only clear if we're starting fresh
-                                if already_have_responses == 0 {
-                                    responses.retain(|(h, _), _| *h != entropy_height);
-                                }
+                            // Clear old responses for this height only if starting fresh
+                            // v2.96: DashMap.retain is lock-free
+                            if already_have_responses == 0 {
+                                ENTROPY_RESPONSES.retain(|k, _| k.0 != entropy_height);
                             }
                             
                             // PRODUCTION: Query peers for their entropy via P2P messages (ASYNC, non-blocking)
                             for peer in peers.iter().take(sample_size - already_have_responses) {
-                                // Check if we already have response from this peer
-                                let peer_already_responded = {
-                                    let responses = entropy_responses_lock();
-                                    responses.contains_key(&(entropy_height, peer.id.clone()))
-                                };
+                                // v2.96: Lock-free contains_key check
+                                let peer_already_responded = ENTROPY_RESPONSES
+                                    .contains_key(&(entropy_height, peer.id.clone()));
                                 
                                 if !peer_already_responded {
                                     // Send entropy request to peer
@@ -10231,24 +10360,24 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 matches = 0;
                                 mismatches = 0;
                                 
-                                {
-                                    let responses = entropy_responses_lock();
-                                    for ((height, responder), peer_entropy) in responses.iter() {
-                                        if *height == entropy_height {
-                                            // CRITICAL FIX: Ignore peer_entropy == 0 (peer doesn't have block yet)
-                                            // This prevents false positives when nodes are at different heights
-                                            // FINALITY_WINDOW ensures synchronized nodes have this block
-                                            if *peer_entropy == [0u8; 32] {
-                                                // Don't count as mismatch - peer is just lagging
-                                                continue;
-                                            }
-                                            
-                                            if *peer_entropy == our_entropy {
-                                                matches += 1;
-                                            } else {
-                                                // REAL mismatch: peer has different entropy (potential fork!)
-                                                mismatches += 1;
-                                            }
+                                // v2.96: Lock-free iteration with DashMap
+                                for entry in ENTROPY_RESPONSES.iter() {
+                                    let (height, _responder) = entry.key();
+                                    let peer_entropy = entry.value();
+                                    if *height == entropy_height {
+                                        // CRITICAL FIX: Ignore peer_entropy == 0 (peer doesn't have block yet)
+                                        // This prevents false positives when nodes are at different heights
+                                        // FINALITY_WINDOW ensures synchronized nodes have this block
+                                        if *peer_entropy == [0u8; 32] {
+                                            // Don't count as mismatch - peer is just lagging
+                                            continue;
+                                        }
+                                        
+                                        if *peer_entropy == our_entropy {
+                                            matches += 1;
+                                        } else {
+                                            // REAL mismatch: peer has different entropy (potential fork!)
+                                            mismatches += 1;
                                         }
                                     }
                                 }
@@ -10275,9 +10404,11 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             }
                             
                             // Log final results with responder details
+                            // v2.96: Lock-free iteration with DashMap
                             if consensus_reached || matches > 0 {
-                                let responses = entropy_responses_lock();
-                                for ((height, responder), peer_entropy) in responses.iter() {
+                                for entry in ENTROPY_RESPONSES.iter() {
+                                    let (height, responder) = entry.key();
+                                    let peer_entropy = entry.value();
                                     if *height == entropy_height && *peer_entropy != [0u8; 32] {
                                         if *peer_entropy == our_entropy {
                                             if is_debug() { println!("[DBG][CONS] entropy_match peer={}", responder); }
@@ -10336,12 +10467,12 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             // This prevents selecting a lagging node as producer (e.g., node stuck at height 1)
                             // ARCHITECTURE: A producer MUST have blocks up to (current_height - FINALITY_WINDOW)
                             // If they don't, they cannot create valid blocks with correct PoH
+                            // v2.96: Lock-free access with DashMap
                             let producer_is_synchronized = {
-                                let responses = entropy_responses_lock();
                                 // Check if current_producer returned entropy = 0 (not synchronized)
-                                let producer_entropy = responses.get(&(entropy_height, current_producer.clone()));
+                                let producer_entropy = ENTROPY_RESPONSES.get(&(entropy_height, current_producer.clone()));
                                 match producer_entropy {
-                                    Some(entropy) if *entropy == [0u8; 32] => {
+                                    Some(ref entry) if *entry.value() == [0u8; 32] => {
                                         // Producer returned 0 = NOT synchronized (doesn't have entropy block)
                                         eprintln!("[ERR][PROD] not_synced producer={} entropy_h={}", current_producer, entropy_height);
                                         false
@@ -10364,18 +10495,18 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             if !producer_is_synchronized {
                                 if is_info() { println!("[INFO][PROD] fallback_select reason=not_synced"); }
                                 
+                                // v2.96: Lock-free iteration with DashMap
                                 // Get list of candidates who ARE synchronized (returned valid entropy)
-                                let synchronized_candidates: Vec<String> = {
-                                    let responses = entropy_responses_lock();
-                                    responses.iter()
-                                        .filter(|((height, _), entropy)| {
-                                            *height == entropy_height && 
-                                            **entropy != [0u8; 32] && // Has valid entropy
-                                            **entropy == our_entropy   // Matches consensus
-                                        })
-                                        .map(|((_, node_id), _)| node_id.clone())
-                                        .collect()
-                                };
+                                let synchronized_candidates: Vec<String> = ENTROPY_RESPONSES.iter()
+                                    .filter(|entry| {
+                                        let (height, _) = entry.key();
+                                        let entropy = entry.value();
+                                        *height == entropy_height && 
+                                        *entropy != [0u8; 32] && // Has valid entropy
+                                        *entropy == our_entropy   // Matches consensus
+                                    })
+                                    .map(|entry| entry.key().1.clone())
+                                    .collect();
                                 
                                 if synchronized_candidates.is_empty() {
                                     // ═══════════════════════════════════════════════════════════════════════════
@@ -10574,16 +10705,10 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         }
                     }
                     
-                    // Check if we're emergency producer
-                    let is_emergency_producer = if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                        if let Some((height, _)) = &*emergency_flag {
-                            *height == next_block_height
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
+                    // Check if we're emergency producer - v2.96: lock-free
+                    let is_emergency_producer = get_emergency_producer()
+                        .map(|(height, _)| height == next_block_height)
+                        .unwrap_or(false);
                     
                     // CRITICAL FIX: DO NOT clear emergency flag here - it causes deadlock!
                     // Flag will be cleared AFTER block is successfully created and saved
@@ -10604,11 +10729,9 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             println!("[EMERGENCY] 🔄 Node is lagging or has fork - clearing emergency flag");
                             println!("[EMERGENCY] 💡 Background sync will resolve the issue");
                             
-                            // Clear emergency flag - we can't produce
-                            if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                                *emergency_flag = None;
-                                println!("[EMERGENCY] 🔧 Cleared emergency flag - node not synchronized");
-                            }
+                            // Clear emergency flag - we can't produce - v2.96: lock-free
+                            clear_emergency_producer();
+                            println!("[EMERGENCY] 🔧 Cleared emergency flag - node not synchronized");
                             
                             false // Cannot produce
                         } else {
@@ -10637,23 +10760,10 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                         println!("[EMERGENCY][WAIT] h={} attempt={}/{} status=arrived elapsed={:.1}s action=canceling_emergency", 
                                                  next_block_height, attempt, max_attempts, elapsed);
                                         
-                                        // Clear emergency flag - use force clear to handle poisoned mutex
-                                        let flag_cleared = match EMERGENCY_PRODUCER_FLAG.lock() {
-                                            Ok(mut flag) => {
-                                                *flag = None;
-                                                true
-                                            },
-                                            Err(poisoned) => {
-                                                let mut flag = poisoned.into_inner();
-                                                *flag = None;
-                                                true
-                                            }
-                                        };
-                                        
-                                        if flag_cleared {
-                                            println!("[EMERGENCY][WAIT] h={} flag_cleared reason=block_delivered_by_original", 
-                                                     next_block_height);
-                                        }
+                                        // Clear emergency flag - v2.96: lock-free
+                                        clear_emergency_producer();
+                                        println!("[EMERGENCY][WAIT] h={} flag_cleared reason=block_delivered_by_original", 
+                                                 next_block_height);
                                         
                                         block_arrived = true;
                                         break;
@@ -12131,7 +12241,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         if height_for_storage % 30 == 0 && height_for_storage > 0 {
                             if let Some(ref p2p) = p2p_for_reward {
                                 if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                                    if let Ok(mut rep_state) = rep_arc.write() {
+                                    let mut rep_state = rep_arc.write();
                                         use qnet_consensus::deterministic_reputation::BlockData;
                                         let producer_id = microblock.producer.clone();
                                         
@@ -12158,15 +12268,16 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                             is_valid: true,
                                             blocks_in_rotation: blocks_by_producer,
                                         };
-                                        rep_state.process_block(&block_data);
+                                    rep_state.process_block(&block_data);
 
-                                        let new_rep = rep_state.get_reputation(&producer_id,
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs());
-                                        println!("[REPUTATION] ✅ Own rotation #{} → {:.1}%", 
-                                                 height_for_storage / 30, new_rep);
+                                    let new_rep = rep_state.get_reputation(&producer_id,
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs());
+                                    if is_info() {
+                                        println!("[INFO][REP] own_rotation r={} rep={:.1}%", 
+                                            height_for_storage / 30, new_rep);
                                     }
                                 }
                             }
@@ -12306,13 +12417,12 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     
                     // CRITICAL FIX: Clear emergency flag AFTER successful block creation
                     // This prevents deadlock where node forgets it's emergency producer
+                    // v2.96: lock-free
                     if is_emergency_producer {
-                        if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                            if let Some((height, _)) = &*emergency_flag {
-                                if *height == microblock.height {
-                                    println!("[EMERGENCY] ✅ Clearing emergency flag after successful block #{} creation", microblock.height);
-                                    *emergency_flag = None;
-                                }
+                        if let Some((height, _)) = get_emergency_producer() {
+                            if height == microblock.height {
+                                println!("[EMERGENCY] ✅ Clearing emergency flag after successful block #{} creation", microblock.height);
+                                clear_emergency_producer();
                             }
                         }
                     }
@@ -12345,7 +12455,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     if microblock.height % 30 == 0 && microblock.height > 0 {
                         if let Some(ref p2p) = unified_p2p {
                             if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                                if let Ok(mut rep_state) = rep_arc.write() {
+                                let mut rep_state = rep_arc.write();
                                     use qnet_consensus::deterministic_reputation::BlockData;
                                     
                                     // Count OWN blocks in this rotation
@@ -12368,11 +12478,12 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                         is_valid: true,
                                         blocks_in_rotation: blocks_by_producer,
                                     };
-                                    rep_state.process_block(&block_data);
+                                rep_state.process_block(&block_data);
 
-                                    let new_rep = rep_state.get_reputation(&microblock.producer, microblock.timestamp);
-                                    println!("[REPUTATION] ✅ Producer {} rotation #{} ({}/30) → {:.1}%", 
-                                             microblock.producer, microblock.height / 30, blocks_by_producer, new_rep);
+                                let new_rep = rep_state.get_reputation(&microblock.producer, microblock.timestamp);
+                                if is_info() {
+                                    println!("[INFO][REP] producer={} rotation={} blocks={}/30 rep={:.1}%", 
+                                        microblock.producer, microblock.height / 30, blocks_by_producer, new_rep);
                                 }
                             }
                         }
@@ -12929,20 +13040,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         (expected_height_timeout - 1) / rotation_interval
                                     };
                                     
+                                    // v2.96: Lock-free cache update with DashMap
                                     use producer_cache::CACHED_PRODUCER_SELECTION;
-                                    if let Some(cache) = CACHED_PRODUCER_SELECTION.get() {
-                                        if let Ok(mut cache_guard) = cache.lock() {
-                                            // Get existing candidates (or empty list - doesn't matter, just need producer ID!)
-                                            let existing_candidates = cache_guard.get(&leadership_round)
-                                                .map(|(_, cands)| cands.clone())
-                                                .unwrap_or_default();
-                                            
-                                            // Update cache: emergency producer takes over this rotation!
-                                            cache_guard.insert(leadership_round, (emergency_producer.clone(), existing_candidates));
-                                            println!("[EMERGENCY][FAILOVER] h={} cache_updated=true round={} new_producer={} reason=emergency_takeover", 
-                                                     expected_height_timeout, leadership_round, emergency_producer);
-                                        }
-                                    }
+                                    let existing_candidates = CACHED_PRODUCER_SELECTION.get(&leadership_round)
+                                        .map(|entry| entry.value().1.clone())
+                                        .unwrap_or_default();
+                                    
+                                    // Update cache: emergency producer takes over this rotation!
+                                    CACHED_PRODUCER_SELECTION.insert(leadership_round, (emergency_producer.clone(), existing_candidates));
+                                    println!("[EMERGENCY][FAILOVER] h={} cache_updated=true round={} new_producer={} reason=emergency_takeover", 
+                                             expected_height_timeout, leadership_round, emergency_producer);
                                     
                                     // EXISTING: Use same emergency broadcast as macroblock (line 2114)
                                     if let Err(e) = p2p_timeout.broadcast_emergency_producer_change(
@@ -12960,11 +13067,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             if is_info() { println!("[INFO][FAIL] we_are_emergency h={}", expected_height_timeout); }
                                             
                                             // Signal main loop to produce block immediately
-                                            // Store emergency producer flag in a shared location
-                                            if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                                                *emergency_flag = Some((expected_height_timeout, emergency_producer.clone()));
-                                                if is_debug() { println!("[DBG][FAIL] flag_set h={}", expected_height_timeout); }
-                                            }
+                                            // Store emergency producer flag - v2.96: lock-free
+                                            set_emergency_producer_flag(expected_height_timeout, emergency_producer.clone());
+                                            if is_debug() { println!("[DBG][FAIL] flag_set h={}", expected_height_timeout); }
                                             
                                             // NOTE: Emergency producer will be checked on next iteration
                                         }
@@ -13254,13 +13359,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             };
             
             // CRITICAL: Use shared module-level cache to prevent duplication
+            // v2.96: Lock-free DashMap for hot path performance
             use producer_cache::CACHED_PRODUCER_SELECTION;
-            
-            let producer_cache = CACHED_PRODUCER_SELECTION.get_or_init(|| {
-                use std::sync::Mutex;
-            use std::collections::HashMap;
-                Mutex::new(HashMap::new())
-            });
             
             // CRITICAL FIX: Don't use cache if synchronization state might affect PoH usage
             // Cache is only valid if all nodes have the same PoH availability
@@ -13285,32 +13385,27 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // This prevents using stale cached producer when entering new round
             if current_height > 0 && (current_height - 1) % rotation_interval == 0 {
                 // We're at a rotation boundary (blocks 31, 61, 91...)
-                // Clear cache for the NEW round we're entering
-                if let Ok(mut cache) = producer_cache.lock() {
-                    cache.remove(&leadership_round);
-                }
+                // v2.96: Lock-free remove with DashMap
+                CACHED_PRODUCER_SELECTION.remove(&leadership_round);
                 // Don't use cache for first block of new round
                 can_use_cache = false;
             }
             
             // Check if we have cached result for this round
+            // v2.96: Lock-free cache lookup with DashMap
             if can_use_cache {
-                if let Ok(cache) = producer_cache.lock() {
-                    if let Some((cached_producer, cached_candidates)) = cache.get(&leadership_round) {
-                        // EXISTING: Log only at rotation boundaries for performance
-                        // Log only at rotation boundaries
-                        if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
-                            if is_info() { println!("[INFO][PRODUCER] id={} round={} next_rot={}", cached_producer, leadership_round, (leadership_round + 1) * rotation_interval + 1); }
-                        }
-                        return cached_producer.clone();
+                if let Some(entry) = CACHED_PRODUCER_SELECTION.get(&leadership_round) {
+                    let (cached_producer, _cached_candidates) = entry.value();
+                    // EXISTING: Log only at rotation boundaries for performance
+                    if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
+                        if is_info() { println!("[INFO][PRODUCER] id={} round={} next_rot={}", cached_producer, leadership_round, (leadership_round + 1) * rotation_interval + 1); }
                     }
+                    return cached_producer.clone();
                 }
-            } else if !can_use_cache {
+            } else {
                 // CRITICAL: Clear cache for this round if we can't use it
-                // This ensures recalculation when synchronization state changes
-                if let Ok(mut cache) = producer_cache.lock() {
-                    cache.remove(&leadership_round);
-                }
+                // v2.96: Lock-free remove
+                CACHED_PRODUCER_SELECTION.remove(&leadership_round);
             }
             
             // Cache miss - need to calculate candidates (only once per 30-block period)
@@ -13651,17 +13746,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             
             // PERFORMANCE FIX: Cache the result for this entire 30-block period
-            if let Ok(mut cache) = producer_cache.lock() {
-                // Clone candidates for cache
-                cache.insert(leadership_round, (selected_producer.clone(), candidates.clone()));
-                
-                // PRODUCTION: Cleanup old cached rounds (keep only last 3 rounds to prevent memory leak)
-                let rounds_to_keep: Vec<u64> = cache.keys()
-                    .filter(|&&round| round + 3 >= leadership_round)
-                    .cloned()
-                    .collect();
-                cache.retain(|k, _| rounds_to_keep.contains(k));
-            }
+            // v2.96: Lock-free cache insert with DashMap
+            CACHED_PRODUCER_SELECTION.insert(leadership_round, (selected_producer.clone(), candidates.clone()));
+            
+            // PRODUCTION: Cleanup old cached rounds (keep only last 3 rounds to prevent memory leak)
+            // v2.96: Lock-free retain with DashMap
+            CACHED_PRODUCER_SELECTION.retain(|round, _| *round + 3 >= leadership_round);
             
             // PRODUCTION: Log producer selection info ONLY at rotation boundaries for performance
             // Rotation happens at blocks 31, 61, 91... (not 30, 60, 90)
@@ -13684,17 +13774,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// CRITICAL FIX: Invalidate producer cache during emergency failover
     /// This prevents the network from selecting failed producers repeatedly
     pub fn invalidate_producer_cache() {
-        // CRITICAL: Must use SAME static that select_microblock_producer uses
-        // Move static declaration OUTSIDE to module level for shared access
+        // v2.96: Lock-free cache clear with DashMap
         use producer_cache::CACHED_PRODUCER_SELECTION;
         
-        if let Some(cache) = CACHED_PRODUCER_SELECTION.get() {
-            if let Ok(mut cache_guard) = cache.lock() {
-                let old_size = cache_guard.len();
-                cache_guard.clear();
-                println!("[PRODUCER_CACHE] 🔄 Producer cache invalidated ({} entries cleared) - forcing new selection", old_size);
-            }
-        }
+        let old_size = CACHED_PRODUCER_SELECTION.len();
+        CACHED_PRODUCER_SELECTION.clear();
+        println!("[PRODUCER_CACHE] 🔄 Producer cache invalidated ({} entries cleared) - forcing new selection", old_size);
     }
     
     /// Get reputation score for a node
@@ -13719,27 +13804,24 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // FIX v2.21.5: Removed Genesis hardcode - they now earn/lose reputation like all nodes
         match p2p.get_deterministic_reputation() {
             Some(rep_state) => {
-                match rep_state.read() {
-                    Ok(state) => {
-                        let current_ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        // get_reputation returns 0-100, convert to 0.0-1.0
-                        let score = state.get_reputation(node_id, current_ts);
-                        // FIX v2.21.5: Proper conversion from 0-100 to 0.0-1.0
-                        let raw_reputation = (score / 100.0).max(0.0).min(1.0);
-                        
-                        if raw_reputation < 0.70 {
-                            #[cfg(debug_assertions)]
-                            println!("[REPUTATION] ⚠️ Node {} below threshold: {:.1}% (min: 70%)", 
-                                     node_id, raw_reputation * 100.0);
-                        }
-                        
-                        raw_reputation
+                let state = rep_state.read();
+                let current_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                // get_reputation returns 0-100, convert to 0.0-1.0
+                let score = state.get_reputation(node_id, current_ts);
+                // FIX v2.21.5: Proper conversion from 0-100 to 0.0-1.0
+                let raw_reputation = (score / 100.0).max(0.0).min(1.0);
+                
+                if raw_reputation < 0.70 {
+                    if is_debug() {
+                        println!("[DBG][REP] node={} below_threshold rep={:.1}%", 
+                            node_id, raw_reputation * 100.0);
                     }
-                    Err(_) => 0.70 // Default to 70% (INITIAL_REPUTATION / 100)
                 }
+                
+                raw_reputation
             }
             None => {
                 // Use new blockchain-based method
@@ -14384,14 +14466,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     .map(|id| {
                                         // Get real reputation from deterministic state
                                         let rep = p2p.get_deterministic_reputation()
-                                            .and_then(|rep_arc| {
-                                                rep_arc.read().ok().map(|state| {
-                                                    state.get_reputation(id, 
-                                                        std::time::SystemTime::now()
-                                                            .duration_since(std::time::UNIX_EPOCH)
-                                                            .unwrap_or_default()
-                                                            .as_secs())
-                                                })
+                                            .map(|rep_arc| {
+                                                let state = rep_arc.read();
+                                                state.get_reputation(id, 
+                                                    std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap_or_default()
+                                                        .as_secs())
                                             })
                                             .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
                                         (id.clone(), rep / 100.0)
@@ -14451,14 +14532,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         .map(|peer| {
                             // Get REAL reputation from deterministic state
                             let rep = p2p.get_deterministic_reputation()
-                                .and_then(|rep_arc| {
-                                    rep_arc.read().ok().map(|state| {
-                                        state.get_reputation(&peer.id, 
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs())
-                                    })
+                                .map(|rep_arc| {
+                                    let state = rep_arc.read();
+                                    state.get_reputation(&peer.id, 
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs())
                                 })
                                 .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
                             
@@ -14469,14 +14549,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Ensure own node included if qualified
                     if !fallback_list.iter().any(|(id, _)| id == own_node_id) && own_node_type != NodeType::Light {
                         let own_rep = p2p.get_deterministic_reputation()
-                            .and_then(|rep_arc| {
-                                rep_arc.read().ok().map(|state| {
-                                    state.get_reputation(own_node_id, 
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs())
-                                })
+                            .map(|rep_arc| {
+                                let state = rep_arc.read();
+                                state.get_reputation(own_node_id, 
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs())
                             })
                             .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
                         
@@ -17660,18 +17739,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey, Verifier};
         
         // Get certificate from P2P cache
+        // v2.96: CRITICAL FIX - minimize lock holding time!
+        // Get cert data and IMMEDIATELY release lock before any heavy operations
         let ed25519_verified = if let Some(p2p_ref) = p2p {
-            // Get certificate from P2P certificate manager
-            // MUST use write lock to properly track usage_count for LRU
-            let mut cert_manager = match p2p_ref.certificate_manager.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    println!("[WARN][CRYPTO] Certificate manager mutex poisoned, recovering...");
-                    poisoned.into_inner()
-                }
+            // Step 1: Get certificate with minimal lock time
+            let cert_data_option = {
+                let mut cert_manager = match p2p_ref.certificate_manager.write() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        println!("[WARN][CRYPTO] Certificate manager mutex poisoned, recovering...");
+                        poisoned.into_inner()
+                    }
+                };
+                cert_manager.get_and_mark_used(&compact_sig.cert_serial)
+                // Lock released here - BEFORE any heavy processing!
             };
-            if let Some(cert_data) = cert_manager.get_and_mark_used(&compact_sig.cert_serial) {
-                drop(cert_manager); // Release lock early
+            
+            if let Some(cert_data) = cert_data_option {
                 
                 // Deserialize certificate
                 if let Ok(certificate) = bincode::deserialize::<HybridCertificate>(&cert_data) {
@@ -17773,8 +17857,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 println!("[CRYPTO]    Serial: {}", hybrid_sig.certificate.serial_number);
                                 
                                 // Cache this certificate for future blocks from same producer
+                                // v2.96: No lock held here - safe to acquire new one
                                 if let Ok(cert_bytes) = bincode::serialize(&hybrid_sig.certificate) {
-                                    drop(cert_manager); // Release lock before re-acquiring
                                     if let Ok(mut cm) = p2p_ref.certificate_manager.write() {
                                         cm.store_remote_certificate(
                                             hybrid_sig.certificate.serial_number.clone(), 
@@ -17857,18 +17941,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         .as_secs();
                     
                     // DDoS PROTECTION: Check if we already requested this certificate recently
-                    let should_request = match REQUESTED_CERTIFICATES.lock() {
-                        Ok(mut requested) => {
-                            if let Some(&last_request) = requested.get(&compact_sig.cert_serial) {
-                                now - last_request >= 5
-                            } else {
-                                requested.insert(compact_sig.cert_serial.clone(), now);
-                                true
-                            }
-                        }
-                        Err(poisoned) => {
-                            let mut requested = poisoned.into_inner();
-                            requested.insert(compact_sig.cert_serial.clone(), now);
+                    // v2.96: Lock-free with DashMap
+                    let should_request = {
+                        if let Some(last_request) = REQUESTED_CERTIFICATES.get(&compact_sig.cert_serial) {
+                            now - *last_request >= 5
+                        } else {
+                            REQUESTED_CERTIFICATES.insert(compact_sig.cert_serial.clone(), now);
                             true
                         }
                     };
@@ -18896,11 +18974,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // All nodes MUST have IDENTICAL reputation after applying macroblock
                 reputation_snapshot: {
                     if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                        if let Ok(rep_state) = rep_arc.read() {
-                            Some(rep_state.create_snapshot())
-                        } else {
-                            None
-                        }
+                        let rep_state = rep_arc.read();
+                        Some(rep_state.create_snapshot())
                     } else {
                         None
                     }
@@ -19150,14 +19225,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     
                     // Apply reputation changes
                     if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                        if let Ok(mut rep_state) = rep_arc.write() {
-                            rep_state.process_macroblock(&macro_data, macroblock.timestamp);
-                            
-                            // Passive recovery for online nodes
-                            let online_nodes = p2p.get_online_node_ids();
-                            rep_state.apply_passive_recovery(&online_nodes, macroblock.timestamp);
-                            
-                            if is_info() { println!("[INFO][MB] rep part={} slash={} jail={}", reveal_participants_set.len(), slashing_events.len(), automatic_jails.len()); }
+                        let mut rep_state = rep_arc.write();
+                        rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                        
+                        // Passive recovery for online nodes
+                        let online_nodes = p2p.get_online_node_ids();
+                        rep_state.apply_passive_recovery(&online_nodes, macroblock.timestamp);
+                        
+                        if is_info() { 
+                            println!("[INFO][MB] rep part={} slash={} jail={}", 
+                                reveal_participants_set.len(), slashing_events.len(), automatic_jails.len()); 
                         }
                     }
                 }
@@ -19512,22 +19589,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Handle incoming EntropyResponse from peer
     pub fn handle_entropy_response(&self, block_height: u64, entropy_hash: [u8; 32], responder_id: String) {
-        // Store the response - handle poisoned lock gracefully
-        match ENTROPY_RESPONSES.lock() {
-            Ok(mut responses) => {
-                responses.insert((block_height, responder_id.clone()), entropy_hash);
-                
-                println!("[DBG][CONS] entropy_stored h={} from={} hash={:x}", 
-                        block_height, responder_id,
-                        u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
-                                           entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
-            }
-            Err(poisoned) => {
-                // SECURITY: Recover from poisoned lock to prevent consensus deadlock
-                let mut responses = poisoned.into_inner();
-                responses.insert((block_height, responder_id.clone()), entropy_hash);
-                println!("[WARN][CONS] Recovered from poisoned lock, stored entropy response for block {}", block_height);
-            }
+        // v2.96: Lock-free insert with DashMap - no blocking, no poison possible
+        ENTROPY_RESPONSES.insert((block_height, responder_id.clone()), entropy_hash);
+        
+        if is_debug() {
+            println!("[DBG][CONS] entropy_stored h={} from={} hash={:x}", 
+                    block_height, responder_id,
+                    u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
+                                       entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
         }
     }
     
@@ -19774,30 +19843,30 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             } else {
                 // P2P transaction - verify signature here
-                // CRITICAL SECURITY v2.25: Cryptographic signature verification
-                // PRODUCTION v2.57: Verify on SIGVERIFY_RUNTIME (isolated from main event loop)
-                // Step 1: Ed25519 signature (ALWAYS required)
-                if let Some(ref sig) = tx.signature {
-                    if let Some(ref pubkey) = tx.public_key {
-                        if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
-                            return Err(QNetError::ValidationError(
-                                "Invalid Ed25519 signature".to_string()
-                            ));
-                        }
-                    } else {
-                        return Err(QNetError::ValidationError("public_key required".to_string()));
-                    }
-                }
-                
-                // Step 2: Dilithium signature (OPTIONAL - quantum TX)
-                if tx.dilithium_signature.is_some() {
-                    if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+            // CRITICAL SECURITY v2.25: Cryptographic signature verification
+            // PRODUCTION v2.57: Verify on SIGVERIFY_RUNTIME (isolated from main event loop)
+            // Step 1: Ed25519 signature (ALWAYS required)
+            if let Some(ref sig) = tx.signature {
+                if let Some(ref pubkey) = tx.public_key {
+                    if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
                         return Err(QNetError::ValidationError(
-                            "Invalid Dilithium signature".to_string()
+                            "Invalid Ed25519 signature".to_string()
                         ));
                     }
-                    if is_info() {
-                        println!("[INFO][SIGVERIFY] dilithium_verified tx={}", &tx.hash[..16.min(tx.hash.len())]);
+                } else {
+                    return Err(QNetError::ValidationError("public_key required".to_string()));
+                }
+            }
+            
+            // Step 2: Dilithium signature (OPTIONAL - quantum TX)
+            if tx.dilithium_signature.is_some() {
+                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                    return Err(QNetError::ValidationError(
+                        "Invalid Dilithium signature".to_string()
+                    ));
+                }
+                if is_info() {
+                    println!("[INFO][SIGVERIFY] dilithium_verified tx={}", &tx.hash[..16.min(tx.hash.len())]);
                     }
                 }
             }
@@ -20150,7 +20219,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 {
                     match vk.verify(msg, sig) {
                         Ok(()) => {
-                            valid_indices.push(tx_indices[i]);
+                        valid_indices.push(tx_indices[i]);
                         }
                         Err(e) => {
                             if crate::node::is_warn() {
@@ -21091,13 +21160,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if !snapshot_data.is_empty() {
                 if let Some(ref p2p) = self.unified_p2p {
                     if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                        if let Ok(mut rep_state) = rep_arc.write() {
-                            match rep_state.apply_snapshot(snapshot_data) {
-                                Ok(count) => {
-                                    println!("[MACROBLOCK-SYNC] 📸 Applied reputation snapshot: {} nodes synced", count);
+                        let mut rep_state = rep_arc.write();
+                        match rep_state.apply_snapshot(snapshot_data) {
+                            Ok(count) => {
+                                if is_info() {
+                                    println!("[INFO][MB-SYNC] snapshot_applied nodes={}", count);
                                 }
-                                Err(e) => {
-                                    println!("[MACROBLOCK-SYNC] ⚠️ Failed to apply reputation snapshot: {}", e);
+                            }
+                            Err(e) => {
+                                if is_warn() {
+                                    println!("[WARN][MB-SYNC] snapshot_failed err={}", e);
                                 }
                             }
                         }
@@ -22084,7 +22156,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // PRODUCTION v2.26: Get real reputation from deterministic blockchain system
             let det_rep = self.deterministic_reputation.clone();
-            let rep_guard = det_rep.read().unwrap_or_else(|p| p.into_inner());
+            let rep_guard = det_rep.read();
             
             // Convert from unified_p2p::PeerInfo to node::PeerInfo format
             p2p_peers.iter().map(|p2p_peer| {
@@ -23013,7 +23085,7 @@ impl Clone for BlockchainNode {
             bootstrap_peers: self.bootstrap_peers.clone(),
             perf_config: self.perf_config.clone(),
             security_config: self.security_config.clone(),
-            sent_heartbeat_commitments: self.sent_heartbeat_commitments.clone(),
+            heartbeat_commitment_tracker: self.heartbeat_commitment_tracker.clone(),
             sent_ping_commitments: self.sent_ping_commitments.clone(),
             height: self.height.clone(),
             is_running: self.is_running.clone(),

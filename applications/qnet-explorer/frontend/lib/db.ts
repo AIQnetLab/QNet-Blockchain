@@ -503,3 +503,124 @@ export async function closePool(): Promise<void> {
   }
 }
 
+// ============================================================================
+// BLOCKS
+// ============================================================================
+
+export interface BlockRow {
+  height: number;
+  hash: string;
+  block_type: string;
+  version: number;
+  timestamp: number;
+  previous_hash: string | null;
+  merkle_root: string | null;
+  state_root: string | null;
+  producer: string;
+  producer_address: string | null;
+  tx_count: number;
+  total_gas_used: number;
+  poh_hash: string | null;
+  poh_count: number;
+  signature_type: string | null;
+  signature: string | null;
+  cert_serial: string | null;
+  qrb_output: string | null;
+  size_bytes: number;
+  consensus_data: Record<string, unknown> | null;
+  micro_blocks: string[] | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export async function getBlockByHeight(height: number): Promise<BlockRow | null> {
+  if (!Number.isInteger(height) || height < 0) {
+    throw new Error('Invalid block height');
+  }
+  
+  const result = await query<BlockRow>(
+    'SELECT * FROM blocks WHERE height = $1',
+    [height]
+  );
+  return result.rows[0] || null;
+}
+
+export async function getBlockByHash(hash: string): Promise<BlockRow | null> {
+  if (!hash || typeof hash !== 'string' || hash.length < 8) {
+    throw new Error('Invalid block hash');
+  }
+  
+  const result = await query<BlockRow>(
+    'SELECT * FROM blocks WHERE hash = $1',
+    [hash]
+  );
+  return result.rows[0] || null;
+}
+
+export async function insertBlock(block: Omit<BlockRow, 'created_at' | 'updated_at'>): Promise<void> {
+  await query(
+    `INSERT INTO blocks (
+      height, hash, block_type, version, timestamp, previous_hash, merkle_root, state_root,
+      producer, producer_address, tx_count, total_gas_used, poh_hash, poh_count,
+      signature_type, signature, cert_serial, qrb_output, size_bytes, consensus_data, micro_blocks
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+    ON CONFLICT (height) DO UPDATE SET
+      hash = EXCLUDED.hash,
+      block_type = EXCLUDED.block_type,
+      version = EXCLUDED.version,
+      timestamp = EXCLUDED.timestamp,
+      previous_hash = EXCLUDED.previous_hash,
+      merkle_root = EXCLUDED.merkle_root,
+      state_root = EXCLUDED.state_root,
+      producer = EXCLUDED.producer,
+      producer_address = EXCLUDED.producer_address,
+      tx_count = EXCLUDED.tx_count,
+      total_gas_used = EXCLUDED.total_gas_used,
+      poh_hash = EXCLUDED.poh_hash,
+      poh_count = EXCLUDED.poh_count,
+      signature_type = EXCLUDED.signature_type,
+      signature = EXCLUDED.signature,
+      cert_serial = EXCLUDED.cert_serial,
+      qrb_output = EXCLUDED.qrb_output,
+      size_bytes = EXCLUDED.size_bytes,
+      consensus_data = EXCLUDED.consensus_data,
+      micro_blocks = EXCLUDED.micro_blocks,
+      updated_at = CURRENT_TIMESTAMP`,
+    [
+      block.height,
+      block.hash,
+      block.block_type,
+      block.version,
+      block.timestamp,
+      block.previous_hash,
+      block.merkle_root,
+      block.state_root,
+      block.producer,
+      block.producer_address,
+      block.tx_count,
+      block.total_gas_used,
+      block.poh_hash,
+      block.poh_count,
+      block.signature_type,
+      block.signature,
+      block.cert_serial,
+      block.qrb_output,
+      block.size_bytes,
+      block.consensus_data ? JSON.stringify(block.consensus_data) : null,
+      block.micro_blocks
+    ]
+  );
+}
+
+export async function getTransactionsByBlock(blockHeight: number): Promise<TransactionRow[]> {
+  if (!Number.isInteger(blockHeight) || blockHeight < 0) {
+    throw new Error('Invalid block height');
+  }
+  
+  const result = await query<TransactionRow>(
+    'SELECT * FROM transactions WHERE block = $1 ORDER BY timestamp ASC',
+    [blockHeight]
+  );
+  return result.rows;
+}
+

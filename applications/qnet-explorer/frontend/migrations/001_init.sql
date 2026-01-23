@@ -1,6 +1,40 @@
 -- QNet Explorer Database Schema
--- Version: 1.0.0
+-- Version: 1.1.0
 -- Created: 2025-01-05
+-- Updated: 2025-01-23 - Added blocks table
+
+-- Blocks table (L1 Blockchain structure)
+CREATE TABLE IF NOT EXISTS blocks (
+    height BIGINT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    block_type TEXT NOT NULL DEFAULT 'MICROBLOCK',
+    version INTEGER NOT NULL DEFAULT 1,
+    timestamp BIGINT NOT NULL,
+    previous_hash TEXT,
+    merkle_root TEXT,
+    state_root TEXT,
+    producer TEXT NOT NULL,
+    producer_address TEXT,
+    tx_count INTEGER NOT NULL DEFAULT 0,
+    total_gas_used BIGINT DEFAULT 0,
+    poh_hash TEXT,
+    poh_count BIGINT DEFAULT 0,
+    signature_type TEXT DEFAULT 'Dilithium3',
+    signature TEXT,
+    cert_serial TEXT,
+    qrb_output TEXT,
+    size_bytes BIGINT DEFAULT 0,
+    consensus_data JSONB,
+    micro_blocks TEXT[],
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes for blocks
+CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_blocks_producer ON blocks(producer);
+CREATE INDEX IF NOT EXISTS idx_blocks_block_type ON blocks(block_type);
 
 -- Transactions table
 CREATE TABLE IF NOT EXISTS transactions (
@@ -77,6 +111,12 @@ CREATE TRIGGER update_transactions_updated_at
 -- Trigger for sync_state
 CREATE TRIGGER update_sync_state_updated_at 
     BEFORE UPDATE ON sync_state 
+    FOR EACH ROW 
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- Trigger for blocks
+CREATE TRIGGER update_blocks_updated_at 
+    BEFORE UPDATE ON blocks 
     FOR EACH ROW 
     EXECUTE FUNCTION update_updated_at_column();
 

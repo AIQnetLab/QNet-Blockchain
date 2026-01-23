@@ -129,6 +129,10 @@ export default function BlockPage() {
             <span className="detail-value">{block.block_type}</span>
           </div>
           <div className="detail-row">
+            <span className="detail-label">Version</span>
+            <span className="detail-value">{block.version || 1}</span>
+          </div>
+          <div className="detail-row">
             <span className="detail-label">Producer</span>
             <span className="detail-value">{block.producer}</span>
           </div>
@@ -145,27 +149,75 @@ export default function BlockPage() {
             <span className="detail-label">Transactions</span>
             <span className="detail-value">{block.tx_count}</span>
           </div>
+          {block.total_gas_used !== undefined && block.total_gas_used > 0 && (
+            <div className="detail-row">
+              <span className="detail-label">Gas Used</span>
+              <span className="detail-value">{block.total_gas_used.toLocaleString()}</span>
+            </div>
+          )}
+          {block.size_bytes !== undefined && block.size_bytes > 0 && (
+            <div className="detail-row">
+              <span className="detail-label">Block Size</span>
+              <span className="detail-value">{(block.size_bytes / 1024).toFixed(2)} KB</span>
+            </div>
+          )}
           <div className="detail-row">
             <span className="detail-label">Previous Hash</span>
             <span className="detail-value">
-              <Link href={`/explorer/block/${block.previous_hash}`} className="address-link">
-                {truncate(block.previous_hash)}
-              </Link>
-              <CopyBtn text={block.previous_hash} />
+              {block.height > 0 ? (
+                <>
+                  <Link href={`/explorer/block/${block.height - 1}`} className="address-link">
+                    {truncate(block.previous_hash)}
+                  </Link>
+                  <CopyBtn text={block.previous_hash} />
+                </>
+              ) : (
+                <span className="mono">Genesis Block</span>
+              )}
             </span>
           </div>
           <div className="detail-row">
             <span className="detail-label">Merkle Root</span>
-            <span className="detail-value mono">{truncate(block.merkle_root, 12, 12)}</span>
+            <span className="detail-value mono">
+              {truncate(block.merkle_root, 12, 12)}
+              <CopyBtn text={block.merkle_root} />
+            </span>
           </div>
+          {block.state_root && (
+            <div className="detail-row">
+              <span className="detail-label">State Root</span>
+              <span className="detail-value mono">
+                {truncate(block.state_root, 12, 12)}
+                <CopyBtn text={block.state_root} />
+              </span>
+            </div>
+          )}
+          {block.poh_hash && (
+            <div className="detail-row">
+              <span className="detail-label">VTS Hash</span>
+              <span className="detail-value mono">
+                {truncate(block.poh_hash, 12, 12)}
+                <CopyBtn text={block.poh_hash} />
+              </span>
+            </div>
+          )}
           <div className="detail-row">
             <span className="detail-label">VTS Counter</span>
             <span className="detail-value">{block.poh_count.toLocaleString()}</span>
           </div>
           <div className="detail-row">
-            <span className="detail-label">Signature</span>
+            <span className="detail-label">Signature Type</span>
             <span className="detail-value">{block.signature_type}</span>
           </div>
+          {block.signature && (
+            <div className="detail-row">
+              <span className="detail-label">Signature</span>
+              <span className="detail-value mono">
+                {truncate(block.signature, 16, 16)}
+                <CopyBtn text={block.signature} />
+              </span>
+            </div>
+          )}
           {block.cert_serial && (
             <div className="detail-row">
               <span className="detail-label">Certificate</span>
@@ -175,7 +227,10 @@ export default function BlockPage() {
           {block.qrb_output && (
             <div className="detail-row">
               <span className="detail-label">QRB Output</span>
-              <span className="detail-value mono">{truncate(block.qrb_output, 16, 16)}</span>
+              <span className="detail-value mono">
+                {truncate(block.qrb_output, 16, 16)}
+                <CopyBtn text={block.qrb_output} />
+              </span>
             </div>
           )}
         </div>
@@ -328,3 +383,4 @@ export default function BlockPage() {
     </div>
   );
 }
+
