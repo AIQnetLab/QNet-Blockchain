@@ -20198,7 +20198,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let message = format!("{}|{}|{}|{}|{}|{}|{}", from, to_str, amount, nonce, gas_price, gas_limit, timestamp);
         let sig_struct = DilithiumSignature {
             signature: dilithium_sig,
-            algorithm: "dilithium3".to_string(),
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
             timestamp,
             strength: "quantum-resistant".to_string(),
         };
@@ -20248,7 +20248,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         let sig_struct = DilithiumSignature {
             signature: dilithium_sig,
-            algorithm: "dilithium3".to_string(),
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
             timestamp: tx.timestamp,
             strength: "quantum-resistant".to_string(),
         };
