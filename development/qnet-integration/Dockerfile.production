@@ -26,9 +26,9 @@ ENV CARGO_HTTP_MULTIPLEXING=false
 ENV CARGO_NET_RETRY=10
 ENV CARGO_HTTP_TIMEOUT=300
 
-# Build from workspace root with correct binary path
-# --locked ensures Cargo.lock is respected (prevents auto-update to incompatible versions)
-RUN cargo build --profile release-fast --bin qnet-node --locked \
+# Pin time crate to version compatible with rustc 1.86.0, then build
+RUN cargo update time --precise 0.3.36 \
+    && cargo build --profile release-fast --bin qnet-node \
     && strip target/release-fast/qnet-node \
     && cp target/release-fast/qnet-node /usr/local/bin/
 
