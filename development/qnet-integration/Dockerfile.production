@@ -27,7 +27,8 @@ ENV CARGO_NET_RETRY=10
 ENV CARGO_HTTP_TIMEOUT=300
 
 # Build from workspace root with correct binary path
-RUN cargo build --profile release-fast --bin qnet-node \
+# --locked ensures Cargo.lock is respected (prevents auto-update to incompatible versions)
+RUN cargo build --profile release-fast --bin qnet-node --locked \
     && strip target/release-fast/qnet-node \
     && cp target/release-fast/qnet-node /usr/local/bin/
 
