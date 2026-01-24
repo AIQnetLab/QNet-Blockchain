@@ -240,18 +240,12 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
     
     // Handle different response structures:
     // 1. { block: { transactions: [...] } } - nested structure
-    // 2. { transactions: [...] } - flat structure (block 0)
+    // 2. Direct block object with all fields (height, producer, transactions, etc.)
     let block: BlockData;
     if (responseData.block) {
       block = responseData.block as BlockData;
-    } else if (responseData.transactions) {
-      // Flat structure with transactions at top level
-      block = {
-        transactions: responseData.transactions,
-        timestamp: responseData.timestamp,
-      } as BlockData;
     } else {
-      // Fallback - use responseData as block
+      // Direct block structure - use responseData as block (preserves all fields including producer)
       block = responseData as BlockData;
     }
     

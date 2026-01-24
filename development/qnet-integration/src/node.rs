@@ -4926,6 +4926,7 @@ impl BlockchainNode {
         let block_event_tx_for_blocks = blockchain.block_event_tx.clone();
         let reward_manager_for_blocks = blockchain.reward_manager.clone();
         let reputation_for_blocks = blockchain.deterministic_reputation.clone();
+        let mempool_for_blocks = blockchain.mempool.clone();
         tokio::spawn(async move {
             Self::process_received_blocks(
                 block_rx, 
@@ -4939,6 +4940,7 @@ impl BlockchainNode {
                 block_event_tx_for_blocks,
                 reward_manager_for_blocks,
                 reputation_for_blocks,
+                mempool_for_blocks,
             ).await;
         });
         
@@ -5474,6 +5476,7 @@ impl BlockchainNode {
         block_event_tx: tokio::sync::broadcast::Sender<u64>,
         reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
         deterministic_reputation: Arc<ParkingRwLock<DeterministicReputationState>>,
+        mempool: Arc<SimpleMempool>,
     ) {
         // CRITICAL FIX: Buffer for out-of-order blocks
         // Key: block height, Value: (block data, retry count, timestamp)
@@ -6303,6 +6306,29 @@ impl BlockchainNode {
                         // METRICS: Track successful retry
                         RETRY_SUCCESS.fetch_add(1, Ordering::Relaxed);
                         if is_debug() { println!("[DBG][BLOCK] pending_removed h={} retry=ok", received_block.height); }
+                    }
+                    
+                    // CRITICAL FIX v3.3: Remove TX from mempool after receiving block from other node
+                    // This prevents TX duplication when THIS node becomes producer
+                    // Problem: TX stays in mempool after being included in block by OTHER node
+                    // Result: Same TX gets included again when THIS node produces a block
+                    if received_block.block_type == "micro" {
+                        let decompressed_for_mempool = zstd::decode_all(&received_block.data[..])
+                            .unwrap_or_else(|_| received_block.data.clone());
+                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&decompressed_for_mempool) {
+                            let tx_hashes: Vec<String> = mb.transactions.iter()
+                                .map(|tx| tx.hash.clone())
+                                .collect();
+                            
+                            if !tx_hashes.is_empty() {
+                                let tx_count = tx_hashes.len();
+                                mempool.batch_remove_transactions(&tx_hashes);
+                                if is_info() {
+                                    println!("[INFO][MEMPOOL] cleanup_received_block h={} removed={} tx", 
+                                             received_block.height, tx_count);
+                                }
+                            }
+                        }
                     }
                     
                     // CRITICAL FIX: Check if we're the producer for next block after rotation boundary
@@ -12570,16 +12596,11 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         }
                     }
                     
-                    // CRITICAL v2.26: Optimized mempool cleanup - batch removal for performance 
-                    // v2.26: Direct access - SimpleMempool is already thread-safe (DashMap + parking_lot)
-                    // No external lock needed - eliminates 100K TPS bottleneck!
-                    {
-                        let tx_hashes: Vec<String> = txs.iter().map(|tx| tx.hash.clone()).collect();
-                        mempool.batch_remove_transactions(&tx_hashes);
-                        let remaining_size = mempool.size();
-                        println!("[MEMPOOL] 🗑️ Removed {} processed transactions | Remaining: {}", 
-                                 txs.len(), remaining_size);
-                    }
+                    // v3.3: REMOVED duplicate mempool cleanup (already done at line 12261)
+                    // batch_remove_transactions was called twice with overlapping TX hashes
+                    // First cleanup at 12261 uses included_tx_hashes (all valid TX from mempool)
+                    // This cleanup used txs.hash (final block TX) - subset of above
+                    // Keeping only the first cleanup for efficiency
                     
                     // Log completion only at epoch boundaries (90 blocks)
                     if microblock_height % 90 == 0 {
