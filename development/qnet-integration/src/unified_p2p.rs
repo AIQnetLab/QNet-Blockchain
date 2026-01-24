@@ -3552,7 +3552,7 @@ impl SimplifiedP2P {
                         shard_peers.retain(|addr| addr != peer_addr);
                     }
                     
-                    println!("[P2P] 🗑️ Removed inactive peer {} (ID: {}, last seen > {} seconds ago)", 
+                    println!("[INFO][P2P] peer_removed peer={} id={} reason=inactive threshold={}s", 
                             peer_addr, peer_id, PEER_INACTIVE_TIMEOUT_SECS);
                 }
                 
@@ -3572,7 +3572,7 @@ impl SimplifiedP2P {
                     transport.cleanup_idle();
                     
                     if removed > 0 || alive < 4 {
-                        println!("[QUIC] 🧹 Health check: {} alive, {} removed | Reconnecting to missing peers...", 
+                        println!("[INFO][QUIC] health_check alive={} removed={} action=reconnect", 
                                  alive, removed);
                     }
                 }
@@ -3584,6 +3584,12 @@ impl SimplifiedP2P {
         
         // v2.25: Start TX cache cleanup task (prevents memory leak)
         self.start_tx_cache_cleanup_task();
+        
+        // v3.0: Start rate limiter cleanup task (CRITICAL: prevents memory leak + network isolation)
+        self.start_rate_limiter_cleanup_task();
+        
+        // v3.1: Start static cache cleanup task (CRITICAL: prevents memory leak at scale with millions of nodes)
+        self.start_static_cache_cleanup_task();
         
         // PRODUCTION v2.56: Start background repair task for incomplete block assemblies
         // CRITICAL: Ensures repair happens independently of chunk arrival
@@ -3613,6 +3619,148 @@ impl SimplifiedP2P {
                 }
             }
         });
+    }
+    
+    /// v3.0: CRITICAL FIX - Periodic cleanup of rate_limiter to prevent memory leak and network isolation
+    /// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+    /// PROBLEM: rate_limiter entries were NEVER cleaned up, causing:
+    ///   1. Memory leak (each peer creates multiple entries: sync_, macrosync_, consensus_, etc.)
+    ///   2. Network isolation (blocked entries persisted, preventing reconnection)
+    /// SOLUTION: Every 5 minutes, remove entries that have been blocked for >5 minutes
+    ///           Also clear expired request timestamps
+    /// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+    fn start_rate_limiter_cleanup_task(&self) {
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        
+        let rate_limiter = Arc::clone(&self.rate_limiter);
+        let nonce_validator = Arc::clone(&self.nonce_validator);
+        
+        handle.spawn(async move {
+            // Cleanup every 5 minutes
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
+            
+            loop {
+                interval.tick().await;
+                
+                let current_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                
+                // Cleanup rate_limiter entries
+                let rate_entries_before = rate_limiter.len();
+                let mut unblocked_count = 0;
+                let mut cleaned_requests = 0;
+                
+                // First pass: unblock expired entries and clean old requests
+                rate_limiter.retain(|key, entry| {
+                    // Unblock if block time has passed
+                    if entry.blocked_until > 0 && entry.blocked_until <= current_time {
+                        entry.blocked_until = 0;
+                        unblocked_count += 1;
+                    }
+                    
+                    // Clean old requests (older than 2 minutes)
+                    let old_len = entry.requests.len();
+                    entry.requests.retain(|&req_time| req_time > current_time.saturating_sub(120));
+                    cleaned_requests += old_len - entry.requests.len();
+                    
+                    // Keep entry if it's still blocked OR has recent requests OR is for genesis node
+                    let is_genesis = key.contains("genesis_node_");
+                    let has_recent_activity = !entry.requests.is_empty() || entry.blocked_until > current_time;
+                    
+                    // Keep genesis node entries (important for network stability)
+                    // Remove non-genesis entries with no recent activity
+                    is_genesis || has_recent_activity
+                });
+                
+                let rate_entries_removed = rate_entries_before.saturating_sub(rate_limiter.len());
+                
+                // Cleanup nonce_validator entries (older than 10 minutes)
+                let nonce_entries_before = nonce_validator.len();
+                nonce_validator.retain(|_key, entry| {
+                    entry.timestamp > current_time.saturating_sub(600)
+                });
+                let nonce_entries_removed = nonce_entries_before.saturating_sub(nonce_validator.len());
+                
+                // Log cleanup stats
+                if rate_entries_removed > 0 || nonce_entries_removed > 0 || unblocked_count > 0 {
+                    println!("[INFO][RATE_LIMIT] cleanup removed_rate={} removed_nonce={} unblocked={} cleaned_reqs={}",
+                             rate_entries_removed, nonce_entries_removed, unblocked_count, cleaned_requests);
+                }
+                
+                // Log current state for monitoring
+                let blocked_count: usize = rate_limiter.iter()
+                    .filter(|e| e.value().blocked_until > current_time)
+                    .count();
+                if blocked_count > 0 {
+                    println!("[WARN][RATE_LIMIT] currently_blocked={}", blocked_count);
+                }
+            }
+        });
+        
+        println!("[INFO][RATE_LIMIT] cleanup_task_started interval=300s");
+    }
+    
+    /// v3.1: CRITICAL - Cleanup static DashMaps WITHOUT existing cleanup to prevent memory leak
+    /// ═══════════════════════════════════════════════════════════════════════════════════════
+    /// NOTE: INVALID_BLOCKS_TRACKER, FALSE_EMERGENCY_TRACKER, PEER_BLACKLIST already have
+    ///       cleanup in their respective functions (report_invalid_block, track_false_emergency, etc.)
+    /// THIS FUNCTION ONLY cleans structures that have NO other cleanup:
+    ///   - PEER_RETRY_COOLDOWN: grows with every peer that fails
+    ///   - QUIC_FALLBACK_RATE_LIMITER: grows with every node making fallback requests
+    /// ═══════════════════════════════════════════════════════════════════════════════════════
+    fn start_static_cache_cleanup_task(&self) {
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        
+        handle.spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(600)); // Every 10 minutes
+            
+            loop {
+                interval.tick().await;
+                
+                let now = std::time::Instant::now();
+                
+                // Cleanup PEER_RETRY_COOLDOWN (NO other cleanup exists!)
+                let retry_before = PEER_RETRY_COOLDOWN.len();
+                PEER_RETRY_COOLDOWN.retain(|_, (_, cooldown_until)| {
+                    *cooldown_until > now // Keep only if still in cooldown
+                });
+                let retry_removed = retry_before.saturating_sub(PEER_RETRY_COOLDOWN.len());
+                
+                // Cleanup QUIC_FALLBACK_RATE_LIMITER (NO other cleanup exists!)
+                let current_time_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let fallback_before = QUIC_FALLBACK_RATE_LIMITER.len();
+                QUIC_FALLBACK_RATE_LIMITER.retain(|_, (_, window_start)| {
+                    *window_start > current_time_secs.saturating_sub(1800) // Keep last 30 min
+                });
+                let fallback_removed = fallback_before.saturating_sub(QUIC_FALLBACK_RATE_LIMITER.len());
+                
+                // Log if anything was cleaned
+                let total_removed = retry_removed + fallback_removed;
+                if total_removed > 0 {
+                    println!("[INFO][CACHE_CLEANUP] peer_retry={} quic_fallback={}", retry_removed, fallback_removed);
+                }
+                
+                // Log current sizes for monitoring (only if significant)
+                let total_size = PEER_RETRY_COOLDOWN.len() + QUIC_FALLBACK_RATE_LIMITER.len();
+                if total_size > 100 {
+                    println!("[WARN][CACHE_SIZE] peer_retry={} quic_fallback={}", 
+                             PEER_RETRY_COOLDOWN.len(), QUIC_FALLBACK_RATE_LIMITER.len());
+                }
+            }
+        });
+        
+        println!("[INFO][CACHE_CLEANUP] static_cache_cleanup_started interval=600s");
     }
     
     /// PRODUCTION v2.56: Background repair task for incomplete block assemblies
@@ -7419,6 +7567,16 @@ impl SimplifiedP2P {
         self.connected_peers_lockfree.len()
     }
     
+    /// v3.0: Get connected peer count for memory monitoring
+    pub fn get_connected_peer_count(&self) -> usize {
+        self.connected_peers_lockfree.len()
+    }
+    
+    /// v3.0: Get rate limiter size for memory monitoring
+    pub fn get_rate_limiter_size(&self) -> usize {
+        self.rate_limiter.len()
+    }
+    
     /// SHARDING INTEGRATION: Get optimal peers for cross-shard communication
     pub fn get_cross_shard_peers(&self, target_shard: u8, limit: usize) -> Vec<PeerInfo> {
         let mut cross_shard_peers = Vec::new();
@@ -11170,7 +11328,7 @@ impl SimplifiedP2P {
                             // CRITICAL: Remove invalid certificate from pending cache
                             let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             cert_manager.pending_certificates.remove(&cert_serial_clone);
-                            println!("[P2P] 🗑️ Removed invalid certificate from pending cache");
+                            println!("[INFO][P2P] cert_removed reason=invalid");
                             
                             // Apply reputation penalty
                             if let Ok(mut rep) = reputation_system_clone.lock() {
@@ -11183,7 +11341,7 @@ impl SimplifiedP2P {
                             // Remove failed certificate from pending cache
                             let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             cert_manager.pending_certificates.remove(&cert_serial_clone);
-                            println!("[P2P] 🗑️ Removed failed certificate from pending cache");
+                            println!("[INFO][P2P] cert_removed reason=failed");
                         }
                     }
                     
@@ -14908,12 +15066,22 @@ impl SimplifiedP2P {
             0
         };
         
+        // v3.0: CRITICAL FIX - Genesis nodes bypass rate limiting to prevent network isolation
+        // PROBLEM: Genesis nodes blocked each other during sync, causing entire network to halt
+        // SOLUTION: Genesis nodes get unlimited sync requests (they are trusted bootstrap nodes)
+        let is_genesis_requester = requester_id.starts_with("genesis_node_");
+        let is_genesis_peer = from_peer.split(':').next()
+            .map(|ip| is_genesis_node_ip(ip))
+            .unwrap_or(false);
+        
         // Check rate limit (adaptive based on sync state)
         let rate_limited = {
+            // v3.0: GENESIS BYPASS - Never rate limit genesis nodes syncing with each other
+            if is_genesis_requester || is_genesis_peer {
+                false // Genesis nodes always allowed
             // CRITICAL: No rate limit for nodes catching up (>5 blocks behind)
-            if blocks_behind > 5 {
-                println!("[SYNC] 🚀 PRIORITY SYNC: {} is {} blocks behind - no rate limit", 
-                         from_peer, blocks_behind);
+            } else if blocks_behind > 5 {
+                println!("[INFO][SYNC] priority_sync peer={} blocks_behind={}", from_peer, blocks_behind);
                 false // No rate limit for catching up
             } else {
                 // Normal rate limiting for synchronized nodes
@@ -14929,7 +15097,7 @@ impl SimplifiedP2P {
                 
                 // Check if currently blocked
                 if rate_limit.blocked_until > current_time {
-                    println!("[SYNC] ⛔ Rate limit: {} blocked for {} more seconds", 
+                    println!("[WARN][SYNC] rate_limited peer={} blocked_for={}s", 
                              from_peer, rate_limit.blocked_until - current_time);
                     return;
                 }
@@ -14941,7 +15109,7 @@ impl SimplifiedP2P {
                 // Check if limit exceeded
                 if rate_limit.requests.len() >= rate_limit.max_requests {
                     rate_limit.blocked_until = current_time + 60; // Block for 1 minute
-                    println!("[SYNC] ⛔ Rate limit exceeded for {} ({}+ requests/minute)", 
+                    println!("[WARN][SYNC] rate_limit_exceeded peer={} requests={}", 
                              from_peer, rate_limit.max_requests);
                     true
                 } else {
@@ -15050,6 +15218,12 @@ impl SimplifiedP2P {
         // Update last_seen for requesting peer
         self.update_peer_last_seen(from_peer);
         
+        // v3.0: CRITICAL FIX - Genesis nodes bypass rate limiting to prevent network isolation
+        let is_genesis_requester = requester_id.starts_with("genesis_node_");
+        let is_genesis_peer = from_peer.split(':').next()
+            .map(|ip| is_genesis_node_ip(ip))
+            .unwrap_or(false);
+        
         // RATE LIMITING: Stricter for macroblocks (they're larger than microblocks)
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -15058,35 +15232,40 @@ impl SimplifiedP2P {
         
         // Check rate limit
         let rate_limited = {
-            let rate_key = format!("macrosync_{}", from_peer);
-            
-            let mut rate_limit = self.rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
-                requests: Vec::new(),
-                max_requests: 5,  // 5 macroblock sync requests per minute (stricter than microblocks)
-                window_seconds: 60,
-                blocked_until: 0,
-            });
-            
-            // Check if currently blocked
-            if rate_limit.blocked_until > current_time {
-                println!("[MACROBLOCK-SYNC] ⛔ Rate limit: {} blocked for {} more seconds", 
-                         from_peer, rate_limit.blocked_until - current_time);
-                return;
-            }
-            
-            // Clean old requests outside window
-            let window = rate_limit.window_seconds;
-            rate_limit.requests.retain(|&req_time| req_time > current_time - window);
-            
-            // Check if limit exceeded
-            if rate_limit.requests.len() >= rate_limit.max_requests {
-                rate_limit.blocked_until = current_time + 120; // Block for 2 minutes (stricter)
-                println!("[MACROBLOCK-SYNC] ⛔ Rate limit exceeded for {} ({}+ requests/minute)", 
-                         from_peer, rate_limit.max_requests);
-                true
+            // v3.0: GENESIS BYPASS - Never rate limit genesis nodes syncing with each other
+            if is_genesis_requester || is_genesis_peer {
+                false // Genesis nodes always allowed
             } else {
-                rate_limit.requests.push(current_time);
-                false
+                let rate_key = format!("macrosync_{}", from_peer);
+                
+                let mut rate_limit = self.rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
+                    requests: Vec::new(),
+                    max_requests: 5,  // 5 macroblock sync requests per minute (stricter than microblocks)
+                    window_seconds: 60,
+                    blocked_until: 0,
+                });
+                
+                // Check if currently blocked
+                if rate_limit.blocked_until > current_time {
+                    println!("[WARN][MB_SYNC] rate_limited peer={} blocked_for={}s", 
+                             from_peer, rate_limit.blocked_until - current_time);
+                    return;
+                }
+                
+                // Clean old requests outside window
+                let window = rate_limit.window_seconds;
+                rate_limit.requests.retain(|&req_time| req_time > current_time - window);
+                
+                // Check if limit exceeded
+                if rate_limit.requests.len() >= rate_limit.max_requests {
+                    rate_limit.blocked_until = current_time + 120; // Block for 2 minutes (stricter)
+                    println!("[WARN][MB_SYNC] rate_limit_exceeded peer={} requests={}", 
+                             from_peer, rate_limit.max_requests);
+                    true
+                } else {
+                    rate_limit.requests.push(current_time);
+                    false
+                }
             }
         };
         

@@ -417,9 +417,16 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       const blockTs = Number(block.timestamp) || 0;
 
       // Calculate total gas used from transactions
+      // NOTE: HeartbeatCommitment txs have gas_price=u64::MAX as sentinel "no gas" value
+      // We must check for this and skip such transactions
+      const U64_MAX = 18446744073709551615;
       let totalGasUsed = 0;
       for (const tx of txs as Record<string, unknown>[]) {
-        const gasUsed = Number(tx.gas_used) || (Number(tx.gas_price || 0) * Number(tx.gas_limit || 1));
+        const gasPrice = Number(tx.gas_price) || 0;
+        const gasLimit = Number(tx.gas_limit) || 0;
+        // Skip if gas_price is u64::MAX (sentinel for "no gas" transactions like HeartbeatCommitment)
+        if (gasPrice >= U64_MAX - 1000 || gasPrice < 0) continue;
+        const gasUsed = Number(tx.gas_used) || (gasPrice * gasLimit);
         totalGasUsed += gasUsed;
       }
 

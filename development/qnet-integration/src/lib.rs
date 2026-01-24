@@ -290,6 +290,9 @@ impl QNetBlockchain {
             merkle_root: [0u8; 32],
             producer: "node1".to_string(),
             signature: vec![],
+            poh_hash: vec![],
+            poh_count: 0,
+            block_type: "MICROBLOCK".to_string(),
         };
         
         info!("Produced block {} at height {}",

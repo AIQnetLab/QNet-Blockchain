@@ -251,7 +251,7 @@ impl QuicTransport {
         self.endpoint = Some(endpoint);
         
         // PRIVACY: bind_addr is local, OK to show
-        println!("[QUIC] ✅ Transport initialized on {}", bind_addr);
+        println!("[INFO][QUIC] transport_initialized addr={}", bind_addr);
         println!("[QUIC] 📊 Config: timeout={}s, streams={}, window=16MB, rtt=50ms", 
             CONNECT_TIMEOUT_SECS, MAX_STREAMS_PER_CONN);
         
@@ -279,14 +279,14 @@ impl QuicTransport {
         
         // Spawn server task
         tokio::spawn(async move {
-            println!("[QUIC] 🚀 Server started, accepting connections...");
+            println!("[INFO][QUIC] server_started accepting=true");
             
             while server_running.load(Ordering::Relaxed) {
                 // Accept incoming connection
                 let incoming = match endpoint.accept().await {
                     Some(conn) => conn,
                     None => {
-                        println!("[QUIC] ⚠️ Endpoint closed");
+                        println!("[WARN][QUIC] endpoint_closed");
                         break;
                     }
                 };
@@ -305,7 +305,7 @@ impl QuicTransport {
                     match incoming.await {
                         Ok(connection) => {
                             // PRIVACY: Hide real IP in logs
-                            println!("[QUIC] 📥 Incoming connection from {}", get_privacy_id_for_addr(&peer_addr.to_string()));
+                            println!("[INFO][QUIC] incoming_conn peer={}", get_privacy_id_for_addr(&peer_addr.to_string()));
                             
                             // Perform handshake
                             let handshake_result = Self::handle_server_handshake(
@@ -318,16 +318,16 @@ impl QuicTransport {
                             let (remote_node_id, remote_cert_serial, remote_node_type) = match handshake_result {
                                 Ok(h) => h,
                                 Err(e) => {
-                                    println!("[QUIC] ❌ Handshake failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                                    println!("[ERR][QUIC] handshake_failed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                                     return;
                                 }
                             };
                             
-                            println!("[QUIC] ✅ Accepted connection from {} (node: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id);
+                            println!("[INFO][QUIC] conn_accepted peer={} node={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id);
                             
                             // CRITICAL: Prevent self-connect on server side too
                             if remote_node_id == node_id_clone {
-                                println!("[QUIC] ⚠️ Self-connect detected on server side, closing");
+                                println!("[WARN][QUIC] self_connect_detected side=server action=close");
                                 connection.close(quinn::VarInt::from_u32(0), b"self-connect");
                                 return;
                             }
@@ -373,12 +373,12 @@ impl QuicTransport {
                             if let Some(addr) = existing_server_addr {
                                 if existing_server_alive {
                                     // Already have LIVE server connection - close this duplicate
-                                    println!("[QUIC] ⚠️ Already have LIVE SERVER connection from node {}, closing duplicate", remote_node_id);
+                                    println!("[WARN][QUIC] duplicate_conn node={} status=live action=close", remote_node_id);
                                     connection.close(quinn::VarInt::from_u32(0), b"duplicate-server");
                                     return;
                                 } else {
                                     // Remove DEAD server connection
-                                    println!("[QUIC] 🔄 Replacing DEAD SERVER connection from node {}", remote_node_id);
+                                    println!("[INFO][QUIC] replace_dead_conn node={}", remote_node_id);
                                     connections_clone.remove(&addr);
                                 }
                             }
@@ -398,7 +398,7 @@ impl QuicTransport {
                             });
                             
                             connections_clone.insert(peer_addr, quic_conn.clone());
-                            println!("[QUIC] 📦 Connection stored for {} (node: {}, type: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type);
+                            println!("[INFO][QUIC] conn_stored peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type);
                             
                             // Update stats
                             {
@@ -407,11 +407,11 @@ impl QuicTransport {
                                 s.active_connections = connections_clone.len();
                             }
                             
-                            // Handle incoming streams
-                            Self::handle_incoming_streams(connection, peer_addr, handler_clone, quic_conn).await;
+                            // Handle incoming streams (v3.1: pass connections for cleanup on close)
+                            Self::handle_incoming_streams(connection, peer_addr, handler_clone, quic_conn, connections_clone.clone()).await;
                         }
                         Err(e) => {
-                            println!("[QUIC] ❌ Connection failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                            println!("[ERR][QUIC] conn_failed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                             let mut s = stats_clone.write().await;
                             s.connections_failed += 1;
                         }
@@ -419,7 +419,7 @@ impl QuicTransport {
                 });
             }
             
-            println!("[QUIC] 🛑 Server stopped");
+            println!("[INFO][QUIC] server_stopped");
         });
         
         Ok(())
@@ -481,11 +481,13 @@ impl QuicTransport {
     }
     
     /// Handle incoming streams from a connection
+    /// v3.1 CRITICAL FIX: Added connections parameter to remove entry on close (prevents 15GB memory leak!)
     async fn handle_incoming_streams(
         conn: Connection,
         peer_addr: SocketAddr,
         handler: Option<MessageHandler>,
         quic_conn: Arc<QuicConnection>,
+        connections: Arc<DashMap<SocketAddr, Arc<QuicConnection>>>,
     ) {
         loop {
             // Accept bidirectional or unidirectional streams
@@ -501,7 +503,7 @@ impl QuicTransport {
                             });
                         }
                         Err(e) => {
-                            println!("[QUIC] 🔌 Connection closed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                            println!("[WARN][QUIC] conn_closed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                             break;
                         }
                     }
@@ -517,12 +519,18 @@ impl QuicTransport {
                             });
                         }
                         Err(e) => {
-                            println!("[QUIC] 🔌 Uni stream closed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                            println!("[WARN][QUIC] uni_closed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                             break;
                         }
                     }
                 }
             }
+        }
+        
+        // v3.1 CRITICAL: Remove connection from DashMap to prevent memory leak
+        // Without this, dead connections accumulate forever causing 15GB+ memory usage!
+        if connections.remove(&peer_addr).is_some() {
+            println!("[INFO][QUIC] conn_removed_on_close peer={}", get_privacy_id_for_addr(&peer_addr.to_string()));
         }
     }
     
@@ -713,7 +721,7 @@ impl QuicTransport {
                 return Ok(conn.clone());
             } else {
                 // Connection is dead - remove it and create new one
-                println!("[QUIC] 🔄 Removing dead connection to {}", get_privacy_id_for_addr(&peer_addr.to_string()));
+                println!("[INFO][QUIC] removing_dead_conn peer={}", get_privacy_id_for_addr(&peer_addr.to_string()));
                 self.connections.remove(&peer_addr);
             }
         }
@@ -751,7 +759,7 @@ impl QuicTransport {
                         
                         // Only log every other attempt to reduce spam
                         if attempt % 2 == 1 || attempt == max_attempts - 1 {
-                            println!("[QUIC] ⚠️ Connection attempt {}/{} to {} failed, retrying in {:?}...",
+                            println!("[WARN][QUIC] conn_attempt_failed attempt={}/{} peer={} retry_in={:?}",
                                 attempt, max_attempts,
                                 get_privacy_id_for_addr(&peer_addr.to_string()),
                                 delay);
@@ -821,12 +829,12 @@ impl QuicTransport {
         
         // CRITICAL: Prevent self-connect
         if remote_node_id == self.node_id {
-            println!("[QUIC] ⚠️ Self-connect detected, closing connection");
+            println!("[WARN][QUIC] self_connect_detected side=client action=close");
             connection.close(quinn::VarInt::from_u32(0), b"self-connect");
             return Err("Self-connect not allowed".to_string());
         }
         
-        println!("[QUIC] ✅ Connected to {} (node: {}, type: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type);
+        println!("[INFO][QUIC] connected peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type);
         
         // Store connection
         let quic_conn = Arc::new(QuicConnection {
@@ -856,8 +864,9 @@ impl QuicTransport {
         let handler = self.message_handler.clone();
         let quic_conn_for_listener = quic_conn.clone();
         let connection_for_listener = quic_conn.connection.clone();
+        let connections_for_cleanup = self.connections.clone(); // v3.1: for cleanup on close
         tokio::spawn(async move {
-            Self::handle_incoming_streams(connection_for_listener, peer_addr, handler, quic_conn_for_listener).await;
+            Self::handle_incoming_streams(connection_for_listener, peer_addr, handler, quic_conn_for_listener, connections_for_cleanup).await;
         });
         
         Ok(quic_conn)
@@ -1415,7 +1424,7 @@ impl QuicTransport {
     pub async fn force_reconnect(&self, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
         // Remove any existing connection (dead or alive)
         if self.connections.remove(&peer_addr).is_some() {
-            println!("[QUIC] 🔄 Force removing connection to {} for reconnect", 
+            println!("[INFO][QUIC] force_remove_conn peer={} reason=reconnect", 
                      get_privacy_id_for_addr(&peer_addr.to_string()));
         }
         

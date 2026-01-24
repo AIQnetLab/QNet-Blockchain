@@ -570,6 +570,15 @@ pub struct Block {
     pub producer: String,
     /// Producer's signature
     pub signature: Vec<u8>,
+    /// Verifiable Time Sequence hash (VTS/PoH)
+    #[serde(default)]
+    pub poh_hash: Vec<u8>,
+    /// Verifiable Time Sequence counter
+    #[serde(default)]
+    pub poh_count: u64,
+    /// Block type indicator
+    #[serde(default)]
+    pub block_type: String,
 }
 
 /// Block header (simplified)
@@ -617,6 +626,9 @@ impl Block {
             transactions,
             producer,
             signature: vec![],
+            poh_hash: vec![],
+            poh_count: 0,
+            block_type: String::new(),
         }
     }
     

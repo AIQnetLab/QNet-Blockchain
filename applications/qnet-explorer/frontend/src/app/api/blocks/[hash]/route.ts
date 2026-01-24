@@ -40,12 +40,13 @@ function getTransactionType(txType: unknown): string {
 }
 
 // Convert byte array to hex string
+// Returns empty string if input is not valid (undefined/null/not array)
 function bytesToHex(bytes: unknown): string {
   if (typeof bytes === 'string') return bytes;
-  if (Array.isArray(bytes)) {
+  if (Array.isArray(bytes) && bytes.length > 0) {
     return bytes.map((b: number) => b.toString(16).padStart(2, '0')).join('');
   }
-  return '0'.repeat(64);
+  return ''; // Return empty string, not zeros - let caller handle default
 }
 
 // Transform DB block + transactions to frontend Block type
@@ -93,18 +94,24 @@ function transformRpcBlock(raw: Record<string, unknown>): Block | null {
   const transactions = (raw.transactions as unknown[]) || [];
   
   // Calculate total gas used
+  // NOTE: HeartbeatCommitment txs have gas_price=u64::MAX as sentinel "no gas" value
+  const U64_MAX = 18446744073709551615;
   let totalGasUsed = 0;
   for (const tx of transactions) {
     const t = tx as Record<string, unknown>;
-    totalGasUsed += Number(t.gas_used) || (Number(t.gas_price || 0) * Number(t.gas_limit || 1));
+    const gasPrice = Number(t.gas_price) || 0;
+    const gasLimit = Number(t.gas_limit) || 0;
+    // Skip if gas_price is u64::MAX (sentinel for "no gas" transactions)
+    if (gasPrice >= U64_MAX - 1000 || gasPrice < 0) continue;
+    totalGasUsed += Number(t.gas_used) || (gasPrice * gasLimit);
   }
   
   return {
     hash: (raw.hash as string) || `block_${height}`,
     height,
     timestamp: timestamp > 1e12 ? timestamp : timestamp * 1000,
-    previous_hash: bytesToHex(raw.previous_hash),
-    merkle_root: bytesToHex(raw.merkle_root),
+    previous_hash: bytesToHex(raw.previous_hash) || '0'.repeat(64),
+    merkle_root: bytesToHex(raw.merkle_root) || '0'.repeat(64),
     block_type: (raw.block_type as 'MICROBLOCK' | 'MACROBLOCK') || 'MICROBLOCK',
     version: (raw.version as number) || 1,
     producer: (raw.producer as string) || 'unknown',
@@ -126,7 +133,7 @@ function transformRpcBlock(raw: Record<string, unknown>): Block | null {
         from: (t.from as string) || '',
         to: (t.to as string) || (t.from as string) || '',
         amount: String(t.amount || 0),
-        fee: t.gas_price ? String((t.gas_price as number) * (t.gas_limit as number || 1)) : undefined,
+        fee: (t.gas_price && Number(t.gas_price) < U64_MAX - 1000) ? String((t.gas_price as number) * (t.gas_limit as number)) : undefined,
         timestamp: (t.timestamp as number) || timestamp,
         nonce: t.nonce as number | undefined,
         status: (t.status as string) || 'confirmed',
@@ -150,8 +157,9 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
     }
     
     if (dbBlock) {
-      // Get transactions for this block
-      const dbTransactions = await getTransactionsByBlock(dbBlock.height);
+      // Get transactions for this block (ensure height is a number)
+      const blockHeight = Number(dbBlock.height);
+      const dbTransactions = await getTransactionsByBlock(blockHeight);
       
       const transactions: BlockTransaction[] = dbTransactions.map(tx => ({
         hash: tx.hash,

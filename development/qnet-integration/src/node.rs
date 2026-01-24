@@ -1403,6 +1403,32 @@ impl BlockchainNode {
         }
     }
     
+    /// CRITICAL FIX v3.2: Cache all NodeRegistration TXs from a block
+    /// This ensures block CREATOR (not just receivers) has wallet addresses cached
+    /// Required for: genesis block creator, regular block producers with NodeRegistration TXs
+    /// Without this, producer can't look up wallet addresses for reward distribution
+    fn cache_node_registrations_from_transactions(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
+        use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
+        
+        for tx in transactions {
+            if let qnet_state::TransactionType::NodeRegistration { 
+                node_id, node_type, wallet_address, .. 
+            } = &tx.tx_type {
+                let type_str = match node_type {
+                    qnet_state::NodeType::Super => "super",
+                    qnet_state::NodeType::Full => "full",
+                    qnet_state::NodeType::Light => "light",
+                };
+                if let Err(e) = storage.save_node_registration(node_id, type_str, wallet_address, INITIAL_REPUTATION) {
+                    eprintln!("[WARN][REG] cache_from_block_fail node={} err={}", node_id, e);
+                } else if is_info() {
+                    println!("[INFO][REG] cached_from_produced_block node={} wallet={}...", 
+                             node_id, &wallet_address[..wallet_address.len().min(16)]);
+                }
+            }
+        }
+    }
+    
     /// Register all 5 Genesis nodes on-chain (called once at blockchain start)
     /// Returns Vec of registration transactions to include in genesis/first block
     /// Create Genesis node registration TXs with FIXED timestamp for determinism
@@ -7628,8 +7654,11 @@ impl BlockchainNode {
         }
         
         // PRODUCTION: Start storage monitoring for all nodes
-        println!("[Storage] 📊 Starting storage usage monitoring...");
+        println!("[INFO][STORAGE] starting_monitoring");
         self.start_storage_monitoring().await;
+        
+        // v3.0: Start memory monitoring to detect leaks before OOM
+        self.start_memory_monitoring().await;
         
         // CONSENSUS: Messages processed directly in macroblock phases (no separate handler needed)
         
@@ -8133,6 +8162,19 @@ impl BlockchainNode {
                             }
                         }
                     }
+                    
+                    // v3.1: CRITICAL - Cleanup old epochs to prevent memory leak at scale
+                    // Keep only last 10 epochs (10 * 14400 blocks = ~40 hours of data)
+                    // With millions of nodes, old epochs MUST be cleaned up!
+                    if current_epoch > 10 {
+                        let min_epoch = current_epoch.saturating_sub(10);
+                        let before_len = heartbeat_tracker.len();
+                        heartbeat_tracker.retain(|epoch, _| *epoch >= min_epoch);
+                        let removed = before_len.saturating_sub(heartbeat_tracker.len());
+                        if removed > 0 && is_info() {
+                            println!("[INFO][HEARTBEAT] cleanup removed={} epochs min_epoch={}", removed, min_epoch);
+                        }
+                    }
                 }
                 
                 // v2.89: LightNodeEligibilityBitmap TX (replaces PingCommitment)
@@ -8354,6 +8396,19 @@ impl BlockchainNode {
                             }
                         }
                     }
+                    
+                    // v3.1: CRITICAL - Cleanup old sent_ping_commitments to prevent memory leak at scale
+                    // Keep only last 10 epochs
+                    if current_epoch > 10 {
+                        let min_epoch = current_epoch.saturating_sub(10);
+                        let mut sent = sent_ping_commitments.write().await;
+                        let before_len = sent.len();
+                        sent.retain(|epoch| *epoch >= min_epoch);
+                        let removed = before_len.saturating_sub(sent.len());
+                        if removed > 0 && is_info() {
+                            println!("[INFO][PING_COMMIT] cleanup removed={} epochs min_epoch={}", removed, min_epoch);
+                        }
+                    }
                 }
             }
         });
@@ -8530,6 +8585,14 @@ impl BlockchainNode {
                                         match storage.save_microblock(0, &data) {
                                             Ok(_) => {
                                                 println!("[INFO][GEN] Genesis Block created and saved at height 0");
+                                                
+                                                // CRITICAL FIX v3.2: Cache NodeRegistration TXs from genesis block
+                                                // Without this, genesis creator can't find wallet addresses for rewards!
+                                                Self::cache_node_registrations_from_transactions(&storage, &genesis_microblock.transactions);
+                                                println!("[INFO][GEN] Cached {} NodeRegistration TXs from genesis block", 
+                                                    genesis_microblock.transactions.iter()
+                                                        .filter(|tx| matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }))
+                                                        .count());
                                                 
                                                 // CRITICAL v2.32: Set GLOBAL_GENESIS_TIMESTAMP immediately!
                                                 // This ensures ALL nodes use the SAME timestamp
@@ -12159,6 +12222,11 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                 }
                             }
                         }
+                        
+                        // CRITICAL FIX v3.2: Cache NodeRegistration TXs when producer creates block
+                        // This ensures producer can find wallet addresses for new nodes in reward distribution
+                        // Without this, only block RECEIVERS would cache registrations, not the producer!
+                        Self::cache_node_registrations_from_transactions(&storage_clone, &txs);
                         
                         // CRITICAL v2.26: Remove included TX from mempool AFTER block is saved!
                         // This prevents re-processing the same TX in future blocks
@@ -19723,14 +19791,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         match self.storage.load_microblock_auto_format(height) {
             Ok(Some(microblock)) => {
                 // Convert MicroBlock to Block format for API compatibility
+                // v2.80: Include poh_hash and poh_count for VTS/PoH data in API response
                 let block = qnet_state::Block {
                     height: microblock.height,
                     timestamp: microblock.timestamp,
                     previous_hash: microblock.previous_hash,
                     merkle_root: microblock.merkle_root,
                     transactions: microblock.transactions,
-                    producer: microblock.producer,
+                    producer: microblock.producer.clone(),
                     signature: microblock.signature,
+                    poh_hash: microblock.poh_hash,
+                    poh_count: microblock.poh_count,
+                    block_type: "MICROBLOCK".to_string(),
                 };
                 Ok(Some(block))
             }
@@ -22612,7 +22684,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         });
         
-        println!("[Archive] 🔄 Small network rebalancing check scheduled");
+        println!("[INFO][ARCHIVE] small_network_rebalancing_scheduled");
     }
     
     /// Start storage usage monitoring with automatic cleanup
@@ -22632,17 +22704,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         // Normal operation
                     },
                     Ok(false) => {
-                        println!("[Storage] ⚠️ Node {} storage in warning/emergency state", node_id);
+                        println!("[WARN][STORAGE] node={} state=warning_or_emergency", node_id);
                         
                         // Check if critically full
                         match storage.is_storage_critically_full() {
                             Ok(true) => {
-                                println!("[Storage] 🆘 CRITICAL: Node {} storage critically full!", node_id);
-                                println!("[Storage] 💡 ADMIN ACTION REQUIRED:");
-                                println!("[Storage]    1. Increase disk space allocation");
-                                println!("[Storage]    2. Set QNET_MAX_STORAGE_GB=500 or higher");
-                                println!("[Storage]    3. Consider reducing archive quota for this node");
-                                println!("[Storage]    4. Move node to server with larger disk");
+                                println!("[CRIT][STORAGE] node={} state=critically_full action=admin_required", node_id);
                                 
                                 // Emergency slowdown to prevent crash
                                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -22651,18 +22718,102 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 // Warning state, continue monitoring
                             },
                             Err(e) => {
-                                println!("[Storage] ❌ Failed to check critical status: {}", e);
+                                println!("[ERR][STORAGE] node={} action=check_critical err={}", node_id, e);
                             }
                         }
                     },
                     Err(e) => {
-                        println!("[Storage] ❌ Storage monitoring failed for node {}: {}", node_id, e);
+                        println!("[ERR][STORAGE] node={} action=monitoring err={}", node_id, e);
                     }
                 }
             }
         });
         
-        println!("[Storage] ✅ Storage monitoring started (hourly checks)");
+        println!("[INFO][STORAGE] monitoring_started interval=3600s");
+    }
+    
+    /// v3.0: Memory monitoring to detect leaks before OOM
+    /// Logs memory usage every 5 minutes with detailed breakdown
+    async fn start_memory_monitoring(&self) {
+        let node_id = self.node_id.clone();
+        let storage = self.storage.clone();
+        let unified_p2p = self.unified_p2p.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+            let mut last_rss_mb: u64 = 0;
+            
+            loop {
+                interval.tick().await;
+                
+                // Get process memory from /proc/self/statm (Linux)
+                let (rss_mb, virt_mb) = match std::fs::read_to_string("/proc/self/statm") {
+                    Ok(statm) => {
+                        let parts: Vec<&str> = statm.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let page_size = 4096u64; // Usually 4KB
+                            let virt_pages: u64 = parts[0].parse().unwrap_or(0);
+                            let rss_pages: u64 = parts[1].parse().unwrap_or(0);
+                            (rss_pages * page_size / 1024 / 1024, virt_pages * page_size / 1024 / 1024)
+                        } else {
+                            (0, 0)
+                        }
+                    },
+                    Err(_) => (0, 0), // Not Linux or /proc not available
+                };
+                
+                // Calculate delta from last check
+                let delta_mb = if rss_mb > last_rss_mb { 
+                    rss_mb - last_rss_mb 
+                } else { 
+                    0 
+                };
+                last_rss_mb = rss_mb;
+                
+                // Get data structure sizes
+                let tx_pool_stats = storage.get_transaction_pool_stats().unwrap_or((0, 0));
+                
+                // Get P2P structure sizes
+                let (peers_count, rate_limiter_count) = if let Some(ref p2p) = unified_p2p {
+                    (p2p.get_connected_peer_count(), p2p.get_rate_limiter_size())
+                } else {
+                    (0, 0)
+                };
+                
+                // Get static cache sizes
+                let producer_cache_size = producer_cache::CACHED_PRODUCER_SELECTION.len();
+                
+                // Log memory stats
+                println!("[INFO][MEMORY] node={} rss_mb={} virt_mb={} delta_mb={} tx_pool={} peers={} rate_limit={} producer_cache={}",
+                         node_id, rss_mb, virt_mb, delta_mb, tx_pool_stats.0, peers_count, rate_limiter_count, producer_cache_size);
+                
+                // CRITICAL: Warn if memory growing too fast (>100MB in 5 minutes)
+                if delta_mb > 100 {
+                    println!("[WARN][MEMORY] node={} rapid_growth delta_mb={} possible_leak", node_id, delta_mb);
+                }
+                
+                // CRITICAL: Warn if RSS > 10GB
+                if rss_mb > 10_000 {
+                    println!("[CRIT][MEMORY] node={} rss_mb={} HIGH_MEMORY action=investigate", node_id, rss_mb);
+                }
+                
+                // CRITICAL: Emergency if RSS > 14GB (for 16GB server)
+                if rss_mb > 14_000 {
+                    println!("[CRIT][MEMORY] node={} rss_mb={} EMERGENCY near_oom action=cleanup", node_id, rss_mb);
+                    
+                    // Force cleanup of caches
+                    producer_cache::CACHED_PRODUCER_SELECTION.clear();
+                    println!("[INFO][MEMORY] producer_cache_cleared");
+                    
+                    // Force GC hint (Rust doesn't have GC but can drop unused allocations)
+                    if let Ok(_) = storage.transaction_pool.cleanup_old_duplicates() {
+                        println!("[INFO][MEMORY] tx_pool_cleanup_forced");
+                    }
+                }
+            }
+        });
+        
+        println!("[INFO][MEMORY] monitoring_started interval=300s");
     }
 
     /// CRITICAL FIX: Generate unique node_id based on Genesis ID or server IP

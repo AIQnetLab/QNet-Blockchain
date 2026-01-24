@@ -40,6 +40,7 @@ pub struct StorageStats {
 
 /// Transaction pool with TTL cleanup for efficient microblock storage
 /// Stores transactions separately from microblocks to avoid duplication
+/// v3.0: Added MAX_SIZE limit to prevent memory leak
 #[derive(Debug)]
 pub struct TransactionPool {
     /// Map of transaction hash to transaction
@@ -48,7 +49,13 @@ pub struct TransactionPool {
     creation_times: Arc<RwLock<HashMap<[u8; 32], u64>>>,
     /// TTL in hours after which transactions are eligible for cleanup
     cleanup_after_hours: u32,
+    /// v3.0: Maximum number of transactions to keep in memory (prevents memory leak)
+    max_size: usize,
 }
+
+/// v3.0: Maximum transaction pool size to prevent memory leak
+/// ~100K transactions × ~1KB average = ~100MB RAM
+const MAX_TRANSACTION_POOL_SIZE: usize = 100_000;
 
 impl TransactionPool {
     /// Create new transaction pool with default TTL of 24 hours
@@ -57,10 +64,12 @@ impl TransactionPool {
             transactions: Arc::new(RwLock::new(HashMap::new())),
             creation_times: Arc::new(RwLock::new(HashMap::new())),
             cleanup_after_hours: 24, // 24 hours retention for local hot storage
+            max_size: MAX_TRANSACTION_POOL_SIZE,
         }
     }
     
     /// Store transaction with current timestamp
+    /// v3.0: Enforces max_size limit to prevent memory leak
     pub fn store_transaction(&self, tx_hash: [u8; 32], transaction: Transaction) -> Result<(), IntegrationError> {
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -72,6 +81,27 @@ impl TransactionPool {
                 .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
             let mut creation_times = self.creation_times.write()
                 .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
+            
+            // v3.0: CRITICAL - Enforce max size to prevent memory leak
+            // If at limit, remove oldest 10% of transactions
+            if transactions.len() >= self.max_size {
+                let cutoff_time = current_time.saturating_sub(self.cleanup_after_hours as u64 * 1800); // 12h instead of 24h when full
+                let old_hashes: Vec<[u8; 32]> = creation_times.iter()
+                    .filter(|(_, &time)| time < cutoff_time)
+                    .map(|(hash, _)| *hash)
+                    .take(self.max_size / 10) // Remove up to 10%
+                    .collect();
+                    
+                for hash in &old_hashes {
+                    transactions.remove(hash);
+                    creation_times.remove(hash);
+                }
+                
+                if !old_hashes.is_empty() {
+                    println!("[WARN][TX_POOL] at_capacity max={} evicted={}", 
+                             self.max_size, old_hashes.len());
+                }
+            }
                 
             transactions.insert(tx_hash, transaction);
             creation_times.insert(tx_hash, current_time);
@@ -4333,6 +4363,59 @@ impl Storage {
             },
             None => Ok(None),
         }
+    }
+    
+    /// v3.1: Get all nodes registered with a specific wallet address
+    /// CRITICAL for mobile app: Returns nodes even when the node itself is offline!
+    /// Data is read from blockchain storage, not from the node's memory
+    pub fn get_nodes_by_wallet(&self, wallet_address: &str) -> IntegrationResult<Vec<(String, String, f64)>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        
+        let mut result = Vec::new();
+        let prefix = b"node_";
+        
+        // Iterate through all nodes in registry
+        let iter = self.persistent.db.prefix_iterator_cf(&registry_cf, prefix);
+        
+        for item in iter {
+            if let Ok((key, value)) = item {
+                // Extract node_id from key (format: "node_{node_id}")
+                let key_str = match std::str::from_utf8(&key) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                
+                let node_id = if key_str.starts_with("node_") {
+                    &key_str[5..] // Skip "node_" prefix
+                } else {
+                    continue;
+                };
+                
+                // Parse value JSON
+                let json_str = match std::str::from_utf8(&value) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                
+                let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                
+                // Check if wallet matches
+                let node_wallet = parsed["wallet"].as_str().unwrap_or("");
+                if node_wallet == wallet_address {
+                    let node_type = parsed["node_type"].as_str().unwrap_or("unknown").to_string();
+                    let reputation = parsed["reputation"].as_f64()
+                        .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
+                    
+                    result.push((node_id.to_string(), node_type, reputation));
+                }
+            }
+        }
+        
+        Ok(result)
     }
     
     // ============================================

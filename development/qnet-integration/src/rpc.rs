@@ -7491,6 +7491,8 @@ async fn handle_get_reward_pools(
 }
 
 // PRODUCTION v2.43.1: GET /api/v1/rewards/by-wallet/{wallet_address} - Get all nodes for wallet
+// v3.1: Now reads from STORAGE (blockchain) as primary, with reward_manager as supplement
+// This ensures nodes are visible even when the node itself is offline!
 async fn handle_get_rewards_by_wallet(
     wallet_address: String,
     remote_addr: Option<std::net::SocketAddr>,
@@ -7501,16 +7503,40 @@ async fn handle_get_rewards_by_wallet(
         return Ok(rate_limit_response);
     }
     
-    // Get all nodes owned by this wallet from reward_manager
+    // v3.1: PRIMARY SOURCE - Read from blockchain storage (survives node offline)
+    // This is the authoritative source from NodeRegistration TX in blockchain
+    let storage = blockchain.get_storage();
+    let storage_nodes = storage.get_nodes_by_wallet(&wallet_address).unwrap_or_default();
+    
+    // SECONDARY SOURCE - Also check reward_manager (may have additional runtime data)
     let reward_manager_arc = blockchain.get_reward_manager();
     let reward_manager = reward_manager_arc.read().await;
-    
-    let nodes = reward_manager.get_nodes_by_owner(&wallet_address);
+    let rm_nodes = reward_manager.get_nodes_by_owner(&wallet_address);
     drop(reward_manager);
+    
+    // Merge both sources (storage is primary, rm adds any missing)
+    let mut nodes: Vec<String> = storage_nodes.iter().map(|(id, _, _)| id.clone()).collect();
+    for rm_node in rm_nodes {
+        if !nodes.contains(&rm_node) {
+            nodes.push(rm_node);
+        }
+    }
     
     let mut nodes_info = Vec::new();
     let current_height = blockchain.get_height().await;
     let current_epoch = (current_height / 14400) + 1;
+    
+    // v3.1: Get active nodes list to determine online status
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    let active_nodes = if let Some(p2p) = blockchain.get_unified_p2p() {
+        p2p.get_active_full_super_nodes()
+    } else {
+        Vec::new()
+    };
     
     for node_id in nodes {
         // Get pending rewards for each node
@@ -7519,16 +7545,36 @@ async fn handle_get_rewards_by_wallet(
         let pending = rm.get_pending_reward(&node_id).cloned();
         drop(rm);
         
-        // Determine node type
-        let node_type = if node_id.starts_with("light_") {
-            "Light"
-        } else if node_id.starts_with("full_") {
-            "Full"
-        } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
-            "Super"
-        } else {
-            "Unknown"
+        // Determine node type from storage or from node_id prefix
+        let node_type = {
+            // Try to get from storage first
+            let storage_type = storage_nodes.iter()
+                .find(|(id, _, _)| id == &node_id)
+                .map(|(_, t, _)| t.clone());
+            
+            if let Some(t) = storage_type {
+                match t.as_str() {
+                    "super" => "Super",
+                    "full" => "Full",
+                    "light" => "Light",
+                    _ => "Unknown"
+                }
+            } else if node_id.starts_with("light_") {
+                "Light"
+            } else if node_id.starts_with("full_") {
+                "Full"
+            } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
+                "Super"
+            } else {
+                "Unknown"
+            }
         };
+        
+        // v3.1: Determine online status from active nodes list
+        let (is_online, last_seen) = active_nodes.iter()
+            .find(|(id, _, _)| id == &node_id)
+            .map(|(_, _, ls)| (now.saturating_sub(*ls) < 15 * 60, *ls)) // Online if seen in last 15 min
+            .unwrap_or((false, 0)); // Not in active list = offline
         
         let (total, pool1, pool2, pool3, phase) = if let Some(ref reward) = pending {
             (
@@ -7550,6 +7596,9 @@ async fn handle_get_rewards_by_wallet(
         nodes_info.push(json!({
             "node_id": node_id,
             "node_type": node_type,
+            "is_online": is_online,
+            "last_seen": last_seen,
+            "last_seen_ago_seconds": if last_seen > 0 { now.saturating_sub(last_seen) } else { 0 },
             "phase": phase,
             "pending_rewards_qnc": total,
             "pools": {
@@ -8228,10 +8277,42 @@ async fn handle_activations_by_wallet(
     
     // NEW: If node_type is NOT specified, return ALL nodes for this wallet
     if node_type.is_none() || node_type.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-        // Query RewardManager for all nodes owned by this wallet
+        // v3.1: PRIMARY SOURCE - Read from blockchain storage (survives node offline)
+        let storage = blockchain.get_storage();
+        let storage_nodes = storage.get_nodes_by_wallet(&wallet_address).unwrap_or_default();
+        
+        // SECONDARY SOURCE - Query RewardManager for nodes (may have additional runtime data)
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
-        let mut nodes = reward_manager.get_nodes_by_wallet(&wallet_address);
+        let rm_nodes = reward_manager.get_nodes_by_wallet(&wallet_address);
+        
+        // Merge both sources into unified list
+        let mut nodes: Vec<(String, qnet_consensus::lazy_rewards::NodeType, u64)> = Vec::new();
+        
+        // Add nodes from storage first (primary source)
+        for (node_id, node_type_str, _rep) in &storage_nodes {
+            // v3.1: NO DEFAULT - skip unknown types instead of assuming Full
+            let node_type = match node_type_str.as_str() {
+                "light" => qnet_consensus::lazy_rewards::NodeType::Light,
+                "full" => qnet_consensus::lazy_rewards::NodeType::Full,
+                "super" => qnet_consensus::lazy_rewards::NodeType::Super,
+                _ => {
+                    println!("[WARN][API] unknown_node_type node={} type={}", node_id, node_type_str);
+                    continue; // Skip unknown types
+                }
+            };
+            let pending = reward_manager.get_pending_reward(node_id)
+                .map(|r| r.total_reward)
+                .unwrap_or(0);
+            nodes.push((node_id.clone(), node_type, pending));
+        }
+        
+        // Add any additional nodes from reward_manager that weren't in storage
+        for (node_id, node_type, pending) in &rm_nodes {
+            if !nodes.iter().any(|(id, _, _)| id == node_id) {
+                nodes.push((node_id.clone(), node_type.clone(), *pending));
+            }
+        }
         
         // CRITICAL FIX v2.76: Genesis nodes are NOT in node_ownership!
         // Check if this wallet matches any genesis node wallet
@@ -8290,18 +8371,44 @@ async fn handle_activations_by_wallet(
             }
         }
         
-        // Build nodes array with full info
+        // v3.1: Get active nodes to determine REAL online status
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let active_nodes = if let Some(p2p) = blockchain.get_unified_p2p() {
+            p2p.get_active_full_super_nodes()
+        } else {
+            Vec::new()
+        };
+        
+        // Build nodes array with full info INCLUDING real online status
         let nodes_json: Vec<serde_json::Value> = nodes.iter().map(|(node_id, node_type, pending)| {
             let type_str = match node_type {
                 qnet_consensus::lazy_rewards::NodeType::Light => "light",
                 qnet_consensus::lazy_rewards::NodeType::Full => "full",
                 qnet_consensus::lazy_rewards::NodeType::Super => "super",
             };
+            
+            // v3.1: Check REAL online status from active nodes list
+            let (is_online, last_seen, status) = active_nodes.iter()
+                .find(|(id, _, _)| id == node_id)
+                .map(|(_, _, ls)| {
+                    let online = now.saturating_sub(*ls) < 15 * 60; // Online if seen in last 15 min
+                    let status = if online { "online" } else { "offline" };
+                    (online, *ls, status)
+                })
+                .unwrap_or((false, 0, "offline")); // Not in active list = offline
+            
             json!({
                 "node_id": node_id,
                 "node_type": type_str,
                 "pending_rewards": pending,
-                "status": "active"
+                "status": status,
+                "is_online": is_online,
+                "last_seen": last_seen,
+                "last_seen_ago_seconds": if last_seen > 0 { now.saturating_sub(last_seen) } else { 0 }
             })
         }).collect();
         
