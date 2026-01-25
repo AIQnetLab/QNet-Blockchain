@@ -19,8 +19,19 @@ const formatAmount = (nanoQNC: string): string => {
 };
 
 // Format timestamp
-const formatTime = (ts: number): string => {
-  return new Date(ts).toUTCString();
+const formatTime = (ts: number | string | undefined): string => {
+  // Ensure ts is a valid number (PostgreSQL BIGINT may come as string)
+  const timestamp = Number(ts);
+  if (!timestamp || !Number.isFinite(timestamp) || timestamp <= 0) {
+    return 'Genesis Block';
+  }
+  // Convert to milliseconds if in seconds
+  const ms = timestamp > 1e12 ? timestamp : timestamp * 1000;
+  const date = new Date(ms);
+  if (isNaN(date.getTime())) {
+    return 'Invalid Date';
+  }
+  return date.toUTCString();
 };
 
 // Copy button (Keeta style)

@@ -51,10 +51,13 @@ function bytesToHex(bytes: unknown): string {
 
 // Transform DB block + transactions to frontend Block type
 function transformDbBlock(dbBlock: BlockRow, transactions: BlockTransaction[]): Block {
+  // IMPORTANT: PostgreSQL BIGINT returns as string, must convert to number
+  const timestamp = Number(dbBlock.timestamp) || 0;
+  
   return {
     hash: dbBlock.hash,
-    height: dbBlock.height,
-    timestamp: dbBlock.timestamp,
+    height: Number(dbBlock.height),
+    timestamp: timestamp > 0 ? timestamp : Date.now(), // Fallback to now for genesis if 0
     previous_hash: dbBlock.previous_hash || '0'.repeat(64),
     merkle_root: dbBlock.merkle_root || '0'.repeat(64),
     block_type: dbBlock.block_type as 'MICROBLOCK' | 'MACROBLOCK',

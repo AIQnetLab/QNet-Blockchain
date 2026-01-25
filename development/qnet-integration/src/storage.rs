@@ -510,7 +510,7 @@ impl PersistentStorage {
         
         // Basic settings that work reliably
         opts.set_max_open_files(1000);
-        opts.set_use_fsync(false);
+        opts.set_use_fsync(true);
         opts.set_bytes_per_sync(1048576);
         opts.set_max_write_buffer_number(4);
         opts.set_write_buffer_size(67108864); // 64MB
@@ -648,8 +648,11 @@ impl PersistentStorage {
     /// Solution: Linear scan with gap tolerance to find actual max continuous height
     /// SECURITY: Only repairs if chain is continuous (no gaps > 10 blocks)
     /// PERFORMANCE: O(n) but only runs once at startup and uses early exit
+    /// 
+    /// v3.0: CRITICAL FIX - If metadata_height is low but blocks exist higher,
+    /// use RocksDB iterator to find first existing block and scan from there
     pub fn verify_and_repair_chain_height(&self) -> IntegrationResult<bool> {
-        use crate::node::{is_info, is_debug};
+        use crate::node::{is_info, is_debug, is_warn};
         
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
@@ -671,7 +674,36 @@ impl PersistentStorage {
         
         // SECURITY: Find max CONTINUOUS height (no gaps > 10 blocks allowed)
         // This prevents accepting blocks from fork/attack with gaps
-        let result = self.find_max_continuous_height(&blocks_cf, metadata_height)?;
+        let mut result = self.find_max_continuous_height(&blocks_cf, metadata_height)?;
+        
+        // v3.0: CRITICAL FIX - If metadata_height is low (0-10) and no continuous blocks found,
+        // scan for FIRST existing block and use that as starting point
+        // This handles the case where OOM corrupted metadata but blocks are intact
+        if result.is_none() && metadata_height < 100 {
+            if is_warn() {
+                println!("[WARN][STORAGE] no_continuous_from_h={} scanning_for_first_block", metadata_height);
+            }
+            
+            // Find first existing block using RocksDB iterator
+            if let Some(first_block_height) = self.find_first_existing_block(&blocks_cf)? {
+                if first_block_height > metadata_height {
+                    if is_warn() {
+                        println!("[WARN][STORAGE] found_first_block_at={} metadata_was={}", 
+                                 first_block_height, metadata_height);
+                    }
+                    
+                    // Now scan from first found block to find max continuous
+                    result = self.find_max_continuous_height(&blocks_cf, first_block_height.saturating_sub(1))?;
+                    
+                    if let Some((max_height, _)) = result {
+                        if is_warn() {
+                            println!("[WARN][STORAGE] recovery_scan first={} max_continuous={}", 
+                                     first_block_height, max_height);
+                        }
+                    }
+                }
+            }
+        }
         
         match result {
             Some((actual_height, has_gaps)) => {
@@ -798,6 +830,74 @@ impl PersistentStorage {
         } else {
             Ok(None)
         }
+    }
+    
+    /// v3.0: Find first existing block in storage using RocksDB iterator
+    /// Used for recovery when metadata is corrupted but blocks exist
+    /// 
+    /// PERFORMANCE: Uses prefix iterator, typically finds block in O(1)
+    fn find_first_existing_block(&self, blocks_cf: &ColumnFamily) -> IntegrationResult<Option<u64>> {
+        use rocksdb::IteratorMode;
+        use crate::node::is_debug;
+        
+        // RocksDB keys are "block_N" where N is the height
+        // Iterator will scan in lexicographic order
+        let iter = self.db.iterator_cf(blocks_cf, IteratorMode::Start);
+        
+        for item in iter {
+            match item {
+                Ok((key, _)) => {
+                    // Parse "block_N" format
+                    if let Ok(key_str) = std::str::from_utf8(&key) {
+                        if key_str.starts_with("block_") {
+                            if let Ok(height) = key_str[6..].parse::<u64>() {
+                                if is_debug() {
+                                    println!("[DBG][STORAGE] found_first_block h={}", height);
+                                }
+                                return Ok(Some(height));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[WARN][STORAGE] iterator_error err={}", e);
+                    break;
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    /// v3.0: Flush all RocksDB data to disk
+    /// CRITICAL: Call before graceful shutdown or when OOM is imminent
+    /// This flushes WAL (Write-Ahead Log) to SST files, ensuring data durability
+    pub fn flush_all(&self) -> IntegrationResult<()> {
+        use rocksdb::FlushOptions;
+        
+        let mut flush_opts = FlushOptions::default();
+        flush_opts.set_wait(true); // Wait for flush to complete
+        
+        // Flush all column families
+        let cf_names = ["metadata", "blocks", "macroblocks", "attestations", "heartbeats", 
+                        "pending_rewards", "light_eligibility", "shred_chunks", "index", 
+                        "accounts", "transactions"];
+        
+        for cf_name in &cf_names {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                if let Err(e) = self.db.flush_cf_opt(&cf, &flush_opts) {
+                    println!("[WARN][STORAGE] flush_cf_failed cf={} err={}", cf_name, e);
+                    // Continue flushing other CFs even if one fails
+                }
+            }
+        }
+        
+        // Also flush default CF
+        if let Err(e) = self.db.flush_opt(&flush_opts) {
+            println!("[WARN][STORAGE] flush_default_failed err={}", e);
+        }
+        
+        Ok(())
     }
     
     /// Set chain height to a specific value (for fork resolution)
@@ -2049,6 +2149,13 @@ impl Storage {
     // ========================================================================
     // GRACEFUL DEGRADATION & STORAGE HEALTH
     // ========================================================================
+    
+    /// v3.0: Flush all RocksDB column families to disk
+    /// CRITICAL: Call this before graceful shutdown to prevent data loss
+    /// This ensures WAL is flushed to SST files
+    pub fn flush_all(&self) -> IntegrationResult<()> {
+        self.persistent.flush_all()
+    }
     
     /// Get current storage health status
     pub fn get_storage_health(&self) -> IntegrationResult<StorageHealth> {
@@ -5974,14 +6081,16 @@ impl Storage {
         let data = response.bytes().await
             .map_err(|e| IntegrationError::Other(format!("Download error: {}", e)))?;
         
-        // Save and load snapshot
-        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
-            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        // Save snapshot to DB (sync operation - cf_handle doesn't cross await)
+        {
+            let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+                .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+            
+            let snapshot_key = format!("snapshot_{}", height);
+            self.persistent.db.put_cf(&snapshots_cf, snapshot_key.as_bytes(), &data)?;
+        }
         
-        let snapshot_key = format!("snapshot_{}", height);
-        self.persistent.db.put_cf(&snapshots_cf, snapshot_key.as_bytes(), &data)?;
-        
-        // Load into state
+        // Load into state (async)
         self.load_state_snapshot(height).await?;
         
         Ok(())

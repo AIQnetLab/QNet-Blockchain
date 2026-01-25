@@ -113,28 +113,27 @@ Every node seeing every transaction is impossible at scale.
 
 #### Solution: Sharded Transaction Processing
 ```rust
-// UPDATED v2.19.10: Sharding is for PARALLEL PROCESSING, not storage partitioning
-// All nodes receive ALL blocks via P2P broadcast
-// Storage differs by TIER (what is kept and for how long), not by shard
+// UPDATED v3.0: Sharding is for PARALLEL PROCESSING, not storage partitioning
+// Full/Super nodes receive ALL blocks via P2P broadcast
+// Light nodes are thin clients (no sync, all via RPC)
 
 struct TieredStorage {
-    // All nodes receive all blocks, but store differently:
-    // Light: Headers only (~100MB, auto-rotating)
+    // Light: Thin client (~10MB app only, no blockchain data)
     // Full: Full blocks + 30-day pruning (~500GB)
     // Super: Full history, no pruning (~2TB)
 }
 
 fn get_storage_behavior(node_type: NodeType) -> StorageTier {
     match node_type {
-        NodeType::Light => StorageTier::HeadersOnly,  // ~100MB, FIFO rotation
+        NodeType::Light => StorageTier::None,         // Thin client - RPC only
         NodeType::Full => StorageTier::PrunedHistory, // ~500GB, 30-day window
         NodeType::Super => StorageTier::FullHistory,  // ~2TB, no pruning
     }
 }
 ```
 
-**Result (v2.19.10)**: 
-- Light nodes: ~100MB storage (headers only, auto-rotating)
+**Result (v3.0)**: 
+- Light nodes: ~10MB (app only, no blockchain storage - thin client)
 - Full nodes: ~500GB storage (30-day pruning window)
 - Super nodes: ~2TB storage (full history, archival role)
 
@@ -216,21 +215,21 @@ Full blockchain sync:
 - Total bandwidth: 1 PB/day!
 ```
 
-#### Solution: State Snapshots + Light Sync
+#### Solution: State Snapshots + Thin Clients
 ```rust
 struct SyncStrategy {
-    // Light nodes: No sync needed
+    // Light nodes: Thin client (no sync, all via RPC)
     // Full nodes: Snapshot + recent blocks
     // Super nodes: Full history
     
-    snapshot_interval: u64,  // Every 10,000 blocks
+    snapshot_interval: u64,  // Every 3,600 blocks (1 hour incremental)
     snapshot_retention: u32,  // Keep last 10 snapshots
 }
 
 impl Node {
     fn sync_strategy(&self) -> SyncMethod {
         match self.node_type {
-            NodeType::Light => SyncMethod::None,
+            NodeType::Light => SyncMethod::None, // Thin client - RPC only
             NodeType::Full => SyncMethod::Snapshot {
                 blocks_back: 10_000,  // Only recent history
             },
@@ -239,6 +238,12 @@ impl Node {
     }
 }
 ```
+
+**Light Node Architecture (v3.0):**
+- Light nodes are mobile apps (thin clients)
+- They do NOT sync or store any blocks
+- All data (balance, TX history) fetched via RPC from Full/Super nodes
+- This eliminates sync bandwidth for millions of mobile devices
 
 ### 6. Critical Weaknesses Identified
 

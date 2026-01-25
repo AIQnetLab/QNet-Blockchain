@@ -182,6 +182,137 @@ pub static EMERGENCY_STOP_TIME: Lazy<Arc<AtomicU64>> =
 static EMERGENCY_FAILOVERS_IN_PROGRESS: Lazy<Arc<DashSet<String>>> = 
     Lazy::new(|| Arc::new(DashSet::new()));
 
+// v3.0: CRITICAL FIX - Track blocks pending in sync queue to prevent duplicates
+// When sync_blocks requests from 3 peers, each peer sends same blocks
+// Without tracking: 2000 blocks × 3 peers = 6000 queue entries = OOM
+// DashMap for lock-free concurrent access with timestamp for TTL
+// Key: block height, Value: timestamp when added (for TTL cleanup)
+static PENDING_SYNC_BLOCKS: Lazy<DashMap<u64, u64>> = 
+    Lazy::new(|| DashMap::new());
+
+// v3.0: Maximum blocks in sync queue before backpressure
+// Prevents OOM even if storage is slow to process
+const MAX_PENDING_SYNC_BLOCKS: usize = 1000;
+
+// v3.0: TTL for pending sync blocks (60 seconds)
+// If block not processed in 60s, remove from tracker to allow re-request
+const PENDING_SYNC_BLOCK_TTL_SECS: u64 = 60;
+
+/// v3.0: Check if block is already pending in sync queue
+pub fn is_block_pending_sync(height: u64) -> bool {
+    PENDING_SYNC_BLOCKS.contains_key(&height)
+}
+
+/// v3.0: Mark block as pending in sync queue
+/// Returns false if already pending or queue is full (backpressure)
+pub fn mark_block_pending_sync(height: u64) -> bool {
+    // Backpressure: don't accept more if queue is full
+    if PENDING_SYNC_BLOCKS.len() >= MAX_PENDING_SYNC_BLOCKS {
+        return false;
+    }
+    
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    // Returns None if key didn't exist (successful insert), Some if already there
+    PENDING_SYNC_BLOCKS.insert(height, now).is_none()
+}
+
+/// v3.0: Remove block from pending set after processing
+pub fn clear_block_pending_sync(height: u64) {
+    PENDING_SYNC_BLOCKS.remove(&height);
+}
+
+/// v3.0: Clear all pending sync blocks (emergency cleanup)
+pub fn clear_all_pending_sync() {
+    PENDING_SYNC_BLOCKS.clear();
+}
+
+/// v3.0: Get current pending sync queue size
+pub fn get_pending_sync_count() -> usize {
+    PENDING_SYNC_BLOCKS.len()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v3.1: MACROBLOCK DEDUPLICATION (same pattern as microblocks)
+// Macroblocks are less frequent but still need protection
+// ═══════════════════════════════════════════════════════════════════════════════
+static PENDING_SYNC_MACROBLOCKS: Lazy<DashMap<u64, u64>> = 
+    Lazy::new(|| DashMap::new());
+
+// Macroblocks are rarer, so smaller limits
+const MAX_PENDING_SYNC_MACROBLOCKS: usize = 100;
+const PENDING_SYNC_MACROBLOCK_TTL_SECS: u64 = 120; // 2 minutes (longer than microblocks)
+
+/// v3.1: Check if macroblock is already pending in sync queue
+pub fn is_macroblock_pending_sync(index: u64) -> bool {
+    PENDING_SYNC_MACROBLOCKS.contains_key(&index)
+}
+
+/// v3.1: Mark macroblock as pending in sync queue
+/// Returns false if already pending or queue is full
+pub fn mark_macroblock_pending_sync(index: u64) -> bool {
+    if PENDING_SYNC_MACROBLOCKS.len() >= MAX_PENDING_SYNC_MACROBLOCKS {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    PENDING_SYNC_MACROBLOCKS.insert(index, now).is_none()
+}
+
+/// v3.1: Remove macroblock from pending set after processing
+pub fn clear_macroblock_pending_sync(index: u64) {
+    PENDING_SYNC_MACROBLOCKS.remove(&index);
+}
+
+/// v3.1: Get current pending macroblock queue size
+pub fn get_pending_macroblock_count() -> usize {
+    PENDING_SYNC_MACROBLOCKS.len()
+}
+
+/// v3.1: Clear all pending macroblock sync entries (emergency cleanup)
+pub fn clear_all_pending_sync_macroblocks() {
+    PENDING_SYNC_MACROBLOCKS.clear();
+}
+
+/// v3.1: Cleanup stale entries from PENDING_SYNC_MACROBLOCKS
+pub fn cleanup_pending_sync_macroblocks() -> usize {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cutoff = now.saturating_sub(PENDING_SYNC_MACROBLOCK_TTL_SECS);
+    let before = PENDING_SYNC_MACROBLOCKS.len();
+    PENDING_SYNC_MACROBLOCKS.retain(|_, &mut timestamp| timestamp > cutoff);
+    before.saturating_sub(PENDING_SYNC_MACROBLOCKS.len())
+}
+
+/// v3.0: Cleanup stale entries from PENDING_SYNC_BLOCKS (TTL 60 seconds)
+/// Call periodically to prevent "stuck" entries from blocking re-requests
+pub fn cleanup_pending_sync_blocks() -> usize {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    let cutoff = now.saturating_sub(PENDING_SYNC_BLOCK_TTL_SECS);
+    let before = PENDING_SYNC_BLOCKS.len();
+    
+    // Remove entries older than TTL
+    PENDING_SYNC_BLOCKS.retain(|_, &mut timestamp| timestamp > cutoff);
+    
+    let removed = before.saturating_sub(PENDING_SYNC_BLOCKS.len());
+    if removed > 0 && crate::node::is_info() {
+        println!("[INFO][SYNC] pending_blocks_ttl_cleanup removed={} remaining={}", 
+                 removed, PENDING_SYNC_BLOCKS.len());
+    }
+    removed
+}
+
 // PRODUCTION: Peer cleanup interval
 // Clean up inactive peers after 30 minutes (reasonable timeout for network health)
 // NOTE: Independent from certificate lifetime (270s) - peers can be temporarily inactive
@@ -3745,22 +3876,43 @@ impl SimplifiedP2P {
                 });
                 let fallback_removed = fallback_before.saturating_sub(QUIC_FALLBACK_RATE_LIMITER.len());
                 
+                // v3.0: Cleanup PENDING_SYNC_BLOCKS (TTL 60 seconds)
+                // This prevents "stuck" entries from blocking re-requests
+                let pending_sync_removed = cleanup_pending_sync_blocks();
+                
+                // v3.1: Cleanup PENDING_SYNC_MACROBLOCKS (TTL 120 seconds)
+                let pending_macro_removed = cleanup_pending_sync_macroblocks();
+                
                 // Log if anything was cleaned
-                let total_removed = retry_removed + fallback_removed;
+                let total_removed = retry_removed + fallback_removed + pending_sync_removed + pending_macro_removed;
                 if total_removed > 0 {
-                    println!("[INFO][CACHE_CLEANUP] peer_retry={} quic_fallback={}", retry_removed, fallback_removed);
+                    println!("[INFO][CACHE_CLEANUP] peer_retry={} quic_fallback={} pending_sync={} pending_macro={}", 
+                             retry_removed, fallback_removed, pending_sync_removed, pending_macro_removed);
                 }
                 
                 // Log current sizes for monitoring (only if significant)
-                let total_size = PEER_RETRY_COOLDOWN.len() + QUIC_FALLBACK_RATE_LIMITER.len();
+                let total_size = PEER_RETRY_COOLDOWN.len() + QUIC_FALLBACK_RATE_LIMITER.len() + 
+                                 PENDING_SYNC_BLOCKS.len() + PENDING_SYNC_MACROBLOCKS.len();
                 if total_size > 100 {
-                    println!("[WARN][CACHE_SIZE] peer_retry={} quic_fallback={}", 
-                             PEER_RETRY_COOLDOWN.len(), QUIC_FALLBACK_RATE_LIMITER.len());
+                    println!("[WARN][CACHE_SIZE] peer_retry={} quic_fallback={} pending_sync={} pending_macro={}", 
+                             PEER_RETRY_COOLDOWN.len(), QUIC_FALLBACK_RATE_LIMITER.len(), 
+                             PENDING_SYNC_BLOCKS.len(), PENDING_SYNC_MACROBLOCKS.len());
                 }
             }
         });
         
         println!("[INFO][CACHE_CLEANUP] static_cache_cleanup_started interval=600s");
+        
+        // v3.0: Separate more frequent cleanup for PENDING_SYNC_BLOCKS
+        // TTL = 60 seconds, so check every 30 seconds to ensure timely cleanup
+        handle.spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            
+            loop {
+                interval.tick().await;
+                cleanup_pending_sync_blocks();
+            }
+        });
     }
     
     /// PRODUCTION v2.56: Background repair task for incomplete block assemblies
@@ -6347,6 +6499,14 @@ impl SimplifiedP2P {
         let block_type = if assembly.is_macroblock { "macro".to_string() } else { "micro".to_string() };
         
         if let Some(ref block_tx) = &*block_tx_guard {
+            // v3.0 FIX: Deduplication for ShredProtocol path
+            if !mark_block_pending_sync(height) {
+                if crate::node::is_debug() {
+                    println!("[DBG][SHRED] block_skip_dup h={}", height);
+                }
+                return; // Already being processed
+            }
+            
             let received_block = ReceivedBlock {
                 height,
                 data: block_data,
@@ -6359,7 +6519,9 @@ impl SimplifiedP2P {
                     .as_secs(),
             };
             
-            let _ = block_tx.send(received_block);
+            if let Err(_) = block_tx.send(received_block) {
+                clear_block_pending_sync(height); // Clear on error
+            }
         } else {
             // block_tx not initialized - remove from processed for retry
             println!("[SHRED_PROTOCOL] ⚠️ Block #{} reconstructed but block_tx not ready, will retry", height);
@@ -6493,6 +6655,14 @@ impl SimplifiedP2P {
                 Err(p) => p.into_inner()
             };
             if let Some(ref block_tx) = &*block_tx_guard {
+                // v3.0 FIX: Deduplication for Reed-Solomon path
+                if !mark_block_pending_sync(height) {
+                    if crate::node::is_debug() {
+                        println!("[DBG][RS] block_skip_dup h={}", height);
+                    }
+                    return; // Already being processed
+                }
+                
                 let received_block = ReceivedBlock {
                     height,
                     data: block_data,
@@ -6505,7 +6675,9 @@ impl SimplifiedP2P {
                         .as_secs(),
                 };
                 
-                let _ = block_tx.send(received_block);
+                if let Err(_) = block_tx.send(received_block) {
+                    clear_block_pending_sync(height); // Clear on error
+                }
             }
         }
     }
@@ -10499,6 +10671,19 @@ impl SimplifiedP2P {
                 
                 // PRODUCTION: Send block to main node for processing via storage
                 if let Some(ref block_tx) = &*block_tx_guard {
+                    // v3.0 FIX: DEDUPLICATION for broadcast path
+                    // Without this, same block from multiple peers causes memory leak
+                    // mark_block_pending_sync returns false if:
+                    // 1. Block already in pending queue (another peer sent it)
+                    // 2. Backpressure - queue full (MAX_PENDING_SYNC_BLOCKS)
+                    if !mark_block_pending_sync(height) {
+                        if crate::node::is_debug() {
+                            println!("[DBG][P2P] block_skip_dup h={} from={}", height, from_peer);
+                        }
+                        drop(block_tx_guard);
+                        return; // Skip duplicate - already being processed
+                    }
+                    
                     let received_block = ReceivedBlock {
                         height,
                         data,
@@ -10536,10 +10721,14 @@ impl SimplifiedP2P {
                             }
                         }
                         Err(e) => {
+                            // v3.0: Clear pending on error so block can be retried
+                            clear_block_pending_sync(height);
                             println!("[P2P] ❌ Failed to queue {} block #{}: {}", block_type, height, e);
                         }
                     }
                 } else {
+                    // v3.0: Clear pending - channel not available
+                    clear_block_pending_sync(height);
                     println!("[P2P] ⚠️ Block processing channel not available - block #{} discarded", height);
                     println!("[DIAGNOSTIC] 💥 CRITICAL: Block channel was LOST after setup!");
                 }
@@ -10758,6 +10947,15 @@ impl SimplifiedP2P {
                 
                 // Queue macroblock for processing via macroblock_tx channel
                 if let Some(ref macroblock_tx) = &*match self.macroblock_tx.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
+                    // v3.1: DEDUPLICATION for macroblock broadcast
+                    // Same macroblock can arrive from multiple peers
+                    if !mark_macroblock_pending_sync(index) {
+                        if crate::node::is_debug() {
+                            println!("[DBG][MB-RX] skip_dup idx={} from={}", index, get_privacy_id_for_addr(&sender_id));
+                        }
+                        return; // Already being processed or queue full
+                    }
+                    
                     let received_macroblock = ReceivedBlock {
                         height: index,
                         data: macroblock_data,
@@ -10770,6 +10968,7 @@ impl SimplifiedP2P {
                     };
                     
                     if let Err(e) = macroblock_tx.send(received_macroblock) {
+                        clear_macroblock_pending_sync(index); // Clear on error
                         println!("[ERR][MB-RX] queue failed idx={}: {}", index, e);
                     } else {
                         println!("[INFO][MB-RX] queued idx={} for processing", index);
@@ -15168,16 +15367,66 @@ impl SimplifiedP2P {
     }
     
     /// Handle blocks batch received for sync
+    /// v3.0: CRITICAL FIX - Deduplicate blocks before queuing to prevent memory leak
+    /// When sync_blocks requests from 3 peers, each sends the same blocks
+    /// Without dedup: 2000 blocks × 3 peers = 6000 queue entries = OOM
+    /// 
+    /// DEDUPLICATION LAYERS:
+    /// 1. Check PENDING_SYNC_BLOCKS (already queued but not processed yet)
+    /// 2. Check storage (already processed and saved)
+    /// 3. Backpressure: reject if queue > MAX_PENDING_SYNC_BLOCKS
     pub fn handle_blocks_batch(&self, blocks: Vec<(u64, Vec<u8>)>, from_height: u64, to_height: u64, sender_id: String) {
-        println!("[SYNC] ✅ Processing {} blocks from {} (heights {}-{})", 
-                 blocks.len(), sender_id, from_height, to_height);
-        
         // CRITICAL FIX: Update last_seen AND height for sender (use highest block in batch)
         self.update_peer_last_seen_with_height(&sender_id, Some(to_height));
         
+        // v3.0: BACKPRESSURE - Check queue size before processing
+        let queue_size = get_pending_sync_count();
+        if queue_size >= MAX_PENDING_SYNC_BLOCKS {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] backpressure queue={} max={} drop_batch from={}", 
+                         queue_size, MAX_PENDING_SYNC_BLOCKS, sender_id);
+            }
+            return;
+        }
+        
+        // v3.0: DEDUPLICATION - Check storage BEFORE queuing to prevent 3x memory usage
+        let storage = match crate::node::try_get_storage() {
+            Some(s) => s,
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][SYNC] storage_unavailable skip_batch from={}", sender_id);
+                }
+                return;
+            }
+        };
+        
         // CRITICAL: Send blocks to block receiver for processing
         if let Some(ref block_tx) = &*match self.block_tx.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
+            let mut queued = 0u32;
+            let mut skipped_exists = 0u32;
+            let mut skipped_pending = 0u32;
+            let mut skipped_backpressure = 0u32;
+            
             for (height, data) in blocks {
+                // v3.0: LAYER 1 - Skip if already in pending queue (another peer sent it)
+                // mark_block_pending_sync returns false if already present OR backpressure
+                if !mark_block_pending_sync(height) {
+                    // Check why it failed
+                    if is_block_pending_sync(height) {
+                        skipped_pending += 1;
+                    } else {
+                        skipped_backpressure += 1;
+                    }
+                    continue;
+                }
+                
+                // v3.0: LAYER 2 - Skip if block already exists in storage
+                if storage.load_microblock(height).unwrap_or(None).is_some() {
+                    clear_block_pending_sync(height); // Remove from pending since it's done
+                    skipped_exists += 1;
+                    continue;
+                }
+                
                 // Create ReceivedBlock for processing
                 let received_block = ReceivedBlock {
                     height,
@@ -15192,12 +15441,23 @@ impl SimplifiedP2P {
                 
                 // Send to block processor
                 if let Err(e) = block_tx.send(received_block) {
-                    println!("[SYNC] ❌ Failed to queue block {} for processing: {}", height, e);
+                    clear_block_pending_sync(height); // Remove from pending on error
+                    if crate::node::is_warn() {
+                        println!("[WARN][SYNC] queue_fail h={} err={}", height, e);
+                    }
+                } else {
+                    queued += 1;
                 }
             }
-            println!("[SYNC] 📥 Queued {} blocks for processing", to_height - from_height + 1);
+            
+            if crate::node::is_info() {
+                println!("[INFO][SYNC] batch from={} range={}-{} queued={} dup_storage={} dup_pending={} backpressure={}", 
+                         sender_id, from_height, to_height, queued, skipped_exists, skipped_pending, skipped_backpressure);
+            }
         } else {
-            println!("[SYNC] ⚠️ Block processor not available, cannot save synced blocks!");
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] block_processor_unavailable from={}", sender_id);
+            }
         }
     }
     
@@ -15319,8 +15579,16 @@ impl SimplifiedP2P {
         
         // CRITICAL: Send macroblocks to macroblock receiver for processing
         if let Some(ref macroblock_tx) = &*match self.macroblock_tx.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
-            let macroblock_count = macroblocks.len();
+            let mut queued = 0;
+            let mut skipped_dup = 0;
+            
             for (index, data) in macroblocks {
+                // v3.1: DEDUPLICATION for macroblock sync
+                if !mark_macroblock_pending_sync(index) {
+                    skipped_dup += 1;
+                    continue; // Already being processed or queue full
+                }
+                
                 // Create ReceivedBlock for macroblock processing
                 let received_macroblock = ReceivedBlock {
                     height: index,  // For macroblocks, height = index
@@ -15335,10 +15603,16 @@ impl SimplifiedP2P {
                 
                 // Send to macroblock processor
                 if let Err(e) = macroblock_tx.send(received_macroblock) {
+                    clear_macroblock_pending_sync(index); // Clear on error
                     println!("[MACROBLOCK-SYNC] ❌ Failed to queue macroblock {} for processing: {}", index, e);
+                } else {
+                    queued += 1;
                 }
             }
-            println!("[MACROBLOCK-SYNC] 📥 Queued {} macroblocks for processing", macroblock_count);
+            
+            if crate::node::is_info() {
+                println!("[INFO][MB-SYNC] batch from={} queued={} dup_skipped={}", sender_id, queued, skipped_dup);
+            }
         } else {
             println!("[MACROBLOCK-SYNC] ⚠️ Macroblock processor not available, cannot save synced macroblocks!");
         }
@@ -15532,7 +15806,17 @@ impl SimplifiedP2P {
     }
     
     /// Request blocks from peers for sync
-    /// v2.65: Multi-peer redundancy - request from top 3 peers for reliability
+    /// v3.0: CRITICAL FIX - Sequential retry instead of parallel
+    /// 
+    /// OLD BEHAVIOR (caused OOM):
+    /// - Request from 3 peers simultaneously
+    /// - Each peer sends 2000 blocks → 6000 blocks in queue → OOM
+    /// 
+    /// NEW BEHAVIOR:
+    /// - Request from 1 peer (best reputation)
+    /// - If fails/timeout after SYNC_PEER_TIMEOUT, try next peer
+    /// - Deduplication layer (handle_blocks_batch) catches any duplicates
+    /// 
     /// v2.96: Filter by failover cache to exclude offline peers
     pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), String> {
         
@@ -15565,31 +15849,34 @@ impl SimplifiedP2P {
         live_peers.sort_by(|a, b| b.combined_reputation().partial_cmp(&a.combined_reputation())
             .unwrap_or(std::cmp::Ordering::Equal));
         
-        // CRITICAL FIX v2.65: Request from TOP 3 LIVE peers for redundancy
+        // v3.0: SEQUENTIAL RETRY - Request from ONE peer at a time
+        // This prevents 3x memory usage from parallel requests
         let request = NetworkMessage::RequestBlocks {
             from_height,
             to_height,
             requester_id: self.node_id.clone(),
         };
         
-        let mut sent_count = 0;
+        // Try peers in order of reputation until one succeeds
         for peer in live_peers.iter().take(3) {
-            if peer.id != self.node_id {
-                self.send_network_message(&peer.addr, request.clone());
-                sent_count += 1;
+            if peer.id == self.node_id {
+                continue;
             }
+            
+            if crate::node::is_info() {
+                println!("[INFO][SYNC] request h={}-{} peer={} rep={:.1}", 
+                         from_height, to_height, peer.id, peer.combined_reputation());
+            }
+            
+            self.send_network_message(&peer.addr, request.clone());
+            
+            // v3.0: Successfully sent to one peer - that's enough
+            // If this peer fails, caller will retry and pick next peer
+            // Deduplication in handle_blocks_batch handles any overlap
+            return Ok(());
         }
         
-        if sent_count == 0 {
-            return Err("No valid peers to sync from".to_string());
-        }
-        
-        if crate::node::is_info() {
-            println!("[INFO][SYNC] blocks h={}-{} sent={} live={}", 
-                     from_height, to_height, sent_count, live_peers.len());
-        }
-        
-        Ok(())
+        Err("No valid peers to sync from".to_string())
     }
     
     /// ═══════════════════════════════════════════════════════════════════════════

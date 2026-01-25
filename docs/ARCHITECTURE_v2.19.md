@@ -1840,7 +1840,7 @@ pub struct VTSState {
 
 | Node Type | Storage | Data Stored |
 |-----------|---------|-------------|
-| **Light** | **50-100 MB** | Headers only, NO blocks/transactions |
+| **Light** | **~10 MB** | Nothing - thin client (all data via RPC) |
 | **Full** | ~50 GB | Sliding window (100K blocks) + snapshots |
 | **Super** | 400+ GB | Full history with archival |
 
@@ -2460,18 +2460,19 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 
 | Node Type | What is Stored | Pruning | Max Storage |
 |-----------|----------------|---------|-------------|
-| **Light** | Block headers only | Last 1,000 blocks | ~100 MB |
+| **Light** | Nothing (thin client) | N/A | ~10 MB (app only) |
 | **Full** | Full blocks | Last 30 days | ~500 GB |
 | **Super/Bootstrap** | Full history | Never | ~2 TB |
 
 ### Minimum Requirements
 
-#### Light Node
-- **CPU**: 1 core (2 GHz)
-- **RAM**: 512 MB
-- **Storage**: 100 MB SSD (headers only)
-- **Bandwidth**: 1 Mbps
-- **Use case**: Mobile wallets, IoT devices
+#### Light Node (Mobile App)
+- **CPU**: Mobile device (any)
+- **RAM**: 256 MB (app only)
+- **Storage**: ~10 MB (app data, no blockchain)
+- **Bandwidth**: On-demand (RPC calls only)
+- **Use case**: Mobile wallets - thin client architecture
+- **Note**: Light nodes do NOT sync or store blocks. All data (balance, TX history) is fetched via RPC from Full/Super nodes.
 
 #### Full Node
 - **CPU**: 4 cores (2.4 GHz)

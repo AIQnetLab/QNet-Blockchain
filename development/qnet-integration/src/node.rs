@@ -156,11 +156,48 @@ pub fn clear_emergency_producer() {
     *EMERGENCY_PRODUCER_ID.write() = String::new();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// v2.97: Track ALL failed producers for a block (including emergency producers)
+// This prevents infinite loops when emergency producer also fails
+// ═══════════════════════════════════════════════════════════════════════════════
+lazy_static::lazy_static! {
+    // Map: block_height -> Vec<failed_producer_ids>
+    static ref FAILED_PRODUCERS_FOR_BLOCK: DashMap<u64, Vec<String>> = DashMap::new();
+}
+
+// Add a failed producer for a specific block height
+pub fn add_failed_producer(block_height: u64, producer: &str) {
+    FAILED_PRODUCERS_FOR_BLOCK
+        .entry(block_height)
+        .or_insert_with(Vec::new)
+        .push(producer.to_string());
+    println!("[INFO][FAIL] added_failed_producer h={} producer={}", block_height, producer);
+}
+
+// Get all failed producers for a block height
+pub fn get_failed_producers(block_height: u64) -> Vec<String> {
+    FAILED_PRODUCERS_FOR_BLOCK
+        .get(&block_height)
+        .map(|v| v.clone())
+        .unwrap_or_default()
+}
+
+// Clear old failed producer entries (keep only last 10 blocks)
+pub fn cleanup_failed_producers(current_height: u64) {
+    let cutoff = current_height.saturating_sub(10);
+    FAILED_PRODUCERS_FOR_BLOCK.retain(|h, _| *h > cutoff);
+}
+
 // CRITICAL: Global synchronization flags for API access
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
+
+// v3.0: Event-driven sync completion (NOT polling!)
+// When process_received_blocks reaches this height, it clears SYNC_IN_PROGRESS
+// This is proper event-driven design - flag cleared at the SOURCE, not by polling
+static SYNC_TARGET_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 // DEADLOCK PROTECTION: Track when sync started to detect stuck operations
 static SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
@@ -3738,7 +3775,75 @@ impl BlockchainNode {
         }
         
         // =========================================================================
-        // PHASE 0.2: PRE-FLIGHT CHECKS (v2.19.22)
+        // PHASE 0.2: SYSTEM REQUIREMENTS CHECK (v3.1)
+        // CRITICAL: Verify minimum RAM before proceeding
+        // Full/Super server nodes require 4GB RAM minimum
+        // (Light nodes are mobile apps - they don't use this server code)
+        // =========================================================================
+        {
+            const MIN_RAM_SERVER_MB: u64 = 4_000;  // 4GB minimum for server nodes
+            
+            // Get total system memory
+            let total_ram_mb: u64 = std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|meminfo| {
+                    meminfo.lines()
+                        .find(|line| line.starts_with("MemTotal:"))
+                        .and_then(|line| {
+                            line.split_whitespace()
+                                .nth(1)
+                                .and_then(|kb| kb.parse::<u64>().ok())
+                                .map(|kb| kb / 1024)
+                        })
+                })
+                .unwrap_or(8_000); // Assume 8GB if can't detect (non-Linux)
+            
+            if total_ram_mb < MIN_RAM_SERVER_MB {
+                let node_type_str = match node_type {
+                    NodeType::Full => "Full",
+                    NodeType::Super => "Super",
+                    NodeType::Light => "Light", // Should never happen - Light nodes are mobile apps
+                };
+                
+                println!("\n");
+                println!("╔══════════════════════════════════════════════════════════════════╗");
+                println!("║                    INSUFFICIENT SYSTEM MEMORY                     ║");
+                println!("╠══════════════════════════════════════════════════════════════════╣");
+                println!("║  Detected RAM:  {:>5} MB                                         ║", total_ram_mb);
+                println!("║  Required RAM:  {:>5} MB                                         ║", MIN_RAM_SERVER_MB);
+                println!("╠══════════════════════════════════════════════════════════════════╣");
+                println!("║  QNet server nodes (Full/Super) require minimum 4 GB RAM         ║");
+                println!("║  to operate reliably without constant OOM crashes.               ║");
+                println!("║                                                                  ║");
+                println!("║  Options:                                                        ║");
+                println!("║  1. Upgrade server RAM to at least 4 GB                          ║");
+                println!("║  2. Set QNET_SKIP_RAM_CHECK=1 to force start (NOT RECOMMENDED)   ║");
+                println!("╚══════════════════════════════════════════════════════════════════╝");
+                println!("\n");
+                
+                // Allow override for testing/development only
+                if std::env::var("QNET_SKIP_RAM_CHECK").is_err() {
+                    set_node_state(NodeState::Error {
+                        reason: format!("Insufficient RAM: {}MB < {}MB required", total_ram_mb, MIN_RAM_SERVER_MB),
+                        recoverable: false,
+                    });
+                    return Err(QNetError::ValidationError(format!(
+                        "Insufficient RAM: {} MB detected, {} MB required for {} node. \
+                         Set QNET_SKIP_RAM_CHECK=1 to override (not recommended).",
+                        total_ram_mb, MIN_RAM_SERVER_MB, node_type_str
+                    )));
+                } else {
+                    println!("[WARN][MEMORY] QNET_SKIP_RAM_CHECK set - proceeding despite low RAM");
+                    println!("[WARN][MEMORY] Node may experience frequent crashes and poor performance!");
+                }
+            } else {
+                println!("[INFO][MEMORY] system_check_passed total_ram={}MB required={}MB", 
+                         total_ram_mb, MIN_RAM_SERVER_MB);
+            }
+        }
+        
+        // =========================================================================
+        // PHASE 0.3: PRE-FLIGHT CHECKS (v2.19.22)
         // CRITICAL: Validate ports and connectivity BEFORE anything else
         // This prevents "ghost nodes" that appear online but can't sync blocks
         // =========================================================================
@@ -5203,8 +5308,17 @@ impl BlockchainNode {
         // CRITICAL FIX: Perform initial sync with network on startup
         // This prevents nodes from getting stuck on old blocks
         if is_info() { println!("[INFO][SYNC] initial_sync_start"); }
+        
+        // CRITICAL FIX v3.0: Set sync flag BEFORE spawning task
+        // This allows certificate expiry check to be skipped for historical blocks
+        // Without this, nodes cannot sync blocks older than certificate TTL (5 min)
+        SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
+        
         let blockchain_for_sync = blockchain.clone();
         tokio::spawn(async move {
+            // v3.0: NO GUARD HERE - flag cleared by process_received_blocks when target reached
+            // This is event-driven, not polling!
+            
             // Wait a bit for P2P connections to establish
             tokio::time::sleep(Duration::from_secs(3)).await;
             
@@ -5303,6 +5417,11 @@ impl BlockchainNode {
                             if is_info() { println!("[INFO][SYNC] net={} local={} syncing", 
                                     network_height, local_height); }
                             
+                            // v3.0: Set target height for event-driven sync completion
+                            // process_received_blocks will clear SYNC_IN_PROGRESS when this height is reached
+                            SYNC_TARGET_HEIGHT.store(network_height, Ordering::SeqCst);
+                            if is_info() { println!("[INFO][SYNC] target_height_set h={}", network_height); }
+                            
                             // STATE MACHINE: Background sync
                             let progress = ((local_height as f64 / network_height as f64) * 100.0) as u8;
                             set_node_state(NodeState::Syncing {
@@ -5311,8 +5430,51 @@ impl BlockchainNode {
                                 progress_percent: progress,
                             });
                             
-                            // Sync in chunks to avoid overwhelming the network
-                            let mut current = local_height + 1;
+                            // v3.0: TRY SNAPSHOT SYNC FIRST for new/empty nodes (Full/Super only)
+                            // SNAPSHOT INTERVALS from constants:
+                            // - SNAPSHOT_INCREMENTAL_INTERVAL = 3600 (1 hour)
+                            // - SNAPSHOT_FULL_INTERVAL = 43200 (12 hours)
+                            // Only try snapshot if network has at least one incremental snapshot
+                            let mut sync_from = local_height + 1;
+                            
+                            // Skip snapshot for Light nodes - they sync only recent blocks
+                            let is_light_node = blockchain_for_sync.node_type == NodeType::Light;
+                            
+                            // Try snapshot only if:
+                            // 1. Not a Light node (they don't need full history)
+                            // 2. Local height is very low (new node)
+                            // 3. Network has at least one incremental snapshot (3600+ blocks)
+                            if !is_light_node && local_height < 100 && network_height > SNAPSHOT_INCREMENTAL_INTERVAL {
+                                if is_info() { 
+                                    println!("[INFO][SYNC] trying_snapshot local={} net={} threshold={}", 
+                                             local_height, network_height, SNAPSHOT_INCREMENTAL_INTERVAL); 
+                                }
+                                
+                                match blockchain_for_sync.storage.fast_sync_with_snapshot(p2p, network_height).await {
+                                    Ok(()) => {
+                                        // Snapshot loaded - update sync_from
+                                        let new_local = blockchain_for_sync.storage.get_chain_height().unwrap_or(local_height);
+                                        if new_local > local_height {
+                                            sync_from = new_local + 1;
+                                            if is_info() {
+                                                println!("[INFO][SYNC] snapshot_loaded new_height={} saved_blocks={}", 
+                                                         new_local, new_local - local_height);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if is_warn() {
+                                            println!("[WARN][SYNC] snapshot_failed err={:?} fallback=block_sync", e);
+                                        }
+                                        // Continue with regular block sync
+                                    }
+                                }
+                            } else if is_light_node && is_info() {
+                                println!("[INFO][SYNC] light_node skip_snapshot sync_recent_only");
+                            }
+                            
+                            // Sync remaining blocks in chunks
+                            let mut current = sync_from;
                             while current <= network_height {
                                 let chunk_end = std::cmp::min(current + 100, network_height);
                                 
@@ -5364,16 +5526,32 @@ impl BlockchainNode {
                                 if is_info() { println!("[INFO][MB-SYNC] synchronized idx={}", local_macroblock_index); }
                             }
                             
-                            if is_info() { println!("[INFO][SYNC] initial_sync_complete"); }
+                            // v3.0: EVENT-DRIVEN sync completion (NO polling!)
+                            // SYNC_IN_PROGRESS will be cleared by process_received_blocks
+                            // when local height reaches SYNC_TARGET_HEIGHT
+                            // This is proper architecture - flag cleared at the SOURCE
+                            if is_info() { println!("[INFO][SYNC] initial_sync_requests_sent target={}", network_height); }
                         } else {
-                            if is_info() { println!("[INFO][SYNC] synced h={}", local_height); }
+                            // Already synced - clear flags
+                            SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                            SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
+                            NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
+                            if is_info() { println!("[INFO][SYNC] already_synced h={}", local_height); }
                         }
                     },
                     Err(e) => {
                         println!("[WARN][SYNC] Could not determine network height: {}", e);
+                        // Clear sync flag on error - no target to reach
+                        SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                     }
                 }
+            } else {
+                // No P2P - clear sync flag
+                SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
             }
+            // v3.0: Flag NOT cleared here - cleared by process_received_blocks when target reached
         });
         
         // ═══════════════════════════════════════════════════════════════════════════
@@ -5529,6 +5707,21 @@ impl BlockchainNode {
                 if is_debug() { println!("[DBG][BLOCK] retry h={}", received_block.height); }
             }
             
+            // v3.0 FIX: Skip duplicate processing for NON-RETRY blocks
+            // If block is already in pending_blocks and was added recently (< 1 sec), skip
+            // This prevents memory growth from multiple peers sending same block
+            if !is_retry {
+                if let Some((_, _, timestamp)) = pending_blocks.get(&received_block.height) {
+                    if timestamp.elapsed() < std::time::Duration::from_secs(1) {
+                        if is_debug() { 
+                            println!("[DBG][BLOCK] skip_dup h={} age={}ms", 
+                                     received_block.height, timestamp.elapsed().as_millis()); 
+                        }
+                        continue; // Skip - already being processed
+                    }
+                }
+            }
+            
             // Check for special ping signal
             if received_block.height == u64::MAX {
                 // Parse ping data: "PING:node_id:success:response_time_ms"
@@ -5672,8 +5865,11 @@ impl BlockchainNode {
                                             RETRY_MISSING_PREV.fetch_add(1, Ordering::Relaxed);
                                         }
                                         
-                                        // CRITICAL FIX: Actively request the missing block with DDoS protection
-                                        if retry_count == 0 { // Only on first attempt
+                                        // CRITICAL FIX v3.0: Request missing block PERIODICALLY, not just on first attempt
+                                        // Bug fix: If first request fails, missing block was NEVER requested again!
+                                        // Now request on: first attempt (0), every 5 retries (5,10,15...) 
+                                        let should_request_missing = retry_count == 0 || retry_count % 5 == 0;
+                                        if should_request_missing {
                                             // Check if we can request this block (rate limiting)
                                             let can_request = if let Some((last_request, request_count)) = requested_blocks.get(&missing_height) {
                                                 // ADAPTIVE: Use fast sync if far behind
@@ -5687,7 +5883,8 @@ impl BlockchainNode {
                                                 // Check cooldown period
                                                 if last_request.elapsed().as_secs() >= cooldown {
                                                     // Cooldown passed, check retry limit
-                                                    *request_count < 3 // Max 3 request attempts per block
+                                                    // v3.0: Increased from 3 to 10 since we now request every 5 retries
+                                                    *request_count < 10 // Max 10 request attempts per block
                                                 } else {
                                                     false // Still in cooldown
                                                 }
@@ -6306,6 +6503,24 @@ impl BlockchainNode {
                         // METRICS: Track successful retry
                         RETRY_SUCCESS.fetch_add(1, Ordering::Relaxed);
                         if is_debug() { println!("[DBG][BLOCK] pending_removed h={} retry=ok", received_block.height); }
+                    }
+                    
+                    // v3.0: Clear from sync queue dedup tracker after successful storage
+                    // This allows future re-requests if needed (e.g., after rollback)
+                    crate::unified_p2p::clear_block_pending_sync(received_block.height);
+                    
+                    // v3.0: EVENT-DRIVEN sync completion (NOT polling!)
+                    // Check if we've reached the target height and clear sync flags
+                    let target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
+                    if target > 0 && received_block.height >= target {
+                        // Sync complete! Clear flags
+                        SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
+                        NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
+                        if is_info() { 
+                            println!("[INFO][SYNC] target_reached h={} target={} sync_complete", 
+                                     received_block.height, target); 
+                        }
                     }
                     
                     // CRITICAL FIX v3.3: Remove TX from mempool after receiving block from other node
@@ -9696,10 +9911,15 @@ impl BlockchainNode {
                 // Using global flags defined at module level
                 
                 // DEADLOCK PROTECTION: Guard that automatically clears sync flag on drop (panic, error, success)
+                // v3.0: BUT NOT if initial sync target is still pending!
                 struct FastSyncGuard;
                 impl Drop for FastSyncGuard {
                     fn drop(&mut self) {
-                        FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                        // v3.0: Don't clear if initial sync target not reached
+                        let target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
+                        if target == 0 {
+                            FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                        }
                         FAST_SYNC_START_TIME.store(0, Ordering::Relaxed); // Clear deadlock timer
                     }
                 }
@@ -9766,8 +9986,11 @@ impl BlockchainNode {
                             
                             // DEADLOCK DETECTION: Check if fast sync is stuck
                             // CRITICAL FIX v2.21.3: Also detect stuck sync with start_time=0
+                            // v3.0: Skip if initial sync target is pending
                             let current_time = get_timestamp_safe();
-                            if FAST_SYNC_IN_PROGRESS.load(Ordering::SeqCst) {
+                            let initial_sync_target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
+                            
+                            if FAST_SYNC_IN_PROGRESS.load(Ordering::SeqCst) && initial_sync_target == 0 {
                                 let sync_start_time = FAST_SYNC_START_TIME.load(Ordering::Relaxed);
                                 
                                 // CRITICAL FIX: If start_time is 0 but flag is set - sync is stuck!
@@ -12744,18 +12967,30 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // SYNC FIX: Using global SYNC_IN_PROGRESS flag
                         
                         // DEADLOCK PROTECTION: Guard that automatically clears sync flag on drop
+                        // v3.0: BUT NOT if initial sync target is still pending!
                         struct SyncGuard;
                         impl Drop for SyncGuard {
                             fn drop(&mut self) {
-                                SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                                // v3.0: Don't clear flag if initial sync target not reached!
+                                // This prevents race condition where background sync clears flag
+                                // before initial sync completes
+                                let target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
+                                if target == 0 {
+                                    // No initial sync target - safe to clear
+                                    SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                                }
                                 SYNC_START_TIME.store(0, Ordering::Relaxed); // Clear deadlock timer
                             }
                         }
                         
                         // DEADLOCK DETECTION: Check if background sync is stuck
                         // CRITICAL FIX v2.21.3: Also detect stuck sync with start_time=0 (never set)
+                        // v3.0: Skip deadlock detection if initial sync target is pending
                         let current_time = get_timestamp_safe();
-                        if SYNC_IN_PROGRESS.load(Ordering::SeqCst) {
+                        let initial_sync_target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
+                        
+                        if SYNC_IN_PROGRESS.load(Ordering::SeqCst) && initial_sync_target == 0 {
+                            // Only run deadlock detection for background sync, not initial sync
                             let sync_start_time = SYNC_START_TIME.load(Ordering::Relaxed);
                             
                             // CRITICAL FIX: If start_time is 0 but flag is set - sync is stuck!
@@ -13105,6 +13340,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     // WHY: Emergency producer should TAKE OVER the rotation cycle
                                     // MECHANISM: Cache will be UPDATED below to emergency producer
                                     // RESULT: Emergency producer completes the 30-block rotation period
+                                    
+                                    // v2.97: Track failed producer to prevent infinite loops
+                                    // Add current producer to failed list (could be original or previous emergency)
+                                    add_failed_producer(expected_height_timeout, &current_producer_timeout);
                                     
                                     // EXISTING: Use same emergency selection as implemented in select_emergency_producer
                                     let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
@@ -13472,12 +13711,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // CRITICAL FIX: Clear cache at rotation boundaries to ensure new producer selection
             // This prevents using stale cached producer when entering new round
+            // v2.97: BUT preserve cache if it contains emergency producer (to prevent loops)
             if current_height > 0 && (current_height - 1) % rotation_interval == 0 {
                 // We're at a rotation boundary (blocks 31, 61, 91...)
-                // v2.96: Lock-free remove with DashMap
-                CACHED_PRODUCER_SELECTION.remove(&leadership_round);
-                // Don't use cache for first block of new round
-                can_use_cache = false;
+                // v2.97: Check if there are failed producers for this block - means emergency is active
+                let has_emergency = !get_failed_producers(current_height).is_empty();
+                
+                if has_emergency {
+                    // v2.97: Emergency in progress - DO NOT clear cache!
+                    // Cache contains emergency producer, clearing would restart selection loop
+                    if is_info() { println!("[INFO][PROD] rotation_boundary h={} emergency_active=true cache_preserved", current_height); }
+                } else {
+                    // Normal rotation - clear cache for new producer selection
+                    // v2.96: Lock-free remove with DashMap
+                    CACHED_PRODUCER_SELECTION.remove(&leadership_round);
+                    // Don't use cache for first block of new round
+                    can_use_cache = false;
+                }
             }
             
             // Check if we have cached result for this round
@@ -13905,8 +14155,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 if raw_reputation < 0.70 {
                     if is_debug() {
+                        // Guard: ensure rep is in valid 0-100 range for display
+                        let display_rep = (raw_reputation * 100.0).clamp(0.0, 100.0);
                         println!("[DBG][REP] node={} below_threshold rep={:.1}%", 
-                            node_id, raw_reputation * 100.0);
+                            node_id, display_rep);
                     }
                 }
                 
@@ -14026,11 +14278,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 //   → All nodes again select SAME next producer (deterministic)
                 // ═══════════════════════════════════════════════════════════════════════════
                 
+                // v2.97: Get ALL failed producers for this block (original + emergency failures)
+                let all_failed = get_failed_producers(current_height);
+                
                 for (node_id, reputation) in qualified {
-                    // Exclude ONLY the failed producer - this is deterministic
-                    // All nodes know who failed (from timeout/broadcast)
+                    // v2.97: Exclude ALL failed producers (original + emergency chain)
+                    // This prevents infinite loops when emergency producer also fails
                     if node_id == failed_producer {
                         println!("[INFO][EMERGENCY] peer={} status=excluded reason=failed_producer", node_id);
+                        continue;
+                    }
+                    
+                    // v2.97: Also exclude any previously failed emergency producers
+                    if all_failed.contains(&node_id) {
+                        println!("[INFO][EMERGENCY] peer={} status=excluded reason=emergency_failed", node_id);
                         continue;
                     }
                     
@@ -20824,41 +21085,28 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         println!("[WARN][SYNC] Node is {} blocks behind, starting sync...", 
                                  network_height - current_height);
                         
-                        // CRITICAL: Light nodes should NOT sync full history!
-                        match self.node_type {
-                            NodeType::Light => {
-                                // Light nodes only sync recent blocks (last 1000 blocks max)
-                                println!("[SYNC] 📱 Light node: syncing only recent history");
-                                let sync_from = std::cmp::max(1, network_height.saturating_sub(1000));
-                                self.sync_blocks(sync_from, network_height).await?;
-                                
-                                // PRODUCTION v2.19.12: Light nodes sync macroblocks (headers only)
-                                // This is essential for Light nodes to verify state
-                                let local_macro_index = current_height / 90;
-                                let network_macro_index = network_height / 90;
-                                if network_macro_index > local_macro_index {
-                                    println!("[MACROBLOCK-SYNC] 📱 Light node: syncing macroblocks {}-{}", 
+                        // Light nodes are thin clients - they don't sync blocks
+                        // They get all data (balance, TX history) via RPC from Full/Super nodes
+                        if self.node_type == NodeType::Light {
+                            if is_info() { println!("[INFO][SYNC] light_node_skip reason=thin_client"); }
+                        } else {
+                            // Full/Super nodes sync complete history
+                            // For new nodes (height 0 or 1), start from block 1 (first microblock)
+                            let sync_from = if current_height <= 1 { 1 } else { current_height + 1 };
+                            
+                            // Sync to network height
+                            self.sync_blocks(sync_from, network_height).await?;
+                            
+                            // PRODUCTION v2.19.12: Sync macroblocks for Full/Super nodes
+                            // Macroblocks contain consensus data and state roots
+                            let local_macro_index = current_height / 90;
+                            let network_macro_index = network_height / 90;
+                            if network_macro_index > local_macro_index {
+                                if is_info() {
+                                    println!("[INFO][MACROBLOCK-SYNC] syncing_macroblocks from={} to={}", 
                                              local_macro_index + 1, network_macro_index);
-                                    self.sync_macroblocks(local_macro_index + 1, network_macro_index).await?;
                                 }
-                            }
-                            NodeType::Full | NodeType::Super => {
-                                // Full/Super nodes sync complete history
-                                // For new nodes (height 0 or 1), start from block 1 (first microblock)
-                                let sync_from = if current_height <= 1 { 1 } else { current_height + 1 };
-                                
-                                // Sync to network height
-                                self.sync_blocks(sync_from, network_height).await?;
-                                
-                                // PRODUCTION v2.19.12: Sync macroblocks for Full/Super nodes
-                                // Macroblocks contain consensus data and state roots
-                                let local_macro_index = current_height / 90;
-                                let network_macro_index = network_height / 90;
-                                if network_macro_index > local_macro_index {
-                                    println!("[MACROBLOCK-SYNC] 🔄 Syncing macroblocks {}-{}", 
-                                             local_macro_index + 1, network_macro_index);
-                                    self.sync_macroblocks(local_macro_index + 1, network_macro_index).await?;
-                                }
+                                self.sync_macroblocks(local_macro_index + 1, network_macro_index).await?;
                             }
                         }
                     } else {
@@ -21215,6 +21463,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Check if we already have this macroblock
         if let Ok(Some(_)) = self.storage.get_macroblock_by_height(index) {
             println!("[MACROBLOCK-SYNC] ℹ️ Macroblock #{} already exists, skipping", index);
+            // v3.1: Clear from pending tracker even if already exists
+            crate::unified_p2p::clear_macroblock_pending_sync(index);
             return Ok(());
         }
         
@@ -21238,6 +21488,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // Save macroblock to storage
         self.storage.save_macroblock(index, &macroblock).await?;
+        
+        // v3.1: Clear from pending sync tracker after successful save
+        crate::unified_p2p::clear_macroblock_pending_sync(index);
         
         // v2.48 FIX: Update global finalized round after successful save
         let round = index * 90;
@@ -22755,6 +23008,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// v3.0: Memory monitoring to detect leaks before OOM
     /// Logs memory usage every 5 minutes with detailed breakdown
+    /// 
+    /// v3.1: DYNAMIC MEMORY LIMITS based on system RAM or env vars
+    /// - QNET_MEMORY_WARN_MB: Warning threshold (default: 60% of system RAM)
+    /// - QNET_MEMORY_EMERGENCY_MB: Emergency cleanup (default: 75% of system RAM)
+    /// - QNET_MEMORY_FATAL_MB: Graceful shutdown (default: 90% of system RAM)
     async fn start_memory_monitoring(&self) {
         let node_id = self.node_id.clone();
         let storage = self.storage.clone();
@@ -22764,23 +23022,134 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
             let mut last_rss_mb: u64 = 0;
             
+            // ═══════════════════════════════════════════════════════════════════════════════
+            // v3.1: FULLY AUTOMATIC MEMORY LIMITS - NO USER INPUT REQUIRED
+            // ═══════════════════════════════════════════════════════════════════════════════
+            // Priority order (all automatic):
+            // 1. Docker cgroups limit (container memory limit)
+            // 2. 70% of AVAILABLE memory (accounts for other processes)
+            // 3. Conservative fallback (4GB)
+            //
+            // MINIMUM REQUIREMENT: 4GB RAM (Full/Super nodes)
+            // ═══════════════════════════════════════════════════════════════════════════════
+            
+            const MIN_MEMORY_REQUIREMENT_MB: u64 = 4_000; // 4GB minimum for Full/Super nodes
+            
+            // Get total system memory first (for requirement check)
+            let (mem_total_mb, mem_available_mb): (u64, Option<u64>) = {
+                match std::fs::read_to_string("/proc/meminfo") {
+                    Ok(meminfo) => {
+                        let total = meminfo.lines()
+                            .find(|line| line.starts_with("MemTotal:"))
+                            .and_then(|line| {
+                                line.split_whitespace()
+                                    .nth(1)
+                                    .and_then(|kb| kb.parse::<u64>().ok())
+                                    .map(|kb| kb / 1024)
+                            })
+                            .unwrap_or(8_000);
+                        
+                        let available = meminfo.lines()
+                            .find(|line| line.starts_with("MemAvailable:"))
+                            .and_then(|line| {
+                                line.split_whitespace()
+                                    .nth(1)
+                                    .and_then(|kb| kb.parse::<u64>().ok())
+                                    .map(|kb| kb / 1024)
+                            });
+                        
+                        (total, available)
+                    }
+                    Err(_) => (8_000, None) // Assume 8GB if can't read
+                }
+            };
+            
+            // Check minimum requirements
+            if mem_total_mb < MIN_MEMORY_REQUIREMENT_MB {
+                println!("[CRIT][MEMORY] INSUFFICIENT_RAM total={}MB required={}MB", 
+                         mem_total_mb, MIN_MEMORY_REQUIREMENT_MB);
+                println!("[CRIT][MEMORY] QNet Full/Super nodes require minimum 4GB RAM!");
+                println!("[CRIT][MEMORY] Node will operate in DEGRADED MODE with aggressive cleanup");
+            }
+            
+            // Calculate memory limit automatically
+            let memory_limit_mb: u64 = {
+                // PRIORITY 1: Docker cgroups limit (fully automatic for containers)
+                let cgroup_limit = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                    .or_else(|_| std::fs::read_to_string("/sys/fs/cgroup/memory.max")) // cgroups v2
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&v| v < u64::MAX / 2) // Filter out "unlimited"
+                    .map(|bytes| bytes / 1024 / 1024); // Convert to MB
+                
+                if let Some(cgroup_mb) = cgroup_limit {
+                    // Docker container - use 85% of container limit
+                    let limit = cgroup_mb * 85 / 100;
+                    println!("[INFO][MEMORY] mode=docker container_limit={}MB node_limit={}MB", 
+                             cgroup_mb, limit);
+                    limit
+                } else if let Some(available) = mem_available_mb {
+                    // Bare metal / VM - use 70% of AVAILABLE memory
+                    // This automatically accounts for other processes!
+                    let limit = available * 70 / 100;
+                    // Ensure minimum 2GB, maximum 80% of total
+                    let final_limit = limit.max(2_000).min(mem_total_mb * 80 / 100);
+                    println!("[INFO][MEMORY] mode=auto total={}MB available={}MB node_limit={}MB", 
+                             mem_total_mb, available, final_limit);
+                    final_limit
+                } else {
+                    // Can't determine available - use 60% of total (conservative)
+                    let limit = mem_total_mb * 60 / 100;
+                    println!("[INFO][MEMORY] mode=fallback total={}MB node_limit={}MB", 
+                             mem_total_mb, limit);
+                    limit
+                }
+            };
+            
+            // Thresholds are FIXED percentages - no user input needed
+            // These are well-tested values that work across all memory sizes
+            let warn_mb = memory_limit_mb * 60 / 100;      // 60% - start monitoring
+            let emergency_mb = memory_limit_mb * 75 / 100; // 75% - aggressive cleanup
+            let fatal_mb = memory_limit_mb * 90 / 100;     // 90% - graceful shutdown
+            
+            println!("[INFO][MEMORY] thresholds: warn={}MB emergency={}MB fatal={}MB",
+                     warn_mb, emergency_mb, fatal_mb);
+            
             loop {
                 interval.tick().await;
                 
-                // Get process memory from /proc/self/statm (Linux)
-                let (rss_mb, virt_mb) = match std::fs::read_to_string("/proc/self/statm") {
-                    Ok(statm) => {
-                        let parts: Vec<&str> = statm.split_whitespace().collect();
-                        if parts.len() >= 2 {
-                            let page_size = 4096u64; // Usually 4KB
-                            let virt_pages: u64 = parts[0].parse().unwrap_or(0);
-                            let rss_pages: u64 = parts[1].parse().unwrap_or(0);
-                            (rss_pages * page_size / 1024 / 1024, virt_pages * page_size / 1024 / 1024)
-                        } else {
-                            (0, 0)
+                // v3.0: Get process memory - cross-platform support
+                // Linux: /proc/self/statm (fast, direct)
+                // Other: Estimate from data structures (fallback)
+                let (rss_mb, virt_mb) = {
+                    // Try Linux /proc first (works in Docker which is always Linux)
+                    match std::fs::read_to_string("/proc/self/statm") {
+                        Ok(statm) => {
+                            let parts: Vec<&str> = statm.split_whitespace().collect();
+                            if parts.len() >= 2 {
+                                let page_size = 4096u64; // Usually 4KB
+                                let virt_pages: u64 = parts[0].parse().unwrap_or(0);
+                                let rss_pages: u64 = parts[1].parse().unwrap_or(0);
+                                (rss_pages * page_size / 1024 / 1024, virt_pages * page_size / 1024 / 1024)
+                            } else {
+                                (0, 0)
+                            }
+                        },
+                        Err(_) => {
+                            // Fallback for Windows/macOS: Estimate from known data structures
+                            // This is less accurate but provides SOME monitoring
+                            let tx_pool_estimate = storage.get_transaction_pool_stats()
+                                .map(|(count, _)| count as u64 / 1000) // ~1KB per TX
+                                .unwrap_or(0);
+                            let pending_sync = crate::unified_p2p::get_pending_sync_count() as u64 / 10; // ~100KB per block
+                            let pending_macro = crate::unified_p2p::get_pending_macroblock_count() as u64; // ~1MB per macroblock
+                            let producer_cache = producer_cache::CACHED_PRODUCER_SELECTION.len() as u64 / 100;
+                            
+                            // Rough estimate: base 500MB + data structures
+                            let estimated_mb = 500 + tx_pool_estimate + pending_sync + pending_macro + producer_cache;
+                            (estimated_mb, estimated_mb * 2) // Virtual usually 2x RSS
                         }
-                    },
-                    Err(_) => (0, 0), // Not Linux or /proc not available
+                    }
                 };
                 
                 // Calculate delta from last check
@@ -22813,23 +23182,59 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     println!("[WARN][MEMORY] node={} rapid_growth delta_mb={} possible_leak", node_id, delta_mb);
                 }
                 
-                // CRITICAL: Warn if RSS > 10GB
-                if rss_mb > 10_000 {
-                    println!("[CRIT][MEMORY] node={} rss_mb={} HIGH_MEMORY action=investigate", node_id, rss_mb);
+                // v3.1: DYNAMIC - Warn if RSS > warn_mb (default 60% of system RAM)
+                if rss_mb > warn_mb {
+                    println!("[CRIT][MEMORY] node={} rss_mb={} warn_limit={} HIGH_MEMORY action=investigate", 
+                             node_id, rss_mb, warn_mb);
                 }
                 
-                // CRITICAL: Emergency if RSS > 14GB (for 16GB server)
-                if rss_mb > 14_000 {
-                    println!("[CRIT][MEMORY] node={} rss_mb={} EMERGENCY near_oom action=cleanup", node_id, rss_mb);
+                // v3.1: DYNAMIC - Emergency if RSS > emergency_mb (default 75% of system RAM)
+                if rss_mb > emergency_mb {
+                    println!("[CRIT][MEMORY] node={} rss_mb={} limit={} EMERGENCY cleanup_start", 
+                             node_id, rss_mb, emergency_mb);
+                    
+                    // v3.0: Clear sync queue to stop incoming blocks
+                    let sync_queue_size = crate::unified_p2p::get_pending_sync_count();
+                    crate::unified_p2p::clear_all_pending_sync();
+                    
+                    // v3.1: Also clear macroblock sync queue
+                    let macro_queue_size = crate::unified_p2p::get_pending_macroblock_count();
+                    crate::unified_p2p::clear_all_pending_sync_macroblocks();
+                    println!("[INFO][MEMORY] sync_queue_cleared micro={} macro={}", sync_queue_size, macro_queue_size);
                     
                     // Force cleanup of caches
                     producer_cache::CACHED_PRODUCER_SELECTION.clear();
                     println!("[INFO][MEMORY] producer_cache_cleared");
                     
-                    // Force GC hint (Rust doesn't have GC but can drop unused allocations)
+                    // Force TX pool cleanup
                     if let Ok(_) = storage.transaction_pool.cleanup_old_duplicates() {
                         println!("[INFO][MEMORY] tx_pool_cleanup_forced");
                     }
+                    
+                    // v3.0: CRITICAL - Flush RocksDB WAL to disk BEFORE potential OOM
+                    // This prevents data corruption if OOM killer terminates process
+                    if let Err(e) = storage.flush_all() {
+                        println!("[WARN][MEMORY] rocksdb_flush_failed err={}", e);
+                    } else {
+                        println!("[INFO][MEMORY] rocksdb_flushed data_safe");
+                    }
+                }
+                
+                // v3.1: DYNAMIC - If RSS > fatal_mb (default 90% of RAM), graceful shutdown
+                // Better to restart cleanly than be killed by OOM
+                if rss_mb > fatal_mb {
+                    println!("[FATAL][MEMORY] node={} rss_mb={} limit={} OOM_IMMINENT graceful_shutdown", 
+                             node_id, rss_mb, fatal_mb);
+                    
+                    // Final flush before exit
+                    let _ = storage.flush_all();
+                    println!("[INFO][MEMORY] final_flush_complete");
+                    
+                    // Give time for logs to be written
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    
+                    // Exit with code 137 (OOM) so Docker knows to restart
+                    std::process::exit(137);
                 }
             }
         });

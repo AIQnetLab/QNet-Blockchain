@@ -227,7 +227,7 @@ Explorer → Node RPC (RocksDB)
 ### 🛡️ **Previous Updates (v2.19.12 - November 27, 2025)**
 - **Full Macroblock Sync**: Complete P2P synchronization for macroblocks (RequestMacroblocks, MacroblocksBatch)
 - **Snapshot API**: New endpoints `/api/v1/snapshot/latest` and `/api/v1/snapshot/{height}` for fast sync
-- **Light Node Support**: Macroblocks synced for state verification, headers rotated to save space
+- **Light Node Architecture (v3.0)**: Thin clients - do NOT sync blocks (all data via RPC from Full/Super nodes)
 - **Async Runtime Fixes**: Isolated `block_on` calls prevent "nested runtime" panics
 - **Balance Restoration**: Balances restored from snapshots or block replay during synchronization
 
@@ -1992,9 +1992,11 @@ docker run ... -e QNET_MAX_THREADS=8 ...
 
 | Node Type | Storage Size | Data Retention | Sync Time |
 |-----------|-------------|----------------|-----------|
-| **Light** | ~50-100 MB | Headers + minimal state | <1 minute |
+| **Light** | ~10 MB (app only) | None (thin client via RPC) | N/A |
 | **Full** | 50-100 GB | Sliding window (~18-74 days) | ~5 minutes |
 | **Super** | 500 GB - 1 TB | Complete history forever | ~15 minutes |
+
+> **Light Node Architecture (v3.0)**: Light nodes are mobile apps (thin clients). They do NOT sync or store any blockchain data. All data (balance, TX history) is fetched via RPC from Full/Super nodes.
 
 - **Smart Defaults**: Automatically detects node type via `QNET_NODE_TYPE` environment variable
 - **Adaptive Sliding Window**: Full nodes auto-scale storage window with network growth (100K × active_shards)

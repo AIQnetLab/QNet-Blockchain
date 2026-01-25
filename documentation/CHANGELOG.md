@@ -1571,8 +1571,8 @@ MacroblocksBatch { macroblocks, from_index, to_index, sender_id }
 
 #### Integration Points
 - **Initial Sync**: Macroblocks synced after microblocks at startup
-- **start_sync_if_needed()**: All node types (Light/Full/Super) sync macroblocks
-- **Light Nodes**: Receive macroblock headers for state verification
+- **start_sync_if_needed()**: Full/Super nodes sync macroblocks
+- **Light Nodes**: Thin clients - do NOT sync blocks (all data via RPC)
 - **Rate Limiting**: 5 requests/minute, 2-minute block on exceed
 - **Batch Size**: Max 10 macroblocks per request (~1MB)
 
@@ -1623,11 +1623,11 @@ GET /api/v1/snapshot/{height} → Binary snapshot data (compressed)
 - `fast_sync_with_snapshot()` - Integrated in node startup
 - IPFS support via `IPFS_GATEWAY_URL` environment variable
 
-#### Light Node Data Rotation
-- `rotate_light_headers()` - Removes old headers (keeps last 1000)
-- `prune_for_light_node()` - Converts full blocks to headers
-- `LightMicroBlock` - Header-only format (~100 bytes)
-- Macroblocks synced for state verification
+#### Light Node Architecture (v3.0 Update)
+- **Thin Client**: Light nodes do NOT sync or store blocks
+- All data (balance, TX history) fetched via RPC from Full/Super nodes
+- Mobile app only stores: private key (encrypted), wallet address, activation code
+- `LightMicroBlock` struct deprecated - not used in production
 
 ---
 

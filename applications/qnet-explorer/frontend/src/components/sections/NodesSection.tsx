@@ -114,10 +114,10 @@ const NodeActivation = React.memo(function NodeActivation() {
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0.5rem 1rem' }}>
                     {selectedNodeType === 'light' && (
                       <>
-                        <span>• Ping interval: every 4h (mobile)</span>
-                        <span>• Response rate: 100%</span>
+                        <span>• Thin client (no blockchain storage)</span>
+                        <span>• All data via RPC from Full/Super</span>
                         <span>• Up to 3 devices per node</span>
-                        <span>• Battery-friendly design</span>
+                        <span>• Battery-friendly design (~10MB app)</span>
                       </>
                     )}
                     {selectedNodeType === 'full' && (

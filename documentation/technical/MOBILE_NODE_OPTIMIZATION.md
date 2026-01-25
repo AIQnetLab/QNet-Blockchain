@@ -252,6 +252,31 @@ The network-initiated ping system works as follows:
 4. **Battery-optimized for mobile** - Node sleeps, wakes only when pinged
 5. **Scalable architecture** - prevents network overload with millions of nodes
 
+## 📱 Light Node Architecture (v3.0)
+
+**CRITICAL UPDATE**: Light nodes are **thin clients** - they do NOT sync or store any blockchain data.
+
+### What Light Nodes Store:
+- Private key (encrypted in SecureStorage)
+- Wallet address
+- Activation code
+- App settings
+
+### What Light Nodes Do NOT Store:
+- Blocks (micro or macro)
+- Transaction history (fetched via RPC)
+- State data (balances fetched via RPC)
+- Headers (removed in v3.0)
+
+### How Light Nodes Work:
+1. `getBalance(address)` → RPC call to Full/Super node
+2. `getTransactionHistory()` → RPC call to Full/Super node
+3. `signTransaction(tx, privateKey)` → LOCAL (on device)
+4. `sendTransaction(signedTx)` → RPC call to Full/Super node
+
+### Trust Model:
+Light nodes trust the Full/Super nodes they connect to. For additional security, apps can query multiple nodes and compare responses.
+
 **How Network Pings Work - ARCHITECTURAL SEPARATION:**
 
 📱 **LIGHT NODES (Mobile Only)**:

@@ -141,8 +141,8 @@ Consensus Layer (consensus_crypto.rs)
 ## 🔄 Block Buffering (v2.19.20)
 
 ### Adaptive Memory Protection
-- **Max Pending (Light)**: 100 blocks (~10 MB)
 - **Max Pending (Full/Super)**: 500 blocks (~50 MB)
+- **Light Nodes**: Do NOT sync blocks (thin client architecture)
 - **Retry**: Pseudo-infinite
 - **Backoff (0-9 retries)**: 10 seconds (aggressive)
 - **Backoff (10+ retries)**: 30s → 60s → 120s → 240s → 300s max
@@ -151,6 +151,8 @@ Consensus Layer (consensus_crypto.rs)
 
 ### Purpose
 Handles out-of-order block arrival in gossip P2P network while preventing memory exhaustion attacks. Blocks are NEVER discarded - pseudo-infinite retries with exponential backoff ensure all blocks are eventually received.
+
+**Note**: Light nodes (mobile apps) are thin clients - they get all data via RPC from Full/Super nodes and do not participate in block sync.
 
 ## 🎯 Reputation System
 
@@ -412,8 +414,8 @@ const MAX_VALIDATORS_PER_ROUND: usize = 1000;  // Consensus limit
 const CERTIFICATE_LIFETIME_SECS: u64 = 270;    // 4.5 minutes
 const MAX_CACHE_SIZE: usize = 100000;          // Certificate cache
 
-// Block buffering (v2.19.20) - adaptive by node type
-// Light nodes: 100 blocks (~10 MB)
+// Block buffering (v2.19.20) - Full/Super nodes only
+// Light nodes: thin client (no block sync)
 // Full/Super nodes: 500 blocks (~50 MB)
 const NETWORK_STABILIZATION_SECS: u64 = 30;    // Genesis startup wait
 const EMERGENCY_WAIT_SECS: u64 = 10;           // Emergency producer wait

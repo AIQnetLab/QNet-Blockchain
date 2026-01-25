@@ -176,10 +176,10 @@ QNet presents an experimental blockchain platform with unique characteristics:
    - Requirements: 4+ GB RAM
 
 3. **Light Nodes** (Mobile):
-   - Block headers only
-   - SPV verification
-   - Minimal resource consumption
-   - Requirements: 2+ GB RAM
+   - Thin client architecture (no blockchain storage)
+   - All data via RPC from Full/Super nodes
+   - Battery-optimized design
+   - Requirements: Any mobile device (256 MB RAM)
 
 ### 2.3 Genesis Architecture
 
@@ -330,7 +330,7 @@ Block #N+5 arrives → Missing #N+1,N+2,N+3,N+4 → Buffer #N+5 → Request Miss
 **Buffer Management (v2.19.20):**
 - HashMap storage: O(1) lookup by block height
 - **Pseudo-infinite retries** - blocks NEVER discarded
-- **Adaptive buffer size**: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
+- **Adaptive buffer size**: Full/Super 500 blocks (~50MB) - Light nodes don't buffer (thin client)
 - **Exponential backoff**: 10s (retries 0-9) → 30s → 60s → 120s → 240s → 300s max
 - Timestamp tracking for age-based re-request (not eviction)
 
@@ -943,7 +943,7 @@ Architecture (v2.23):
 ├── Full/Super: Self-attest via heartbeats (10 per 4h window, HYBRID signature - quantum-resistant)
 ├── 256-shard ping system: Light nodes assigned to pingers based on SHA3-256(node_id)[0]
 ├── Light node reputation: Fixed at 70 (immutable, not affected by events)
-├── Storage: Tiered (Light ~100MB headers, Full ~500GB pruned, Super ~2TB full)
+├── Storage: Tiered (Light ~10MB thin client, Full ~500GB pruned, Super ~2TB full)
 └── Mobile monitoring: viewing only, no attestations
 
 Deterministic On-Chain Heartbeats (v2.41):
@@ -1019,7 +1019,7 @@ OPTIMIZATIONS (v2.19.20):
 ├── Emergency Timeout 10s: Allows original producer delivery (was 2s)
 ├── Pseudo-Infinite Retries: Blocks NEVER discarded
 ├── Exponential Backoff: 10s (0-9) → 30s → 60s → 120s → 240s → 300s max
-├── Adaptive Buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
+├── Adaptive Buffer: Full/Super 500 blocks (~50MB) - Light nodes: thin client (no buffer)
 ├── Kademlia K-neighbors: Heartbeats use DHT distance for efficient routing
 ├── Shred Protocol ALWAYS: Block propagation uses Shred Protocol for ALL network sizes
 ├── Heartbeat with HYBRID (v2.23): Full quantum protection (Ed25519 + Dilithium per message)
@@ -1873,7 +1873,7 @@ pub struct QNetSignature {
 
 | Node Type | Storage | Data Stored |
 |-----------|---------|-------------|
-| **Light** | **50-100 MB** | Headers ONLY (no blocks, no transactions) |
+| **Light** | **~10 MB** | Nothing (thin client - all data via RPC) |
 | **Full** | ~50 GB | Sliding window (100K blocks) + snapshots |
 | **Super** | 400+ GB | Full history with archival |
 
