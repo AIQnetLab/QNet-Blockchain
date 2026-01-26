@@ -2708,6 +2708,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[GENESIS SYNC] ✅ Keeping signal listener active for BlockchainNode creation...");
         genesis_signal_listener = Some(signal_listener);
         
+        // Note: QNET_PREFLIGHT_DONE=1 was set at line 2624 after preflight passed
+        // BlockchainNode::new() will skip preflight checks because of this flag
+        
         // Brief wait for all nodes to reach this point
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }

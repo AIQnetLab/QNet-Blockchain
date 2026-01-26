@@ -3853,10 +3853,15 @@ impl BlockchainNode {
             .or_else(|_| std::env::var("HOST_IP"))
             .ok();
         
-        // v2.101: Pre-flight checks are MANDATORY - no skip option for operators
+        // v2.103: Pre-flight checks are MANDATORY - no skip option for operators
         // This prevents "ghost nodes" that appear online but can't sync blocks
-        // QNET_DEV_SKIP_PREFLIGHT is internal dev-only flag (not documented)
-        if std::env::var("QNET_DEV_SKIP_PREFLIGHT").is_err() {
+        // Skip conditions:
+        //   - QNET_PREFLIGHT_DONE=1 : Already passed in qnet-node.rs (genesis sync)
+        //   - QNET_DEV_SKIP_PREFLIGHT=1 : Internal dev-only flag (not documented)
+        let preflight_already_done = std::env::var("QNET_PREFLIGHT_DONE").is_ok();
+        let skip_preflight_dev = std::env::var("QNET_DEV_SKIP_PREFLIGHT").is_ok();
+        
+        if !preflight_already_done && !skip_preflight_dev {
             match crate::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
                 Ok(result) => {
                     if !result.critical_failures.is_empty() {
