@@ -3567,6 +3567,11 @@ async fn handle_transaction_submit(
             // Add to mempool using public method
             match blockchain.add_transaction_to_mempool(tx).await {
                 Ok(_) => {
+                    println!("[INFO][TX] submitted tx={} from={} to={} amount={}", 
+                             &tx_hash[..16.min(tx_hash.len())],
+                             &tx_request.from[..16.min(tx_request.from.len())],
+                             &tx_request.to[..16.min(tx_request.to.len())],
+                             tx_request.amount);
                     let response = json!({
                         "success": true,
                         "tx_hash": tx_hash,
@@ -3575,6 +3580,10 @@ async fn handle_transaction_submit(
                     Ok(warp::reply::json(&response))
                 }
                 Err(e) => {
+                    // v2.101: Log mempool rejection for debugging
+                    println!("[WARN][TX] mempool_rejected from={} err={}", 
+                             &tx_request.from[..16.min(tx_request.from.len())],
+                             e);
                     let error_response = json!({
                         "success": false,
                         "error": "Failed to add transaction to mempool",

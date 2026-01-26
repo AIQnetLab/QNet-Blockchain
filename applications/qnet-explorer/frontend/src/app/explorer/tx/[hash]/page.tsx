@@ -3,6 +3,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
+import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
 
 interface TransactionData {
   hash: string;
@@ -79,125 +80,71 @@ const CopyBtn = ({ text }: { text: string }) => {
   );
 };
 
-// Check sessionStorage for cached transaction data
-function getCachedTx(hash: string): TransactionData | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    const cached = sessionStorage.getItem('qnet_explorer_cache_v3');
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      const txList = parsed.transactions || [];
-      const found = txList.find((t: { hash: string }) => t.hash === hash);
-      if (found) {
-        return {
-          hash: found.hash,
-          type: found.type, // Keep original type from cache
-          status: 'confirmed',
-          block: typeof found.block === 'number' ? found.block : 0,
-          timestamp: found.timestamp || 0,
-          from: found.from || 'unknown',
-          to: found.to || 'N/A',
-          amount: found.amount || '0 QNC',
-        };
-      }
-    }
-  } catch { /* ignore */ }
-  return null;
-}
-
 export default function TransactionPage() {
   const params = useParams();
   const hash = params.hash as string;
   
-  const [tx, setTx] = useState<TransactionData | null>(null);
-  const [loading, setLoading] = useState(true);
+  // v2.102: Sync cache read for instant display
+  const cachedTx = hash ? getCache<TransactionData>('tx', hash) : null;
+  
+  const [tx, setTx] = useState<TransactionData | null>(cachedTx);
   const [error, setError] = useState<string | null>(null);
-  const [hasFetched, setHasFetched] = useState(false);
+  const [hasFetched, setHasFetched] = useState(!!cachedTx);
   
   useEffect(() => {
-    if (!hash || hasFetched) return;
+    if (!hash) return;
     
-    // Try cache first (client-side only)
-    const cachedTx = getCachedTx(hash);
+    // If we have fresh cache, skip fetch
+    if (cachedTx && !isCacheStale('tx', hash)) {
+      setHasFetched(true);
+      return;
+    }
     
     const fetchTransaction = async () => {
       try {
-        // If have cached data - show it immediately, don't show loading
-        if (cachedTx) {
-          setTx(cachedTx);
-          setLoading(false);
-        }
-        
-        // Always fetch from API for latest data
         const res = await fetch(`/api/tx/${hash}`);
         const data = await res.json();
         
         if (data.success && data.data) {
           const newData = data.data as TransactionData;
           
-          // CRITICAL: Ensure timestamp is set and valid
-          // Use API timestamp if valid, otherwise try cached
+          // Handle timestamp validation
           const apiTs = Number(newData.timestamp) || 0;
-          let finalTimestamp = apiTs;
-          
-          // Check if API timestamp is valid
           if (apiTs > 0) {
-            // Convert to milliseconds if needed
             const tsMs = apiTs < 1e12 ? apiTs * 1000 : apiTs;
-            // If timestamp is valid (after 2000-01-01), use it
             if (tsMs >= 946684800000) {
-              finalTimestamp = apiTs; // Keep original format (milliseconds)
-            } else if (cachedTx && cachedTx.timestamp) {
-              // API timestamp invalid, try cached
-              const cachedTsMs = Number(cachedTx.timestamp) < 1e12 ? Number(cachedTx.timestamp) * 1000 : Number(cachedTx.timestamp);
-              if (cachedTsMs >= 946684800000) {
-                finalTimestamp = Number(cachedTx.timestamp);
-              }
-            }
-          } else if (cachedTx && cachedTx.timestamp) {
-            // No timestamp from API, use cached if valid
-            const cachedTsMs = Number(cachedTx.timestamp) < 1e12 ? Number(cachedTx.timestamp) * 1000 : Number(cachedTx.timestamp);
-            if (cachedTsMs >= 946684800000) {
-              finalTimestamp = Number(cachedTx.timestamp);
+              newData.timestamp = apiTs;
             }
           }
           
-          // Always set timestamp (formatTime will handle validation)
-          newData.timestamp = finalTimestamp;
-          
           setTx(newData);
+          setCache('tx', hash, newData);
           setError(null);
-        } else if (!cachedTx) {
-          // Only show error if we don't have cached data
+        } else {
           setError(data.error || 'Transaction not found');
         }
       } catch {
-        if (!cachedTx) {
-          setError('Transaction not found or backend unavailable');
-        }
+        setError('Transaction not found or backend unavailable');
       } finally {
-        setLoading(false);
         setHasFetched(true);
       }
     };
     
     fetchTransaction();
-  }, [hash, hasFetched]);
+  }, [hash, cachedTx]);
   
-  if (loading) {
-    return (
-      <div className="block-page">
-        <div className="loading-state">Loading transaction...</div>
-      </div>
-    );
-  }
-  
-  if (error || !tx) {
+  // Show error ONLY after fetch attempt
+  if (hasFetched && (error || !tx)) {
     return (
       <div className="block-page">
         <div className="error-state">{error || 'Transaction not found'}</div>
       </div>
     );
+  }
+  
+  // Still loading - show empty shell
+  if (!tx) {
+    return <div className="block-page" />;
   }
   
   return (

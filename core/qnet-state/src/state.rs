@@ -124,11 +124,16 @@ impl StateManager {
     /// v2.96: Update pending rewards for a node (after emission processing)
     /// CRITICAL SECURITY: This ensures all nodes have same pending_rewards on-chain
     /// Prevents manipulation of local RocksDB to claim fraudulent rewards
+    /// v2.100: BUGFIX - Use SET (=) not ADD (+=)!
+    /// get_all_pending_rewards() returns TOTAL accumulated amount from reward_manager
+    /// Using += caused DOUBLE accumulation: reward_manager accumulates + state accumulates again
     pub fn update_pending_rewards(&self, node_wallet: &str, reward_amount: u64) -> StateResult<()> {
         let mut account = self.accounts.entry(node_wallet.to_string())
             .or_insert_with(|| Account::new(node_wallet.to_string()));
         
-        account.pending_rewards += reward_amount;
+        // v2.100: CRITICAL FIX - SET not ADD!
+        // reward_amount is already the TOTAL accumulated from PhaseAwareRewardManager
+        account.pending_rewards = reward_amount;
         
         println!("[STATE] pending_rewards_updated wallet={} amount={} QNC total={} QNC",
                  &node_wallet[..node_wallet.len().min(16)],

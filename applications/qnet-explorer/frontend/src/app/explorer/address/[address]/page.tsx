@@ -3,6 +3,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
+import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
 
 interface AddressData {
   address: string;
@@ -143,50 +144,58 @@ export default function AddressPage() {
   const params = useParams();
   const address = params.address as string;
   
-  const [data, setData] = useState<AddressData | null>(null);
-  const [loading, setLoading] = useState(true);
+  // v2.102: Sync cache read for instant display
+  const cachedData = address ? getCache<AddressData>('address', address) : null;
+  
+  const [data, setData] = useState<AddressData | null>(cachedData);
   const [error, setError] = useState<string | null>(null);
+  const [hasFetched, setHasFetched] = useState(!!cachedData);
   const [txPage, setTxPage] = useState(1);
   const TX_PER_PAGE = 10;
   
   useEffect(() => {
     if (!address) return;
     
+    // If we have fresh cache, skip fetch
+    if (cachedData && !isCacheStale('address', address)) {
+      setHasFetched(true);
+      return;
+    }
+    
     const fetchAddress = async () => {
       try {
-        setLoading(true);
         const res = await fetch(`/api/address/${address}`);
         const result = await res.json();
         
         if (result.success && result.data) {
           setData(result.data);
+          setCache('address', address, result.data);
+          setError(null);
         } else {
           setError(result.error || 'Address not found');
         }
-      } catch (err) {
+      } catch {
         setError('Failed to load address');
       } finally {
-        setLoading(false);
+        setHasFetched(true);
       }
     };
     
     fetchAddress();
-  }, [address]);
+  }, [address, cachedData]);
   
-  if (loading) {
-    return (
-      <div className="address-page">
-        <div className="loading-state">Loading address...</div>
-      </div>
-    );
-  }
-  
-  if (error || !data) {
+  // Show error ONLY after fetch attempt
+  if (hasFetched && (error || !data)) {
     return (
       <div className="address-page">
         <div className="error-state">{error || 'Address not found'}</div>
       </div>
     );
+  }
+  
+  // Still loading - show empty shell
+  if (!data) {
+    return <div className="address-page" />;
   }
   
   return (

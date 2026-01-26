@@ -4776,7 +4776,9 @@ export class WalletManager {
       // PRODUCTION: Create Ed25519 signature for transaction
       // v2.77: Format includes nonce for replay protection (Ethereum-style)
       // Format: "transfer:from:to:amount:nonce:gas_price:gas_limit"
-      const amountSmallest = Math.floor(amount * 1_000_000_000); // Convert QNC to smallest unit (9 decimals)
+      // v2.101: Use Math.round() to avoid floating point precision loss
+      // Example: Math.floor(0.1 * 1e9) = 99999999, but Math.round() = 100000000
+      const amountSmallest = Math.round(amount * 1_000_000_000); // Convert QNC to smallest unit (9 decimals)
       const gasPrice = 1;
       const gasLimit = 10_000;
       
@@ -4834,7 +4836,12 @@ export class WalletManager {
       const result = await response.json();
       
       if (!response.ok || !result.success) {
-        throw new Error(result.error || result.details || 'Failed to send transaction');
+        // v2.101: Show BOTH error and details for debugging
+        const errorMsg = result.details 
+          ? `${result.error}: ${result.details}`
+          : (result.error || 'Failed to send transaction');
+        console.error('[WalletManager] Transaction rejected:', result);
+        throw new Error(errorMsg);
       }
       
       return {

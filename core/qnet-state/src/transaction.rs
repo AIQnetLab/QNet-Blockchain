@@ -445,15 +445,21 @@ impl Transaction {
     /// QUANTUM v2.78: Set quantum signature fields after creation (HYBRID ONLY)
     /// ARCHITECTURE: For HYBRID signatures (Ed25519 + Dilithium)
     /// Pure Dilithium not supported - use Hybrid for quantum resistance
+    /// v2.101: CRITICAL - Must recalculate hash after changing fields!
     pub fn with_quantum_signature(mut self, dilithium_sig: Option<String>, dilithium_pk: Option<String>) -> Self {
         self.dilithium_signature = dilithium_sig;
         self.dilithium_public_key = dilithium_pk;
+        // v2.101: Recalculate hash after changing fields to pass validate()
+        self.hash = self.calculate_hash();
         self
     }
     
     /// QUANTUM v2.25.2: Set public key for Ed25519 verification
+    /// v2.101: CRITICAL - Must recalculate hash after changing fields!
     pub fn with_public_key(mut self, public_key: Option<String>) -> Self {
         self.public_key = public_key;
+        // v2.101: Recalculate hash after changing fields to pass validate()
+        self.hash = self.calculate_hash();
         self
     }
     
@@ -512,33 +518,17 @@ impl Transaction {
             return Err("Empty sender address".to_string());
         }
         
-        // Hash validation with special handling for system commitment TXs
+        // v2.101: Hash validation - STRICT for ALL transaction types
+        // bincode serialization IS deterministic for our structures (no HashMap, no floats)
+        // Previous "workaround" for system TXs was unnecessary - removed
         let calculated_hash = self.calculate_hash();
         if self.hash != calculated_hash {
-            // System commitment TXs may have hash mismatches due to complex nested serialization
-            // They are protected by MANDATORY cryptographic signatures (Ed25519 + Dilithium)
-            // verified in validate_and_add_network_transaction before reaching mempool
-            let is_system_commitment = matches!(self.tx_type,
-                TransactionType::HeartbeatCommitment { .. } |
-                TransactionType::PingCommitmentWithSampling { .. } |
-                TransactionType::LightNodeEligibilityBitmap { .. } |
-                TransactionType::RewardDistribution { .. }
-            );
-            
-            if is_system_commitment {
-                // Log for diagnostics but allow - cryptographic signatures ensure integrity
-                eprintln!("[WARN][TX-HASH] System TX hash mismatch (signatures will verify): type={:?} stored={}.. calc={}...",
-                    std::mem::discriminant(&self.tx_type),
-                    &self.hash[..16.min(self.hash.len())],
-                    &calculated_hash[..16.min(calculated_hash.len())]
-                );
-            } else {
-                // Regular TX - hash MUST match exactly
-                return Err(format!("Invalid transaction hash: expected {} got {}", 
-                    &self.hash[..16.min(self.hash.len())],
-                    &calculated_hash[..16.min(calculated_hash.len())]
-                ));
-            }
+            return Err(format!(
+                "Invalid transaction hash: stored={}.. calculated={}.. (type={:?})", 
+                &self.hash[..16.min(self.hash.len())],
+                &calculated_hash[..16.min(calculated_hash.len())],
+                std::mem::discriminant(&self.tx_type)
+            ));
         }
         
         // Type-specific validation

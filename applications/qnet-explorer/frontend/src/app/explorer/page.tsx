@@ -2,6 +2,7 @@
 
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Link from 'next/link';
+import { batchCache } from '@/lib/explorer-cache';
 
 interface ActivityItem {
   hash: string;
@@ -118,6 +119,7 @@ export default function ExplorerPage() {
   const [transactionMap, setTransactionMap] = useState<Map<string, ActivityItem>>(new Map());
   const [currentHeight, setCurrentHeight] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [hasFetched, setHasFetched] = useState(false); // v2.102: Track if we ever loaded data
   const [searchQuery, setSearchQuery] = useState('');
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
@@ -135,6 +137,7 @@ export default function ExplorerPage() {
       setTransactionMap(cached.transactions);
       setCurrentHeight(cached.height);
       setLoading(false);
+      setHasFetched(true); // We have data from cache
     }
   }, []);
 
@@ -197,11 +200,28 @@ export default function ExplorerPage() {
         setTotalCount(total);
         setTotalPages(pages);
         saveToCache(newMap, networkHeight);
+        
+        // v2.101: Pre-cache transactions for instant detail page load
+        const txItems = Array.from(newMap.values()).map(tx => ({
+          key: tx.hash,
+          data: {
+            hash: tx.hash,
+            type: tx.type,
+            status: 'confirmed' as const,
+            block: tx.block,
+            timestamp: tx.timestamp,
+            from: tx.from,
+            to: tx.to,
+            amount: tx.amount,
+          }
+        }));
+        batchCache('tx', txItems);
       }
     } catch (err) {
       console.error('[Explorer] Fetch error:', err);
     } finally {
       setLoading(false);
+      setHasFetched(true);
     }
   }, []);
 
@@ -335,13 +355,13 @@ export default function ExplorerPage() {
         </div>
         
         <div className="table-wrapper">
-          {loading && filteredAndSortedActivity.length === 0 ? (
-            <div className="loading-state">Loading transactions...</div>
-          ) : filteredAndSortedActivity.length === 0 ? (
+          {filteredAndSortedActivity.length === 0 && hasFetched ? (
             <div className="empty-state">
               <p>No transactions found</p>
               <span>{typeFilters.length > 0 ? `No ${typeFilters.join('/')} transactions yet` : 'Waiting for network activity...'}</span>
             </div>
+          ) : filteredAndSortedActivity.length === 0 ? (
+            <div className="table-placeholder" />
           ) : (
             <table className="activity-table">
               <thead>

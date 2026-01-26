@@ -30,9 +30,11 @@ pub struct CheckResult {
 }
 
 /// Required ports for QNet node
-/// NOTE: 9876/9877 removed - not actually used, P2P works via QUIC (10876) and HTTP API (8001)
+/// All ports must be open for full node operation
 pub const REQUIRED_PORTS: &[(u16, &str, &str)] = &[
     (8001, "TCP", "REST API"),
+    (9876, "TCP", "P2P Network"),
+    (9877, "TCP", "P2P Regional"),
     (10876, "UDP", "QUIC Transport"),
 ];
 

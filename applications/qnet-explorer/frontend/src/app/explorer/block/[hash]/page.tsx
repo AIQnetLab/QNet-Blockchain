@@ -4,6 +4,7 @@ import React, { useState, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import type { Block, BlockTransaction, HeartbeatEntry } from '@/lib/types';
+import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
 
 // Helper to truncate
 const truncate = (str: string, start = 8, end = 6): string => {
@@ -64,50 +65,58 @@ export default function BlockPage() {
   const params = useParams();
   const hash = params.hash as string;
   
-  const [block, setBlock] = useState<Block | null>(null);
-  const [loading, setLoading] = useState(true);
+  // v2.102: Sync cache read for instant display
+  const cachedBlock = hash ? getCache<Block>('block', hash) : null;
+  
+  const [block, setBlock] = useState<Block | null>(cachedBlock);
   const [error, setError] = useState<string | null>(null);
+  const [hasFetched, setHasFetched] = useState(!!cachedBlock); // true if we have cache
   const [showValidators, setShowValidators] = useState(false);
   const [showRelated, setShowRelated] = useState(false);
   
   useEffect(() => {
     if (!hash) return;
     
+    // If we have fresh cache, skip fetch
+    if (cachedBlock && !isCacheStale('block', hash)) {
+      setHasFetched(true);
+      return;
+    }
+    
     const fetchBlock = async () => {
       try {
-        setLoading(true);
         const res = await fetch(`/api/blocks/${hash}`);
         const data = await res.json();
         
         if (data.success && data.data) {
           setBlock(data.data);
+          setCache('block', hash, data.data);
+          setError(null);
         } else {
           setError(data.error || 'Block not found');
         }
-      } catch (err) {
+      } catch {
         setError('Failed to load block');
       } finally {
-        setLoading(false);
+        setHasFetched(true);
       }
     };
     
     fetchBlock();
-  }, [hash]);
+  }, [hash, cachedBlock]);
   
-  if (loading) {
-    return (
-      <div className="block-page">
-        <div className="loading-state">Loading block...</div>
-      </div>
-    );
-  }
-  
-  if (error || !block) {
+  // Show error ONLY after fetch attempt
+  if (hasFetched && (error || !block)) {
     return (
       <div className="block-page">
         <div className="error-state">{error || 'Block not found'}</div>
       </div>
     );
+  }
+  
+  // Still loading - show empty shell (no flicker)
+  if (!block) {
+    return <div className="block-page" />;
   }
   
   const isMacro = block.block_type === 'MACROBLOCK';

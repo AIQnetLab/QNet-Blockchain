@@ -3853,10 +3853,10 @@ impl BlockchainNode {
             .or_else(|_| std::env::var("HOST_IP"))
             .ok();
         
-        // Run pre-flight checks unless explicitly disabled or already done (Genesis nodes)
-        // QNET_PREFLIGHT_DONE is set by Genesis nodes after running preflight BEFORE GENESIS SYNC
-        if std::env::var("QNET_SKIP_PREFLIGHT").is_err() 
-            && std::env::var("QNET_PREFLIGHT_DONE").is_err() {
+        // v2.101: Pre-flight checks are MANDATORY - no skip option for operators
+        // This prevents "ghost nodes" that appear online but can't sync blocks
+        // QNET_DEV_SKIP_PREFLIGHT is internal dev-only flag (not documented)
+        if std::env::var("QNET_DEV_SKIP_PREFLIGHT").is_err() {
             match crate::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
                 Ok(result) => {
                     if !result.critical_failures.is_empty() {
@@ -3870,7 +3870,7 @@ impl BlockchainNode {
                             format!("Pre-flight checks failed: {:?}", result.critical_failures)
                         ));
                     }
-                    if is_info() { println!("[INFO][NODE] preflight_ok"); }
+                    if is_info() { println!("[INFO][NODE] preflight_ok checks_passed"); }
                 }
                 Err(e) => {
                     // CRITICAL: Pre-flight checks failed - do NOT start the node
@@ -3889,6 +3889,15 @@ impl BlockchainNode {
                     eprintln!("");
                     eprintln!("Node cannot start until these issues are fixed.");
                     eprintln!("This prevents 'ghost nodes' that appear online but cannot sync.");
+                    eprintln!("");
+                    eprintln!("Required ports (must be open in firewall!):");
+                    eprintln!("  - TCP 8001  : REST API");
+                    eprintln!("  - TCP 9876  : P2P Network");
+                    eprintln!("  - TCP 9877  : P2P Network (regional)");
+                    eprintln!("  - UDP 10876 : QUIC Transport (block sync)");
+                    eprintln!("");
+                    eprintln!("Docker example:");
+                    eprintln!("  -p 8001:8001 -p 9876:9876 -p 9877:9877 -p 10876:10876/udp");
                     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     eprintln!("");
                     
@@ -3898,7 +3907,8 @@ impl BlockchainNode {
                 }
             }
         } else {
-            if is_warn() { println!("[WARN][NODE] preflight_skipped not_for_production"); }
+            // Internal dev flag - not for operators
+            if is_warn() { println!("[WARN][NODE] preflight_skipped dev_mode"); }
         }
         
         // NOTE: Light node server blocking is already implemented in bin/qnet-node.rs (lines 78-83, 173-184)

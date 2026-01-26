@@ -1512,6 +1512,33 @@ const WalletScreen = () => {
     setSendAmount('');
   };
   
+  // v2.101: Validate amount input - international standard (dot separator, max 6 decimals)
+  const validateAmountInput = (text) => {
+    // Replace comma with dot (for locales that use comma)
+    let normalized = text.replace(',', '.');
+    
+    // Remove any non-numeric characters except dot
+    normalized = normalized.replace(/[^\d.]/g, '');
+    
+    // Ensure only one decimal point
+    const parts = normalized.split('.');
+    if (parts.length > 2) {
+      normalized = parts[0] + '.' + parts.slice(1).join('');
+    }
+    
+    // Limit decimal places (6 for display, blockchain uses 9 internally)
+    if (parts.length === 2 && parts[1].length > 6) {
+      normalized = parts[0] + '.' + parts[1].substring(0, 6);
+    }
+    
+    // Prevent leading zeros (except for "0." pattern)
+    if (normalized.length > 1 && normalized[0] === '0' && normalized[1] !== '.') {
+      normalized = normalized.substring(1);
+    }
+    
+    setSendAmount(normalized);
+  };
+  
   // Set amount as percentage of balance
   const setAmountPercentage = (percentage) => {
     if (!sendingToken) return;
@@ -3418,7 +3445,8 @@ const WalletScreen = () => {
                   placeholderTextColor="#888"
                   keyboardType="decimal-pad"
                   value={sendAmount}
-                  onChangeText={setSendAmount}
+                  onChangeText={validateAmountInput}
+                  maxLength={20}
                 />
                 
                 {/* Percentage Buttons */}
@@ -3685,9 +3713,10 @@ const WalletScreen = () => {
                   style={[styles.input, styles.amountInput]}
                   placeholder="0.00"
                   placeholderTextColor="#888"
-                  keyboardType="numeric"
+                  keyboardType="decimal-pad"
                   value={sendAmount}
-                  onChangeText={setSendAmount}
+                  onChangeText={validateAmountInput}
+                  maxLength={20}
                 />
                 <View style={styles.tokenSelector}>
                   <TouchableOpacity 
