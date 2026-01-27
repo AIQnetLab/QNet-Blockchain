@@ -125,22 +125,54 @@ use parking_lot::RwLock as ParkingRwLock;
 // CRITICAL: Global flag for emergency producer activation (lock-free)
 // Height stored atomically, producer string in fast parking_lot lock
 static EMERGENCY_PRODUCER_HEIGHT: StdAtomicU64 = StdAtomicU64::new(0);
+// v3.3: Store END of rotation cycle - emergency producer works until this height
+static EMERGENCY_PRODUCER_END_HEIGHT: StdAtomicU64 = StdAtomicU64::new(0);
 lazy_static::lazy_static! {
     static ref EMERGENCY_PRODUCER_ID: ParkingRwLock<String> = ParkingRwLock::new(String::new());
 }
 
 // CRITICAL: Public function to set emergency producer flag from other modules
+// v3.3: Emergency producer now works for ENTIRE remaining rotation cycle
 pub fn set_emergency_producer_flag(block_height: u64, producer: String) {
     EMERGENCY_PRODUCER_HEIGHT.store(block_height, StdOrdering::SeqCst);
-    *EMERGENCY_PRODUCER_ID.write() = producer;
+    
+    // v3.3: Calculate end of rotation cycle (next rotation boundary)
+    // Rotation happens every 30 blocks starting from block 1: 31, 61, 91, 121...
+    let rotation_interval = 30u64;
+    let current_cycle = block_height / rotation_interval;
+    let end_height = (current_cycle + 1) * rotation_interval;
+    EMERGENCY_PRODUCER_END_HEIGHT.store(end_height, StdOrdering::SeqCst);
+    
+    *EMERGENCY_PRODUCER_ID.write() = producer.clone();
+    
+    println!("[INFO][EMERGENCY] flag_set producer={} start_h={} end_h={} (full_cycle)", 
+             producer, block_height, end_height);
 }
 
-// Helper to get emergency producer (returns None if height is 0)
+// Helper to get emergency producer (returns None if height is 0 or cycle ended)
+// v3.3: Returns (start_height, end_height, producer) - emergency producer for entire cycle
 pub fn get_emergency_producer() -> Option<(u64, String)> {
     let height = EMERGENCY_PRODUCER_HEIGHT.load(StdOrdering::SeqCst);
     if height == 0 {
         None
     } else {
+        let end_height = EMERGENCY_PRODUCER_END_HEIGHT.load(StdOrdering::SeqCst);
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // v3.3: Emergency producer works until END of rotation cycle
+        // Only expire when we've passed the end_height (rotation boundary)
+        if current_height > end_height {
+            // Rotation cycle ended - clear emergency flag
+            EMERGENCY_PRODUCER_HEIGHT.store(0, StdOrdering::SeqCst);
+            EMERGENCY_PRODUCER_END_HEIGHT.store(0, StdOrdering::SeqCst);
+            *EMERGENCY_PRODUCER_ID.write() = String::new();
+            if is_debug() {
+                println!("[DBG][EMERGENCY] cycle_ended start_h={} end_h={} current_h={}", 
+                         height, end_height, current_height);
+            }
+            return None;
+        }
+        
         let producer = EMERGENCY_PRODUCER_ID.read().clone();
         if producer.is_empty() {
             None
@@ -150,9 +182,15 @@ pub fn get_emergency_producer() -> Option<(u64, String)> {
     }
 }
 
+// v3.3: Get end height of emergency cycle
+pub fn get_emergency_end_height() -> u64 {
+    EMERGENCY_PRODUCER_END_HEIGHT.load(StdOrdering::SeqCst)
+}
+
 // Helper to clear emergency producer flag
 pub fn clear_emergency_producer() {
     EMERGENCY_PRODUCER_HEIGHT.store(0, StdOrdering::SeqCst);
+    EMERGENCY_PRODUCER_END_HEIGHT.store(0, StdOrdering::SeqCst);
     *EMERGENCY_PRODUCER_ID.write() = String::new();
 }
 
@@ -5167,12 +5205,16 @@ impl BlockchainNode {
         });
         
         // PRODUCTION v2.19.12: Start macroblock receiver handler
+        // v3.2: CRITICAL FIX - Clear pending sync on errors to prevent stuck entries
         let blockchain_for_macroblocks = blockchain.clone();
         tokio::spawn(async move {
             while let Some(received_macroblock) = macroblock_rx.recv().await {
+                let index = received_macroblock.height;
                 // Process received macroblock
                 if let Err(e) = blockchain_for_macroblocks.process_received_macroblock(received_macroblock).await {
-                    eprintln!("[ERR][MB-SYNC] process_failed err={}", e);
+                    // v3.2: CRITICAL - Clear pending sync on error to allow re-request
+                    crate::unified_p2p::clear_macroblock_pending_sync(index);
+                    eprintln!("[ERR][MB-SYNC] process_failed idx={} err={}", index, e);
                 }
             }
         });
@@ -5455,14 +5497,26 @@ impl BlockchainNode {
                             // Skip snapshot for Light nodes - they sync only recent blocks
                             let is_light_node = blockchain_for_sync.node_type == NodeType::Light;
                             
-                            // Try snapshot only if:
+                            // v3.3: IMPROVED SNAPSHOT SYNC for returning nodes
+                            // Try snapshot if:
                             // 1. Not a Light node (they don't need full history)
-                            // 2. Local height is very low (new node)
-                            // 3. Network has at least one incremental snapshot (3600+ blocks)
-                            if !is_light_node && local_height < 100 && network_height > SNAPSHOT_INCREMENTAL_INTERVAL {
+                            // 2. EITHER: New node (local_height < 100)
+                            //    OR: Large gap (>10,000 blocks = ~2.7 hours offline)
+                            // 3. Network has at least one full snapshot (43,200+ blocks)
+                            //
+                            // RATIONALE: Node offline for days should use snapshot, not sync 500K blocks!
+                            // Example: 500K blocks × 100 batch = 5,000 requests × 25 sec = ~35 hours to sync
+                            // With snapshot: download snapshot + sync remaining = minutes
+                            let gap = network_height.saturating_sub(local_height);
+                            let large_gap_threshold = 10_000; // ~2.7 hours worth of blocks
+                            let should_use_snapshot = !is_light_node 
+                                && (local_height < 100 || gap > large_gap_threshold)
+                                && network_height > SNAPSHOT_FULL_INTERVAL;  // Need at least 1 full snapshot
+                            
+                            if should_use_snapshot {
                                 if is_info() { 
-                                    println!("[INFO][SYNC] trying_snapshot local={} net={} threshold={}", 
-                                             local_height, network_height, SNAPSHOT_INCREMENTAL_INTERVAL); 
+                                    println!("[INFO][SYNC] trying_snapshot local={} net={} gap={} threshold={}", 
+                                             local_height, network_height, gap, large_gap_threshold); 
                                 }
                                 
                                 match blockchain_for_sync.storage.fast_sync_with_snapshot(p2p, network_height).await {
@@ -5519,15 +5573,39 @@ impl BlockchainNode {
                                 if is_info() { println!("[INFO][MB-SYNC] syncing from={} to={}", 
                                     local_macroblock_index + 1, network_macroblock_index); }
                                 
-                                // Sync macroblocks in batches of 10
+                                // v3.2: Sync macroblocks in batches of 10, with retry on failure
                                 let mut current_macro = local_macroblock_index + 1;
+                                let mut consecutive_failures = 0;
+                                const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+                                
                                 while current_macro <= network_macroblock_index {
                                     let batch_end = std::cmp::min(current_macro + 9, network_macroblock_index);
                                     
                                     if is_debug() { println!("[DBG][MB-SYNC] request from={} to={}", current_macro, batch_end); }
+                                    
+                                    // v3.2: Clear pending sync for this batch to allow fresh request
+                                    for idx in current_macro..=batch_end {
+                                        crate::unified_p2p::clear_macroblock_pending_sync(idx);
+                                    }
+                                    
                                     if let Err(e) = p2p.sync_macroblocks(current_macro, batch_end).await {
-                                        println!("[WARN][MB-SYNC] sync_failed idx={} err={}", current_macro, e);
-                                        break;
+                                        println!("[WARN][MB-SYNC] sync_failed idx={}-{} err={}", current_macro, batch_end, e);
+                                        consecutive_failures += 1;
+                                        
+                                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                            println!("[WARN][MB-SYNC] too_many_failures={} stopping_batch_sync", consecutive_failures);
+                                            break;
+                                        }
+                                        
+                                        // v3.2: Don't break on single failure - try individual macroblocks
+                                        for idx in current_macro..=batch_end {
+                                            if let Err(e2) = p2p.sync_macroblocks(idx, idx).await {
+                                                if is_debug() { println!("[DBG][MB-SYNC] individual_fail idx={} err={}", idx, e2); }
+                                            }
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                        }
+                                    } else {
+                                        consecutive_failures = 0; // Reset on success
                                     }
                                     
                                     current_macro = batch_end + 1;
@@ -5634,15 +5712,23 @@ impl BlockchainNode {
                                  missing_macroblocks.len(), display_missing);
                     }
                     
-                    // Request missing macroblocks from network (limit to 10 per cycle to prevent overload)
+                    // v3.2: Request missing macroblocks from network
+                    // CRITICAL FIX: Increased limit from 10 to 30 to recover faster from DESYNC
+                    // Also clear pending queue for these indices to allow re-request
                     if let Some(ref p2p) = blockchain_for_macrocheck.unified_p2p {
-                        for mb_index in missing_macroblocks.iter().take(10) {
+                        // v3.2: Clear pending sync for missing macroblocks to allow fresh request
+                        for mb_index in missing_macroblocks.iter() {
+                            crate::unified_p2p::clear_macroblock_pending_sync(*mb_index);
+                        }
+                        
+                        // Request in larger batches for faster recovery
+                        for mb_index in missing_macroblocks.iter().take(30) {
                             if is_debug() { println!("[DBG][MB-CHECK] request idx={}", mb_index); }
                             if let Err(e) = p2p.sync_macroblocks(*mb_index, *mb_index).await {
                                 println!("[WARN][MB-CHECK] sync_failed idx={} err={}", mb_index, e);
                             }
                             // Small delay between requests
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            tokio::time::sleep(Duration::from_millis(300)).await;
                         }
                     }
                 } else if current_height % 180 == 0 {
@@ -5817,6 +5903,9 @@ impl BlockchainNode {
                                     (received_block.clone(), retry_count, std::time::Instant::now())
                                 );
                                 
+                                // v2.105: Clear from PENDING_SYNC_BLOCKS so duplicate can come if needed
+                                crate::unified_p2p::clear_block_pending_sync(received_block.height);
+                                
                                 // METRICS: Track certificate race condition occurrence
                                 if retry_count == 0 {
                                     RETRY_CERT_RACE.fetch_add(1, Ordering::Relaxed);
@@ -5827,6 +5916,8 @@ impl BlockchainNode {
                                 if is_debug() { println!("[DBG][BLOCK] cert_pending via_rebroadcast"); }
                                 continue; // Skip error logging, this is expected race condition
                             } else {
+                                // v2.105: CRITICAL - Clear from pending when cert retries exhausted
+                                crate::unified_p2p::clear_block_pending_sync(received_block.height);
                                 eprintln!("[ERR][BLOCK] rejected h={} cert_retries={}", 
                                          received_block.height, retry_count);
                             }
@@ -5874,6 +5965,9 @@ impl BlockchainNode {
                                             received_block.height, 
                                             (received_block.clone(), retry_count, std::time::Instant::now())
                                         );
+                                        
+                                        // v2.105: Clear from PENDING_SYNC_BLOCKS so block can be re-requested
+                                        crate::unified_p2p::clear_block_pending_sync(received_block.height);
                                         
                                         // METRICS: Track missing previous block occurrence
                                         if retry_count == 0 {
@@ -5975,6 +6069,8 @@ impl BlockchainNode {
                                         // CRITICAL: Check if reorg already in progress (prevent race condition)
                                         let is_reorg_active = *reorg_in_progress.read().await;
                                         if is_reorg_active {
+                                            // v2.105: Clear pending so block can be re-requested after reorg
+                                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
                                             if is_debug() { println!("[DBG][REORG] in_progress=true skip fork_from={}", fork_producer); }
                                             continue;
                                         }
@@ -5988,6 +6084,8 @@ impl BlockchainNode {
                                         
                                         // CRITICAL FIX: Always handle forks immediately, but rate limit to prevent DoS
                                         if !own_fork && last_attempt.elapsed().as_secs() < FORK_ATTEMPT_COOLDOWN_SECS {
+                                            // v2.105: Clear pending so block can be re-requested later
+                                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
                                             println!("[WARN][REORG] rate_limited cooldown={}s", FORK_ATTEMPT_COOLDOWN_SECS);
                                             continue;
                                         }
@@ -6146,6 +6244,10 @@ impl BlockchainNode {
                         } else {
                             // SECURITY: Track invalid block for malicious behavior detection
                             eprintln!("[ERR][BLOCK] invalid_microblock h={} err={}", received_block.height, e);
+                            
+                            // v2.105: CRITICAL FIX - Clear from pending sync queue!
+                            // Without this, block stays in PENDING_SYNC_BLOCKS forever → deadlock!
+                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
                             
                             // Report to P2P system for soft punishment tracking
                             if let Some(p2p) = &unified_p2p {
@@ -8317,11 +8419,12 @@ impl BlockchainNode {
                                                 
                                                 // Step 4: Check for emergency producer (failover scenario)
                                                 // If network stalled and emergency producer was activated, send to them too
-                                                // v2.96: Lock-free emergency producer check
+                                                // v3.3: Check if next_height is within emergency cycle
                                                 let emergency_target: Option<(u64, String)> = get_emergency_producer();
                                                 
-                                                if let Some((emergency_height, emergency_producer)) = emergency_target {
-                                                    if emergency_height >= next_height && 
+                                                if let Some((emergency_start, emergency_producer)) = emergency_target {
+                                                    let emergency_end = get_emergency_end_height();
+                                                    if next_height >= emergency_start && next_height < emergency_end && 
                                                        emergency_producer != node_id &&
                                                        !sent_to.contains(&emergency_producer) {
                                                         if let Some(producer_addr) = p2p.get_peer_addr_by_id(&emergency_producer) {
@@ -8601,9 +8704,10 @@ impl BlockchainNode {
                                                         }
                                                     }
                                                     
-                                                    // Handle emergency producer (failover) - v2.96: lock-free
-                                                    if let Some((emergency_height, emergency_producer)) = get_emergency_producer() {
-                                                        if emergency_height >= next_height && 
+                                                    // Handle emergency producer (failover) - v3.3: check cycle
+                                                    if let Some((emergency_start, emergency_producer)) = get_emergency_producer() {
+                                                        let emergency_end = get_emergency_end_height();
+                                                        if next_height >= emergency_start && next_height < emergency_end && 
                                                            emergency_producer != node_id &&
                                                            emergency_producer != producer_next &&
                                                            emergency_producer != producer_next_plus_one {
@@ -10466,26 +10570,83 @@ impl BlockchainNode {
                 // Nodes at different heights naturally won't interfere with each other
                 let mut is_my_turn_to_produce = current_producer == node_id;
                 
+                // ═══════════════════════════════════════════════════════════════════════════
+                // v2.104: SELF-EXCLUDE CHECK - Producer must be synced to produce
+                // ═══════════════════════════════════════════════════════════════════════════
+                // PROBLEM: If selected producer is significantly behind (>100 blocks), it cannot
+                // produce valid blocks because it doesn't have the correct state/entropy.
+                // 
+                // SOLUTION: Producer self-excludes and initiates emergency failover to next candidate.
+                // This prevents network deadlock when producer is desynchronized.
+                //
+                // WHY 100 BLOCKS THRESHOLD:
+                // - Normal sync lag (<10 blocks): Expected during network propagation
+                // - Minor lag (10-100 blocks): Warning but can still produce (state is recent)
+                // - Critical lag (>100 blocks): State is too stale, must self-exclude
+                // ═══════════════════════════════════════════════════════════════════════════
+                if is_my_turn_to_produce && next_block_height > 10 {
+                    if let Some(p2p) = &unified_p2p {
+                        let network_height = p2p.get_max_peer_height();
+                        let local_height = storage.get_chain_height().unwrap_or(0);
+                        let sync_lag = network_height.saturating_sub(local_height);
+                        
+                        if sync_lag > 100 {
+                            // CRITICAL: Self-exclude - we're too far behind
+                            println!("[WARN][PROD] self_exclude local={} network={} lag={}", 
+                                     local_height, network_height, sync_lag);
+                            
+                            let emergency_producer = Self::select_emergency_producer(
+                                &node_id,           // failed_producer (self)
+                                next_block_height,  // current_height
+                                &unified_p2p,       // p2p
+                                &node_id,           // own_node_id
+                                node_type,          // own_node_type
+                                Some(storage.clone()) // storage
+                            ).await;
+                            
+                            if !emergency_producer.is_empty() && emergency_producer != node_id {
+                                p2p.broadcast_emergency_producer_change(
+                                    &node_id,
+                                    &emergency_producer,
+                                    next_block_height,
+                                    "microblock"
+                                ).ok();
+                                
+                                set_emergency_producer_flag(next_block_height, emergency_producer.clone());
+                                
+                                if is_info() {
+                                    println!("[INFO][FAILOVER] emergency_producer={} h={}", emergency_producer, next_block_height);
+                                }
+                            }
+                            
+                            is_my_turn_to_produce = false;
+                            current_producer = emergency_producer;
+                        } else if sync_lag > 10 && is_warn() {
+                            println!("[WARN][PROD] sync_lag={} h={} (producing)", sync_lag, next_block_height);
+                        }
+                    }
+                }
+                
                 // CRITICAL FIX: Check if we're emergency producer for this block
-                // Emergency producer MUST create block even if not originally scheduled
-                // v2.96: Lock-free emergency check
+                // v3.3: Emergency producer works for ENTIRE rotation cycle
                 if !is_my_turn_to_produce {
-                    if let Some((height, producer)) = get_emergency_producer() {
-                        if height == next_block_height && producer == node_id {
-                            println!("[EMERGENCY] 🚨 OVERRIDING: WE ARE EMERGENCY PRODUCER FOR BLOCK #{}", height);
-                            println!("[EMERGENCY] 🔥 FORCING IMMEDIATE BLOCK PRODUCTION!");
+                    if let Some((start_h, producer)) = get_emergency_producer() {
+                        let end_h = get_emergency_end_height();
+                        // Check if current block is within emergency cycle
+                        if next_block_height >= start_h && next_block_height < end_h && producer == node_id {
+                            if is_info() {
+                                println!("[INFO][EMERGENCY] override h={} cycle=[{},{}]", 
+                                         next_block_height, start_h, end_h);
+                            }
                             
                             // STATE MACHINE: Emergency producer mode
                             set_node_state(NodeState::Producing { 
-                                round: (height - 1) / 30, 
-                                current_height: height,
+                                round: (next_block_height - 1) / 30, 
+                                current_height: next_block_height,
                             });
                             
                             current_producer = node_id.clone();
                             is_my_turn_to_produce = true;
-                            
-                            // CRITICAL: Skip all waiting and produce block NOW
-                            // Emergency producer doesn't wait for sync or anything
                         }
                     }
                 }
@@ -10526,9 +10687,14 @@ impl BlockchainNode {
                 // CRITICAL: Verify entropy consensus at rotation boundaries
                 // This prevents different nodes selecting different producers
                 // Rotation happens when creating blocks 31, 61, 91... (first block of new round)
-                if next_block_height > 1 && (next_block_height - 1) % 30 == 0 {
-                    // We're at a rotation boundary (blocks 31, 61, 91...)
-                    println!("[INFO][CONS] rotation_boundary h={}", next_block_height);
+                //
+                // v3.3: SKIP entropy consensus if WE ARE THE PRODUCER!
+                // Producer already knows they are producer - no need to wait for consensus
+                // This was causing blocking delays that triggered false emergency failovers!
+                // Only NON-producers need to wait for consensus to know who the producer is.
+                if next_block_height > 1 && (next_block_height - 1) % 30 == 0 && !is_my_turn_to_produce {
+                    // We're at a rotation boundary (blocks 31, 61, 91...) AND we're NOT the producer
+                    println!("[INFO][CONS] rotation_boundary h={} we_are_validator", next_block_height);
                     
                     if let Some(p2p) = &unified_p2p {
                         // CRITICAL FIX: Use FINALITY_WINDOW for entropy consensus (Byzantine-safe)
@@ -10942,6 +11108,13 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             }
                         }
                     }
+                } else if next_block_height > 1 && (next_block_height - 1) % 30 == 0 && is_my_turn_to_produce {
+                    // v3.3: Producer at rotation boundary - SKIP entropy consensus wait!
+                    // Producer already knows they are producer - no blocking wait needed
+                    // This fixes the issue where producer was delayed by consensus, causing false emergencies
+                    if is_info() {
+                        println!("[INFO][CONS] rotation_boundary h={} we_are_producer skip_consensus_wait", next_block_height);
+                    }
                 }
                 
                 // CRITICAL FIX: Update NODE_IS_SYNCHRONIZED for ALL nodes BEFORE producer check
@@ -11032,10 +11205,35 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         }
                     }
                     
-                    // Check if we're emergency producer - v2.96: lock-free
-                    let is_emergency_producer = get_emergency_producer()
-                        .map(|(height, _)| height == next_block_height)
-                        .unwrap_or(false);
+                    // v3.3: Check if we're emergency producer for THIS block (within emergency cycle)
+                    // Emergency producer works for ENTIRE rotation cycle, not just one block
+                    let (is_emergency_producer, emergency_producer_id) = if let Some((start_h, producer)) = get_emergency_producer() {
+                        let end_h = get_emergency_end_height();
+                        // Check if current block is within emergency cycle
+                        if next_block_height >= start_h && next_block_height < end_h {
+                            (producer == node_id, Some(producer))
+                        } else {
+                            (false, None)
+                        }
+                    } else {
+                        (false, None)
+                    };
+                    
+                    // v3.3: CRITICAL - If there's an emergency producer and it's NOT us, we CANNOT produce!
+                    // This prevents the original producer from creating blocks during emergency cycle
+                    if let Some(ref ep) = emergency_producer_id {
+                        if ep != &node_id {
+                            if is_info() {
+                                println!("[INFO][PROD] blocked_by_emergency h={} emergency_producer={} end_h={}", 
+                                         next_block_height, ep, get_emergency_end_height());
+                            }
+                            // Skip this iteration - emergency producer handles this block
+                            // Wait 1 block interval (1 second) before checking again
+                            // This matches block production rate and prevents spam
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
                     
                     // CRITICAL FIX: DO NOT clear emergency flag here - it causes deadlock!
                     // Flag will be cleared AFTER block is successfully created and saved
@@ -11084,13 +11282,14 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                 match storage.load_microblock(next_block_height) {
                                     Ok(Some(_)) => {
                                         let elapsed = (attempt as f32 * check_interval_ms as f32) / 1000.0;
-                                        println!("[EMERGENCY][WAIT] h={} attempt={}/{} status=arrived elapsed={:.1}s action=canceling_emergency", 
+                                        println!("[EMERGENCY][WAIT] h={} attempt={}/{} status=arrived elapsed={:.1}s action=skip_this_block", 
                                                  next_block_height, attempt, max_attempts, elapsed);
                                         
-                                        // Clear emergency flag - v2.96: lock-free
-                                        clear_emergency_producer();
-                                        println!("[EMERGENCY][WAIT] h={} flag_cleared reason=block_delivered_by_original", 
-                                                 next_block_height);
+                                        // v3.3: DON'T clear emergency flag - we remain emergency producer for the cycle
+                                        // Just skip this specific block since someone else created it
+                                        // Emergency producer continues to handle remaining blocks in the cycle
+                                        println!("[INFO][EMERGENCY] block_arrived_skip h={} remaining_emergency_until={}", 
+                                                 next_block_height, get_emergency_end_height());
                                         
                                         block_arrived = true;
                                         break;
@@ -12747,15 +12946,19 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // This prevents phantom height where node claims height N without having block N
                     if is_debug() { println!("[DBG][PROD] saved h={}", microblock.height); }
                     
-                    // CRITICAL FIX: Clear emergency flag AFTER successful block creation
-                    // This prevents deadlock where node forgets it's emergency producer
-                    // v2.96: lock-free
+                    // v3.3: Emergency producer works for ENTIRE rotation cycle
+                    // Only clear flag when rotation boundary is reached (end of cycle)
                     if is_emergency_producer {
-                        if let Some((height, _)) = get_emergency_producer() {
-                            if height == microblock.height {
-                                println!("[EMERGENCY] ✅ Clearing emergency flag after successful block #{} creation", microblock.height);
-                                clear_emergency_producer();
-                            }
+                        let end_height = get_emergency_end_height();
+                        // Clear only when we've created the LAST block of the cycle
+                        // (rotation boundary - 1, because rotation boundary is the NEXT cycle's first block)
+                        if end_height > 0 && microblock.height >= end_height - 1 {
+                            println!("[INFO][EMERGENCY] cycle_complete h={} end_h={} clearing_flag", 
+                                     microblock.height, end_height);
+                            clear_emergency_producer();
+                        } else if is_debug() {
+                            println!("[DBG][EMERGENCY] continuing h={} end_h={} remaining={}", 
+                                     microblock.height, end_height, end_height.saturating_sub(microblock.height));
                         }
                     }
                     
@@ -14107,16 +14310,54 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // v2.96: Lock-free retain with DashMap
             CACHED_PRODUCER_SELECTION.retain(|round, _| *round + 3 >= leadership_round);
             
+            // ═══════════════════════════════════════════════════════════════════════════
+            // v2.104: CRITICAL FIX - Check emergency producer AFTER QRDS selection
+            // ═══════════════════════════════════════════════════════════════════════════
+            // PROBLEM: QRDS selects producer deterministically, but if that producer is
+            // desynchronized, it cannot produce blocks. Network deadlocks.
+            //
+            // SOLUTION: After QRDS selection, check if there's an active emergency producer.
+            // Emergency producer (selected via failover) takes precedence over QRDS result.
+            //
+            // FLOW:
+            // 1. QRDS selects Producer X (deterministic, same on all nodes)
+            // 2. Producer X is not synced -> self-excludes -> broadcasts emergency
+            // 3. All nodes receive emergency -> set emergency flag for Producer Y
+            // 4. Next call to select_microblock_producer returns Producer Y (not X)
+            // ═══════════════════════════════════════════════════════════════════════════
+            // v3.3: Check emergency producer for ENTIRE rotation cycle
+            // Emergency producer works from start_height to end_height (rotation boundary)
+            let final_producer = if let Some((emergency_start_height, emergency_producer)) = get_emergency_producer() {
+                let emergency_end_height = get_emergency_end_height();
+                
+                // Check if current_height is within emergency cycle [start, end)
+                if current_height >= emergency_start_height && current_height < emergency_end_height {
+                    if is_info() {
+                        println!("[INFO][QRDS] emergency_override producer={} cycle=[{},{}] current_h={}", 
+                                 emergency_producer, emergency_start_height, emergency_end_height, current_height);
+                    }
+                    emergency_producer
+                } else {
+                    if is_debug() {
+                        println!("[DBG][QRDS] emergency_outside_cycle h={} start={} end={}", 
+                                 current_height, emergency_start_height, emergency_end_height);
+                    }
+                    selected_producer
+                }
+            } else {
+                selected_producer
+            };
+            
             // PRODUCTION: Log producer selection info ONLY at rotation boundaries for performance
             // Rotation happens at blocks 31, 61, 91... (not 30, 60, 90)
             if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
                 // New round - Quantum-Resistant Deterministic Selection (QRDS)
                 let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
                 println!("[QRDS] 🎯 Producer: {} (round: {}, DETERMINISTIC SELECTION, next rotation: block {})", 
-                         selected_producer, leadership_round, next_rotation_block);
+                         final_producer, leadership_round, next_rotation_block);
             }
             
-            selected_producer
+            final_producer
         } else {
             // Solo mode - no P2P peers
             println!("[QRDS] 🏠 Solo mode - self production");
@@ -14334,42 +14575,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 .collect();
             
             // ═══════════════════════════════════════════════════════════════════════════
-            // CRITICAL: Filter out recently failed producers using EXISTING function!
+            // v2.105: REMOVED NON-DETERMINISTIC FILTERING!
             // ═══════════════════════════════════════════════════════════════════════════
-            // WHY: Emergency should select MOST STABLE node, not one that's also failing
-            // EXAMPLE: Node002 failed 3 times recently → don't select as emergency!
-            // USES: get_recent_producer_failures() with CHECK_RANGE=30 blocks
-            let stable_candidates = if let Some(store) = &storage {
-                let mut filtered = Vec::new();
-                for (node_id, reputation) in &valid_candidates {
-                    let failure_count = Self::get_recent_producer_failures(
-                        &node_id, 
-                        current_height, 
-                        store
-                    ).await;
-                    
-                    if failure_count >= 3 {
-                        println!("[INFO][EMERGENCY] h={} peer={} status=excluded reason=unstable failures={}/30blocks", 
-                                 current_height, node_id, failure_count);
-                    } else {
-                        filtered.push((node_id.clone(), *reputation));
-                    }
-                }
-                
-                if filtered.is_empty() && !valid_candidates.is_empty() {
-                    // ALL candidates are unstable - use original list to prevent deadlock
-                    println!("[WARN][EMERGENCY] h={} all_candidates_unstable=true using_original_list", 
-                             current_height);
-                    valid_candidates.clone()
-                } else {
-                    filtered
-                }
-            } else {
-                valid_candidates
-            };
+            // CRITICAL BUG FIX: get_recent_producer_failures(storage) was using LOCAL storage
+            // which differs between nodes → different failure_count → different candidates → FORK!
+            //
+            // CORRECT APPROACH: Use ONLY N-2 macroblock snapshot (already done above)
+            // Failed producers are excluded via `all_failed` list (deterministic)
+            // NO LOCAL STORAGE QUERIES FOR CANDIDATE FILTERING!
+            // ═══════════════════════════════════════════════════════════════════════════
+            let stable_candidates = valid_candidates;
             
-            println!("[INFO][EMERGENCY] candidates={} excluded={}", 
-                     stable_candidates.len(), failed_producer);
+            if is_info() {
+                println!("[INFO][EMERGENCY] candidates={} excluded={}", 
+                         stable_candidates.len(), failed_producer);
+            }
             
             if stable_candidates.is_empty() {
                 println!("[WARN][EMERGENCY] no_valid_candidates=true");
@@ -14858,15 +15078,29 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
                 Ok(None) => {
-                    // v2.65: CRITICAL FIX - EMERGENCY FALLBACK
-                    // If MB#N-2 is missing, this node is DESYNCHRONIZED.
-                    // OLD BEHAVIOR: Return empty list → emergency failover fails → network DEADLOCK
-                    // NEW BEHAVIOR: Return Genesis list → emergency can continue → network RECOVERS
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // v3.2: CRITICAL FIX - NO FALLBACK! Node MUST sync before participating!
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    //
+                    // OLD BEHAVIOR (BROKEN): 
+                    //   Return fallback list from get_validated_active_peers()
+                    //   PROBLEM: Different nodes see different peers → different candidates → FORK!
+                    //
+                    // NEW BEHAVIOR (CORRECT):
+                    //   Return EMPTY LIST → node excluded from consensus
+                    //   Trigger SYNCHRONOUS sync attempt → node recovers on next round
+                    //   NO non-deterministic fallbacks!
+                    //
+                    // This is the ONLY correct approach because:
+                    // 1. Any fallback based on local state is NON-DETERMINISTIC
+                    // 2. Different nodes have different local P2P state
+                    // 3. Non-deterministic candidates → non-deterministic initiator → FORK
+                    // ═══════════════════════════════════════════════════════════════════════════
                     
-                    println!("[WARN][CAND] mb={} NOT_FOUND h={} - using Genesis fallback for emergency!", 
+                    println!("[ERR][CAND] DESYNC: mb={} NOT_FOUND h={} - node EXCLUDED from consensus!", 
                              required_macroblock, current_height);
                     
-                    // Trigger background sync for missing MacroBlock
+                    // Trigger sync for missing MacroBlock (but don't use result for THIS round)
                     let current_tasks = ACTIVE_MACROBLOCK_CHECK_TASKS.load(std::sync::atomic::Ordering::Relaxed);
                     if current_tasks < MAX_CONCURRENT_MACROBLOCK_CHECKS {
                         let p2p_clone = p2p.clone();
@@ -14883,56 +15117,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             }
                             let _guard = TaskGuard;
                             
-                            println!("[SYNC] Requesting missing MacroBlock #{}", missing_index);
+                            // v3.2: Clear pending sync first to ensure fresh request
+                            crate::unified_p2p::clear_macroblock_pending_sync(missing_index);
+                            
+                            println!("[SYNC] Requesting missing MacroBlock #{} for consensus recovery", missing_index);
                             if let Err(e) = p2p_clone.sync_macroblocks(missing_index, missing_index).await {
                                 println!("[WARN][SYNC] mb={} sync_failed={}", missing_index, e);
                             }
                         });
                     }
                     
-                    let validated_peers = p2p.get_validated_active_peers();
-                    
-                    let mut fallback_list: Vec<(String, f64)> = validated_peers.iter()
-                        .filter(|peer| !matches!(peer.node_type, crate::unified_p2p::NodeType::Light))
-                        .map(|peer| {
-                            // Get REAL reputation from deterministic state
-                            let rep = p2p.get_deterministic_reputation()
-                                .map(|rep_arc| {
-                                    let state = rep_arc.read();
-                                    state.get_reputation(&peer.id, 
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs())
-                                })
-                                .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
-                            
-                            (peer.id.clone(), rep / 100.0)
-                        })
-                        .collect();
-                    
-                    // Ensure own node included if qualified
-                    if !fallback_list.iter().any(|(id, _)| id == own_node_id) && own_node_type != NodeType::Light {
-                        let own_rep = p2p.get_deterministic_reputation()
-                            .map(|rep_arc| {
-                                let state = rep_arc.read();
-                                state.get_reputation(own_node_id, 
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs())
-                            })
-                            .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
-                        
-                        fallback_list.push((own_node_id.to_string(), own_rep / 100.0));
-                    }
-                    
-                    fallback_list.sort_by(|a, b| a.0.cmp(&b.0));
-                    fallback_list.dedup_by(|a, b| a.0 == b.0);
-                    
-                    if is_info() { println!("[INFO][CAND] fallback=all_peers n={} mb={}", fallback_list.len(), required_macroblock); }
-                    
-                    return fallback_list;
+                    // v3.2: Return EMPTY list - node cannot participate without MB N-2
+                    // This is CRITICAL for determinism - no fallbacks allowed!
+                    return Vec::new();
                 }
                 Err(e) => {
                     // v2.47: Storage error = node is broken, cannot participate
@@ -15501,34 +15698,30 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // CRITICAL v2.65: FALLBACK INITIATOR LOGIC
-        // If primary initiator is unavailable/desynced, next node in circle takes over
-        // This prevents network stall when initiator node has issues
+        // v3.2: NO EARLY FALLBACK INITIATOR DECISION!
+        // ═══════════════════════════════════════════════════════════════════════════
+        //
+        // OLD BEHAVIOR (BROKEN):
+        //   Check if primary initiator is available via get_validated_active_peers()
+        //   If not available, next node becomes fallback initiator
+        //   PROBLEM: Different nodes have different local P2P state → race condition!
+        //   
+        //   Node A sees primary unavailable → creates macroblock
+        //   Node B sees primary available → waits for primary
+        //   Result: potential fork or consensus failure!
+        //
+        // NEW BEHAVIOR (CORRECT):
+        //   Only deterministically selected initiator returns true here
+        //   Fallback happens via TIMEOUT in participate_in_macroblock_consensus()
+        //   All nodes use same timeout → deterministic fallback behavior
+        //
+        // If primary initiator fails to create macroblock within timeout:
+        //   1. All nodes detect via timeout (not local P2P state)
+        //   2. Emergency macroblock creation triggered (separate mechanism)
+        //   3. Sync from peers who received the macroblock
         // ═══════════════════════════════════════════════════════════════════════════
         
-        // Check if primary initiator is available as active peer
-        let initiator_available = p2p.get_validated_active_peers()
-            .iter()
-            .any(|peer| peer.id == *consensus_initiator);
-        
-        if !initiator_available {
-            // Primary initiator unavailable - check if we're next in circle
-            let our_index = sorted_candidates.iter()
-                .position(|(id, _)| id == &our_consensus_id);
-            
-            if let Some(our_idx) = our_index {
-                // Next candidate after primary initiator (circular)
-                let next_index = (initiator_index + 1) % sorted_candidates.len();
-                
-                if our_idx == next_index {
-                    if is_info() { println!("[INFO][CONS] fallback_initiator=true primary={} reason=unavailable", 
-                             consensus_initiator); }
-                    return true;  // I'm fallback initiator!
-                }
-            }
-        }
-        
-        // I'm participant (not initiator)
+        // I'm participant (not initiator) - wait for macroblock via timeout
         false
     }
     

@@ -198,25 +198,127 @@ const MAX_PENDING_SYNC_BLOCKS: usize = 1000;
 // If block not processed in 60s, remove from tracker to allow re-request
 const PENDING_SYNC_BLOCK_TTL_SECS: u64 = 60;
 
+// v2.104: Soft limit before cleanup triggers (80% of max)
+const SOFT_LIMIT_PENDING_SYNC_BLOCKS: usize = 800;
+
 /// v3.0: Check if block is already pending in sync queue
 pub fn is_block_pending_sync(height: u64) -> bool {
     PENDING_SYNC_BLOCKS.contains_key(&height)
 }
 
-/// v3.0: Mark block as pending in sync queue
-/// Returns false if already pending or queue is full (backpressure)
-pub fn mark_block_pending_sync(height: u64) -> bool {
-    // Backpressure: don't accept more if queue is full
-    if PENDING_SYNC_BLOCKS.len() >= MAX_PENDING_SYNC_BLOCKS {
-        return false;
-    }
-    
+/// v2.104: Cleanup stale and outdated entries from pending sync queue
+/// ═══════════════════════════════════════════════════════════════════════════
+/// PROBLEM: When sync queue fills up (1000 entries), new blocks are dropped.
+/// If dropped blocks include critical heights, sync deadlocks.
+///
+/// SOLUTION: Proactive cleanup of stale/outdated entries:
+/// 1. Stale: Entries older than TTL (60s) - likely failed to process
+/// 2. Outdated: Heights below local_height-10 - already processed or irrelevant
+///
+/// Returns number of entries removed
+/// ═══════════════════════════════════════════════════════════════════════════
+pub fn cleanup_pending_sync_blocks() -> usize {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     
-    // Returns None if key didn't exist (successful insert), Some if already there
+    let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+    let mut removed = 0usize;
+    
+    PENDING_SYNC_BLOCKS.retain(|height, timestamp| {
+        let is_stale = now.saturating_sub(*timestamp) > PENDING_SYNC_BLOCK_TTL_SECS;
+        let is_outdated = local_height > 10 && *height < local_height.saturating_sub(10);
+        
+        if is_stale || is_outdated {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    
+    if removed > 0 && crate::node::is_info() {
+        println!("[INFO][SYNC] queue_cleanup removed={} remaining={}", removed, PENDING_SYNC_BLOCKS.len());
+    }
+    
+    removed
+}
+
+/// v3.0: Mark block as pending in sync queue
+/// v2.104: FIXED - On backpressure, cleanup stale entries first instead of dropping
+/// ═══════════════════════════════════════════════════════════════════════════
+/// PROBLEM (before v2.104):
+/// When queue reached 1000 entries, ALL new blocks were rejected.
+/// If node was behind, it could never catch up -> deadlock.
+///
+/// ADDITIONAL FIX v2.104:
+/// If block is ALREADY in pending but timestamp is OLD (>TTL), allow re-queue.
+/// This fixes case where block was added to pending but never processed.
+///
+/// SOLUTION:
+/// 1. Soft limit (800): Trigger proactive cleanup
+/// 2. Hard limit (1000): Emergency cleanup of outdated entries
+/// 3. If block already in pending but stale (>TTL): allow re-queue
+/// 4. Only reject if queue is STILL full after cleanup
+///
+/// Returns false if already pending (and fresh) or queue is still full
+/// ═══════════════════════════════════════════════════════════════════════════
+pub fn mark_block_pending_sync(height: u64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    // v2.104: Check if block is already pending but STALE
+    // If pending for >TTL seconds, it likely never got processed - allow re-queue
+    if let Some(entry) = PENDING_SYNC_BLOCKS.get(&height) {
+        let timestamp = *entry;
+        if now.saturating_sub(timestamp) < PENDING_SYNC_BLOCK_TTL_SECS {
+            // Block is pending and fresh - skip
+            return false;
+        }
+        // Block is pending but stale - remove it to allow re-queue
+        drop(entry); // Release lock before remove
+        PENDING_SYNC_BLOCKS.remove(&height);
+        if crate::node::is_debug() {
+            println!("[DBG][SYNC] stale_pending_cleared h={} age={}s", height, now.saturating_sub(timestamp));
+        }
+    }
+    
+    // Soft limit: proactive cleanup
+    if PENDING_SYNC_BLOCKS.len() >= SOFT_LIMIT_PENDING_SYNC_BLOCKS {
+        cleanup_pending_sync_blocks();
+    }
+    
+    // Hard limit: emergency cleanup
+    if PENDING_SYNC_BLOCKS.len() >= MAX_PENDING_SYNC_BLOCKS {
+        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        let mut entries_to_remove: Vec<u64> = Vec::new();
+        
+        // Remove entries below local height (already processed)
+        for entry in PENDING_SYNC_BLOCKS.iter() {
+            if *entry.key() < local_height.saturating_sub(5) {
+                entries_to_remove.push(*entry.key());
+            }
+            if entries_to_remove.len() >= 100 {
+                break;
+            }
+        }
+        
+        for h in entries_to_remove {
+            PENDING_SYNC_BLOCKS.remove(&h);
+        }
+        
+        if PENDING_SYNC_BLOCKS.len() >= MAX_PENDING_SYNC_BLOCKS {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] queue_full_after_cleanup size={} rejecting={}", 
+                         PENDING_SYNC_BLOCKS.len(), height);
+            }
+            return false;
+        }
+    }
+    
     PENDING_SYNC_BLOCKS.insert(height, now).is_none()
 }
 
@@ -253,14 +355,41 @@ pub fn is_macroblock_pending_sync(index: u64) -> bool {
 
 /// v3.1: Mark macroblock as pending in sync queue
 /// Returns false if already pending or queue is full
+/// v3.2: CRITICAL FIX - Proactive cleanup before rejecting to prevent systematic skips
 pub fn mark_macroblock_pending_sync(index: u64) -> bool {
-    if PENDING_SYNC_MACROBLOCKS.len() >= MAX_PENDING_SYNC_MACROBLOCKS {
-        return false;
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    
+    // v3.2: If queue is near full, do proactive cleanup FIRST
+    if PENDING_SYNC_MACROBLOCKS.len() >= MAX_PENDING_SYNC_MACROBLOCKS - 10 {
+        // Emergency cleanup: remove stale entries (TTL expired)
+        let cutoff = now.saturating_sub(PENDING_SYNC_MACROBLOCK_TTL_SECS);
+        PENDING_SYNC_MACROBLOCKS.retain(|_, &mut timestamp| timestamp > cutoff);
+        
+        // Also remove very old indices (far below current network height)
+        // Macroblocks older than current - 50 are unlikely to be needed
+        if let Some(max_idx) = PENDING_SYNC_MACROBLOCKS.iter().map(|e| *e.key()).max() {
+            if max_idx > 50 {
+                let min_valid = max_idx.saturating_sub(50);
+                PENDING_SYNC_MACROBLOCKS.retain(|&idx, _| idx >= min_valid);
+            }
+        }
+        
+        if crate::node::is_warn() {
+            println!("[WARN][MB-PENDING] queue_cleanup size={}", PENDING_SYNC_MACROBLOCKS.len());
+        }
+    }
+    
+    // Final check after cleanup
+    if PENDING_SYNC_MACROBLOCKS.len() >= MAX_PENDING_SYNC_MACROBLOCKS {
+        if crate::node::is_warn() {
+            println!("[WARN][MB-PENDING] queue_full idx={} size={}", index, PENDING_SYNC_MACROBLOCKS.len());
+        }
+        return false;
+    }
+    
     PENDING_SYNC_MACROBLOCKS.insert(index, now).is_none()
 }
 
@@ -291,29 +420,8 @@ pub fn cleanup_pending_sync_macroblocks() -> usize {
     before.saturating_sub(PENDING_SYNC_MACROBLOCKS.len())
 }
 
-/// v3.0: Cleanup stale entries from PENDING_SYNC_BLOCKS (TTL 60 seconds)
-/// Call periodically to prevent "stuck" entries from blocking re-requests
-pub fn cleanup_pending_sync_blocks() -> usize {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    
-    let cutoff = now.saturating_sub(PENDING_SYNC_BLOCK_TTL_SECS);
-    let before = PENDING_SYNC_BLOCKS.len();
-    
-    // Remove entries older than TTL
-    PENDING_SYNC_BLOCKS.retain(|_, &mut timestamp| timestamp > cutoff);
-    
-    let removed = before.saturating_sub(PENDING_SYNC_BLOCKS.len());
-    if removed > 0 && crate::node::is_info() {
-        println!("[INFO][SYNC] pending_blocks_ttl_cleanup removed={} remaining={}", 
-                 removed, PENDING_SYNC_BLOCKS.len());
-    }
-    removed
-}
-
 // PRODUCTION: Peer cleanup interval
+// NOTE: cleanup_pending_sync_blocks() is defined once at line ~220 (v2.105 - removed duplicate)
 // Clean up inactive peers after 30 minutes (reasonable timeout for network health)
 // NOTE: Independent from certificate lifetime (270s) - peers can be temporarily inactive
 const PEER_INACTIVE_TIMEOUT_SECS: u64 = 1800; // 30 minutes - balanced cleanup interval
@@ -15375,18 +15483,33 @@ impl SimplifiedP2P {
     /// 1. Check PENDING_SYNC_BLOCKS (already queued but not processed yet)
     /// 2. Check storage (already processed and saved)
     /// 3. Backpressure: reject if queue > MAX_PENDING_SYNC_BLOCKS
+    /// 
+    /// v2.104: FIXED - On backpressure, cleanup stale entries first instead of dropping
     pub fn handle_blocks_batch(&self, blocks: Vec<(u64, Vec<u8>)>, from_height: u64, to_height: u64, sender_id: String) {
         // CRITICAL FIX: Update last_seen AND height for sender (use highest block in batch)
         self.update_peer_last_seen_with_height(&sender_id, Some(to_height));
         
-        // v3.0: BACKPRESSURE - Check queue size before processing
+        // v2.104: BACKPRESSURE - Check queue size and cleanup if needed
+        let queue_size = get_pending_sync_count();
+        if queue_size >= SOFT_LIMIT_PENDING_SYNC_BLOCKS {
+            // Proactive cleanup before hard limit
+            let cleaned = cleanup_pending_sync_blocks();
+            if crate::node::is_info() && cleaned > 0 {
+                println!("[INFO][SYNC] proactive_cleanup cleaned={} queue_now={}", 
+                         cleaned, get_pending_sync_count());
+            }
+        }
+        
+        // Check again after cleanup
         let queue_size = get_pending_sync_count();
         if queue_size >= MAX_PENDING_SYNC_BLOCKS {
+            // v2.104: Even after cleanup, queue is full - log and continue with what we can
+            // Don't return immediately - try to process some blocks
             if crate::node::is_warn() {
-                println!("[WARN][SYNC] backpressure queue={} max={} drop_batch from={}", 
+                println!("[WARN][SYNC] backpressure queue={} max={} from={} (will process with priority)", 
                          queue_size, MAX_PENDING_SYNC_BLOCKS, sender_id);
             }
-            return;
+            // Don't return - let individual blocks be processed with priority filtering
         }
         
         // v3.0: DEDUPLICATION - Check storage BEFORE queuing to prevent 3x memory usage
@@ -15672,33 +15795,77 @@ impl SimplifiedP2P {
             requester_id: self.node_id.clone(),
         };
         
-        // v2.96: Try each peer until one succeeds (retry on failure)
-        let mut success = false;
-        for peer in eligible_peers.iter().take(3) {
-            if crate::node::is_debug() {
-                println!("[DBG][MB-SYNC] try peer={} rep={:.1}", peer.id, peer.combined_reputation());
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v2.105: CRITICAL FIX - SEQUENTIAL retry with WAIT for response
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Same fix as sync_blocks - wait for macroblock to actually arrive!
+        // ═══════════════════════════════════════════════════════════════════════════
+        
+        let storage = match crate::node::try_get_storage() {
+            Some(s) => s,
+            None => return Err("Storage unavailable for macroblock sync".to_string()),
+        };
+        
+        let max_peers_to_try = 5.min(eligible_peers.len());
+        
+        for (attempt, peer) in eligible_peers.iter().take(max_peers_to_try).enumerate() {
+            if peer.id == self.node_id {
+                continue;
             }
             
-            // Send request and check if peer is reachable
-            if Self::test_peer_connectivity_static(&peer.addr) {
-                self.send_network_message(&peer.addr, request.clone());
-                if crate::node::is_info() {
-                    println!("[INFO][MB-SYNC] sent to={} idx={}-{}", peer.id, from_index, to_index);
-                }
-                success = true;
-                break;
-            } else {
+            // Check if peer is reachable
+            if !Self::test_peer_connectivity_static(&peer.addr) {
                 if crate::node::is_warn() {
                     println!("[WARN][MB-SYNC] peer_unreachable id={} retry=next", peer.id);
                 }
+                continue;
+            }
+            
+            if crate::node::is_info() {
+                println!("[INFO][MB-SYNC] request idx={}-{} peer={} attempt={}/{}", 
+                         from_index, to_index, peer.id, attempt + 1, max_peers_to_try);
+            }
+            
+            // Send request
+            self.send_network_message(&peer.addr, request.clone());
+            
+            // v3.3: ADAPTIVE TIMEOUT based on ACTUAL batch size from server
+            // Server limits: max 10 macroblocks per response (see handle_macroblock_request)
+            // Macroblocks are ~100-500KB each, but validation requires checking all signatures
+            let requested_count = to_index - from_index + 1;
+            let actual_batch_size = requested_count.min(10);  // Server sends max 10!
+            let timeout_secs = match actual_batch_size {
+                1 => 6,           // Single macroblock - 6 sec (includes signature validation)
+                2..=5 => 10,      // Small batch - 10 sec
+                6..=10 => 15,     // Max batch - 15 sec (10 macroblocks × 500KB = 5MB + validation)
+                _ => 15,          // Unreachable, but safe fallback
+            };
+            tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+            
+            // Check if macroblocks were received
+            let mut all_received = true;
+            for idx in from_index..=to_index {
+                if storage.get_macroblock_by_height(idx).map(|opt| opt.is_some()).unwrap_or(false) {
+                    continue;
+                } else {
+                    all_received = false;
+                    break;
+                }
+            }
+            
+            if all_received {
+                if crate::node::is_info() {
+                    println!("[INFO][MB-SYNC] received idx={}-{} from={}", from_index, to_index, peer.id);
+                }
+                return Ok(());
+            } else {
+                if crate::node::is_warn() {
+                    println!("[WARN][MB-SYNC] no_response idx={}-{} from={} trying_next", from_index, to_index, peer.id);
+                }
             }
         }
         
-        if !success {
-            return Err("All peers unreachable for macroblock sync".to_string());
-        }
-        
-        Ok(())
+        Err(format!("Macroblock sync failed: all peers did not respond for idx={}-{}", from_index, to_index))
     }
     
     /// Get current macroblock index from chain height
@@ -15818,6 +15985,9 @@ impl SimplifiedP2P {
     /// - Deduplication layer (handle_blocks_batch) catches any duplicates
     /// 
     /// v2.96: Filter by failover cache to exclude offline peers
+    /// v2.104: CRITICAL FIX - Send to MULTIPLE peers, not just one!
+    ///         Previous bug: sent to one peer, returned Ok(), peer didn't respond,
+    ///         next call picked same peer again → deadlock
     pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), String> {
         
         let peers = self.get_validated_active_peers();
@@ -15849,34 +16019,107 @@ impl SimplifiedP2P {
         live_peers.sort_by(|a, b| b.combined_reputation().partial_cmp(&a.combined_reputation())
             .unwrap_or(std::cmp::Ordering::Equal));
         
-        // v3.0: SEQUENTIAL RETRY - Request from ONE peer at a time
-        // This prevents 3x memory usage from parallel requests
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v2.105: CRITICAL FIX - SEQUENTIAL retry with WAIT for response
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PROBLEM (before v2.105):
+        //   - Sent to 3 peers in parallel → returned Ok() immediately
+        //   - If peers didn't respond, no retry to OTHER peers
+        //   - Infinite loop requesting from same unresponsive peers
+        //
+        // SOLUTION:
+        //   - Try peers SEQUENTIALLY (not parallel)
+        //   - Wait 2s after each request to see if blocks arrive
+        //   - Check storage to verify blocks were received
+        //   - If not received → try next peer
+        //   - Return error only if ALL peers fail
+        // ═══════════════════════════════════════════════════════════════════════════
+        
         let request = NetworkMessage::RequestBlocks {
             from_height,
             to_height,
             requester_id: self.node_id.clone(),
         };
         
-        // Try peers in order of reputation until one succeeds
-        for peer in live_peers.iter().take(3) {
+        let mut tried_peers = 0u32;
+        let max_peers_to_try = 5.min(live_peers.len());
+        
+        for peer in live_peers.iter().take(max_peers_to_try) {
             if peer.id == self.node_id {
                 continue;
             }
             
+            tried_peers += 1;
+            
             if crate::node::is_info() {
-                println!("[INFO][SYNC] request h={}-{} peer={} rep={:.1}", 
-                         from_height, to_height, peer.id, peer.combined_reputation());
+                println!("[INFO][SYNC] request h={}-{} peer={} attempt={}/{}", 
+                         from_height, to_height, peer.id, tried_peers, max_peers_to_try);
             }
             
+            // Send request
             self.send_network_message(&peer.addr, request.clone());
             
-            // v3.0: Successfully sent to one peer - that's enough
-            // If this peer fails, caller will retry and pick next peer
-            // Deduplication in handle_blocks_batch handles any overlap
-            return Ok(());
+            // v3.3: ADAPTIVE TIMEOUT based on ACTUAL batch size from server
+            // Server limits: max 100 blocks per response (see handle_block_request)
+            // Calculation: 100 blocks × 1MB avg = 100MB at 1Gbps = 0.8 sec
+            // Worst case: 100 blocks × 30MB (100K TPS) = 3GB at 1Gbps = 24 sec
+            let requested_count = to_height - from_height + 1;
+            let actual_batch_size = requested_count.min(100);  // Server sends max 100!
+            let timeout_secs = match actual_batch_size {
+                1 => 5,           // Single block - 5 sec (margin for 40MB at slow connection)
+                2..=10 => 8,      // Small batch - 8 sec
+                11..=30 => 12,    // Medium batch - 12 sec
+                31..=50 => 18,    // Large batch - 18 sec
+                _ => 25,          // Max batch (51-100) - 25 sec (3GB at 1Gbps = 24 sec)
+            };
+            tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+            
+            // Check if blocks were received
+            let storage = match crate::node::try_get_storage() {
+                Some(s) => s,
+                None => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][SYNC] storage_unavailable trying_next_peer");
+                    }
+                    continue;
+                }
+            };
+            
+            // Check if at least the first block was received
+            let first_received = storage.load_microblock(from_height)
+                .map(|opt| opt.is_some())
+                .unwrap_or(false);
+            
+            if first_received {
+                // Check how many blocks we got
+                let mut received_count = 0u64;
+                for h in from_height..=to_height {
+                    if storage.load_microblock(h).map(|opt| opt.is_some()).unwrap_or(false) {
+                        received_count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                
+                if crate::node::is_info() {
+                    println!("[INFO][SYNC] received h={}-{} from={} count={}/{}", 
+                             from_height, from_height + received_count - 1, peer.id, 
+                             received_count, to_height - from_height + 1);
+                }
+                return Ok(());
+            } else {
+                if crate::node::is_warn() {
+                    println!("[WARN][SYNC] no_response h={} from={} trying_next_peer", from_height, peer.id);
+                }
+            }
         }
         
-        Err("No valid peers to sync from".to_string())
+        // All peers failed
+        if tried_peers > 0 {
+            Err(format!("Sync failed: all {} peers did not respond for h={}-{}", tried_peers, from_height, to_height))
+        } else {
+            Err("No valid peers to sync from (all excluded)".to_string())
+        }
     }
     
     /// ═══════════════════════════════════════════════════════════════════════════
@@ -18479,9 +18722,17 @@ impl SimplifiedP2P {
                     if current_stop_height == 0 {
                         EMERGENCY_STOP_HEIGHT.store(block_height, Ordering::Relaxed);
                         EMERGENCY_STOP_TIME.store(current_time, Ordering::Relaxed);
-                        println!("[RECOVERY] 📍 Will auto-recover after 10 seconds (time-based) or 10 blocks");
+                        
+                        // v3.3: Calculate end of rotation cycle - stop until rotation boundary
+                        let rotation_interval = 30u64;
+                        let current_cycle = block_height / rotation_interval;
+                        let cycle_end = (current_cycle + 1) * rotation_interval;
+                        let remaining_in_cycle = cycle_end.saturating_sub(block_height);
+                        
+                        println!("[INFO][RECOVERY] stop_until_rotation h={} cycle_end={} remaining={}", 
+                                 block_height, cycle_end, remaining_in_cycle);
                     } else {
-                        println!("[RECOVERY] ⚠️ Already stopped at block #{}, not resetting timer", current_stop_height);
+                        println!("[INFO][RECOVERY] already_stopped at_h={}", current_stop_height);
                     }
                     // Main loop will check this flag and stop producing blocks
                     // This prevents fork creation when emergency failover happens
@@ -18493,8 +18744,9 @@ impl SimplifiedP2P {
             }
         }
         
-        // Check if we should clear the emergency stop (been stopped for 10+ blocks OR 10+ seconds)
-        // This applies to Super/Full nodes that were previously stopped
+        // v3.3: Check if we should clear the emergency stop
+        // Emergency stop lasts until END OF ROTATION CYCLE (30 blocks), not just 10
+        // This ensures emergency producer has exclusive control for entire cycle
         if EMERGENCY_STOP_PRODUCTION.load(Ordering::Relaxed) {
             let stop_height = EMERGENCY_STOP_HEIGHT.load(Ordering::Relaxed);
             let stop_time = EMERGENCY_STOP_TIME.load(Ordering::Relaxed);
@@ -18503,23 +18755,21 @@ impl SimplifiedP2P {
                 .unwrap_or_default()
                 .as_secs();
             
-            // CRITICAL FIX: Clear stop EITHER after 10 blocks OR 10 seconds (whichever comes first)
-            // This prevents deadlock when network stops producing blocks
-            let blocks_passed = if block_height > stop_height { block_height - stop_height } else { 0 };
+            // v3.3: Calculate rotation boundary for the cycle when stop was triggered
+            let rotation_interval = 30u64;
+            let stop_cycle = stop_height / rotation_interval;
+            let cycle_end = (stop_cycle + 1) * rotation_interval;
+            
+            // Clear when we've passed the rotation boundary OR 60 seconds (safety timeout)
             let seconds_passed = if current_time > stop_time { current_time - stop_time } else { 0 };
             
-            if stop_height > 0 && (blocks_passed >= 10 || seconds_passed >= 10) {
-                println!("[RECOVERY] ✅ Auto-clearing emergency stop after {} blocks / {} seconds", 
-                        blocks_passed, seconds_passed);
+            if stop_height > 0 && (block_height >= cycle_end || seconds_passed >= 60) {
+                println!("[INFO][RECOVERY] stop_cleared h={} cycle_end={} reason={}", 
+                        block_height, cycle_end,
+                        if block_height >= cycle_end { "rotation_complete" } else { "timeout_60s" });
                 EMERGENCY_STOP_PRODUCTION.store(false, Ordering::Relaxed);
                 EMERGENCY_STOP_HEIGHT.store(0, Ordering::Relaxed);
                 EMERGENCY_STOP_TIME.store(0, Ordering::Relaxed);
-                println!("[RECOVERY] 🚀 Node can now resume block production");
-            } else if stop_height > 0 {
-                let blocks_remaining = 10_u64.saturating_sub(blocks_passed);
-                let seconds_remaining = 10_u64.saturating_sub(seconds_passed);
-                println!("[RECOVERY] ⏳ Emergency stop active for {} more blocks OR {} more seconds", 
-                        blocks_remaining, seconds_remaining);
             }
         }
         
@@ -18549,17 +18799,27 @@ impl SimplifiedP2P {
             return;
         }
         
-        // CRITICAL FIX: Set EMERGENCY_PRODUCER_FLAG IMMEDIATELY if WE are the new emergency producer
-        // This MUST happen BEFORE any async tasks to ensure immediate activation
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v2.104: CRITICAL FIX - Set emergency producer flag on ALL nodes
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PROBLEM (before v2.104):
+        //   - Only the new emergency producer set the flag
+        //   - Other nodes didn't know about emergency -> continued using QRDS result
+        //   - QRDS returned failed producer -> network deadlock!
+        //
+        // SOLUTION:
+        //   - ALL nodes receiving emergency broadcast set the flag
+        //   - select_microblock_producer checks emergency flag AFTER QRDS
+        //   - If emergency flag is set, use emergency producer instead of QRDS result
+        // ═══════════════════════════════════════════════════════════════════════════
+        use crate::node::set_emergency_producer_flag;
+        
+        set_emergency_producer_flag(block_height, new_producer.clone());
+        
         if new_producer == self.node_id {
-            println!("[FAILOVER] 🚀 WE ARE THE EMERGENCY PRODUCER - Setting flag for block #{}", block_height);
-            
-            // Use the global EMERGENCY_PRODUCER_FLAG from node.rs
-            // This is exposed as a public static in node.rs
-            use crate::node::set_emergency_producer_flag;
-            
-            set_emergency_producer_flag(block_height, new_producer.clone());
-            println!("[FAILOVER] ✅ Emergency producer flag set successfully");
+            println!("[INFO][FAILOVER] we_are_emergency h={}", block_height);
+        } else if crate::node::is_debug() {
+            println!("[DBG][FAILOVER] emergency_set h={} producer={}", block_height, new_producer);
         }
         
         // Log emergency change for network transparency
