@@ -67,7 +67,7 @@ export async function GET() {
           ? `${(circulatingSupply / 1_000).toFixed(2)}K`
           : `${Math.floor(circulatingSupply).toLocaleString()}`;
       } catch (dbError) {
-        console.error('[API] Failed to fetch circulating supply from DB:', dbError);
+        /* log disabled */
       }
       
       const response = NextResponse.json({

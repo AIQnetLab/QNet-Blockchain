@@ -178,8 +178,7 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
       
       return transformDbBlock(dbBlock, transactions);
     }
-  } catch (dbErr) {
-    console.error('[BLOCK] PostgreSQL error:', dbErr);
+  } catch {
     // Continue to RPC fallback
   }
   
@@ -196,7 +195,6 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
     });
     
     if (!response.ok) {
-      console.error(`[BLOCK] Node RPC failed: ${response.status}`);
       return null;
     }
     
@@ -205,8 +203,7 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
     
     const block = (data.block || data) as Record<string, unknown>;
     return transformRpcBlock(block);
-  } catch (err) {
-    console.error(`[BLOCK] RPC Error:`, err);
+  } catch {
     return null;
   }
 }

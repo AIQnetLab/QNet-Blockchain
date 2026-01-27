@@ -38,10 +38,10 @@ export default function SearchBar({
         onSearchResults?.(response.data);
       } else {
         setResults([]);
-        console.error('Search failed:', response.error);
+        /* log disabled */
       }
     } catch (error) {
-      console.error('Search error:', error);
+      /* log disabled */
       setResults([]);
     } finally {
       setIsSearching(false);

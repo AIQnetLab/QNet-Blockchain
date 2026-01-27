@@ -73,7 +73,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<Activatio
       txHash: activationData.burn_transaction || activationData.activation_id 
     });
   } catch (error) {
-    console.error('Activation error:', error);
+    /* log disabled */
     return NextResponse.json({ success: false, error: 'Unexpected server error' }, { status: 500 });
   }
 }
@@ -109,7 +109,7 @@ export async function GET(): Promise<NextResponse> {
       });
     }
   } catch (error) {
-    console.error('Bridge API unavailable:', error);
+    /* log disabled */
   }
   
   // Fallback if bridge offline: Use current production baseline (0% burned = 1500 1DEV)

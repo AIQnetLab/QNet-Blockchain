@@ -92,10 +92,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (accounts && accounts.length > 0) {
         setIsWalletConnected(true);
         setWalletAddress(accounts[0]);
-        console.log('✅ QNet Wallet connected:', accounts[0]);
+        /* log disabled */
       }
     } catch (error) {
-      console.error('❌ Failed to connect QNet Wallet:', error);
+      /* log disabled */
       throw error;
     }
   };
@@ -107,7 +107,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setWalletAddress(null);
       setNodeStatus('inactive');
       setNodeType(null);
-      console.log('🔌 QNet Wallet disconnected');
+      /* log disabled */
     }
   };
 

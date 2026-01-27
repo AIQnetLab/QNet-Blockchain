@@ -186,7 +186,7 @@ export async function GET(request: NextRequest) {
     });
     
     if (jsonString.length > 10 * 1024 * 1024) {
-      console.warn('[API] Response too large, truncating data');
+      /* log disabled */
       return NextResponse.json({
         success: true,
         version: 'v4.0-postgresql',
@@ -224,13 +224,7 @@ export async function GET(request: NextRequest) {
       }
     });
   } catch (err) {
-    console.error('[API] Activity route error:', err);
     const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-    console.error('[API] Error details:', {
-      message: errorMessage,
-      stack: err instanceof Error ? err.stack : undefined,
-      DATABASE_URL: process.env.DATABASE_URL ? 'set' : 'not set',
-    });
     return NextResponse.json({
       success: false,
       error: `Database error: ${errorMessage}`,

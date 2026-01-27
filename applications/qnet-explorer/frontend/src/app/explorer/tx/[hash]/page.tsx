@@ -25,33 +25,20 @@ const truncate = (str: string, start = 8, end = 6): string => {
   return `${str.slice(0, start)}...${str.slice(-end)}`;
 };
 
-// Format time (timestamp in ms or seconds)
-const formatTime = (ts: number): string => {
-  if (!ts || ts === 0) return '—';
-  
-  // Convert seconds to ms if needed (timestamp < 1e12 means it's in seconds)
-  let msTs: number;
-  if (ts < 1e12) {
-    msTs = ts * 1000;
-  } else {
-    msTs = ts;
+// Format timestamp (same logic as blocks page)
+const formatTime = (ts: number | string | undefined): string => {
+  // Ensure ts is a valid number (PostgreSQL BIGINT may come as string)
+  const timestamp = Number(ts);
+  if (!timestamp || !Number.isFinite(timestamp) || timestamp <= 0) {
+    return 'Genesis Transaction';
   }
-  
-  // Validate timestamp (must be after 2000-01-01)
-  if (msTs < 946684800000) { // Before 2000-01-01
-    return '—';
+  // Convert to milliseconds if in seconds
+  const ms = timestamp > 1e12 ? timestamp : timestamp * 1000;
+  const date = new Date(ms);
+  if (isNaN(date.getTime())) {
+    return 'Invalid Date';
   }
-  
-  try {
-    const date = new Date(msTs);
-    // Check if date is valid
-    if (isNaN(date.getTime())) {
-      return '—';
-    }
-    return date.toUTCString();
-  } catch {
-    return '—';
-  } 
+  return date.toUTCString();
 };
 
 // Copy button
@@ -159,8 +146,8 @@ export default function TransactionPage() {
           <h1>{hash}</h1>
           <CopyBtn text={hash} />
         </div>
-        <div className="block-timestamp">
-          {tx.timestamp && tx.timestamp > 0 ? formatTime(tx.timestamp) : '—'}
+        <div className="block-timestamp" suppressHydrationWarning>
+          {formatTime(tx.timestamp)}
         </div>
       </div>
 
@@ -185,18 +172,26 @@ export default function TransactionPage() {
           <div className="detail-row">
             <span className="detail-label">From</span>
             <span className="detail-value">
-              <Link href={`/explorer/address/${tx.from}`} className="address-link">
-                {truncate(tx.from, 12, 8)}
-              </Link>
+              {tx.from && tx.from.length > 10 && tx.from.includes('eon') ? (
+                <Link href={`/explorer/address/${tx.from}`} className="address-link">
+                  {truncate(tx.from, 12, 8)}
+                </Link>
+              ) : (
+                <span className="address-link">{tx.from || 'N/A'}</span>
+              )}
               <CopyBtn text={tx.from} />
             </span>
           </div>
           <div className="detail-row">
             <span className="detail-label">To</span>
             <span className="detail-value">
-              <Link href={`/explorer/address/${tx.to}`} className="address-link">
-                {truncate(tx.to, 12, 8)}
-              </Link>
+              {tx.to && tx.to.length > 10 && tx.to.includes('eon') ? (
+                <Link href={`/explorer/address/${tx.to}`} className="address-link">
+                  {truncate(tx.to, 12, 8)}
+                </Link>
+              ) : (
+                <span className="address-link">{tx.to || 'N/A'}</span>
+              )}
               <CopyBtn text={tx.to} />
             </span>
           </div>

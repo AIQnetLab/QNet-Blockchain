@@ -9640,7 +9640,9 @@ impl BlockchainNode {
                                                 if transport.broadcast_to(quic_addr, &ping_msg).await.is_ok() {
                                                     quic_success += 1;
                                                     if is_debug() {
-                                                        println!("[DBG][P2P] quic_ping_sent ip={} port={}", ip, quic_port);
+                                                        // PRIVACY: Use pseudonym instead of raw IP
+                                                        let peer_display = crate::unified_p2p::get_privacy_id_for_addr(ip);
+                                                        println!("[DBG][P2P] quic_ping_sent peer={} port={}", peer_display, quic_port);
                                                     }
                                                 }
                                             }
@@ -9857,8 +9859,10 @@ impl BlockchainNode {
                         // CRITICAL: Trigger emergency if no blocks for 10+ seconds
                         // This is GLOBAL stall detection, not just local
                         if time_since_last_block > 10 && microblock_height > 0 {
-                            println!("[STALL] 🚨 NETWORK STALL DETECTED! No blocks for {} seconds", time_since_last_block);
-                            println!("[STALL] 📊 Last block: #{} at timestamp {}", last_block_height, last_block_time);
+                            if is_warn() {
+                                println!("[WARN][STALL] no_blocks_for={}s last_h={} local_h={}", 
+                                         time_since_last_block, last_block_height, microblock_height);
+                            }
                             
                             // STATE MACHINE: Network stall detected
                             set_node_state(NodeState::Error {
@@ -9868,14 +9872,17 @@ impl BlockchainNode {
                             
                             // Force emergency producer selection if we're supposed to be producing
                             if let Some(p2p) = &unified_p2p {
-                                let next_height = microblock_height + 1;
+                                let next_height = last_block_height + 1;
                                 let expected_producer = Self::select_microblock_producer(
                                     next_height, &unified_p2p, &node_id, node_type,
                                     Some(&storage), &quantum_poh
                                 ).await;
                                 
                                 if time_since_last_block > 15 {
-                                    println!("[STALL] 🔥 Triggering emergency failover for producer: {}", expected_producer);
+                                    if is_warn() {
+                                        println!("[WARN][STALL] emergency h={} producer={} local={} network={}", 
+                                                 next_height, expected_producer, microblock_height, last_block_height);
+                                    }
                                     
                                     // Select emergency producer
                                     let emergency_producer = Self::select_emergency_producer(
@@ -9888,7 +9895,10 @@ impl BlockchainNode {
                                         &expected_producer, &emergency_producer, 
                                         next_height, "network_stall"
                                     ) {
-                                        println!("[STALL] ⚠️ Failed to broadcast emergency: {}", e);
+                                        if is_warn() { println!("[WARN][STALL] broadcast_failed err={}", e); }
+                                    } else if is_info() {
+                                        println!("[INFO][STALL] emergency_broadcast h={} from={} to={}", 
+                                                 next_height, expected_producer, emergency_producer);
                                     }
                                 }
                                 
@@ -10172,9 +10182,11 @@ impl BlockchainNode {
                                     let timeout_secs = std::cmp::max(60, (blocks_to_sync / 10) + 30);  // Min 60s, ~10 blocks/sec + 30s buffer
                                     if is_debug() { println!("[DBG][SYNC] timeout={}s blocks={}", timeout_secs, blocks_to_sync); }
                                     
+                                    // CRITICAL FIX: parallel_download_microblocks expects current_height and iterates from current_height+1
+                                    // sync_from_height is already the FIRST block to download, so pass sync_from_height-1
                                     let sync_result = tokio::time::timeout(
                                         Duration::from_secs(timeout_secs),
-                                        p2p_clone.parallel_download_microblocks(&storage_clone, sync_from_height, sync_to_height)
+                                        p2p_clone.parallel_download_microblocks(&storage_clone, sync_from_height.saturating_sub(1), sync_to_height)
                                     ).await;
                                     
                                     match sync_result {

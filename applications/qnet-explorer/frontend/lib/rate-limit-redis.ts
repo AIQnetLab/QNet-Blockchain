@@ -33,7 +33,7 @@ async function initRedis(): Promise<void> {
     });
     
     redisClient.on('error', (err: Error) => {
-      console.error('[RateLimit] Redis error:', err);
+      // console.error('[RateLimit] Redis error:', err);
       redisAvailable = false;
     });
     
@@ -185,7 +185,7 @@ export async function closeRedis(): Promise<void> {
       redisClient = null;
       redisAvailable = false;
     } catch (err) {
-      console.error('[RateLimit] Error closing Redis:', err);
+      // console.error('[RateLimit] Error closing Redis:', err);
     }
   }
 }

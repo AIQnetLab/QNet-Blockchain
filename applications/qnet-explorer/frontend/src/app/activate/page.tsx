@@ -40,7 +40,7 @@ export default function ActivatePage() {
         }
       })
       .catch(error => {
-        console.error('Failed to fetch real-time pricing:', error);
+        /* log disabled */
         // Keep default values on error
       });
   }, []);
@@ -109,9 +109,9 @@ export default function ActivatePage() {
     try {
       // Simulate activation process
       await new Promise(resolve => setTimeout(resolve, 2000));
-      console.log('Node activated:', nodeId);
+      /* log disabled */
     } catch (error) {
-      console.error('Activation failed:', error);
+      /* log disabled */
     } finally {
       setActivating(false);
     }

@@ -9,8 +9,7 @@ export async function POST() {
     let status;
     try {
       status = await getSyncServiceStatus();
-    } catch (statusErr) {
-      console.warn('[API] Could not get initial status, starting anyway:', statusErr);
+    } catch {
       status = { isRunning: false } as any;
     }
     
@@ -22,7 +21,6 @@ export async function POST() {
       });
     }
     
-    console.log('[API] Manually starting sync service...');
     startSyncService();
     
     // Wait a bit for it to initialize
@@ -31,8 +29,7 @@ export async function POST() {
     let newStatus;
     try {
       newStatus = await getSyncServiceStatus();
-    } catch (statusErr) {
-      console.warn('[API] Could not get new status after start:', statusErr);
+    } catch {
       newStatus = { isRunning: true, lastHeight: 0, lastSyncAt: null } as any;
     }
     
@@ -42,7 +39,6 @@ export async function POST() {
       status: newStatus,
     });
   } catch (err) {
-    console.error('[API] Failed to start sync service:', err);
     return NextResponse.json({
       success: false,
       error: err instanceof Error ? err.message : 'Unknown error',

@@ -179,8 +179,7 @@ export async function GET(
         transactions: txData,
       },
     });
-  } catch (err) {
-    console.error('[API] Address route error:', err);
+  } catch {
     return NextResponse.json({
       success: false,
       error: err instanceof Error ? err.message : 'Database error',

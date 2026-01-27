@@ -280,9 +280,17 @@ export default function AddressPage() {
                         <span className={isSend ? 'tx-out' : 'tx-in'}>
                           {isSend ? 'To: ' : 'From: '}
                         </span>
-                        <Link href={`/explorer/address/${isSend ? tx.to : tx.from}`} className="address-link">
-                          {truncate(isSend ? tx.to : tx.from, 6, 4)}
-                        </Link>
+                        {(() => {
+                          const addr = isSend ? tx.to : tx.from;
+                          const isValid = addr && addr.length > 10 && addr.includes('eon');
+                          return isValid ? (
+                            <Link href={`/explorer/address/${addr}`} className="address-link">
+                              {truncate(addr, 6, 4)}
+                            </Link>
+                          ) : (
+                            <span className="address-link">{addr || 'N/A'}</span>
+                          );
+                        })()}
                       </td>
                       <td className={isSend ? 'amount-out' : 'amount-in'}>
                         {isSend ? '-' : '+'}{tx.amount}

@@ -19,7 +19,7 @@ export async function GET() {
     await dbPool.query('SELECT 1');
     status.database = 'ok';
   } catch (dbErr: any) {
-    console.error('[Health] Database check failed:', dbErr);
+    /* log disabled */
     status.database = 'error';
     status.databaseError = dbErr?.message || 'Unknown error';
     status.application = 'degraded';
@@ -36,7 +36,7 @@ export async function GET() {
       status.application = 'degraded';
     }
   } catch (syncErr: any) {
-    console.error('[Health] Sync service check failed:', syncErr);
+    /* log disabled */
     status.syncService = { 
       isRunning: false,
       error: syncErr?.message || 'Unknown error',
@@ -50,7 +50,7 @@ export async function GET() {
     const health = getMonitoringHealth();
     status.monitoring = health;
   } catch (monErr: any) {
-    console.error('[Health] Monitoring check failed:', monErr);
+    /* log disabled */
     status.monitoring = { error: monErr?.message || 'Unknown error' };
   }
 
@@ -59,7 +59,7 @@ export async function GET() {
     const rateLimitStats = await getRateLimitStats();
     status.rateLimit = rateLimitStats;
   } catch (rateErr: any) {
-    console.error('[Health] Rate limit check failed:', rateErr);
+    /* log disabled */
     status.rateLimit = { error: rateErr?.message || 'Unknown error' };
   }
 

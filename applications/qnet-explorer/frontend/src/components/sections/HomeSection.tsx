@@ -48,7 +48,7 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
           setCirculatingSupply(data.data?.circulatingFormatted || '0');
         }
       } catch (err) {
-        console.error('Failed to fetch circulating supply:', err);
+        /* log disabled */
         setCirculatingSupply('N/A');
       }
     };

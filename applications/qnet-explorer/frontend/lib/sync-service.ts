@@ -1,6 +1,12 @@
 import { getDbPool, insertTransactionsBatch, updateSyncState, getSyncState, query, insertBlock } from './db';
 import { verifyTransactionHash, verifyTransactionIntegrity, logSecurityEvent } from './security';
 
+// Disable logging in production (set to true for debugging)
+const DEBUG = false;
+const log = DEBUG ? log.bind(console) : () => {};
+const warn = DEBUG ? warn.bind(console) : () => {};
+const error = DEBUG ? error.bind(console) : () => {};
+
 // Validate and sanitize NODE_RPC_URL to prevent SSRF
 function getNodeRpcUrl(): string {
   const url = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
@@ -22,12 +28,12 @@ function getNodeRpcUrl(): string {
         hostname.startsWith('172.26.') || hostname.startsWith('172.27.') ||
         hostname.startsWith('172.28.') || hostname.startsWith('172.29.') ||
         hostname.startsWith('172.30.') || hostname.startsWith('172.31.')) {
-      console.error('[Sync] NODE_RPC_URL points to private IP, using default');
+      error('[Sync] NODE_RPC_URL points to private IP, using default');
       return 'http://162.244.25.114:8001';
     }
     return url;
   } catch {
-    console.error('[Sync] Invalid NODE_RPC_URL format, using default');
+    error('[Sync] Invalid NODE_RPC_URL format, using default');
     return 'http://162.244.25.114:8001';
   }
 }
@@ -73,13 +79,13 @@ function transformTransaction(
   // Validate hash - allow alphanumeric and underscores (system transactions may have non-hex hashes)
   const hash = String(tx.hash || '');
   if (!hash || hash.length < 8 || hash.length > 128) {
-    console.warn('[Sync] Invalid transaction hash length, skipping:', hash.substring(0, 32));
+    warn('[Sync] Invalid transaction hash length, skipping:', hash.substring(0, 32));
     return null;
   }
 
   // Validate block height
   if (!Number.isInteger(blockHeight) || blockHeight < 0) {
-    console.warn('[Sync] Invalid block height:', blockHeight);
+    warn('[Sync] Invalid block height:', blockHeight);
     return null;
   }
 
@@ -87,7 +93,7 @@ function transformTransaction(
   let rawTs = Number(tx.timestamp) || 0;
   if (rawTs === 0) rawTs = blockTimestamp;
   if (!Number.isFinite(rawTs) || rawTs < 0) {
-    console.warn('[Sync] Invalid timestamp, using block timestamp:', rawTs);
+    warn('[Sync] Invalid timestamp, using block timestamp:', rawTs);
     rawTs = blockTimestamp;
   }
   const timestamp = rawTs > 1e12 ? rawTs : rawTs * 1000;
@@ -95,13 +101,13 @@ function transformTransaction(
   // Validate amount
   const amount = Number(tx.amount) || 0;
   if (!Number.isFinite(amount) || amount < 0) {
-    console.warn('[Sync] Invalid amount, using 0:', amount);
+    warn('[Sync] Invalid amount, using 0:', amount);
   }
 
   // Validate nonce
   const nonce = Number(tx.nonce) || 0;
   if (!Number.isInteger(nonce) || nonce < 0) {
-    console.warn('[Sync] Invalid nonce, using 0:', nonce);
+    warn('[Sync] Invalid nonce, using 0:', nonce);
   }
 
   // Determine quantum signature
@@ -119,7 +125,7 @@ function transformTransaction(
   }
   const from = String(fromRaw);
   if (from.length > 128) {
-    console.warn('[Sync] Invalid from address length:', from.length);
+    warn('[Sync] Invalid from address length:', from.length);
     return null;
   }
   
@@ -138,13 +144,13 @@ function transformTransaction(
   // These transactions may have non-standard addresses and amount = 0
   // Address validation is too strict for genesis/activation transactions - just accept all valid UTF-8
   // if (!isSystemAddress && !isRewardTx && !isSystemTx && !/^[a-f0-9]{40,}$/i.test(from)) {
-  //   console.warn(`[Sync] Non-standard from address: ${from.substring(0, 32)} (tx_type: ${txType})`);
+  //   warn(`[Sync] Non-standard from address: ${from.substring(0, 32)} (tx_type: ${txType})`);
   // }
   // NOTE: Commented out strict validation - accepting all addresses to capture genesis/activation transactions
 
   const to = tx.to ? String(tx.to) : (tx.to_address ? String(tx.to_address) : null);
   if (to && to.length > 128) {
-    console.warn('[Sync] Invalid to address length:', to.length);
+    warn('[Sync] Invalid to address length:', to.length);
     return null;
   }
 
@@ -219,14 +225,14 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
     // Check response size before parsing (limit to 50MB)
     const contentLength = res.headers.get('content-length');
     if (contentLength && parseInt(contentLength, 10) > 50 * 1024 * 1024) {
-      console.warn(`[Sync] Block ${height} response too large: ${contentLength} bytes`);
+      warn(`[Sync] Block ${height} response too large: ${contentLength} bytes`);
       return null;
     }
 
     // Parse with size limit
     const text = await res.text();
     if (text.length > 50 * 1024 * 1024) {
-      console.warn(`[Sync] Block ${height} response too large: ${text.length} bytes`);
+      warn(`[Sync] Block ${height} response too large: ${text.length} bytes`);
       return null;
     }
 
@@ -234,7 +240,7 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
     try {
       responseData = JSON.parse(text);
     } catch (parseErr) {
-      console.warn(`[Sync] Failed to parse block ${height} JSON:`, parseErr);
+      warn(`[Sync] Failed to parse block ${height} JSON:`, parseErr);
       return null;
     }
     
@@ -251,7 +257,7 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
     
     // Validate block structure
     if (!block || typeof block !== 'object') {
-      console.warn(`[Sync] Invalid block structure for height ${height}`);
+      warn(`[Sync] Invalid block structure for height ${height}`);
       return null;
     }
     
@@ -262,31 +268,31 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
     
     // Validate transactions array
     if (block.transactions && !Array.isArray(block.transactions)) {
-      console.warn(`[Sync] Invalid transactions array for block ${height}`);
+      warn(`[Sync] Invalid transactions array for block ${height}`);
       block.transactions = [];
     }
     
     // Limit transactions per block to prevent memory issues (100k max as per requirement)
     const MAX_TXS_PER_BLOCK = 100000;
     if (Array.isArray(block.transactions) && block.transactions.length > MAX_TXS_PER_BLOCK) {
-      console.warn(`[Sync] Block ${height} has ${block.transactions.length} transactions, limiting to ${MAX_TXS_PER_BLOCK}`);
+      warn(`[Sync] Block ${height} has ${block.transactions.length} transactions, limiting to ${MAX_TXS_PER_BLOCK}`);
       block.transactions = block.transactions.slice(0, MAX_TXS_PER_BLOCK);
     }
     
     // Log transaction count only for blocks with many transactions
     if (Array.isArray(block.transactions) && block.transactions.length > 100) {
-      console.log(`[Sync] Block ${height} has ${block.transactions.length} transactions`);
+      log(`[Sync] Block ${height} has ${block.transactions.length} transactions`);
     }
     
     // Validate timestamp
     if (block.timestamp && (!Number.isFinite(Number(block.timestamp)) || Number(block.timestamp) < 0)) {
-      console.warn(`[Sync] Invalid timestamp for block ${height}, using 0`);
+      warn(`[Sync] Invalid timestamp for block ${height}, using 0`);
       block.timestamp = 0;
     }
     
     return { block, height };
   } catch (err) {
-    console.error(`[Sync] Failed to fetch block ${height}:`, err);
+    error(`[Sync] Failed to fetch block ${height}:`, err);
     return null;
   }
 }
@@ -301,14 +307,14 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
     });
 
     if (!heightRes.ok) {
-      console.log('[Sync] Failed to get height from node');
+      log('[Sync] Failed to get height from node');
       return { added: 0, currentHeight: 0 };
     }
 
     // Validate response size before parsing
     const heightText = await heightRes.text();
     if (heightText.length > 1024) {
-      console.warn('[Sync] Height response too large:', heightText.length);
+      warn('[Sync] Height response too large:', heightText.length);
       return { added: 0, currentHeight: 0 };
     }
     
@@ -316,7 +322,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
     try {
       heightData = JSON.parse(heightText) as { height?: number };
     } catch (parseErr) {
-      console.warn('[Sync] Failed to parse height JSON:', parseErr);
+      warn('[Sync] Failed to parse height JSON:', parseErr);
       return { added: 0, currentHeight: 0 };
     }
     
@@ -331,7 +337,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
 
     // Check for blockchain reset
     if (currentHeight < lastHeight) {
-      console.log(`[Sync] Blockchain reset detected! ${currentHeight} < ${lastHeight}`);
+      log(`[Sync] Blockchain reset detected! ${currentHeight} < ${lastHeight}`);
       await updateSyncState(0);
       return { added: 0, currentHeight };
     }
@@ -369,7 +375,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
     ]);
     
     const results = await timeoutPromise.catch(() => {
-      console.error('[Sync] Sync operation timed out');
+      error('[Sync] Sync operation timed out');
       return fetchPromises.map(() => ({ status: 'rejected' as const, reason: new Error('Timeout') }));
     });
 
@@ -451,7 +457,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
 
       // Check if we're approaching memory limit
       if (transactionsToInsert.length + txs.length > MAX_TOTAL_TXS_PER_SYNC) {
-        console.warn(`[Sync] Approaching memory limit, processing ${txs.length} transactions from block ${height} would exceed limit`);
+        warn(`[Sync] Approaching memory limit, processing ${txs.length} transactions from block ${height} would exceed limit`);
         // Process only what fits
         const remaining = MAX_TOTAL_TXS_PER_SYNC - transactionsToInsert.length;
         const txsToProcess = txs.slice(0, remaining);
@@ -463,7 +469,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
           }
         }
         
-        console.warn(`[Sync] Processed ${remaining} transactions from block ${height}, skipped ${txs.length - remaining}`);
+        warn(`[Sync] Processed ${remaining} transactions from block ${height}, skipped ${txs.length - remaining}`);
         break; // Stop processing more blocks
       }
 
@@ -484,7 +490,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       try {
         await insertBlock(blockData);
       } catch (err) {
-        console.error(`[Sync] Failed to save block ${blockData.height}:`, err);
+        error(`[Sync] Failed to save block ${blockData.height}:`, err);
       }
     }
 
@@ -503,7 +509,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
     }
     // Log only if filtering out many duplicates (e.g., block 0)
     if (duplicateCount > 100) {
-      console.log(`[Sync] Filtered out ${duplicateCount} duplicate transactions`);
+      log(`[Sync] Filtered out ${duplicateCount} duplicate transactions`);
     }
 
     // Batch insert transactions (limit batch size to prevent memory issues)
@@ -538,7 +544,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
               const obj = tx.tx_type as Record<string, unknown>;
               const json = JSON.stringify(obj);
               if (json.length > 100000) { // 100KB max
-                console.warn('[Sync] tx_type_data too large, truncating');
+                warn('[Sync] tx_type_data too large, truncating');
                 return JSON.parse(json.substring(0, 100000)) as Record<string, unknown>;
               }
               return obj;
@@ -551,12 +557,12 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
             is_quantum_signed: tx.is_quantum_signed
           })));
         } catch (err) {
-          console.error(`[Sync] Failed to insert batch of ${batch.length} transactions:`, err);
+          error(`[Sync] Failed to insert batch of ${batch.length} transactions:`, err);
           throw err;
         }
       }
 
-      console.log(`[Sync] Inserted ${uniqueTransactions.length} transactions in ${batches.length} batch(es)`);
+      log(`[Sync] Inserted ${uniqueTransactions.length} transactions in ${batches.length} batch(es)`);
     }
 
     // Update sync state - use the highest block we actually processed
@@ -570,7 +576,7 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
 
     return { added: transactionsToInsert.length, currentHeight: finalHeight };
   } catch (err) {
-    console.error('[Sync] Error:', err);
+    error('[Sync] Error:', err);
     return { added: 0, currentHeight: 0 };
   }
 }
@@ -580,7 +586,7 @@ let isVerifying = false; // Lock to prevent concurrent integrity checks
 
 async function verifyDataIntegrity(): Promise<void> {
   if (isVerifying) {
-    console.log('[Integrity] Integrity check already in progress, skipping...');
+    log('[Integrity] Integrity check already in progress, skipping...');
     return;
   }
   
@@ -621,7 +627,7 @@ async function verifyDataIntegrity(): Promise<void> {
       // Validate response size
       const responseText = await nodeRes.text();
       if (responseText.length > 10 * 1024 * 1024) {
-        console.warn(`[Integrity] Transaction ${hash} response too large: ${responseText.length} bytes`);
+        warn(`[Integrity] Transaction ${hash} response too large: ${responseText.length} bytes`);
         continue;
       }
       
@@ -629,7 +635,7 @@ async function verifyDataIntegrity(): Promise<void> {
       try {
         nodeData = JSON.parse(responseText) as { transaction?: Record<string, unknown> };
       } catch (parseErr) {
-        console.warn(`[Integrity] Failed to parse transaction ${hash} JSON:`, parseErr);
+        warn(`[Integrity] Failed to parse transaction ${hash} JSON:`, parseErr);
         continue;
       }
       
@@ -679,7 +685,7 @@ async function verifyDataIntegrity(): Promise<void> {
             is_quantum_signed: restored.is_quantum_signed
           }]);
 
-          console.log(`[Integrity] Restored transaction ${hash} from node`);
+          log(`[Integrity] Restored transaction ${hash} from node`);
         }
       }
     }
@@ -690,10 +696,10 @@ async function verifyDataIntegrity(): Promise<void> {
         mismatches
       });
     } else {
-      console.log(`[Integrity] ✅ All ${result.rows.length} transactions verified`);
+      log(`[Integrity] ✅ All ${result.rows.length} transactions verified`);
     }
   } catch (err) {
-    console.error('[Integrity] Error:', err);
+    error('[Integrity] Error:', err);
   } finally {
     isVerifying = false;
   }
@@ -705,12 +711,12 @@ let integrityInterval: NodeJS.Timeout | null = null;
 let isSyncing = false; // Lock to prevent concurrent syncs
 
 export function startSyncService(): void {
-  console.log('[Sync] Service started');
+  log('[Sync] Service started');
 
   // Initial sync (silent)
   syncBlocks()
     .catch(err => {
-      console.error('[Sync] Initial sync failed:', err);
+      error('[Sync] Initial sync failed:', err);
     });
 
   // Periodic sync with lock (silent, only log new transactions)
@@ -724,11 +730,11 @@ export function startSyncService(): void {
       .then(({ added }) => {
         // Only log if transactions were added
         if (added > 0) {
-          console.log(`[Sync] +${added} transactions`);
+          log(`[Sync] +${added} transactions`);
         }
       })
       .catch(err => {
-        console.error('[Sync] Sync failed:', err);
+        error('[Sync] Sync failed:', err);
       })
       .finally(() => {
         isSyncing = false;
@@ -738,15 +744,15 @@ export function startSyncService(): void {
   // Periodic integrity check
   integrityInterval = setInterval(() => {
     verifyDataIntegrity().catch(err => {
-      console.error('[Integrity] Error in integrity check:', err);
+      error('[Integrity] Error in integrity check:', err);
     });
   }, INTEGRITY_CHECK_INTERVAL);
 
-  console.log('[Sync] Sync service started');
+  log('[Sync] Sync service started');
 }
 
 export async function stopSyncService(): Promise<void> {
-  console.log('[Sync] Stopping sync service...');
+  log('[Sync] Stopping sync service...');
   
   // Stop intervals
   if (syncInterval) {
@@ -760,7 +766,7 @@ export async function stopSyncService(): Promise<void> {
   
   // Wait for current sync to finish (with timeout)
   if (isSyncing) {
-    console.log('[Sync] Waiting for current sync to finish...');
+    log('[Sync] Waiting for current sync to finish...');
     const startWait = Date.now();
     const maxWait = 30000; // 30 seconds
     
@@ -769,14 +775,14 @@ export async function stopSyncService(): Promise<void> {
     }
     
     if (isSyncing) {
-      console.warn('[Sync] Sync did not finish in time, forcing stop');
+      warn('[Sync] Sync did not finish in time, forcing stop');
       isSyncing = false;
     }
   }
   
   // Wait for integrity check to finish
   if (isVerifying) {
-    console.log('[Sync] Waiting for integrity check to finish...');
+    log('[Sync] Waiting for integrity check to finish...');
     const startWait = Date.now();
     const maxWait = 60000; // 60 seconds
     
@@ -785,12 +791,12 @@ export async function stopSyncService(): Promise<void> {
     }
     
     if (isVerifying) {
-      console.warn('[Sync] Integrity check did not finish in time, forcing stop');
+      warn('[Sync] Integrity check did not finish in time, forcing stop');
       isVerifying = false;
     }
   }
   
-  console.log('[Sync] Sync service stopped');
+  log('[Sync] Sync service stopped');
 }
 
 export async function getSyncServiceStatus(): Promise<{
@@ -812,7 +818,7 @@ export async function getSyncServiceStatus(): Promise<{
       lastError: null, // Could be enhanced to track last error
     };
   } catch (err) {
-    console.error('[Sync] Error getting sync service status:', err);
+    error('[Sync] Error getting sync service status:', err);
     return {
       isRunning: syncInterval !== null,
       isSyncing: false,

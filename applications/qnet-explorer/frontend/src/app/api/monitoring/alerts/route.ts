@@ -20,7 +20,7 @@ export async function GET(request: NextRequest) {
       count: alerts.length,
     });
   } catch (err) {
-    console.error('[Monitoring] Get alerts error:', err);
+    /* log disabled */
     return NextResponse.json({
       success: false,
       error: 'Failed to get alerts',

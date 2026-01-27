@@ -38,7 +38,7 @@ export default function HomePage() {
           setStats(data.data);
         }
       } catch (err) {
-        console.error('Failed to fetch network stats:', err);
+        /* log disabled */
       }
     };
     fetchStats();

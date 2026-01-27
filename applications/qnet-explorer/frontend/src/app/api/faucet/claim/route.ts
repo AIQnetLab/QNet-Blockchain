@@ -191,7 +191,7 @@ async function sendTokens(
         return { success: false, error: 'Unsupported token type' };
     }
   } catch (error) {
-    console.error('Token sending error:', error);
+    /* log disabled */
     return { success: false, error: 'Failed to send tokens' };
   }
 }
@@ -245,7 +245,7 @@ async function send1DEVTokens(
         try {
           faucetPrivateKey = JSON.parse(faucetPrivateKeyEnv);
         } catch (e) {
-          console.error('[FAUCET] Failed to parse FAUCET_PRIVATE_KEY:', e);
+          /* log disabled */
           throw new Error('Faucet configuration error - invalid private key format');
         }
       } else {
@@ -272,7 +272,7 @@ async function send1DEVTokens(
             }
           }
         } catch (error) {
-          console.error('[FAUCET] Error loading config:', error);
+          /* log disabled */
           throw error;
         }
       }
@@ -374,7 +374,7 @@ async function send1DEVTokens(
           // Use processed commitment for fastest confirmation
           await connection.confirmTransaction(signature, 'processed');
         } catch (err) {
-          console.error('Background confirmation error:', err);
+          /* log disabled */
           // Try alternate RPCs for confirmation
           for (const endpoint of rpcEndpoints.slice(1)) {
             try {
@@ -394,8 +394,8 @@ async function send1DEVTokens(
       };
       
     } catch (error: any) {
-      console.error('[FAUCET] Error in send1DEVTokens:', error);
-      console.error('[FAUCET] Error stack:', error.stack);
+      /* log disabled */
+      /* log disabled */
       return {
         success: false,
         error: error.message || 'Failed to send tokens'
@@ -510,7 +510,7 @@ async function sendQNCTokens(
       }
       
     } catch (error) {
-      console.error('QNet testnet faucet error:', error);
+      /* log disabled */
       
       // Fallback to local node faucet
       try {
@@ -534,7 +534,7 @@ async function sendQNCTokens(
           };
         }
       } catch (localError) {
-        console.error('Local QNet faucet error:', localError);
+        /* log disabled */
       }
       
       return {
@@ -585,7 +585,7 @@ async function sendQNCTokens(
     }
     
   } catch (error) {
-    console.error('Production QNet faucet error:', error);
+    /* log disabled */
     return {
       success: false,
       error: 'Production QNet faucet unavailable'
@@ -699,8 +699,8 @@ export async function POST(request: NextRequest) {
     }
     
   } catch (error) {
-    console.error('[FAUCET] API error:', error);
-    console.error('[FAUCET] Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+    /* log disabled */
+    /* log disabled */
     return NextResponse.json(
       { success: false, error: 'Internal server error' },
       { status: 500 }

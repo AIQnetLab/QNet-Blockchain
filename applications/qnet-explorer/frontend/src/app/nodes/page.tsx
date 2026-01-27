@@ -41,7 +41,7 @@ export default function NodesPage() {
           }
         }
       })
-      .catch(error => console.error('Failed to fetch pricing data:', error));
+      .catch(() => {});
   }, []);
 
   const getCostRange = (type: 'light' | 'full' | 'super'): string => {

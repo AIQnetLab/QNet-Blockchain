@@ -157,15 +157,6 @@ export default function BlockPage() {
             <span className="detail-value">{block.producer}</span>
           </div>
           <div className="detail-row">
-            <span className="detail-label">Producer Address</span>
-            <span className="detail-value">
-              <Link href={`/explorer/address/${block.producer_address}`} className="address-link">
-                {truncate(block.producer_address, 12, 8)}
-              </Link>
-              <CopyBtn text={block.producer_address} />
-            </span>
-          </div>
-          <div className="detail-row">
             <span className="detail-label">Transactions</span>
             <span className="detail-value">{block.tx_count}</span>
           </div>
@@ -321,13 +312,21 @@ export default function BlockPage() {
                   <span className={`type-badge type-${tx.type.toLowerCase()}`}>{tx.type}</span>
                 </td>
                 <td>
-                  <Link href={`/explorer/address/${tx.from}`} className="address-link">
-                    {truncate(tx.from, 6, 4)}
-                  </Link>
+                  {tx.from && tx.from.length > 10 && tx.from.includes('eon') ? (
+                    <Link href={`/explorer/address/${tx.from}`} className="address-link">
+                      {truncate(tx.from, 6, 4)}
+                    </Link>
+                  ) : (
+                    <span className="address-link">{tx.from || 'N/A'}</span>
+                  )}
                   <span className="tx-arrow">→</span>
-                  <Link href={`/explorer/address/${tx.to}`} className="address-link">
-                    {truncate(tx.to, 6, 4)}
-                  </Link>
+                  {tx.to && tx.to.length > 10 && tx.to.includes('eon') ? (
+                    <Link href={`/explorer/address/${tx.to}`} className="address-link">
+                      {truncate(tx.to, 6, 4)}
+                    </Link>
+                  ) : (
+                    <span className="address-link">{tx.to || 'N/A'}</span>
+                  )}
                 </td>
                 <td>{formatAmount(tx.amount)}</td>
               </tr>

@@ -186,7 +186,7 @@ export default function TokenFaucet() {
         setError(data.error || 'Node activation failed. Please try again.');
       }
     } catch (err) {
-      console.error('Activation error:', err);
+      /* log disabled */
       setError('Network error during activation. Please try again.');
     } finally {
       setIsLoading(false);

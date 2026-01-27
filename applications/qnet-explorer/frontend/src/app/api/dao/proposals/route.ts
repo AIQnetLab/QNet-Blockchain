@@ -104,7 +104,7 @@ class MockGovernanceContract implements GovernanceContract {
         return data.qnc_balance || 0;
       }
     } catch (error) {
-      console.error('Failed to fetch QNC balance:', error);
+      /* log disabled */
     }
     
     // Fallback to mock for development

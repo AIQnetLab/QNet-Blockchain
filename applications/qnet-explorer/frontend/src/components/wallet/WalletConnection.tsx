@@ -48,11 +48,11 @@ export default function WalletConnection() {
     try {
       // Check QNet Wallet only
       if (window.qnet) {
-        console.log('QNet Wallet detected');
+        /* log disabled */
         await checkQNetConnection();
       }
     } catch (error) {
-      console.error('Error checking wallet connection:', error);
+      /* log disabled */
     }
   };
 
@@ -78,7 +78,7 @@ export default function WalletConnection() {
         setError(null);
       }
     } catch (error) {
-      console.error('QNet wallet connection check failed:', error);
+      /* log disabled */
     }
   };
 
@@ -150,7 +150,7 @@ export default function WalletConnection() {
         setNetwork(network);
       }
     } catch (error) {
-      console.error('Failed to update wallet info:', error);
+      /* log disabled */
     }
   };
 
@@ -185,12 +185,12 @@ export default function WalletConnection() {
         setBalance(balance);
         setNetwork(network);
         
-        console.log('QNet Wallet connected successfully');
+        /* log disabled */
       } else {
         throw new Error('No accounts found in QNet Wallet');
       }
     } catch (error: any) {
-      console.error('Failed to connect QNet Wallet:', error);
+      /* log disabled */
       setError(error.message || 'Failed to connect QNet Wallet');
     } finally {
       setIsConnecting(false);
@@ -208,9 +208,9 @@ export default function WalletConnection() {
       }
       
       handleDisconnect();
-      console.log('Wallet disconnected successfully');
+      /* log disabled */
     } catch (error) {
-      console.error('Failed to disconnect wallet:', error);
+      /* log disabled */
     }
   };
 

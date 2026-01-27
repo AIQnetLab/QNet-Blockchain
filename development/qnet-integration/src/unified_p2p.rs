@@ -6032,6 +6032,9 @@ impl SimplifiedP2P {
         
         for (idx, result) in results.iter().enumerate() {
             let peer_addr = &peers_to_query[idx];
+            // PRIVACY: Use pseudonym instead of raw IP for non-genesis nodes
+            let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
+            let peer_display = get_privacy_id_for_addr(peer_ip);
             match result {
                 Ok(true) => {
                     exists_count += 1;
@@ -6039,17 +6042,17 @@ impl SimplifiedP2P {
                         verified_peer = Some(peer_addr.clone());
                     }
                     println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=exists", 
-                             block_height, peer_addr);
+                             block_height, peer_display);
                 },
                 Ok(false) => {
                     not_found_count += 1;
                     println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=not_found", 
-                             block_height, peer_addr);
+                             block_height, peer_display);
                 },
                 Err(e) => {
                     error_count += 1;
                     println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=error error={}", 
-                             block_height, peer_addr, e);
+                             block_height, peer_display, e);
                 }
             }
         }
@@ -15821,7 +15824,7 @@ impl SimplifiedP2P {
                 continue;
             }
             
-            if crate::node::is_info() {
+                if crate::node::is_info() {
                 println!("[INFO][MB-SYNC] request idx={}-{} peer={} attempt={}/{}", 
                          from_index, to_index, peer.id, attempt + 1, max_peers_to_try);
             }
@@ -15849,7 +15852,7 @@ impl SimplifiedP2P {
                     continue;
                 } else {
                     all_received = false;
-                    break;
+                break;
                 }
             }
             
@@ -16106,7 +16109,7 @@ impl SimplifiedP2P {
                              from_height, from_height + received_count - 1, peer.id, 
                              received_count, to_height - from_height + 1);
                 }
-                return Ok(());
+            return Ok(());
             } else {
                 if crate::node::is_warn() {
                     println!("[WARN][SYNC] no_response h={} from={} trying_next_peer", from_height, peer.id);
@@ -18812,9 +18815,9 @@ impl SimplifiedP2P {
         //   - select_microblock_producer checks emergency flag AFTER QRDS
         //   - If emergency flag is set, use emergency producer instead of QRDS result
         // ═══════════════════════════════════════════════════════════════════════════
-        use crate::node::set_emergency_producer_flag;
-        
-        set_emergency_producer_flag(block_height, new_producer.clone());
+            use crate::node::set_emergency_producer_flag;
+            
+            set_emergency_producer_flag(block_height, new_producer.clone());
         
         if new_producer == self.node_id {
             println!("[INFO][FAILOVER] we_are_emergency h={}", block_height);

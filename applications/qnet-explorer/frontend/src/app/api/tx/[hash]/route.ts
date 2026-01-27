@@ -83,7 +83,7 @@ async function fetchTransaction(hash: string): Promise<Record<string, unknown> |
     // Validate response size before parsing
     const text = await res.text();
     if (text.length > 10 * 1024 * 1024) { // 10MB max
-      console.warn('[TX] Transaction response too large:', text.length);
+      // console.warn('[TX] Transaction response too large:', text.length);
       return null;
     }
     
@@ -91,7 +91,7 @@ async function fetchTransaction(hash: string): Promise<Record<string, unknown> |
     try {
       data = JSON.parse(text) as { status?: string; transaction?: Record<string, unknown> };
     } catch (parseErr) {
-      console.warn('[TX] Failed to parse transaction JSON:', parseErr);
+      // console.warn('[TX] Failed to parse transaction JSON:', parseErr);
       return null;
     }
     
@@ -120,7 +120,7 @@ async function searchInEmissionBlocks(hash: string): Promise<Record<string, unkn
       // Validate response size
       const blockText = await res.text();
       if (blockText.length > 50 * 1024 * 1024) { // 50MB max
-        console.warn(`[TX] Block ${height} response too large`);
+        // console.warn(`[TX] Block ${height} response too large`);
         continue;
       }
       
@@ -230,7 +230,8 @@ export async function GET(
       const fee = totalFee > 0 ? formatAmount(totalFee) : '0 QNC';
       
       // Get timestamp - if 0, fetch from block
-      let finalTimestamp = dbTx.timestamp > 0 ? dbTx.timestamp : 0;
+      // Note: PostgreSQL BIGINT may come as string, so convert first
+      let finalTimestamp = Number(dbTx.timestamp) > 0 ? Number(dbTx.timestamp) : 0;
       
       // If timestamp is 0 and block is 0, fetch block timestamp
       if (finalTimestamp === 0 && dbTx.block === 0) {
@@ -326,7 +327,7 @@ export async function GET(
       if (blockRes.ok) {
         const blockText = await blockRes.text();
         if (blockText.length > 10 * 1024 * 1024) {
-          console.warn('[TX] Block response too large');
+          // console.warn('[TX] Block response too large');
         } else {
           try {
             const block = JSON.parse(blockText) as { timestamp?: number };
@@ -406,8 +407,7 @@ export async function GET(
       }
     });
     
-  } catch (err) {
-    console.error('[TX] Error:', err);
+  } catch {
     return NextResponse.json({
       success: false,
       error: 'Backend unavailable',

@@ -91,13 +91,21 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
         <span className={`type-badge ${getBadgeClass(item.type)}`}>{item.type}</span>
       </td>
       <td className="col-addresses">
-        <Link href={`/explorer/address/${item.from}`} className="addr">
-          {item.from.slice(0, 6)}...{item.from.slice(-4)}
-        </Link>
+        {item.from && item.from.length > 10 && item.from.includes('eon') ? (
+          <Link href={`/explorer/address/${item.from}`} className="addr">
+            {item.from.slice(0, 6)}...{item.from.slice(-4)}
+          </Link>
+        ) : (
+          <span className="addr">{item.from || 'N/A'}</span>
+        )}
         <span className="arr">→</span>
-        <Link href={`/explorer/address/${item.to}`} className="addr">
-          {item.to.slice(0, 6)}...{item.to.slice(-4)}
-        </Link>
+        {item.to && item.to.length > 10 && item.to.includes('eon') ? (
+          <Link href={`/explorer/address/${item.to}`} className="addr">
+            {item.to.slice(0, 6)}...{item.to.slice(-4)}
+          </Link>
+        ) : (
+          <span className="addr">{item.to || 'N/A'}</span>
+        )}
       </td>
       <td className="col-amount">{item.amount}</td>
       <td className="col-block">
@@ -218,7 +226,7 @@ export default function ExplorerPage() {
         batchCache('tx', txItems);
       }
     } catch (err) {
-      console.error('[Explorer] Fetch error:', err);
+      /* log disabled */
     } finally {
       setLoading(false);
       setHasFetched(true);

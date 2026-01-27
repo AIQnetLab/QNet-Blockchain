@@ -99,7 +99,7 @@ export default function ClientWrapper({
           setCirculatingSupply(data.data?.circulatingFormatted || '0');
         }
       } catch (err) {
-        console.error('Failed to fetch circulating supply:', err);
+        /* log disabled */
       }
     };
     fetchCirculatingSupply();
@@ -126,7 +126,7 @@ export default function ClientWrapper({
           }
         }
       })
-      .catch(error => console.error('Failed to fetch pricing data:', error));
+      .catch(() => {});
   }, []);
 
   const getCostRange = (type: 'light' | 'full' | 'super'): string => {

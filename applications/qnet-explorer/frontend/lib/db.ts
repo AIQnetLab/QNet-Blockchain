@@ -18,14 +18,10 @@ export function getDbPool(): Pool {
       // Auto-disable SSL for localhost connections
       if (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === 'host.docker.internal') {
         useSSL = false;
-        console.log('[DB] Auto-disabling SSL for localhost connection');
       }
-    } catch (err) {
-      // Invalid URL format - log but continue (pg will handle connection string validation)
-      console.warn('[DB] Invalid DATABASE_URL format, but continuing:', err);
+    } catch {
+      // Invalid URL format - continue (pg will handle connection string validation)
     }
-
-    console.log('[DB] SSL configuration:', { useSSL, DB_SSL: process.env.DB_SSL });
 
     pool = new Pool({
       connectionString: databaseUrl,
@@ -37,9 +33,8 @@ export function getDbPool(): Pool {
       } : false,
     });
 
-    pool.on('error', (err: Error) => {
-      console.error('[DB] Unexpected error on idle client', err);
-      // Don't exit - allow retry
+    pool.on('error', () => {
+      // Silent - allow retry
     });
   }
 
@@ -88,7 +83,7 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
   try {
     db = getDbPool();
   } catch (poolErr) {
-    console.error('[DB] Failed to get pool:', poolErr);
+    // console.error('[DB] Failed to get pool:', poolErr);
     throw new Error(`Database connection pool error: ${poolErr instanceof Error ? poolErr.message : 'Unknown error'}`);
   }
   
@@ -101,13 +96,7 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
       const res = await db.query<T>(text, params);
       const duration = Date.now() - start;
       
-      if (duration > 1000) {
-        console.warn('[DB] Slow query:', { 
-          text: text.substring(0, 100), 
-          duration,
-          params: params ? params.length : 0
-        });
-      }
+      // Slow query detection disabled
       
       return res;
     } catch (err: unknown) {
@@ -116,18 +105,13 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
       if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT' || error.code === 'ENOTFOUND') {
         retries++;
         if (retries < maxRetries) {
-          console.warn(`[DB] Connection error, retrying (${retries}/${maxRetries}):`, error.code);
+          // console.warn(`[DB] Connection error, retrying (${retries}/${maxRetries}):`, error.code);
           await new Promise(resolve => setTimeout(resolve, 1000 * retries));
           continue;
         }
       }
       
-      // Don't log full query to prevent information leakage
-      console.error('[DB] Query error:', {
-        code: error.code,
-        message: error.message,
-        queryType: text.split(' ')[0] // Only log query type (SELECT, INSERT, etc.)
-      });
+      // Error logging disabled
       throw err;
     }
   }
@@ -287,12 +271,12 @@ export async function insertTransaction(tx: Omit<TransactionRow, 'created_at' | 
           // Limit JSON size and prevent circular references
           const json = JSON.stringify(tx.tx_type_data);
           if (json.length > 100000) { // 100KB max
-            console.warn('[DB] tx_type_data too large, truncating');
+            // console.warn('[DB] tx_type_data too large, truncating');
             return json.substring(0, 100000);
           }
           return json;
         } catch (err) {
-          console.warn('[DB] Failed to stringify tx_type_data:', err);
+          // console.warn('[DB] Failed to stringify tx_type_data:', err);
           return null;
         }
       })() : null,
@@ -323,7 +307,7 @@ export async function insertTransactionsBatch(transactions: Omit<TransactionRow,
   }
   
   if (isBatchInserting) {
-    console.warn('[DB] Batch insert timeout, forcing reset of lock');
+    // console.warn('[DB] Batch insert timeout, forcing reset of lock');
     isBatchInserting = false; // Force reset the lock
   }
 
@@ -402,12 +386,12 @@ export async function insertTransactionsBatch(transactions: Omit<TransactionRow,
               // Limit JSON size and prevent circular references
               const json = JSON.stringify(tx.tx_type_data);
               if (json.length > 100000) { // 100KB max
-                console.warn('[DB] tx_type_data too large, truncating');
+                // console.warn('[DB] tx_type_data too large, truncating');
                 return json.substring(0, 100000);
               }
               return json;
             } catch (err) {
-              console.warn('[DB] Failed to stringify tx_type_data:', err);
+              // console.warn('[DB] Failed to stringify tx_type_data:', err);
               return null;
             }
           })() : null,
