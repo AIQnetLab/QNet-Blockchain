@@ -780,6 +780,27 @@ impl PhaseAwareRewardManager {
             return Ok(false); // Return false = already processed, don't update supply/storage again
         }
         
+        // v3.0: CRITICAL - DELAYED REWARDS ARCHITECTURE
+        // Rewards are delayed by 1 epoch (4 hours / 14400 blocks / 160 MacroBlocks)
+        // 
+        // Timeline:
+        //   MB 160 (epoch=1): NO rewards - first emission MB but no completed epoch to reward
+        //   MB 320 (epoch=2): First rewards for epoch 0
+        //   MB 480 (epoch=3): Rewards for epoch 1
+        //
+        // epoch = macroblock_index / 160
+        // We need epoch >= 2 to have a completed epoch (epoch - 2) to reward
+        const MACROBLOCKS_PER_EPOCH: u64 = 160;
+        let current_epoch = macroblock_index / MACROBLOCKS_PER_EPOCH;
+        
+        if macroblock_index > 0 && current_epoch < 2 {
+            println!("[INFO][REWARDS] mb={} epoch={} SKIP_REWARD_ACCUMULATION (delayed rewards: need epoch>=2)", 
+                     macroblock_index, current_epoch);
+            // Mark as processed to prevent re-processing, but don't accumulate rewards
+            self.processed_emission_macroblocks.insert(macroblock_index);
+            return Ok(false);
+        }
+        
         let current_phase = self.get_current_phase();
         
         // Use MacroBlock values if provided, otherwise fall back to local (legacy)

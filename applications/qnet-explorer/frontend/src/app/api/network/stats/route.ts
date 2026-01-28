@@ -45,27 +45,28 @@ export async function GET() {
       // Time until reward in seconds (1 block = 1 second)
       const secondsUntilReward = blocksUntilReward;
       
-      // Calculate actual circulating supply from reward transactions in DB
+      // Calculate actual circulating supply from EMISSION transactions only
+      // v3.0: Filter by from_address = 'system_emission' to exclude claim transactions
+      // - system_emission → system_rewards_pool = REAL EMISSION (counts)
+      // - system_rewards_pool → user_wallet = CLAIM (does NOT count - just moves existing QNC)
       let circulatingSupply = 0;
       let circulatingFormatted = '0';
       try {
         const result = await pool.query(
           `SELECT COALESCE(SUM(amount), 0) as total_rewards 
            FROM transactions 
-           WHERE tx_type = 'RewardDistribution'`
+           WHERE tx_type = 'RewardDistribution' 
+             AND from_address = 'system_emission'`
         );
         // amount is in nanoQNC, convert to QNC
         const totalRewardsNano = BigInt(result.rows[0]?.total_rewards || 0);
         circulatingSupply = Number(totalRewardsNano) / 1_000_000_000;
         
-        // Format for display
-        circulatingFormatted = circulatingSupply >= 1_000_000_000 
-          ? `${(circulatingSupply / 1_000_000_000).toFixed(2)}B`
-          : circulatingSupply >= 1_000_000
-          ? `${(circulatingSupply / 1_000_000).toFixed(2)}M`
-          : circulatingSupply >= 1_000
-          ? `${(circulatingSupply / 1_000).toFixed(2)}K`
-          : `${Math.floor(circulatingSupply).toLocaleString()}`;
+        // v3.0: Format for display - full numbers with thousand separators (no K/M)
+        circulatingFormatted = circulatingSupply.toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2
+        });
       } catch (dbError) {
         /* log disabled */
       }
