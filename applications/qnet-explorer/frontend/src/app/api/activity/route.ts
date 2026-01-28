@@ -11,11 +11,14 @@ const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 
 // Format amount from nanoQNC to QNC
 function formatAmount(amount: number): string {
-  if (!amount) return '0 QNC';
+  if (!amount) return '0.00 QNC';
   const qnc = amount / 1e9;
-  if (qnc >= 1_000_000) return (qnc / 1_000_000).toFixed(2) + 'M QNC';
-  if (qnc >= 1_000) return (qnc / 1_000).toFixed(2) + 'K QNC';
-  return qnc.toFixed(2) + ' QNC';
+  // v3.0: Show FULL numbers with thousand separators (like Etherscan)
+  // No K/M abbreviations - they confuse users
+  return qnc.toLocaleString('en-US', { 
+    minimumFractionDigits: 2, 
+    maximumFractionDigits: 2 
+  }) + ' QNC';
 }
 
 // Map transaction type to display string

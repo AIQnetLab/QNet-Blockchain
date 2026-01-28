@@ -6282,17 +6282,89 @@ impl BlockchainNode {
                                 // These update total_supply on non-producer nodes
                                 if tx.tx_type == qnet_state::TransactionType::RewardDistribution 
                                    && tx.from == "system_emission" {
-                                    if is_debug() { println!("[DBG][STATE] emission amount={} block={}", 
+                                    if is_debug() { println!("[DBG][STATE] emission_tx amount={} block={}", 
                                              tx.amount / 1_000_000_000, microblock.height); }
                                     
-                                    // Update total_supply for emission transactions
-                                    // This is CRITICAL for state consistency across network
-                                    // v2.76.1: Use already-taken state_guard instead of taking lock again
-                                    if let Err(e) = state_guard.emit_rewards(tx.amount) {
-                                        eprintln!("[WARN][STATE] emission_failed err={}", e);
+                                    // v3.0: CRITICAL FIX - Prevent double emission!
+                                    // emit_rewards is ALREADY called in process_macroblock_heartbeats_deterministic
+                                    // when MacroBlock is processed (by INITIATOR or PARTICIPANT).
+                                    // Emission TX is only for blockchain audit record.
+                                    // Only call emit_rewards here if MacroBlock was NOT processed yet
+                                    // (e.g., node syncing microblocks before macroblocks).
+                                    
+                                    // ARCHITECTURE: DELAYED REWARD by 1 epoch (4 hours)
+                                    // Epochs: epoch = height / 14400
+                                    //   Epoch 0: blocks 0-14399
+                                    //   Epoch 1: blocks 14400-28799
+                                    //   Epoch 2: blocks 28800-43199
+                                    //
+                                    // Emission TX timeline:
+                                    // - Block 14400 (current_epoch=1): NO emission TX (skip)
+                                    // - Block 28800 (current_epoch=2): Emission TX for epoch 0, using MB 160
+                                    // - Block 43200 (current_epoch=3): Emission TX for epoch 1, using MB 320
+                                    //
+                                    // Formula: rewarding_epoch = current_epoch - 2
+                                    //          emission_mb = (rewarding_epoch + 1) * 14400 / 90
+                                    
+                                    const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+                                    const MICROBLOCKS_PER_MB: u64 = 90;
+                                    
+                                    // Calculate which emission MB this TX belongs to (DELAYED REWARD!)
+                                    let current_epoch = microblock.height / EMISSION_BLOCK_INTERVAL;
+                                    let emission_mb_index = if current_epoch >= 2 {
+                                        // Delayed by 1 epoch: rewarding_epoch = current_epoch - 2
+                                        let rewarding_epoch = current_epoch - 2;
+                                        let rewarding_epoch_end_block = (rewarding_epoch + 1) * EMISSION_BLOCK_INTERVAL;
+                                        rewarding_epoch_end_block / MICROBLOCKS_PER_MB
+                                        // Block 28800: epoch=2, rewarding=0, end=14400, mb=160 ✓
+                                        // Block 43200: epoch=3, rewarding=1, end=28800, mb=320 ✓
                                     } else {
-                                        let new_supply = state_guard.get_total_supply();
-                                        if is_debug() { println!("[DBG][STATE] supply_updated total={} QNC", new_supply / 1_000_000_000); }
+                                        // current_epoch < 2: No emission TX should exist
+                                        0  // Will not match any processed MB
+                                    };
+                                    
+                                    // Check if this emission MB was already processed via MacroBlock
+                                    let already_processed = {
+                                        let reward_mgr = reward_manager.read().await;
+                                        let processed = reward_mgr.get_processed_emission_macroblocks();
+                                        processed.contains(&emission_mb_index)
+                                    };
+                                    
+                                    if already_processed {
+                                        // Skip - already processed via MacroBlock (prevents double emission!)
+                                        if is_debug() { 
+                                            println!("[DBG][STATE] emission_skip_dup mb={} block={} (already via MacroBlock)", 
+                                                     emission_mb_index, microblock.height); 
+                                        }
+                                    } else {
+                                        // Not yet processed via MacroBlock - apply from TX
+                                        // This happens during sync when microblocks arrive before macroblocks
+                                        if let Err(e) = state_guard.emit_rewards(tx.amount) {
+                                            eprintln!("[WARN][STATE] emission_failed err={}", e);
+                                        } else {
+                                            let new_supply = state_guard.get_total_supply();
+                                            if is_info() { 
+                                                println!("[INFO][STATE] emission_from_tx mb={} amount={} total={} QNC", 
+                                                         emission_mb_index, tx.amount / 1_000_000_000, new_supply / 1_000_000_000); 
+                                            }
+                                            
+                                            // v3.0: CRITICAL - Mark as processed to prevent double emission
+                                            // when MacroBlock arrives later!
+                                            if emission_mb_index > 0 {
+                                                let mut reward_mgr = reward_manager.write().await;
+                                                let mut processed_set = reward_mgr.get_processed_emission_macroblocks().clone();
+                                                processed_set.insert(emission_mb_index);
+                                                reward_mgr.set_processed_emission_macroblocks(processed_set.clone());
+                                                drop(reward_mgr);
+                                                
+                                                // Persist to storage
+                                                if let Err(e) = storage.save_processed_emission_macroblocks(&processed_set) {
+                                                    eprintln!("[WARN][STATE] processed_save_fail mb={} err={}", emission_mb_index, e);
+                                                } else if is_debug() {
+                                                    println!("[DBG][STATE] emission_marked_processed mb={}", emission_mb_index);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 
@@ -11481,10 +11553,15 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // ARCHITECTURE v2.77: DELAYED REWARD - emission TX for PREVIOUS epoch
                         // This eliminates deadlock between emission block and MacroBlock finalization
                         // 
-                        // Timeline:
-                        //   Block 14400 (epoch 0): NO emission TX (no previous epoch)
-                        //   Block 28800 (epoch 1): Emission TX for epoch 0 (blocks 0-14400) using MacroBlock 160
-                        //   Block 43200 (epoch 2): Emission TX for epoch 1 (blocks 14400-28800) using MacroBlock 320
+                        // Epochs: epoch = height / 14400
+                        //   Epoch 0: blocks 0-14399
+                        //   Epoch 1: blocks 14400-28799
+                        //   Epoch 2: blocks 28800-43199
+                        //
+                        // Emission TX Timeline:
+                        //   Block 14400 (current_epoch=1): NO emission TX (skip - no previous finalized epoch)
+                        //   Block 28800 (current_epoch=2): Emission TX for epoch 0 (blocks 0-14399) using MB 160
+                        //   Block 43200 (current_epoch=3): Emission TX for epoch 1 (blocks 14400-28799) using MB 320
                         // 
                         // Delayed reward by 1 epoch (4 hours) - ensures MacroBlock is finalized
                         

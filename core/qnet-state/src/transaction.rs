@@ -533,10 +533,9 @@ impl Transaction {
         
         // Type-specific validation
         match &self.tx_type {
-            TransactionType::Transfer { from, to, amount } => {
-                if from == to {
-                    return Err("Cannot transfer to self".to_string());
-                }
+            TransactionType::Transfer { amount, .. } => {
+                // v3.0: Self-transfers are ALLOWED (like Bitcoin, Ethereum, Solana)
+                // Use cases: testing, nonce increment, consolidation
                 if *amount == 0 {
                     return Err("Transfer amount must be greater than 0".to_string());
                 }

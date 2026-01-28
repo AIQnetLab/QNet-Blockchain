@@ -3469,6 +3469,7 @@ a[href*="play.google.com"] img {
 .col-addresses {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.82rem;
+  max-width: 280px;  /* v3.0: Narrower FROM→TO column */
 }
 
 .col-addresses .addr {
@@ -3486,7 +3487,15 @@ a[href*="play.google.com"] img {
   margin: 0 0.4rem;
 }
 
-.col-amount,
+.col-amount {
+  color: #8b9caa !important;
+  white-space: nowrap;
+  font-size: 0.82rem;
+  font-family: 'JetBrains Mono', monospace;
+  min-width: 150px;  /* v3.0: Wider for full numbers like 100,570.00 QNC */
+  text-align: right;
+}
+
 .col-time {
   color: #8b9caa !important;
   white-space: nowrap;

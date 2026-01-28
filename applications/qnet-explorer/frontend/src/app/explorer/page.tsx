@@ -377,7 +377,7 @@ export default function ExplorerPage() {
                   <th>TRANSACTION</th>
                   <th>TYPE</th>
                   <th>FROM → TO</th>
-                  <th>AMOUNT</th>
+                  <th style={{ textAlign: 'right' }}>AMOUNT</th>
                   <th 
                     className="sortable-header"
                     onClick={toggleSort}
