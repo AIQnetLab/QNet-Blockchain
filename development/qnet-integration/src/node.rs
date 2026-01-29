@@ -136,11 +136,15 @@ lazy_static::lazy_static! {
 pub fn set_emergency_producer_flag(block_height: u64, producer: String) {
     EMERGENCY_PRODUCER_HEIGHT.store(block_height, StdOrdering::SeqCst);
     
-    // v3.3: Calculate end of rotation cycle (next rotation boundary)
+    // v3.4: Calculate end of rotation cycle (next rotation boundary)
     // Rotation happens every 30 blocks starting from block 1: 31, 61, 91, 121...
+    // Emergency cycle is INCLUSIVE of the last block before rotation boundary
+    // Example: if emergency starts at h=1232, cycle 41 ends at h=1260
+    // end_height should be 1261 so that condition "h < end_height" includes 1260
     let rotation_interval = 30u64;
     let current_cycle = block_height / rotation_interval;
-    let end_height = (current_cycle + 1) * rotation_interval;
+    // +1 to include the last block of the cycle (e.g., 1260 when end_height=1261)
+    let end_height = (current_cycle + 1) * rotation_interval + 1;
     EMERGENCY_PRODUCER_END_HEIGHT.store(end_height, StdOrdering::SeqCst);
     
     *EMERGENCY_PRODUCER_ID.write() = producer.clone();
@@ -195,36 +199,19 @@ pub fn clear_emergency_producer() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// v2.97: Track ALL failed producers for a block (including emergency producers)
-// This prevents infinite loops when emergency producer also fails
+// v3.6: REMOVED FAILED_PRODUCERS_FOR_BLOCK - IT CAUSED NON-DETERMINISTIC FORKS!
 // ═══════════════════════════════════════════════════════════════════════════════
-lazy_static::lazy_static! {
-    // Map: block_height -> Vec<failed_producer_ids>
-    static ref FAILED_PRODUCERS_FOR_BLOCK: DashMap<u64, Vec<String>> = DashMap::new();
-}
-
-// Add a failed producer for a specific block height
-pub fn add_failed_producer(block_height: u64, producer: &str) {
-    FAILED_PRODUCERS_FOR_BLOCK
-        .entry(block_height)
-        .or_insert_with(Vec::new)
-        .push(producer.to_string());
-    println!("[INFO][FAIL] added_failed_producer h={} producer={}", block_height, producer);
-}
-
-// Get all failed producers for a block height
-pub fn get_failed_producers(block_height: u64) -> Vec<String> {
-    FAILED_PRODUCERS_FOR_BLOCK
-        .get(&block_height)
-        .map(|v| v.clone())
-        .unwrap_or_default()
-}
-
-// Clear old failed producer entries (keep only last 10 blocks)
-pub fn cleanup_failed_producers(current_height: u64) {
-    let cutoff = current_height.saturating_sub(10);
-    FAILED_PRODUCERS_FOR_BLOCK.retain(|h, _| *h > cutoff);
-}
+// PROBLEM: Each node had DIFFERENT local failed producers list because:
+//   1. Different nodes detected timeouts at DIFFERENT times (network delays)
+//   2. Different lists → Different candidate filtering → Different emergency producers
+//   3. RESULT: FORK when two nodes select themselves as emergency!
+//
+// SOLUTION: Use ONLY the deterministic failed_producer parameter passed to
+// select_emergency_producer(). This value comes from the emergency message
+// which is the SAME for all nodes. If emergency producer also fails:
+//   1. New emergency message with IT as failed_producer
+//   2. All nodes receive SAME message → Select SAME next producer → NO FORK
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // CRITICAL: Global synchronization flags for API access
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -236,6 +223,12 @@ pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
 // When process_received_blocks reaches this height, it clears SYNC_IN_PROGRESS
 // This is proper event-driven design - flag cleared at the SOURCE, not by polling
 static SYNC_TARGET_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+// v3.5: Flag to skip slot timing after sync completion
+// PROBLEM: After sync, node may be "ahead" of slot time and wait unnecessarily
+// while network expects block from it immediately
+// SOLUTION: Skip slot timing wait on first block after sync if we're producer
+static JUST_COMPLETED_SYNC: AtomicBool = AtomicBool::new(false);
 
 // DEADLOCK PROTECTION: Track when sync started to detect stuck operations
 static SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
@@ -5594,7 +5587,7 @@ impl BlockchainNode {
                                         
                                         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                                             println!("[WARN][MB-SYNC] too_many_failures={} stopping_batch_sync", consecutive_failures);
-                                            break;
+                                        break;
                                         }
                                         
                                         // v3.2: Don't break on single failure - try individual macroblocks
@@ -6339,10 +6332,10 @@ impl BlockchainNode {
                                     } else {
                                         // Not yet processed via MacroBlock - apply from TX
                                         // This happens during sync when microblocks arrive before macroblocks
-                                        if let Err(e) = state_guard.emit_rewards(tx.amount) {
-                                            eprintln!("[WARN][STATE] emission_failed err={}", e);
-                                        } else {
-                                            let new_supply = state_guard.get_total_supply();
+                                    if let Err(e) = state_guard.emit_rewards(tx.amount) {
+                                        eprintln!("[WARN][STATE] emission_failed err={}", e);
+                                    } else {
+                                        let new_supply = state_guard.get_total_supply();
                                             if is_info() { 
                                                 println!("[INFO][STATE] emission_from_tx mb={} amount={} total={} QNC", 
                                                          emission_mb_index, tx.amount / 1_000_000_000, new_supply / 1_000_000_000); 
@@ -6706,8 +6699,14 @@ impl BlockchainNode {
                         SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                         SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                         NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
+                        
+                        // v3.5: Set flag to skip slot timing on first block after sync
+                        // CRITICAL: If we become producer immediately after sync, we must
+                        // create block without waiting for slot time (network expects it NOW)
+                        JUST_COMPLETED_SYNC.store(true, Ordering::SeqCst);
+                        
                         if is_info() { 
-                            println!("[INFO][SYNC] target_reached h={} target={} sync_complete", 
+                            println!("[INFO][SYNC] target_reached h={} target={} sync_complete skip_slot=true", 
                                      received_block.height, target); 
                         }
                     }
@@ -9454,46 +9453,61 @@ impl BlockchainNode {
                     // Normal operation: 0-2 sec, sync: 0-10 sec, >60 sec = error
                     const MAX_SLOT_WAIT_SECS: u64 = 60;
                     
-                    let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    
-                    if genesis_ts > 0 {
-                        // Calculate expected Unix timestamp for next block
-                        let current_height = *height.read().await;
-                        let expected_unix_time = genesis_ts + current_height + 1;
-                        
-                        let current_unix_time = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        
-                        if expected_unix_time > current_unix_time {
-                            let wait_secs = expected_unix_time - current_unix_time;
-                            
-                            if wait_secs > MAX_SLOT_WAIT_SECS {
-                                // Height is ahead of wall clock by >3 minutes
-                                // This indicates sync issue - don't busy loop, wait for correction
-                                if is_warn() { 
-                                    println!("[WARN][SLOT] height_desync h={} expected_ts={} current_ts={} drift={}s", 
-                                             current_height + 1, expected_unix_time, current_unix_time, wait_secs); 
-                                }
-                                tokio::time::sleep(Duration::from_secs(10)).await;
-                                continue;
-                            }
-                            
-                            // Normal case: wait until correct Unix time for this block slot
-                            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-                        } else {
-                            // RATE LIMIT v2.42.1: If late (QUIC init took >15 sec), still wait 1 sec
-                            // This prevents overwhelming QUIC with burst of catch-up blocks
-                            // Not a hack - this is network capacity protection (like TCP congestion control)
-                            // Max 1 block/sec is the network's design limit
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                    // v3.5: Check if we just completed sync - skip slot timing wait!
+                    // PROBLEM: After sync, node is "ahead" of slot time and would wait
+                    // unnecessarily while network expects block from it immediately.
+                    // SOLUTION: Skip wait on first iteration after sync completion.
+                    let just_synced = JUST_COMPLETED_SYNC.swap(false, Ordering::SeqCst);
+                    if just_synced {
+                        if is_info() {
+                            println!("[INFO][SLOT] post_sync_skip_wait reason=just_completed_sync");
                         }
+                        // Minimal wait to allow state to settle, then proceed immediately
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        // Don't skip the rest of the block - continue to production logic
                     } else {
-                        // No genesis timestamp yet - use simple 1 second interval
-                        tokio::time::sleep(microblock_interval).await;
-                    }
+                        // Normal slot timing logic
+                        let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        
+                        if genesis_ts > 0 {
+                            // Calculate expected Unix timestamp for next block
+                            let current_height = *height.read().await;
+                            let expected_unix_time = genesis_ts + current_height + 1;
+                            
+                            let current_unix_time = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            
+                            if expected_unix_time > current_unix_time {
+                                let wait_secs = expected_unix_time - current_unix_time;
+                                
+                                if wait_secs > MAX_SLOT_WAIT_SECS {
+                                    // Height is ahead of wall clock by >3 minutes
+                                    // This indicates sync issue - don't busy loop, wait for correction
+                                    if is_warn() { 
+                                        println!("[WARN][SLOT] height_desync h={} expected_ts={} current_ts={} drift={}s", 
+                                                 current_height + 1, expected_unix_time, current_unix_time, wait_secs); 
+                                    }
+                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                    continue;
+                                }
+                                
+                                // Normal case: wait until correct Unix time for this block slot
+                                tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                            } else {
+                                // RATE LIMIT v2.42.1: If late (QUIC init took >15 sec), still wait 1 sec
+                                // This prevents overwhelming QUIC with burst of catch-up blocks
+                                // Not a hack - this is network capacity protection (like TCP congestion control)
+                                // Max 1 block/sec is the network's design limit
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                        } else {
+                            // No genesis timestamp yet - use simple 1 second interval
+                            tokio::time::sleep(microblock_interval).await;
+                        }
+                    } // end of normal slot timing (else branch of just_synced)
                 }
                 
                 cpu_check_counter += 1;
@@ -11262,6 +11276,14 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             if let Some(hybrid) = instances_guard.get(&normalized_id) {
                                 if let Some(cert) = hybrid.get_current_certificate() {
                                     if let Ok(cert_bytes) = bincode::serialize(&cert) {
+                                        // v3.4 CRITICAL: Set broadcast-in-progress flag BEFORE certificate broadcast
+                                        // This prevents emergency messages from interrupting mid-broadcast
+                                        // Race condition: cert sent → emergency → data not sent → all nodes stuck
+                                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        if is_debug() {
+                                            println!("[DBG][PROD] broadcast_flag=true h={}", next_block_height);
+                                        }
+                                        
                                         println!("[CERTIFICATE] 🚀 IMMEDIATE TRACKED broadcast as new producer for round {} (block #{}): {}", 
                                             current_round, next_block_height, cert.serial_number);
                                         
@@ -11314,6 +11336,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             // Skip this iteration - emergency producer handles this block
                             // Wait 1 block interval (1 second) before checking again
                             // This matches block production rate and prevents spam
+                            // v3.4: CRITICAL - Clear broadcast flag before continue to prevent stuck flag
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                             continue;
                         }
@@ -11489,6 +11513,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         }
                         
                         // Skip this production round
+                        // v3.4: CRITICAL - Clear broadcast flag before continue
+                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                         tokio::time::sleep(microblock_interval).await;
                         continue;
                     }
@@ -12197,6 +12223,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // CRITICAL v2.32: Don't produce blocks without valid Genesis timestamp!
                         if genesis_timestamp == 0 {
                             println!("[WARN][BLOCK] no_genesis_ts waiting_for_sync");
+                            // v3.4: CRITICAL - Clear broadcast flag before continue
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_secs(5)).await;
                             continue;
                         }
@@ -12244,6 +12272,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                 }
                             }
                             
+                            // v3.4: CRITICAL - Clear broadcast flag before continue
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue;  // Retry without producing
                         }
@@ -12267,6 +12297,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                 if total_peers > 0 && peers_with_block > total_peers / 2 {
                                     println!("[INFO][SYNC] peers_have_block h={} count={}/{}", 
                                              next_block_height - 1, peers_with_block, total_peers);
+                                    // v3.4: CRITICAL - Clear broadcast flag before continue
+                                    crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                     continue;  // Keep waiting - block exists on network
                                 }
@@ -12303,6 +12335,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                 }
                             }
                             // Skip this production round - prevent fork creation!
+                            // v3.4: CRITICAL - Clear broadcast flag before continue
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                             tokio::time::sleep(microblock_interval).await;
                             continue;
                         }
@@ -12311,6 +12345,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                  next_block_height, next_block_height - 1, retry_count); }
                         
                         // PERFORMANCE FIX: Reduce retry delay from 500ms to 100ms for faster recovery
+                        // v3.4: CRITICAL - Clear broadcast flag before continue
+                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     } else if next_block_height > 1 {
@@ -12372,6 +12408,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                         (vec![0u8; 64], next_block_height * 500_000) // Estimate based on block height
                                     }
                                 } else {
+                                    // v3.4: CRITICAL - Clear broadcast flag before continue
+                                    crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                                     tokio::time::sleep(Duration::from_millis(200)).await;
                                     continue;
                                 }
@@ -12391,6 +12429,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                         (vec![0u8; 64], next_block_height * 500_000) // Estimate based on block height
                                     }
                                 } else {
+                                    // v3.4: CRITICAL - Clear broadcast flag before continue
+                                    crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                                     tokio::time::sleep(Duration::from_millis(200)).await;
                                     continue;
                                 }
@@ -12534,6 +12574,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         });
                         
                         // Skip this block - let another node produce it
+                        // v3.4: CRITICAL - Clear broadcast flag before continue
+                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         continue;
                     }
@@ -12643,6 +12685,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         },
                         Err(e) => {
                             println!("[ERR][CRYPTO] Failed to sign microblock #{}: {}", microblock_height, e);
+                            // v3.4: CRITICAL - Clear broadcast flag before continue
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                             continue; // Skip this block if signing fails
                         }
                     }
@@ -12662,6 +12706,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // Validate microblock (production checks)
                     if let Err(e) = Self::validate_microblock_production(&microblock) {
                         println!("[Microblock] ❌ Validation failed: {}", e);
+                        // v3.4: CRITICAL - Clear broadcast flag before continue
+                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                         continue;
                     }
                     
@@ -12725,6 +12771,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         
                         if !all_valid {
                             println!("[Microblock] ❌ Parallel validation failed in {}ms", validation_time.as_millis());
+                            // v3.4: CRITICAL - Clear broadcast flag before continue
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                             continue;
                         }
                         
@@ -12740,6 +12788,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     if microblock.height > 0 {
                         if let Ok(Some(_)) = storage.load_microblock(microblock.height) {
                             println!("[WARN][PROD] Block #{} already exists, skipping creation to prevent fork", microblock.height);
+                            // v3.4: CRITICAL - Clear broadcast flag before continue
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                             continue;
                         }
                     }
@@ -13023,8 +13073,20 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             println!("[P2P] 🚀 Async broadcast started for block #{} (pending={})", 
                                     height_for_broadcast, pending_now);
                         }
+                        
+                        // v3.4 CRITICAL: Clear broadcast-in-progress flag AFTER data is queued for transmission
+                        // At this point both certificate and block data are committed to network
+                        // Emergency messages can now be processed (but this block is already safe)
+                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                        if is_debug() {
+                            println!("[DBG][PROD] broadcast_flag=false h={} (data_queued)", height_for_broadcast);
+                        }
                     } else {
-                        println!("[WARN][P2P] P2P system not available - cannot broadcast block #{}", microblock.height);
+                        // v3.4: Clear flag even if P2P unavailable (to prevent stuck flag)
+                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                        if is_warn() {
+                            println!("[WARN][P2P] p2p_unavailable h={}", microblock.height);
+                        }
                     }
                     
                     // ATOMIC REWARDS: Track block for rotation reward
@@ -13044,7 +13106,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         if end_height > 0 && microblock.height >= end_height - 1 {
                             println!("[INFO][EMERGENCY] cycle_complete h={} end_h={} clearing_flag", 
                                      microblock.height, end_height);
-                            clear_emergency_producer();
+                                clear_emergency_producer();
                         } else if is_debug() {
                             println!("[DBG][EMERGENCY] continuing h={} end_h={} remaining={}", 
                                      microblock.height, end_height, end_height.saturating_sub(microblock.height));
@@ -13648,9 +13710,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     // MECHANISM: Cache will be UPDATED below to emergency producer
                                     // RESULT: Emergency producer completes the 30-block rotation period
                                     
-                                    // v2.97: Track failed producer to prevent infinite loops
-                                    // Add current producer to failed list (could be original or previous emergency)
-                                    add_failed_producer(expected_height_timeout, &current_producer_timeout);
+                                    // v3.6: REMOVED add_failed_producer() - it caused NON-DETERMINISTIC selection!
+                                    // Each node had DIFFERENT failed lists → DIFFERENT emergency producers → FORK
+                                    // Now: failed_producer is passed EXPLICITLY to select_emergency_producer
                                     
                                     // EXISTING: Use same emergency selection as implemented in select_emergency_producer
                                     let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
@@ -14018,14 +14080,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // CRITICAL FIX: Clear cache at rotation boundaries to ensure new producer selection
             // This prevents using stale cached producer when entering new round
-            // v2.97: BUT preserve cache if it contains emergency producer (to prevent loops)
+            // v3.6: Check for ACTIVE emergency using global flag (DETERMINISTIC!)
+            // Replaced get_failed_producers() which used LOCAL non-deterministic DashMap
             if current_height > 0 && (current_height - 1) % rotation_interval == 0 {
                 // We're at a rotation boundary (blocks 31, 61, 91...)
-                // v2.97: Check if there are failed producers for this block - means emergency is active
-                let has_emergency = !get_failed_producers(current_height).is_empty();
+                // v3.6: Check global emergency flag - SAME value on all nodes!
+                let has_emergency = get_emergency_producer().is_some();
                 
                 if has_emergency {
-                    // v2.97: Emergency in progress - DO NOT clear cache!
+                    // Emergency in progress - DO NOT clear cache!
                     // Cache contains emergency producer, clearing would restart selection loop
                     if is_info() { println!("[INFO][PROD] rotation_boundary h={} emergency_active=true cache_preserved", current_height); }
                 } else {
@@ -14623,25 +14686,32 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 //   → All nodes again select SAME next producer (deterministic)
                 // ═══════════════════════════════════════════════════════════════════════════
                 
-                // v2.97: Get ALL failed producers for this block (original + emergency failures)
-                let all_failed = get_failed_producers(current_height);
+                // v3.6 CRITICAL FIX: REMOVED get_failed_producers() - IT WAS NON-DETERMINISTIC!
+                // ═══════════════════════════════════════════════════════════════════════════
+                // PROBLEM: get_failed_producers() uses LOCAL DashMap that differs per node:
+                //   - Node A sees timeout for X → adds X to local failed list
+                //   - Node B hasn't seen timeout yet → X not in its list
+                //   - Both call select_emergency_producer → DIFFERENT candidates → FORK!
+                //
+                // SOLUTION: Exclude ONLY the deterministic failed_producer parameter
+                //   - All nodes receive SAME failed_producer in emergency message
+                //   - If emergency producer ALSO fails → new emergency with IT as failed_producer
+                //   - Chain of emergency selections is DETERMINISTIC (same on all nodes)
+                // ═══════════════════════════════════════════════════════════════════════════
                 
                 for (node_id, reputation) in qualified {
-                    // v2.97: Exclude ALL failed producers (original + emergency chain)
-                    // This prevents infinite loops when emergency producer also fails
+                    // DETERMINISTIC: Exclude ONLY the explicitly passed failed_producer
+                    // This is the SAME value on ALL nodes receiving the emergency message
                     if node_id == failed_producer {
                         println!("[INFO][EMERGENCY] peer={} status=excluded reason=failed_producer", node_id);
                         continue;
                     }
                     
-                    // v2.97: Also exclude any previously failed emergency producers
-                    if all_failed.contains(&node_id) {
-                        println!("[INFO][EMERGENCY] peer={} status=excluded reason=emergency_failed", node_id);
-                        continue;
-                    }
-                    
-                    // Add ALL other qualified candidates without sync filtering
-                    // Sync check happens on the SELECTED node (self-exclude if not ready)
+                    // v3.6: NO local state filtering! All other candidates are included.
+                    // If selected emergency producer is also down:
+                    //   1. It self-excludes (doesn't produce)
+                    //   2. Timeout triggers NEW emergency with IT as failed_producer
+                    //   3. All nodes AGAIN select SAME next candidate (deterministic)
                     println!("[INFO][EMERGENCY] peer={} status=candidate rep={:.1}", 
                              node_id, reputation * 100.0);
                     candidates.push((node_id.clone(), reputation));
@@ -14676,8 +14746,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let stable_candidates = valid_candidates;
             
             if is_info() {
-                println!("[INFO][EMERGENCY] candidates={} excluded={}", 
-                         stable_candidates.len(), failed_producer);
+            println!("[INFO][EMERGENCY] candidates={} excluded={}", 
+                     stable_candidates.len(), failed_producer);
             }
             
             if stable_candidates.is_empty() {

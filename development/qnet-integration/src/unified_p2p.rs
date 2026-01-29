@@ -176,6 +176,12 @@ pub static EMERGENCY_STOP_HEIGHT: Lazy<Arc<AtomicU64>> =
 pub static EMERGENCY_STOP_TIME: Lazy<Arc<AtomicU64>> = 
     Lazy::new(|| Arc::new(AtomicU64::new(0)));
 
+// v3.4 CRITICAL: Track when block broadcast is in progress
+// Emergency messages MUST be ignored while broadcasting to prevent partial block transmission
+// Race condition: emergency arrives mid-broadcast → only certificate sent, data lost → all nodes stuck
+pub static BLOCK_BROADCAST_IN_PROGRESS: Lazy<Arc<AtomicBool>> = 
+    Lazy::new(|| Arc::new(AtomicBool::new(false)));
+
 // CRITICAL: Track emergency failovers in progress to prevent race conditions
 // Format: "emergency_failover_{height}" -> prevents multiple nodes from initiating same failover
 // SCALABILITY: DashSet for lock-free concurrent access with millions of nodes
@@ -18711,6 +18717,16 @@ impl SimplifiedP2P {
                         // Could track reputation penalty for false failovers here in future
                         
                         // DO NOT STOP - continue producing blocks
+                        return;
+                    }
+                    
+                    // v3.4 CRITICAL: Check if broadcast is in progress
+                    // If we're mid-broadcast, DO NOT stop! Interrupting broadcast causes partial blocks
+                    // which leaves ALL nodes stuck waiting for data that will never arrive
+                    if BLOCK_BROADCAST_IN_PROGRESS.load(Ordering::SeqCst) {
+                        if crate::node::is_warn() {
+                            println!("[WARN][FAILOVER] broadcast_in_progress=true ignoring_emergency h={}", block_height);
+                        }
                         return;
                     }
                     
