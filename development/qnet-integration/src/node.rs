@@ -9734,7 +9734,25 @@ impl BlockchainNode {
                     // This is fine because non-bootstrap nodes only join after network is running
                 }
             } else {
-                println!("[INFO][GEN] Genesis block found at height 0, proceeding with normal operation");
+                // Genesis block already exists in storage
+                // CRITICAL FIX v3.15.1: Still need to sync GLOBAL_GENESIS_TIMESTAMP from stored Genesis!
+                // Without this, nodes use their LOCAL start time instead of Genesis timestamp
+                if let Ok(Some(genesis_data)) = storage.load_microblock(0) {
+                    if let Ok(genesis_block) = bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
+                        let old_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+                        if old_ts != genesis_block.timestamp {
+                            crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                                genesis_block.timestamp,
+                                std::sync::atomic::Ordering::Relaxed
+                            );
+                            crate::update_global_pricing_state(0.0, 5, genesis_block.timestamp);
+                            if is_info() { 
+                                println!("[INFO][GEN] genesis_ts_synced_from_storage old={} new={}", old_ts, genesis_block.timestamp); 
+                            }
+                        }
+                    }
+                }
+                if is_info() { println!("[INFO][GEN] genesis_found_in_storage height=0"); }
             }
             
             // NOTE: Timing is now Unix-based in main loop (v2.42)
