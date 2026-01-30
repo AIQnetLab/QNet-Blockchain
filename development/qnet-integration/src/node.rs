@@ -9340,7 +9340,14 @@ impl BlockchainNode {
                                                     genesis_microblock.timestamp,
                                                     std::sync::atomic::Ordering::Relaxed
                                                 );
-                                                println!("[GENESIS] 🔒 GLOBAL_GENESIS_TIMESTAMP set to: {}", genesis_microblock.timestamp);
+                                                if is_info() { println!("[INFO][GEN] genesis_ts_set ts={}", genesis_microblock.timestamp); }
+                                                
+                                                // CRITICAL FIX v3.15: Initialize LAST_BLOCK_PRODUCED_TIME to NOW
+                                                // This ensures delay calculation starts fresh from Genesis creation
+                                                let now = get_timestamp_safe();
+                                                LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                                                LAST_BLOCK_PRODUCED_HEIGHT.store(0, std::sync::atomic::Ordering::Relaxed);
+                                                if is_info() { println!("[INFO][GEN] last_block_time_init ts={} height=0", now); }
                                                 
                                                 // Display economic information (halving & phase)
                                                 {
@@ -9586,7 +9593,7 @@ impl BlockchainNode {
                         
                         // Check if Genesis block arrived
                         match storage.load_microblock(0) {
-                            Ok(Some(_)) => {
+                            Ok(Some(genesis_data)) => {
                                 println!("[INFO][GEN] Genesis block received after {} attempts", 
                                         genesis_wait_attempts);
                                 // Update height from storage
@@ -9594,6 +9601,33 @@ impl BlockchainNode {
                                     microblock_height = stored_height;
                                     *height.write().await = stored_height;
                                     println!("[GENESIS] 📊 Height synchronized to {}", stored_height);
+                                }
+                                
+                                // CRITICAL FIX v3.15: Update GLOBAL_GENESIS_TIMESTAMP from received Genesis!
+                                // Without this, nodes 002-005 use their LOCAL start time instead of 
+                                // the actual Genesis timestamp from node 001, causing timestamp validation
+                                // to reject valid blocks as "too old" (delta=-85s)
+                                if let Ok(genesis_block) = bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
+                                    let old_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+                                    crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                                        genesis_block.timestamp,
+                                        std::sync::atomic::Ordering::Relaxed
+                                    );
+                                    if is_info() { println!("[INFO][GEN] genesis_ts_synced old={} new={}", old_ts, genesis_block.timestamp); }
+                                    
+                                    // CRITICAL FIX v3.15: Initialize LAST_BLOCK_PRODUCED_TIME to NOW
+                                    // This ensures delay calculation starts fresh from Genesis reception
+                                    // Without this, delay = current_time - genesis_ts could be large
+                                    // if nodes waited a long time before Genesis was created
+                                    let now = get_timestamp_safe();
+                                    LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                                    LAST_BLOCK_PRODUCED_HEIGHT.store(0, std::sync::atomic::Ordering::Relaxed);
+                                    if is_info() { println!("[INFO][GEN] last_block_time_init ts={} height=0", now); }
+                                    
+                                    // Also update reward manager with correct genesis timestamp
+                                    crate::update_global_pricing_state(0.0, 5, genesis_block.timestamp);
+                                } else {
+                                    println!("[WARN][GEN] Failed to deserialize Genesis block for timestamp sync");
                                 }
                                 
                                 // CRITICAL FIX: Broadcast certificate AFTER Genesis reception
@@ -9705,6 +9739,24 @@ impl BlockchainNode {
             
             // NOTE: Timing is now Unix-based in main loop (v2.42)
             // Uses genesis_timestamp + height for deterministic slot timing
+            
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL FIX v3.15: Initialize LAST_BLOCK_PRODUCED_TIME RIGHT BEFORE main_loop!
+            // ═══════════════════════════════════════════════════════════════════════════
+            // WHY HERE (not earlier):
+            //   - Earlier initialization (at Genesis reception) would result in delay = 120s
+            //     because nodes wait ~2 minutes for certificates before starting main_loop
+            //   - Initializing HERE ensures delay starts at ~0 when production begins
+            //   - All nodes initialize at roughly the same time (within NTP drift ~2s)
+            // ═══════════════════════════════════════════════════════════════════════════
+            {
+                let now = get_timestamp_safe();
+                LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                LAST_BLOCK_PRODUCED_HEIGHT.store(microblock_height, std::sync::atomic::Ordering::Relaxed);
+                if is_info() { 
+                    println!("[INFO][GEN] main_loop_init last_block_time={} height={}", now, microblock_height); 
+                }
+            }
             
             println!("[Microblock] 🚀 Starting production-ready microblock system");
             println!("[Microblock] ⚡ Target: 100k+ TPS with batch processing");
