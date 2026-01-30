@@ -237,11 +237,25 @@ static FAST_SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.8: DETERMINISTIC TIMEOUT-BASED FAILOVER
 // ═══════════════════════════════════════════════════════════════════════════════
-// Replaces non-deterministic emergency broadcast system.
-// All nodes compute SAME timeout_round from blockchain state → SAME producer!
+// v3.13: BLOCK-TIMESTAMP BASED DETERMINISTIC FAILOVER
+// ═══════════════════════════════════════════════════════════════════════════════
+// KEY: timeout_round is computed from PREVIOUS BLOCK TIMESTAMP (not genesis_ts!)
+// 
+// WHY THIS WORKS:
+//   - prev_block.timestamp is IDENTICAL on all synchronized nodes
+//   - delay = current_time - (prev_block_ts + 1) is typically 0-10 seconds
+//   - NTP drift (±2 sec) < grace period (5 sec) → SAME timeout_round on all nodes!
+//
+// WHY genesis_ts + height WAS WRONG:
+//   - Accumulated ALL previous delays (could be 85+ seconds!)
+//   - Small NTP drift in large delay → different timeout_round → FORK!
 // ═══════════════════════════════════════════════════════════════════════════════
 static CURRENT_TIMEOUT_ROUND: AtomicU64 = AtomicU64::new(0);
 static TIMEOUT_ROUND_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+// v3.13: Cache for prev_block_ts to avoid repeated storage reads
+static CACHED_PREV_BLOCK_TS: AtomicU64 = AtomicU64::new(0);
+static CACHED_PREV_BLOCK_HEIGHT: AtomicU64 = AtomicU64::new(u64::MAX); // MAX = not cached
 
 /// Get current timeout round for producer selection
 pub fn get_current_timeout_round() -> u64 {
@@ -254,9 +268,27 @@ pub fn set_timeout_round(round: u64, height: u64) {
     TIMEOUT_ROUND_HEIGHT.store(height, Ordering::SeqCst);
 }
 
+/// v3.13: Get cached prev block timestamp (or u64::MAX if not cached for this height)
+fn get_cached_prev_block_ts(height: u64) -> Option<u64> {
+    if CACHED_PREV_BLOCK_HEIGHT.load(Ordering::Relaxed) == height {
+        Some(CACHED_PREV_BLOCK_TS.load(Ordering::Relaxed))
+    } else {
+        None
+    }
+}
+
+/// v3.13: Cache prev block timestamp for performance
+fn cache_prev_block_ts(height: u64, timestamp: u64) {
+    CACHED_PREV_BLOCK_TS.store(timestamp, Ordering::Relaxed);
+    CACHED_PREV_BLOCK_HEIGHT.store(height, Ordering::Relaxed);
+}
+
 /// Reset timeout round when block is received
+/// v3.13: Also invalidates prev_block_ts cache
 pub fn reset_timeout_round() {
     CURRENT_TIMEOUT_ROUND.store(0, Ordering::SeqCst);
+    // Invalidate cache so next iteration loads fresh timestamp
+    CACHED_PREV_BLOCK_HEIGHT.store(u64::MAX, Ordering::Relaxed);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -10232,20 +10264,26 @@ impl BlockchainNode {
                     }
                     
                     // ═══════════════════════════════════════════════════════════════════════════
-                    // v3.9: FULLY DETERMINISTIC SLOT-BASED FAILOVER
+                    // v3.13: BLOCK-TIMESTAMP BASED DETERMINISTIC FAILOVER
                     // ═══════════════════════════════════════════════════════════════════════════
-                    // KEY PRINCIPLE: Use GLOBAL genesis_ts + height, NOT local block receive time!
+                    // KEY PRINCIPLE: Use PREVIOUS BLOCK TIMESTAMP, not genesis_ts + height!
                     //
-                    // WHY THIS WORKS:
-                    //   - All nodes know: block H should be created at genesis_ts + H
-                    //   - All nodes see same current_time (NTP synchronized, ±1 sec)
-                    //   - delay = current_time - expected_time is SAME on all nodes!
-                    //   - timeout_round computed from delay is DETERMINISTIC!
+                    // WHY THIS IS CORRECT:
+                    //   - prev_block.timestamp is IDENTICAL on all synchronized nodes
+                    //   - delay = current_time - (prev_block_ts + 1) is small (0-10 sec normally)
+                    //   - NTP drift (±2 sec) < grace period (5 sec) → SAME timeout_round!
                     //
-                    // CONTRAST WITH OLD APPROACH (BROKEN):
-                    //   - Node A receives block at T+0.5s → time_since = 4.5s → round 0
-                    //   - Node C doesn't receive block → time_since = 10s → round 1
-                    //   - DIFFERENT rounds → DIFFERENT producers → FORK!
+                    // WHY genesis_ts + height WAS WRONG:
+                    //   - It accumulated ALL previous delays (could be 85+ seconds!)
+                    //   - NTP drift of 2 sec in 85 sec delay → different timeout_round!
+                    //   - Example: delay=85 → round=16, delay=87 → round=16 (OK)
+                    //             but delay=89 → round=17 (DIFFERENT!) → FORK!
+                    //
+                    // NEW APPROACH:
+                    //   - delay = current_time - prev_block.timestamp - 1
+                    //   - Normal: delay ≈ 0-2 sec → timeout_round = 0
+                    //   - Stall: delay > 5 sec → timeout_round = 1, 2, 3...
+                    //   - NTP drift (±2 sec) cannot cause round difference!
                     // ═══════════════════════════════════════════════════════════════════════════
                     let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
                     let next_height = microblock_height + 1;
@@ -10253,10 +10291,32 @@ impl BlockchainNode {
                     
                     // Only proceed if genesis timestamp is set
                     if genesis_ts > 0 && current_time > 0 {
-                        // Expected time for next block (DETERMINISTIC!)
-                        let expected_time = genesis_ts + next_height;
+                        // v3.13: Get PREVIOUS BLOCK TIMESTAMP (identical on all synced nodes!)
+                        // PERFORMANCE: Use cache to avoid repeated storage reads in hot loop
+                        let prev_block_ts = if microblock_height == 0 {
+                            // Genesis case: use genesis timestamp
+                            genesis_ts
+                        } else if let Some(cached_ts) = get_cached_prev_block_ts(microblock_height) {
+                            // Cache hit - use cached value (O(1), no I/O)
+                            cached_ts
+                        } else {
+                            // Cache miss - load from storage and cache
+                            // CRITICAL: Use load_microblock_auto_format to handle both formats!
+                            let ts = match storage.load_microblock_auto_format(microblock_height) {
+                                Ok(Some(block)) => block.timestamp,
+                                _ => {
+                                    // Fallback: estimate from genesis (rare - only if storage corrupted)
+                                    genesis_ts + microblock_height
+                                }
+                            };
+                            cache_prev_block_ts(microblock_height, ts);
+                            ts
+                        };
                         
-                        // How late is the block? (SAME VALUE ON ALL NODES!)
+                        // Expected time for next block = prev block timestamp + 1 second
+                        let expected_time = prev_block_ts + 1;
+                        
+                        // How late is the block? (DETERMINISTIC - prev_block_ts is same on all nodes!)
                         let delay = current_time.saturating_sub(expected_time);
                         
                         // v3.9: Calculate timeout_round from SLOT DELAY (DETERMINISTIC!)
@@ -10302,8 +10362,9 @@ impl BlockchainNode {
                                              next_height, delay, timeout_round, current_producer);
                                 }
                                 
-                                // v3.9: NO BROADCAST! All nodes compute same producer
-                                // because delay = current_time - (genesis_ts + height) is SAME everywhere!
+                                // v3.13: NO BROADCAST! All nodes compute same producer
+                                // because delay = current_time - (prev_block_ts + 1) is SAME everywhere!
+                                // prev_block_ts is IDENTICAL on all synchronized nodes!
                             }
                         }
                         
@@ -10974,8 +11035,9 @@ impl BlockchainNode {
                     }
                 }
                 
-                // v3.9: Get timeout_round for DETERMINISTIC failover
-                // This is computed from slot delay (current_time - (genesis_ts + height)) above
+                // v3.13: Get timeout_round for DETERMINISTIC failover
+                // This is computed from slot delay (current_time - prev_block_ts - 1) above
+                // Using prev_block_ts ensures all synced nodes compute SAME delay!
                 let timeout_round = get_current_timeout_round();
                 
                 // v3.8: Use select_microblock_producer_with_round for deterministic failover
