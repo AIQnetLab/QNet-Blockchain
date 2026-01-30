@@ -7371,21 +7371,11 @@ impl BlockchainNode {
             
             // Skip timestamp validation for genesis block (h=0) or before genesis is set
             if microblock.height > 0 && genesis_ts > 0 && local_time > 0 {
-                // 2a. MONOTONICITY CHECK: Block timestamp must be > previous block
-                // This prevents time manipulation attacks and ensures causal ordering
-                if let Ok(Some(prev_data)) = storage.load_microblock(microblock.height - 1) {
-                    if let Ok(prev_block) = bincode::deserialize::<qnet_state::MicroBlock>(&prev_data) {
-                        if microblock.timestamp <= prev_block.timestamp {
-                            METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("[ERR][TIMESTAMP] monotonicity_violation h={} ts={} prev_ts={}", 
-                                     microblock.height, microblock.timestamp, prev_block.timestamp);
-                            return Err(format!(
-                                "TIMESTAMP_INVALID:monotonicity:h={}:block_ts={}:prev_ts={}", 
-                                microblock.height, microblock.timestamp, prev_block.timestamp
-                            ));
-                        }
-                    }
-                }
+                // NOTE: MONOTONICITY CHECK REMOVED (v3.12.1)
+                // With 30-block producer rotation, different producers may have slightly
+                // different clocks. Strict monotonicity would reject valid blocks when
+                // a new producer's clock is behind the previous producer's clock.
+                // This is expected behavior in distributed systems with multiple producers.
                 
                 // 2b. FUTURE CHECK: Block cannot be from the future (with tolerance)
                 // This prevents producers with fast clocks from creating "future" blocks
@@ -7906,22 +7896,11 @@ impl BlockchainNode {
             
             // Skip for first macroblock or before genesis set
             if macroblock.height > 0 && genesis_ts > 0 && local_time > 0 {
-                // 2a. MONOTONICITY: Check against previous macroblock
-                if macroblock.height > 1 {
-                    if let Ok(Some(prev_mb_data)) = storage.get_macroblock_by_height(macroblock.height - 1) {
-                        if let Ok(prev_mb) = bincode::deserialize::<qnet_state::MacroBlock>(&prev_mb_data) {
-                            if macroblock.timestamp <= prev_mb.timestamp {
-                                METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("[ERR][TIMESTAMP] macroblock_monotonicity mb={} ts={} prev_ts={}", 
-                                         macroblock.height, macroblock.timestamp, prev_mb.timestamp);
-                                return Err(format!(
-                                    "TIMESTAMP_INVALID:macroblock_monotonicity:mb={}:ts={}:prev_ts={}", 
-                                    macroblock.height, macroblock.timestamp, prev_mb.timestamp
-                                ));
-                            }
-                        }
-                    }
-                }
+                // NOTE: MONOTONICITY CHECK REMOVED (v3.12.1)
+                // Macroblock timestamp is derived from last microblock timestamp.
+                // Since microblock timestamps may not be strictly monotonic (due to
+                // producer rotation with different clocks), macroblock timestamps
+                // may also not be strictly monotonic.
                 
                 // 2b. NOT FROM FUTURE: Macroblock cannot be from the future
                 // Use slightly larger tolerance (10s) because macroblock creation involves consensus
