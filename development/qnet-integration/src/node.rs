@@ -9735,22 +9735,23 @@ impl BlockchainNode {
                 }
             } else {
                 // Genesis block already exists in storage
-                // CRITICAL FIX v3.15.1: Still need to sync GLOBAL_GENESIS_TIMESTAMP from stored Genesis!
+                // CRITICAL FIX v3.15.2: Still need to sync GLOBAL_GENESIS_TIMESTAMP from stored Genesis!
                 // Without this, nodes use their LOCAL start time instead of Genesis timestamp
-                if let Ok(Some(genesis_data)) = storage.load_microblock(0) {
-                    if let Ok(genesis_block) = bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
-                        let old_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
-                        if old_ts != genesis_block.timestamp {
-                            crate::GLOBAL_GENESIS_TIMESTAMP.store(
-                                genesis_block.timestamp,
-                                std::sync::atomic::Ordering::Relaxed
-                            );
-                            crate::update_global_pricing_state(0.0, 5, genesis_block.timestamp);
-                            if is_info() { 
-                                println!("[INFO][GEN] genesis_ts_synced_from_storage old={} new={}", old_ts, genesis_block.timestamp); 
-                            }
+                // MUST use load_microblock_auto_format() to handle compressed/efficient formats!
+                if let Ok(Some(genesis_block)) = storage.load_microblock_auto_format(0) {
+                    let old_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+                    if old_ts != genesis_block.timestamp {
+                        crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                            genesis_block.timestamp,
+                            std::sync::atomic::Ordering::Relaxed
+                        );
+                        crate::update_global_pricing_state(0.0, 5, genesis_block.timestamp);
+                        if is_info() { 
+                            println!("[INFO][GEN] genesis_ts_synced_from_storage old={} new={}", old_ts, genesis_block.timestamp); 
                         }
                     }
+                } else {
+                    if is_warn() { println!("[WARN][GEN] failed_to_load_genesis_for_ts_sync"); }
                 }
                 if is_info() { println!("[INFO][GEN] genesis_found_in_storage height=0"); }
             }
