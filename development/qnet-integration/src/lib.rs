@@ -67,6 +67,13 @@ pub use validator::BlockValidator;
 pub use node::{BlockchainNode, NodeType, Region};
 pub use unified_p2p::SimplifiedP2P;
 
+// v3.12: Re-export failover metrics for monitoring (NTP functions removed - using proper timestamp validation)
+pub use node::{
+    get_failover_metrics,
+    get_extended_failover_metrics,
+    FailoverMetrics,
+};
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ============================================================================

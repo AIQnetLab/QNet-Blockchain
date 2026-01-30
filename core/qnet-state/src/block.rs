@@ -207,6 +207,20 @@ pub struct ConsensusData {
     /// Phase 2: Sum of all node activation QNC payments
     #[serde(default)]
     pub pool3_total_activations: Option<u64>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXCLUDED PRODUCERS FOR NEXT EPOCH (v3.10)
+    // Deterministic failover exclusion - stored in blockchain for consistency
+    // All nodes read SAME list from MacroBlock N-2 → NO FORK!
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Producers excluded from next epoch due to failover events
+    /// Format: bincode serialized Vec<ExcludedProducerEntry>
+    /// Populated from failover history during MacroBlock creation
+    /// Used by calculate_qualified_candidates to exclude unreliable producers
+    /// CRITICAL: All nodes use SAME list from blockchain → deterministic selection!
+    #[serde(default)]
+    pub excluded_producers_for_next_epoch: Option<Vec<u8>>,
 }
 
 /// Eligible producer entry for epoch-based validator set
@@ -248,6 +262,28 @@ pub struct AutomaticJailData {
     /// Offense count (for progressive jail)
     pub offense_count: u32,
     /// Reason code
+    pub reason: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXCLUDED PRODUCER ENTRY (v3.10)
+// Deterministic failover exclusion data stored in MacroBlock
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Excluded producer entry for deterministic failover handling
+/// Stored in MacroBlock.consensus_data.excluded_producers_for_next_epoch
+/// Used to exclude unreliable producers from next epoch selection
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExcludedProducerEntry {
+    /// Node identifier being excluded
+    pub node_id: String,
+    /// Number of failover events in the epoch
+    pub failover_count: u32,
+    /// Block heights where failovers occurred
+    pub failover_heights: Vec<u64>,
+    /// Exclusion duration in blocks (typically 90 = 1 epoch)
+    pub exclusion_blocks: u64,
+    /// Reason for exclusion
     pub reason: String,
 }
 

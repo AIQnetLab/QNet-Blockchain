@@ -235,6 +235,31 @@ static SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
 static FAST_SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// v3.8: DETERMINISTIC TIMEOUT-BASED FAILOVER
+// ═══════════════════════════════════════════════════════════════════════════════
+// Replaces non-deterministic emergency broadcast system.
+// All nodes compute SAME timeout_round from blockchain state → SAME producer!
+// ═══════════════════════════════════════════════════════════════════════════════
+static CURRENT_TIMEOUT_ROUND: AtomicU64 = AtomicU64::new(0);
+static TIMEOUT_ROUND_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Get current timeout round for producer selection
+pub fn get_current_timeout_round() -> u64 {
+    CURRENT_TIMEOUT_ROUND.load(Ordering::SeqCst)
+}
+
+/// Set timeout round (called from stall detection)
+pub fn set_timeout_round(round: u64, height: u64) {
+    CURRENT_TIMEOUT_ROUND.store(round, Ordering::SeqCst);
+    TIMEOUT_ROUND_HEIGHT.store(height, Ordering::SeqCst);
+}
+
+/// Reset timeout round when block is received
+pub fn reset_timeout_round() {
+    CURRENT_TIMEOUT_ROUND.store(0, Ordering::SeqCst);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.50: Lock-free global storage with OnceCell + Arc
 // RocksDB does NOT support multiple connections - single instance shared immutably
 // 10x faster than Mutex-based approach for block writes
@@ -286,6 +311,106 @@ static RETRY_TOTAL: AtomicU64 = AtomicU64::new(0);           // Total retry atte
 static RETRY_SUCCESS: AtomicU64 = AtomicU64::new(0);         // Successful retries (validation passed)
 static RETRY_CERT_RACE: AtomicU64 = AtomicU64::new(0);       // Retries due to certificate race
 static RETRY_MISSING_PREV: AtomicU64 = AtomicU64::new(0);    // Retries due to missing previous block
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v3.10: FAILOVER METRICS - Track slot delay and timeout rounds for monitoring
+// Used to detect network stalls and producer failures
+// ═══════════════════════════════════════════════════════════════════════════════
+static METRIC_SLOT_DELAY_MAX: AtomicU64 = AtomicU64::new(0);      // Max slot delay in current window
+static METRIC_TIMEOUT_ROUND_MAX: AtomicU64 = AtomicU64::new(0);   // Max timeout_round in current window
+static METRIC_FAILOVER_COUNT: AtomicU64 = AtomicU64::new(0);      // Total failover events (timeout_round > 0)
+static METRIC_LAST_RESET: AtomicU64 = AtomicU64::new(0);          // Timestamp of last metrics reset
+static METRIC_TIMESTAMP_REJECTIONS: AtomicU64 = AtomicU64::new(0); // Blocks rejected due to invalid timestamp
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v3.12: TIMESTAMP VALIDATION CONSTANTS (Tendermint/Ethereum 2.0 style)
+// ═══════════════════════════════════════════════════════════════════════════════
+// These constants define acceptable timestamp ranges for incoming blocks.
+// SECURITY: Blocks with timestamps outside these bounds are REJECTED.
+// 
+// WHY THESE VALUES:
+// - FUTURE_TOLERANCE (5s): Allow for network propagation delay + minor clock drift
+//   Ethereum 2.0 uses ~4s, we use 5s for safety margin
+// - PAST_TOLERANCE (30s): Allow for delayed block propagation during network issues
+//   Must be < macroblock interval (90s) to prevent history rewriting
+// - These values are industry-standard for slot-based consensus
+// ═══════════════════════════════════════════════════════════════════════════════
+const TIMESTAMP_FUTURE_TOLERANCE: u64 = 5;   // Block can be max 5 seconds in future
+const TIMESTAMP_PAST_TOLERANCE: u64 = 30;    // Block can be max 30 seconds in past
+
+/// Get current failover metrics (for Prometheus/Grafana integration)
+pub fn get_failover_metrics() -> (u64, u64, u64, u64) {
+    (
+        METRIC_SLOT_DELAY_MAX.load(Ordering::Relaxed),
+        METRIC_TIMEOUT_ROUND_MAX.load(Ordering::Relaxed),
+        METRIC_FAILOVER_COUNT.load(Ordering::Relaxed),
+        METRIC_TIMESTAMP_REJECTIONS.load(Ordering::Relaxed),
+    )
+}
+
+/// v3.12: Simplified failover metrics (removed NTP drift - now using proper timestamp validation)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FailoverMetrics {
+    pub max_slot_delay: u64,
+    pub max_timeout_round: u64,
+    pub failover_count: u64,
+    pub timestamp_rejections: u64,
+    pub window_seconds: u64,
+    pub current_timeout_round: u64,
+    pub genesis_timestamp: u64,
+    pub current_time: u64,
+}
+
+/// v3.12: Get failover metrics for monitoring
+pub fn get_extended_failover_metrics() -> FailoverMetrics {
+    FailoverMetrics {
+        max_slot_delay: METRIC_SLOT_DELAY_MAX.load(Ordering::Relaxed),
+        max_timeout_round: METRIC_TIMEOUT_ROUND_MAX.load(Ordering::Relaxed),
+        failover_count: METRIC_FAILOVER_COUNT.load(Ordering::Relaxed),
+        timestamp_rejections: METRIC_TIMESTAMP_REJECTIONS.load(Ordering::Relaxed),
+        window_seconds: 300,
+        current_timeout_round: get_current_timeout_round(),
+        genesis_timestamp: crate::GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed),
+        current_time: get_timestamp_safe(),
+    }
+}
+
+/// Update failover metrics (called from stall detection)
+fn update_failover_metrics(slot_delay: u64, timeout_round: u64) {
+    // Update max values
+    let _ = METRIC_SLOT_DELAY_MAX.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        if slot_delay > current { Some(slot_delay) } else { None }
+    });
+    
+    let _ = METRIC_TIMEOUT_ROUND_MAX.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        if timeout_round > current { Some(timeout_round) } else { None }
+    });
+    
+    // Count failover events
+    if timeout_round > 0 {
+        METRIC_FAILOVER_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    // Reset metrics every 5 minutes (300 seconds) for rolling window
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last_reset = METRIC_LAST_RESET.load(Ordering::Relaxed);
+    
+    if now - last_reset > 300 {
+        // Log metrics before reset
+        let max_delay = METRIC_SLOT_DELAY_MAX.swap(0, Ordering::Relaxed);
+        let max_round = METRIC_TIMEOUT_ROUND_MAX.swap(0, Ordering::Relaxed);
+        let failovers = METRIC_FAILOVER_COUNT.swap(0, Ordering::Relaxed);
+        METRIC_LAST_RESET.store(now, Ordering::Relaxed);
+        
+        if max_delay > 0 || failovers > 0 {
+            println!("[METRICS][FAILOVER] window=5min max_slot_delay={}s max_timeout_round={} failover_events={}", 
+                     max_delay, max_round, failovers);
+        }
+    }
+}
 
 // FIX v2.28: Counter for newly received certificates
 // Retry loop checks this to trigger immediate retry when certificate arrives
@@ -6026,18 +6151,35 @@ impl BlockchainNode {
                                                                     break;
                                                             }
                                                         } else {
-                                                            // Regular block request
-                                                                if let Err(e) = p2p_clone.sync_blocks(retry_missing_height, retry_missing_height).await {
-                                                                    println!("[WARN][BLOCK] request_fail h={} attempt={} err={}", retry_missing_height, attempt, e);
-                                                                    if attempt < 3 {
-                                                                        tokio::time::sleep(Duration::from_secs(attempt)).await;
-                                                                        continue;
-                                                                    }
-                                                            } else {
-                                                                    if is_debug() { println!("[DBG][BLOCK] requested h={}", retry_missing_height); }
-                                                                    break;
+                                                            // v3.7: CRITICAL FIX - Request BATCH if far behind!
+                                                            // Check network height and request range if gap > 5
+                                                            let network_h = p2p_clone.get_max_peer_height();
+                                                            let gap = network_h.saturating_sub(retry_missing_height);
+                                                            
+                                                            let (from, to) = if gap > 5 && retry_missing_height > 0 {
+                                                                // Far behind - request batch
+                                                                let batch_end = std::cmp::min(network_h, retry_missing_height + 50);
+                                                                if is_info() {
+                                                                    println!("[INFO][SYNC] batch_request gap={} range={}-{}", 
+                                                                             gap, retry_missing_height, batch_end);
                                                                 }
+                                                                (retry_missing_height, batch_end)
+                                                            } else {
+                                                                // Small gap - just request missing block
+                                                                (retry_missing_height, retry_missing_height)
+                                                            };
+                                                            
+                                                            if let Err(e) = p2p_clone.sync_blocks(from, to).await {
+                                                                println!("[WARN][BLOCK] request_fail h={}-{} attempt={} err={}", from, to, attempt, e);
+                                                                if attempt < 3 {
+                                                                    tokio::time::sleep(Duration::from_secs(attempt)).await;
+                                                                    continue;
+                                                                }
+                                                            } else {
+                                                                if is_debug() { println!("[DBG][BLOCK] requested h={}-{}", from, to); }
+                                                                break;
                                                             }
+                                                        }
                                                         }
                                                     });
                                                 }
@@ -6857,6 +6999,10 @@ impl BlockchainNode {
                             LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
                             LAST_BLOCK_PRODUCED_HEIGHT.store(received_block.height, Ordering::Relaxed);
                             
+                            // v3.9: Reset timeout_round when new block received
+                            // This clears failover state since network is progressing
+                            reset_timeout_round();
+                            
                             // CRITICAL FIX: Update P2P local height for message filtering
                             crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
                                 received_block.height, 
@@ -7090,13 +7236,31 @@ impl BlockchainNode {
                             // SECURITY: Use saturating_add to prevent overflow at u8::MAX (255)
                             requested_blocks.insert(missing_height, (std::time::Instant::now(), (retry_count as u8).saturating_add(1)));
                             
-                            // Request via P2P
+                            // v3.7: CRITICAL FIX - Request BATCH of blocks, not just one!
+                            // Problem: Requesting 1 block at a time with 5s timeout = node NEVER catches up
+                            // Solution: Check network height and request ALL missing blocks in one batch
                             if let Some(p2p) = &unified_p2p {
                                 let p2p_clone = p2p.clone();
                                 let missing = missing_height;
+                                let local_h = storage.get_chain_height().unwrap_or(0);
+                                let network_h = p2p.get_max_peer_height();
+                                
                                 tokio::spawn(async move {
-                                    if let Err(e) = p2p_clone.sync_blocks(missing, missing).await {
-                                        println!("[WARN][BLOCK] rerequest_failed h={} err={}", missing, e);
+                                    // If far behind (>5 blocks), request BATCH up to network height
+                                    let gap = network_h.saturating_sub(local_h);
+                                    let (from, to) = if gap > 5 {
+                                        // Request batch: from local+1 to min(network, local+100)
+                                        let batch_end = std::cmp::min(network_h, local_h + 100);
+                                        println!("[INFO][SYNC] batch_rerequest local={} network={} gap={} range={}-{}", 
+                                                 local_h, network_h, gap, local_h + 1, batch_end);
+                                        (local_h + 1, batch_end)
+                                    } else {
+                                        // Small gap - just request the missing block
+                                        (missing, missing)
+                                    };
+                                    
+                                    if let Err(e) = p2p_clone.sync_blocks(from, to).await {
+                                        println!("[WARN][BLOCK] rerequest_failed h={}-{} err={}", from, to, e);
                                     }
                                 });
                             }
@@ -7183,6 +7347,94 @@ impl BlockchainNode {
         // 2. Basic structure validation
         if block.data.len() < 100 {
             return Err("Microblock too small".to_string());
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v3.12: TIMESTAMP VALIDATION
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SECURITY: This prevents time-based attacks where malicious producers
+        // create blocks with manipulated timestamps.
+        //
+        // Three invariants (like Tendermint):
+        // 1. MONOTONICITY: timestamp > previous block timestamp
+        // 2. NOT FROM FUTURE: timestamp <= local_time + FUTURE_TOLERANCE
+        // 3. NOT TOO OLD: timestamp >= expected_time - PAST_TOLERANCE
+        //
+        // WHY THIS MATTERS:
+        // - Prevents "future blocks" attack (producer with clock ahead)
+        // - Prevents "time travel" attack (producer with clock behind)
+        // - Ensures deterministic timeout_round calculation across all nodes
+        // ═══════════════════════════════════════════════════════════════════════════
+        {
+            let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+            let local_time = get_timestamp_safe();
+            
+            // Skip timestamp validation for genesis block (h=0) or before genesis is set
+            if microblock.height > 0 && genesis_ts > 0 && local_time > 0 {
+                // 2a. MONOTONICITY CHECK: Block timestamp must be > previous block
+                // This prevents time manipulation attacks and ensures causal ordering
+                if let Ok(Some(prev_data)) = storage.load_microblock(microblock.height - 1) {
+                    if let Ok(prev_block) = bincode::deserialize::<qnet_state::MicroBlock>(&prev_data) {
+                        if microblock.timestamp <= prev_block.timestamp {
+                            METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("[ERR][TIMESTAMP] monotonicity_violation h={} ts={} prev_ts={}", 
+                                     microblock.height, microblock.timestamp, prev_block.timestamp);
+                            return Err(format!(
+                                "TIMESTAMP_INVALID:monotonicity:h={}:block_ts={}:prev_ts={}", 
+                                microblock.height, microblock.timestamp, prev_block.timestamp
+                            ));
+                        }
+                    }
+                }
+                
+                // 2b. FUTURE CHECK: Block cannot be from the future (with tolerance)
+                // This prevents producers with fast clocks from creating "future" blocks
+                // that would disrupt timeout_round calculation on other nodes
+                let max_allowed_timestamp = local_time + TIMESTAMP_FUTURE_TOLERANCE;
+                if microblock.timestamp > max_allowed_timestamp {
+                    let future_delta = microblock.timestamp - local_time;
+                    METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                    
+                    // SECURITY: Always log future block attempts (potential attack)
+                    eprintln!("[ERR][TIMESTAMP] future_block h={} ts={} local={} delta=+{}s (max={}s)", 
+                             microblock.height, microblock.timestamp, local_time, 
+                             future_delta, TIMESTAMP_FUTURE_TOLERANCE);
+                    
+                    return Err(format!(
+                        "TIMESTAMP_INVALID:future:h={}:block_ts={}:local_ts={}:delta=+{}s", 
+                        microblock.height, microblock.timestamp, local_time, future_delta
+                    ));
+                }
+                
+                // 2c. PAST CHECK: Block cannot be too far in the past
+                // This prevents delayed/replayed blocks from being accepted
+                // Expected time = genesis_ts + height (1 second per block)
+                let expected_time = genesis_ts + microblock.height;
+                let min_allowed_timestamp = expected_time.saturating_sub(TIMESTAMP_PAST_TOLERANCE);
+                
+                if microblock.timestamp < min_allowed_timestamp {
+                    let past_delta = expected_time.saturating_sub(microblock.timestamp);
+                    METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                    
+                    if is_warn() {
+                        println!("[WARN][TIMESTAMP] old_block h={} ts={} expected={} delta=-{}s (max={}s)", 
+                                 microblock.height, microblock.timestamp, expected_time, 
+                                 past_delta, TIMESTAMP_PAST_TOLERANCE);
+                    }
+                    
+                    return Err(format!(
+                        "TIMESTAMP_INVALID:past:h={}:block_ts={}:expected_ts={}:delta=-{}s", 
+                        microblock.height, microblock.timestamp, expected_time, past_delta
+                    ));
+                }
+                
+                // DEBUG: Log timestamp validation success at low frequency
+                if is_debug() && microblock.height % 100 == 0 {
+                    let slot_delay = local_time.saturating_sub(expected_time);
+                    println!("[DBG][TIMESTAMP] valid h={} ts={} expected={} delay={}s", 
+                             microblock.height, microblock.timestamp, expected_time, slot_delay);
+                }
+            }
         }
         
         // 3. CRITICAL: Verify chain continuity (previous_hash) for ALL blocks
@@ -7637,6 +7889,73 @@ impl BlockchainNode {
         // 2. Basic structure validation
         if block.data.len() < 200 {
             return Err("Macroblock too small".to_string());
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v3.12: MACROBLOCK TIMESTAMP VALIDATION (same security as microblock)
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Macroblocks aggregate 90 microblocks. Timestamp = last microblock timestamp.
+        // Same three invariants apply:
+        // 1. MONOTONICITY: timestamp > previous macroblock timestamp  
+        // 2. NOT FROM FUTURE: timestamp <= local_time + tolerance
+        // 3. REASONABLE FOR HEIGHT: timestamp ~ genesis_ts + (height * 90)
+        // ═══════════════════════════════════════════════════════════════════════════
+        {
+            let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+            let local_time = get_timestamp_safe();
+            
+            // Skip for first macroblock or before genesis set
+            if macroblock.height > 0 && genesis_ts > 0 && local_time > 0 {
+                // 2a. MONOTONICITY: Check against previous macroblock
+                if macroblock.height > 1 {
+                    if let Ok(Some(prev_mb_data)) = storage.get_macroblock_by_height(macroblock.height - 1) {
+                        if let Ok(prev_mb) = bincode::deserialize::<qnet_state::MacroBlock>(&prev_mb_data) {
+                            if macroblock.timestamp <= prev_mb.timestamp {
+                                METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("[ERR][TIMESTAMP] macroblock_monotonicity mb={} ts={} prev_ts={}", 
+                                         macroblock.height, macroblock.timestamp, prev_mb.timestamp);
+                                return Err(format!(
+                                    "TIMESTAMP_INVALID:macroblock_monotonicity:mb={}:ts={}:prev_ts={}", 
+                                    macroblock.height, macroblock.timestamp, prev_mb.timestamp
+                                ));
+                            }
+                        }
+                    }
+                }
+                
+                // 2b. NOT FROM FUTURE: Macroblock cannot be from the future
+                // Use slightly larger tolerance (10s) because macroblock creation involves consensus
+                const MACROBLOCK_FUTURE_TOLERANCE: u64 = 10;
+                if macroblock.timestamp > local_time + MACROBLOCK_FUTURE_TOLERANCE {
+                    let future_delta = macroblock.timestamp - local_time;
+                    METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("[ERR][TIMESTAMP] future_macroblock mb={} ts={} local={} delta=+{}s", 
+                             macroblock.height, macroblock.timestamp, local_time, future_delta);
+                    return Err(format!(
+                        "TIMESTAMP_INVALID:macroblock_future:mb={}:delta=+{}s", 
+                        macroblock.height, future_delta
+                    ));
+                }
+                
+                // 2c. REASONABLE FOR HEIGHT: Macroblock height * 90 = expected microblock height
+                // Macroblock timestamp should be close to genesis_ts + (height * 90)
+                let expected_microblock_height = macroblock.height * 90;
+                let expected_time = genesis_ts + expected_microblock_height;
+                const MACROBLOCK_PAST_TOLERANCE: u64 = 120; // 2 minutes for consensus delays
+                
+                if macroblock.timestamp + MACROBLOCK_PAST_TOLERANCE < expected_time {
+                    let past_delta = expected_time.saturating_sub(macroblock.timestamp);
+                    if is_warn() {
+                        println!("[WARN][TIMESTAMP] old_macroblock mb={} ts={} expected={} delta=-{}s", 
+                                 macroblock.height, macroblock.timestamp, expected_time, past_delta);
+                    }
+                    // Warning only - don't reject due to consensus timing variations
+                }
+                
+                if is_debug() && macroblock.height % 10 == 0 {
+                    println!("[DBG][TIMESTAMP] macroblock_valid mb={} ts={}", macroblock.height, macroblock.timestamp);
+                }
+            }
         }
         
         // 3. CRITICAL: Verify chain continuity with previous macroblock
@@ -9933,79 +10252,101 @@ impl BlockchainNode {
                         last_production_time = std::time::Instant::now();
                     }
                     
-                    // CRITICAL FIX: Global network stall detection
-                    // Check if ANY block has been produced recently (by us or others)
-                    let last_block_time = LAST_BLOCK_PRODUCED_TIME.load(Ordering::Relaxed);
-                    let last_block_height = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // v3.9: FULLY DETERMINISTIC SLOT-BASED FAILOVER
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // KEY PRINCIPLE: Use GLOBAL genesis_ts + height, NOT local block receive time!
+                    //
+                    // WHY THIS WORKS:
+                    //   - All nodes know: block H should be created at genesis_ts + H
+                    //   - All nodes see same current_time (NTP synchronized, ±1 sec)
+                    //   - delay = current_time - expected_time is SAME on all nodes!
+                    //   - timeout_round computed from delay is DETERMINISTIC!
+                    //
+                    // CONTRAST WITH OLD APPROACH (BROKEN):
+                    //   - Node A receives block at T+0.5s → time_since = 4.5s → round 0
+                    //   - Node C doesn't receive block → time_since = 10s → round 1
+                    //   - DIFFERENT rounds → DIFFERENT producers → FORK!
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+                    let next_height = microblock_height + 1;
                     let current_time = get_timestamp_safe();
                     
-                    if last_block_time > 0 && current_time > last_block_time {
-                        let time_since_last_block = current_time - last_block_time;
+                    // Only proceed if genesis timestamp is set
+                    if genesis_ts > 0 && current_time > 0 {
+                        // Expected time for next block (DETERMINISTIC!)
+                        let expected_time = genesis_ts + next_height;
                         
-                        // CRITICAL: Trigger emergency if no blocks for 10+ seconds
-                        // This is GLOBAL stall detection, not just local
-                        if time_since_last_block > 10 && microblock_height > 0 {
+                        // How late is the block? (SAME VALUE ON ALL NODES!)
+                        let delay = current_time.saturating_sub(expected_time);
+                        
+                        // v3.9: Calculate timeout_round from SLOT DELAY (DETERMINISTIC!)
+                        // Round 0: 0-5 sec delay (normal - block expected soon)
+                        // Round 1: 5-10 sec delay (first failover)
+                        // Round 2: 10-15 sec delay (second failover)
+                        // etc.
+                        let timeout_round = if delay <= 5 {
+                            0
+                        } else {
+                            ((delay - 5) / 5 + 1) as u64
+                        };
+                        
+                        // Store timeout_round for producer selection (global function)
+                        set_timeout_round(timeout_round, next_height);
+                        
+                        // v3.10: Update failover metrics for monitoring
+                        update_failover_metrics(delay, timeout_round);
+                        
+                        // v3.9: Stall detected when delay > 5 seconds
+                        if delay > 5 && microblock_height > 0 {
                             if is_warn() {
-                                println!("[WARN][STALL] no_blocks_for={}s last_h={} local_h={}", 
-                                         time_since_last_block, last_block_height, microblock_height);
+                                println!("[WARN][STALL] slot_delay={}s h={} timeout_round={}", 
+                                         delay, next_height, timeout_round);
                             }
                             
                             // STATE MACHINE: Network stall detected
                             set_node_state(NodeState::Error {
-                                reason: format!("Network stall: no blocks for {} seconds", time_since_last_block),
+                                reason: format!("Slot delay: {}s, timeout_round={}", delay, timeout_round),
                                 recoverable: true,
                             });
                             
-                            // Force emergency producer selection if we're supposed to be producing
-                            if let Some(p2p) = &unified_p2p {
-                                let next_height = last_block_height + 1;
-                                let expected_producer = Self::select_microblock_producer(
+                            // v3.9: Select producer with timeout_round - FULLY DETERMINISTIC!
+                            // NO BROADCAST NEEDED - all nodes compute same delay from same genesis_ts!
+                            if let Some(_p2p) = &unified_p2p {
+                                let current_producer = Self::select_microblock_producer_with_round(
                                     next_height, &unified_p2p, &node_id, node_type,
-                                    Some(&storage), &quantum_poh
+                                    Some(&storage), &quantum_poh, timeout_round
                                 ).await;
                                 
-                                if time_since_last_block > 15 {
-                                    if is_warn() {
-                                        println!("[WARN][STALL] emergency h={} producer={} local={} network={}", 
-                                                 next_height, expected_producer, microblock_height, last_block_height);
-                                    }
-                                    
-                                    // Select emergency producer
-                                    let emergency_producer = Self::select_emergency_producer(
-                                        &expected_producer, next_height, &unified_p2p,
-                                        &node_id, node_type, Some(storage.clone())
-                                    ).await;
-                                    
-                                    // Broadcast emergency change
-                                    if let Err(e) = p2p.broadcast_emergency_producer_change(
-                                        &expected_producer, &emergency_producer, 
-                                        next_height, "network_stall"
-                                    ) {
-                                        if is_warn() { println!("[WARN][STALL] broadcast_failed err={}", e); }
-                                    } else if is_info() {
-                                        println!("[INFO][STALL] emergency_broadcast h={} from={} to={}", 
-                                                 next_height, expected_producer, emergency_producer);
-                                    }
+                                if is_info() {
+                                    println!("[INFO][FAILOVER] h={} delay={}s round={} producer={}", 
+                                             next_height, delay, timeout_round, current_producer);
                                 }
                                 
-                                // ═══════════════════════════════════════════════════════════════════
-                                // PRODUCTION v2.44: AGGRESSIVE CATCH-UP (15s/5 blocks)
-                                // ═══════════════════════════════════════════════════════════════════
-                                // ARCHITECTURE FIX: Previous 120s/50 blocks was too conservative!
-                                // After high-TPS tests, nodes can desync and stay stuck forever because:
-                                // 1. Round mismatch rejects consensus messages
-                                // 2. Cached network_height is stale (no new blocks = no updates)
-                                // 3. 50-block threshold never triggers because gap appears small
-                                // 
-                                // Solution (like Tendermint/Aptos):
-                                // - 15s stall → aggressive resync (was 120s)
-                                // - 5 block gap → trigger sync (was 50)
-                                // - Byzantine median height (2f+1 consensus across peers)
-                                // ═══════════════════════════════════════════════════════════════════
-                                if time_since_last_block > 15 {
-                                    // v2.44: Use Byzantine median from peer heights (QUIC HealthPing data)
-                                    // This is MORE reliable than single cached value
-                                    let network_height = match p2p.sync_blockchain_height().await {
+                                // v3.9: NO BROADCAST! All nodes compute same producer
+                                // because delay = current_time - (genesis_ts + height) is SAME everywhere!
+                            }
+                        }
+                        
+                        // ═══════════════════════════════════════════════════════════════════
+                        // PRODUCTION v2.44: AGGRESSIVE CATCH-UP (15s/5 blocks)
+                        // ═══════════════════════════════════════════════════════════════════
+                        // ARCHITECTURE FIX: Previous 120s/50 blocks was too conservative!
+                        // After high-TPS tests, nodes can desync and stay stuck forever because:
+                        // 1. Round mismatch rejects consensus messages
+                        // 2. Cached network_height is stale (no new blocks = no updates)
+                        // 3. 50-block threshold never triggers because gap appears small
+                        // 
+                        // Solution (like Tendermint/Aptos):
+                        // - 15s slot delay → aggressive resync (was 120s)
+                        // - 5 block gap → trigger sync (was 50)
+                        // - Byzantine median height (2f+1 consensus across peers)
+                        // ═══════════════════════════════════════════════════════════════════
+                        if delay > 15 {
+                            if let Some(p2p) = &unified_p2p {
+                                // v2.44: Use Byzantine median from peer heights (QUIC HealthPing data)
+                                // This is MORE reliable than single cached value
+                                let network_height = match p2p.sync_blockchain_height().await {
                                         Ok(h) => {
                                             if crate::node::is_info() { println!("[INFO][SYNC] median_height={}", h); }
                                             h
@@ -10042,8 +10383,8 @@ impl BlockchainNode {
                                     if height_gap > dynamic_threshold && (now_secs - last_rollback) > rollback_cooldown {
                                         LAST_ROLLBACK_TIME.store(now_secs, std::sync::atomic::Ordering::Relaxed);
                                         
-                                        println!("[ERR][FORK] stuck={}s behind={} blocks threshold={}", 
-                                                 time_since_last_block, height_gap, dynamic_threshold);
+                                        println!("[ERR][FORK] slot_delay={}s behind={} blocks threshold={}", 
+                                                 delay, height_gap, dynamic_threshold);
                                         println!("[INFO][FORK] force_resync local={} network={} nodes={}", 
                                                  microblock_height, network_height, network_size);
                                         
@@ -10121,7 +10462,6 @@ impl BlockchainNode {
                             }
                         }
                     }
-                }
                 // SYNC FIX: Fast catch-up mode for nodes that are far behind
                 // Using global flags defined at module level
                 
@@ -10655,13 +10995,19 @@ impl BlockchainNode {
                     }
                 }
                 
-                let mut current_producer = Self::select_microblock_producer(
-                    next_block_height,  // Use NEXT height for producer selection
+                // v3.9: Get timeout_round for DETERMINISTIC failover
+                // This is computed from slot delay (current_time - (genesis_ts + height)) above
+                let timeout_round = get_current_timeout_round();
+                
+                // v3.8: Use select_microblock_producer_with_round for deterministic failover
+                let mut current_producer = Self::select_microblock_producer_with_round(
+                    next_block_height,
                     &unified_p2p, 
                     &node_id, 
                     node_type,
-                    Some(&storage),  // Pass storage for entropy
-                    &quantum_poh  // Pass PoH for quantum entropy
+                    Some(&storage),
+                    &quantum_poh,
+                    timeout_round  // CRITICAL: Pass timeout_round for deterministic failover!
                 ).await;
                 
                 // CRITICAL: Simple producer check - let natural consensus handle lagging
@@ -10682,6 +11028,22 @@ impl BlockchainNode {
                 // - Minor lag (10-100 blocks): Warning but can still produce (state is recent)
                 // - Critical lag (>100 blocks): State is too stale, must self-exclude
                 // ═══════════════════════════════════════════════════════════════════════════
+                // ═══════════════════════════════════════════════════════════════════════════
+                // v3.9: SELF-EXCLUDE - Producer must be synced, BUT NO BROADCAST!
+                // ═══════════════════════════════════════════════════════════════════════════
+                // WHY NO BROADCAST:
+                //   - Broadcast is non-deterministic (different nodes receive at different times)
+                //   - This breaks consensus → forks!
+                //
+                // HOW IT WORKS WITHOUT BROADCAST:
+                //   1. Node A is selected as producer for h=1000
+                //   2. Node A sees it's behind by >100 blocks → does NOT produce
+                //   3. After 5 seconds, all nodes see slot_delay > 5
+                //   4. All nodes compute timeout_round=1 → select NEXT producer DETERMINISTICALLY!
+                //   5. No broadcast needed - pure slot-based failover!
+                //
+                // CRITICAL: This aligns with Ethereum 2.0 / Tendermint approach
+                // ═══════════════════════════════════════════════════════════════════════════
                 if is_my_turn_to_produce && next_block_height > 10 {
                     if let Some(p2p) = &unified_p2p {
                         let network_height = p2p.get_max_peer_height();
@@ -10689,36 +11051,15 @@ impl BlockchainNode {
                         let sync_lag = network_height.saturating_sub(local_height);
                         
                         if sync_lag > 100 {
-                            // CRITICAL: Self-exclude - we're too far behind
-                            println!("[WARN][PROD] self_exclude local={} network={} lag={}", 
+                            // v3.9: Self-exclude - just DON'T PRODUCE, no broadcast needed!
+                            // timeout_round will handle failover DETERMINISTICALLY
+                            println!("[WARN][PROD] self_exclude local={} network={} lag={} (timeout_round will handle)", 
                                      local_height, network_height, sync_lag);
                             
-                            let emergency_producer = Self::select_emergency_producer(
-                                &node_id,           // failed_producer (self)
-                                next_block_height,  // current_height
-                                &unified_p2p,       // p2p
-                                &node_id,           // own_node_id
-                                node_type,          // own_node_type
-                                Some(storage.clone()) // storage
-                            ).await;
-                            
-                            if !emergency_producer.is_empty() && emergency_producer != node_id {
-                                p2p.broadcast_emergency_producer_change(
-                                    &node_id,
-                                    &emergency_producer,
-                                    next_block_height,
-                                    "microblock"
-                                ).ok();
-                                
-                                set_emergency_producer_flag(next_block_height, emergency_producer.clone());
-                                
-                                if is_info() {
-                                    println!("[INFO][FAILOVER] emergency_producer={} h={}", emergency_producer, next_block_height);
-                                }
-                            }
-                            
+                            // Simply skip this iteration - don't produce the block
+                            // All other nodes will see slot_delay > 5 and select next producer
                             is_my_turn_to_produce = false;
-                            current_producer = emergency_producer;
+                            // Don't set current_producer - leave it as is, we're not producing
                         } else if sync_lag > 10 && is_warn() {
                             println!("[WARN][PROD] sync_lag={} h={} (producing)", sync_lag, next_block_height);
                         }
@@ -11489,27 +11830,11 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // Mark ourselves as not leader
                         *is_leader.write().await = false;
                         
-                        // Trigger emergency producer selection
-                        if let Some(p2p) = &unified_p2p {
-                        let emergency_producer = Self::select_emergency_producer(
-                            &node_id,
-                            next_block_height,  // Use next block height for emergency selection
-                            &Some(p2p.clone()),
-                            &node_id,
-                            node_type,
-                            Some(storage.clone()),  // Pass storage for deterministic entropy
-                            ).await;
-                            
-                            if is_warn() { println!("[WARN][PROD] emergency_handover to={}", emergency_producer); }
-                            
-                            // Broadcast emergency change for CURRENT height
-                            // CRITICAL FIX: Use current height, not +1
-                            let _ = p2p.broadcast_emergency_producer_change(
-                                &node_id,
-                                &emergency_producer,
-                                microblock_height,
-                                "microblock"
-                            );
+                        // v3.9: NO BROADCAST! Just skip production, timeout_round will handle failover
+                        // All nodes will see slot_delay increase → compute same new producer
+                        if is_warn() { 
+                            println!("[WARN][PROD] skip_production h={} reason=blocked_by_emergency (timeout_round handles failover)", 
+                                     next_block_height); 
                         }
                         
                         // Skip this production round
@@ -12310,30 +12635,11 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             eprintln!("[ERR][PROD] prev_hash_timeout h={} retries={} (15s)", next_block_height, retry_count);
                             PREV_HASH_RETRY_COUNTER.store(0, Ordering::SeqCst);  // Reset counter
                             
-                            // CRITICAL: Still don't produce block with missing prev!
-                            // Instead, trigger emergency producer who may have the block
-                            if let Some(p2p) = &unified_p2p {
-                                let emergency_producer = Self::select_emergency_producer(
-                                    &node_id,
-                                    next_block_height,
-                                    &Some(p2p.clone()),
-                                    &node_id,
-                                    node_type,
-                                    Some(storage.clone()),
-                                ).await;
-                                
-                                // Only broadcast if different producer (we can't help if we're chosen)
-                                if emergency_producer != node_id {
-                                    println!("[INFO][FAILOVER] delegate h={} to={}", 
-                                             next_block_height, emergency_producer);
-                                    let _ = p2p.broadcast_emergency_producer_change(
-                                        &node_id,
-                                        &emergency_producer,
-                                        next_block_height,
-                                        "microblock"
-                                    );
-                                }
-                            }
+                            // v3.9: NO BROADCAST! Just skip production, timeout_round will handle failover
+                            // If we don't have prev block, we CAN'T produce - simple as that
+                            // All other nodes will see slot_delay increase → compute same new producer
+                            println!("[WARN][PROD] skip_production h={} reason=prev_hash_missing (timeout_round handles failover)", 
+                                     next_block_height);
                             // Skip this production round - prevent fork creation!
                             // v3.4: CRITICAL - Clear broadcast flag before continue
                             crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -13743,34 +14049,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         .map(|entry| entry.value().1.clone())
                                         .unwrap_or_default();
                                     
-                                    // Update cache: emergency producer takes over this rotation!
-                                    CACHED_PRODUCER_SELECTION.insert(leadership_round, (emergency_producer.clone(), existing_candidates));
-                                    println!("[EMERGENCY][FAILOVER] h={} cache_updated=true round={} new_producer={} reason=emergency_takeover", 
-                                             expected_height_timeout, leadership_round, emergency_producer);
+                                    // v3.9: NO BROADCAST NEEDED! timeout_round handles failover DETERMINISTICALLY
+                                    // 
+                                    // HOW IT WORKS:
+                                    // 1. This background task detected timeout
+                                    // 2. slot_delay is already > 5 seconds (that's why we're here)
+                                    // 3. Main loop will compute timeout_round from slot_delay
+                                    // 4. ALL nodes compute SAME timeout_round → SAME producer
+                                    // 5. No broadcast needed - pure deterministic failover!
+                                    //
+                                    // REMOVED: broadcast_emergency_producer_change (non-deterministic!)
+                                    // REMOVED: set_emergency_producer_flag (non-deterministic!)
+                                    // REMOVED: cache update (timeout_round doesn't use cache for failover!)
                                     
-                                    // EXISTING: Use same emergency broadcast as macroblock (line 2114)
-                                    if let Err(e) = p2p_timeout.broadcast_emergency_producer_change(
-                                        &current_producer_timeout,
-                                        &emergency_producer,
-                                        expected_height_timeout,
-                                        "microblock"
-                                    ) {
-                                        if is_warn() { println!("[WARN][FAIL] broadcast_fail err={}", e); }
-                                    } else {
-                                        if is_info() { println!("[INFO][FAIL] broadcast_ok h={}", expected_height_timeout); }
-                                        
-                                        // CRITICAL FIX: If WE are the emergency producer, start producing immediately!
-                                        if emergency_producer == node_id_timeout {
-                                            if is_info() { println!("[INFO][FAIL] we_are_emergency h={}", expected_height_timeout); }
-                                            
-                                            // Signal main loop to produce block immediately
-                                            // Store emergency producer flag - v2.96: lock-free
-                                            set_emergency_producer_flag(expected_height_timeout, emergency_producer.clone());
-                                            if is_debug() { println!("[DBG][FAIL] flag_set h={}", expected_height_timeout); }
-                                            
-                                            // NOTE: Emergency producer will be checked on next iteration
-                                        }
-                                    }
+                                    println!("[INFO][FAILOVER] h={} timeout_detected producer_was={} (timeout_round handles failover)", 
+                                             expected_height_timeout, current_producer_timeout);
                                 }
                                 
                                 // CRITICAL: Clear failover flag when task completes
@@ -14028,13 +14321,45 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// PRODUCTION: Select microblock producer using Quantum-Resistant Deterministic Selection every 30 blocks
     /// Uses SHA3-512 deterministic hash (NOT VRF) to ensure all nodes compute identical result
+    /// 
+    /// v3.8: CRITICAL FIX - Added timeout_round for DETERMINISTIC failover
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// PROBLEM: Previous emergency broadcast system was NON-DETERMINISTIC!
+    ///   - Different nodes received broadcast at different times
+    ///   - Some nodes had emergency flag, others didn't
+    ///   - Different nodes selected different producers → FORK!
+    ///
+    /// SOLUTION: Round-based deterministic selection (like Tendermint/Cosmos)
+    ///   - Round 0: Normal QRDS selection
+    ///   - Round 1+: Exclude failed producers from previous rounds DETERMINISTICALLY
+    ///   - ALL nodes compute SAME excluded list from SAME blockchain data
+    ///   - NO BROADCAST NEEDED!
+    /// ═══════════════════════════════════════════════════════════════════════════
     pub async fn select_microblock_producer(
         current_height: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         own_node_id: &str,
-        own_node_type: NodeType, // CRITICAL: Use real node type instead of string guessing
-        storage: Option<&Arc<Storage>>, // ADDED: For getting previous block hash
-        quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>, // ADDED: For PoH entropy
+        own_node_type: NodeType,
+        storage: Option<&Arc<Storage>>,
+        quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>,
+    ) -> String {
+        // v3.8: Wrapper that calls internal function with timeout_round=0 (normal selection)
+        Self::select_microblock_producer_with_round(
+            current_height, unified_p2p, own_node_id, own_node_type, storage, quantum_poh, 0
+        ).await
+    }
+    
+    /// v3.8: Internal producer selection with timeout_round support
+    /// timeout_round=0: Normal selection
+    /// timeout_round=1+: Exclude producers who failed in previous rounds
+    pub async fn select_microblock_producer_with_round(
+        current_height: u64,
+        unified_p2p: &Option<Arc<SimplifiedP2P>>,
+        own_node_id: &str,
+        own_node_type: NodeType,
+        storage: Option<&Arc<Storage>>,
+        quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>,
+        timeout_round: u64,
     ) -> String {
         // PRODUCTION: Quantum-Resistant Deterministic Selection (QRDS)
         // Each 30-block period uses SHA3-512 deterministic hash to select producer from qualified candidates
@@ -14420,96 +14745,123 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if is_debug() { println!("[DBG][PROD] single={}", candidates[0].0); }
                 candidates[0].0.clone()
             } else {
-                // DETERMINISTIC QUANTUM-RESISTANT SELECTION using SHA3-512
-                // All nodes compute IDENTICAL result → consensus without forks
+                // ═══════════════════════════════════════════════════════════════════════════
+                // v3.8: DETERMINISTIC ROUND-BASED PRODUCER SELECTION
+                // ═══════════════════════════════════════════════════════════════════════════
+                // Like Tendermint/Cosmos: If producer fails, exclude them in next round
+                // ALL nodes compute SAME excluded list from SAME blockchain data → NO FORK!
+                // ═══════════════════════════════════════════════════════════════════════════
                 use sha3::{Sha3_512, Digest};
-                let mut selector = Sha3_512::new();
                 
-                // Entropy components (ALL deterministic across nodes):
-                selector.update(b"QNet_Deterministic_Producer_Selection_v6");
-                selector.update(&vrf_entropy);  // From finality window block (Dilithium-signed!)
-                selector.update(&leadership_round.to_le_bytes());
-                
-                // Include sorted candidate list for additional entropy
-                for (candidate_id, _) in &candidates {
-                    selector.update(candidate_id.as_bytes());
-                }
-                
-                let selection_hash = selector.finalize();
-                let selection_value = u64::from_le_bytes([
-                    selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
-                    selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
-                ]);
-                
-                let selection_index = (selection_value as usize) % candidates.len();
-                let winner = &candidates[selection_index];
-                
-                // Log at rotation boundaries only (performance)
-                if current_height > 0 && ((current_height - 1) % 30 == 0 || current_height == 1) {
-                    if is_info() { println!("[INFO][PROD] selected={} round={} idx={}/{}", 
-                             winner.0, leadership_round, selection_index + 1, candidates.len()); }
-                }
-                
-                winner.0.clone()
-            };
-            
-            
-            // PERFORMANCE FIX: Cache the result for this entire 30-block period
-            // v2.96: Lock-free cache insert with DashMap
-            CACHED_PRODUCER_SELECTION.insert(leadership_round, (selected_producer.clone(), candidates.clone()));
-            
-            // PRODUCTION: Cleanup old cached rounds (keep only last 3 rounds to prevent memory leak)
-            // v2.96: Lock-free retain with DashMap
-            CACHED_PRODUCER_SELECTION.retain(|round, _| *round + 3 >= leadership_round);
-            
-            // ═══════════════════════════════════════════════════════════════════════════
-            // v2.104: CRITICAL FIX - Check emergency producer AFTER QRDS selection
-            // ═══════════════════════════════════════════════════════════════════════════
-            // PROBLEM: QRDS selects producer deterministically, but if that producer is
-            // desynchronized, it cannot produce blocks. Network deadlocks.
-            //
-            // SOLUTION: After QRDS selection, check if there's an active emergency producer.
-            // Emergency producer (selected via failover) takes precedence over QRDS result.
-            //
-            // FLOW:
-            // 1. QRDS selects Producer X (deterministic, same on all nodes)
-            // 2. Producer X is not synced -> self-excludes -> broadcasts emergency
-            // 3. All nodes receive emergency -> set emergency flag for Producer Y
-            // 4. Next call to select_microblock_producer returns Producer Y (not X)
-            // ═══════════════════════════════════════════════════════════════════════════
-            // v3.3: Check emergency producer for ENTIRE rotation cycle
-            // Emergency producer works from start_height to end_height (rotation boundary)
-            let final_producer = if let Some((emergency_start_height, emergency_producer)) = get_emergency_producer() {
-                let emergency_end_height = get_emergency_end_height();
-                
-                // Check if current_height is within emergency cycle [start, end)
-                if current_height >= emergency_start_height && current_height < emergency_end_height {
-                    if is_info() {
-                        println!("[INFO][QRDS] emergency_override producer={} cycle=[{},{}] current_h={}", 
-                                 emergency_producer, emergency_start_height, emergency_end_height, current_height);
+                // Helper function to select producer from candidates with given round
+                let select_for_round = |cands: &[(String, f64)], round: u64| -> String {
+                    if cands.is_empty() {
+                        return own_node_id.to_string();
                     }
-                    emergency_producer
+                    
+                    let mut selector = Sha3_512::new();
+                    selector.update(b"QNet_Deterministic_Producer_Selection_v8");
+                    selector.update(&vrf_entropy);
+                    selector.update(&leadership_round.to_le_bytes());
+                    selector.update(&round.to_le_bytes()); // Include timeout_round!
+                    
+                    for (candidate_id, _) in cands {
+                        selector.update(candidate_id.as_bytes());
+                    }
+                    
+                    let hash = selector.finalize();
+                    let value = u64::from_le_bytes([
+                        hash[0], hash[1], hash[2], hash[3],
+                        hash[4], hash[5], hash[6], hash[7],
+                    ]);
+                    
+                    let idx = (value as usize) % cands.len();
+                    cands[idx].0.clone()
+                };
+                
+                // v3.8: Calculate excluded producers from previous rounds DETERMINISTICALLY
+                // Round 0: no exclusions
+                // Round 1: exclude producer from Round 0
+                // Round 2: exclude producers from Round 0 and Round 1
+                // etc.
+                let mut excluded: Vec<String> = Vec::new();
+                
+                for prev_round in 0..timeout_round {
+                    // Get candidates NOT in excluded list
+                    let available: Vec<(String, f64)> = candidates.iter()
+                        .filter(|(id, _)| !excluded.contains(id))
+                        .cloned()
+                        .collect();
+                    
+                    if available.is_empty() {
+                        break; // All candidates exhausted
+                    }
+                    
+                    // Who was selected in prev_round?
+                    let failed_producer = select_for_round(&available, prev_round);
+                    excluded.push(failed_producer.clone());
+                    
+                    if is_info() && prev_round == timeout_round - 1 {
+                        println!("[INFO][TIMEOUT] h={} round={} excluded={}", 
+                                 current_height, prev_round, failed_producer);
+                    }
+                }
+                
+                // Now select for current round from remaining candidates
+                let final_candidates: Vec<(String, f64)> = candidates.iter()
+                    .filter(|(id, _)| !excluded.contains(id))
+                    .cloned()
+                    .collect();
+                
+                let winner = if final_candidates.is_empty() {
+                    // All candidates exhausted - wrap around to original list
+                    if is_warn() {
+                        println!("[WARN][TIMEOUT] h={} all_candidates_exhausted timeout_round={}", 
+                                 current_height, timeout_round);
+                    }
+                    select_for_round(&candidates, timeout_round)
                 } else {
-                    if is_debug() {
-                        println!("[DBG][QRDS] emergency_outside_cycle h={} start={} end={}", 
-                                 current_height, emergency_start_height, emergency_end_height);
+                    select_for_round(&final_candidates, timeout_round)
+                };
+                
+                // Log at rotation boundaries or when timeout_round > 0
+                if timeout_round > 0 || (current_height > 0 && ((current_height - 1) % 30 == 0 || current_height == 1)) {
+                    if is_info() { 
+                        println!("[INFO][PROD] selected={} round={} timeout={} candidates={}/{}", 
+                                 winner, leadership_round, timeout_round, 
+                                 final_candidates.len(), candidates.len()); 
                     }
-                    selected_producer
                 }
-            } else {
-                selected_producer
+                
+                winner
             };
             
-            // PRODUCTION: Log producer selection info ONLY at rotation boundaries for performance
-            // Rotation happens at blocks 31, 61, 91... (not 30, 60, 90)
-            if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
-                // New round - Quantum-Resistant Deterministic Selection (QRDS)
-                let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
-                println!("[QRDS] 🎯 Producer: {} (round: {}, DETERMINISTIC SELECTION, next rotation: block {})", 
-                         final_producer, leadership_round, next_rotation_block);
+            
+            // ═══════════════════════════════════════════════════════════════════════════
+            // v3.8: REMOVED emergency_override - now using timeout_round instead!
+            // ═══════════════════════════════════════════════════════════════════════════
+            // OLD PROBLEM: Emergency override used LOCAL flag that differed between nodes
+            // NEW SOLUTION: timeout_round provides DETERMINISTIC failover
+            //   - All nodes see same blockchain state
+            //   - All nodes compute same excluded producers
+            //   - NO BROADCAST NEEDED → NO FORK!
+            // ═══════════════════════════════════════════════════════════════════════════
+            
+            // PERFORMANCE FIX: Only cache for timeout_round=0 (normal selection)
+            // Don't cache timeout rounds as they're height-specific
+            if timeout_round == 0 {
+                CACHED_PRODUCER_SELECTION.insert(leadership_round, (selected_producer.clone(), candidates.clone()));
+                CACHED_PRODUCER_SELECTION.retain(|round, _| *round + 3 >= leadership_round);
             }
             
-            final_producer
+            // Log at rotation boundaries
+            if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
+                let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
+                println!("[QRDS] producer={} round={} timeout={} next_rotation={}", 
+                         selected_producer, leadership_round, timeout_round, next_rotation_block);
+            }
+            
+            selected_producer
         } else {
             // Solo mode - no P2P peers
             println!("[QRDS] 🏠 Solo mode - self production");
@@ -15188,17 +15540,46 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 Ok(Some(macroblock_data)) => {
                     match bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
                         Ok(macroblock) => {
+                            // ═══════════════════════════════════════════════════════════════
+                            // v3.10: EXCLUDED PRODUCERS - Read from blockchain (DETERMINISTIC!)
+                            // All nodes read SAME list from MacroBlock → NO FORK!
+                            // ═══════════════════════════════════════════════════════════════
+                            let excluded_node_ids: std::collections::HashSet<String> = 
+                                if let Some(ref excluded_data) = macroblock.consensus_data.excluded_producers_for_next_epoch {
+                                    if let Ok(excluded) = bincode::deserialize::<Vec<qnet_state::ExcludedProducerEntry>>(excluded_data) {
+                                        let excluded_set: std::collections::HashSet<String> = excluded
+                                            .iter()
+                                            .map(|e| e.node_id.clone())
+                                            .collect();
+                                        if !excluded_set.is_empty() {
+                                            println!("[INFO][CAND] v3.10_excluded mb={} nodes={:?}", 
+                                                     required_macroblock, excluded_set);
+                                        }
+                                        excluded_set
+                                    } else {
+                                        std::collections::HashSet::new()
+                                    }
+                                } else {
+                                    std::collections::HashSet::new()
+                                };
+                            
                             // PRIMARY: Use eligible_producers snapshot from macroblock
                             if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
                                 if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
                                     if !producers.is_empty() {
+                                        // v3.10: Filter out excluded producers (DETERMINISTIC!)
                                         let mut all_qualified: Vec<(String, f64)> = producers.iter()
+                                            .filter(|p| !excluded_node_ids.contains(&p.node_id))
                                             .map(|p| (p.node_id.clone(), p.reputation))
                                             .collect();
                                         
                                         all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
                                         
-                                        if is_debug() { println!("[DBG][CANDIDATES] ep={} prod={} mb={}", current_epoch, all_qualified.len(), required_macroblock); }
+                                        if is_debug() { 
+                                            println!("[DBG][CANDIDATES] ep={} prod={} excluded={} mb={}", 
+                                                     current_epoch, all_qualified.len(), 
+                                                     excluded_node_ids.len(), required_macroblock); 
+                                        }
                                         return all_qualified;
                                     }
                                 }
@@ -15206,7 +15587,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             
                             // SECONDARY: Use consensus participants from macroblock
                             if !macroblock.consensus_data.commits.is_empty() {
+                                // v3.10: Also filter excluded from SECONDARY path
                                 let mut all_qualified: Vec<(String, f64)> = macroblock.consensus_data.commits.keys()
+                                    .filter(|id| !excluded_node_ids.contains(*id))  // v3.10: Exclude failed producers
                                     .map(|id| {
                                         // Get real reputation from deterministic state
                                         let rep = p2p.get_deterministic_reputation()
@@ -15224,8 +15607,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     .collect();
                                 all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
                                 
-                                println!("[WARN][CAND] Epoch {}: {} participants from MacroBlock #{} commits (no snapshot)", 
-                                         current_epoch, all_qualified.len(), required_macroblock);
+                                println!("[WARN][CAND] Epoch {}: {} participants from MacroBlock #{} commits (excluded={}, no snapshot)", 
+                                         current_epoch, all_qualified.len(), required_macroblock, excluded_node_ids.len());
                                 return all_qualified;
                             }
                             
@@ -17115,6 +17498,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Emergency macroblocks don't include pool data (not emission blocks)
             pool2_total_fees: None,
             pool3_total_activations: None,
+            // v3.10: Emergency macroblocks don't modify exclusion list
+            excluded_producers_for_next_epoch: None,
         };
         
         // Count microblocks before moving
@@ -19896,6 +20281,66 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         Some(pool3_activations)
                     } else {
                         None // Regular MacroBlock - no pool data
+                    }
+                },
+                // ═══════════════════════════════════════════════════════════════════
+                // v3.10: EXCLUDED PRODUCERS FOR NEXT EPOCH
+                // Deterministic failover exclusion from blockchain storage
+                // All nodes read SAME list from MacroBlock N-2 → NO FORK!
+                // ═══════════════════════════════════════════════════════════════════
+                excluded_producers_for_next_epoch: {
+                    // Collect failover events from this epoch (last 90 blocks)
+                    let mb_index = consensus_data.round_number;
+                    let epoch_start = mb_index.saturating_sub(1) * 90;
+                    let epoch_end = mb_index * 90;
+                    
+                    // THRESHOLD: Exclude producers with 2+ failovers in one epoch
+                    const FAILOVER_THRESHOLD: u32 = 2;
+                    
+                    match storage.get_failover_history(epoch_start, 100) {
+                        Ok(events) => {
+                            // Count failovers per producer in this epoch
+                            let mut failover_counts: std::collections::HashMap<String, (u32, Vec<u64>)> = 
+                                std::collections::HashMap::new();
+                            
+                            for event in events.iter() {
+                                if event.height >= epoch_start && event.height <= epoch_end {
+                                    let entry = failover_counts
+                                        .entry(event.failed_producer.clone())
+                                        .or_insert((0, Vec::new()));
+                                    entry.0 += 1;
+                                    entry.1.push(event.height);
+                                }
+                            }
+                            
+                            // Create exclusion entries for producers exceeding threshold
+                            let excluded: Vec<qnet_state::ExcludedProducerEntry> = failover_counts
+                                .into_iter()
+                                .filter(|(_, (count, _))| *count >= FAILOVER_THRESHOLD)
+                                .map(|(node_id, (count, heights))| {
+                                    qnet_state::ExcludedProducerEntry {
+                                        node_id: node_id.clone(),
+                                        failover_count: count,
+                                        failover_heights: heights,
+                                        exclusion_blocks: 90, // Exclude for 1 epoch
+                                        reason: format!("failover_count_{}_in_epoch_{}", count, mb_index),
+                                    }
+                                })
+                                .collect();
+                            
+                            if !excluded.is_empty() {
+                                println!("[INFO][MB] EXCLUDED_PRODUCERS mb={} count={} nodes={:?}",
+                                         mb_index, excluded.len(), 
+                                         excluded.iter().map(|e| &e.node_id).collect::<Vec<_>>());
+                                bincode::serialize(&excluded).ok()
+                            } else {
+                                None // No producers to exclude
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[WARN][MB] failover_history_error mb={} err={}", mb_index, e);
+                            None // No exclusions on error (fail-open for availability)
+                        }
                     }
                 },
             },

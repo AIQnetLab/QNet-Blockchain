@@ -16050,57 +16050,79 @@ impl SimplifiedP2P {
             requester_id: self.node_id.clone(),
         };
         
-        let mut tried_peers = 0u32;
-        let max_peers_to_try = 5.min(live_peers.len());
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v3.7: CRITICAL FIX - PARALLEL REQUESTS to ALL peers simultaneously!
+        // 
+        // PROBLEM (was):
+        //   for peer in peers {
+        //       send_request(peer);
+        //       sleep(5_sec);        ← SEQUENTIAL! 
+        //       if !received { continue; }  ← Try next peer after timeout
+        //   }
+        //   Result: 3 peers × 5 sec = 15 sec for ONE block if first 2 peers down!
+        //
+        // SOLUTION (now):
+        //   Send to ALL 3 peers SIMULTANEOUSLY
+        //   Wait ONCE for shortest timeout
+        //   Check storage - if block received from ANY peer, done!
+        //
+        // Result: 3 peers × 1 parallel request = 2-4 sec total!
+        // ═══════════════════════════════════════════════════════════════════════════
         
+        let max_peers_to_try = 3.min(live_peers.len());
+        let mut sent_to_peers: Vec<String> = Vec::new();
+        
+        // STEP 1: Send requests to ALL peers SIMULTANEOUSLY (fire-and-forget)
         for peer in live_peers.iter().take(max_peers_to_try) {
             if peer.id == self.node_id {
                 continue;
             }
             
-            tried_peers += 1;
-            
-            if crate::node::is_info() {
-                println!("[INFO][SYNC] request h={}-{} peer={} attempt={}/{}", 
-                         from_height, to_height, peer.id, tried_peers, max_peers_to_try);
-            }
-            
-            // Send request
             self.send_network_message(&peer.addr, request.clone());
+            sent_to_peers.push(peer.id.clone());
+        }
+        
+        if sent_to_peers.is_empty() {
+            return Err("No valid peers to sync from".to_string());
+        }
+        
+        if crate::node::is_info() {
+            println!("[INFO][SYNC] parallel_request h={}-{} peers=[{}]", 
+                     from_height, to_height, sent_to_peers.join(","));
+        }
+        
+        // STEP 2: Calculate adaptive timeout based on batch size
+        let requested_count = to_height - from_height + 1;
+        let actual_batch_size = requested_count.min(100);  // Server sends max 100!
+        let timeout_secs = match actual_batch_size {
+            1 => 2,           // Single block - 2 sec
+            2..=10 => 4,      // Small batch - 4 sec
+            11..=30 => 8,     // Medium batch - 8 sec
+            31..=50 => 12,    // Large batch - 12 sec
+            _ => 18,          // Max batch (51-100) - 18 sec
+        };
+        
+        // STEP 3: Poll storage every 200ms until block arrives or timeout
+        // This is MUCH faster than sleeping full timeout!
+        let start = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(200);
+        let timeout = Duration::from_secs(timeout_secs);
+        
+        while start.elapsed() < timeout {
+            tokio::time::sleep(poll_interval).await;
             
-            // v3.3: ADAPTIVE TIMEOUT based on ACTUAL batch size from server
-            // Server limits: max 100 blocks per response (see handle_block_request)
-            // Calculation: 100 blocks × 1MB avg = 100MB at 1Gbps = 0.8 sec
-            // Worst case: 100 blocks × 30MB (100K TPS) = 3GB at 1Gbps = 24 sec
-            let requested_count = to_height - from_height + 1;
-            let actual_batch_size = requested_count.min(100);  // Server sends max 100!
-            let timeout_secs = match actual_batch_size {
-                1 => 5,           // Single block - 5 sec (margin for 40MB at slow connection)
-                2..=10 => 8,      // Small batch - 8 sec
-                11..=30 => 12,    // Medium batch - 12 sec
-                31..=50 => 18,    // Large batch - 18 sec
-                _ => 25,          // Max batch (51-100) - 25 sec (3GB at 1Gbps = 24 sec)
-            };
-            tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
-            
-            // Check if blocks were received
+            // Check if blocks arrived in storage (from ANY peer)
             let storage = match crate::node::try_get_storage() {
                 Some(s) => s,
-                None => {
-                    if crate::node::is_warn() {
-                        println!("[WARN][SYNC] storage_unavailable trying_next_peer");
-                    }
-                    continue;
-                }
+                None => continue,
             };
             
-            // Check if at least the first block was received
             let first_received = storage.load_microblock(from_height)
                 .map(|opt| opt.is_some())
                 .unwrap_or(false);
             
             if first_received {
-                // Check how many blocks we got
+                // Count how many blocks we got
                 let mut received_count = 0u64;
                 for h in from_height..=to_height {
                     if storage.load_microblock(h).map(|opt| opt.is_some()).unwrap_or(false) {
@@ -16111,24 +16133,24 @@ impl SimplifiedP2P {
                 }
                 
                 if crate::node::is_info() {
-                    println!("[INFO][SYNC] received h={}-{} from={} count={}/{}", 
-                             from_height, from_height + received_count - 1, peer.id, 
-                             received_count, to_height - from_height + 1);
+                    println!("[INFO][SYNC] parallel_received h={}-{} count={}/{} elapsed={}ms", 
+                             from_height, from_height + received_count - 1,
+                             received_count, requested_count,
+                             start.elapsed().as_millis());
                 }
-            return Ok(());
-            } else {
-                if crate::node::is_warn() {
-                    println!("[WARN][SYNC] no_response h={} from={} trying_next_peer", from_height, peer.id);
-                }
+                return Ok(());
             }
         }
         
-        // All peers failed
-        if tried_peers > 0 {
-            Err(format!("Sync failed: all {} peers did not respond for h={}-{}", tried_peers, from_height, to_height))
-        } else {
-            Err("No valid peers to sync from (all excluded)".to_string())
+        // Timeout - none of the peers responded
+        if crate::node::is_warn() {
+            println!("[WARN][SYNC] parallel_timeout h={}-{} peers=[{}] timeout={}s", 
+                     from_height, to_height, sent_to_peers.join(","), timeout_secs);
         }
+        
+        // All peers failed - return error
+        Err(format!("Sync failed: {} peers did not respond for h={}-{}", 
+                    sent_to_peers.len(), from_height, to_height))
     }
     
     /// ═══════════════════════════════════════════════════════════════════════════

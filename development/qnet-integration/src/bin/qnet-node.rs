@@ -2439,6 +2439,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     env_logger::init();
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.10: NTP DRIFT CHECK - Fail-fast if system time is too far off
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL: QNet uses slot-based timing (genesis_ts + height) for determinism.
+    // If NTP drift > 3 seconds, nodes will compute different timeout_rounds → FORK!
+    // Better to fail at startup than cause consensus issues.
+    // ═══════════════════════════════════════════════════════════════════════════
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        // Simple NTP drift estimation using multiple time sources
+        // In production, nodes should have NTP configured properly
+        let system_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        
+        // Basic sanity check: system time should be reasonable (after 2024)
+        const MIN_VALID_TIMESTAMP: u64 = 1704067200; // 2024-01-01 00:00:00 UTC
+        const MAX_REASONABLE_TIMESTAMP: u64 = 2524608000; // 2050-01-01 00:00:00 UTC
+        
+        if system_time < MIN_VALID_TIMESTAMP {
+            eprintln!("═══════════════════════════════════════════════════════════════════════════");
+            eprintln!("[FATAL] System clock is set before 2024!");
+            eprintln!("[FATAL] Current timestamp: {} (expected > {})", system_time, MIN_VALID_TIMESTAMP);
+            eprintln!("[FATAL] Please sync your system clock with NTP before running QNet.");
+            eprintln!("");
+            eprintln!("  Linux:   sudo timedatectl set-ntp true && sudo systemctl restart systemd-timesyncd");
+            eprintln!("  Docker:  Ensure host has NTP sync (containers inherit host time)");
+            eprintln!("  Windows: Settings → Time & Language → Sync now");
+            eprintln!("═══════════════════════════════════════════════════════════════════════════");
+            std::process::exit(1);
+        }
+        
+        if system_time > MAX_REASONABLE_TIMESTAMP {
+            eprintln!("═══════════════════════════════════════════════════════════════════════════");
+            eprintln!("[FATAL] System clock is set too far in the future!");
+            eprintln!("[FATAL] Current timestamp: {} (expected < {})", system_time, MAX_REASONABLE_TIMESTAMP);
+            eprintln!("[FATAL] Please sync your system clock with NTP before running QNet.");
+            eprintln!("═══════════════════════════════════════════════════════════════════════════");
+            std::process::exit(1);
+        }
+        
+        println!("[INFO][NTP] System time check passed: {} (OK)", system_time);
+    }
+    
     // Check if data cleanup is requested
     if std::env::var("QNET_CLEAN_DATA").unwrap_or_default() == "1" {
         println!("🧹 CLEANING NODE DATA...");

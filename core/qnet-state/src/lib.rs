@@ -20,7 +20,7 @@ pub mod state;
 mod python_bindings;
 
 pub use account::{Account, AccountState, NodeType};
-pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock, StoredMicroBlock, PoHState, storage_version, SlashingEventData, AutomaticJailData, EligibleProducer, RewardHeartbeat, HeartbeatSummary};
+pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock, StoredMicroBlock, PoHState, storage_version, SlashingEventData, AutomaticJailData, EligibleProducer, RewardHeartbeat, HeartbeatSummary, ExcludedProducerEntry};
 pub use transaction::{Transaction, TransactionReceipt, TransactionType, gas_limits, PingSampleData, HeartbeatSampleData, ShardHeartbeatSummary};
 pub use state_db::StateDB;
 pub use state_manager::StateManager;
