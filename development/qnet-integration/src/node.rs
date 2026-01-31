@@ -496,6 +496,12 @@ lazy_static::lazy_static! {
     /// - No tokio runtime blocking
     /// - Safe for high-frequency access from multiple async tasks
     pub static ref ENTROPY_RESPONSES: DashMap<(u64, String), [u8; 32]> = DashMap::new();
+    
+    /// v3.16: Lock-free concurrent HashMap for producer votes
+    /// Key: (block_height, voter_node_id)
+    /// Value: voted_producer_id
+    /// Used for Byzantine 66% consensus on producer selection
+    pub static ref PRODUCER_VOTES: DashMap<(u64, String), String> = DashMap::new();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -14532,7 +14538,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // PRODUCTION: Direct calculation for consensus determinism (THREAD-SAFE)
             // QNet requires consistent candidate lists across all nodes for Byzantine safety
             // CRITICAL: Now includes validator sampling for millions of nodes
-            let candidates = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
+            // v3.16: Pass current_height to ensure SAME epoch for entropy AND candidates!
+            let candidates = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type, current_height).await;
             
             // VALIDATION: Filter out invalid fallback IDs from candidates
             let valid_candidates: Vec<(String, f64)> = candidates.into_iter()
@@ -14938,14 +14945,48 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 CACHED_PRODUCER_SELECTION.retain(|round, _| *round + 3 >= leadership_round);
             }
             
+            // ═══════════════════════════════════════════════════════════════════════════
+            // v3.16: BYZANTINE 66% CONSENSUS on producer selection at rotation boundaries
+            // ═══════════════════════════════════════════════════════════════════════════
+            // CRITICAL: At rotation boundaries, broadcast vote and wait for 66% consensus
+            // This prevents forks when different nodes compute different producers
+            // ═══════════════════════════════════════════════════════════════════════════
+            let is_rotation_boundary = current_height > 0 && (current_height - 1) % rotation_interval == 0;
+            
+            let final_producer = if is_rotation_boundary {
+                // Rotation boundary - need 66% consensus!
+                let consensus_producer = Self::producer_vote_consensus(
+                    current_height,
+                    &selected_producer,
+                    own_node_id,
+                    timeout_round,
+                    p2p,
+                    &candidates,
+                ).await;
+                
+                if consensus_producer != selected_producer {
+                    if is_info() {
+                        println!("[INFO][VOTE] override h={} local={} consensus={}", 
+                                 current_height, selected_producer, consensus_producer);
+                    }
+                }
+                
+                consensus_producer
+            } else {
+                // Not rotation boundary - use deterministic selection
+                selected_producer.clone()
+            };
+            
             // Log at rotation boundaries
-            if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
+            if is_rotation_boundary || current_height == 1 {
                 let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
-                println!("[QRDS] producer={} round={} timeout={} next_rotation={}", 
-                         selected_producer, leadership_round, timeout_round, next_rotation_block);
+                if is_info() {
+                    println!("[INFO][QRDS] producer={} round={} timeout={} next_rotation={}", 
+                             final_producer, leadership_round, timeout_round, next_rotation_block);
+                }
             }
             
-            selected_producer
+            final_producer
         } else {
             // Solo mode - no P2P peers
             println!("[QRDS] 🏠 Solo mode - self production");
@@ -14963,6 +15004,146 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let old_size = CACHED_PRODUCER_SELECTION.len();
         CACHED_PRODUCER_SELECTION.clear();
         println!("[PRODUCER_CACHE] 🔄 Producer cache invalidated ({} entries cleared) - forcing new selection", old_size);
+    }
+    
+    /// v3.16: Byzantine 66% consensus on producer selection
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// ARCHITECTURE: ONLY qualified candidates (from MacroBlock N-2) participate in voting
+    /// This ensures:
+    ///   1. SCALABILITY: Only ~1000 producers vote, not millions of nodes
+    ///   2. SYBIL RESISTANCE: Only blockchain-verified producers can vote
+    ///   3. DETERMINISM: Same candidate list on all nodes = same voting pool
+    ///
+    /// If 66%+ agree → use that producer
+    /// If no consensus → use plurality (like LMD-GHOST fork choice)
+    /// ═══════════════════════════════════════════════════════════════════════════
+    async fn producer_vote_consensus(
+        block_height: u64,
+        our_selection: &str,
+        own_node_id: &str,
+        timeout_round: u64,
+        p2p: &Arc<SimplifiedP2P>,
+        candidates: &[(String, f64)],
+    ) -> String {
+        use std::collections::HashMap;
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SCALABILITY CHECK: Only CANDIDATES (qualified producers) can vote!
+        // Non-candidates observe but don't participate in voting
+        // ═══════════════════════════════════════════════════════════════════════════
+        let we_are_candidate = candidates.iter().any(|(id, _)| id == own_node_id);
+        
+        if !we_are_candidate {
+            // Not a candidate - just use local selection, don't participate in voting
+            if is_debug() { 
+                println!("[DBG][VOTE] not_candidate h={} using_local={}", block_height, our_selection); 
+            }
+            return our_selection.to_string();
+        }
+        
+        // Step 1: Clear old votes for this height
+        PRODUCER_VOTES.retain(|k, _| k.0 != block_height);
+        
+        // Step 2: Add our own vote (we are a candidate)
+        PRODUCER_VOTES.insert((block_height, own_node_id.to_string()), our_selection.to_string());
+        
+        // Step 3: Broadcast vote ONLY to other candidates (SCALABLE!)
+        // Get peer addresses for candidates only
+        let peers = p2p.get_validated_active_peers();
+        let vote_message = crate::unified_p2p::NetworkMessage::ProducerVote {
+            block_height,
+            voted_producer: our_selection.to_string(),
+            voter_id: own_node_id.to_string(),
+            timeout_round,
+        };
+        
+        // Filter peers to only candidates (O(candidates) not O(all_peers))
+        let mut broadcast_count = 0;
+        for (candidate_id, _) in candidates.iter() {
+            if candidate_id == own_node_id {
+                continue; // Skip self
+            }
+            // Find peer address for this candidate
+            if let Some(peer) = peers.iter().find(|p| &p.id == candidate_id) {
+                p2p.send_network_message(&peer.addr, vote_message.clone());
+                broadcast_count += 1;
+            }
+        }
+        
+        if is_info() {
+            println!("[INFO][VOTE] broadcast h={} vote={} candidates={}/{}", 
+                     block_height, our_selection, broadcast_count, candidates.len());
+        }
+        
+        // Step 4: Wait for responses with adaptive timeout
+        // Byzantine threshold: 66% of candidates (Sybil-resistant)
+        let total_candidates = candidates.len();
+        let byzantine_threshold = (total_candidates * 2 + 2) / 3; // Ceiling division for 66%
+        
+        let consensus_start = std::time::Instant::now();
+        let max_wait = tokio::time::Duration::from_millis(1500); // 1.5 seconds max
+        
+        let mut consensus_producer: Option<String> = None;
+        
+        loop {
+            // Count votes (only from candidates - Sybil protection)
+            let mut vote_counts: HashMap<String, usize> = HashMap::new();
+            
+            for entry in PRODUCER_VOTES.iter() {
+                let (height, voter) = entry.key();
+                let voted_producer = entry.value();
+                
+                if *height == block_height {
+                    // CRITICAL: Only count votes from qualified candidates
+                    let voter_is_candidate = candidates.iter().any(|(id, _)| id == voter);
+                    if voter_is_candidate {
+                        *vote_counts.entry(voted_producer.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+            
+            // Check for 66% consensus
+            for (producer, count) in &vote_counts {
+                if *count >= byzantine_threshold {
+                    consensus_producer = Some(producer.clone());
+                    if is_info() {
+                        println!("[INFO][VOTE] consensus h={} producer={} votes={}/{} threshold={}", 
+                                 block_height, producer, count, total_candidates, byzantine_threshold);
+                    }
+                    break;
+                }
+            }
+            
+            if consensus_producer.is_some() {
+                break;
+            }
+            
+            // Check timeout
+            if consensus_start.elapsed() >= max_wait {
+                // No 66% consensus - use plurality (most votes, like LMD-GHOST)
+                if let Some((best_producer, best_count)) = vote_counts.iter()
+                    .max_by_key(|(_, count)| *count) 
+                {
+                    if is_warn() {
+                        println!("[WARN][VOTE] no_66_consensus h={} plurality={} votes={}/{}", 
+                                 block_height, best_producer, best_count, total_candidates);
+                    }
+                    consensus_producer = Some(best_producer.clone());
+                }
+                break;
+            }
+            
+            // Wait 100ms before checking again
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        
+        // Return consensus producer or fallback to our selection
+        consensus_producer.unwrap_or_else(|| {
+            if is_warn() { 
+                println!("[WARN][VOTE] no_votes h={} fallback={}", block_height, our_selection); 
+            }
+            our_selection.to_string()
+        })
     }
     
     /// Get reputation score for a node
@@ -15092,7 +15273,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // This ensures emergency selection uses same list as normal selection
                 println!("[EMERGENCY_SELECTION] 📋 Using standard qualified candidates");
                 
-                let qualified = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
+                // v3.16: Pass current_height for deterministic epoch calculation
+                let qualified = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type, current_height).await;
                 
                 // CRITICAL FIX v2.44: If qualified is empty, node is DESYNC'd - abort!
                 if qualified.is_empty() {
@@ -15562,9 +15744,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         p2p: &Arc<SimplifiedP2P>,
         own_node_id: &str,
         own_node_type: NodeType,
+        target_height: u64,  // v3.16: CRITICAL FIX - use explicit height, not LOCAL_BLOCKCHAIN_HEIGHT!
     ) -> Vec<(String, f64)> {
-        // Get current height for epoch determination
-        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        // v3.16: Use target_height parameter for DETERMINISTIC epoch calculation
+        // CRITICAL BUG FIX: Previously used LOCAL_BLOCKCHAIN_HEIGHT which differs between nodes!
+        // This caused entropy (from select_microblock_producer_with_round current_height)
+        // and candidates (from LOCAL_BLOCKCHAIN_HEIGHT) to use DIFFERENT epochs → FORK!
+        let current_height = target_height;
         
         // ═══════════════════════════════════════════════════════════════════
         // GENESIS EPOCH (blocks 1-180): Use static hardcoded list
@@ -16166,7 +16352,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if is_debug() { println!("[DBG][CONS] synced stored={} curr={}", stored_height, current_height); }
         
         // Get all qualified candidates using existing validator sampling system
-        let mut qualified_candidates = Self::calculate_qualified_candidates(p2p, our_node_id, our_node_type).await;
+        // v3.16: Use LOCAL height for consensus initiation (we're checking if WE should initiate)
+        let local_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        let mut qualified_candidates = Self::calculate_qualified_candidates(p2p, our_node_id, our_node_type, local_height).await;
         
         // CRITICAL v2.30: NO FALLBACK FOR CONSENSUS CANDIDATES!
         // Empty candidates means node is DESYNCHRONIZED - it cannot participate in consensus!
@@ -16178,7 +16366,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // by returning static Genesis list. If it returns empty at height > 180,
         // it means macroblock is missing and node MUST sync first.
         if qualified_candidates.is_empty() {
-            let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            let current_height = local_height;
             
             if current_height <= 180 {
                 // This should NEVER happen - calculate_qualified_candidates returns static list for height ≤ 180
@@ -16496,10 +16684,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         
                         // Check if we're a validator for this round
                         if let Some(ref p2p_ref) = p2p {
+                            // v3.16: Pass current_height for deterministic epoch calculation
                             let qualified = Self::calculate_qualified_candidates(
                                 p2p_ref,
                                 &node_id,
-                                node_type
+                                node_type,
+                                current_height
                             ).await;
                             
                             let is_validator = qualified.iter().any(|(id, _)| id == &node_id);
@@ -17244,10 +17434,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // Get participants from calculate_qualified_candidates (same as should_initiate)
                 // This returns static Genesis list for height <= 180, or macroblock snapshot for height > 180
                 let own_node_id = p2p_finalize.get_node_id();
+                // v3.16: Use local_height for deterministic epoch calculation
                 let qualified = Self::calculate_qualified_candidates(
                     &p2p_finalize, 
                     &own_node_id, 
-                    NodeType::Super // Genesis nodes are Super type
+                    NodeType::Super, // Genesis nodes are Super type
+                    local_height
                 ).await;
                 
                 let mut participants: Vec<String> = qualified.iter()
@@ -19469,7 +19661,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // Get deterministic participants list (same for all nodes via N-2 snapshot)
-        let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type).await;
+        // v3.16: Use end_height for deterministic epoch calculation
+        let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type, end_height).await;
         let mut all_participants: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
         all_participants.sort();
         
@@ -19687,7 +19880,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let round_id = end_height;
             
             // PRODUCTION v2.34: Use DETERMINISTIC participant list from N-2 macroblock!
-            let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type).await;
+            // v3.16: Use end_height for deterministic epoch calculation
+            let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type, end_height).await;
             let mut all_participants: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
             all_participants.sort();
             

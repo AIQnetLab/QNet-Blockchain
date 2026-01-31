@@ -10503,6 +10503,15 @@ pub enum NetworkMessage {
         responder_id: String,
     },
     
+    /// v3.16: Producer vote for Byzantine 66% consensus
+    /// Sent at rotation boundaries to agree on producer selection
+    ProducerVote {
+        block_height: u64,
+        voted_producer: String,
+        voter_id: String,
+        timeout_round: u64,  // Include timeout_round for deterministic verification
+    },
+    
     /// PRODUCTION: Hybrid certificate announcement for compact signatures
     CertificateAnnounce {
         node_id: String,
@@ -11308,6 +11317,18 @@ impl SimplifiedP2P {
                             block_height, responder_id,
                             u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
                                                entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
+                }
+            }
+            
+            // v3.16: Producer vote for Byzantine 66% consensus on producer selection
+            NetworkMessage::ProducerVote { block_height, voted_producer, voter_id, timeout_round: _ } => {
+                // Store vote in PRODUCER_VOTES for consensus verification
+                // Key: (height, voter_id), Value: voted_producer
+                crate::node::PRODUCER_VOTES.insert((block_height, voter_id.clone()), voted_producer.clone());
+                
+                if crate::node::is_debug() {
+                    println!("[DBG][VOTE] recv h={} voter={} vote={}", 
+                            block_height, voter_id, voted_producer);
                 }
             }
             
