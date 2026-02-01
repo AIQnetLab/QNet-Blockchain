@@ -10,8 +10,8 @@ from enum import Enum
 import time
 
 class NodeType(Enum):
+    # v3.18: Only Light and Super nodes (Full removed)
     LIGHT = "light"
-    FULL = "full"
     SUPER = "super"
 
 @dataclass
@@ -38,10 +38,10 @@ class QNCNodeActivationContract:
         self.activated_nodes: Dict[str, NodeActivation] = {}
         
         # QNC Pool 3 transfer requirements (fixed amounts)
+        # v3.18: Only Light and Super nodes (Full removed)
         self.burn_requirements = {
-            NodeType.LIGHT: 5_000,    # 5k QNC
-            NodeType.FULL: 7_500,     # 7.5k QNC
-            NodeType.SUPER: 10_000    # 10k QNC
+            NodeType.LIGHT: 10_000,   # 10,000 QNC base
+            NodeType.SUPER: 7_500      # 7,500 QNC base
         }
         
         # Network size multipliers

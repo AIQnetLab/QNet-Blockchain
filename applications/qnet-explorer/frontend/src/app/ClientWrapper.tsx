@@ -67,7 +67,8 @@ export default function ClientWrapper({
   // proposal creation form state
   const [newTitle, setNewTitle] = useState('');
   const [newDesc, setNewDesc] = useState('');
-  const [selectedNodeType, setSelectedNodeType] = useState<'light' | 'full' | 'super'>('light');
+  // v3.18: Only Light and Super nodes
+  const [selectedNodeType, setSelectedNodeType] = useState<'light' | 'super'>('light');
 
   // faucet state - track last claim time and input address
   const [lastFaucetClaim, setLastFaucetClaim] = useState<number | null>(null);
@@ -79,8 +80,8 @@ export default function ClientWrapper({
   const currentPhase: 'phase1' | 'phase2' = 'phase1';
   const [burnedTokensPhase1, setBurnedTokensPhase1] = useState(0);
   const [currentPricing, setCurrentPricing] = useState({
+    // v3.18: Only Light and Super nodes (Full removed)
     light: [1500, 150],
-    full: [1500, 150], 
     super: [1500, 150]
   });
   const totalPhase1Supply = 1_000_000_000;        // 1 billion 1DEV total supply (pump.fun standard)
@@ -115,8 +116,8 @@ export default function ClientWrapper({
         if (data.dynamicPricing && data.dynamicPricing.enabled) {
           const currentPrice = data.nodeTypes.light.burnAmount;
           setCurrentPricing({
+            // v3.18: Only Light and Super nodes (Full removed)
             light: [currentPrice, 300],
-            full: [currentPrice, 300],
             super: [currentPrice, 300]
           });
           
@@ -129,7 +130,7 @@ export default function ClientWrapper({
       .catch(() => {});
   }, []);
 
-  const getCostRange = (type: 'light' | 'full' | 'super'): string => {
+  const getCostRange = (type: 'light' | 'super'): string => {
     if (currentPhase === 'phase1') {
       // Use dynamic pricing data from API
       const [currentPrice, minPrice] = currentPricing[type];
@@ -137,10 +138,10 @@ export default function ClientWrapper({
     }
 
     // Phase 2 dynamic QNC pricing - CORRECT implementation
-    const basePrices: Record<'light' | 'full' | 'super', number> = {
-      light: 5000,   // Base price for Light node
-      full: 7500,    // Base price for Full node
-      super: 10000,  // Base price for Super node
+    // v3.18: Only Light and Super nodes (Full removed)
+    const basePrices: Record<'light' | 'super', number> = {
+      light: 10000,  // Base price for Light node (10,000 QNC)
+      super: 7500   // Base price for Super node (7,500 QNC)
     };
 
     let netMultiplier = 0.5;   // 0-100k nodes

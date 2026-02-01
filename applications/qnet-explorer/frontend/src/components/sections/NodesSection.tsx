@@ -11,14 +11,14 @@ const mockNodes = [
 ];
 
 
+// v3.18: Only Light and Super nodes
 const NodeActivation = React.memo(function NodeActivation() {
-    const [selectedNodeType, setSelectedNodeType] = useState<'light' | 'full' | 'super'>('light');
+    const [selectedNodeType, setSelectedNodeType] = useState<'light' | 'super'>('light');
     
     // Dynamic pricing data
     const [burnedTokensPhase1, setBurnedTokensPhase1] = useState(0);
     const [currentPricing, setCurrentPricing] = useState({
         light: [1500, 300],
-        full: [1500, 300],
         super: [1500, 300]
     });
     
@@ -31,7 +31,6 @@ const NodeActivation = React.memo(function NodeActivation() {
                     const currentPrice = data.nodeTypes.light.burnAmount;
                     setCurrentPricing({
                         light: [currentPrice, 300],
-                        full: [currentPrice, 300],
                         super: [currentPrice, 300]
                     });
                     
@@ -45,7 +44,7 @@ const NodeActivation = React.memo(function NodeActivation() {
             .catch(() => {});
     }, []);
     
-    const getCostRange = (type: 'light' | 'full' | 'super'): string => {
+    const getCostRange = (type: 'light' | 'super'): string => {
         const currentPhase: 'phase1' | 'phase2' = 'phase1';
         const totalPhase1Supply = 1_000_000_000; // 1 billion 1DEV total supply (pump.fun standard)
         const activeNodes = 156;
@@ -56,8 +55,8 @@ const NodeActivation = React.memo(function NodeActivation() {
             return `Activation Cost: ${currentPrice.toLocaleString()} 1DEV (burn)`;
         }
     
-        // Phase 2 dynamic QNC pricing - CORRECT implementation
-        const basePrices: Record<'light' | 'full' | 'super', number> = { light: 5000, full: 7500, super: 10000 };
+        // Phase 2 dynamic QNC pricing - v3.18: Only Light and Super (Full removed)
+        const basePrices: Record<'light' | 'super', number> = { light: 10000, super: 7500 };
         // CANONICAL VALUES: ≤100K=0.5x, ≤300K=1.0x, ≤1M=2.0x, >1M=3.0x
         let netMultiplier = activeNodes > 1_000_000 ? 3.0 : activeNodes > 300_000 ? 2.0 : activeNodes > 100_000 ? 1.0 : 0.5;
         
@@ -90,13 +89,6 @@ const NodeActivation = React.memo(function NodeActivation() {
                   LIGHT NODE<br/><small style={{ fontSize: '0.8rem', opacity: 0.8 }}>(MOBILE)</small>
                 </button>
                 <button 
-                  className={`qnet-button ${selectedNodeType === 'full' ? 'primary' : 'secondary'}`}
-                  onClick={() => setSelectedNodeType('full')}
-                  style={{ padding: '1.5rem 1rem', fontSize: '1rem', fontWeight: 'bold' }}
-                >
-                  FULL NODE<br/><small style={{ fontSize: '0.8rem', opacity: 0.8 }}>(SERVER)</small>
-                </button>
-                <button 
                   className={`qnet-button ${selectedNodeType === 'super' ? 'primary' : 'secondary'}`}
                   onClick={() => setSelectedNodeType('super')}
                   style={{ padding: '1.5rem 1rem', fontSize: '1rem', fontWeight: 'bold' }}
@@ -115,17 +107,9 @@ const NodeActivation = React.memo(function NodeActivation() {
                     {selectedNodeType === 'light' && (
                       <>
                         <span>• Thin client (no blockchain storage)</span>
-                        <span>• All data via RPC from Full/Super</span>
+                        <span>• All data via RPC from Super nodes</span>
                         <span>• Up to 3 devices per node</span>
                         <span>• Battery-friendly design (~10MB app)</span>
-                      </>
-                    )}
-                    {selectedNodeType === 'full' && (
-                      <>
-                        <span>• Ping interval: every 4 min</span>
-                        <span>• Response rate: ≥ 95%</span>
-                        <span>• Public HTTP endpoint</span>
-                        <span>• Stable 24/7 connection</span>
                       </>
                     )}
                     {selectedNodeType === 'super' && (

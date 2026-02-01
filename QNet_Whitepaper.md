@@ -169,9 +169,8 @@ QNet presents an experimental blockchain platform with unique characteristics:
    - Block production
    - Requirements: 8+ GB RAM, SSD
 
-2. **Full Nodes**:
-   - Full blockchain synchronization
-   - Transaction validation
+2. ~~**Full Nodes**~~ (REMOVED in v3.18):
+   - v3.18: Full node type removed - all server nodes are now Super nodes
    - Don't participate in block production
    - Requirements: 4+ GB RAM
 
@@ -934,9 +933,9 @@ After 2 macroblocks with 2/3+ validator signatures = FINAL
 
 ```
 Response requirements:
-├── Light Nodes: 1+ attestation per window (pinged by Full/Super via FCM push)
-├── Full Nodes: 80% (8+ out of 10 heartbeats in current window)
+├── Light Nodes: 1+ attestation per window (pinged by Super via FCM push)
 └── Super Nodes: 90% (9+ out of 10 heartbeats in current window)
+(v3.18: Full Nodes removed)
 
 Architecture (v2.23):
 ├── Light: Full/Super nodes ping via FCM V1 API → Light signs challenge → attestation
@@ -1004,7 +1003,7 @@ GOSSIP ARCHITECTURE:
 ├── Transport: HTTP POST (reliable, NAT-friendly)
 ├── Fanout: Adaptive 4-32 (same as Shred Protocol block propagation)
 ├── Signature: SHA3-256 (quantum-safe verification)
-└── Scope: Super + Full nodes only (Light nodes excluded)
+└── Scope: Super nodes only (v3.18: Full and Light nodes excluded)
 
 EXPONENTIAL PROPAGATION (v2.19.19):
 ├── Initial Send: Node gossips to K closest neighbors by Kademlia distance (K=3)
@@ -1239,7 +1238,7 @@ pub struct SimpleMempool {
 
 **Scalability**:
 - ✅ **Light Nodes**: NOT affected (don't produce blocks)
-- ✅ **Full Nodes**: Can submit bundles if reputation ≥80%
+- ✅ **Super Nodes**: Can submit bundles if reputation ≥80% (v3.18: Full removed)
 - ✅ **Super Nodes**: Full MEV protection capabilities
 - ✅ **Lock-Free**: DashMap for concurrent bundle operations
 
@@ -1386,18 +1385,12 @@ Determinism Level: ⚠️ PARTIAL (by design)
 └── Byzantine consensus prevents malicious manipulation
 ```
 
-**Pool #2 - Transaction Fee Distribution:**
+**Pool #2 - REMOVED in v3.18:**
 ```
-Source: Network transaction fees
-Distribution Split:
-├── 70% to Super Nodes (divided equally among all eligible Super nodes)
-├── 30% to Full Nodes (divided equally among all eligible Full nodes)
-└── 0% to Light Nodes (no transaction processing)
-Eligibility (NEW rewards): 
-├── Full Nodes: 8+ heartbeats (80%) + reputation ≥70
-└── Super Nodes: 9+ heartbeats (90%) + reputation ≥70
-Claim OLD rewards: No reputation requirement (only wallet ownership, even if banned)
-Dynamic Scaling: Increases with network usage
+v3.18: Pool 2 was completely removed
+Transaction fees now go DIRECTLY to block producer
+No batched distribution - fees credited immediately upon block creation
+This eliminates the 4-hour delay and simplifies the reward system
 ```
 
 **Pool #3 - Activation Pool (Critical Innovation, Phase 2 only):**
@@ -1411,7 +1404,6 @@ Mechanism:
 Distribution: Equal share to all eligible nodes
 Eligibility (NEW rewards): 
 ├── Light Nodes: 1+ attestation per window + reputation = 70 (fixed)
-├── Full Nodes: 8+ heartbeats (80%) + reputation ≥70
 └── Super Nodes: 9+ heartbeats (90%) + reputation ≥70
 Claim OLD rewards: No reputation requirement (only wallet ownership, even if banned)
 Innovation: Every new node activation benefits the entire network
@@ -1440,10 +1432,10 @@ Transition Trigger: 90% burned OR 5 years from genesis → Phase 2 (QNC activati
 **Phase 2 (QNC Network-Based Pricing):**
 
 ```
-Base Activation Costs:
-├── Light Node: 5,000 QNC base
-├── Full Node: 7,500 QNC base
-└── Super Node: 10,000 QNC base
+Base Activation Costs (Phase 2):
+├── Light Node: 10,000 QNC base
+└── Super Node: 7,500 QNC base
+(v3.18: Full Node removed, prices corrected)
 
 Network Size Multipliers:
 ├── 0-100K nodes: 0.5x (early adopter discount)
@@ -1452,8 +1444,8 @@ Network Size Multipliers:
 └── 1M+ nodes: 3.0x (mature network premium)
 
 Final Price Ranges:
-├── Light: 2,500-15,000 QNC
-├── Full: 3,750-22,500 QNC
+├── Light: 5,000-30,000 QNC (base: 10,000 QNC)
+└── Super: 3,750-22,500 QNC (base: 7,500 QNC)
 └── Super: 5,000-30,000 QNC
 
 ALL activation QNC → Pool #3 → Redistributed to network
@@ -1483,10 +1475,10 @@ Reputation Score Mechanics (v2.19.4):
 
 Economic Thresholds:
 ├── Light Nodes: Fixed 70 reputation, 1+ attestation = eligible for Pool 1
-├── Full Nodes: 70+ points + 7+ heartbeats (70%) = eligible for Pool 1 + Pool 2
-├── Super Nodes: 70+ points + 9+ heartbeats (90%) = eligible for Pool 1 + Pool 2
-├── Full/Super: 10-69 points - network access only, no new rewards
-└── Full/Super: <10 points - complete network ban (can claim old rewards)
+├── Super Nodes: 70+ points + 9+ heartbeats (90%) = eligible for Pool 1
+├── Super: 10-69 points - network access only, no new rewards
+└── Super: <10 points - complete network ban (can claim old rewards)
+(v3.18: Full Nodes removed, Pool 2 removed - fees go directly to producer)
 
 Penalties by Violation Type (Full/Super only, Light nodes unaffected):
 ├── Missed Heartbeat: NO penalty (heartbeats only for eligibility, not reputation)
@@ -1572,8 +1564,8 @@ SECURITY NOTE (v2.19.19 - NIST FIPS 204 compliant):
 
 Response Requirements by Node Type:
 ├── Light Nodes: 1+ attestation per window (not 100%)
-├── Full Nodes: 80% success rate (8+ out of 10 heartbeats)
 └── Super Nodes: 90% success rate (9+ out of 10 heartbeats)
+(v3.18: Full Nodes removed)
 
 Light Node Reputation: Fixed at 70 (immutable by design)
 ├── Mobile devices have unstable connectivity
@@ -2831,9 +2823,8 @@ ws://node:8001/ws/transactions // Subscribe to transactions
 - **Network**: 1 Gbps symmetric channel
 - **OS**: Ubuntu 22.04 LTS or newer
 
-**Full Node:**
-- **CPU**: 4+ cores
-- **RAM**: 4+ GB
+~~**Full Node**~~ (REMOVED in v3.18):
+- v3.18: Full node type removed - use Super node for servers
 - **Storage**: 500+ GB SSD
 - **Network**: 100 Mbps
 - **OS**: Ubuntu 20.04+ / macOS / Windows

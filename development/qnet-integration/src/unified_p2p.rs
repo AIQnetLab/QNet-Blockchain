@@ -865,10 +865,10 @@ pub struct PeerMetrics {
 
 /// Simple node types for P2P
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// v3.18: Full node type REMOVED - only Light and Super remain
 pub enum NodeType {
-    Light,   // Only receives macroblock headers
-    Full,    // Receives all microblocks
-    Super,   // Validates and produces blocks
+    Light,   // Mobile nodes - receives macroblock headers
+    Super,   // Server nodes - validates and produces blocks
 }
 
 /// Geographic regions for basic clustering
@@ -1260,8 +1260,9 @@ pub struct SimplifiedP2P {
     // Values are stored in MacroBlock for all nodes to use identical amounts
     // ═══════════════════════════════════════════════════════════════════════════
     
-    /// Pool 2: Accumulated transaction fees (nanoQNC)
-    /// Distribution: 70% Super nodes, 30% Full nodes, 0% Light nodes
+    /// Pool 2: Accumulated transaction fees (nanoQNC) - v3.18: DEPRECATED
+    /// v3.18: Pool 2 removed - fees go directly to block producer
+    /// This field kept for backward compatibility (always 0)
     /// Reset after each EMISSION MacroBlock (every 4 hours)
     pool2_accumulated_fees: Arc<AtomicU64>,
     
@@ -1307,7 +1308,8 @@ pub struct CertificateManager {
 
 impl CertificateManager {
     pub fn new() -> Self {
-        Self::with_node_type(NodeType::Full) // Default to Full node
+        // v3.18: Full nodes removed - default to Super
+        Self::with_node_type(NodeType::Super)
     }
     
     /// Create certificate manager with node type specific limits
@@ -1316,8 +1318,7 @@ impl CertificateManager {
         // ARCHITECTURE: Max 1000 validators per round × 4 hour TTL = 4000 certs max
         let max_cache_size = match node_type {
             NodeType::Light => 0,      // Light nodes: DON'T participate in consensus, no certs needed!
-            NodeType::Full => 5000,    // Full nodes: 4000 active + 1000 buffer for rotation
-            NodeType::Super => 5000,   // Super nodes: same as Full, both validate blocks
+            NodeType::Super => 5000,   // Super nodes: 4000 active + 1000 buffer for rotation
         };
         
         if max_cache_size == 0 {
@@ -1584,8 +1585,7 @@ impl CertificateManager {
         // Persist only most used certificates for quick recovery after restart
         let max_persist_certs = match node_type {
             NodeType::Light => 0,     // Light nodes: NO persistence (no consensus participation)
-            NodeType::Full => 2000,   // Full nodes: persist active validators for 2 hours
-            NodeType::Super => 2000,  // Super nodes: same as Full
+            NodeType::Super => 2000,  // Super nodes: persist active validators for 2 hours
         };
         
         if max_persist_certs == 0 {
@@ -2168,9 +2168,9 @@ impl SimplifiedP2P {
             .map_err(|e| format!("Invalid QUIC bind address: {}", e))?;
         
         // UNIFIED: Use lowercase format consistent with ActiveNodeAnnouncement
+        // v3.18: Full node type removed - only Light and Super remain
         let node_type_str = match self.node_type {
             NodeType::Super => "super",
-            NodeType::Full => "full",
             NodeType::Light => "light",
         };
         let mut transport = QuicTransport::new(self.node_id.clone(), node_type_str.to_string(), quic_port);
@@ -2476,8 +2476,8 @@ impl SimplifiedP2P {
                 }
                 _ => {
                     self.start_peer_exchange_protocol(initial_peers);
-                    println!("[P2P] 🔄 Started peer exchange protocol for {} node", 
-                            if matches!(self.node_type, NodeType::Super) { "Super" } else { "Full" });
+                    // v3.18: Full nodes removed
+                    println!("[P2P] 🔄 Started peer exchange protocol for Super node");
                 }
             }
         }
@@ -2883,7 +2883,7 @@ impl SimplifiedP2P {
             };
             (NodeType::Super, region)
         } else {
-            (NodeType::Full, Region::Europe) // Default for non-Genesis
+            (NodeType::Super, Region::Europe) // Default for non-Genesis
         };
         
         // Get reputation from blockchain (v2.21.5)
@@ -3386,8 +3386,7 @@ impl SimplifiedP2P {
                             
                             let node_type_prefix = match node_type {
                                 NodeType::Super => "super",
-                                NodeType::Full => "full", 
-                                _ => "node"
+                                NodeType::Light => "light",
                             };
                             
                             format!("{}_{}_{}", 
@@ -3681,9 +3680,8 @@ impl SimplifiedP2P {
                 // Regular nodes: Keep original timing (already safe)
                 let sync_interval = match &node_type {
                     NodeType::Light => 30,  // Light nodes: 30s (mobile, stores only 1000 blocks)
-                    NodeType::Full => 5,    // Full nodes: 5s (Full nodes are never Genesis)
                     NodeType::Super => {
-                        if is_genesis_node { 7 } else { 2 }  // Super nodes: 7s genesis (was 1s), 2s normal
+                        if is_genesis_node { 7 } else { 2 }  // Super nodes: 7s genesis, 2s normal
                     }
                 };
                 
@@ -7829,7 +7827,7 @@ impl SimplifiedP2P {
         
         // Broadcast to all Full and Super nodes
         let target_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
-            .filter(|e| matches!(e.value().node_type, NodeType::Full | NodeType::Super))
+            .filter(|e| matches!(e.value().node_type, NodeType::Super))
             .map(|e| e.value().clone())
             .collect();
         
@@ -7954,22 +7952,22 @@ impl SimplifiedP2P {
         
         // Use node_type from QUIC handshake (real value from remote node)
         // UNIFIED: All node_type strings normalized to lowercase for comparison
+        // v3.18: Full nodes removed
         let node_type = match quic_node_type.to_lowercase().as_str() {
             "super" => NodeType::Super,
-            "full" => NodeType::Full,
             "light" => NodeType::Light, // Light nodes won't be here, but handle for completeness
             _ => {
                 // Fallback for legacy/unknown formats
+                // v3.18: Full nodes removed
                 match quic_node_type.to_lowercase().as_str() {
                     "super" => NodeType::Super,
-                    "full" => NodeType::Full,
                     "light" => NodeType::Light,
                     _ => {
                         // Genesis nodes are always Super
                         if node_id.starts_with("genesis_node_") {
                             NodeType::Super
                         } else {
-                            NodeType::Full // Default for unknown types
+                            NodeType::Super // Default for unknown types
                         }
                     }
                 }
@@ -8547,10 +8545,10 @@ impl SimplifiedP2P {
                             if let Some(active_info_ref) = self.active_full_super_nodes.get(&node_id) {
                                 let active_info = active_info_ref.value();
                                 // Create PeerInfo from ActiveNodeInfo - use REAL data!
+                                // v3.18: Full nodes removed
                                 let node_type = match active_info.node_type.to_lowercase().as_str() {
                                     "super" => NodeType::Super,
-                                    "full" => NodeType::Full,
-                                    _ => NodeType::Super, // Genesis are Super
+                                    _ => NodeType::Super, // Genesis are Super (ignore "full")
                                 };
                                 // Region from shard_id
                                 let region = match active_info.shard_id % 6 {
@@ -8724,7 +8722,7 @@ impl SimplifiedP2P {
             let validated_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
                 .filter(|entry| {
                     let peer = entry.value();
-                    let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
+                    let is_consensus_capable = matches!(peer.node_type, NodeType::Super);
                     
                     if is_consensus_capable {
                         let peer_ip = peer.addr.split(':').next().unwrap_or("");
@@ -8778,7 +8776,7 @@ impl SimplifiedP2P {
                 .filter(|entry| {
                     let peer = entry.value();
                     let is_genesis = genesis_peer_ids.contains(&peer.id);
-                    let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
+                    let is_consensus_capable = matches!(peer.node_type, NodeType::Super);
                     !is_genesis && is_consensus_capable
                 })
                 .map(|entry| entry.value().clone())
@@ -9073,7 +9071,7 @@ impl SimplifiedP2P {
         let correct_node_type = if is_genesis_node_ip(ip) {
             NodeType::Super  // All Genesis nodes are Super nodes  
         } else {
-            NodeType::Full   // Default for regular nodes
+            NodeType::Super   // Default for regular nodes
         };
         
         // v2.45.1: Use INITIAL_REPUTATION from consensus
@@ -9731,8 +9729,8 @@ impl SimplifiedP2P {
                                  peer.id.contains("slashed") ||
                                  peer.id.contains("malicious");
             
+            // v3.18: Full nodes removed
             let has_valid_format = peer.id.starts_with("light_") ||
-                                   peer.id.starts_with("full_") ||
                                    peer.id.starts_with("super_") ||
                                    peer.id.starts_with("genesis_node_") ||
                                    peer.id.starts_with("node_");
@@ -9928,8 +9926,8 @@ impl SimplifiedP2P {
         // Light nodes: 5 workers, 20 blocks/chunk (battery-friendly, mobile devices)
         
         // PRODUCTION: Detect node type from environment with safe default
-        // Default to "full" (server node) if not specified - consistent with storage.rs
-        let node_type = std::env::var("QNET_NODE_TYPE").unwrap_or_else(|_| "full".to_string());
+        // v3.18: Full nodes removed - default to "super" (server node) if not specified
+        let node_type = std::env::var("QNET_NODE_TYPE").unwrap_or_else(|_| "super".to_string());
         
         let (workers, chunk_size) = match node_type.to_lowercase().as_str() {
             "light" => {
@@ -9939,8 +9937,9 @@ impl SimplifiedP2P {
                 // - Small chunks for quick completion
                 (5, 20)
             },
-            "full" | "super" => {
-                // Full/Super nodes (servers): Balanced performance
+            "super" => {
+                // Super nodes (servers): Balanced performance
+                // v3.18: Full nodes removed
                 // - Full blockchain sync
                 // - 10 workers = proven stable in production
                 // - Avoids network overload with many nodes
@@ -10562,7 +10561,7 @@ pub enum NetworkMessage {
     /// Nodes prove liveness by broadcasting signed heartbeats at deterministic times
     NodeHeartbeat {
         node_id: String,              // Node identifier
-        node_type: String,            // "full" or "super"
+        node_type: String,            // "super" (v3.18: Full removed)
         timestamp: u64,               // Unix timestamp of heartbeat
         block_height: u64,            // Current block height (informational)
         signature: String,            // Dilithium signature proving key ownership
@@ -10601,7 +10600,7 @@ pub enum NetworkMessage {
     /// Gossiped when node starts and periodically (every 10 min) to maintain active list
     ActiveNodeAnnouncement {
         node_id: String,              // Node identifier
-        node_type: String,            // "full" or "super"
+        node_type: String,            // "super" (v3.18: Full removed)
         shard_id: u8,                 // Node's shard (0-255)
         reputation: f64,              // Current reputation score
         timestamp: u64,               // Announcement timestamp
@@ -10677,7 +10676,7 @@ pub enum NetworkMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveNodeInfo {
     pub node_id: String,
-    pub node_type: String,          // "full" or "super"
+    pub node_type: String,          // "super" (v3.18: Full removed)
     pub shard_id: u8,
     pub reputation: f64,
     pub last_seen: u64,             // Last heartbeat/announcement timestamp
@@ -13404,10 +13403,10 @@ impl SimplifiedP2P {
     /// CRITICAL: blockchain_height must be a clone of Arc that can be moved into async context
     pub fn start_heartbeat_service_with_height(self: Arc<Self>, get_height: Arc<dyn Fn() -> u64 + Send + Sync>) {
         let node_id = self.node_id.clone();
+        // v3.18: Full node type removed - only Light and Super remain
         let node_type = match self.node_type {
             NodeType::Super => "super",
-            NodeType::Full => "full",
-            _ => return, // Light nodes don't send heartbeats
+            NodeType::Light => return, // Light nodes don't send heartbeats
         };
         
         let p2p = self.clone();
@@ -13944,16 +13943,18 @@ impl SimplifiedP2P {
             // PRODUCTION: Strict node type detection - NO DEFAULTS!
             // Node IDs MUST follow naming conventions:
             // - "light_{region}_{hash}" for Light nodes (mobile apps)
-            // - "full_{activation_code}" for Full nodes (servers with partial state)
             // - "super_{id}" or "genesis_node_{N}" for Super nodes (full validators)
+            // v3.18: Full nodes removed - "full_" prefix ignored
             // Unknown formats are REJECTED (not counted for rewards)
             // ═══════════════════════════════════════════════════════════════════════════
             let node_type: Option<u8> = if node_id.starts_with("light_") {
                 Some(0) // Light node - mobile app
-            } else if node_id.starts_with("full_") {
-                Some(1) // Full node - server with partial state
             } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
                 Some(2) // Super node - full validator
+            } else if node_id.starts_with("full_") {
+                // v3.18: Full nodes removed - reject old format
+                println!("[WARN][HEARTBEAT] rejected_full_node_format id={} action=skip_rewards", node_id);
+                None // Skip this node - Full node type removed
             } else {
                 // PRODUCTION: Unknown format - REJECT, don't guess!
                 // Node must re-register with correct ID format
@@ -14232,7 +14233,8 @@ impl SimplifiedP2P {
     // ═══════════════════════════════════════════════════════════════════════════════
     
     /// Add transaction fee to Pool 2 accumulator (called when TX is processed)
-    /// Pool 2: Distributed to validators (70% Super, 30% Full, 0% Light)
+    /// v3.18: Pool 2 removed - fees go directly to block producer
+    /// This method kept for backward compatibility (does nothing)
     pub fn add_to_pool2(&self, fee_amount: u64) {
         self.pool2_accumulated_fees.fetch_add(fee_amount, Ordering::SeqCst);
     }
@@ -14354,9 +14356,9 @@ impl SimplifiedP2P {
         }
         
         // Required count per whitepaper
+        // v3.18: Full nodes removed
         let required = match node_type {
             "super" => 9,  // 90% = 9/10
-            "full" => 8,   // 80% = 8/10
             _ => 10,       // Light nodes: 100% (but they don't use heartbeats)
         };
         
@@ -14790,10 +14792,10 @@ impl SimplifiedP2P {
             .unwrap_or_default()
             .as_secs();
         
+        // v3.18: Full node type removed - only Light and Super remain
         let node_type_str = match self.node_type {
             NodeType::Super => "super",
-            NodeType::Full => "full",
-            _ => return, // Light nodes don't register
+            NodeType::Light => return, // Light nodes don't register
         };
         
         // Get reputation from blockchain (v2.21.5)
@@ -14855,10 +14857,10 @@ impl SimplifiedP2P {
             .unwrap_or_default()
             .as_secs();
         
+        // v3.18: Full node type removed - only Light and Super remain
         let node_type_str = match self.node_type {
             NodeType::Super => "super",
-            NodeType::Full => "full",
-            _ => return, // Light nodes don't register
+            NodeType::Light => return, // Light nodes don't register
         };
         
         // Get current reputation
@@ -15192,10 +15194,10 @@ impl SimplifiedP2P {
                 }
                 
                 // Check eligibility threshold (case-insensitive)
+                // v3.18: Full nodes removed
                 let required = match node_type.to_lowercase().as_str() {
                     "super" => 9,
-                    "full" => 8,
-                    _ => 10,
+                    _ => 10, // Ignore "full"
                 };
                 
                 if count >= required {
@@ -15264,7 +15266,8 @@ impl SimplifiedP2P {
         let mut counts: std::collections::HashMap<String, (String, u8)> = std::collections::HashMap::new();
         
         for (node_id, _, _) in heartbeats {
-            let entry = counts.entry(node_id.clone()).or_insert(("full".to_string(), 0));
+            // v3.18: Full nodes removed - default to "super" for backward compatibility
+            let entry = counts.entry(node_id.clone()).or_insert(("super".to_string(), 0));
             entry.1 += 1;
         }
         
@@ -15298,10 +15301,10 @@ impl SimplifiedP2P {
                 }
                 
                 // Filter by eligibility: Full >= 8/10, Super >= 9/10 (case-insensitive)
+                // v3.18: Full nodes removed
                 match node_type.to_lowercase().as_str() {
                     "super" => *count >= 9,
-                    "full" => *count >= 8,
-                    _ => false,
+                    _ => false, // Ignore "full"
                 }
             })
             .collect()
@@ -15789,7 +15792,7 @@ impl SimplifiedP2P {
         
         // CRITICAL: Only request from Super/Full nodes that are ACTUALLY ONLINE
         let mut eligible_peers: Vec<_> = peers.iter()
-            .filter(|p| matches!(p.node_type, NodeType::Super | NodeType::Full))
+            .filter(|p| matches!(p.node_type, NodeType::Super))
             .filter(|p| {
                 // v2.96: Filter by failover connectivity cache
                 let peer_ip = p.addr.split(':').next().unwrap_or("");
@@ -15804,7 +15807,7 @@ impl SimplifiedP2P {
                 println!("[WARN][MB-SYNC] no_live_peers fallback=all_eligible");
             }
             eligible_peers = peers.iter()
-                .filter(|p| matches!(p.node_type, NodeType::Super | NodeType::Full))
+                .filter(|p| matches!(p.node_type, NodeType::Super))
                 .cloned()
                 .collect();
         }
@@ -16812,7 +16815,7 @@ impl SimplifiedP2P {
                 // This saves ~300MB-3GB of storage on constrained devices
                 return;
             },
-            NodeType::Full | NodeType::Super => {
+            NodeType::Super => {
                 // Both Full and Super nodes store ALL reputation
                 // Full nodes: Can participate in consensus, need full data
                 // Super nodes: Produce blocks, need full data for leader selection
@@ -17129,7 +17132,7 @@ impl SimplifiedP2P {
                 // They request from Super/Full nodes via API when needed
                 return None;
             },
-            NodeType::Full | NodeType::Super => {
+            NodeType::Super => {
                 // Both Full and Super nodes have complete reputation storage
                 // Continue with loading from local files
             }
@@ -17774,10 +17777,10 @@ impl SimplifiedP2P {
                                                 format!("{:?}", self.node_type)).as_bytes());
         
         // PRIVACY: Generate P2P-friendly display name without revealing IP
+        // v3.18: Full node type removed - only Light and Super remain
         let node_type_prefix = match self.node_type {
             NodeType::Super => "super",
-            NodeType::Full => "full", 
-            _ => "node"
+            NodeType::Light => "light",
         };
         
         let region_hint = format!("{:?}", self.region).to_lowercase();
@@ -18716,7 +18719,7 @@ impl SimplifiedP2P {
         if failed_producer == self.node_id {
             // Check if we're actually a block-producing node
             match self.node_type {
-                NodeType::Super | NodeType::Full => {
+                NodeType::Super => {
                     // CRITICAL FIX: Check if we're actively producing blocks
                     // Protect against false failover from competing nodes
                     use crate::node::{LAST_BLOCK_PRODUCED_TIME, LAST_BLOCK_PRODUCED_HEIGHT};

@@ -19,10 +19,10 @@ export class NodeManager {
         this.phaseCheckInterval = 60000; // Check phase every minute
         
         // Ping success tracking for rewards
+        // v3.18: Only Light and Super nodes
         this.pingSuccessRate = {
             light: 1.0,   // 100% success rate required
-            full: 0.95,   // 95% success rate required  
-            super: 0.98   // 98% success rate required
+            super: 0.90   // 90% success rate required
         };
     }
     

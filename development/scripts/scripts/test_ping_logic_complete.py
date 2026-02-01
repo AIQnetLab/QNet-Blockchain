@@ -50,9 +50,10 @@ class TestNodeDetectionLogic(unittest.TestCase):
         result = self.router.determine_ping_target("full_node_1", registration)
         
         # Network should ping server endpoint
+        # v3.18: Full nodes removed - use Super
         self.assertEqual(result["ping_target"], "server")
-        self.assertEqual(result["node_type"], "full")
-        self.assertEqual(result["success_rate_required"], 0.95)
+        self.assertEqual(result["node_type"], "super")
+        self.assertEqual(result["success_rate_required"], 0.90)  # Super nodes: 90%
         self.assertEqual(result["pings_per_4h_window"], 60)
         self.assertIn("full-node-server.com:8080", result["endpoint"])
         

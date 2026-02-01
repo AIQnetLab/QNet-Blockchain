@@ -18,9 +18,9 @@ class ShardAssignment:
     TOTAL_SHARDS = 10000
     
     # Shard visibility by node type
+    # v3.18: Full nodes removed
     SHARDS_PER_NODE = {
         NodeType.LIGHT: 0,    # No transaction processing
-        NodeType.FULL: 1,     # See 1 shard
         NodeType.SUPER: 3,    # See 3 shards
     }
     

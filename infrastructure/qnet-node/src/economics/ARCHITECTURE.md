@@ -44,10 +44,10 @@ The pricing system separates **static configuration** from **dynamic blockchain 
 [Token]
 # These NEVER change after deployment
 onedev_initial_burn_light = 1500000000  # 1500 1DEV (6 decimals)
-onedev_initial_burn_full = 1500000000   # 1500 1DEV (6 decimals)
+# onedev_initial_burn_full = 1500000000   # DEPRECATED v3.18: Full node removed
 onedev_initial_burn_super = 1500000000  # 1500 1DEV (6 decimals)
 onedev_min_burn_light = 300000000       # 300 1DEV minimum at 80-90%
-onedev_min_burn_full = 300000000        # 300 1DEV minimum at 80-90%
+# onedev_min_burn_full = 300000000        # DEPRECATED v3.18: Full node removed
 onedev_min_burn_super = 300000000       # 300 1DEV minimum at 80-90%
 onedev_total_supply = 1000000000000000
 onedev_burn_target_ratio = 0.9

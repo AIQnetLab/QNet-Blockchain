@@ -6,7 +6,7 @@ const BRIDGE_API_BASE = process.env.BRIDGE_API_BASE || 'http://localhost:5000';
 
 interface ActivationRequest {
   walletAddress: string;
-  nodeType: 'light' | 'full' | 'super';
+  nodeType: 'light' | 'super';  // v3.18: Full removed
   burnAmount: number;
 }
 
@@ -93,10 +93,7 @@ export async function GET(): Promise<NextResponse> {
             burnAmount: currentPrice,
             description: 'Mobile-optimized node for basic validation'
           },
-          full: {
-            burnAmount: currentPrice,
-            description: 'Complete validation node for desktop/server'
-          },
+          // v3.18: Full node removed
           super: {
             burnAmount: currentPrice,
             description: 'High-performance node for enterprise use'
@@ -117,8 +114,8 @@ export async function GET(): Promise<NextResponse> {
   
   return NextResponse.json({
     nodeTypes: {
+      // v3.18: Only Light and Super nodes (Full removed)
       light: { burnAmount: productionBaselinePrice, description: 'Mobile-optimized node for basic validation' },
-      full: { burnAmount: productionBaselinePrice, description: 'Complete validation node for desktop/server' },
       super: { burnAmount: productionBaselinePrice, description: 'High-performance node for enterprise use' }
     },
     phase: 1,

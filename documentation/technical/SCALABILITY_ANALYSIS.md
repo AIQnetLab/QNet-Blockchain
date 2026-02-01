@@ -30,15 +30,13 @@ With millions of nodes (especially mobile light nodes), traditional ping/heartbe
 ┌─────────────────────────────────────┐
 │         Super Nodes (100)           │  Layer 1: Core validators
 ├─────────────────────────────────────┤
-│      Full Nodes (10,000)            │  Layer 2: Regular validators  
-├─────────────────────────────────────┤
-│    Light Nodes (1,000,000+)         │  Layer 3: Mobile/light clients
+│    Light Nodes (1,000,000+)         │  Layer 2: Mobile/light clients
 └─────────────────────────────────────┘
 ```
 
 **Benefits**:
-- Light nodes only connect to nearby full nodes
-- Full nodes aggregate data before sending to super nodes
+- Light nodes connect to Super nodes
+- Super nodes handle all validation and block production
 - Reduces complexity from O(n) to O(log n)
 
 ### 2. **Gossip Protocol Instead of Direct Pings**
@@ -112,16 +110,10 @@ pub struct KademliaRouting {
 - **Connection**: Full mesh or near-full mesh
 - **Heartbeat**: Every 30 seconds
 
-### Layer 2: Full Nodes  
-- **Count**: 10,000-100,000 nodes
-- **Role**: Transaction validation, state storage
-- **Connection**: Connect to 20-50 other full nodes + some super nodes
-- **Heartbeat**: Every 60 seconds via gossip
-
-### Layer 3: Light Nodes
+### Layer 2: Light Nodes
 - **Count**: Millions
 - **Role**: Transaction submission, balance queries
-- **Connection**: Connect to 3-5 full nodes only
+- **Connection**: Connect to 3-5 Super nodes only
 - **Heartbeat**: Every 5-10 minutes, or on-demand
 
 ### Special: Mobile Nodes
@@ -145,7 +137,6 @@ pub struct KademliaRouting {
 | Node Type | Upload | Download | Monthly Data |
 |-----------|--------|----------|--------------|
 | Super Node | 100 Mbps | 100 Mbps | 30 TB |
-| Full Node | 10 Mbps | 10 Mbps | 3 TB |
 | Light Node | 1 Mbps | 1 Mbps | 300 GB |
 | Mobile Node | 100 Kbps | 100 Kbps | 30 GB |
 

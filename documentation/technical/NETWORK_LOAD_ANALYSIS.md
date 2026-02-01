@@ -134,7 +134,6 @@ fn get_storage_behavior(node_type: NodeType) -> StorageTier {
 
 **Result (v3.0)**: 
 - Light nodes: ~10MB (app only, no blockchain storage - thin client)
-- Full nodes: ~500GB storage (30-day pruning window)
 - Super nodes: ~2TB storage (full history, archival role)
 
 ### 4. Consensus Participation Load
@@ -219,7 +218,6 @@ Full blockchain sync:
 ```rust
 struct SyncStrategy {
     // Light nodes: Thin client (no sync, all via RPC)
-    // Full nodes: Snapshot + recent blocks
     // Super nodes: Full history
     
     snapshot_interval: u64,  // Every 3,600 blocks (1 hour incremental)
@@ -272,11 +270,9 @@ impl Node {
 ### 1. Hierarchical Network Structure
 ```
 Super Nodes (Tier 1)
-├── Full Nodes (Tier 2)
-└── Light Nodes (Tier 3)
+└── Light Nodes (Tier 2)
 
-- Light nodes connect to Full nodes only
-- Full nodes connect to Super nodes
+- Light nodes connect to Super nodes only
 - Super nodes form core mesh network
 ```
 

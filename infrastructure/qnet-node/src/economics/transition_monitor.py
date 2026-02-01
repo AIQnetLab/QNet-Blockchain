@@ -196,9 +196,9 @@ class NodeActivationRouter:
         if self.transition_monitor.should_use_qnc_contract():
             # QNC phase - fixed prices with network size multiplier
             base_prices = {
-                "light": 5_000,
-                "full": 7_500,
-                "super": 10_000
+                # v3.18: Only Light and Super (Full removed)
+                "light": 10_000,  # 10,000 QNC base
+                "super": 7_500    # 7,500 QNC base
             }
             
             # Apply network size multiplier

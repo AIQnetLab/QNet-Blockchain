@@ -76,6 +76,29 @@ impl StateManager {
         self.accounts.get(address).map(|acc| acc.balance).unwrap_or(0)
     }
     
+    /// v3.18: Credit block fees directly to producer's wallet
+    /// This is called when a block is produced/validated to give fees to the producer
+    /// Fees are NOT a transaction - they are direct balance credit (like Ethereum coinbase)
+    pub fn credit_producer_fees(&self, producer_wallet: &str, fees: u64) -> StateResult<()> {
+        if fees == 0 {
+            return Ok(()); // No fees to credit
+        }
+        
+        // Get or create producer account
+        let mut account = self.accounts
+            .entry(producer_wallet.to_string())
+            .or_insert_with(|| Account::new(producer_wallet.to_string()))
+            .clone();
+        
+        // Credit fees (using saturating_add to prevent overflow)
+        account.balance = account.balance.saturating_add(fees);
+        
+        // Update account
+        self.accounts.insert(producer_wallet.to_string(), account);
+        
+        Ok(())
+    }
+    
     /// Apply transaction
     pub fn apply_transaction(&self, tx: &Transaction) -> StateResult<()> {
         // Get mutable access to accounts

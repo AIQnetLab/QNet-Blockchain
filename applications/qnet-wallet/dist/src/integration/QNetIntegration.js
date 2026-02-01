@@ -158,9 +158,9 @@ export class QNetIntegration {
         try {
             const response = await this.makeRPCCall('get_activation_costs', {});
 
+            // v3.18: Only Light and Super nodes
             return {
                 light: response.costs.light,
-                full: response.costs.full,
                 super: response.costs.super,
                 networkSize: response.network_size,
                 multiplier: response.multiplier,
@@ -170,9 +170,9 @@ export class QNetIntegration {
         } catch (error) {
             console.error('Failed to get activation costs:', error);
             // PRODUCTION: Return error state, NOT fake prices
+            // v3.18: Only Light and Super nodes
             return {
                 light: null,
-                full: null,
                 super: null,
                 networkSize: null,
                 multiplier: null,
@@ -404,11 +404,11 @@ export class QNetIntegration {
         try {
             const response = await this.makeRPCCall('get_network_stats', {});
 
+            // v3.18: Only Light and Super nodes (fullNodes kept for API backward compat)
             return {
                 totalNodes: response.total_nodes,
                 activeNodes: response.active_nodes,
                 lightNodes: response.light_nodes,
-                fullNodes: response.full_nodes,
                 superNodes: response.super_nodes,
                 totalSupply: response.total_supply / Math.pow(10, this.qncDecimals),
                 circulatingSupply: response.circulating_supply / Math.pow(10, this.qncDecimals),

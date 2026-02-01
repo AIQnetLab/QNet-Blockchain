@@ -28,18 +28,18 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("QNetBridge")
 
+# v3.18: Full nodes removed - only Light and Super
 class NodeType(Enum):
     LIGHT = "Light"
-    FULL = "Full"
     SUPER = "Super"
 
 class QNCActivationCosts:
     """QNC activation costs with network size multipliers"""
     
+    # v3.18: Only Light and Super nodes (Full removed)
     base_costs = {
-        NodeType.LIGHT: 5000,
-        NodeType.FULL: 7500, 
-        NodeType.SUPER: 10000
+        NodeType.LIGHT: 10000,  # Light: 10,000 QNC base
+        NodeType.SUPER: 7500     # Super: 7,500 QNC base
     }
     
     network_multipliers = {
@@ -286,7 +286,7 @@ async def start_phase1_activation(request: Phase1ActivationRequest):
         },
         "phase1_economics": {
             "model": "Every 10% burned = -150 1DEV cost reduction",
-            "universal_pricing": "Same cost for Light, Full, Super nodes",
+            "universal_pricing": "Same cost for Light and Super nodes (v3.18: Full removed)",
             "node_specific_codes": "Different activation codes for each node type (despite same price)",
             "quantum_secure": "Codes generated with cryptographic entropy + Solana burn data",
             "qnet_address_binding": "Phase 1 codes bound to derived QNet addresses",
@@ -353,9 +353,9 @@ async def start_phase2_activation(request: Phase2ActivationRequest):
     )
     
     # Calculate daily rewards
+    # v3.18: Full nodes removed
     base_rewards = {
         NodeType.LIGHT: 50,
-        NodeType.FULL: 75,
         NodeType.SUPER: 100
     }
     
@@ -398,8 +398,9 @@ async def get_phase2_pricing_info():
     network_size = await get_current_network_size()
     
     # Calculate current prices for all node types
+    # v3.18: Full nodes removed
     pricing_info = {}
-    for node_type in [NodeType.LIGHT, NodeType.FULL, NodeType.SUPER]:
+    for node_type in [NodeType.LIGHT, NodeType.SUPER]:
         base_cost = QNCActivationCosts.base_costs[node_type]
         current_cost = QNCActivationCosts.calculate_required_qnc(node_type, network_size)
         multiplier = current_cost / base_cost

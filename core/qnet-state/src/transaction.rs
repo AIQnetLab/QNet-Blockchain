@@ -100,7 +100,7 @@ pub enum TransactionType {
     },
     
     /// Token swap via DEX smart contract
-    /// Fee: standard gas fee goes to Pool 2 (distributed to validators)
+    /// Fee: standard gas fee goes directly to block producer (v3.18: Pool 2 removed)
     Swap {
         /// Address initiating the swap
         from: String,
@@ -272,7 +272,7 @@ pub struct ShardHeartbeatSummary {
     pub shard_id: u8,                      // Shard 0-255
     pub total_nodes: u32,                  // Total nodes in shard
     pub eligible_light: u32,               // Eligible Light nodes
-    pub eligible_full: u32,                // Eligible Full nodes  
+    pub eligible_full: u32,                // v3.18: Always 0 (Full nodes removed)  
     pub eligible_super: u32,               // Eligible Super nodes
     pub total_eligible: u32,               // Sum of eligible nodes
     pub commitments_merkle_root: String,   // Merkle root of all HeartbeatCommitment TXs in shard
@@ -720,11 +720,11 @@ impl Transaction {
                 if node_id.is_empty() {
                     return Err("Node ID cannot be empty".to_string());
                 }
+                // v3.18: Full nodes removed
                 if !node_id.starts_with("light_") 
-                    && !node_id.starts_with("full_") 
                     && !node_id.starts_with("super_") 
                     && !node_id.starts_with("genesis_node_") {
-                    return Err(format!("Invalid node_id format: {}", node_id));
+                    return Err(format!("Invalid node_id format: {} (Full node type removed in v3.18)", node_id));
                 }
                 
                 // Validate window heights
@@ -989,7 +989,7 @@ impl Transaction {
             }
             TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, amount_out, pool_address } => {
                 // Token swap via DEX
-                // Gas fee goes to Pool 2 (distributed to validators: 70% Super, 30% Full)
+                // v3.18: Gas fee goes directly to block producer (Pool 2 removed)
                 let sender = accounts.get_mut(from)
                     .ok_or_else(|| StateError::AccountNotFound(from.clone()))?;
                 
@@ -1042,7 +1042,7 @@ impl Transaction {
                 
                 sender.nonce += 1;
                 
-                println!("[SWAP] 🔄 {} swapped {} {} for {} {} via pool {} (fee: {} QNC → Pool 2)", 
+                println!("[SWAP] 🔄 {} swapped {} {} for {} {} via pool {} (fee: {} QNC → Producer)", 
                          from, amount_in, token_in, amount_out, token_out, pool_address, fee);
             }
             TransactionType::RewardDistribution => {
@@ -1449,7 +1449,7 @@ impl TransactionReceipt {
     }
 }
 
-/// Transaction processing with Pool 2 integration
+/// Transaction processing with reward integration (v3.18: Pool 2 removed)
 pub struct TransactionProcessor {
     /// Integration with reward system
     pub reward_integration: Option<Box<dyn RewardIntegrationCallback>>,
@@ -1457,7 +1457,7 @@ pub struct TransactionProcessor {
 
 /// Callback trait for reward integration
 pub trait RewardIntegrationCallback: Send + Sync {
-    /// Process transaction fee for Pool 2
+    /// Process transaction fee (v3.18: Pool 2 removed - fees go directly to producer)
     fn process_transaction_fee(&mut self, tx_hash: String, amount: u64, gas_used: u64, gas_price: u64) -> Result<(), String>;
     
     /// Process node activation for Pool 3
@@ -1482,7 +1482,8 @@ impl TransactionProcessor {
         // Apply transaction logic
         tx.apply_to_state(accounts)?;
         
-        // Calculate and process fee for Pool 2 - Phase 1 activations are FREE!
+        // v3.18: Pool 2 removed - fees go directly to block producer
+        // Calculate fee - Phase 1 activations are FREE!
         // QUANTUM v2.25: Use effective_gas_price() which adds +50% for Dilithium TX
         let fee_amount = match &tx.tx_type {
             TransactionType::NodeActivation { phase: ActivationPhase::Phase1, .. } => {

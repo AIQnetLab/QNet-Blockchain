@@ -698,8 +698,9 @@ impl BlockchainActivationRegistry {
                 println!("✅ Light node device switched successfully (no migration limits)");
             }
             
-            "full" | "super" => {
-                // FULL/SUPER NODES: Real server migration with rate limiting
+            "super" => {
+                // SUPER NODES: Real server migration with rate limiting
+                // v3.18: Full nodes removed
                 println!("🖥️ Server node migration - applying rate limits and blockchain validation");
                 
                 // Check migration rate limiting (1 per 24 hours for servers)
@@ -755,7 +756,8 @@ impl BlockchainActivationRegistry {
             if let Some(node_info) = active_nodes.values_mut().find(|n| n.activation_code == code) {
                 node_info.device_signature = new_device_signature.to_string();
                 // Only increment migration count for servers
-                if node_type == "full" || node_type == "super" {
+                // v3.18: Full nodes removed
+                if node_type == "super" {
                     node_info.migration_count += 1;
                 }
             }
@@ -1164,8 +1166,9 @@ impl BlockchainActivationRegistry {
             let node_type_char = code[5..6].to_uppercase();
             match node_type_char.as_str() {
                 "L" => Ok("light".to_string()),
-                "F" => Ok("full".to_string()),
                 "S" => Ok("super".to_string()),
+                // v3.18: "F" (Full) removed - map to Super for backward compatibility
+                "F" => Ok("super".to_string()), // Full nodes upgraded to Super
                 _ => {
                     // Fallback: query activation records
                     if let Some(record) = self.activation_records.read().await.get(code) {
@@ -1371,14 +1374,15 @@ impl BlockchainActivationRegistry {
         
         let active_nodes = self.active_nodes.read().await;
         
-        // Filter nodes by type (Full/Super only) and reputation (≥70%)
+        // Filter nodes by type (Super only) and reputation (≥70%)
         // CRITICAL FIX: Case-insensitive comparison for node_type
-        // Handles both "Super"/"Full" (Capitalized) and "super"/"full" (lowercase)
+        // v3.18: Full nodes removed
         let mut eligible: Vec<(String, f64, String)> = active_nodes
             .values()
             .filter(|node| {
                 let node_type_lower = node.node_type.to_lowercase();
-                (node_type_lower == "full" || node_type_lower == "super") &&
+                // v3.18: Only Super nodes (Full removed)
+                node_type_lower == "super" &&
                 // Calculate reputation based on activity and uptime
                 self.calculate_node_reputation(node) >= 0.70
             })
@@ -1590,11 +1594,12 @@ impl BlockchainActivationRegistry {
             // FALLBACK: If no storage path, use temporary simulation
             println!("[REGISTRY] ⚠️ No storage path, using simulation");
             for i in 0..3 { // Temporary simulation
+                // v3.18: Full nodes removed - only Light and Super
                 let node_type = match i {
                 0 => "light".to_string(),
-                1 => "full".to_string(),
+                1 => "super".to_string(), // v3.18: Index 1 is now Super (Full removed)
                 2 => "super".to_string(),
-                _ => unreachable!("Only 3 node types exist"),
+                _ => unreachable!("Only 2 node types exist (Light and Super)"),
             };
             
             // Calculate dynamic price based on phase and network size
@@ -1712,11 +1717,11 @@ impl BlockchainActivationRegistry {
         use qnet_state::{Transaction, TransactionType, account::{NodeType, ActivationPhase}};
         
         // Parse node type from string to enum
+        // v3.18: Full nodes removed
         let node_type_enum = match record.node_type.to_lowercase().as_str() {
             "light" => NodeType::Light,
-            "full" => NodeType::Full,
             "super" => NodeType::Super,
-            _ => NodeType::Light, // Default
+            _ => NodeType::Light, // Default (ignore "full")
         };
         
         // Parse phase from u8 to enum
@@ -2731,11 +2736,11 @@ impl BlockchainActivationRegistry {
         // PRODUCTION: Dynamic pricing based on network size (matching dynamic_pricing.py)
         
         // Base prices in QNC (Phase 2)
+        // v3.18: Only Light and Super nodes (Full removed)
         let base_price = match node_type {
-            "light" => 5_000,   // Light node base cost
-            "full" => 7_500,    // Full node base cost
-            "super" => 10_000,  // Super node base cost
-            _ => 5_000,         // Default to light node price
+            "light" => 10_000,  // Light node base cost (10,000 QNC)
+            "super" => 7_500,   // Super node base cost (7,500 QNC)
+            _ => 10_000,        // Default to light node price
         };
         
         // Network size multipliers (CORRECT implementation from dynamic_pricing.py)
@@ -2821,18 +2826,18 @@ impl BlockchainActivationRegistry {
         let mut super_count = 0u64;
         
         for node in active_nodes.values() {
+            // v3.18: Full nodes removed - ignore "full" type completely
             match node.node_type.to_lowercase().as_str() {
                 "light" => light_count += 1,
-                "full" => full_count += 1,
                 "super" => super_count += 1,
-                _ => {}
+                _ => {} // Ignore "full" and unknown types
             }
         }
         
         NetworkStats {
             total_nodes: total,
             light_nodes: light_count,
-            full_nodes: full_count,
+            full_nodes: 0, // v3.18: Always 0 (Full node type removed)
             super_nodes: super_count,
         }
     }

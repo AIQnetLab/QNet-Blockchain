@@ -64,6 +64,16 @@ pub struct MicroBlock {
     /// Note: Field named vrf_proof for serialization compatibility
     #[serde(default)]
     pub vrf_proof: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.18: DIRECT FEE COLLECTION - Pool 2 removed
+    // Fees go directly to block producer, recorded here for transparency
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Total transaction fees collected in this block (nanoQNC)
+    /// v3.18: Credited directly to producer's wallet, not pooled
+    #[serde(default)]
+    pub fees_collected: u64,
 }
 
 /// Macroblock structure - consensus blocks that finalize microblocks
@@ -195,7 +205,7 @@ pub struct ConsensusData {
     
     /// Pool 2: Total transaction fees collected in this emission window (4 hours)
     /// Recorded ONLY in EMISSION MacroBlocks (every 160th = 4 hours)
-    /// Distribution: 70% Super nodes, 30% Full nodes, 0% Light nodes
+    /// v3.18: Pool 2 removed - fees go directly to block producer (always 0)
     /// All nodes use this SAME value for deterministic reward calculation
     #[serde(default)]
     pub pool2_total_fees: Option<u64>,
@@ -364,6 +374,14 @@ pub struct EfficientMicroBlock {
     /// Note: Field named vrf_proof for serialization compatibility
     #[serde(default)]
     pub vrf_proof: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.18: DIRECT FEE COLLECTION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Total transaction fees collected in this block (nanoQNC)
+    #[serde(default)]
+    pub fees_collected: u64,
 }
 
 /// Light microblock header for mobile nodes
@@ -771,6 +789,8 @@ impl MicroBlock {
             // QRB v3.0: VRF fields (None for legacy/compatibility)
             vrf_output: None,
             vrf_proof: None,
+            // v3.18: Direct fee collection (default 0)
+            fees_collected: 0,
         }
     }
     
@@ -860,6 +880,8 @@ impl EfficientMicroBlock {
             // QRB v3.0: VRF fields (None for legacy/compatibility)
             vrf_output: None,
             vrf_proof: None,
+            // v3.18: fees_collected for producer rewards
+            fees_collected: 0,
         }
     }
     
@@ -908,6 +930,8 @@ impl EfficientMicroBlock {
             // QRB v3.0: Copy VRF fields from source microblock
             vrf_output: microblock.vrf_output,
             vrf_proof: microblock.vrf_proof.clone(),
+            // v3.18: Copy fees_collected from source microblock
+            fees_collected: microblock.fees_collected,
         }
     }
     

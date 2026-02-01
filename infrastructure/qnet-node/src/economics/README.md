@@ -13,7 +13,7 @@ Implements the dynamic pricing for node activation using 1DEV tokens:
 
 ### 2. Dynamic Pricing (`dynamic_pricing.py`)
 Post-transition QNC pricing based on network size:
-- Base prices: 5,000 / 7,500 / 10,000 QNC (light/full/super)
+- v3.18: Base prices: Light 10,000 / Super 7,500 QNC (Full node removed)
 - Price range: 0.5x-3x based on network size (2,500-30,000 QNC max)
 - Target equilibrium: 100,000 nodes
 - Smooth quadratic curves to prevent manipulation

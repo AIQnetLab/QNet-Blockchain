@@ -711,7 +711,6 @@ struct FullNodeHeartbeat {
 ```
 
 **Eligibility Requirements**:
-- Full nodes: 8+ heartbeats (80% success rate)
 - Super nodes: 9+ heartbeats (90% success rate)
 - Reputation ≥ 70% required
 

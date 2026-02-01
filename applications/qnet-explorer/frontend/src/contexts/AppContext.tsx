@@ -33,7 +33,7 @@ interface AppContextType {
   
   // Node State
   nodeStatus: 'inactive' | 'activating' | 'active' | 'error';
-  nodeType: 'light' | 'full' | 'super' | null;
+  nodeType: 'light' | 'super' | null;  // v3.18: Only Light and Super
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -50,7 +50,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   const [qnetProvider, setQnetProvider] = useState<QNetProvider | null>(null);
   const [nodeStatus, setNodeStatus] = useState<'inactive' | 'activating' | 'active' | 'error'>('inactive');
-  const [nodeType, setNodeType] = useState<'light' | 'full' | 'super' | null>(null);
+  // v3.18: Only Light and Super nodes
+  const [nodeType, setNodeType] = useState<'light' | 'super' | null>(null);
 
   useEffect(() => {
     // Check for QNet wallet on mount

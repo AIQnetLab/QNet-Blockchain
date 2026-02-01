@@ -148,11 +148,8 @@ pub fn handler(
                 .checked_add(1)
                 .ok_or(BurnError::MathOverflow)?;
         }
-        NodeType::Full => {
-            burn_tracker.full_nodes = burn_tracker.full_nodes
-                .checked_add(1)
-                .ok_or(BurnError::MathOverflow)?;
-        }
+        // v3.18: Full nodes removed - this branch should never be reached
+        // NodeType::Full is deprecated in state.rs enum
         NodeType::Super => {
             burn_tracker.super_nodes = burn_tracker.super_nodes
                 .checked_add(1)
@@ -265,10 +262,11 @@ fn generate_activation_signature(
         node_pubkey,
         burner,
         burn_tx,
+        // v3.18: Full nodes removed
         match node_type {
             NodeType::Light => "LIGHT",
-            NodeType::Full => "FULL",
             NodeType::Super => "SUPER",
+            // NodeType::Full is deprecated and should never be reached
         },
         amount
     );

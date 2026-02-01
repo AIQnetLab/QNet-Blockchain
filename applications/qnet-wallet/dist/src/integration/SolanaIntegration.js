@@ -476,10 +476,10 @@ export class SolanaIntegration {
             // Check if Phase 2 (90% burned or 5 years passed)
             if (burnPercent >= 90) {
                 // Phase 2: QNC activation with dynamic network multiplier
+                // v3.18: Only Light and Super nodes (Full removed)
                 const phase2BaseCosts = {
-                    light: 5000,  // Base QNC cost
-                    full: 7500,   // Base QNC cost
-                    super: 10000  // Base QNC cost
+                    light: 10000,  // Base QNC cost (10,000 QNC)
+                    super: 7500   // Base QNC cost (7,500 QNC)
                 };
                 
                 // PRODUCTION: Get real active nodes count from QNet API
@@ -498,7 +498,8 @@ export class SolanaIntegration {
                     multiplier = 3.0; // >1M: Maximum (cap)
                 }
                 
-                const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.full;
+                // v3.18: Fallback to light if unknown type
+                const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.light;
                 const finalCost = Math.round(baseCost * multiplier);
                 
                 return {
@@ -538,7 +539,7 @@ export class SolanaIntegration {
                 savingsPercent: savingsPercent,
                 currency: '1DEV',
                 phase: 1,
-                universalPrice: true, // Same price for Light, Full, Super nodes
+                universalPrice: true, // v3.18: Same price for Light and Super nodes
                 mechanism: 'burn'
             };
 
@@ -774,10 +775,10 @@ export class SolanaIntegration {
             const networkSize = await this.getNetworkSize();
             
             // Base costs for Phase 2
+            // v3.18: Only Light and Super nodes
             const baseCosts = {
-                light: 5000,   // QNC
-                full: 7500,    // QNC
-                super: 10000   // QNC
+                light: 10000,  // QNC (10,000 QNC base)
+                super: 7500   // QNC (7,500 QNC base)
             };
             
             // Network size multipliers
@@ -883,8 +884,8 @@ export class SolanaIntegration {
                     
                     if (response.ok) {
                         const stats = await response.json();
+                        // v3.18: Only Light and Super nodes
                         const totalNodes = (stats.light_nodes || 0) + 
-                                          (stats.full_nodes || 0) + 
                                           (stats.super_nodes || 0);
                         if (totalNodes > 0) {
                             // UPDATE CACHE

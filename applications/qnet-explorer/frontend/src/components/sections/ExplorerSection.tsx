@@ -24,7 +24,7 @@ const truncateAddress = (address: string, start: number = 6, end: number = 4): s
 // Mock data for transactions/activity
 // QNET EON Address format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
 // Tokens: QNC (native), custom tokens via smart contracts
-// SWAP: gas fee goes to Pool 2 (70% Super nodes, 30% Full nodes)
+// v3.18+: Transaction fees go directly to block producer (Super node)
 const mockActivity = [
   {
     id: '1',
@@ -40,7 +40,7 @@ const mockActivity = [
       amountIn: '100',
       amountOut: '99.5',
       poolAddress: 'dex0pool01qncwqnc00eonabcdef123456781234',
-      gasFee: '0.001 QNC → Pool 2',
+      gasFee: '0.001 QNC → Producer',
     },
   },
   {
@@ -77,7 +77,7 @@ const mockActivity = [
     type: 'NODE_ACTIVATION',
     from: 'd4e5f6g7h8i9j0k1l2aeonopqrstuvwxyz01e4f5', // 41 chars
     to: 'pool3activation0000eon000000000000001234',   // 41 chars - Pool 3
-    amount: '7,500 QNC → Pool #3',
+    amount: '10,000 QNC → Pool #3',
   },
   {
     id: '6',
@@ -93,7 +93,7 @@ const mockActivity = [
       amountIn: '500',
       amountOut: '125.5',
       poolAddress: 'dex0pool02stblqnc00eonbcdefg234567891234',
-      gasFee: '0.002 QNC → Pool 2',
+      gasFee: '0.002 QNC → Producer',
     },
   },
   {

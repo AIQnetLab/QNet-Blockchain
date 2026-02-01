@@ -164,21 +164,20 @@
 
 **Transaction Processing:**
 - ✅ **Gas fee system** with dynamic pricing (4 tiers: Eco/Standard/Fast/Priority)
-- ✅ **Automatic fee collection** to Pool 2 in real-time
+- ✅ **Direct fee crediting** to block producer (v3.18 - Pool 2 removed)
 - ✅ **Thread-safe transaction processing** with proper nonce management
 - ✅ **Mempool optimization** with priority-based eviction
 
-**Three-Pool Reward System:**
+**Two-Pool Reward System (v3.18):**
 - ✅ **Pool 1 (Base Emission):** Sharp drop halving mechanism
   - 245,100.67 QNC per 4h → halving every 4 years
   - Special "Sharp Drop" ÷10 at year 20-24 instead of ÷2
   - Automatic calculation based on genesis timestamp
-- ✅ **Pool 2 (Transaction Fees):** Automatic fee distribution
-  - 70% to Super nodes, 30% to Full nodes, 0% to Light nodes
-  - Real-time collection from all network transactions
 - ✅ **Pool 3 (Activation Bonus):** QNC redistribution from Phase 2
   - Equal distribution to ALL active nodes
   - Funded by QNC spent on Phase 2 node activations
+
+> **v3.18 Change**: Pool 2 removed - transaction fees now go directly to block producer.
 
 **Security & Validation:**
 - ✅ **Post-quantum cryptography** with CRYSTALS-Dilithium

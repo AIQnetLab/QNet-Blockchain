@@ -149,7 +149,8 @@ def create_directories():
     
     print("✅ Required directories created")
 
-def run_node(node_type='full'):
+# v3.18: Full nodes removed - default to super
+def run_node(node_type='super'):
     """Run the QNet node"""
     print(f"\n🚀 Starting QNet {node_type} node...")
     

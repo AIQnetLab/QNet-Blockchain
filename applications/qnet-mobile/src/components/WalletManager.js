@@ -3377,7 +3377,8 @@ export class WalletManager {
   //
   // This method is DEPRECATED - use requestActivationCodeFromServer() instead
   // Kept for backward compatibility with stored codes only
-  generateActivationCode(nodeType = 'full', walletAddress = '', seedPhrase = null) {
+  // v3.18: Full nodes removed - default to 'super' for backward compatibility
+  generateActivationCode(nodeType = 'super', walletAddress = '', seedPhrase = null) {
     console.warn('[DEPRECATED] generateActivationCode() should not be used for new activations');
     console.warn('   Use requestActivationCodeFromServer() after burn transaction');
     
@@ -3843,7 +3844,8 @@ export class WalletManager {
                       }
                     }
                     
-                    if (nodeType && ['light', 'full', 'super'].includes(nodeType)) {
+                    // v3.18: Full nodes removed
+                    if (nodeType && ['light', 'super'].includes(nodeType)) {
                       // Found exact type from memo!
                       // console.log('[checkBlockchainForActivations] ✅ Exact node type determined:', nodeType);
                       // Store activation metadata for future quick lookups
@@ -4021,7 +4023,8 @@ export class WalletManager {
   }
   
   // Calculate dynamic activation cost based on burn percentage
-  async calculateActivationCost(nodeType = 'full') {
+  // v3.18: Full nodes removed - default to 'super' for backward compatibility
+  async calculateActivationCost(nodeType = 'super') {
     try {
       const burnPercent = parseFloat(await this.getBurnProgress(false));
       
@@ -4033,10 +4036,10 @@ export class WalletManager {
       // Check if Phase 2 (90% burned or 5 years passed)
       if (burnPercent >= 90) {
         // Phase 2: QNC activation with dynamic network multiplier
+        // v3.18: Only Light and Super nodes (Full removed)
         const phase2BaseCosts = {
-          light: 5000,  // Base QNC cost
-          full: 7500,   // Base QNC cost
-          super: 10000  // Base QNC cost
+          light: 10000,  // Light: 10,000 QNC base
+          super: 7500    // Super: 7,500 QNC base
         };
         
         // Get real active nodes count from blockchain
@@ -4054,7 +4057,8 @@ export class WalletManager {
           multiplier = 3.0; // Mature network (1M+)
         }
         
-        const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.full;
+        // v3.18: Full nodes removed - default to super if invalid type
+        const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.super;
         const finalCost = Math.round(baseCost * multiplier);
         
         return {

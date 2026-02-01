@@ -66,10 +66,10 @@ class TokenConfig:
     
     # DYNAMIC PRICING PARAMETERS (actual calculation in Rust)
     # Formula: base_price * network_multiplier
+    # v3.18: Only Light and Super nodes (Full node type removed)
     qnc_base_prices = {
-        "light": 5_000,   # Base: 5,000 QNC
-        "full": 7_500,    # Base: 7,500 QNC
-        "super": 10_000   # Base: 10,000 QNC
+        "light": 10_000,  # Base: 10,000 QNC
+        "super": 7_500    # Base: 7,500 QNC
     }
     
     # Network multiplier thresholds
@@ -90,12 +90,13 @@ class NodeConfig:
             "max_connections": 50,
             "storage_requirement": "headers_only"
         },
-        "full": {
-            "capabilities": ["full_validation", "consensus_participation", "single_shard"],
-            "resource_requirements": "moderate",
-            "max_connections": 200,
-            "storage_requirement": "full_blockchain"
-        },
+        # v3.18: Full node type removed - kept for backward compatibility only
+        # "full": {
+        #     "capabilities": ["full_validation", "consensus_participation", "single_shard"],
+        #     "resource_requirements": "moderate",
+        #     "max_connections": 200,
+        #     "storage_requirement": "full_blockchain"
+        # },
         "super": {
             "capabilities": ["priority_validation", "cross_shard", "triple_shard", "leadership"],
             "resource_requirements": "high",
@@ -185,10 +186,10 @@ class PhaseTransitionConfig:
             "description": "Base emission with halving every 4 years",
             "halving_interval_years": 4
         },
-        "pool2_transaction_fees": {
-            "super_nodes": 0.70,  # 70% to super nodes
-            "full_nodes": 0.30,  # 30% to full nodes
-            "light_nodes": 0.00  # 0% to light nodes
+        # v3.18: Pool2 REMOVED - fees go directly to block producer
+        "transaction_fees": {
+            "producer": 1.00,  # 100% to block producer (Super node)
+            "light_nodes": 0.00  # Light nodes don't produce blocks
         },
         "pool3_activation_deposits": {
             "redistribution_ratio": 1.0,  # 100% redistributed
@@ -237,8 +238,9 @@ class DynamicPricingConfig:
     # Phase 2: QNC spending pricing
     # Price increases with network size (prevents node inflation)
     # CANONICAL VALUES - same across all components
+    # v3.18: Only Light (10,000 QNC) and Super (7,500 QNC) - Full removed
     phase2_formula = """
-    base_prices = {"light": 5000, "full": 7500, "super": 10000}
+    base_prices = {"light": 10000, "super": 7500}
     
     network_multiplier = {
         ≤100K nodes:  0.5x (early adopter discount)
@@ -249,11 +251,17 @@ class DynamicPricingConfig:
     
     final_price = base_prices[node_type] * network_multiplier
     
-    Examples (Super Node):
-    - 50K nodes:  5,000 QNC (0.5x)
-    - 200K nodes: 10,000 QNC (1.0x)
-    - 500K nodes: 20,000 QNC (2.0x)
-    - 2M nodes:   30,000 QNC (3.0x max)
+    Examples (Super Node, base 7,500 QNC):
+    - 50K nodes:  3,750 QNC (0.5x = 7,500 × 0.5)
+    - 200K nodes: 7,500 QNC (1.0x = 7,500 × 1.0)
+    - 500K nodes: 15,000 QNC (2.0x = 7,500 × 2.0)
+    - 2M nodes:   22,500 QNC (3.0x = 7,500 × 3.0)
+    
+    Examples (Light Node, base 10,000 QNC):
+    - 50K nodes:  5,000 QNC (0.5x = 10,000 × 0.5)
+    - 200K nodes: 10,000 QNC (1.0x = 10,000 × 1.0)
+    - 500K nodes: 20,000 QNC (2.0x = 10,000 × 2.0)
+    - 2M nodes:   30,000 QNC (3.0x = 10,000 × 3.0)
     """
 
 class QNetConfig:
@@ -301,7 +309,8 @@ class QNetConfig:
         Estimate Phase 2 price (for display only)
         ACTUAL PRICE is calculated in Rust
         """
-        base_price = self.tokens.qnc_base_prices.get(node_type, 5000)
+        # v3.18: Only Light (10000) and Super (7500) - Full removed
+        base_price = self.tokens.qnc_base_prices.get(node_type, 10000)  # Default to Light if unknown
         
         # Network multiplier calculation
         # CANONICAL VALUES - same across all components

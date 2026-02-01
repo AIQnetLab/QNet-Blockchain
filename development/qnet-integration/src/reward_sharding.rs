@@ -149,21 +149,22 @@ impl ShardedRewardManager {
                 // Check if node is eligible based on type
                 if let Some((node_type, _, reputation)) = self.storage.load_node_registration(node_id)? {
                     // Light nodes: ANY reputation (mobile-friendly)
-                    // Full/Super/Genesis: reputation >= 70 (maintain network quality)
+                    // Super/Genesis: reputation >= 70 (maintain network quality)
+                    // v3.18: Full nodes removed
                     use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
                     let eligible = match node_type.to_lowercase().as_str() {
                         "light" => true, // Light nodes always eligible (just need to answer pings)
-                        "full" | "super" => reputation >= MIN_CONSENSUS_REPUTATION,
-                        _ => reputation >= MIN_CONSENSUS_REPUTATION,
+                        "super" => reputation >= MIN_CONSENSUS_REPUTATION,
+                        _ => false, // Ignore "full" and unknown types
                     };
                     
                     if eligible {
                         total_eligible_nodes += 1;
+                        // v3.18: Full nodes removed
                         match node_type.to_lowercase().as_str() {
                             "super" => eligible_super_nodes += 1,
-                            "full" => eligible_full_nodes += 1,
                             "light" => eligible_light_nodes += 1,
-                            _ => {}
+                            _ => {} // Ignore "full" and unknown types
                         }
                     }
                 }
@@ -375,37 +376,8 @@ impl ShardedRewardManager {
                             println!("[WARN][SHARDING] node_counts=None, cannot calculate reward for node");
                             0
                         };
-                        // Get Pool #2 transaction fees for distribution
-                        let pool2_share = {
-                            let rm = match reward_manager.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                            let total_fees = rm.get_pool2_fees();
-                            
-                            // CORRECT: Distribute Pool #2 by node type counts
-                            // Super: 70% divided by ONLY super nodes
-                            // Full: 30% divided by ONLY full nodes
-                            // Light: 0% (don't process transactions)
-                            // v2.64: No fallbacks - must have real eligible counts (case-insensitive)
-                            match node_type.to_lowercase().as_str() {
-                                "super" => {
-                                    let super_pool = (total_fees * 70) / 100;
-                                    if let Some(ref counts) = node_counts {
-                                        if counts.super_nodes > 0 {
-                                            super_pool / counts.super_nodes as u64
-                                        } else { 0 }
-                                    } else { 0 } // v2.64: No fallback
-                                },
-                                "full" => {
-                                    let full_pool = (total_fees * 30) / 100;
-                                    if let Some(ref counts) = node_counts {
-                                        if counts.full_nodes > 0 {
-                                            full_pool / counts.full_nodes as u64
-                                        } else { 0 }
-                                    } else { 0 } // v2.64: No fallback
-                                },
-                                "light" => 0, // Light nodes get 0% of transaction fees
-                                _ => 0,
-                            }
-                        };
+                        // v3.18: Pool 2 REMOVED - fees go directly to block producer
+                        let pool2_share = 0_u64; // v3.18: Pool 2 removed
                         
                         let new_reward = PhaseAwareReward {
                             current_phase: qnet_consensus::QNetPhase::Phase1,

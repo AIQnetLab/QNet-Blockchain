@@ -11,13 +11,13 @@ const mockNodes = [
 
 export default function NodesPage() {
   const [activeTab, setActiveTab] = useState('node-activation');
-  const [selectedNodeType, setSelectedNodeType] = useState<'light' | 'full' | 'super'>('light');
+  // v3.18: Only Light and Super nodes
+  const [selectedNodeType, setSelectedNodeType] = useState<'light' | 'super'>('light');
   
   // Dynamic data from API
   const [burnedTokensPhase1, setBurnedTokensPhase1] = useState(0);
   const [currentPricing, setCurrentPricing] = useState({
     light: [1500, 150],
-    full: [1500, 150], 
     super: [1500, 150]
   });
   
@@ -30,7 +30,6 @@ export default function NodesPage() {
           const currentPrice = data.nodeTypes.light.burnAmount;
           setCurrentPricing({
             light: [currentPrice, 300],
-            full: [currentPrice, 300],
             super: [currentPrice, 300]
           });
           
@@ -44,7 +43,7 @@ export default function NodesPage() {
       .catch(() => {});
   }, []);
 
-  const getCostRange = (type: 'light' | 'full' | 'super'): string => {
+  const getCostRange = (type: 'light' | 'super'): string => {
     const currentPhase: 'phase1' | 'phase2' = 'phase1';
     const totalPhase1Supply = 1_000_000_000; // 1 billion 1DEV total supply (pump.fun standard)
     const activeNodes = 156;
@@ -55,10 +54,10 @@ export default function NodesPage() {
       return `Activation Cost: ${currentPrice.toLocaleString()} 1DEV (burn)`;
     }
 
+    // v3.18: Only Light and Super nodes (Full removed)
     const baseRange: Record<typeof type, [number, number]> = {
-      light: [2500, 15000],
-      full: [3750, 22500],
-      super: [5000, 30000],
+      light: [5000, 30000],  // 10,000 base × 0.5-3.0x (min: 5,000, max: 30,000)
+      super: [3750, 22500]  // 7,500 base × 0.5-3.0x
     };
 
     let netMultiplier = 0.5;
@@ -125,21 +124,14 @@ export default function NodesPage() {
                 </p>
                 
                 <div style={{ width: '100%', padding: '1rem', background: 'rgba(0, 255, 255, 0.05)', borderRadius: '10px', border: '1px solid rgba(0, 255, 255, 0.2)' }}>
-                  <h4 style={{ color: '#00ffff', marginBottom: '1rem', textAlign: 'center', fontSize: '1rem' }}>Select Node Type</h4>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.75rem', marginBottom: '1rem' }}>
+                  <h4 style={{ color: '#00ffff', marginBottom: '1rem', textAlign: 'center', fontSize: '1rem' }}>Select Node Type (v3.18)</h4>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.75rem', marginBottom: '1rem' }}>
                     <button 
                       className={`qnet-button ${selectedNodeType === 'light' ? 'primary' : 'secondary'}`}
                       onClick={() => setSelectedNodeType('light')}
                       style={{ padding: '0.75rem 0.5rem', fontSize: '0.8rem', fontWeight: 'bold' }}
                     >
                       LIGHT NODE<br/><small style={{ fontSize: '0.7rem', opacity: 0.8 }}>(MOBILE)</small>
-                    </button>
-                    <button 
-                      className={`qnet-button ${selectedNodeType === 'full' ? 'primary' : 'secondary'}`}
-                      onClick={() => setSelectedNodeType('full')}
-                      style={{ padding: '0.75rem 0.5rem', fontSize: '0.8rem', fontWeight: 'bold' }}
-                    >
-                      FULL NODE<br/><small style={{ fontSize: '0.7rem', opacity: 0.8 }}>(SERVER)</small>
                     </button>
                     <button 
                       className={`qnet-button ${selectedNodeType === 'super' ? 'primary' : 'secondary'}`}
@@ -158,7 +150,6 @@ export default function NodesPage() {
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                       <div style={{ fontSize: '0.85rem', lineHeight: '1.4', whiteSpace: 'nowrap', textAlign: 'center' }}>
                         {selectedNodeType === 'light' && '• Ping: 4h • Uptime: 99% • Devices: ≤3 • Low Power'}
-                        {selectedNodeType === 'full' && '• Ping: 4min • Uptime: ≥95% • Public IP • 24/7 Online'}
                         {selectedNodeType === 'super' && '• Ping: 4min • Uptime: ≥98% • Backbone • High Perf'}
                       </div>
 

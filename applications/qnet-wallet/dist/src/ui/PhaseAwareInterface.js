@@ -476,18 +476,15 @@ export class PhaseAwareInterface {
                 <div class="section-content">
                     <p>${this.i18n.t('phase2.qnc_description')}</p>
                     
+                    <!-- v3.18: Only Light and Super nodes -->
                     <div class="network-info">
                         <div class="info-item">
                             <div class="info-label">${this.i18n.t('node.light_cost')}</div>
-                            <div class="info-value">${activationCosts.light.toLocaleString()} QNC</div>
-                        </div>
-                        <div class="info-item">
-                            <div class="info-label">${this.i18n.t('node.full_cost')}</div>
-                            <div class="info-value">${activationCosts.full.toLocaleString()} QNC</div>
+                            <div class="info-value">${activationCosts.light?.toLocaleString() || '10,000'} QNC</div>
                         </div>
                         <div class="info-item">
                             <div class="info-label">${this.i18n.t('node.super_cost')}</div>
-                            <div class="info-value">${activationCosts.super.toLocaleString()} QNC</div>
+                            <div class="info-value">${activationCosts.super?.toLocaleString() || '7,500'} QNC</div>
                         </div>
                     </div>
                     
@@ -532,6 +529,7 @@ export class PhaseAwareInterface {
         
         return `
             <div class="action-grid">
+                <!-- v3.18: Only Light and Super nodes -->
                 <div class="action-card solana primary" data-action="burn-light">
                     <div class="action-icon">⚡</div>
                     <div class="action-title">${this.i18n.t('node.light_node')}</div>
@@ -539,15 +537,8 @@ export class PhaseAwareInterface {
                     <div class="cost-display">${burnProgress.currentCost} 1DEV</div>
                 </div>
                 
-                <div class="action-card solana primary" data-action="burn-full">
-                    <div class="action-icon">🔥</div>
-                    <div class="action-title">${this.i18n.t('node.full_node')}</div>
-                    <div class="action-description">${this.i18n.t('node.full_description')}</div>
-                    <div class="cost-display">${burnProgress.currentCost} 1DEV</div>
-                </div>
-                
                 <div class="action-card solana primary" data-action="burn-super">
-                    <div class="action-icon">⚡</div>
+                    <div class="action-icon">⭐</div>
                     <div class="action-title">${this.i18n.t('node.super_node')}</div>
                     <div class="action-description">${this.i18n.t('node.super_description')}</div>
                     <div class="cost-display">${burnProgress.currentCost} 1DEV</div>
@@ -604,27 +595,21 @@ export class PhaseAwareInterface {
     async createPhase2QNetActions() {
         const activationCosts = await this.getActivationCosts();
         
+        // v3.18: Only Light and Super nodes
         return `
             <div class="action-grid">
                 <div class="action-card primary" data-action="activate-light-qnc">
                     <div class="action-icon">⚡</div>
                     <div class="action-title">${this.i18n.t('node.light_node')}</div>
                     <div class="action-description">${this.i18n.t('node.light_description')}</div>
-                    <div class="cost-display">${activationCosts.light.toLocaleString()} QNC</div>
-                </div>
-                
-                <div class="action-card primary" data-action="activate-full-qnc">
-                    <div class="action-icon">🔥</div>
-                    <div class="action-title">${this.i18n.t('node.full_node')}</div>
-                    <div class="action-description">${this.i18n.t('node.full_description')}</div>
-                    <div class="cost-display">${activationCosts.full.toLocaleString()} QNC</div>
+                    <div class="cost-display">${activationCosts.light?.toLocaleString() || '10,000'} QNC</div>
                 </div>
                 
                 <div class="action-card primary" data-action="activate-super-qnc">
-                    <div class="action-icon">⚡</div>
+                    <div class="action-icon">⭐</div>
                     <div class="action-title">${this.i18n.t('node.super_node')}</div>
                     <div class="action-description">${this.i18n.t('node.super_description')}</div>
-                    <div class="cost-display">${activationCosts.super.toLocaleString()} QNC</div>
+                    <div class="cost-display">${activationCosts.super?.toLocaleString() || '7,500'} QNC</div>
                 </div>
             </div>
         `;
@@ -692,44 +677,41 @@ export class PhaseAwareInterface {
             if (response?.success) {
                 if (response.phase === 1) {
                     // Phase 1: Same price for all node types (1DEV)
+                    // v3.18: Only Light and Super nodes
                     return {
                         light: response.cost,
-                        full: response.cost,
                         super: response.cost,
                         currency: '1DEV',
                         phase: 1
                     };
                 } else {
                     // Phase 2: Different prices per node type (QNC)
-                    // Need to get each type's price
+                    // v3.18: Only Light and Super nodes
                     const lightResp = await chrome.runtime.sendMessage({ type: 'GET_ACTIVATION_PRICING', nodeType: 'light' });
-                    const fullResp = await chrome.runtime.sendMessage({ type: 'GET_ACTIVATION_PRICING', nodeType: 'full' });
                     const superResp = await chrome.runtime.sendMessage({ type: 'GET_ACTIVATION_PRICING', nodeType: 'super' });
                     
                     return {
-                        light: lightResp?.cost || null,
-                        full: fullResp?.cost || null,
-                        super: superResp?.cost || null,
+                        light: lightResp?.cost || 10000,
+                        super: superResp?.cost || 7500,
                         currency: 'QNC',
                         phase: 2
                     };
                 }
             }
             
-            // No response - return error state
+            // No response - return default state (v3.18)
             return {
-                light: null,
-                full: null,
-                super: null,
+                light: 10000,
+                super: 7500,
                 error: 'Pricing data unavailable',
                 unavailable: true
             };
         } catch (error) {
             console.error('Failed to get activation costs:', error);
+            // v3.18: Return default prices on error
             return {
-                light: null,
-                full: null,
-                super: null,
+                light: 10000,
+                super: 7500,
                 error: error.message,
                 unavailable: true
             };

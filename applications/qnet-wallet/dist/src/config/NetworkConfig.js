@@ -78,10 +78,10 @@ export class NetworkConfig {
                         explorer: 'https://testnet-explorer.qnet.network',
                         chainId: 'qnet-testnet-1',
                         qncDecimals: 9,
+                        // v3.18: Only Light and Super nodes
                         activationCosts: {
-                            light: 2500,    // 50% discount for testnet
-                            full: 3750,     // 50% discount for testnet
-                            super: 5000     // 50% discount for testnet
+                            light: 5000,    // 50% discount for testnet (base 10000)
+                            super: 3750     // 50% discount for testnet (base 7500)
                         },
                         networkSizeMultipliers: {
                             small: 0.25,    // 0-10K nodes (testnet discount)
@@ -99,10 +99,10 @@ export class NetworkConfig {
                         explorer: 'https://explorer.qnet.network',
                         chainId: 'qnet-mainnet-1',
                         qncDecimals: 9,
+                        // v3.18: Only Light and Super
                         activationCosts: {
-                            light: 5000,
-                            full: 7500,
-                            super: 10000
+                            light: 10000,
+                            super: 7500
                         },
                         networkSizeMultipliers: {
                             small: 0.5,     // 0-100K nodes
@@ -161,10 +161,10 @@ export class NetworkConfig {
                         explorer: 'https://testnet-explorer.qnet.network',
                         chainId: 'qnet-testnet-1',
                         qncDecimals: 9,
+                        // v3.18: Only Light and Super nodes
                         activationCosts: {
-                            light: 2500,
-                            full: 3750,
-                            super: 5000
+                            light: 5000,
+                            super: 3750
                         },
                         networkSizeMultipliers: {
                             small: 0.25,
@@ -182,10 +182,10 @@ export class NetworkConfig {
                         explorer: 'https://explorer.qnet.network',
                         chainId: 'qnet-mainnet-1',
                         qncDecimals: 9,
+                        // v3.18: Only Light and Super
                         activationCosts: {
-                            light: 5000,
-                            full: 7500,
-                            super: 10000
+                            light: 10000,  // Light: 10,000 QNC base
+                            super: 7500    // Super: 7,500 QNC base
                         },
                         networkSizeMultipliers: {
                             small: 0.5,     // 0-100K nodes
@@ -304,10 +304,10 @@ export class NetworkConfig {
             multiplier = multipliers.massive;
         }
 
+        // v3.18: Only Light and Super nodes
         return {
-            light: Math.floor(baseCosts.light * multiplier),
-            full: Math.floor(baseCosts.full * multiplier),
-            super: Math.floor(baseCosts.super * multiplier),
+            light: Math.floor((baseCosts.light || 10000) * multiplier),
+            super: Math.floor((baseCosts.super || 7500) * multiplier),
             multiplier,
             networkSize
         };

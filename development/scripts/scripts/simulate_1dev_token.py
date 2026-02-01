@@ -184,8 +184,9 @@ def main():
         print(f"   Wallet {i+1}: {wallet[:20]}... claimed 1,500 1DEV (TX: {tx_hash[:16]}...)")
     
     # Test 2: Node activations
+    # v3.18: Full nodes removed
     print(f"\n📋 Test 2: Node Activations")
-    node_types = ["light", "full", "super", "light", "full"]
+    node_types = ["light", "super", "light", "super", "light"]
     
     for i, (wallet, node_type) in enumerate(zip(test_wallets, node_types)):
         try:
@@ -234,8 +235,9 @@ def main():
         
         try:
             # Claim and burn
+            # v3.18: Full nodes removed
             token.faucet_claim(wallet, claim_amount)
-            node_type = random.choice(["light", "full", "super"])
+            node_type = random.choice(["light", "super"])
             activator.activate_node(wallet, node_type)
             
             if (i + 1) % 100 == 0:

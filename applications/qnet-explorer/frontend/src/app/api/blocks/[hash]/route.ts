@@ -79,7 +79,7 @@ function transformDbBlock(dbBlock: BlockRow, transactions: BlockTransaction[]): 
       reveals_count: (dbBlock.consensus_data.reveals_count as number) || 0,
       next_leader: (dbBlock.consensus_data.next_leader as string) || '',
       eligible_nodes_count: (dbBlock.consensus_data.eligible_nodes_count as number) || 0,
-      pool2_total_fees: dbBlock.consensus_data.pool2_total_fees as number | undefined,
+      fees_collected: dbBlock.consensus_data.fees_collected as number | undefined,
       pool3_total_activations: dbBlock.consensus_data.pool3_total_activations as number | undefined,
       heartbeat_entries: (dbBlock.consensus_data.heartbeat_entries as any[]) || [],
     } : undefined,

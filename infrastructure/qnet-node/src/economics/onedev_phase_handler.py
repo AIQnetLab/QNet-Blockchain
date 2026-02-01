@@ -45,14 +45,13 @@ class OneDEVPhaseHandler:
         self.genesis_claimed = set()
         
         # Pricing model - ALL NODE TYPES SAME PRICE
+        # v3.18: Only Light and Super nodes (Full removed)
         self.base_prices = {
             "light": 1500,
-            "full": 1500,
-            "super": 1500
+            "super": 1500  # Universal pricing for all node types in Phase 1
         }
         self.min_prices = {
             "light": 300,
-            "full": 300,
             "super": 300
         }
         
@@ -70,7 +69,7 @@ class OneDEVPhaseHandler:
         
         Args:
             owner_address: QNet address of node owner
-            node_type: Type of node (light/full/super)
+            node_type: Type of node (light/super) - v3.18: Full removed
             node_id: Unique node identifier
             solana_burn_tx: Solana burn transaction hash
             burned_amount: Amount burned in this transaction
@@ -181,7 +180,8 @@ class OneDEVPhaseHandler:
     
     def get_stats(self) -> Dict:
         """Get activation statistics"""
-        node_counts = {"light": 0, "full": 0, "super": 0}
+        # v3.18: Only Light and Super nodes (Full removed)
+        node_counts = {"light": 0, "super": 0}
         total_burned = 0
         
         for node in self.activated_nodes.values():

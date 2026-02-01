@@ -50,9 +50,9 @@ pub struct AccountMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// v3.18: Full node type REMOVED - only Light and Super remain
 pub enum NodeType {
     Light,
-    Full,
     Super,
 }
 

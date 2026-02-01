@@ -3342,17 +3342,18 @@ class SolanaRPC {
         throw new Error('Network size unavailable - all bootstrap nodes unreachable');
     }
     
-    async getCurrentBurnPricing(nodeType = 'full') {
+    // v3.18: Default to 'light' instead of 'full'
+    async getCurrentBurnPricing(nodeType = 'light') {
         try {
             const burnPercent = await this.getBurnProgress();
             
             // Check if Phase 2 (90% burned or 5 years passed)
             if (burnPercent >= 90) {
                 // Phase 2: QNC activation with dynamic network multiplier
+                // v3.18: Only Light and Super nodes
                 const phase2BaseCosts = {
-                    light: 5000,  // Base QNC cost
-                    full: 7500,   // Base QNC cost
-                    super: 10000  // Base QNC cost
+                    light: 10000,  // Base QNC cost (10,000 QNC)
+                    super: 7500   // Base QNC cost (7,500 QNC)
                 };
                 
                 // PRODUCTION: Get real active nodes count from QNet API
@@ -3371,7 +3372,8 @@ class SolanaRPC {
                     multiplier = 3.0;       // >1M: Maximum (cap)
                 }
                 
-                const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.full;
+                // v3.18: Full nodes removed - default to super if invalid type
+                const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.super;
                 const finalCost = Math.round(baseCost * multiplier);
                 
                 return {
@@ -3625,9 +3627,9 @@ async function burnAndActivateNode(nodeType, amount) {
         if (Object.keys(existingCodes).length > 0) {
             // Found existing activation - determine which type
             const existingType = Object.keys(existingCodes)[0];
+            // v3.18: Only Light and Super nodes
             const nodeTypeNames = { 
                 light: 'Light Node', 
-                full: 'Full Node', 
                 super: 'Super Node' 
             };
             walletState.isActivatingNode = false;
@@ -3781,9 +3783,9 @@ async function burnAndActivateNode(nodeType, amount) {
         // Double-check: ensure no other nodes are activated (protection against race conditions)
         if (Object.keys(encryptedCodes).length > 0) {
             const existingType = Object.keys(encryptedCodes)[0];
+            // v3.18: Only Light and Super nodes
             const nodeTypeNames = { 
                 light: 'Light Node', 
-                full: 'Full Node', 
                 super: 'Super Node' 
             };
             walletState.isActivatingNode = false;
@@ -4728,14 +4730,15 @@ async function checkBlockchainForActivations(walletAddress) {
                                     }
                                 }
                                 
-                                if (nodeType && ['light', 'full', 'super'].includes(nodeType)) {
+                                // v3.18: Only Light and Super nodes
+                                if (nodeType && ['light', 'super'].includes(nodeType)) {
                                     // Found exact type from memo!
                                     // console.log('[checkBlockchainForActivations] ✅ Exact node type determined from MEMO:', nodeType);
                                     return [nodeType];
                                 } else {
                                     // Old activation without memo - return all types
                                     // console.log('[checkBlockchainForActivations] No MEMO found (old activation), returning all types');
-                                    return ['light', 'full', 'super'];
+                                    return ['light', 'super'];  // v3.18: Only Light and Super
                                 }
                             }
                         } else if (mint !== DEV_TOKEN_MINT) {
@@ -4787,7 +4790,7 @@ async function checkBlockchainForActivations(walletAddress) {
                                                                 // Check if it's in Phase 1 range (dynamic pricing: 300-1500 1DEV)
                                                                 if (burned >= 300000000 && burned <= 1500000000) {
                                                                     // console.log('[checkBlockchainForActivations] ✅ Found node activation burn (manual)!');
-                                                                    return ['light', 'full', 'super'];
+                                                                    return ['light', 'super'];  // v3.18: Only Light and Super
                                                                 }
                                                             }
                                                         }
@@ -4826,9 +4829,9 @@ async function syncActivationCodes(walletAddress, seedPhrase) {
     // console.log('[syncActivationCodes] Starting sync for wallet:', walletAddress?.substring(0, 8) + '...');
     try {
         // Generate deterministic codes for all node types
+        // v3.18: Only Light and Super nodes
         const codes = {
             light: await generateActivationCode('light', walletAddress, seedPhrase),
-            full: await generateActivationCode('full', walletAddress, seedPhrase),
             super: await generateActivationCode('super', walletAddress, seedPhrase)
         };
         
@@ -7244,7 +7247,8 @@ async function initializeSolanaRPC() {
 /**
  * Get current network phase (Phase 1 or Phase 2)
  */
-async function getBurnPricing(nodeType = 'full') {
+// v3.18: Default to 'light' instead of 'full'
+async function getBurnPricing(nodeType = 'light') {
     try {
         // Check if wallet is initialized with Solana
         if (!walletState.solanaRPC) {

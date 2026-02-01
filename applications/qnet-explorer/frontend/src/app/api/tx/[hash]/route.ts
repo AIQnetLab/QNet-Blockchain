@@ -31,14 +31,18 @@ function mapTxType(type: string | object | undefined): string {
   return map[typeStr] || 'Transfer';
 }
 
-// Format amount from nanoQNC to QNC
+// Format amount from nanoQNC to QNC (ALWAYS divide by 1e9)
 function formatAmount(amount: number | string | undefined): string {
   if (!amount) return '0 QNC';
   const num = typeof amount === 'string' ? parseFloat(amount) : amount;
-  if (num >= 1e9) {
-    return (num / 1e9).toLocaleString('en-US', { maximumFractionDigits: 6 }) + ' QNC';
+  if (num === 0) return '0 QNC';
+  // ALWAYS convert from nanoQNC to QNC (1 QNC = 1,000,000,000 nanoQNC)
+  const qnc = num / 1e9;
+  if (qnc < 0.000001) {
+    // Very small amounts - show in scientific notation or nanoQNC
+    return qnc.toExponential(2) + ' QNC';
   }
-  return num.toLocaleString('en-US', { maximumFractionDigits: 6 }) + ' QNC';
+  return qnc.toLocaleString('en-US', { maximumFractionDigits: 9 }) + ' QNC';
 }
 
 // Validate and sanitize NODE_RPC_URL to prevent SSRF
@@ -64,7 +68,7 @@ function getNodeRpcUrl(): string {
     }
     return url;
   } catch {
-    return 'http://161.97.86.81:8001';
+    return 'http://162.244.25.114:8001';
   }
 }
 

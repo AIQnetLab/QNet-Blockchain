@@ -27,7 +27,7 @@ let shard_id = sha3_256(light_node_id)[0]; // First byte = 0-255
 If all nodes ping at exact intervals:
 - 1 million nodes × ping every 4 hours = **1 million simultaneous pings** 💥
 - Network spike every 4 hours could crash the system
-- Full nodes can't handle millions of connections at once
+- Super nodes can't handle millions of connections at once
 
 ## 🎲 Legacy Solution: Randomized Time Slots
 

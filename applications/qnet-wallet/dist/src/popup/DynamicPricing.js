@@ -16,10 +16,10 @@ class DynamicPricing {
         this.TIME_LIMIT_YEARS = 5;
         
         // Phase 2: QNC spending to Pool 3 constants
+        // v3.18: Only Light and Super nodes (Full removed)
         this.PHASE_2_BASE_COSTS = {
-            light: 5000,  // QNC to spend to Pool 3
-            full: 7500,   // QNC to spend to Pool 3
-            super: 10000  // QNC to spend to Pool 3
+            light: 10000,  // QNC to spend to Pool 3 (10,000 QNC base)
+            super: 7500   // QNC to spend to Pool 3 (7,500 QNC base)
         };
         
         // Network size multipliers for Phase 2
@@ -157,7 +157,8 @@ class DynamicPricing {
         if (!this.isDataAvailable()) {
             throw new Error('Pricing data not available - call updateLiveData() first');
         }
-        const baseCost = this.PHASE_2_BASE_COSTS[nodeType] || this.PHASE_2_BASE_COSTS.full;
+        // v3.18: Only Light and Super nodes (fallback to light if unknown)
+        const baseCost = this.PHASE_2_BASE_COSTS[nodeType] || this.PHASE_2_BASE_COSTS.light;
         const multiplier = this.getNetworkMultiplier(this.liveData.activeNodes);
         const finalCost = Math.round(baseCost * multiplier);
         
@@ -233,19 +234,18 @@ class DynamicPricing {
                 ]
             };
         } else {
+            // v3.18: Only Light and Super nodes
             const lightCost = this.calculatePhase2Cost('light');
-            const fullCost = this.calculatePhase2Cost('full');
             const superCost = this.calculatePhase2Cost('super');
             
             return {
                 phase: 2,
-                title: 'Phase 2: QNC Transfer Activation',
+                title: 'Phase 2: QNC Transfer Activation (v3.18)',
                 subtitle: `Transfer to Pool #3 for redistribution`,
                 mechanism: 'QNC transfer to Pool #3',
                 details: [
-                    `Light Node: ${lightCost.cost} QNC`,
-                    `Full Node: ${fullCost.cost} QNC`, 
-                    `Super Node: ${superCost.cost} QNC`,
+                    `Light Node: ${lightCost.cost} QNC (base 10,000)`,
+                    `Super Node: ${superCost.cost} QNC (base 7,500)`,
                     `Network multiplier: ${lightCost.multiplier}x (${lightCost.networkSize} nodes)`
                 ]
             };

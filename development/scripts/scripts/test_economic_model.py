@@ -70,10 +70,10 @@ class EconomicModelTester:
             phase_number=2,
             token_type="QNC",
             mechanism="send_to_pool_3", # CORRECTED: QNC is sent to Pool #3 for redistribution to ALL active nodes, not held
+            # v3.18: Only Light and Super nodes (Full removed)
             requirements={
-                "light": 5000,
-                "full": 7500,
-                "super": 10000
+                "light": 10000,  # Light: 10,000 QNC base
+                "super": 7500   # Super: 7,500 QNC base
             },
             active=False
         )
@@ -90,7 +90,10 @@ class EconomicModelTester:
         print(f"🔥 Testing Phase 1 activation: {node_type} node for {wallet_address}")
         
         # Validate node type
-        if node_type not in ["light", "full", "super"]:
+        # v3.18: Full nodes removed
+        if node_type not in ["light", "super"]:
+            if node_type == "full":
+                raise ValueError("Full node type removed in v3.18. Use Super node instead.")
             raise ValueError(f"Invalid node type: {node_type}")
         
         # Calculate burn amount
@@ -306,9 +309,10 @@ class EconomicModelTester:
         
         results = {"phase1": 0, "phase2": 0, "failed": 0}
         
+        # v3.18: Full nodes removed
         for i in range(target_nodes):
             wallet = f"test_wallet_{i:06d}"
-            node_type = random.choice(["light", "full", "super"])
+            node_type = random.choice(["light", "super"])
             
             try:
                 # 70% Phase 1, 30% Phase 2 (if available)
@@ -533,9 +537,10 @@ class EconomicModelTester:
                 "total_rewards": total_rewards,
                 "current_phase": self.current_phase
             },
+            # v3.18: Full nodes removed
             "node_types": {
                 "light": len([n for n in self.nodes.values() if n.node_type == "light"]),
-                "full": len([n for n in self.nodes.values() if n.node_type == "full"]),
+                "full": 0,  # v3.18: Always 0 (Full nodes removed)
                 "super": len([n for n in self.nodes.values() if n.node_type == "super"])
             },
             "phase_transition": {

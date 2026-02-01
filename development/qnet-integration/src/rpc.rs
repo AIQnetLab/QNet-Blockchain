@@ -880,13 +880,19 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     // REST API endpoints (new)
     let api_v1 = warp::path("api").and(warp::path("v1"));
     
-    // Height endpoint (for peer sync)
+    // Height endpoint (for peer sync) - RATE LIMITED v3.19
     let chain_height = api_v1
         .and(warp::path("height"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
-        .and_then(|blockchain: Arc<BlockchainNode>| async move {
+        .and_then(|remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>| async move {
+            // v3.19: Rate limiting for DDoS protection
+            if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+                return Ok::<_, Rejection>(rate_limit_response.into_response());
+            }
+            
             let height = blockchain.get_height().await;
             
             // API DEADLOCK FIX: Use cached network height to avoid circular HTTP calls
@@ -908,23 +914,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                         network_height = height;
                     } else {
                         // Regular node without cache - use local height
-                        println!("[API] ⚠️ No cached network height available, using local height");
+                        println!("[API] No cached network height available, using local height");
                     }
                 }
             }
             
-            // Log only every 100th request to reduce spam
-            if height % 100 == 0 || height <= 10 {
-                println!("[API] 📊 Height request: local={}, network={}, syncing={}", 
-                         height, network_height, is_syncing);
-            }
-            
             Ok::<_, Rejection>(warp::reply::json(&json!({
                 "height": height,
-                "network_height": network_height, // API FIX: Include network height
-                "is_syncing": is_syncing, // API FIX: Include sync status
-                "blocks_behind": network_height.saturating_sub(height) // API FIX: How many blocks behind
-            })))
+                "network_height": network_height,
+                "is_syncing": is_syncing,
+                "blocks_behind": network_height.saturating_sub(height)
+            })).into_response())
         });
     
     // Microblock by height
@@ -1012,12 +1012,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_account_info);
     
+    // Account endpoints - RATE LIMITED v3.19
     let account_balance = api_v1
         .and(warp::path("account"))
         .and(warp::path::param::<String>())
         .and(warp::path("balance"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_account_balance);
     
@@ -1027,6 +1029,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("transactions"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_account_transactions);
     
@@ -1052,12 +1055,13 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_recent_transactions);
     
-    // Block endpoints
+    // Block endpoints - RATE LIMITED v3.19
     let block_latest = api_v1
         .and(warp::path("block"))
         .and(warp::path("latest"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_block_latest);
     
@@ -1066,6 +1070,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_block_by_height);
     
@@ -1075,15 +1080,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_block_by_hash);
     
-    // Macroblock endpoint - PRODUCTION
+    // Macroblock endpoint - RATE LIMITED v3.19
     let macroblock_by_index = api_v1
         .and(warp::path("macroblock"))
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_by_index);
     
@@ -1116,29 +1123,32 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_submit);
     
+    // Transaction get - RATE LIMITED v3.19
     let transaction_get = api_v1
         .and(warp::path("transaction"))
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_get);
     
-    // Mempool endpoints
+    // Mempool endpoints - RATE LIMITED v3.19
     let mempool_status = api_v1
         .and(warp::path("mempool"))
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_mempool_status);
     
     let mempool_transactions = api_v1
         .and(warp::path("mempool"))
         .and(warp::path("transactions"))
-
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_mempool_transactions);
     
@@ -1195,6 +1205,12 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 .unwrap_or_default()
                 .as_secs();
             
+            // v3.19 FIX: Get reputation from blockchain, not P2P cache!
+            // PeerInfo.reputation is set ONCE at connection time and never updated.
+            // DeterministicReputationState is synced via macroblocks - all nodes have identical data.
+            let det_rep = blockchain.get_deterministic_reputation();
+            let rep_guard = det_rep.read();
+            
             let mut peer_list: Vec<serde_json::Value> = peers.iter()
                 .filter(|peer| {
                     // API FIX: Filter out peers with invalid addresses
@@ -1203,18 +1219,18 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                     !peer.address.starts_with("0.0.0.0")
                 })
                 .map(|peer| {
-                    // API FIX: Calculate proper last_seen as seconds ago, not absolute timestamp
-                    // Keep absolute timestamp - it's already in seconds since Unix epoch
                     let last_seen_timestamp = peer.last_seen;
+                    // v3.19: Get REAL reputation from blockchain (DeterministicReputationState)
+                    let real_reputation = rep_guard.get_reputation(&peer.id, current_time);
                     
                     json!({
                         "id": peer.id,
                         "address": peer.address,
                         "node_type": peer.node_type,
                         "region": peer.region,
-                        "last_seen": last_seen_timestamp, // Return absolute timestamp (seconds since Unix epoch)
-                        "reputation": peer.reputation, // Include actual reputation score
-                        "version": peer.version // Include node version
+                        "last_seen": last_seen_timestamp,
+                        "reputation": real_reputation, // v3.19: From blockchain, not P2P cache!
+                        "version": peer.version
                     })
                 }).collect();
             
@@ -1259,8 +1275,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             
             // API FIX: Include summary statistics
             let total_peers = peer_list.len();
-            let super_nodes = peer_list.iter().filter(|p| p["node_type"] == "Super").count();
-            let full_nodes = peer_list.iter().filter(|p| p["node_type"] == "Full").count();
+            // v3.18: Full nodes removed - "Full" mapped to Super for backward compatibility
+            let super_nodes = peer_list.iter().filter(|p| p["node_type"] == "Super" || p["node_type"] == "Full").count();
+            let full_nodes = 0; // v3.18: Always 0 (Full node type removed)
             let light_nodes = peer_list.iter().filter(|p| p["node_type"] == "Light").count();
             
             println!("[API] 📊 Peers request: returning {} peers (Super:{}, Full:{}, Light:{})", 
@@ -1271,7 +1288,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 "total": total_peers, // API FIX: Include total count
                 "statistics": { // API FIX: Include node type breakdown
                     "super_nodes": super_nodes,
-                    "full_nodes": full_nodes,
+                    "full_nodes": full_nodes, // v3.18: Always 0 (Full node type removed)
                     "light_nodes": light_nodes
                 }
             })))
@@ -1561,43 +1578,46 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_failover_history);
     
-    // General statistics endpoint
+    // General statistics endpoint - RATE LIMITED v3.19
     let stats_endpoint = api_v1
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_stats);
     
-    // Producer status endpoint
+    // Producer status endpoint - RATE LIMITED v3.19
     let producer_status = api_v1
         .and(warp::path("producer"))
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_producer_status);
     
-    // Sync status detailed endpoint
+    // Sync status detailed endpoint - RATE LIMITED v3.19
     let sync_status = api_v1
         .and(warp::path("sync"))
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_sync_status);
     
     // ============================================================================
-    // PUBLIC ENDPOINTS: Cached, no rate limiting needed (same data for everyone)
+    // PUBLIC ENDPOINTS: Cached + Rate limited for DDoS protection
     // ============================================================================
     
-    // PUBLIC: Network stats for website (cached 10 minutes)
-    // Safe to call frequently - returns same cached data
+    // PUBLIC: Network stats for website (cached 10 minutes) - RATE LIMITED v3.19
     let public_stats = api_v1
         .and(warp::path("public"))
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_public_stats);
     
@@ -2088,8 +2108,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         start_light_node_ping_service(blockchain.clone());
         println!("🕐 Light node randomized ping service started");
         
-        // CRITICAL: Start heartbeat service for Full/Super nodes (required for rewards!)
-        // Full nodes need 8/10 heartbeats, Super nodes need 9/10 per 4h window
+        // CRITICAL: Start heartbeat service for Super nodes (required for rewards!)
+        // v3.18: Super nodes need 9/10 heartbeats per 4h window (Full nodes removed)
         // v2.42.2: Now uses tokio::spawn with sync height access (no block_on!)
         if let Some(p2p) = blockchain.get_unified_p2p() {
             let blockchain_for_heartbeat = blockchain.clone();
@@ -2174,9 +2194,9 @@ async fn node_get_info(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcErro
     let peer_count = blockchain.get_peer_count().await.unwrap_or(0);
     let mempool_size = blockchain.get_mempool_size().await.unwrap_or(0);
     
+    // v3.18: Full node type removed - only Light and Super remain
     let node_type = match blockchain.get_node_type() {
         crate::node::NodeType::Light => "light",
-        crate::node::NodeType::Full => "full",
         crate::node::NodeType::Super => "super",
     };
     
@@ -2217,8 +2237,17 @@ async fn node_get_peers(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcErr
     // Get real peer list from blockchain node
     let peers = blockchain.get_connected_peers().await.unwrap_or_default();
     
+    // v3.19: Get reputation from blockchain, not P2P cache!
+    let det_rep = blockchain.get_deterministic_reputation();
+    let rep_guard = det_rep.read();
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
     // Format peers for RPC response
     let peer_list: Vec<Value> = peers.iter().map(|peer| {
+        let real_reputation = rep_guard.get_reputation(&peer.id, current_time);
         json!({
             "id": peer.id,
             "address": peer.address,
@@ -2226,7 +2255,7 @@ async fn node_get_peers(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcErr
             "region": peer.region,
             "last_seen": peer.last_seen,
             "connection_time": peer.connection_time,
-            "reputation": peer.reputation,
+            "reputation": real_reputation, // v3.19: From blockchain!
             "version": peer.version.as_deref().unwrap_or("unknown")
         })
     }).collect();
@@ -2890,8 +2919,22 @@ async fn handle_account_info(
 
 async fn handle_account_balance(
     address: String,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // v3.19: Validate address parameter (max 64 chars)
+    if address.len() > 64 {
+        return Ok(warp::reply::json(&json!({
+            "error": "Invalid address",
+            "message": "Address parameter too long (max 64 characters)"
+        })));
+    }
+    
     match blockchain.get_balance(&address).await {
         Ok(balance) => Ok(warp::reply::json(&json!({
             "address": address,
@@ -2909,8 +2952,22 @@ async fn handle_account_balance(
 
 async fn handle_account_transactions(
     address: String,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // v3.19: Validate address parameter
+    if address.len() > 64 {
+        return Ok(warp::reply::json(&json!({
+            "error": "Invalid address",
+            "message": "Address parameter too long (max 64 characters)"
+        })));
+    }
+    
     // PRODUCTION: Fetch real transactions from blockchain storage
     let storage = blockchain.get_storage();
     
@@ -2945,7 +3002,7 @@ async fn handle_account_transactions(
             Ok(warp::reply::json(&response))
         }
         Err(e) => {
-            println!("[API] ❌ Failed to fetch transactions for {}: {}", address, e);
+            println!("[WARN][API] tx_fetch_failed address={} err={}", address, e);
             let error_response = json!({
                 "address": address,
                 "transactions": [],
@@ -3153,8 +3210,14 @@ async fn handle_recent_transactions(
 }
 
 async fn handle_block_latest(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
     let height = blockchain.get_height().await;
     match blockchain.get_block(height).await {
         Ok(Some(block)) => Ok(warp::reply::json(&block)),
@@ -3177,8 +3240,24 @@ async fn handle_block_latest(
 
 async fn handle_block_by_height(
     height: u64,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // v3.19: Validate height parameter (prevent resource exhaustion)
+    let current_height = blockchain.get_height().await;
+    if height > current_height + 1000 {
+        return Ok(warp::reply::json(&json!({
+            "error": "Invalid height",
+            "message": "Requested height is too far in the future",
+            "current_height": current_height
+        })));
+    }
+    
     match blockchain.get_block(height).await {
         Ok(Some(block)) => Ok(warp::reply::json(&block)),
         Ok(None) => {
@@ -3200,11 +3279,23 @@ async fn handle_block_by_height(
 
 async fn handle_block_by_hash(
     hash: String,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    // PRODUCTION: Fetch real block by hash from blockchain storage
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // v3.19: Validate hash parameter (max 128 chars for hex hash)
+    if hash.len() > 128 {
+        return Ok(warp::reply::json(&json!({
+            "error": "Invalid hash",
+            "message": "Hash parameter too long (max 128 characters)"
+        })));
+    }
+    
     // PRODUCTION: Search for block by hash using storage
-    // Convert hex hash to proper lookup - for now search recent blocks
     let current_height = blockchain.get_height().await;
     
     // Search last 1000 blocks for matching hash (production would use hash index)
@@ -3256,8 +3347,14 @@ async fn handle_block_by_hash(
 
 async fn handle_macroblock_by_index(
     index: u64,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
     match blockchain.get_macroblock(index).await {
         Ok(Some(macroblock)) => {
             // v2.75: Decode heartbeat summaries if present
@@ -3606,8 +3703,22 @@ async fn handle_transaction_submit(
 
 async fn handle_transaction_get(
     tx_hash: String,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // v3.19: Validate tx_hash parameter (max 128 chars for hex hash)
+    if tx_hash.len() > 128 {
+        return Ok(warp::reply::json(&json!({
+            "error": "Invalid tx_hash",
+            "message": "Transaction hash parameter too long (max 128 characters)"
+        })));
+    }
+    
     // PRODUCTION: Fetch real transaction from blockchain storage
     match blockchain.get_transaction(&tx_hash).await {
         Ok(Some(tx)) => {
@@ -3691,8 +3802,14 @@ async fn handle_transaction_get(
 }
 
 async fn handle_mempool_status(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
     let mempool_size = blockchain.get_mempool_size().await.unwrap_or(0);
     let response = json!({
         "size": mempool_size,
@@ -3705,8 +3822,14 @@ async fn handle_mempool_status(
 }
 
 async fn handle_mempool_transactions(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
     let txs = blockchain.get_mempool_transactions().await;
     
     let response = json!({
@@ -4229,15 +4352,25 @@ async fn handle_node_discovery(
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     let peers = blockchain.get_connected_peers().await.unwrap_or_default();
+    
+    // v3.19: Get reputation from blockchain, not P2P cache!
+    let det_rep = blockchain.get_deterministic_reputation();
+    let rep_guard = det_rep.read();
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
     let peer_nodes: Vec<Value> = peers.iter().map(|peer| {
+        let real_reputation = rep_guard.get_reputation(&peer.id, current_time);
         json!({
             "node_id": peer.id,
             "address": peer.address,
-            "api_port": 8001, // Default API port
+            "api_port": 8001,
             "node_type": peer.node_type,
             "region": peer.region,
             "last_seen": peer.last_seen,
-            "reputation": peer.reputation,
+            "reputation": real_reputation, // v3.19: From blockchain!
             "api_endpoint": format!("http://{}:8001/api/v1/", peer.address)
         })
     }).collect();
@@ -5178,9 +5311,9 @@ async fn handle_node_secure_info(
     let peer_count = blockchain.get_peer_count().await.unwrap_or(0);
     let mempool_size = blockchain.get_mempool_size().await.unwrap_or(0);
     
+    // v3.18: Full node type removed - only Light and Super remain
     let node_type = match blockchain.get_node_type() {
         crate::node::NodeType::Light => "light",
-        crate::node::NodeType::Full => "full",
         crate::node::NodeType::Super => "super",
     };
     
@@ -5971,9 +6104,10 @@ async fn handle_server_node_status(
                 let heartbeat_count = node_heartbeats.len() as u8;
                 
                 // Determine required heartbeats based on node type (case-insensitive)
+                // v3.18: Only Super nodes (Full removed)
                 let required_heartbeats = match node_type.to_lowercase().as_str() {
                     "super" => 9,  // Super nodes need 9/10
-                    _ => 8,        // Full nodes need 8/10
+                    _ => 9,        // v3.18: Default to Super (Full removed)
                 };
                 
                 // Calculate if node is active (seen in last 15 minutes)
@@ -7155,10 +7289,9 @@ async fn handle_get_pending_rewards(
     let blocks_until_next = epoch_end.saturating_sub(current_height);
     
     // Determine node type from ID
+    // v3.18: Full nodes removed
     let node_type = if node_id.starts_with("light_") {
         "Light"
-    } else if node_id.starts_with("full_") {
-        "Full"
     } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
         "Super"
     } else {
@@ -7447,12 +7580,13 @@ async fn handle_get_reward_pools(
     let blocks_until_emission = 14400 - blocks_in_epoch;
     
     // Determine node type
+    // v3.18: Full nodes removed
     let node_type = if node_id.starts_with("light_") {
         "Light"
-    } else if node_id.starts_with("full_") {
-        "Full"
     } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
         "Super"
+    } else if node_id.starts_with("full_") {
+        "Super" // v3.18: Map to Super for backward compatibility (old nodes)
     } else {
         "Unknown"
     };
@@ -7476,8 +7610,8 @@ async fn handle_get_reward_pools(
             },
             "pool2_tx_fees": {
                 "amount_qnc": pool2 as f64 / 1_000_000_000.0,
-                "description": "Transaction fees - 70% Super, 30% Full, 0% Light",
-                "eligible": node_type == "Full" || node_type == "Super"
+                "description": "v3.18: Pool 2 removed - fees go directly to block producer (always 0)",
+                "eligible": false  // v3.18: Pool 2 removed
             },
             "pool3_activation_bonus": {
                 "amount_qnc": pool3 as f64 / 1_000_000_000.0,
@@ -7562,16 +7696,16 @@ async fn handle_get_rewards_by_wallet(
                 .map(|(_, t, _)| t.clone());
             
             if let Some(t) = storage_type {
+                // v3.18: Full nodes removed
                 match t.as_str() {
                     "super" => "Super",
-                    "full" => "Full",
                     "light" => "Light",
+                    "full" => "Super", // v3.18: Map to Super for backward compatibility
                     _ => "Unknown"
                 }
+            // v3.18: Full nodes removed
             } else if node_id.starts_with("light_") {
                 "Light"
-            } else if node_id.starts_with("full_") {
-                "Full"
             } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
                 "Super"
             } else {
@@ -7891,12 +8025,13 @@ async fn handle_get_reward_summary(
     };
     
     // Determine node type
+    // v3.18: Full nodes removed
     let node_type = if node_id.starts_with("light_") {
         "Light"
-    } else if node_id.starts_with("full_") {
-        "Full"
     } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
         "Super"
+    } else if node_id.starts_with("full_") {
+        "Super" // v3.18: Map to Super for backward compatibility (old nodes)
     } else {
         "Unknown"
     };
@@ -7951,18 +8086,25 @@ async fn handle_register_node(
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     // PRODUCTION v2.41.1: node_type is REQUIRED - no defaults!
+    // v3.18: Full nodes removed - only Light and Super allowed
     let node_type = match body["node_type"].as_str() {
-        Some(t) if t == "light" || t == "full" || t == "super" => t,
+        Some(t) if t == "light" || t == "super" => t,
+        Some("full") => {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Full node type removed in v3.18. Use Super node instead."
+            })));
+        },
         Some(t) => {
             return Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": format!("Invalid node_type '{}'. Must be: light, full, or super", t)
+                "error": format!("Invalid node_type '{}'. Must be: light or super", t)
             })));
         },
         None => {
             return Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": "Missing required field: node_type (must be: light, full, or super)"
+                "error": "Missing required field: node_type (must be: light or super)"
             })));
         }
     };
@@ -7989,11 +8131,11 @@ async fn handle_register_node(
         
         // Register node with reward manager
         use qnet_consensus::lazy_rewards::NodeType;
+        // v3.18: Full nodes removed
         let node_type_enum = match node_type {
             "light" => NodeType::Light,
-            "full" => NodeType::Full,
             "super" => NodeType::Super,
-            _ => NodeType::Light,
+            _ => NodeType::Light, // Ignore "full"
         };
         
         // Register node with all required info
@@ -8301,9 +8443,9 @@ async fn handle_activations_by_wallet(
         // Add nodes from storage first (primary source)
         for (node_id, node_type_str, _rep) in &storage_nodes {
             // v3.1: NO DEFAULT - skip unknown types instead of assuming Full
+            // v3.18: Full nodes removed
             let node_type = match node_type_str.as_str() {
                 "light" => qnet_consensus::lazy_rewards::NodeType::Light,
-                "full" => qnet_consensus::lazy_rewards::NodeType::Full,
                 "super" => qnet_consensus::lazy_rewards::NodeType::Super,
                 _ => {
                     println!("[WARN][API] unknown_node_type node={} type={}", node_id, node_type_str);
@@ -8394,9 +8536,9 @@ async fn handle_activations_by_wallet(
         
         // Build nodes array with full info INCLUDING real online status
         let nodes_json: Vec<serde_json::Value> = nodes.iter().map(|(node_id, node_type, pending)| {
+            // v3.18: Full node type removed - only Light and Super remain
             let type_str = match node_type {
                 qnet_consensus::lazy_rewards::NodeType::Light => "light",
-                qnet_consensus::lazy_rewards::NodeType::Full => "full",
                 qnet_consensus::lazy_rewards::NodeType::Super => "super",
             };
             
@@ -8542,8 +8684,16 @@ async fn handle_generate_activation_code(
     }
     
     // Validate node type
-    let valid_node_types = ["light", "full", "super"];
+    // v3.18: Full nodes removed - only Light and Super allowed
+    let valid_node_types = ["light", "super"];
     if !valid_node_types.contains(&request.node_type.to_lowercase().as_str()) {
+        // Reject "full" node type
+        if request.node_type.to_lowercase() == "full" {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Full node type removed in v3.18. Use Super node instead."
+            })));
+        }
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "Invalid node type. Must be: light, full, or super"
@@ -9513,8 +9663,14 @@ async fn verify_burn_transaction_exists(
 
 /// Handle general statistics request
 async fn handle_stats(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
     let height = blockchain.get_height().await;
     
     // Get network statistics
@@ -9600,8 +9756,14 @@ static PUBLIC_STATS_CACHE: Lazy<std::sync::RwLock<(serde_json::Value, std::time:
 /// Handle public stats request (cached 10 minutes)
 /// GET /api/v1/public/stats
 async fn handle_public_stats(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection (even cached endpoints)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
     const CACHE_TTL_SECS: u64 = 600; // 10 minutes
     
     // Check cache first
@@ -9616,17 +9778,18 @@ async fn handle_public_stats(
     let height = blockchain.get_height().await;
     
     // Get node counts
+    // v3.18: Full nodes removed - all server nodes are Super
     let (light_nodes, full_nodes, super_nodes) = if let Some(p2p) = blockchain.get_unified_p2p() {
         let peers = p2p.get_validated_active_peers();
         let light = peers.iter().filter(|p| p.node_type == crate::unified_p2p::NodeType::Light).count();
-        let full = peers.iter().filter(|p| p.node_type == crate::unified_p2p::NodeType::Full).count();
+        // v3.18: full_nodes always 0 (Full node type removed)
         let super_n = peers.iter().filter(|p| p.node_type == crate::unified_p2p::NodeType::Super).count();
-        (light, full, super_n + 1) // +1 for self if Super
+        (light, 0, super_n + 1) // +1 for self if Super, full_nodes = 0
     } else {
-        (0, 0, 5) // Default: 5 Genesis nodes
+        (0, 0, 5) // Default: 5 Genesis nodes (all Super)
     };
     
-    let total_nodes = light_nodes + full_nodes + super_nodes;
+    let total_nodes = light_nodes + super_nodes; // v3.18: full_nodes removed
     
     // Determine current phase
     let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
@@ -9693,11 +9856,12 @@ async fn handle_activation_price(
     // Phase 2: QNC pricing with network multiplier
     let active_nodes = crate::GLOBAL_ACTIVE_NODES.load(std::sync::atomic::Ordering::Relaxed);
     
-    // Base costs
+    // Base costs (Phase 2)
+    // v3.18: Only Light and Super nodes (Full removed)
     let base_cost = match node_type {
-        "super" => 10000u64,
-        "full" => 7500u64,
-        _ => 5000u64, // light
+        "light" => 10000u64,  // Light node: 10,000 QNC base
+        "super" => 7500u64,   // Super node: 7,500 QNC base
+        _ => 10000u64,        // Default to light
     };
     
     // Network multiplier (canonical thresholds)
@@ -9791,8 +9955,14 @@ async fn handle_failover_history(
 
 /// Handle producer status request
 async fn handle_producer_status(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
     let current_height = blockchain.get_height().await;
     // CRITICAL FIX: Check if producer for NEXT block, not current state
     let is_leader = blockchain.is_next_block_producer().await;
@@ -9856,8 +10026,14 @@ async fn handle_producer_status(
 
 /// Handle sync status request
 async fn handle_sync_status(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting for DDoS protection
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
     let local_height = blockchain.get_height().await;
     
     let network_height = if let Some(p2p) = blockchain.get_unified_p2p() {
@@ -10111,10 +10287,11 @@ async fn generate_quantum_activation_code(
     let entropy_short = &entropy_hash[..4].to_uppercase();
     
     // Step 4: Node type marker
+    // v3.18: Full nodes removed
     let node_type_marker = match request.node_type.to_lowercase().as_str() {
         "light" => "L",
-        "full" => "F", 
         "super" => "S",
+        "full" => "S", // v3.18: Map to Super for backward compatibility
         _ => "U",
     };
     

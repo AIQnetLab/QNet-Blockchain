@@ -10,22 +10,21 @@ from enum import Enum
 import math
 
 class NodeType(Enum):
+    # v3.18: Only Light and Super nodes (Full removed)
     LIGHT = "light"
-    FULL = "full" 
     SUPER = "super"
 
 @dataclass
 class OneDEVBurnConfig:
     """Configuration for 1DEV burn model"""
     
+    # v3.18: Only Light and Super nodes (Full removed)
     # Universal base prices (SAME for all node types!)
     base_price_light: int = 1500    # 1500 1DEV universal
-    base_price_full: int = 1500     # 1500 1DEV universal  
     base_price_super: int = 1500    # 1500 1DEV universal
     
     # Universal minimum prices
     min_price_light: int = 300      # 300 1DEV minimum at 80-90%
-    min_price_full: int = 300       # 300 1DEV minimum at 80-90%
     min_price_super: int = 300      # 300 1DEV minimum at 80-90%
     
     # Supply configuration
@@ -183,7 +182,8 @@ if __name__ == "__main__":
     # Test burn percentages
     test_percentages = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
     
-    print(f"{'Burned%':<8} {'Light':<8} {'Full':<8} {'Super':<8} {'Note'}")
+    # v3.18: Only Light and Super nodes (Full removed)
+    print(f"{'Burned%':<8} {'Light':<8} {'Super':<8} {'Note'}")
     print("-" * 50)
     
     for percent in test_percentages:
@@ -200,7 +200,8 @@ if __name__ == "__main__":
         elif percent == 90:
             note = "← Transition threshold"
         
-        print(f"{percent}%{'':<5} {light_req['amount']:<8} {light_req['amount']:<8} {light_req['amount']:<8} {note}")
+        # v3.18: Only Light and Super (Full removed) - all same price in Phase 1
+        print(f"{percent}%{'':<5} {light_req['amount']:<8} {light_req['amount']:<8} {note}")
     
     print("-" * 50)
     print("✅ UNIVERSAL PRICING: All node types cost the same!")

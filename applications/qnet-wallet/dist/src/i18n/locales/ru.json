@@ -106,7 +106,6 @@
     "activateNode": "Активировать ноду",
     "nodeStatus": "Статус ноды: Неактивна",
     "nodeType": "Выберите тип ноды",
-    "fullNode": "Полная нода",
     "lightNode": "Лёгкая нода",
     "validatorNode": "Супер нода",
     "burnTokens": "Сжечь 1DEV токены",

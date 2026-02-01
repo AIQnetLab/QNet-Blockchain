@@ -56,9 +56,9 @@ def get_active_nodes_count() -> Dict[NodeType, int]:
         # Get active node counts by type
         active_nodes = registry.get_active_nodes_by_type()
         
+        # v3.18: Only Light and Super nodes
         return {
             NodeType.LIGHT: active_nodes.get('light', 0),
-            NodeType.FULL: active_nodes.get('full', 0),
             NodeType.SUPER: active_nodes.get('super', 0)
         }
         
@@ -80,16 +80,13 @@ def get_active_nodes_count() -> Dict[NodeType, int]:
                 # NOT for actual node management or rewards distribution
                 estimated_nodes = total_burned // 1500  # Phase 1: 1500 1DEV per node
                 
+                # v3.18: Only Light and Super nodes
                 # Distribute by typical economic ratios for pricing purposes
-                # Based on economic modeling: most users choose Light nodes (mobile)
-                # This helps estimate network size for dynamic pricing multipliers
-                light_nodes = int(estimated_nodes * 0.6)   # 60% light nodes (mobile users)
-                full_nodes = int(estimated_nodes * 0.3)    # 30% full nodes (servers)
-                super_nodes = int(estimated_nodes * 0.1)   # 10% super nodes (enterprise)
+                light_nodes = int(estimated_nodes * 0.7)   # 70% light nodes (mobile users)
+                super_nodes = int(estimated_nodes * 0.3)   # 30% super nodes (servers)
                 
                 return {
                     NodeType.LIGHT: light_nodes,
-                    NodeType.FULL: full_nodes,
                     NodeType.SUPER: super_nodes
                 }
                 
@@ -102,10 +99,10 @@ def get_active_nodes_count() -> Dict[NodeType, int]:
         print(f"⚠️ Warning: Using conservative estimates for pricing calculation")
         print(f"   Real node counts will be fetched from blockchain when available")
         
+        # v3.18: Only Light and Super nodes
         return {
             NodeType.LIGHT: 1000,   # Conservative estimate for pricing
-            NodeType.FULL: 500,     # Conservative estimate for pricing
-            NodeType.SUPER: 100     # Conservative estimate for pricing
+            NodeType.SUPER: 200     # Conservative estimate for pricing
         }
 
 @pricing_bp.route('/current_prices', methods=['GET'])
@@ -128,8 +125,8 @@ def get_current_prices():
             prices = {
                 "token": "QNC",
                 "prices": {
+                    # v3.18: Only Light and Super nodes
                     "light": qnc_prices[NodeType.LIGHT],
-                    "full": qnc_prices[NodeType.FULL],
                     "super": qnc_prices[NodeType.SUPER]
                 },
                 "transition_complete": True
@@ -139,8 +136,8 @@ def get_current_prices():
             prices = {
                 "token": "1DEV",
                 "prices": {
+                    # v3.18: Only Light and Super nodes
                     "light": onedev_schedule["light"]["amount"],
-                    "full": onedev_schedule["full"]["amount"],
                     "super": onedev_schedule["super"]["amount"]
                 },
                 "transition_complete": False,
@@ -302,13 +299,14 @@ def get_price_history():
         # TODO: Implement actual historical data retrieval
         # For now, return mock data showing price progression
         
+        # v3.18: Only Light and Super nodes
         mock_history = [
-            {"date": "2024-01-01", "light": 1500, "full": 1500, "super": 1500, "token": "1DEV", "burned_percent": 0},
-            {"date": "2024-02-01", "light": 1350, "full": 1350, "super": 1350, "token": "1DEV", "burned_percent": 10},
-            {"date": "2024-03-01", "light": 1200, "full": 1200, "super": 1200, "token": "1DEV", "burned_percent": 25},
-            {"date": "2024-04-01", "light": 950, "full": 950, "super": 950, "token": "1DEV", "burned_percent": 50},
-            {"date": "2024-05-01", "light": 750, "full": 750, "super": 750, "token": "1DEV", "burned_percent": 75},
-            {"date": "2024-06-01", "light": 500, "full": 500, "super": 500, "token": "1DEV", "burned_percent": 85},
+            {"date": "2024-01-01", "light": 1500, "super": 1500, "token": "1DEV", "burned_percent": 0},
+            {"date": "2024-02-01", "light": 1350, "super": 1350, "token": "1DEV", "burned_percent": 10},
+            {"date": "2024-03-01", "light": 1200, "super": 1200, "token": "1DEV", "burned_percent": 25},
+            {"date": "2024-04-01", "light": 950, "super": 950, "token": "1DEV", "burned_percent": 50},
+            {"date": "2024-05-01", "light": 750, "super": 750, "token": "1DEV", "burned_percent": 75},
+            {"date": "2024-06-01", "light": 500, "super": 500, "token": "1DEV", "burned_percent": 85},
         ]
         
         return jsonify({
@@ -335,15 +333,16 @@ def simulate_pricing():
         # Get simulation parameters
         burned_percent = data.get("burned_percent", 0)
         total_nodes = data.get("total_nodes", 10000)
-        node_distribution = data.get("distribution", {"light": 0.7, "full": 0.25, "super": 0.05})
+        # v3.18: Only Light and Super nodes
+        node_distribution = data.get("distribution", {"light": 0.7, "super": 0.3})
         
         # Calculate burned amount
         total_burned = (burned_percent / 100) * 1_000_000_000
         
         # Calculate node counts
         active_nodes = {
+            # v3.18: Only Light and Super nodes
             NodeType.LIGHT: int(total_nodes * node_distribution["light"]),
-            NodeType.FULL: int(total_nodes * node_distribution["full"]),
             NodeType.SUPER: int(total_nodes * node_distribution["super"])
         }
         
@@ -354,8 +353,8 @@ def simulate_pricing():
             result = {
                 "token": "QNC",
                 "prices": {
+                    # v3.18: Only Light and Super nodes
                     "light": prices[NodeType.LIGHT],
-                    "full": prices[NodeType.FULL],
                     "super": prices[NodeType.SUPER]
                 }
             }
@@ -365,8 +364,8 @@ def simulate_pricing():
             result = {
                 "token": "1DEV",
                 "prices": {
+                    # v3.18: Only Light and Super nodes
                     "light": schedule["light"]["amount"],
-                    "full": schedule["full"]["amount"],
                     "super": schedule["super"]["amount"]
                 }
             }

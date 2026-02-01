@@ -1,6 +1,7 @@
 //! Reward Integration Module
 //! Connects transaction processing with the PhaseAwareRewardManager system
-//! Ensures transaction fees go to Pool 2 and activation QNC goes to Pool 3
+//! v3.18: Pool 2 removed - transaction fees go directly to block producer
+//! Activation QNC goes to Pool 3
 
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
@@ -50,7 +51,7 @@ pub struct RewardIntegrationManager {
 #[derive(Debug, Clone, Default)]
 pub struct PoolStatistics {
     pub pool1_total_distributed: u64,
-    pub pool2_total_fees: u64,
+    pub pool2_total_fees: u64,  // v3.18: Always 0 (Pool 2 removed)
     pub pool3_total_activations: u64,
     pub total_transactions_processed: u64,
     pub total_nodes_activated: u64,
@@ -96,16 +97,14 @@ impl RewardIntegrationManager {
         }
     }
     
-    /// Process transaction and extract fees for Pool 2
+    /// Process transaction fee (v3.18: Pool 2 removed - fees go directly to block producer)
+    /// Legacy method kept for backward compatibility - fees are now credited directly in node.rs
     pub fn process_transaction_fee(&mut self, tx_hash: String, amount: u64, gas_used: u64, gas_price: u64) -> Result<(), ConsensusError> {
-        // Calculate total fee
-        let fee_amount = gas_used * gas_price;
+        // v3.18: Pool 2 removed - fees go directly to block producer
+        // This method is kept for backward compatibility but does nothing
+        // Actual fee crediting happens in node.rs::credit_producer_fees()
         
-        if fee_amount == 0 {
-            return Ok(()); // No fee to process
-        }
-        
-        // Create fee record
+        // Track processed fee for statistics only
         let fee = TransactionFee {
             tx_hash: tx_hash.clone(),
             amount,
@@ -117,20 +116,11 @@ impl RewardIntegrationManager {
                 .as_secs(),
         };
         
-        // Add fee to Pool 2
-        {
-            let mut reward_manager = match self.reward_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
-            reward_manager.add_transaction_fees(fee_amount);
-        }
-        
-        // Track processed fee
         self.processed_fees.insert(tx_hash, fee);
-        
-        // Update statistics
-        self.pool_stats.pool2_total_fees += fee_amount;
         self.pool_stats.total_transactions_processed += 1;
         
-        println!("[RewardIntegration] ✅ Transaction fee processed: {} QNC → Pool 2", fee_amount);
+        // v3.18: pool2_total_fees always 0 (Pool 2 removed)
+        // self.pool_stats.pool2_total_fees += fee_amount; // REMOVED
         
         Ok(())
     }
@@ -312,7 +302,7 @@ impl RewardIntegrationCallbackImpl {
 }
 
 impl RewardIntegrationCallback for RewardIntegrationCallbackImpl {
-    /// Process transaction fee for Pool 2
+    /// Process transaction fee (v3.18: Pool 2 removed - kept for backward compatibility)
     fn process_transaction_fee(&mut self, tx_hash: String, amount: u64, gas_used: u64, gas_price: u64) -> Result<(), String> {
         self.manager.process_transaction_fee(tx_hash, amount, gas_used, gas_price)
             .map_err(|e| format!("Failed to process transaction fee: {:?}", e))
@@ -322,7 +312,7 @@ impl RewardIntegrationCallback for RewardIntegrationCallbackImpl {
     fn process_node_activation(&mut self, node_id: String, node_type: String, amount: u64, tx_hash: String) -> Result<(), String> {
         let node_type_enum = match node_type.as_str() {
             "Light" => NodeType::Light,
-            "Full" => NodeType::Full,
+            "Full" => NodeType::Super,
             "Super" => NodeType::Super,
             _ => return Err(format!("Invalid node type: {}", node_type)),
         };
@@ -333,7 +323,7 @@ impl RewardIntegrationCallback for RewardIntegrationCallbackImpl {
     }
 }
 
-/// Production-ready transaction processor with Pool 2 integration
+/// Production-ready transaction processor (v3.18: Pool 2 removed)
 pub fn create_production_transaction_processor() -> (TransactionProcessor, RewardIntegrationManager) {
     let reward_integration = RewardIntegrationManager::new();
     let mut transaction_processor = TransactionProcessor::new();

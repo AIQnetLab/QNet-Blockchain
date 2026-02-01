@@ -3015,7 +3015,7 @@ a[href*="play.google.com"] img {
   font-size: 1.1rem;
 }
 
-/* Pool 2 indicator for swap fees */
+/* Fee indicator for swap fees (v3.18: fees go to producer) */
 .pool-indicator {
   display: inline-flex;
   align-items: center;

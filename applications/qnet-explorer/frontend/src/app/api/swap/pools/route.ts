@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 
 // ============================================================================
 // SWAP Pools API - DEX Module
-// When launched: Fees from swaps go to Pool 2 (70% Super nodes, 30% Full nodes)
+// v3.18+: Transaction fees go directly to block producer (Super nodes only)
 // Status: Planned for Phase 3
 // ============================================================================
 
@@ -22,7 +22,6 @@ export async function GET() {
         success: true,
         pools: data.pools || [],
         totalTvl: data.total_tvl || '0',
-        pool2Balance: data.pool2_balance || '0',
       });
     }
     
@@ -33,7 +32,6 @@ export async function GET() {
       message: 'Decentralized Exchange is scheduled for Phase 3',
       pools: [],
       totalTvl: '0',
-      pool2Balance: '0',
     }, { status: 501 }); // 501 Not Implemented
     
   } catch {
@@ -43,7 +41,6 @@ export async function GET() {
       message: 'DEX service is not available',
       pools: [],
       totalTvl: '0',
-      pool2Balance: '0',
     }, { status: 503 });
   }
 }

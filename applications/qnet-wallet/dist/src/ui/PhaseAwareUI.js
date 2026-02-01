@@ -142,28 +142,20 @@ export class PhaseAwareUI {
                 <div class="activation-options">
                     <h3>🤖 Cross-Chain Activation</h3>
                     <div class="node-types">
+                        <!-- v3.18: Only Light and Super nodes -->
                         <div class="node-card" data-type="light">
                             <div class="node-icon">⚡</div>
                             <h4>Light Node</h4>
-                            <div class="cost" id="light-cost">1,350 1DEV</div>
+                            <div class="cost" id="light-cost">1,500 1DEV</div>
                             <button onclick="phaseAwareUI.startActivation('light')">
                                 Activate Light Node
-                            </button>
-                        </div>
-                        
-                        <div class="node-card" data-type="full">
-                            <div class="node-icon">🔥</div>
-                            <h4>Full Node</h4>
-                            <div class="cost" id="full-cost">2,025 1DEV</div>
-                            <button onclick="phaseAwareUI.startActivation('full')">
-                                Activate Full Node
                             </button>
                         </div>
                         
                         <div class="node-card" data-type="super">
                             <div class="node-icon">⭐</div>
                             <h4>Super Node</h4>
-                            <div class="cost" id="super-cost">2,700 1DEV</div>
+                            <div class="cost" id="super-cost">1,500 1DEV</div>
                             <button onclick="phaseAwareUI.startActivation('super')">
                                 Activate Super Node
                             </button>
@@ -255,8 +247,9 @@ export class PhaseAwareUI {
                     <p>Multiplier: <span id="multiplier">2.0x (High demand)</span></p>
                 </div>
 
+                <!-- v3.18: Only Light and Super nodes -->
                 <div class="native-activation">
-                    <h3>🤖 Native QNC Activation</h3>
+                    <h3>🤖 Native QNC Activation (v3.18)</h3>
                     <div class="node-types">
                         <div class="node-card" data-type="light">
                             <div class="node-icon">⚡</div>
@@ -267,19 +260,10 @@ export class PhaseAwareUI {
                             </button>
                         </div>
                         
-                        <div class="node-card" data-type="full">
-                            <div class="node-icon">🔥</div>
-                            <h4>Full Node</h4>
-                            <div class="cost" id="full-qnc-cost">15,000 QNC</div>
-                            <button onclick="phaseAwareUI.startPhase2Activation('full')">
-                                Send to Pool 3
-                            </button>
-                        </div>
-                        
                         <div class="node-card" data-type="super">
                             <div class="node-icon">⭐</div>
                             <h4>Super Node</h4>
-                            <div class="cost" id="super-qnc-cost">20,000 QNC</div>
+                            <div class="cost" id="super-qnc-cost">7,500 QNC</div>
                             <button onclick="phaseAwareUI.startPhase2Activation('super')">
                                 Send to Pool 3
                             </button>

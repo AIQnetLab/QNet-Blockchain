@@ -587,8 +587,9 @@ async function handleClearData() {
  */
 async function handleGetActivationCode() {
     try {
-        const nodeType = prompt('Select node type (light/full/super):', 'light');
-        if (!nodeType || !['light', 'full', 'super'].includes(nodeType)) {
+        // v3.18: Only Light and Super nodes
+        const nodeType = prompt('Select node type (light/super):', 'light');
+        if (!nodeType || !['light', 'super'].includes(nodeType)) {
             uiManager.showToast('Invalid node type', 'error');
             return;
         }

@@ -193,23 +193,23 @@ Handles out-of-order block arrival in gossip P2P network while preventing memory
 
 ## 💰 Reward System
 
-### Three Pools
+### Two Pools (v3.18)
 | Pool | Source | Distribution |
 |------|--------|--------------|
 | **Pool 1** | Base Emission | Equal share to ALL eligible nodes |
-| **Pool 2** | Transaction Fees | 70% Super / 30% Full / 0% Light |
-| **Pool 3** | Activation Bonus | Phase 2 only (1DEV burns) |
+| **Pool 3** | Activation Bonus | Phase 2 only (QNC spent) |
+
+> **Note**: Pool 2 was removed in v3.18 - transaction fees go directly to block producer.
 
 ### Lazy Rewards
 - Rewards accumulate automatically every 4 hours
 - Claim anytime via `/api/v1/rewards/claim`
 - No missed windows, no gas wars
 
-### Eligibility
+### Eligibility (v3.18: Only Light and Super)
 | Node Type | Ping Requirement | Reputation |
 |-----------|------------------|------------|
 | **Light** | 1+ attestation per window | Any (fixed 70) |
-| **Full** | 8+ heartbeats (80%) | ≥ 70% |
 | **Super** | 9+ heartbeats (90%) | ≥ 70% |
 
 ### Halving Schedule
@@ -254,7 +254,7 @@ CRITICAL ATTACKS → PERMANENT BAN (no return):
 - **Transport**: QUIC (UDP 10876)
 - **Protocol**: Binary (bincode serialization)
 - **Interval**: Every 5 minutes
-- **Scope**: Super + Full nodes only
+- **Scope**: Super nodes only (v3.18)
 - **Signature**: SHA3-256 quantum-safe
 
 ### Byzantine Threshold

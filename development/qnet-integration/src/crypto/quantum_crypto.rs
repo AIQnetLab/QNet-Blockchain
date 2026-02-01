@@ -807,7 +807,7 @@ impl QNetQuantumCrypto {
         // Decode node type from first segment (existing logic)
         let node_type = match &encoded_data[0..1] {
             "L" | "l" | "1" | "2" | "3" | "A" | "B" | "C" => NodeType::Light,
-            "F" | "f" | "4" | "5" | "6" | "D" | "E" => NodeType::Full, 
+            "F" | "f" | "4" | "5" | "6" | "D" | "E" => NodeType::Super, 
             "S" | "s" | "7" | "8" | "9" => NodeType::Super,
             _ => {
                 // Fallback logic (SHA3-256 for consistency)
@@ -816,9 +816,9 @@ impl QNetQuantumCrypto {
                 let hash = hasher.finalize();
                 match hash[0] % 3 {
                     0 => NodeType::Light,
-                    1 => NodeType::Full,
+                    1 => NodeType::Super,
                     2 => NodeType::Super,
-                    _ => NodeType::Full,
+                    _ => NodeType::Super,
                 }
             }
         };
@@ -855,9 +855,9 @@ impl QNetQuantumCrypto {
         let qnc_amount = match phase {
             1 => 1500, // Phase 1: 1500 1DEV (universal pricing from economic model)
             2 => match node_type {
-                NodeType::Light => 5000,  // Phase 2: 5000 QNC
-                NodeType::Full => 7500,   // Phase 2: 7500 QNC  
-                NodeType::Super => 10000, // Phase 2: 10000 QNC
+                // v3.18: Updated Phase 2 pricing
+                NodeType::Light => 10000,  // Phase 2: 10000 QNC for Mobile Node (Light)
+                NodeType::Super => 7500,   // Phase 2: 7500 QNC for Server Node (Super)
             },
             _ => return Err(anyhow!("Invalid phase in activation code")),
         };
@@ -1301,11 +1301,11 @@ impl QNetQuantumCrypto {
             let network_multiplier = self.calculate_network_multiplier(network_size);
             
             // Base prices per node type (TokenConfig.qnc_base_prices)
+            // v3.18: Only Light and Super nodes (Full node type removed)
             let base_price = match node_type {
-                "light" => 5_000u64,   // 5,000 QNC base
-                "full" => 7_500u64,    // 7,500 QNC base
-                "super" => 10_000u64,  // 10,000 QNC base
-                _ => 5_000u64,         // Default to light
+                "light" => 10_000u64,  // 10,000 QNC base
+                "super" => 7_500u64,   // 7,500 QNC base
+                _ => 10_000u64,        // Default to light
             };
             
             // Apply network multiplier (0.5x to 3.0x)

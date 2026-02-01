@@ -96,10 +96,11 @@ pub async fn submit_transaction(
             TransactionType::ContractCall
         }
         TransactionTypeRequest::NodeActivation { node_type, amount, phase } => {
+            // v3.18: Full nodes removed
             let node_type = match node_type.as_str() {
                 "light" => NodeType::Light,
-                "full" => NodeType::Full,
                 "super" => NodeType::Super,
+                "full" => return Err(ApiError::BadRequest("Full node type removed in v3.18. Use Super node instead.".to_string())),
                 _ => return Err(ApiError::BadRequest("Invalid node type".to_string())),
             };
             

@@ -248,12 +248,28 @@ export default function ExplorerPage() {
     }
   }, [page, mounted, fetchActivity]);
 
-  // Background refresh every 30 seconds (only if on page 1)
+  // Background refresh transactions every 30 seconds (only if on page 1)
   useEffect(() => {
     if (!mounted || page !== 1) return;
-    const interval = setInterval(() => fetchActivity(1), 30000);
+    const interval = setInterval(() => fetchActivity(1), 5000); // Update every 5 seconds
     return () => clearInterval(interval);
   }, [mounted, page, fetchActivity]);
+
+  // Real-time height update every 1 second (lightweight stats endpoint)
+  useEffect(() => {
+    if (!mounted) return;
+    const fetchHeight = async () => {
+      try {
+        const res = await fetch(`/api/network/stats?t=${Date.now()}`, { cache: 'no-store' });
+        const data = await res.json();
+        if (data.success && data.data?.height) {
+          setCurrentHeight(data.data.height);
+        }
+      } catch {}
+    };
+    const interval = setInterval(fetchHeight, 5000); // Update every 5 seconds
+    return () => clearInterval(interval);
+  }, [mounted]);
 
   const goToPage = (newPage: number) => {
     if (newPage >= 1 && newPage <= totalPages && newPage !== page) {

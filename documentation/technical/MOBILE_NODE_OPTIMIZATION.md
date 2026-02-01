@@ -116,7 +116,7 @@ Time     Action                    Heartbeat?
 ```
 **Result**: 12 heartbeats in 2 hours! 🔥
 
-## 🔧 Full Node Implementation
+## 🔧 Super Node Implementation
 
 ```rust
 pub struct FullNode {

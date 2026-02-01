@@ -187,26 +187,26 @@ impl TransactionPool {
 // NOT State Sharding for storage division.
 //
 // SHARDING = Parallel transaction PROCESSING (CPU cores)
-// STORAGE  = Tiered by node type (Light/Full/Super)
-//
-// ALL nodes receive ALL blocks. Storage differs by:
-// - What data is kept (headers vs full blocks)
-// - How long data is kept (pruning window)
+// STORAGE = Tiered by node type (Light/Super)
 //
 // ┌─────────────────────────────────────────────────────────────┐
-// │                    STORAGE TIERS                            │
+// │                    STORAGE TIERS (v3.19)                    │
 // ├─────────────────────────────────────────────────────────────┤
 // │                                                              │
-// │  ┌─────────┐  ┌─────────┐  ┌─────────────────┐              │
-// │  │  Light  │  │  Full   │  │ Super/Bootstrap │              │
-// │  │  Node   │  │  Node   │  │     Node        │              │
-// │  └────┬────┘  └────┬────┘  └────────┬────────┘              │
-// │       │            │                │                        │
-// │  Headers      Full blocks      Full blocks                   │
-// │  only         + pruning        NO pruning                    │
-// │  (1K blocks)  (30 days)        (full history)                │
-// │       │            │                │                        │
-// │   ~100 MB       ~500 GB           ~2 TB                      │
+// │  ┌─────────────┐            ┌─────────────────┐             │
+// │  │   Light     │            │ Super/Bootstrap │             │
+// │  │   Node      │            │     Node        │             │
+// │  │  (wallet)   │            │   (server)      │             │
+// │  └──────┬──────┘            └────────┬────────┘             │
+// │         │                            │                      │
+// │   NO storage!                 Full blocks (archival)        │
+// │   Pure API client             NO pruning (full history)     │
+// │         │                            │                      │
+// │      0 MB                        ~500 MB/day                │
+// │                                                              │
+// │  Data via API:                Serves API requests:          │
+// │  GET /api/v1/balance          GET /api/v1/block/{height}    │
+// │  GET /api/v1/address/{w}      GET /api/v1/transaction/{h}   │
 // │                                                              │
 // └─────────────────────────────────────────────────────────────┘
 //
@@ -227,32 +227,21 @@ pub struct StorageTierConfig {
 }
 
 impl StorageTierConfig {
-    /// Light node: Headers only, ~100MB max, keep last 1000 headers
-    /// - Mobile wallets, IoT devices
-    /// - Only verify block headers, not transactions
-    /// - Rely on Full/Super nodes for transaction data
+    /// Light node: Pure API client - NO local storage
+    /// - Mobile wallets (like Phantom)
+    /// - All data via API: /api/v1/balance, /api/v1/address/{wallet}
+    /// - Wallet app stores TX history in localStorage/AsyncStorage (not here!)
+    /// - This config exists only for backward compatibility
     pub fn light() -> Self {
         Self {
             store_full_blocks: false,
-            max_storage_bytes: 100 * 1024 * 1024, // 100 MB
-            pruning_window_blocks: 1_000, // Keep last 1000 block headers
-            compress_old_blocks: false, // Headers are already small
+            max_storage_bytes: 0, // NO storage - pure API client
+            pruning_window_blocks: 0,
+            compress_old_blocks: false,
         }
     }
     
-    /// Full node: Full blocks + pruning, ~500GB max, keep 30 days
-    /// - Desktop/server nodes
-    /// - Full transaction verification
-    /// - Participate in consensus (if reputation >= 70%)
-    /// - Prune old blocks to manage storage
-    pub fn full() -> Self {
-        Self {
-            store_full_blocks: true,
-            max_storage_bytes: 500 * 1024 * 1024 * 1024, // 500 GB
-            pruning_window_blocks: 2_592_000, // ~30 days at 1 block/sec
-            compress_old_blocks: true, // Apply Zstd-22 to blocks > 7 days old
-        }
-    }
+    // v3.19: Light nodes = pure API client, Super nodes = archival servers
     
     /// Super/Bootstrap node: Full blocks, NO pruning, ~2TB
     /// - High-performance servers
@@ -372,18 +361,15 @@ impl GracefulDegradation {
         match health {
             StorageHealth::Full => {
                 // Degrade to next lower tier
+                // v3.18: Only Light and Super modes (Full removed)
                 let new_mode = match self.current_mode {
                     StorageMode::Super => {
-                        println!("[GracefulDegradation] 🔻 Super → Full: Storage full, switching to pruning mode");
-                        StorageMode::Full
-                    },
-                    StorageMode::Full => {
-                        println!("[GracefulDegradation] 🔻 Full → Light: Storage full, switching to headers-only mode");
+                        println!("[WARN][STORAGE] degradation super_to_light reason=storage_full");
                         StorageMode::Light
                     },
                     StorageMode::Light => {
                         // Already at lowest tier, can't degrade further
-                        println!("[GracefulDegradation] ⚠️ Already at Light mode, cannot degrade further!");
+                        println!("[WARN][STORAGE] Already at Light mode, cannot degrade further!");
                         return None;
                     }
                 };
@@ -409,12 +395,11 @@ impl GracefulDegradation {
                 
                 if let Some(since) = self.degraded_since {
                     if now - since > 3600 {
-                        println!("[GracefulDegradation] 🔺 Restoring to {} mode (storage healthy)", 
-                            match self.original_mode {
-                                StorageMode::Light => "Light",
-                                StorageMode::Full => "Full",
-                                StorageMode::Super => "Super",
-                            });
+                        let mode_name = match self.original_mode {
+                            StorageMode::Light => "light",
+                            StorageMode::Super => "super",
+                        };
+                        println!("[INFO][STORAGE] restored_mode mode={} reason=storage_healthy", mode_name);
                         self.current_mode = self.original_mode;
                         self.is_degraded = false;
                         self.degraded_since = None;
@@ -503,47 +488,91 @@ impl PersistentStorage {
         let path = Path::new(data_dir);
         std::fs::create_dir_all(path)?;
         
-        // Simple, reliable RocksDB configuration
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v3.19: OPTIMIZED RocksDB configuration for reduced disk usage
+        // ═══════════════════════════════════════════════════════════════════════════
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
         
-        // Basic settings that work reliably
-        opts.set_max_open_files(1000);
-        opts.set_use_fsync(true);
-        opts.set_bytes_per_sync(1048576);
-        opts.set_max_write_buffer_number(4);
-        opts.set_write_buffer_size(67108864); // 64MB
-        opts.set_target_file_size_base(67108864); // 64MB
-        opts.set_min_write_buffer_number_to_merge(2);
-        opts.set_level_zero_stop_writes_trigger(12);
-        opts.set_level_zero_slowdown_writes_trigger(8);
+        // v3.19: Reduced buffer sizes (64MB -> 16MB = 4x smaller WAL files)
+        opts.set_max_open_files(500);  // Reduced from 1000
+        opts.set_use_fsync(false);     // Async fsync for better performance
+        opts.set_bytes_per_sync(524288); // 512KB sync interval (was 1MB)
+        opts.set_max_write_buffer_number(2);  // Reduced from 4
+        opts.set_write_buffer_size(16777216); // 16MB (was 64MB) - 4x smaller WAL!
+        opts.set_target_file_size_base(16777216); // 16MB (was 64MB)
+        opts.set_min_write_buffer_number_to_merge(1); // Merge immediately
+        opts.set_level_zero_stop_writes_trigger(8);   // Reduced
+        opts.set_level_zero_slowdown_writes_trigger(4); // Reduced
         opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
-        opts.set_max_background_jobs(4);
+        opts.set_max_background_jobs(2);  // Reduced from 4
         opts.set_disable_auto_compactions(false);
         
-        // Optimize for failover events storage
-        let mut failover_opts = Options::default();
-        failover_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        // v3.19: AGGRESSIVE compaction settings
+        opts.set_level_compaction_dynamic_level_bytes(true);
+        opts.set_max_bytes_for_level_base(67108864); // 64MB base level
+        opts.set_max_bytes_for_level_multiplier(4.0); // Faster level growth
+        
+        // v3.19: Enable compression at ALL levels (huge disk savings!)
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        
+        // v3.19: Optimized block-based options
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_block_size(16384); // 16KB blocks (was default 4KB)
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_bloom_filter(10.0, false); // Bloom filter for faster lookups
+        opts.set_block_based_table_factory(&block_opts);
+        
+        // v3.19: Create optimized CF options with compression
+        fn create_cf_opts() -> Options {
+            let mut cf_opts = Options::default();
+            cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+            cf_opts.set_write_buffer_size(8388608); // 8MB per CF
+            cf_opts.set_max_write_buffer_number(2);
+            cf_opts.set_target_file_size_base(16777216); // 16MB
+            cf_opts
+        }
+        
+        // v3.19: Optimized CF for hot data (microblocks, heartbeats)
+        fn create_hot_cf_opts() -> Options {
+            let mut cf_opts = Options::default();
+            cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+            cf_opts.set_write_buffer_size(4194304); // 4MB - very small for hot data
+            cf_opts.set_max_write_buffer_number(2);
+            cf_opts.set_target_file_size_base(8388608); // 8MB
+            cf_opts
+        }
+        
+        // v3.19: Optimized CF for cold data (old blocks)
+        fn create_cold_cf_opts() -> Options {
+            let mut cf_opts = Options::default();
+            cf_opts.set_compression_type(rocksdb::DBCompressionType::Zstd); // Better compression
+            cf_opts.set_write_buffer_size(16777216); // 16MB
+            cf_opts.set_max_write_buffer_number(2);
+            cf_opts.set_target_file_size_base(33554432); // 32MB
+            cf_opts
+        }
         
         let cfs = vec![
-            ColumnFamilyDescriptor::new("blocks", Options::default()),
-            ColumnFamilyDescriptor::new("transactions", Options::default()),
-            ColumnFamilyDescriptor::new("accounts", Options::default()),
-            ColumnFamilyDescriptor::new("metadata", Options::default()),
-            ColumnFamilyDescriptor::new("microblocks", Options::default()),
-            ColumnFamilyDescriptor::new("consensus", Options::default()),
-            ColumnFamilyDescriptor::new("sync_state", Options::default()),
-            ColumnFamilyDescriptor::new("pending_rewards", Options::default()),
-            ColumnFamilyDescriptor::new("node_registry", Options::default()),
-            ColumnFamilyDescriptor::new("ping_history", Options::default()),
-            ColumnFamilyDescriptor::new("failover_events", failover_opts),
-            ColumnFamilyDescriptor::new("snapshots", Options::default()),
-            ColumnFamilyDescriptor::new("tx_index", Options::default()), // O(1) transaction lookups
-            ColumnFamilyDescriptor::new("tx_by_address", Options::default()), // Index: address -> [tx_hashes]
-            ColumnFamilyDescriptor::new("attestations", Options::default()), // Light node attestations
-            ColumnFamilyDescriptor::new("heartbeats", Options::default()),   // Full/Super node heartbeats
-            ColumnFamilyDescriptor::new("poh_state", Options::default()),    // PoH state for fast validation (v2.19.13)
+            ColumnFamilyDescriptor::new("blocks", create_cold_cf_opts()),  // Cold: old blocks
+            ColumnFamilyDescriptor::new("transactions", create_cf_opts()),
+            ColumnFamilyDescriptor::new("accounts", create_cf_opts()),
+            ColumnFamilyDescriptor::new("metadata", create_cf_opts()),
+            ColumnFamilyDescriptor::new("microblocks", create_hot_cf_opts()), // Hot: recent blocks
+            ColumnFamilyDescriptor::new("consensus", create_hot_cf_opts()),   // Hot: consensus data
+            ColumnFamilyDescriptor::new("sync_state", create_cf_opts()),
+            ColumnFamilyDescriptor::new("pending_rewards", create_cf_opts()),
+            ColumnFamilyDescriptor::new("node_registry", create_cf_opts()),
+            ColumnFamilyDescriptor::new("ping_history", create_hot_cf_opts()), // Hot: pings
+            ColumnFamilyDescriptor::new("failover_events", create_cf_opts()),
+            ColumnFamilyDescriptor::new("snapshots", create_cold_cf_opts()),  // Cold: snapshots
+            ColumnFamilyDescriptor::new("tx_index", create_cf_opts()),
+            ColumnFamilyDescriptor::new("tx_by_address", create_cf_opts()),
+            ColumnFamilyDescriptor::new("attestations", create_hot_cf_opts()), // Hot: attestations
+            ColumnFamilyDescriptor::new("heartbeats", create_hot_cf_opts()),   // Hot: heartbeats
+            ColumnFamilyDescriptor::new("poh_state", create_hot_cf_opts()),    // Hot: PoH state
         ];
         
         let db = match DB::open_cf_descriptors(&opts, path, cfs) {
@@ -897,6 +926,139 @@ impl PersistentStorage {
             println!("[WARN][STORAGE] flush_default_failed err={}", e);
         }
         
+        Ok(())
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.19: PRUNING - Remove old data to save disk space
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// v3.19: Prune old microblocks older than retention_blocks
+    /// Keeps only recent blocks for sync, deletes old ones to save disk
+    /// SAFE: Only prunes microblocks, not macroblocks (which contain finality data)
+    pub fn prune_old_microblocks(&self, current_height: u64, retention_blocks: u64) -> IntegrationResult<usize> {
+        let microblocks_cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks CF not found".to_string()))?;
+        
+        if current_height <= retention_blocks {
+            return Ok(0); // Nothing to prune yet
+        }
+        
+        let prune_below = current_height - retention_blocks;
+        let mut deleted = 0;
+        
+        // Delete microblocks older than prune_below
+        let mut batch = WriteBatch::default();
+        
+        for height in 0..prune_below {
+            let key = height.to_be_bytes();
+            batch.delete_cf(&microblocks_cf, &key);
+            deleted += 1;
+            
+            // Commit in batches of 1000 to avoid memory issues
+            if deleted % 1000 == 0 {
+                self.db.write(batch)?;
+                batch = WriteBatch::default();
+            }
+        }
+        
+        // Write remaining deletes
+        if deleted % 1000 != 0 {
+            self.db.write(batch)?;
+        }
+        
+        // Trigger compaction to reclaim space
+        self.db.compact_range_cf(&microblocks_cf, None::<&[u8]>, None::<&[u8]>);
+        
+        println!("[STORAGE] v3.19: Pruned {} old microblocks (kept last {})", deleted, retention_blocks);
+        Ok(deleted)
+    }
+    
+    /// v3.19: Prune old heartbeats older than retention_seconds
+    /// Heartbeats are only needed for recent epoch, old ones waste space
+    pub fn prune_old_heartbeats(&self, retention_seconds: u64) -> IntegrationResult<usize> {
+        let heartbeats_cf = self.db.cf_handle("heartbeats")
+            .ok_or_else(|| IntegrationError::StorageError("heartbeats CF not found".to_string()))?;
+        
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let prune_before = current_time.saturating_sub(retention_seconds);
+        let mut deleted = 0;
+        let mut batch = WriteBatch::default();
+        
+        // Iterate through heartbeats and delete old ones
+        let iter = self.db.iterator_cf(&heartbeats_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            if let Ok((key, value)) = item {
+                // Try to extract timestamp from value
+                if value.len() >= 8 {
+                    let ts = u64::from_be_bytes(value[0..8].try_into().unwrap_or([0; 8]));
+                    if ts < prune_before {
+                        batch.delete_cf(&heartbeats_cf, &key);
+                        deleted += 1;
+                        
+                        if deleted % 1000 == 0 {
+                            self.db.write(batch)?;
+                            batch = WriteBatch::default();
+                        }
+                    }
+                }
+            }
+        }
+        
+        if deleted % 1000 != 0 {
+            self.db.write(batch)?;
+        }
+        
+        // Trigger compaction
+        self.db.compact_range_cf(&heartbeats_cf, None::<&[u8]>, None::<&[u8]>);
+        
+        if deleted > 0 {
+            println!("[STORAGE] v3.19: Pruned {} old heartbeats (kept last {}s)", deleted, retention_seconds);
+        }
+        Ok(deleted)
+    }
+    
+    /// v3.19: Run full pruning cycle (call periodically, e.g., every hour)
+    /// retention_blocks: How many microblocks to keep (e.g., 86400 = ~1 day at 1 block/sec)
+    /// heartbeat_retention_secs: How long to keep heartbeats (e.g., 86400 = 1 day)
+    pub fn run_pruning_cycle(&self, current_height: u64, retention_blocks: u64, heartbeat_retention_secs: u64) -> IntegrationResult<()> {
+        println!("[STORAGE] v3.19: Starting pruning cycle (retention: {} blocks, {} sec heartbeats)", 
+                 retention_blocks, heartbeat_retention_secs);
+        
+        let start = std::time::Instant::now();
+        
+        // Prune microblocks
+        let microblocks_deleted = self.prune_old_microblocks(current_height, retention_blocks)?;
+        
+        // Prune heartbeats  
+        let heartbeats_deleted = self.prune_old_heartbeats(heartbeat_retention_secs)?;
+        
+        // Force compaction on all CFs
+        self.compact_all()?;
+        
+        let elapsed = start.elapsed();
+        println!("[STORAGE] v3.19: Pruning complete in {:?} (microblocks: {}, heartbeats: {})", 
+                 elapsed, microblocks_deleted, heartbeats_deleted);
+        
+        Ok(())
+    }
+    
+    /// v3.19: Compact all column families to reclaim disk space
+    pub fn compact_all(&self) -> IntegrationResult<()> {
+        let cf_names = ["microblocks", "heartbeats", "attestations", "ping_history", 
+                        "consensus", "poh_state", "blocks", "transactions"];
+        
+        for cf_name in &cf_names {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                self.db.compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
+            }
+        }
+        
+        println!("[STORAGE] v3.19: Compaction triggered on all CFs");
         Ok(())
     }
     
@@ -2026,11 +2188,10 @@ impl PersistentStorage {
 /// Storage modes for different node types
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StorageMode {
-    /// Light node - headers only, no full blocks
+    /// Light node - headers only, no full blocks (mobile/IoT)
     Light,
-    /// Full node - sliding window of recent blocks + snapshots
-    Full,
-    /// Super node - keeps complete blockchain history + sharding support
+    /// Super node - keeps complete blockchain history + sharding support (servers)
+    /// v3.18: Full node type removed - only Light and Super remain
     Super,
 }
 
@@ -2173,13 +2334,13 @@ impl Storage {
         
         if let Some(new_mode) = degradation.check_and_degrade(health) {
             // Log the change
-            println!("[Storage] 🔄 Storage mode changed due to disk space:");
-            println!("[Storage]    Health: {}", health.as_str());
-            println!("[Storage]    New mode: {:?}", new_mode);
+            println!("[WARN][STORAGE] Storage mode changed due to disk space:");
+            println!("[WARN][STORAGE]    Health: {}", health.as_str());
+            println!("[WARN][STORAGE]    New mode: {:?}", new_mode);
             
             // If degraded to Light mode, need to cleanup full block data
             if new_mode == StorageMode::Light {
-                println!("[Storage] 🧹 Cleaning up full block data (keeping headers only)...");
+                println!("[WARN][STORAGE] Cleaning up full block data (keeping headers only)...");
                 // Note: Actual cleanup happens in background to not block
             }
             
@@ -2268,9 +2429,9 @@ impl Storage {
     
     /// Get storage statistics for tiered storage
     pub fn get_tiered_storage_stats(&self) -> TieredStorageStats {
+        // v3.18: Only Light and Super modes
         let mode_str = match self.storage_mode {
             StorageMode::Light => "Light (headers only, ~100MB)",
-            StorageMode::Full => "Full (full blocks + pruning, ~500GB)",
             StorageMode::Super => "Super/Bootstrap (full history, ~2TB)",
         };
         
@@ -2308,7 +2469,8 @@ impl Storage {
         let transaction_pool = TransactionPool::new();
         
         // Detect node type from environment or config
-        let node_type = std::env::var("QNET_NODE_TYPE").unwrap_or_else(|_| "full".to_string());
+        // v3.18: Full nodes removed - default to "super" (server node) if not specified
+        let node_type = std::env::var("QNET_NODE_TYPE").unwrap_or_else(|_| "super".to_string());
         
         // DYNAMIC SHARD CALCULATION: Automatically scales with network growth
         // Uses existing calculate_optimal_shards() from reward_sharding module
@@ -2326,7 +2488,7 @@ impl Storage {
             let network_size = Self::estimate_network_size_from_storage(&persistent);
             let optimal_shards = crate::reward_sharding::calculate_optimal_shards(network_size) as u64;
             
-            println!("[Storage] ⚡ AUTO-SCALING: Calculated optimal shards: {}", optimal_shards);
+            println!("[WARN][STORAGE] AUTO-SCALING: Calculated optimal shards: {}", optimal_shards);
             
             optimal_shards
         };
@@ -2347,59 +2509,35 @@ impl Storage {
                 1_000, // Keep last 1000 block headers
                 StorageTierConfig::light()
             ),
-            "full" => (
-                StorageMode::Full, 
-                500, // ~500 GB
-                2_592_000, // ~30 days at 1 block/sec
-                StorageTierConfig::full()
-            ),
-            "super" | "bootstrap" => (
+            // v3.18: "full" maps to Super for backward compatibility
+            "full" | "super" | "bootstrap" => (
                 StorageMode::Super, 
                 2000, // ~2 TB
-                0, // No pruning - keep EVERYTHING
+                0, // No pruning - keep EVERYTHING (archival)
                 StorageTierConfig::super_node()
             ),
             _ => {
-                println!("[Storage] Unknown node type '{}', defaulting to Full mode", node_type);
+                println!("[WARN][STORAGE] unknown_node_type type={} default=super", node_type);
                 (
-                    StorageMode::Full, 
-                    500, 
-                    2_592_000,
-                    StorageTierConfig::full()
+                    StorageMode::Super, 
+                    2000, 
+                    0,
+                    StorageTierConfig::super_node()
                 )
             }
         };
         
-        // Log tiered storage configuration
-        println!("[Storage] 📦 Tiered Storage Configuration:");
-        match storage_mode {
-            StorageMode::Light => {
-                println!("[Storage]    Mode: LIGHT");
-                println!("[Storage]    Storage: Headers only (~100MB)");
-                println!("[Storage]    Pruning: Keep last {} block headers", tier_config.pruning_window_blocks);
-            },
-            StorageMode::Full => {
-                println!("[Storage]    Mode: FULL");
-                println!("[Storage]    Storage: Full blocks with pruning (~500GB)");
-                println!("[Storage]    Pruning: Keep last {} blocks (~30 days)", tier_config.pruning_window_blocks);
-            },
-            StorageMode::Super => {
-                println!("[Storage]    Mode: SUPER/BOOTSTRAP");
-                println!("[Storage]    Storage: Full history, NO pruning (~2TB)");
-                println!("[Storage]    Archive: Complete blockchain history");
-            },
-        }
-        
-        // CRITICAL FIX: Scale sliding window with active shards
-        // This ensures we store ~1 day of data regardless of shard count
-        let sliding_window = if storage_mode == StorageMode::Full && base_window > 0 {
-            let scaled_window = base_window * active_shards;
-            println!("[Storage] 📊 Scaling window for {} active shards: {} blocks", 
-                    active_shards, scaled_window);
-            scaled_window
-        } else {
-            base_window
+        // Log tiered storage configuration (v3.18: only Light and Super)
+        let (mode_name, storage_desc) = match storage_mode {
+            StorageMode::Light => ("light", "headers_only ~100MB"),
+            StorageMode::Super => ("super", "full_history_archival ~2TB"),
         };
+        println!("[INFO][STORAGE] config mode={} storage={} pruning_window={}", 
+                 mode_name, storage_desc, tier_config.pruning_window_blocks);
+        
+        // v3.18: Only Light and Super modes - no sliding window scaling needed
+        // Super nodes keep everything, Light nodes keep minimal headers
+        let sliding_window = base_window;
         
         // Allow override via environment
         let max_storage_size = std::env::var("QNET_MAX_STORAGE_GB")
@@ -2412,21 +2550,22 @@ impl Storage {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(sliding_window);
             
-        println!("[Storage] 🎯 Node configured as {:?} mode:", storage_mode);
-        println!("[Storage]    Max storage: {} GB", max_storage_size / (1024 * 1024 * 1024));
-        println!("[Storage]    Sliding window: {} blocks", 
+        println!("[WARN][STORAGE] Node configured as {:?} mode:", storage_mode);
+        println!("[WARN][STORAGE]    Max storage: {} GB", max_storage_size / (1024 * 1024 * 1024));
+        println!("[WARN][STORAGE]    Sliding window: {} blocks", 
                 if sliding_window_size == u64::MAX { "unlimited".to_string() } else { sliding_window_size.to_string() });
         
         // SAFETY WARNING: Check aggressive pruning settings
+        // v3.18: Aggressive pruning check (only for Light nodes, Super nodes are archival)
         let aggressive_pruning_enabled = std::env::var("QNET_AGGRESSIVE_PRUNING")
             .unwrap_or_else(|_| "0".to_string()) == "1";
         
-        if aggressive_pruning_enabled && storage_mode == StorageMode::Full {
+        if aggressive_pruning_enabled && storage_mode == StorageMode::Light {
             let super_node_count = Self::estimate_super_node_count();
             let min_safe_super_nodes = 50u64;
             
-            println!("");
-            println!("⚠️⚠️⚠️ WARNING: AGGRESSIVE PRUNING ENABLED ⚠️⚠️⚠️");
+            println!("[WARN][STORAGE] aggressive_pruning_enabled super_nodes={} min_required={}", 
+                     super_node_count, min_safe_super_nodes);
             println!("This Full node will delete microblocks immediately after finalization!");
             println!("");
             println!("Network Status:");
@@ -2435,7 +2574,7 @@ impl Storage {
             
             if super_node_count < min_safe_super_nodes {
                 println!("");
-                println!("🚨 CRITICAL: Network safety at RISK!");
+                println!("[WARN][STORAGE] CRITICAL: Network safety at RISK!");
                 println!("   Not enough Super nodes to maintain full blockchain archive.");
                 println!("   Aggressive pruning will be AUTOMATICALLY DISABLED during macroblock finalization.");
                 println!("   Consider setting QNET_AGGRESSIVE_PRUNING=0 until network grows.");
@@ -2495,7 +2634,7 @@ impl Storage {
         // Check if storage is critically full before accepting new blocks
         if self.is_storage_critically_full()? {
             // Try emergency cleanup first
-            println!("[Storage] 🚨 Storage critically full - attempting emergency cleanup before save_block");
+            println!("[WARN][STORAGE] Storage critically full - attempting emergency cleanup before save_block");
             self.emergency_cleanup()?;
             
             // Re-check after cleanup
@@ -2530,7 +2669,7 @@ impl Storage {
         
         // Step 2: Check if storage is critically full
         if self.is_storage_critically_full()? {
-            println!("[Storage] 🚨 Storage critically full - attempting emergency cleanup");
+            println!("[WARN][STORAGE] Storage critically full - attempting emergency cleanup");
             self.emergency_cleanup()?;
             
             // If still full after cleanup, try graceful degradation
@@ -2552,36 +2691,26 @@ impl Storage {
         
         match effective_mode {
             StorageMode::Light => {
-                // LIGHT MODE: Store header only + auto-rotate
-                if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(data) {
-                    let header = qnet_state::LightMicroBlock {
-                        height: microblock.height,
-                        timestamp: microblock.timestamp,
-                        tx_count: microblock.transactions.len() as u32,
-                        merkle_root: microblock.merkle_root,
-                        size_bytes: data.len() as u32,
-                        producer: microblock.producer.clone(),
-                    };
-                    
-                    let header_data = bincode::serialize(&header)
-                        .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-                    
-                    let compressed = zstd::encode_all(&header_data[..], 3)
-                        .map_err(|e| IntegrationError::Other(format!("Zstd error: {}", e)))?;
-                    
-                    // Auto-rotate old headers to maintain ~100MB limit
-                    let rotated = self.rotate_light_headers(height)?;
-                    if rotated > 0 && height % 1000 == 0 {
-                        println!("[Storage] 🔄 Light mode: rotated {} old headers", rotated);
-                    }
-                    
-                    return self.persistent.save_microblock(height, &compressed);
-                }
-                // Fallback for non-MicroBlock data
-                self.persistent.save_microblock(height, data)
+                // ═══════════════════════════════════════════════════════════════════════════
+                // LIGHT MODE (v3.19): Pure API client - NO local storage
+                // ═══════════════════════════════════════════════════════════════════════════
+                // Light nodes (mobile wallets) do NOT store ANY blockchain data!
+                // They are pure API clients like Phantom wallet:
+                //
+                // - Balance: GET /api/v1/balance/{wallet}
+                // - TX history: GET /api/v1/address/{wallet}
+                // - Send TX: POST /api/v1/transaction
+                //
+                // The wallet app (qnet-mobile, qnet-wallet) stores user's TX history
+                // in its own localStorage/AsyncStorage - NOT in RocksDB!
+                //
+                // This function should NEVER be called for Light nodes in production.
+                // If called, just ignore - Light nodes don't participate in sync.
+                // ═══════════════════════════════════════════════════════════════════════════
+                Ok(())
             },
-            StorageMode::Full | StorageMode::Super => {
-                // FULL/SUPER MODE: Full block storage with EfficientMicroBlock format
+            StorageMode::Super => {
+                // SUPER MODE: Full block storage with EfficientMicroBlock format
                 if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(data) {
                     return self.save_microblock_efficient(height, &microblock);
                 }
@@ -2699,6 +2828,8 @@ impl Storage {
             // Quantum Randomness Beacon (QRB) v3.0
             vrf_output: microblock.vrf_output,
             vrf_proof: microblock.vrf_proof.clone(),
+            // v3.18: Copy fees_collected for producer rewards
+            fees_collected: microblock.fees_collected,
         };
         
         // Step 3: Save PoH state separately for fast validation (v2.19.13)
@@ -2883,33 +3014,44 @@ impl Storage {
                 ));
             }
             
-            // In production, this would be actual state data, not just macroblock
-            // For now, we use macroblock as placeholder for state
-            self.save_state_snapshot(height, macroblock.state_root, state_data).await?;
-            println!("[STATE] 📸 State snapshot saved at macroblock #{} (verified)", height);
-        }
-        
-        // OPTIMIZATION: Prune finalized microblocks based on node type
-        // CRITICAL: Only prune if enabled AND network has enough Super nodes for safety
-        if std::env::var("QNET_AGGRESSIVE_PRUNING").unwrap_or_else(|_| "0".to_string()) == "1" {
-            // SAFETY CHECK: Verify network has enough archival Super nodes
-            let super_node_count = Self::estimate_super_node_count();
-            let min_required_super_nodes = 10u64; // Minimum for network safety
-            
-            if super_node_count < min_required_super_nodes {
-                println!("[PRUNING] 🛡️ SAFETY: Aggressive pruning DISABLED - insufficient Super nodes in network");
-                println!("[PRUNING]    Current Super nodes: {} | Required minimum: {}", 
-                        super_node_count, min_required_super_nodes);
-                println!("[PRUNING]    Full blockchain archive must be maintained until more Super nodes join!");
-                // Skip aggressive pruning for network safety
-            } else if self.storage_mode == StorageMode::Full {
-                // Safe to prune: network has enough archival nodes
-                println!("[PRUNING] ✅ Network safety verified: {} Super nodes maintain full archive", 
-                        super_node_count);
-                self.prune_finalized_microblocks(macroblock).await?;
+            // v3.19: Save state snapshot every 10th macroblock (saves ~45MB/day!)
+            // OLD: Every macroblock = 960 snapshots/day × ~50KB = 48MB/day
+            // NEW: Every 10th = 96 snapshots/day × ~50KB = ~5MB/day
+            // SAFETY: Can restore from any snapshot + replay macroblocks
+            if height % 10 == 0 || height <= 10 {
+                self.save_state_snapshot(height, macroblock.state_root, state_data).await?;
+                println!("[STATE] 📸 State snapshot saved at macroblock #{} (every 10th)", height);
             }
         }
-        // Normal operation: rely on sliding window pruning in prune_old_blocks()
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // STORAGE STRATEGY (v3.19)
+        // ═══════════════════════════════════════════════════════════════════════════
+        // 
+        // SUPER/GENESIS NODES (servers):
+        //   - ARCHIVAL mode - keep ALL microblocks forever
+        //   - Required for network sync (other nodes download from them)
+        //   - Storage: ~500MB-1GB per day
+        //
+        // LIGHT NODES (mobile wallets):
+        //   - Pure API clients - NO local storage at all!
+        //   - They never call save_macroblock() - this code path is unreachable
+        //   - All data fetched via API: /api/v1/address/{wallet}, etc.
+        //   - Wallet app stores TX history in localStorage/AsyncStorage
+        //
+        // New Super nodes use snapshot-based sync:
+        // 1. Download snapshot from /api/v1/snapshot/latest
+        // 2. Restore accounts/balances from snapshot
+        // 3. Sync only blocks from snapshot_height to current
+        // ═══════════════════════════════════════════════════════════════════════════
+        
+        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        
+        // Super/Genesis: ARCHIVAL - keep all microblocks for network sync
+        if is_genesis && macroblock.height % 1000 == 0 {
+            println!("[INFO][STORAGE] archival_mode node_type=genesis height={}", macroblock.height);
+        }
+        // NO PRUNING - Super nodes are archival!
         
         Ok(())
     }
@@ -3026,6 +3168,17 @@ impl Storage {
         if pruned > 0 {
             self.persistent.db.write(batch)?;
             println!("[PRUNING] ✅ Pruned {} microblocks (3 leader rotations finalized)", pruned);
+            
+            // v3.19: Trigger compaction to reclaim disk space immediately
+            self.persistent.db.compact_range_cf(&microblocks_cf, None::<&[u8]>, None::<&[u8]>);
+        }
+        
+        // v3.19: Prune old heartbeats every 10 macroblocks (~15 min)
+        // Keep 8h (2 epochs) - enough for reward calculation (needs 4h window)
+        // OLD: 24h = 6 epochs = excessive
+        // NEW: 8h = 2 epochs = safe margin
+        if macroblock.height % 10 == 0 {
+            let _ = self.persistent.prune_old_heartbeats(28800); // 8h = 28800 sec
         }
         
         Ok(())
@@ -3191,6 +3344,8 @@ impl Storage {
                         // QRB v3.0: VRF fields
                         vrf_output: efficient_block.vrf_output,
                         vrf_proof: efficient_block.vrf_proof,
+                        // v3.18: Direct fee collection
+                        fees_collected: efficient_block.fees_collected,
                     };
                     
                     // Serialize as full MicroBlock for network transmission
@@ -3362,6 +3517,8 @@ impl Storage {
                 // Quantum Randomness Beacon (QRB) v3.0
                 vrf_output: efficient_block.vrf_output,
                 vrf_proof: efficient_block.vrf_proof,
+                // v3.18: fees_collected for producer rewards
+                fees_collected: efficient_block.fees_collected,
             };
             
             return Ok(Some(microblock));
@@ -4920,7 +5077,7 @@ impl Storage {
         // Keep ~30 days of history (assuming ~100 failovers per day worst case)
         let max_events = match std::env::var("QNET_NODE_TYPE").unwrap_or_default().as_str() {
             "super" => 10_000,   // Super nodes: ~30 days (400KB) - enough for analysis
-            "full" => 10_000,    // Full nodes: same as Super - they participate in consensus
+            // v3.18: Full nodes removed - use "super" for all server nodes
             _ => 0,              // Light nodes: don't store (mobile devices)
         };
         
@@ -5927,23 +6084,17 @@ impl Storage {
     
     /// Check if block is within retention window
     pub fn is_block_retained(&self, height: u64) -> bool {
-        if self.storage_mode == StorageMode::Super {
-            return true; // Super nodes keep everything
+        match self.storage_mode {
+            StorageMode::Super => true,  // Super nodes keep everything (archival)
+            StorageMode::Light => false, // Light nodes don't store blocks (API client)
         }
-        
-        if self.storage_mode == StorageMode::Light {
-            return false; // Light nodes don't keep full blocks
-        }
-        
-        let current = self.get_chain_height().unwrap_or(0);
-        height + self.sliding_window_size > current
     }
     
     /// Estimate storage requirements for current configuration
     pub fn estimate_storage_requirements(&self) -> String {
+        // v3.19: Light nodes = NO storage (pure API client), Super = archival
         match self.storage_mode {
-            StorageMode::Light => "~50-100 MB (headers + minimal state, mobile/IoT devices)".to_string(),
-            StorageMode::Full => format!("~50-100 GB (last {} blocks + snapshots)", self.sliding_window_size),
+            StorageMode::Light => "0 MB (API client only, no local storage)".to_string(),
             StorageMode::Super => "500 GB - 1 TB (complete blockchain history with compression)".to_string(),
         }
     }

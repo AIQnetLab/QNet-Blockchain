@@ -725,10 +725,10 @@ fn generate_eon_address_from_id(id: &str) -> String {
 
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
+/// v3.18: Removed Full node type - only Light and Super remain
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum NodeType {
     Light,
-    Full,
     Super,
 }
 
@@ -1590,9 +1590,9 @@ impl BlockchainNode {
     /// Cache node registration for fast lookups
     async fn cache_node_registration(&self, node_id: &str, node_type: qnet_state::NodeType, wallet: String) {
         // Use storage for persistence
+        // v3.18: Full node type removed
         let type_str = match node_type {
             qnet_state::NodeType::Light => "light",
-            qnet_state::NodeType::Full => "full",
             qnet_state::NodeType::Super => "super",
         };
         let _ = self.storage.save_node_registration(node_id, type_str, &wallet, 1.0);
@@ -1602,9 +1602,9 @@ impl BlockchainNode {
     async fn get_cached_node_registration(&self, node_id: &str) -> Option<(qnet_state::NodeType, String)> {
         match self.storage.load_node_registration(node_id) {
             Ok(Some((type_str, wallet, _))) => {
+                // v3.18: Full node type removed - map "full" to Super
                 let node_type = match type_str.to_lowercase().as_str() {
-                    "super" => qnet_state::NodeType::Super,
-                    "full" => qnet_state::NodeType::Full,
+                    "super" | "full" => qnet_state::NodeType::Super,
                     _ => qnet_state::NodeType::Light,
                 };
                 Some((node_type, wallet))
@@ -1624,9 +1624,9 @@ impl BlockchainNode {
             if let qnet_state::TransactionType::NodeRegistration { 
                 node_id, node_type, wallet_address, .. 
             } = &tx.tx_type {
+                // v3.18: Full node type removed
                 let type_str = match node_type {
                     qnet_state::NodeType::Super => "super",
-                    qnet_state::NodeType::Full => "full",
                     qnet_state::NodeType::Light => "light",
                 };
                 if let Err(e) = storage.save_node_registration(node_id, type_str, wallet_address, INITIAL_REPUTATION) {
@@ -1898,9 +1898,10 @@ impl BlockchainNode {
                 .map(|(_, wallet, _)| wallet)
                 .unwrap_or_else(|| generate_eon_address_from_id(&node_id));
             
+            // v3.18: Full node type removed
             let reward_type = match node_type.to_lowercase().as_str() {
-                "super" => RewardNodeType::Super,
-                _ => RewardNodeType::Full,
+                "super" | "full" => RewardNodeType::Super,
+                _ => RewardNodeType::Light,
             };
             
             let _ = reward_manager.register_node(node_id.clone(), reward_type, wallet_address);
@@ -3190,10 +3191,9 @@ impl BlockchainNode {
                 last_heartbeat_time,
                 ..
             } = tx_type {
+                // v3.18: Full nodes removed
                 let node_type = if node_id.starts_with("light_") {
                     0
-                } else if node_id.starts_with("full_") {
-                    1
                 } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
                     2
                 } else {
@@ -3253,10 +3253,9 @@ impl BlockchainNode {
                 last_heartbeat_time,
                 ..
             } = &tx_type {
+                // v3.18: Full nodes removed
                 let node_type = if node_id.starts_with("light_") {
                     0
-                } else if node_id.starts_with("full_") {
-                    1
                 } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
                     2
                 } else {
@@ -3300,7 +3299,6 @@ impl BlockchainNode {
             
             let mut total_nodes = 0;
             let mut eligible_light = 0;
-            let mut eligible_full = 0;
             let mut eligible_super = 0;
             let mut commitment_hashes = Vec::new();
             
@@ -3312,20 +3310,22 @@ impl BlockchainNode {
                 } = tx_type {
                     total_nodes += 1;
                     
+                    // v3.18: Full nodes removed
                     let node_type = if node_id.starts_with("light_") {
-                        0
-                    } else if node_id.starts_with("full_") {
-                        1
+                        0  // Mobile node (Light)
                     } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
-                        2
+                        2  // Server node (Super)
+                    } else if node_id.starts_with("full_") {
+                        // v3.18: Reject old Full node format
+                        continue;
                     } else {
                         continue;
                     };
                     
+                    // v3.18: Light=1, Super=9 heartbeats required
                     let required = match node_type {
-                        0 => 1,
-                        1 => 8,
-                        2 => 9,
+                        0 => 1,   // Mobile: 1 heartbeat
+                        2 => 9,   // Server: 9 heartbeats
                         _ => 10,
                     };
                     let is_eligible = *heartbeat_count >= required;
@@ -3333,7 +3333,6 @@ impl BlockchainNode {
                     if is_eligible {
                         match node_type {
                             0 => eligible_light += 1,
-                            1 => eligible_full += 1,
                             2 => eligible_super += 1,
                             _ => {}
                         }
@@ -3344,7 +3343,8 @@ impl BlockchainNode {
             }
             
             if total_nodes > 0 {
-                let total_eligible = eligible_light + eligible_full + eligible_super;
+                // v3.18: eligible_full always 0 (struct compat)
+                let total_eligible = eligible_light + eligible_super;
                 
                 let sample_count = (commitment_hashes.len() * 10 / 100).max(1).min(commitment_hashes.len());
                 let sample_hashes: Vec<String> = commitment_hashes.iter().take(sample_count).cloned().collect();
@@ -3355,11 +3355,12 @@ impl BlockchainNode {
                 }
                 let commitments_root = hex::encode(hasher.finalize());
                 
+                // v3.18: eligible_full always 0 (Full nodes removed)
                 shard_summaries.push(qnet_state::ShardHeartbeatSummary {
                     shard_id,
                     total_nodes,
                     eligible_light,
-                    eligible_full,
+                    eligible_full: 0, // v3.18: Full nodes removed, always 0
                     eligible_super,
                     total_eligible,
                     commitments_merkle_root: commitments_root,
@@ -3918,7 +3919,7 @@ impl BlockchainNode {
             data_dir,
             p2p_port,
             bootstrap_peers,
-            NodeType::Full,
+            NodeType::Super, // v3.18: Full removed, default to Super
             region,
         ).await
     }
@@ -3971,9 +3972,9 @@ impl BlockchainNode {
                 })
                 .unwrap_or(8_000); // Assume 8GB if can't detect (non-Linux)
             
+            // v3.18: Full node type removed
             if total_ram_mb < MIN_RAM_SERVER_MB {
                 let node_type_str = match node_type {
-                    NodeType::Full => "Full",
                     NodeType::Super => "Super",
                     NodeType::Light => "Light", // Should never happen - Light nodes are mobile apps
                 };
@@ -4440,9 +4441,9 @@ impl BlockchainNode {
         // Create unified P2P with regional clustering
         if is_debug() { println!("[DBG][P2P] unified_p2p_init"); }
         
+        // v3.18: Full node type removed
         let unified_node_type = match node_type {
             NodeType::Light => UnifiedNodeType::Light,
-            NodeType::Full => UnifiedNodeType::Full,
             NodeType::Super => UnifiedNodeType::Super,
         };
         
@@ -4726,11 +4727,11 @@ impl BlockchainNode {
                             let (node_type, wallet) = match registration {
                                 Ok(Some((node_type_str, wallet, _reputation))) => {
                                     // Normal case: node found in storage
+                                    // v3.18: Full node type removed - map to Super
                                     let nt = match node_type_str.to_lowercase().as_str() {
                                         "light" => RewardNodeType::Light,
-                                        "full" => RewardNodeType::Full,
-                                        "super" => RewardNodeType::Super,
-                                        _ => RewardNodeType::Full,
+                                        "super" | "full" => RewardNodeType::Super,
+                                        _ => RewardNodeType::Light,
                                     };
                                     (nt, wallet)
                                 }
@@ -4799,9 +4800,9 @@ impl BlockchainNode {
         if let Err(e) = archive_manager.register_archive_node(&node_id, node_type, &node_ip).await {
             if is_warn() { println!("[WARN][NODE] archive_reg_fail err={}", e); }
         } else {
+            // v3.18: Full node type removed
             let quota = match node_type {
                 NodeType::Light => 0,
-                NodeType::Full => 3,
                 NodeType::Super => 8,
             };
             if is_info() { println!("[INFO][NODE] archive_reg chunks={}", quota); }
@@ -4814,8 +4815,9 @@ impl BlockchainNode {
         // CRITICAL: VTS only runs on Full and Super nodes (block producers)
         // Light nodes do NOT run PoH - they are mobile devices with limited resources
         // =========================================================================
+        // v3.18: Full node type removed
         let (quantum_poh, poh_receiver): (Option<Arc<crate::quantum_poh::QuantumPoH>>, Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::quantum_poh::PoHEntry>>>>) = 
-            if matches!(node_type, NodeType::Full | NodeType::Super) {
+            if matches!(node_type, NodeType::Super) {
                 if is_info() { println!("[INFO][POH] init type={:?}", node_type); }
                 
                 // Get genesis hash for PoH initialization
@@ -5918,9 +5920,10 @@ impl BlockchainNode {
         // Full/Super nodes: 500 blocks (~50MB) - covers 8+ minutes of network issues
         // Light nodes: 100 blocks (~10MB) - minimal memory footprint
         // Protects against malicious peers sending out-of-order blocks
+        // v3.18: Full node type removed
         let max_pending_blocks: usize = match node_type {
             NodeType::Light => 100,  // Light nodes: minimal memory (~10MB)
-            NodeType::Full | NodeType::Super => 500,  // Full/Super: larger buffer (~50MB)
+            NodeType::Super => 500,  // Super: larger buffer (~50MB)
         };
         
         // CRITICAL: REORG PROTECTION - Prevent concurrent reorgs and DoS attacks
@@ -6555,29 +6558,9 @@ impl BlockchainNode {
                                     // Some transactions may fail validation (insufficient balance, etc)
                                     println!("[WARN][STATE] tx_apply_failed hash={} err={}", tx.hash, e);
                                 } else {
-                                    // POOL #2 INTEGRATION: Collect transaction fees
-                                    // Only collect fees for non-system transactions
-                                    // QUANTUM v2.25: Use effective_gas_price() for +50% Dilithium TX fee
-                                    if !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
-                                        let fee_amount = tx.effective_gas_price() * tx.gas_limit;
-                                        if fee_amount > 0 {
-                                            // v2.51.1: Add fees to BOTH sources for deterministic distribution
-                                            // 1. reward_manager for local calculation (legacy)
-                                            let mut reward_mgr = reward_manager.write().await;
-                                            reward_mgr.add_transaction_fees(fee_amount);
-                                            
-                                            // 2. p2p accumulator for MacroBlock recording (deterministic)
-                                            // CRITICAL: This is used by MacroBlock.consensus_data.pool2_total_fees
-                                            if let Some(ref p2p) = unified_p2p {
-                                                p2p.add_to_pool2(fee_amount);
-                                            }
-                                            
-                                            // Log only for significant fees (> 0.001 QNC)
-                                            if fee_amount > 1_000_000 {
-                                                if is_debug() { println!("[DBG][POOL2] fee_collected amount={} nanoQNC", fee_amount); }
-                                            }
-                                        }
-                                    }
+                                    // v3.18: Pool 2 REMOVED - fees go directly to block producer
+                                    // Fee calculation still happens for transparency (fees_collected in block)
+                                    // Actual crediting happens AFTER all TXs are processed (see below)
                                     
                                     // POOL #3 INTEGRATION: Collect Phase 2 activation payments
                                     // Phase 2: QNC from node activation goes to Pool 3 (equal share to all)
@@ -6618,9 +6601,9 @@ impl BlockchainNode {
                                             node_id, node_type, wallet_address, .. 
                                         } => {
                                             // Cache in RocksDB for fast access (blockchain is source of truth)
+                                            // v3.18: Full node type removed
                                             let type_str = match node_type {
                                                 qnet_state::NodeType::Super => "super",
-                                                qnet_state::NodeType::Full => "full",
                                                 qnet_state::NodeType::Light => "light",
                                             };
                                             let _ = storage.save_node_registration(node_id, type_str, wallet_address, 1.0);
@@ -6631,6 +6614,46 @@ impl BlockchainNode {
                                             }
                                         }
                                         _ => {} // Other transaction types don't contribute to Pool 3
+                                    }
+                                }
+                            }
+                            
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v3.18: DIRECT FEE CREDITING - Credit fees to block producer
+                            // This replaces Pool 2 - fees go directly to producer, not pooled
+                            // IDEMPOTENCY: Only credit if block is NEW (not already in storage)
+                            // ═══════════════════════════════════════════════════════════════════
+                            let block_is_new = match storage.load_microblock(microblock.height) {
+                                Ok(Some(_)) => false, // Block already exists
+                                _ => true, // Block is new
+                            };
+                            
+                            if microblock.fees_collected > 0 && block_is_new {
+                                // Find producer's wallet from node registration
+                                let producer_wallet = match storage.load_node_registration(&microblock.producer) {
+                                    Ok(Some((_, wallet, _))) => wallet,
+                                    _ => {
+                                        // Genesis nodes have node_id like "genesis_node_001"
+                                        // Their wallet should be registered in block 0
+                                        if is_warn() {
+                                            println!("[WARN][FEES] producer_wallet_not_found producer={} h={}", 
+                                                     microblock.producer, microblock.height);
+                                        }
+                                        String::new() // Skip crediting if no wallet found
+                                    }
+                                };
+                                
+                                if !producer_wallet.is_empty() {
+                                    // Credit fees directly to producer (like Ethereum coinbase)
+                                    if let Err(e) = state_guard.credit_producer_fees(&producer_wallet, microblock.fees_collected) {
+                                        eprintln!("[ERR][FEES] credit_failed producer={} wallet={} fees={} err={}", 
+                                                 microblock.producer, producer_wallet, microblock.fees_collected, e);
+                                    } else if is_info() && microblock.fees_collected > 10_000_000 {
+                                        // Log only for significant fees (> 0.01 QNC)
+                                        println!("[INFO][FEES] credited producer={} wallet={}... fees={} nanoQNC h={}",
+                                                 microblock.producer, 
+                                                 &producer_wallet[..16.min(producer_wallet.len())],
+                                                 microblock.fees_collected, microblock.height);
                                     }
                                 }
                             }
@@ -8388,8 +8411,9 @@ impl BlockchainNode {
             // Light nodes will sync through P2P received blocks
         }
         
-        // PRODUCTION: Start archive compliance enforcement (mandatory for Full/Super nodes)
-        if matches!(self.node_type, NodeType::Full | NodeType::Super) {
+        // PRODUCTION: Start archive compliance enforcement (mandatory for Super nodes)
+        // v3.18: Full node type removed
+        if matches!(self.node_type, NodeType::Super) {
             println!("[Archive] 📋 Starting archive compliance monitoring...");
             self.start_archive_compliance_monitoring().await;
             
@@ -9298,6 +9322,7 @@ impl BlockchainNode {
                                 // QRB v3.0: Genesis has no VRF (no prev_hash to derive from)
                                 vrf_output: None,
                                 vrf_proof: None,
+                                fees_collected: 0, // v3.18: Genesis block has no fees
                             };
                             
                             // PRODUCTION: Use deterministic signature for Genesis Block
@@ -9980,9 +10005,9 @@ impl BlockchainNode {
                             let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
                             let data_dir = std::path::Path::new(&storage_path);
                             // Convert node::NodeType to unified_p2p::NodeType
+                            // v3.18: Full node type removed
                             let unified_node_type = match node_type {
                                 NodeType::Light => crate::unified_p2p::NodeType::Light,
-                                NodeType::Full => crate::unified_p2p::NodeType::Full,
                                 NodeType::Super => crate::unified_p2p::NodeType::Super,
                             };
                             if let Err(e) = std::fs::create_dir_all(&data_dir) {
@@ -12078,10 +12103,9 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                             //     * Full:  1.0 weight  
                                             //     * Light: 1.0 weight (equal participation)
                                             // 
-                                            // Pool 2: Transaction fees
-                                            //   - 70% Super nodes (validators)
-                                            //   - 30% Full nodes (relayers)
-                                            //   - 0% Light nodes (don't process transactions)
+                                            // Pool 2: REMOVED in v3.18
+                                            //   - Fees go directly to block producer
+                                            //   - See fees_collected in MicroBlock
                                             // 
                                             // Pool 3: Activation bonuses (Phase 2 only)
                                             //   - Equal share to ALL eligible nodes (Light/Full/Super)
@@ -12139,10 +12163,10 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                                     }
                                                 }
                                                 
-                                                // Process ALL nodes (Light/Full/Super) together via unified deterministic function
+                                                // v3.18: Process all nodes (Light/Super) via unified deterministic function
                                                 // This ensures:
                                                 // - Pool 1: ALL nodes get equal share
-                                                // - Pool 2: Light=0%, Full=30%, Super=70%
+                                                // - Pool 2: REMOVED - fees go to block producer
                                                 // - Pool 3: ALL nodes get equal share (Phase 2 only)
                                                 {
                                                     let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = all_summaries.iter()
@@ -12976,6 +13000,19 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         continue;
                     }
                     
+                    // ═══════════════════════════════════════════════════════════════════
+                    // v3.18: Calculate fees_collected BEFORE creating microblock
+                    // Fees go directly to producer (Pool 2 removed)
+                    // ═══════════════════════════════════════════════════════════════════
+                    let mut block_fees_collected: u64 = 0;
+                    for tx in &txs {
+                        // QUANTUM v2.25: Use effective_gas_price() for +50% Dilithium TX fee
+                        if !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
+                            let fee_amount = tx.effective_gas_price() * tx.gas_limit;
+                            block_fees_collected = block_fees_collected.saturating_add(fee_amount);
+                        }
+                    }
+                    
                     let mut microblock = qnet_state::MicroBlock {
                         height: next_block_height,  // Use next_block_height instead of microblock_height
                         timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
@@ -12990,6 +13027,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // Note: struct fields named vrf_* for serialization compatibility
                         vrf_output: qrb_output,
                         vrf_proof: qrb_proof,
+                        fees_collected: block_fees_collected, // v3.18: Direct to producer
                     };
                     
                     // QUANTUM VTS: Mix microblock into VTS chain for cryptographic time proof
@@ -13237,24 +13275,33 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             }
                         }
                         
-                        // POOL #2 INTEGRATION: Collect transaction fees from producer's own block
-                        // This ensures fees are collected even when producer creates the block
-                        let mut total_fees_collected: u64 = 0;
-                        for tx in &txs {
-                            // QUANTUM v2.25: Use effective_gas_price() for +50% Dilithium TX fee
-                            if !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
-                                let fee_amount = tx.effective_gas_price() * tx.gas_limit;
-                                if fee_amount > 0 {
-                                    total_fees_collected += fee_amount;
+                        // ═══════════════════════════════════════════════════════════════════
+                        // v3.18: DIRECT FEE CREDITING - Credit fees to self (producer)
+                        // block_fees_collected was calculated before microblock creation
+                        // ═══════════════════════════════════════════════════════════════════
+                        if block_fees_collected > 0 {
+                            // Get producer's own wallet from node registration
+                            let producer_wallet = match storage_clone.load_node_registration(&node_id) {
+                                Ok(Some((_, wallet, _))) => wallet,
+                                _ => {
+                                    // Genesis nodes should have registration
+                                    if is_warn() {
+                                        println!("[WARN][FEES] producer_self_wallet_not_found node={}", node_id);
+                                    }
+                                    String::new()
                                 }
-                            }
-                        }
-                        if total_fees_collected > 0 {
-                            let mut reward_mgr = reward_manager_for_spawn.write().await;
-                            reward_mgr.add_transaction_fees(total_fees_collected);
-                            // Log for significant fees (> 0.01 QNC)
-                            if total_fees_collected > 10_000_000 {
-                                println!("[POOL2] 💰 Producer collected {} nanoQNC in fees → Pool #2", total_fees_collected);
+                            };
+                            
+                            if !producer_wallet.is_empty() {
+                                let mut state_guard = state.write().await;
+                                if let Err(e) = state_guard.credit_producer_fees(&producer_wallet, block_fees_collected) {
+                                    eprintln!("[ERR][FEES] self_credit_failed wallet={} fees={} err={}", 
+                                             producer_wallet, block_fees_collected, e);
+                                } else if is_info() && block_fees_collected > 10_000_000 {
+                                    println!("[INFO][FEES] producer_credited self={} fees={} nanoQNC h={}",
+                                             &producer_wallet[..16.min(producer_wallet.len())],
+                                             block_fees_collected, height_for_storage);
+                                }
                             }
                         }
                         
@@ -14946,47 +14993,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
             
             // ═══════════════════════════════════════════════════════════════════════════
-            // v3.16: BYZANTINE 66% CONSENSUS on producer selection at rotation boundaries
+            // v3.17: Pure deterministic producer selection (QRDS)
             // ═══════════════════════════════════════════════════════════════════════════
-            // CRITICAL: At rotation boundaries, broadcast vote and wait for 66% consensus
-            // This prevents forks when different nodes compute different producers
+            // Removed Byzantine voting - determinism ensured by calculate_qualified_candidates(target_height)
+            // All nodes use same target_height → same MacroBlock N-2 → same candidates → same producer
             // ═══════════════════════════════════════════════════════════════════════════
             let is_rotation_boundary = current_height > 0 && (current_height - 1) % rotation_interval == 0;
-            
-            let final_producer = if is_rotation_boundary {
-                // Rotation boundary - need 66% consensus!
-                let consensus_producer = Self::producer_vote_consensus(
-                    current_height,
-                    &selected_producer,
-                    own_node_id,
-                    timeout_round,
-                    p2p,
-                    &candidates,
-                ).await;
-                
-                if consensus_producer != selected_producer {
-                    if is_info() {
-                        println!("[INFO][VOTE] override h={} local={} consensus={}", 
-                                 current_height, selected_producer, consensus_producer);
-                    }
-                }
-                
-                consensus_producer
-            } else {
-                // Not rotation boundary - use deterministic selection
-                selected_producer.clone()
-            };
             
             // Log at rotation boundaries
             if is_rotation_boundary || current_height == 1 {
                 let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
                 if is_info() {
                     println!("[INFO][QRDS] producer={} round={} timeout={} next_rotation={}", 
-                             final_producer, leadership_round, timeout_round, next_rotation_block);
+                             selected_producer, leadership_round, timeout_round, next_rotation_block);
                 }
             }
             
-            final_producer
+            selected_producer
         } else {
             // Solo mode - no P2P peers
             println!("[QRDS] 🏠 Solo mode - self production");
@@ -15988,14 +16011,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     own_reputation >= 0.70
                 }
             },
-            NodeType::Full => {
-                // EXISTING: Regular Full nodes need validated peers for consensus participation
-                let validated_peers = p2p.get_validated_active_peers();
-                let has_peers = validated_peers.len() >= 3; // EXISTING: 3f+1 Byzantine formula
-                let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                let has_reputation = own_reputation >= 0.70;
-                has_peers && has_reputation
-            },
             NodeType::Light => {
                 false // Light nodes never participate
             }
@@ -16136,11 +16151,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             NodeType::Super => {
                 // Super nodes always eligible if reputation ≥70%
                 println!("  ├── Own Super node: checking reputation threshold");
-                true // Will check reputation below
-            },
-            NodeType::Full => {
-                // Full nodes eligible if reputation ≥70% 
-                println!("  ├── Own Full node: checking reputation threshold");
                 true // Will check reputation below
             },
             NodeType::Light => {
@@ -20520,10 +20530,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 },
                 vrf_contributions_count: Some(vrf_contributions_count),
                 // ═══════════════════════════════════════════════════════════════════
-                // v2.50.0: POOL 2 & POOL 3 TOTALS - Deterministic reward calculation
+                // v3.18: POOL 3 TOTALS - Deterministic reward calculation
                 // Recorded ONLY in EMISSION MacroBlocks (every 160 = 4 hours)
                 // All nodes use SAME values from blockchain for identical rewards
-                // Pool 2: 70% Super, 30% Full, 0% Light (transaction fees)
+                // Pool 2: REMOVED - fees go directly to block producer (fees_collected)
                 // Pool 3: Equal share to ALL eligible (Phase 2 only)
                 // ═══════════════════════════════════════════════════════════════════
                 pool2_total_fees: {
@@ -21080,10 +21090,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 format!("{:?}", self.node_type)).as_bytes());
         
         // PRIVACY: Generate server-friendly display name without revealing IP
+        // v3.18: Full node type removed
         let node_type_prefix = match self.node_type {
             NodeType::Super => "super",
-            NodeType::Full => "full", 
-            _ => "node"
+            NodeType::Light => "light",
         };
         
         let region_hint = format!("{:?}", self.region).to_lowercase();
@@ -23067,9 +23077,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Save activation code to persistent storage with security validation
     pub async fn save_activation_code(&self, code: &str, node_type: NodeType) -> Result<(), QNetError> {
+        // v3.18: Full node type removed - use 2 for Super (backward compatible)
         let node_type_id = match node_type {
             NodeType::Light => 0,
-            NodeType::Full => 1,
             NodeType::Super => 2,
         };
         
@@ -23240,11 +23250,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Light nodes register through mobile app via RPC
         // Genesis nodes register separately
         if !bootstrap_whitelist.contains(&code) && node_type != NodeType::Light {
+            // v3.18: Full node type removed
             let mut reward_manager = self.reward_manager.write().await;
             let reward_node_type = match node_type {
-                NodeType::Full => RewardNodeType::Full,
                 NodeType::Super => RewardNodeType::Super,
-                _ => RewardNodeType::Full, // Should never happen
+                NodeType::Light => RewardNodeType::Light,
             };
             
             if let Err(e) = reward_manager.register_node(
@@ -23261,10 +23271,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // v2.71: Create ON-CHAIN NodeRegistration TX for Full/Super nodes
             // This ensures wallet→node binding is immutable and verifiable by all nodes
+            // v3.18: Full node type removed
             let qnet_node_type = match node_type {
                 NodeType::Super => qnet_state::NodeType::Super,
-                NodeType::Full => qnet_state::NodeType::Full,
-                _ => qnet_state::NodeType::Light,
+                NodeType::Light => qnet_state::NodeType::Light,
             };
             
             // Use activation code hash as registration proof
@@ -23302,11 +23312,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         match self.storage.load_activation_code()
             .map_err(|e| QNetError::StorageError(e.to_string()))? {
             Some((code, node_type_id, timestamp)) => {
+                // v3.18: Full node type removed - map old Full (1) to Super
                 let node_type = match node_type_id {
                     0 => NodeType::Light,
-                    1 => NodeType::Full,
                     2 => NodeType::Super,
-                    _ => NodeType::Full,
+                    1 => {
+                        // v3.18: Old Full node type - upgrade to Super for backward compatibility
+                        println!("[INFO][NODE] full_to_super_migration node_type_id=1");
+                        NodeType::Super
+                    },
+                    _ => {
+                        println!("[WARN][NODE] unknown_node_type id={} defaulting=Light", node_type_id);
+                        NodeType::Light // Default to Light for unknown types
+                    },
                 };
                 
                 // Check if activation is still valid (codes never expire - tied to blockchain burns)
@@ -23326,9 +23344,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Migrate device (same wallet, different device)
     pub async fn migrate_device(&self, code: &str, node_type: NodeType, new_device_signature: &str) -> Result<(), QNetError> {
+        // v3.18: Full node type removed - use 2 for Super (backward compatible)
         let node_type_id = match node_type {
             NodeType::Light => 0,
-            NodeType::Full => 1,
             NodeType::Super => 2,
         };
         
@@ -23997,11 +24015,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 println!("[Archive]   Average replicas per chunk: {:.1}", stats.avg_replicas);
                                 
                                 // Alert if this node is non-compliant
+                                // v3.18: Full node type removed
                                 if stats.non_compliant_nodes > 0 {
                                     let required_chunks = match node_type {
-                                        NodeType::Full => 3,
                                         NodeType::Super => 8,
-                                        _ => 0,
+                                        NodeType::Light => 0,
                                     };
                                     println!("[Archive] ⚠️  NETWORK COMPLIANCE ISSUE: {} nodes not meeting archive obligations", stats.non_compliant_nodes);
                                     println!("[Archive] 📋 Required: {} chunks for {:?} nodes", required_chunks, node_type);

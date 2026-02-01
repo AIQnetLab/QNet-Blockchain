@@ -91,9 +91,9 @@ pub struct NodeActivationInfo {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// v3.18: Full node type REMOVED - only Light and Super remain
 pub enum NodeType {
     Light,
-    Full,
     Super,
 }
 
@@ -117,18 +117,19 @@ impl NodeType {
     /// Get Phase 2 activation cost (QNC Pool 3 transfer) - REAL QNet model
     pub fn get_phase2_cost(&self, network_size: u64) -> u64 {
         // REAL QNet economic model: Different base costs per node type
+        // v3.18: Only Light and Super nodes (Full node type removed)
         let base_cost = match self {
-            NodeType::Light => 5000u64,  // 5,000 QNC
-            NodeType::Full => 7500u64,   // 7,500 QNC
-            NodeType::Super => 10000u64, // 10,000 QNC
+            NodeType::Light => 10000u64,  // 10,000 QNC base
+            NodeType::Super => 7500u64,   // 7,500 QNC base
         };
         
         // Network size multipliers - REAL QNet model
+        // CANONICAL VALUES - same across all components
         let multiplier = match network_size {
-            0..=100_000 => 0.5,      // Early discount
-            100_001..=1_000_000 => 1.0, // Standard rate
-            1_000_001..=10_000_000 => 2.0, // High demand
-            _ => 3.0,                // Mature network (10M+)
+            0..=100_000 => 0.5,          // ≤100K: Early adopter discount
+            100_001..=300_000 => 1.0,    // ≤300K: Base price
+            300_001..=1_000_000 => 2.0,  // ≤1M: High demand
+            _ => 3.0,                    // >1M: Maximum (cap)
         };
         
         (base_cost as f64 * multiplier) as u64

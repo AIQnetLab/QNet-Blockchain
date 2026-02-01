@@ -105,8 +105,9 @@ SOLANA_RPC_URL=https://api.devnet.solana.com
 | Node Type | Price (1DEV-TEST) | Percentage of Supply |
 |-----------|-------------------|---------------------|
 | **Light Node** | 1,500 | 0.00015% |
-| **Full Node** | 1,500 | 0.00015% |
 | **Super Node** | 1,500 | 0.00015% |
+
+> **v3.18**: Full Node type removed - only Light and Super nodes.
 
 **Note**: All node types have the same burn price of 1,500 tokens. Price decreases by 10% for every 10% of total supply burned, following the QNet economic model.
 

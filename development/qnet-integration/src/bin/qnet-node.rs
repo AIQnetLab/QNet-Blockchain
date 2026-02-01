@@ -73,7 +73,7 @@ async fn decode_activation_code_quantum_secure(
     // 2. Parse node type from payload (case-insensitive)
     let node_type = match payload.node_type.to_lowercase().as_str() {
         "light" => NodeType::Light,
-        "full" => NodeType::Full,
+        "full" => NodeType::Super,
         "super" => NodeType::Super,
         _ => return Err(format!("Invalid node type in activation code: {}", payload.node_type)),
     };
@@ -83,7 +83,7 @@ async fn decode_activation_code_quantum_secure(
         eprintln!("🚨 SECURITY VIOLATION: Light node activation attempted on server!");
         eprintln!("   Light nodes can ONLY be activated on mobile devices");
         eprintln!("   Server activation is STRICTLY FORBIDDEN for Light nodes");
-        eprintln!("   Use Full or Super node activation codes for servers");
+        eprintln!("   Use Super node activation codes for servers (v3.18: Full removed)");
         std::process::exit(1); // IMMEDIATE TERMINATION
     }
 
@@ -178,17 +178,13 @@ fn validate_server_node_type(node_type: NodeType) -> Result<(), String> {
         NodeType::Light => {
             eprintln!("❌ CRITICAL ERROR: Light nodes are NOT allowed on server hardware!");
             eprintln!("   🚫 Light nodes must run ONLY on mobile devices (phones, tablets)");
-            eprintln!("   🖥️  For servers use: Full Node or Super Node activation codes");
+            eprintln!("   🖥️  For servers use: Super Node activation codes (v3.18: Full nodes removed)");
             eprintln!("   💡 Get correct server activation code from wallet extension");
             eprintln!("");
             eprintln!("🛑 SYSTEM SECURITY: Blocking Light node server activation");
             
             // ABSOLUTE BLOCKING: Light nodes cannot run on servers 
             std::process::exit(1);
-        },
-        NodeType::Full => {
-            println!("✅ Full node validated for server deployment");
-            Ok(())
         },
         NodeType::Super => {
             println!("✅ Super node validated for server deployment");
@@ -588,12 +584,12 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
     let node_type = select_node_type(current_phase, &pricing_info)?;
 
     // Calculate activation price
+    // v3.18: Full node type removed - pricing for Light and Super only
     let price = match current_phase {
         1 => 10.0,      // Phase 1: Universal pricing
         2 => match node_type {
-            NodeType::Light => 5.0,
-            NodeType::Full => 10.0,
-            NodeType::Super => 20.0,
+            NodeType::Light => 10.0,   // Mobile Node (Light): 10,000 QNC base
+            NodeType::Super => 7.5,    // Server Node (Super): 7,500 QNC base
         },
         _ => 10.0,
     };
@@ -1059,46 +1055,38 @@ fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dy
         return Ok(NodeType::Super);
     }
     
+    // v3.18: Only Super nodes for servers (Full node type removed)
     loop {
         println!("\n🖥️ Node Type:");
-        println!("1. Full Node   - Standard server");
-        println!("2. Super Node  - High-performance server");
+        println!("1. Super Node  - Server/validator node (7,500 QNC base)");
+        println!("   NOTE: Full Node type was removed in v3.18");
         
-        // Show pricing
-    for (i, node_type) in [NodeType::Full, NodeType::Super].iter().enumerate() {
-        let price = calculate_node_price(phase, *node_type, pricing);
+        // Show pricing for Super node
+        let price = calculate_node_price(phase, NodeType::Super, pricing);
         let price_str = format_price(phase, price);
-            println!("   {}. {}", i + 1, price_str);
-    }
+        println!("   Price: {}", price_str);
     
-        print!("\nChoice (1-2): ");
-    io::stdout().flush()?;
+        print!("\nPress Enter to confirm Super Node, or 'q' to quit: ");
+        io::stdout().flush()?;
     
-    let mut input = String::new();
-    match io::stdin().read_line(&mut input) {
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
             Ok(_) => {},
             Err(_) => continue,
         }
         
-        // Take only the first digit from input
-        let choice = input.trim().chars()
-            .find(|c| c.is_ascii_digit())
-            .map(|c| c.to_string())
-            .unwrap_or_default();
-        
-        println!("Debug: cleaned input '{}'", choice);
+        let choice = input.trim().to_lowercase();
         
         match choice.as_str() {
-        "1" => {
-                println!("✅ Full Node selected");
-                return Ok(NodeType::Full);
-        },
-        "2" => {
+            "" | "1" | "y" | "yes" => {
                 println!("✅ Super Node selected");
                 return Ok(NodeType::Super);
-        },
-        _ => {
-                println!("❌ Invalid choice '{}'. Please enter 1 or 2.", choice);
+            },
+            "q" | "quit" | "exit" => {
+                return Err("User cancelled".into());
+            },
+            _ => {
+                println!("❌ Invalid choice '{}'. Press Enter to confirm or 'q' to quit.", choice);
                 // Continue the loop to ask again
             }
         }
@@ -1125,14 +1113,12 @@ fn calculate_node_price(phase: u8, node_type: NodeType, pricing: &PricingInfo) -
             current_price.max(min_price)
         }
         2 => {
-            // Phase 2: Real QNC pricing from contract constants
-            // QNC_LIGHT_ACTIVATION = 5000 QNC
-            // QNC_FULL_ACTIVATION = 7500 QNC  
-            // QNC_SUPER_ACTIVATION = 10000 QNC
+            // Phase 2: Real QNC pricing (v3.18)
+            // Mobile Node (Light): 10,000 QNC base
+            // Server Node (Super): 7,500 QNC base
             let base_price = match node_type {
-                NodeType::Light => 5_000.0,
-                NodeType::Full => 7_500.0,
-                NodeType::Super => 10_000.0,
+                NodeType::Light => 10_000.0,
+                NodeType::Super => 7_500.0,
             };
             base_price * pricing.network_multiplier
         }
@@ -1151,7 +1137,6 @@ fn format_price(phase: u8, price: f64) -> String {
 fn format_node_type(node_type: NodeType) -> &'static str {
     match node_type {
         NodeType::Light => "Light Node ",
-        NodeType::Full => "Full Node  ",
         NodeType::Super => "Super Node ",
     }
 }
@@ -1341,20 +1326,20 @@ fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
         .unwrap_or(false);
     
     if is_light_node {
-        // Light nodes (mobile) connect to Full/Super nodes for better decentralization
+        // v3.18: Light nodes (mobile) connect to Super nodes for better decentralization
         let genesis_ips = get_genesis_node_ips_dynamic();
-        let full_super_peers: Vec<String> = genesis_ips.iter()
+        let super_peers: Vec<String> = genesis_ips.iter()
             .take(2)  // Use first 2 Genesis nodes as fallback for Light nodes
             .map(|ip| format!("{}:8001", ip))
             .collect();
         
-        println!("[BOOTSTRAP] 📱 Light node: Connecting to Full/Super nodes");
-        println!("[BOOTSTRAP] ✅ {} Full/Super nodes for Light node: {:?}", 
-                 full_super_peers.len(), full_super_peers);
+        println!("[BOOTSTRAP] 📱 Light node: Connecting to Super nodes");
+        println!("[BOOTSTRAP] ✅ {} Super nodes for Light node: {:?}", 
+                 super_peers.len(), super_peers);
         
-        full_super_peers
+        super_peers
     } else {
-        // Full/Super/Genesis nodes connect to Genesis bootstrap network
+        // v3.18: Super/Genesis nodes connect to Genesis bootstrap network
         let genesis_ips = get_genesis_node_ips_dynamic();
         let genesis_bootstrap_peers: Vec<String> = genesis_ips.iter()
             .map(|ip| format!("{}:8001", ip))
@@ -2545,9 +2530,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Store activation code and node type for validation and storage configuration
     std::env::set_var("QNET_ACTIVATION_CODE", activation_code);
+    // v3.18: Full node type removed - only Light and Super remain
     std::env::set_var("QNET_NODE_TYPE", match node_type {
         NodeType::Light => "light",
-        NodeType::Full => "full",
         NodeType::Super => "super",
     });
     
@@ -2916,9 +2901,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(e) = std::fs::create_dir_all(&data_dir) {
                         println!("[SHUTDOWN] ⚠️ Failed to create data dir {}: {}", storage_path, e);
                     } else if let Ok(mut cert_manager) = p2p.certificate_manager.write() {
+                        // v3.18: Full node type removed - only Light and Super remain
                         let unified_node_type = match node_type {
                             NodeType::Light => qnet_integration::unified_p2p::NodeType::Light,
-                            NodeType::Full => qnet_integration::unified_p2p::NodeType::Full,
                             NodeType::Super => qnet_integration::unified_p2p::NodeType::Super,
                         };
                         match cert_manager.persist_to_disk(&data_dir, unified_node_type) {
@@ -3033,7 +3018,7 @@ fn parse_node_type(type_str: &str) -> Result<NodeType, String> {
         "light" => {
             Err("❌ Light nodes are not supported on servers! Light nodes are restricted to mobile devices only. Use 'full' or 'super' for server deployment.".to_string())
         },
-        "full" => Ok(NodeType::Full),
+        "full" => Ok(NodeType::Super),
         "super" => Ok(NodeType::Super),
         _ => Err(format!("❌ Invalid node type: '{}' for server deployment.\n🖥️  Servers support: full, super\n📱 Mobile devices support: light", type_str)),
     }
@@ -3396,21 +3381,15 @@ fn display_node_config(config: &AutoConfig, node_type: &NodeType, region: &Regio
     // Validate node type for server deployment
     match node_type {
         NodeType::Light => {
-            println!("  ❌ ERROR: Light nodes not supported on servers!");
-            println!("  📱 Light nodes are restricted to mobile devices only");
-            println!("  💡 Use mobile app for Light node activation");
-        },
-        NodeType::Full => {
-            println!("  ✅ Full node: Suitable for server deployment");
-            println!("  🔧 Capability: Full validation + microblock sync");
-            println!("  💰 Dynamic pricing: Base 7500 QNC × network multiplier (Phase 2)");
-            println!("  💰 Dynamic pricing: 1500→300 1DEV min (Phase 1, universal)");
+            println!("  [ERR] Light nodes not supported on servers!");
+            println!("  Light nodes are restricted to mobile devices only");
+            println!("  Use mobile app for Light node activation");
         },
         NodeType::Super => {
-            println!("  ✅ Super node: Optimized for server deployment");
-            println!("  🔧 Capability: Validation + production + maximum rewards");
-            println!("  💰 Dynamic pricing: Base 10000 QNC × network multiplier (Phase 2)");
-            println!("  💰 Dynamic pricing: 1500→300 1DEV min (Phase 1, universal)");
+            println!("  [OK] Super node: Optimized for server deployment");
+            println!("  Capability: Validation + production + maximum rewards");
+            println!("  Dynamic pricing: Base 7500 QNC x network multiplier (Phase 2)");
+            println!("  Dynamic pricing: 1500->300 1DEV min (Phase 1, universal)");
         },
     }
     
@@ -3887,10 +3866,11 @@ async fn calculate_base_reward() -> Result<f64, String> {
 async fn calculate_fee_share(node_type_str: &str) -> Result<f64, String> {
     let total_fees = 100.0; // In production: Query blockchain
     
+    // v3.18: Pool 2 removed - fees go directly to block producer
+    // This code kept for backward compatibility (always returns 0)
     let share_percentage = match node_type_str {
         "light" => 0.0,  // 0% of fees
-        "full" => 0.30,  // 30% of fees
-        "super" => 0.70, // 70% of fees
+        "super" => 0.0,  // v3.18: Fees go directly to producer, not pooled
         _ => 0.0,
     };
     
@@ -4120,9 +4100,10 @@ async fn scan_active_qnet_nodes() -> (RealNodeCounts, Vec<String>) {
     
     for peer_addr in discovered_peers.clone() {
         if let Ok(node_info) = query_node_info(&peer_addr).await {
+            // v3.18: Full nodes removed - "full" mapped to Super for backward compatibility
             match node_info.node_type.to_lowercase().as_str() {
                 "light" => counts.light += 1,
-                "full" => counts.full += 1,
+                "full" => counts.super_nodes += 1, // v3.18: Full nodes are now Super
                 "super" => counts.super_nodes += 1,
                 _ => {}
             }
@@ -4135,8 +4116,8 @@ async fn scan_active_qnet_nodes() -> (RealNodeCounts, Vec<String>) {
     println!("📊 Decentralized network scan complete:");
     println!("   🌐 Total Active Nodes: {}", counts.total);
     println!("   📱 Light Nodes: {} (mobile devices)", counts.light);
-    println!("   🖥️  Full Nodes: {} (servers)", counts.full);
-    println!("   ⚡ Super Nodes: {} (high-performance)", counts.super_nodes);
+    // v3.18: Full Nodes removed
+    println!("   ⚡ Super Nodes: {} (high-performance servers)", counts.super_nodes);
     
     // QUANTUM DECENTRALIZED: No file persistence - use real-time network discovery only
     println!("[DISCOVERY] 🔗 QUANTUM: Peer discovery completed via decentralized protocol (no cache persistence)");
@@ -4576,9 +4557,9 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
             println!("[DEBUG] Found existing activation code");
             let node_type = match node_type_id {
                 0 => NodeType::Light,
-                1 => NodeType::Full,
+                1 => NodeType::Super,
                 2 => NodeType::Super,
-                _ => NodeType::Full,
+                _ => NodeType::Super,
             };
             
             // Check if activation is still valid (codes never expire - tied to blockchain burns)

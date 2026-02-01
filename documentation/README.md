@@ -60,8 +60,8 @@
 
 ```bash
 # Dynamic pricing based on network burn progress (exponential decay curve)
+# v3.18: Only Light and Super nodes - Full node type removed
 Light Node:  1,500-300 $1DEV burned (decreases as total network burn % increases)
-Full Node:   1,500-300 $1DEV burned (decreases as total network burn % increases)  
 Super Node:  1,500-300 $1DEV burned (decreases as total network burn % increases)
 
 # Price reduction mechanism:
@@ -86,9 +86,9 @@ Macroblocks: 90 second intervals (90 microblocks)
 
 ```bash
 # Phase 2: Dynamic QNC pricing based on network size
-Light Node:  2,500-15,000 QNC (base: 5,000 QNC)
-Full Node:   3,750-22,500 QNC (base: 7,500 QNC)  
-Super Node:  5,000-30,000 QNC (base: 10,000 QNC)
+# v3.18: Only Light and Super nodes - Full node type removed
+Light Node:  5,000-30,000 QNC (base: 10,000 QNC)
+Super Node:  3,750-22,500 QNC (base: 7,500 QNC)
 
 # Network size multipliers:
 # 0-100K nodes: 0.5x (early network discount)
@@ -156,7 +156,7 @@ curl http://localhost:8545/api/v1/metrics
 | Type | Access Cost | Capabilities | Storage | Performance |
 |------|-------------|--------------|---------|-------------|
 | **Light** | 1,500-300 $1DEV | Basic validation, mobile-optimized | ~100MB (headers only) | 8,859 TPS mobile |
-| **Full** | 1,500-300 $1DEV | Complete validation, 30-day history | ~500GB (pruned) | 424,411 TPS blockchain |
+| ~~**Full**~~ | ~~1,500-300 $1DEV~~ | ~~v3.18: REMOVED~~ | ~~~500GB (pruned)~~ | ~~424,411 TPS blockchain~~ |
 | **Super** | 1,500-300 $1DEV | Priority validation, full archive | ~2TB (no pruning) | 424,411 TPS blockchain |
 
 > **Note (v2.19.10)**: Sharding is for parallel TX processing, NOT storage partitioning. All nodes receive all blocks; storage differs by tier.
@@ -238,10 +238,10 @@ await burnTokensOnSolana(burnAmount, nodeType);
 ### Phase 2: QNC Native (Future)
 ```rust
 // Simple QNC spending to Pool 3 (no burning)
+// v3.18: Only Light and Super nodes (Full removed)
 let required_balance = match node_type {
-    NodeType::Light => 5_000,
-    NodeType::Full => 7_500,
-    NodeType::Super => 10_000,
+    NodeType::Light => 10_000,  // Light: 10,000 QNC base
+    NodeType::Super => 7_500,   // Super: 7,500 QNC base
 };
 ```
 

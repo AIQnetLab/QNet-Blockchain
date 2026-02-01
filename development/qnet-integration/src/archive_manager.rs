@@ -111,7 +111,6 @@ impl ArchiveReplicationManager {
             // Static quotas for large networks
             match node_type {
                 NodeType::Light => 0,    // Light nodes exempt from archival
-                NodeType::Full => 3,     // Static: Full nodes archive 3 chunks
                 NodeType::Super => 8,    // Static: Super nodes archive 8 chunks
             }
         };
@@ -244,9 +243,8 @@ impl ArchiveReplicationManager {
                 }
                 
                 let required_chunks = match node_info.node_type {
-                    NodeType::Full => 3,
+                    NodeType::Light => continue,
                     NodeType::Super => 8,
-                    _ => continue,
                 };
                 
                 let actual_chunks = node_info.assigned_chunks.len() as u8;
@@ -374,7 +372,7 @@ impl ArchiveReplicationManager {
         // Count nodes by type
         let genesis_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Super)).count(); // Genesis treated as Super for now
         let super_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Super)).count();
-        let full_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Full)).count();
+        let full_count = 0; // v3.18: Always 0 (Full node type removed)
         let light_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Light)).count();
         
         drop(archive_nodes);
@@ -391,7 +389,6 @@ impl ArchiveReplicationManager {
                 
                 match node_type {
                     NodeType::Light => 0,
-                    NodeType::Full => 8,  // Increase Full node quota significantly
                     NodeType::Super => 15, // Increase Super node quota significantly
                 }
             },
@@ -403,7 +400,6 @@ impl ArchiveReplicationManager {
                 
                 match node_type {
                     NodeType::Light => 0,
-                    NodeType::Full => 6,  // Higher quota for Full nodes
                     NodeType::Super => 12, // Higher quota for Super nodes
                 }
             },
@@ -415,7 +411,6 @@ impl ArchiveReplicationManager {
                 
                 match node_type {
                     NodeType::Light => 0,
-                    NodeType::Full => 4,  // Slightly higher than standard
                     NodeType::Super => 10, // Slightly higher than standard
                 }
             },
@@ -427,7 +422,6 @@ impl ArchiveReplicationManager {
                 
                 match node_type {
                     NodeType::Light => 0,
-                    NodeType::Full => 3,  // Standard quota
                     NodeType::Super => 8,  // Standard quota
                 }
             }
@@ -435,12 +429,6 @@ impl ArchiveReplicationManager {
         
         let quota = match node_type {
             NodeType::Light => 0,
-            NodeType::Full => match total_nodes {
-                0..=15 => 8,
-                16..=50 => 6,
-                51..=200 => 4,
-                _ => 3,
-            },
             NodeType::Super => match total_nodes {
                 0..=15 => 15,
                 16..=50 => 12,
@@ -538,20 +526,17 @@ impl ArchiveReplicationManager {
     /// Calculate emergency quota for very small networks
     fn calculate_emergency_quota(&self, node_type: &NodeType, total_nodes: usize) -> u8 {
         match (node_type, total_nodes) {
+            // v3.18: Full nodes removed, only Super and Light remain
             // EMERGENCY: 5-15 nodes total
-            (NodeType::Full, 5..=15) => 12,   // Emergency: Full nodes take 12 chunks each
             (NodeType::Super, 5..=15) => 20,  // Emergency: Super nodes take 20 chunks each
             
             // SMALL: 16-30 nodes total  
-            (NodeType::Full, 16..=30) => 8,   // Small network: Full nodes take 8 chunks
             (NodeType::Super, 16..=30) => 15, // Small network: Super nodes take 15 chunks
             
             // MEDIUM: 31-50 nodes total
-            (NodeType::Full, 31..=50) => 5,   // Medium network: Full nodes take 5 chunks
             (NodeType::Super, 31..=50) => 10, // Medium network: Super nodes take 10 chunks
             
             // STANDARD: 50+ nodes
-            (NodeType::Full, _) => 3,          // Standard quota
             (NodeType::Super, _) => 8,         // Standard quota
             
             (NodeType::Light, _) => 0,         // Light nodes never archive
@@ -739,7 +724,6 @@ impl BackgroundReplicationService {
     fn get_max_chunks_for_node_type(node_type: &crate::node::NodeType) -> usize {
         match node_type {
             crate::node::NodeType::Light => 0,
-            crate::node::NodeType::Full => 5,     // Allow up to 5 chunks (3 required + 2 buffer)
             crate::node::NodeType::Super => 12,   // Allow up to 12 chunks (8 required + 4 buffer)
         }
     }

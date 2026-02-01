@@ -2,8 +2,9 @@
 
 import { useState, useEffect } from 'react';
 
+// v3.18: Only Light and Super nodes
 export default function ActivatePage() {
-  const [selectedNodeType, setSelectedNodeType] = useState<'light' | 'full' | 'super'>('light');
+  const [selectedNodeType, setSelectedNodeType] = useState<'light' | 'super'>('light');
   const [nodeId, setNodeId] = useState('');
   const [activating, setActivating] = useState(false);
   
@@ -12,7 +13,6 @@ export default function ActivatePage() {
   const [burnedTokensPhase1, setBurnedTokensPhase1] = useState(0); // Real-time from blockchain
   const [currentPricing, setCurrentPricing] = useState<Record<string, [number, number]>>({
     light: [1500, 300], // [currentPrice, minimumPrice] - updated from API
-    full: [1500, 300],
     super: [1500, 300]
   });
   const activeNodes = 156;
@@ -28,7 +28,6 @@ export default function ActivatePage() {
           const currentPrice = data.nodeTypes.light.burnAmount;
           setCurrentPricing({
             light: [currentPrice, 300],
-            full: [currentPrice, 300], 
             super: [currentPrice, 300]
           });
           
@@ -48,11 +47,10 @@ export default function ActivatePage() {
   // Use current pricing instead of static basePricing
   const basePricing = currentPricing;
 
-  const getCostInfo = (type: 'light' | 'full' | 'super') => {
+  const getCostInfo = (type: 'light' | 'super') => {
     if (currentPhase === 'phase1') {
-      const base: Record<'light' | 'full' | 'super', [number, number]> = {
+      const base: Record<'light' | 'super', [number, number]> = {
         light: [1500, 300],
-        full: [1500, 300],
         super: [1500, 300]
       };
       // CORRECT Phase 1 pricing: 1500 base, -150 per each COMPLETE 10% burned, min 300 at 80-90%
@@ -72,10 +70,10 @@ export default function ActivatePage() {
     }
 
     // Phase 2 dynamic QNC pricing - CORRECT implementation
-    const basePrices: Record<'light' | 'full' | 'super', number> = {
-      light: 5000,   // Base price for Light node
-      full: 7500,    // Base price for Full node
-      super: 10000,  // Base price for Super node
+    // v3.18: Only Light and Super nodes (Full removed)
+    const basePrices: Record<'light' | 'super', number> = {
+      light: 10000,  // Base price for Light node (10,000 QNC)
+      super: 7500   // Base price for Super node (7,500 QNC)
     };
 
     // Determine network multiplier based on active nodes
@@ -213,7 +211,7 @@ export default function ActivatePage() {
             gap: "16px",
             marginBottom: "32px"
           }}>
-            {(['light', 'full', 'super'] as const).map((type) => (
+            {(['light', 'super'] as const).map((type) => (
               <button
                 key={type}
                 onClick={() => setSelectedNodeType(type)}
@@ -278,14 +276,6 @@ export default function ActivatePage() {
                     <div>• Response rate: 100%</div>
                     <div>• Up to 3 devices per node</div>
                     <div>• Battery-friendly design</div>
-                  </>
-                )}
-                {selectedNodeType === 'full' && (
-                  <>
-                    <div>• Ping interval: every 4 min</div>
-                    <div>• Response rate: ≥ 95%</div>
-                    <div>• Public HTTP endpoint</div>
-                    <div>• Stable 24/7 connection</div>
                   </>
                 )}
                 {selectedNodeType === 'super' && (

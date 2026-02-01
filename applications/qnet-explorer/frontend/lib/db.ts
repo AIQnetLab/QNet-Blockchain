@@ -420,8 +420,9 @@ export async function getSyncState(): Promise<SyncState | null> {
 }
 
 export async function updateSyncState(height: number): Promise<void> {
+  // ONLY update if new height is GREATER than current (prevents jumps from out-of-order blocks)
   await query(
-    'UPDATE sync_state SET last_height = $1, last_sync_at = CURRENT_TIMESTAMP WHERE id = 1',
+    'UPDATE sync_state SET last_height = GREATEST(last_height, $1), last_sync_at = CURRENT_TIMESTAMP WHERE id = 1',
     [height]
   );
 }

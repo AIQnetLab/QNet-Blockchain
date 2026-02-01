@@ -1,22 +1,29 @@
 import { getDbPool, insertTransactionsBatch, updateSyncState, getSyncState, query, insertBlock } from './db';
 import { verifyTransactionHash, verifyTransactionIntegrity, logSecurityEvent } from './security';
+import WebSocket from 'ws';
+
+// ============================================================================
+// PRODUCTION v3.19: WebSocket-based sync (replaces polling)
+// - Realtime block notifications via WebSocket
+// - Single REST request per block (instead of 500 parallel)
+// - Automatic reconnection with exponential backoff
+// - Fallback to polling if WebSocket unavailable
+// ============================================================================
 
 // Disable logging in production (set to true for debugging)
-const DEBUG = false;
-const log = DEBUG ? log.bind(console) : () => {};
-const warn = DEBUG ? warn.bind(console) : () => {};
-const error = DEBUG ? error.bind(console) : () => {};
+const DEBUG = process.env.SYNC_DEBUG === 'true';
+const log = DEBUG ? console.log.bind(console) : () => {};
+const warn = DEBUG ? console.warn.bind(console) : () => {};
+const error = console.error.bind(console); // Always log errors
 
 // Validate and sanitize NODE_RPC_URL to prevent SSRF
 function getNodeRpcUrl(): string {
   const url = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
   try {
     const parsed = new URL(url);
-    // Only allow http/https
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       throw new Error('Invalid protocol');
     }
-    // Block private/internal IPs (SSRF protection)
     const hostname = parsed.hostname;
     if (hostname === 'localhost' || hostname === '127.0.0.1' || 
         hostname.startsWith('192.168.') || hostname.startsWith('10.') ||
@@ -38,9 +45,19 @@ function getNodeRpcUrl(): string {
   }
 }
 
+// Get WebSocket URL from HTTP URL
+function getNodeWsUrl(): string {
+  const httpUrl = getNodeRpcUrl();
+  const wsUrl = httpUrl.replace('http://', 'ws://').replace('https://', 'wss://');
+  return `${wsUrl}/ws/subscribe?channels=blocks`;
+}
+
 const NODE_RPC_URL = getNodeRpcUrl();
-const SYNC_INTERVAL = 10000; // 10 seconds
+const NODE_WS_URL = getNodeWsUrl();
+const SYNC_INTERVAL = 30000; // Fallback polling: 30 seconds (less aggressive)
 const INTEGRITY_CHECK_INTERVAL = 600000; // 10 minutes
+const WS_RECONNECT_DELAY_BASE = 1000; // Initial reconnect delay: 1 second
+const WS_RECONNECT_DELAY_MAX = 60000; // Max reconnect delay: 60 seconds
 
 interface TransactionFromNode {
   hash: string;
@@ -76,20 +93,17 @@ function transformTransaction(
   blockHeight: number,
   blockTimestamp: number
 ): TransactionFromNode | null {
-  // Validate hash - allow alphanumeric and underscores (system transactions may have non-hex hashes)
   const hash = String(tx.hash || '');
   if (!hash || hash.length < 8 || hash.length > 128) {
     warn('[Sync] Invalid transaction hash length, skipping:', hash.substring(0, 32));
     return null;
   }
 
-  // Validate block height
   if (!Number.isInteger(blockHeight) || blockHeight < 0) {
     warn('[Sync] Invalid block height:', blockHeight);
     return null;
   }
 
-  // Get timestamp with validation
   let rawTs = Number(tx.timestamp) || 0;
   if (rawTs === 0) rawTs = blockTimestamp;
   if (!Number.isFinite(rawTs) || rawTs < 0) {
@@ -98,29 +112,14 @@ function transformTransaction(
   }
   const timestamp = rawTs > 1e12 ? rawTs : rawTs * 1000;
 
-  // Validate amount
   const amount = Number(tx.amount) || 0;
-  if (!Number.isFinite(amount) || amount < 0) {
-    warn('[Sync] Invalid amount, using 0:', amount);
-  }
-
-  // Validate nonce
   const nonce = Number(tx.nonce) || 0;
-  if (!Number.isInteger(nonce) || nonce < 0) {
-    warn('[Sync] Invalid nonce, using 0:', nonce);
-  }
 
-  // Determine quantum signature
   const isQuantumSigned = !!(tx.is_quantum_signed || 
     (tx.dilithium_signature && tx.dilithium_public_key));
 
-  // Validate addresses - filter out entries without proper from address (likely system/meta data)
-  // Real transactions must have a 'from' or 'from_address' field
-  // Allow system addresses like 'system_emission' for reward transactions
   const fromRaw = tx.from || tx.from_address;
   if (!fromRaw || (typeof fromRaw === 'string' && fromRaw.length === 0)) {
-    // Skip entries without from address - these are likely system metadata, not real transactions
-    // This filters out garbage entries that are not actual transactions
     return null;
   }
   const from = String(fromRaw);
@@ -128,25 +127,6 @@ function transformTransaction(
     warn('[Sync] Invalid from address length:', from.length);
     return null;
   }
-  
-  // Allow system addresses for reward/emission transactions
-  const isSystemAddress = from.startsWith('system_') || from === 'system_emission' || from === 'system_rewards_pool';
-  
-  // Handle tx_type as either string or object (e.g. { NodeRegistration: {...} })
-  const txTypeRaw = tx.tx_type || tx.type;
-  const txTypeStr = typeof txTypeRaw === 'string' ? txTypeRaw : (typeof txTypeRaw === 'object' && txTypeRaw ? JSON.stringify(txTypeRaw) : '');
-  const txType = txTypeStr.toLowerCase();
-  
-  const isRewardTx = txType.includes('reward') || txType.includes('emission');
-  const isSystemTx = txType.includes('noderegistration') || txType.includes('smartcontract') || txType.includes('createaccount') || txType.includes('contractcall');
-  
-  // For system transactions, allow any address format (including non-hex)
-  // These transactions may have non-standard addresses and amount = 0
-  // Address validation is too strict for genesis/activation transactions - just accept all valid UTF-8
-  // if (!isSystemAddress && !isRewardTx && !isSystemTx && !/^[a-f0-9]{40,}$/i.test(from)) {
-  //   warn(`[Sync] Non-standard from address: ${from.substring(0, 32)} (tx_type: ${txType})`);
-  // }
-  // NOTE: Commented out strict validation - accepting all addresses to capture genesis/activation transactions
 
   const to = tx.to ? String(tx.to) : (tx.to_address ? String(tx.to_address) : null);
   if (to && to.length > 128) {
@@ -154,10 +134,8 @@ function transformTransaction(
     return null;
   }
 
-  // FILTER: Skip genesis benchmark transactions (1000 transfers from genesis to EON1be... addresses)
-  // These are test/benchmark transactions created at genesis (block 0) and should not pollute the explorer
+  // Skip genesis benchmark transactions
   if (blockHeight === 0 && from === 'genesis' && to && to.startsWith('EON1be')) {
-    // Skip benchmark transfers: genesis → EON1be...0000 to EON1be...0999 with 1M QNC each
     return null;
   }
 
@@ -202,6 +180,18 @@ interface BlockData {
   [key: string]: unknown;
 }
 
+// WebSocket NewBlock event
+interface WsNewBlockEvent {
+  type: 'NewBlock';
+  data: {
+    height: number;
+    hash: string;
+    timestamp: number;
+    tx_count: number;
+    producer: string;
+  };
+}
+
 // Convert byte array to hex string
 function bytesToHex(bytes: unknown): string {
   if (typeof bytes === 'string') return bytes;
@@ -211,25 +201,22 @@ function bytesToHex(bytes: unknown): string {
   return '';
 }
 
-// Fetch block from node with validation
+// Fetch single block from node
 async function fetchBlock(height: number): Promise<{ block: BlockData; height: number } | null> {
   try {
-    // Timeout increased to 120s for Genesis block (block 0 with 1007 transactions = 612KB)
     const res = await fetch(`${NODE_RPC_URL}/api/v1/block/${height}`, {
       cache: 'no-store',
-      signal: AbortSignal.timeout(120000), // 120 seconds for Genesis block
+      signal: AbortSignal.timeout(30000), // 30 seconds timeout
     });
 
     if (!res.ok) return null;
 
-    // Check response size before parsing (limit to 50MB)
     const contentLength = res.headers.get('content-length');
     if (contentLength && parseInt(contentLength, 10) > 50 * 1024 * 1024) {
       warn(`[Sync] Block ${height} response too large: ${contentLength} bytes`);
       return null;
     }
 
-    // Parse with size limit
     const text = await res.text();
     if (text.length > 50 * 1024 * 1024) {
       warn(`[Sync] Block ${height} response too large: ${text.length} bytes`);
@@ -244,50 +231,31 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
       return null;
     }
     
-    // Handle different response structures:
-    // 1. { block: { transactions: [...] } } - nested structure
-    // 2. Direct block object with all fields (height, producer, transactions, etc.)
     let block: BlockData;
     if (responseData.block) {
       block = responseData.block as BlockData;
     } else {
-      // Direct block structure - use responseData as block (preserves all fields including producer)
       block = responseData as BlockData;
     }
     
-    // Validate block structure
     if (!block || typeof block !== 'object') {
       warn(`[Sync] Invalid block structure for height ${height}`);
       return null;
     }
     
-    // Handle transactions array - check both 'transactions' and 'txs' fields
     if (!block.transactions && (block as any).txs) {
       block.transactions = (block as any).txs;
     }
     
-    // Validate transactions array
     if (block.transactions && !Array.isArray(block.transactions)) {
       warn(`[Sync] Invalid transactions array for block ${height}`);
       block.transactions = [];
     }
     
-    // Limit transactions per block to prevent memory issues (100k max as per requirement)
     const MAX_TXS_PER_BLOCK = 100000;
     if (Array.isArray(block.transactions) && block.transactions.length > MAX_TXS_PER_BLOCK) {
       warn(`[Sync] Block ${height} has ${block.transactions.length} transactions, limiting to ${MAX_TXS_PER_BLOCK}`);
       block.transactions = block.transactions.slice(0, MAX_TXS_PER_BLOCK);
-    }
-    
-    // Log transaction count only for blocks with many transactions
-    if (Array.isArray(block.transactions) && block.transactions.length > 100) {
-      log(`[Sync] Block ${height} has ${block.transactions.length} transactions`);
-    }
-    
-    // Validate timestamp
-    if (block.timestamp && (!Number.isFinite(Number(block.timestamp)) || Number(block.timestamp) < 0)) {
-      warn(`[Sync] Invalid timestamp for block ${height}, using 0`);
-      block.timestamp = 0;
     }
     
     return { block, height };
@@ -297,10 +265,115 @@ async function fetchBlock(height: number): Promise<{ block: BlockData; height: n
   }
 }
 
-// Sync new blocks
-async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
+// Process and save a single block
+async function processSingleBlock(height: number): Promise<number> {
+  const result = await fetchBlock(height);
+  if (!result) return 0;
+
+  const { block } = result;
+  const txs = Array.isArray(block.transactions) ? block.transactions : [];
+  const blockTs = Number(block.timestamp) || 0;
+
+  // Calculate total gas used
+  const U64_MAX = 18446744073709551615;
+  let totalGasUsed = 0;
+  for (const tx of txs as Record<string, unknown>[]) {
+    const gasPrice = Number(tx.gas_price) || 0;
+    const gasLimit = Number(tx.gas_limit) || 0;
+    if (gasPrice >= U64_MAX - 1000 || gasPrice < 0) continue;
+    const gasUsed = Number(tx.gas_used) || (gasPrice * gasLimit);
+    totalGasUsed += gasUsed;
+  }
+
+  // Save block to PostgreSQL
   try {
-    // Get current height from node
+    await insertBlock({
+      height,
+      hash: block.hash || `block_${height}`,
+      block_type: (block.block_type as string) || 'MICROBLOCK',
+      version: (block.version as number) || 1,
+      timestamp: blockTs > 1e12 ? blockTs : blockTs * 1000,
+      previous_hash: bytesToHex(block.previous_hash) || null,
+      merkle_root: bytesToHex(block.merkle_root) || null,
+      state_root: bytesToHex(block.state_root) || null,
+      producer: (block.producer as string) || 'unknown',
+      producer_address: (block.producer_address as string) || null,
+      tx_count: txs.length,
+      total_gas_used: totalGasUsed,
+      poh_hash: bytesToHex(block.poh_hash) || null,
+      poh_count: (block.poh_count as number) || 0,
+      signature_type: (block.signature_type as string) || 'Dilithium3',
+      signature: (block.signature as string) || null,
+      cert_serial: (block.cert_serial as string) || null,
+      qrb_output: bytesToHex(block.qrb_output) || null,
+      size_bytes: (block.size_bytes as number) || 0,
+      consensus_data: (block.consensus_data as Record<string, unknown>) || null,
+      micro_blocks: Array.isArray(block.micro_blocks) ? (block.micro_blocks as string[]) : null,
+    });
+  } catch (err) {
+    error(`[Sync] Failed to save block ${height}:`, err);
+  }
+
+  // Transform and save transactions
+  const transactions: TransactionFromNode[] = [];
+  for (const tx of txs as Record<string, unknown>[]) {
+    const transformed = transformTransaction(tx, height, blockTs);
+    if (transformed) {
+      transactions.push(transformed);
+    }
+  }
+
+  // Deduplicate by hash
+  const seenHashes = new Set<string>();
+  const uniqueTransactions: TransactionFromNode[] = [];
+  for (const tx of transactions) {
+    if (!seenHashes.has(tx.hash)) {
+      seenHashes.add(tx.hash);
+      uniqueTransactions.push(tx);
+    }
+  }
+
+  // Batch insert transactions
+  if (uniqueTransactions.length > 0) {
+    const MAX_BATCH_SIZE = 1000;
+    for (let i = 0; i < uniqueTransactions.length; i += MAX_BATCH_SIZE) {
+      const batch = uniqueTransactions.slice(i, i + MAX_BATCH_SIZE);
+      try {
+        await insertTransactionsBatch(batch.map(tx => ({
+          hash: tx.hash,
+          from_address: tx.from,
+          to_address: tx.to,
+          amount: tx.amount,
+          nonce: tx.nonce,
+          block: tx.block,
+          timestamp: tx.timestamp,
+          gas_price: tx.gas_price,
+          gas_limit: tx.gas_limit,
+          signature: tx.signature,
+          public_key: tx.public_key,
+          dilithium_signature: tx.dilithium_signature,
+          dilithium_public_key: tx.dilithium_public_key,
+          tx_type: typeof tx.tx_type === 'string' ? tx.tx_type : JSON.stringify(tx.tx_type),
+          tx_type_data: typeof tx.tx_type === 'object' ? (tx.tx_type as Record<string, unknown>) : null,
+          data: tx.data,
+          status: tx.status,
+          is_quantum_signed: tx.is_quantum_signed
+        })));
+      } catch (err) {
+        error(`[Sync] Failed to insert batch:`, err);
+      }
+    }
+  }
+
+  // Update sync state
+  await updateSyncState(height);
+
+  return uniqueTransactions.length;
+}
+
+// Sync blocks using polling (fallback mode - ONLY when WebSocket is down)
+async function syncBlocksPolling(): Promise<{ added: number; currentHeight: number }> {
+  try {
     const heightRes = await fetch(`${NODE_RPC_URL}/api/v1/height`, {
       cache: 'no-store',
       signal: AbortSignal.timeout(5000),
@@ -311,7 +384,6 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       return { added: 0, currentHeight: 0 };
     }
 
-    // Validate response size before parsing
     const heightText = await heightRes.text();
     if (heightText.length > 1024) {
       warn('[Sync] Height response too large:', heightText.length);
@@ -331,7 +403,6 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       return { added: 0, currentHeight: 0 };
     }
 
-    // Get last synced height (ensure it's a number)
     const syncState = await getSyncState();
     const lastHeight = typeof syncState?.last_height === 'number' ? syncState.last_height : Number(syncState?.last_height) || 0;
 
@@ -342,247 +413,25 @@ async function syncBlocks(): Promise<{ added: number; currentHeight: number }> {
       return { added: 0, currentHeight };
     }
 
-    // Fetch new blocks (limit to 500 per sync for high performance)
-    const blocksToFetch: number[] = [];
-    // Start from block 0 if lastHeight is -1 or 0, otherwise re-fetch last 10 for reorgs
-    const startBlock = lastHeight < 0 ? 0 : Math.max(0, lastHeight - 10);
-
-    // If lastHeight is -1, start from 0. Otherwise start from lastHeight + 1
-    const firstBlock = lastHeight < 0 ? 0 : Math.max(startBlock, lastHeight + 1);
-    
-    // Production: 500 blocks per batch for high performance
-    for (let h = firstBlock; h <= currentHeight && blocksToFetch.length < 500; h++) {
-      blocksToFetch.push(h);
+    // Sync missing blocks (max 50 per poll to avoid rate limits)
+    let totalAdded = 0;
+    const maxBlocksPerPoll = 50;
+    for (let h = lastHeight + 1; h <= currentHeight && h <= lastHeight + maxBlocksPerPoll; h++) {
+      const added = await processSingleBlock(h);
+      totalAdded += added;
+      // Small delay between requests to avoid rate limits
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
-    if (blocksToFetch.length === 0) {
-      return { added: 0, currentHeight };
-    }
-
-    // Limit parallel fetches (500 blocks in parallel for high performance)
-    const MAX_PARALLEL_FETCHES = 500;
-    // IMPORTANT: Only process blocks we actually fetch!
-    const blocksToProcess = blocksToFetch.slice(0, MAX_PARALLEL_FETCHES);
-    const fetchPromises = blocksToProcess.map(height => fetchBlock(height));
-    
-    // Add timeout wrapper to prevent hanging (10 minutes for 500 blocks)
-    const timeoutMs = 600000; // 600 seconds for parallel fetch of 500 blocks
-    const timeoutPromise = Promise.race([
-      Promise.allSettled(fetchPromises),
-      new Promise<PromiseSettledResult<{ block: BlockData; height: number } | null>[]>((_, reject) => {
-        setTimeout(() => reject(new Error('Sync timeout')), timeoutMs);
-      })
-    ]);
-    
-    const results = await timeoutPromise.catch(() => {
-      error('[Sync] Sync operation timed out');
-      return fetchPromises.map(() => ({ status: 'rejected' as const, reason: new Error('Timeout') }));
-    });
-
-    // Process transactions with memory protection
-    const transactionsToInsert: TransactionFromNode[] = [];
-    let maxHeight = lastHeight;
-    const MAX_TOTAL_TXS_PER_SYNC = 50000; // Limit total transactions per sync to prevent memory issues
-
-    // Blocks to save to PostgreSQL (L1 structure)
-    const blocksToSave: Array<{
-      height: number;
-      hash: string;
-      block_type: string;
-      version: number;
-      timestamp: number;
-      previous_hash: string | null;
-      merkle_root: string | null;
-      state_root: string | null;
-      producer: string;
-      producer_address: string | null;
-      tx_count: number;
-      total_gas_used: number;
-      poh_hash: string | null;
-      poh_count: number;
-      signature_type: string | null;
-      signature: string | null;
-      cert_serial: string | null;
-      qrb_output: string | null;
-      size_bytes: number;
-      consensus_data: Record<string, unknown> | null;
-      micro_blocks: string[] | null;
-    }> = [];
-
-    for (const result of results) {
-      if (result.status !== 'fulfilled' || !result.value) continue;
-
-      const { block, height } = result.value;
-      const txs = Array.isArray(block.transactions) ? block.transactions : [];
-      const blockTs = Number(block.timestamp) || 0;
-
-      // Calculate total gas used from transactions
-      // NOTE: HeartbeatCommitment txs have gas_price=u64::MAX as sentinel "no gas" value
-      // We must check for this and skip such transactions
-      const U64_MAX = 18446744073709551615;
-      let totalGasUsed = 0;
-      for (const tx of txs as Record<string, unknown>[]) {
-        const gasPrice = Number(tx.gas_price) || 0;
-        const gasLimit = Number(tx.gas_limit) || 0;
-        // Skip if gas_price is u64::MAX (sentinel for "no gas" transactions like HeartbeatCommitment)
-        if (gasPrice >= U64_MAX - 1000 || gasPrice < 0) continue;
-        const gasUsed = Number(tx.gas_used) || (gasPrice * gasLimit);
-        totalGasUsed += gasUsed;
-      }
-
-      // Save block metadata to PostgreSQL (L1 structure)
-      blocksToSave.push({
-        height,
-        hash: block.hash || `block_${height}`,
-        block_type: (block.block_type as string) || 'MICROBLOCK',
-        version: (block.version as number) || 1,
-        timestamp: blockTs > 1e12 ? blockTs : blockTs * 1000,
-        previous_hash: bytesToHex(block.previous_hash) || null,
-        merkle_root: bytesToHex(block.merkle_root) || null,
-        state_root: bytesToHex(block.state_root) || null,
-        producer: (block.producer as string) || 'unknown',
-        producer_address: (block.producer_address as string) || null,
-        tx_count: txs.length,
-        total_gas_used: totalGasUsed,
-        poh_hash: bytesToHex(block.poh_hash) || null,
-        poh_count: (block.poh_count as number) || 0,
-        signature_type: (block.signature_type as string) || 'Dilithium3',
-        signature: (block.signature as string) || null,
-        cert_serial: (block.cert_serial as string) || null,
-        qrb_output: bytesToHex(block.qrb_output) || null,
-        size_bytes: (block.size_bytes as number) || 0,
-        consensus_data: (block.consensus_data as Record<string, unknown>) || null,
-        micro_blocks: Array.isArray(block.micro_blocks) ? (block.micro_blocks as string[]) : null,
-      });
-
-      // Check if we're approaching memory limit
-      if (transactionsToInsert.length + txs.length > MAX_TOTAL_TXS_PER_SYNC) {
-        warn(`[Sync] Approaching memory limit, processing ${txs.length} transactions from block ${height} would exceed limit`);
-        // Process only what fits
-        const remaining = MAX_TOTAL_TXS_PER_SYNC - transactionsToInsert.length;
-        const txsToProcess = txs.slice(0, remaining);
-        
-        for (const tx of txsToProcess as Record<string, unknown>[]) {
-          const transformed = transformTransaction(tx, height, blockTs);
-          if (transformed) {
-            transactionsToInsert.push(transformed);
-          }
-        }
-        
-        warn(`[Sync] Processed ${remaining} transactions from block ${height}, skipped ${txs.length - remaining}`);
-        break; // Stop processing more blocks
-      }
-
-      for (const tx of txs as Record<string, unknown>[]) {
-        const transformed = transformTransaction(tx, height, blockTs);
-        if (transformed) {
-          transactionsToInsert.push(transformed);
-        }
-      }
-
-      // Silent processing (only log errors via transformTransaction warnings)
-
-      maxHeight = Math.max(maxHeight, height);
-    }
-
-    // Save blocks to PostgreSQL
-    for (const blockData of blocksToSave) {
-      try {
-        await insertBlock(blockData);
-      } catch (err) {
-        error(`[Sync] Failed to save block ${blockData.height}:`, err);
-      }
-    }
-
-
-    // Deduplicate transactions by hash (filter out duplicates from genesis block)
-    const seenHashes = new Set<string>();
-    const uniqueTransactions: TransactionFromNode[] = [];
-    let duplicateCount = 0;
-    for (const tx of transactionsToInsert) {
-      if (seenHashes.has(tx.hash)) {
-        duplicateCount++;
-        continue;
-      }
-      seenHashes.add(tx.hash);
-      uniqueTransactions.push(tx);
-    }
-    // Log only if filtering out many duplicates (e.g., block 0)
-    if (duplicateCount > 100) {
-      log(`[Sync] Filtered out ${duplicateCount} duplicate transactions`);
-    }
-
-    // Batch insert transactions (limit batch size to prevent memory issues)
-    const MAX_BATCH_SIZE = 1000;
-    if (uniqueTransactions.length > 0) {
-      // Split into smaller batches if needed
-      const batches: TransactionFromNode[][] = [];
-      for (let i = 0; i < uniqueTransactions.length; i += MAX_BATCH_SIZE) {
-        batches.push(uniqueTransactions.slice(i, i + MAX_BATCH_SIZE));
-      }
-      
-      for (const batch of batches) {
-        try {
-          await insertTransactionsBatch(batch.map(tx => ({
-          hash: tx.hash,
-          from_address: tx.from,
-          to_address: tx.to,
-          amount: tx.amount,
-          nonce: tx.nonce,
-          block: tx.block,
-          timestamp: tx.timestamp,
-          gas_price: tx.gas_price,
-          gas_limit: tx.gas_limit,
-          signature: tx.signature,
-          public_key: tx.public_key,
-          dilithium_signature: tx.dilithium_signature,
-          dilithium_public_key: tx.dilithium_public_key,
-          tx_type: typeof tx.tx_type === 'string' ? tx.tx_type : JSON.stringify(tx.tx_type),
-          tx_type_data: typeof tx.tx_type === 'object' ? (() => {
-            try {
-              // Validate and limit object size
-              const obj = tx.tx_type as Record<string, unknown>;
-              const json = JSON.stringify(obj);
-              if (json.length > 100000) { // 100KB max
-                warn('[Sync] tx_type_data too large, truncating');
-                return JSON.parse(json.substring(0, 100000)) as Record<string, unknown>;
-              }
-              return obj;
-            } catch {
-              return null;
-            }
-          })() : null,
-          data: tx.data,
-          status: tx.status,
-            is_quantum_signed: tx.is_quantum_signed
-          })));
-        } catch (err) {
-          error(`[Sync] Failed to insert batch of ${batch.length} transactions:`, err);
-          throw err;
-        }
-      }
-
-      log(`[Sync] Inserted ${uniqueTransactions.length} transactions in ${batches.length} batch(es)`);
-    }
-
-    // Update sync state - use the highest block we actually processed
-    // CRITICAL: Use only blocks we actually fetched, not all blocksToFetch!
-    const highestFetchedBlock = blocksToProcess.length > 0 ? Math.max(...blocksToProcess) : lastHeight;
-    const finalHeight = Math.max(maxHeight, highestFetchedBlock);
-    
-    if (finalHeight > lastHeight) {
-      await updateSyncState(finalHeight);
-    }
-
-    return { added: transactionsToInsert.length, currentHeight: finalHeight };
+    return { added: totalAdded, currentHeight };
   } catch (err) {
-    error('[Sync] Error:', err);
+    error('[Sync] Polling error:', err);
     return { added: 0, currentHeight: 0 };
   }
 }
 
-// Verify data integrity by comparing random transactions with node
-let isVerifying = false; // Lock to prevent concurrent integrity checks
+// Verify data integrity
+let isVerifying = false;
 
 async function verifyDataIntegrity(): Promise<void> {
   if (isVerifying) {
@@ -593,9 +442,6 @@ async function verifyDataIntegrity(): Promise<void> {
   isVerifying = true;
   
   try {
-    // Integrity check (silent)
-
-    // Limit integrity check to prevent DoS (max 50 transactions per check)
     const MAX_INTEGRITY_CHECK = 50;
     const result = await query<{ hash: string }>(
       `SELECT hash FROM transactions ORDER BY RANDOM() LIMIT ${MAX_INTEGRITY_CHECK}`
@@ -606,7 +452,6 @@ async function verifyDataIntegrity(): Promise<void> {
     for (const row of result.rows) {
       const hash = row.hash;
       
-      // Get from DB
       const dbTxResult = await query(
         'SELECT * FROM transactions WHERE hash = $1',
         [hash]
@@ -616,7 +461,6 @@ async function verifyDataIntegrity(): Promise<void> {
       
       const dbTx = dbTxResult.rows[0];
 
-      // Get from node (source of truth)
       const nodeRes = await fetch(`${NODE_RPC_URL}/api/v1/transaction/${hash}`, {
         cache: 'no-store',
         signal: AbortSignal.timeout(3000),
@@ -624,7 +468,6 @@ async function verifyDataIntegrity(): Promise<void> {
 
       if (!nodeRes.ok) continue;
 
-      // Validate response size
       const responseText = await nodeRes.text();
       if (responseText.length > 10 * 1024 * 1024) {
         warn(`[Integrity] Transaction ${hash} response too large: ${responseText.length} bytes`);
@@ -643,7 +486,6 @@ async function verifyDataIntegrity(): Promise<void> {
 
       const nodeTx = nodeData.transaction as Record<string, unknown>;
 
-      // Verify integrity
       const verification = verifyTransactionIntegrity(
         dbTx as Record<string, unknown>, 
         nodeTx
@@ -656,7 +498,6 @@ async function verifyDataIntegrity(): Promise<void> {
           differences: verification.differences
         });
 
-        // Restore from node
         const restored = transformTransaction(
           nodeTx as Record<string, unknown>,
           ((nodeTx.block_height as number) || (nodeTx.block as number) || 0) as number,
@@ -696,7 +537,7 @@ async function verifyDataIntegrity(): Promise<void> {
         mismatches
       });
     } else {
-      log(`[Integrity] ✅ All ${result.rows.length} transactions verified`);
+      log(`[Integrity] All ${result.rows.length} transactions verified`);
     }
   } catch (err) {
     error('[Integrity] Error:', err);
@@ -705,36 +546,142 @@ async function verifyDataIntegrity(): Promise<void> {
   }
 }
 
-// Start sync service
-let syncInterval: NodeJS.Timeout | null = null;
-let integrityInterval: NodeJS.Timeout | null = null;
-let isSyncing = false; // Lock to prevent concurrent syncs
+// ============================================================================
+// WEBSOCKET SYNC (PRIMARY MODE)
+// ============================================================================
 
-export function startSyncService(): void {
-  log('[Sync] Service started');
+let wsConnection: WebSocket | null = null;
+let wsReconnectDelay = WS_RECONNECT_DELAY_BASE;
+let wsReconnectTimeout: NodeJS.Timeout | null = null;
+let isWsConnected = false;
 
-  // Initial sync (silent)
-  syncBlocks()
-    .catch(err => {
-      error('[Sync] Initial sync failed:', err);
+function connectWebSocket(): void {
+  if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
+    return;
+  }
+
+  console.log(`[WS] Connecting to ${NODE_WS_URL}...`);
+
+  try {
+    wsConnection = new WebSocket(NODE_WS_URL);
+
+    wsConnection.on('open', () => {
+      console.log('[WS] Connected to node (realtime sync enabled)');
+      isWsConnected = true;
+      wsReconnectDelay = WS_RECONNECT_DELAY_BASE; // Reset delay on successful connect
     });
 
-  // Periodic sync with lock (silent, only log new transactions)
+    wsConnection.on('message', async (data: WebSocket.Data) => {
+      try {
+        const message = JSON.parse(data.toString());
+        
+        if (message.type === 'NewBlock') {
+          const event = message as WsNewBlockEvent;
+          const height = event.data.height;
+          
+          log(`[WS] NewBlock received: height=${height}, txs=${event.data.tx_count}`);
+          
+          // Fetch and process the full block
+          const added = await processSingleBlock(height);
+          
+          if (added > 0) {
+            log(`[WS] Block ${height}: +${added} transactions`);
+          }
+        }
+      } catch (err) {
+        error('[WS] Error processing message:', err);
+      }
+    });
+
+    wsConnection.on('close', (code: number, reason: Buffer) => {
+      console.log(`[WS] Disconnected (code=${code}, reason=${reason.toString()})`);
+      isWsConnected = false;
+      wsConnection = null;
+      
+      // Schedule reconnection with exponential backoff
+      scheduleWsReconnect();
+    });
+
+    wsConnection.on('error', (err: Error) => {
+      console.error('[WS] Connection error:', err.message);
+      isWsConnected = false;
+    });
+
+  } catch (err) {
+    error('[WS] Failed to create connection:', err);
+    isWsConnected = false;
+    scheduleWsReconnect();
+  }
+}
+
+function scheduleWsReconnect(): void {
+  if (wsReconnectTimeout) {
+    clearTimeout(wsReconnectTimeout);
+  }
+
+  console.log(`[WS] Reconnecting in ${wsReconnectDelay / 1000}s...`);
+  
+  wsReconnectTimeout = setTimeout(() => {
+    connectWebSocket();
+  }, wsReconnectDelay);
+
+  // Exponential backoff
+  wsReconnectDelay = Math.min(wsReconnectDelay * 2, WS_RECONNECT_DELAY_MAX);
+}
+
+function disconnectWebSocket(): void {
+  if (wsReconnectTimeout) {
+    clearTimeout(wsReconnectTimeout);
+    wsReconnectTimeout = null;
+  }
+
+  if (wsConnection) {
+    wsConnection.close();
+    wsConnection = null;
+  }
+
+  isWsConnected = false;
+}
+
+// ============================================================================
+// SYNC SERVICE LIFECYCLE
+// ============================================================================
+
+let syncInterval: NodeJS.Timeout | null = null;
+let integrityInterval: NodeJS.Timeout | null = null;
+let isSyncing = false;
+
+export function startSyncService(): void {
+  console.log('[Sync] Starting sync service (WebSocket primary, polling fallback)...');
+
+  // Start WebSocket IMMEDIATELY for realtime sync
+  // NOTE: For initial sync from zero, use database snapshot (pg_dump/pg_restore)
+  // WebSocket will catch up with any new blocks after snapshot
+  console.log('[Sync] Starting WebSocket connection...');
+  connectWebSocket();
+
+  // Fallback polling (runs if WebSocket is disconnected)
   syncInterval = setInterval(() => {
+    // Only poll if WebSocket is not connected
+    if (isWsConnected) {
+      return;
+    }
+
     if (isSyncing) {
       return;
     }
     
     isSyncing = true;
-    syncBlocks()
+    log('[Sync] Fallback polling (WS disconnected)...');
+    
+    syncBlocksPolling()
       .then(({ added }) => {
-        // Only log if transactions were added
         if (added > 0) {
-          log(`[Sync] +${added} transactions`);
+          log(`[Sync] Polling: +${added} transactions`);
         }
       })
       .catch(err => {
-        error('[Sync] Sync failed:', err);
+        error('[Sync] Polling failed:', err);
       })
       .finally(() => {
         isSyncing = false;
@@ -748,11 +695,14 @@ export function startSyncService(): void {
     });
   }, INTEGRITY_CHECK_INTERVAL);
 
-  log('[Sync] Sync service started');
+  console.log('[Sync] Sync service started');
 }
 
 export async function stopSyncService(): Promise<void> {
-  log('[Sync] Stopping sync service...');
+  console.log('[Sync] Stopping sync service...');
+  
+  // Stop WebSocket
+  disconnectWebSocket();
   
   // Stop intervals
   if (syncInterval) {
@@ -764,11 +714,11 @@ export async function stopSyncService(): Promise<void> {
     integrityInterval = null;
   }
   
-  // Wait for current sync to finish (with timeout)
+  // Wait for current sync to finish
   if (isSyncing) {
     log('[Sync] Waiting for current sync to finish...');
     const startWait = Date.now();
-    const maxWait = 30000; // 30 seconds
+    const maxWait = 30000;
     
     while (isSyncing && (Date.now() - startWait) < maxWait) {
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -784,7 +734,7 @@ export async function stopSyncService(): Promise<void> {
   if (isVerifying) {
     log('[Sync] Waiting for integrity check to finish...');
     const startWait = Date.now();
-    const maxWait = 60000; // 60 seconds
+    const maxWait = 60000;
     
     while (isVerifying && (Date.now() - startWait) < maxWait) {
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -796,13 +746,14 @@ export async function stopSyncService(): Promise<void> {
     }
   }
   
-  log('[Sync] Sync service stopped');
+  console.log('[Sync] Sync service stopped');
 }
 
 export async function getSyncServiceStatus(): Promise<{
   isRunning: boolean;
   isSyncing: boolean;
   isVerifying: boolean;
+  isWsConnected: boolean;
   lastHeight: number;
   lastSyncAt: string | null;
   lastError: string | null;
@@ -810,19 +761,21 @@ export async function getSyncServiceStatus(): Promise<{
   try {
     const state = await getSyncState();
     return {
-      isRunning: syncInterval !== null,
+      isRunning: syncInterval !== null || isWsConnected,
       isSyncing,
       isVerifying,
+      isWsConnected,
       lastHeight: state?.last_height || 0,
       lastSyncAt: state?.last_sync_at ? new Date(state.last_sync_at).toISOString() : null,
-      lastError: null, // Could be enhanced to track last error
+      lastError: null,
     };
   } catch (err) {
     error('[Sync] Error getting sync service status:', err);
     return {
-      isRunning: syncInterval !== null,
+      isRunning: syncInterval !== null || isWsConnected,
       isSyncing: false,
       isVerifying: false,
+      isWsConnected: false,
       lastHeight: 0,
       lastSyncAt: null,
       lastError: err instanceof Error ? err.message : 'Unknown error',

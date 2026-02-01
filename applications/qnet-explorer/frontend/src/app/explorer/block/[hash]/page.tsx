@@ -268,10 +268,10 @@ export default function BlockPage() {
               <span className="detail-label">Eligible Nodes</span>
               <span className="detail-value">{block.consensus_data.eligible_nodes_count}</span>
             </div>
-            {block.consensus_data.pool2_total_fees !== undefined && (
+            {block.consensus_data.fees_collected !== undefined && (
               <div className="detail-row highlight">
-                <span className="detail-label">Pool 2 Fees</span>
-                <span className="detail-value">{formatAmount(block.consensus_data.pool2_total_fees.toString())}</span>
+                <span className="detail-label">Fees Collected</span>
+                <span className="detail-value">{formatAmount(block.consensus_data.fees_collected.toString())}</span>
               </div>
             )}
             {block.consensus_data.pool3_total_activations !== undefined && (

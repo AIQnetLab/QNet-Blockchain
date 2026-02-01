@@ -79,10 +79,10 @@ pub fn is_in_consensus_window(block_height: u64) -> bool {
 }
 
 /// Node type for validator selection
+/// v3.18: Full nodes removed - only Super and Light remain
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatorNodeType {
     Super,
-    Full,
     Light,
 }
 
@@ -1140,7 +1140,7 @@ impl CommitRevealConsensus {
             .filter(|c| c.node_type == ValidatorNodeType::Super)
             .collect();
         let mut full_nodes: Vec<_> = eligible.iter()
-            .filter(|c| c.node_type == ValidatorNodeType::Full)
+            .filter(|c| c.node_type == ValidatorNodeType::Super)
             .collect();
         
         // 3. Sort by reputation (higher first)
@@ -1280,7 +1280,7 @@ impl CommitRevealConsensus {
             .collect();
         
         let mut full_nodes: Vec<ValidatorCandidate> = qualified.iter()
-            .filter(|c| c.node_type == ValidatorNodeType::Full)
+            .filter(|c| c.node_type == ValidatorNodeType::Super)
             .cloned()
             .collect();
         

@@ -594,7 +594,7 @@ async function updateNodeCard() {
         // No active node
         nodeStatusText.textContent = 'No active node';
         
-        const activationCost = walletState.currentPhase === 2 ? '5,000 QNC' : 'Phase 1 activation only';
+        const activationCost = walletState.currentPhase === 2 ? '7,500-10,000 QNC' : 'Phase 1 activation only';
         const qncBalance = walletState.networks.qnet.balance?.QNC || 0;
         
         nodeDetails.innerHTML = `
@@ -610,7 +610,7 @@ async function updateNodeCard() {
             </div>
         `;
         
-        // PRODUCTION: Minimum activation cost is 5000 × 0.5 = 2500 QNC (Light node at early stage)
+        // PRODUCTION: Minimum activation cost is 7500 × 0.5 = 3750 QNC (Super node at early stage)
         // Show button as enabled if user has at least minimum possible cost
         const minPossibleCost = 2500; // Light node with 0.5x multiplier
         const canActivate = walletState.currentPhase === 2 && qncBalance >= minPossibleCost;

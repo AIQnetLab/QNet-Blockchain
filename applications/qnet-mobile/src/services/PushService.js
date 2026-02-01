@@ -578,10 +578,12 @@ export async function checkServerNodeStatus(activationCode, nodeId = null) {
       // Calculate required heartbeats based on node type if not provided by server
       let requiredHeartbeats = result.required_heartbeats;
       if (!requiredHeartbeats && result.node_type) {
+        // v3.18: Full nodes removed
         if (result.node_type === 'super') {
           requiredHeartbeats = 9; // Super nodes: 9/10 (90%)
         } else if (result.node_type === 'full') {
-          requiredHeartbeats = 8; // Full nodes: 8/10 (80%)
+          // v3.18: Full nodes removed - ignore old node type
+          requiredHeartbeats = 0; // Reject Full nodes
         } else {
           requiredHeartbeats = 8; // Default fallback
         }

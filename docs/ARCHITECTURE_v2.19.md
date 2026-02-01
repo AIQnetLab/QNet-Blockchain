@@ -1227,12 +1227,14 @@ const signature = nacl.sign.detached(messageBytes, secretKey);
 - Size: 96 bytes (signature + public key)
 - Energy: Low (mobile-friendly)
 
-### Full Nodes
-- **Purpose**: Network validation and relay
-- **Consensus**: Partial participation (if reputation ≥ 70%)
-- **Storage**: Full blockchain (all microblocks + macroblocks)
-- **Bandwidth**: Medium (validate and relay)
-- **Requirements**: 3+ validated peers for consensus eligibility
+### ~~Full Nodes~~ (DEPRECATED in v3.18)
+> **Note**: Full Nodes were removed in v3.18. All server nodes are now Super nodes.
+
+- ~~**Purpose**: Network validation and relay~~
+- ~~**Consensus**: Partial participation (if reputation ≥ 70%)~~
+- ~~**Storage**: Full blockchain (all microblocks + macroblocks)~~
+- ~~**Bandwidth**: Medium (validate and relay)~~
+- ~~**Requirements**: 3+ validated peers for consensus eligibility~~
 
 **Eligibility**:
 ```rust
@@ -1395,7 +1397,7 @@ pub fn get_sync_peers_filtered(&self, max_peers: usize) -> Vec<PeerInfo> {
 **Transport**: QUIC (UDP 10876) - binary protocol  
 **Interval**: Every 5 minutes  
 **Signature**: SHA3-256 (quantum-safe)  
-**Scope**: Super + Full nodes only (Light nodes excluded)  
+**Scope**: Super nodes only (v3.18: Full and Light nodes excluded)  
 **Fanout**: Adaptive 4-32 (same as Shred Protocol)
 
 ```rust
@@ -1585,10 +1587,10 @@ QNet implements a **Phase-Aware Three-Pool Reward System** with lazy reward accu
 │  └─────────────────────────────────────────────────────┘   │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │ POOL 2: Transaction Fees                             │   │
-│  │ • 70% to Super nodes (divided equally among Super)  │   │
-│  │ • 30% to Full nodes (divided equally among Full)    │   │
-│  │ • 0% to Light nodes (don't process transactions)    │   │
+│  │ POOL 2: REMOVED in v3.18                              │   │
+│  │ • Transaction fees now go directly to block producer │   │
+│  │ • No batched distribution                            │   │
+│  │                                                       │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐   │
@@ -1765,16 +1767,15 @@ let sample_seed = sha3_256(b"QNet_Ping_Sampling_v1" || entropy_block || window_s
 let sampled_pings = deterministic_sample(&all_pings, sample_seed, SAMPLE_SIZE);
 
 // STEP 4: Calculate rewards per node
+// v3.18: Pool 2 removed - fees go directly to block producer
 let pool1_per_node = pool1_emission / eligible_nodes_count;
-let pool2_super = (pool2_fees * 70 / 100) / super_nodes_count;
-let pool2_full = (pool2_fees * 30 / 100) / full_nodes_count;
 
 // STEP 5: Store pending rewards (lazy accumulation)
+// v3.18: Full nodes removed - only Light and Super remain
 for node in eligible_nodes {
     let reward = match node.node_type {
         Light => pool1_per_node,
-        Full => pool1_per_node + pool2_full,
-        Super => pool1_per_node + pool2_super,
+        Super => pool1_per_node,  // v3.18: Pool 2 removed, only Pool 1 + Pool 3
     };
     storage.save_pending_reward(&node.id, reward)?;
 }
@@ -2077,7 +2078,6 @@ DELETE /api/v1/bundle/{bundle_id}
 
 **Scalability**:
 - ✅ **Light Nodes**: NOT affected (don't produce blocks)
-- ✅ **Full Nodes**: Can submit bundles if reputation ≥80%
 - ✅ **Super Nodes**: Full MEV protection capabilities
 - ✅ **Lock-Free**: DashMap for concurrent bundle operations
 
@@ -2472,14 +2472,14 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 - **Storage**: ~10 MB (app data, no blockchain)
 - **Bandwidth**: On-demand (RPC calls only)
 - **Use case**: Mobile wallets - thin client architecture
-- **Note**: Light nodes do NOT sync or store blocks. All data (balance, TX history) is fetched via RPC from Full/Super nodes.
+- **Note**: Light nodes do NOT sync or store blocks. All data (balance, TX history) is fetched via RPC from Super nodes.
 
-#### Full Node
-- **CPU**: 4 cores (2.4 GHz)
-- **RAM**: 8 GB
-- **Storage**: 500 GB SSD (30 days history)
-- **Bandwidth**: 10 Mbps
-- **Use case**: Desktop/server nodes, consensus participation
+#### Super Node (Server Only)
+- **CPU**: 8+ cores (2.4+ GHz)
+- **RAM**: 16+ GB
+- **Storage**: 2+ TB SSD (full history)
+- **Bandwidth**: 100+ Mbps
+- **Use case**: Block production, full validation, consensus participation
 
 #### Super/Bootstrap Node
 - **CPU**: 8 cores (2.4 GHz+)
@@ -2525,7 +2525,7 @@ Environment:
 - Macroblock missing (PFP activated)
 - Reputation below 70% (consensus exclusion)
 - Storage >90% capacity
-- Peer count <3 (Full nodes)
+- Peer count <3 (Super nodes, v3.18: Full removed)
 
 ---
 

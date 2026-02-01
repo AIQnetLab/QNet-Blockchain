@@ -13,7 +13,7 @@ interface AddressData {
   lastActive: number;
   nodeInfo?: {
     nodeId: string;
-    nodeType: 'SUPER' | 'FULL' | 'LIGHT';
+    nodeType: 'SUPER' | 'LIGHT';  // v3.18: FULL removed
     reputation: number;
     activatedAt: number;
     isActive: boolean;

@@ -4,7 +4,7 @@
 
 ```
 REST API:     http://{node_ip}:8001/api/v1  (for Light nodes & external clients)
-P2P (QUIC):   quic://{node_ip}:10876        (for Full/Super nodes - internal)
+P2P (QUIC):   quic://{node_ip}:10876        (for Super nodes - internal)
 
 Genesis Nodes:
   - 154.38.160.39:8001 (REST API) / :10876/udp (QUIC P2P)
@@ -13,7 +13,7 @@ Genesis Nodes:
   - 5.189.130.160:8001 (REST API) / :10876/udp (QUIC P2P)
   - 162.244.25.114:8001 (REST API) / :10876/udp (QUIC P2P)
 
-Note: Light nodes use REST API (HTTP). Full/Super nodes use QUIC for P2P.
+Note: Light nodes use REST API (HTTP). Super nodes use QUIC for P2P.
 ```
 
 ## 🔐 Authentication
@@ -389,7 +389,7 @@ Content-Type: application/json
 {
   "wallet_address": "Solana_or_EON_address",
   "burn_tx_hash": "solana_burn_tx_signature",
-  "node_type": "light|full|super",
+  "node_type": "light|super",  // v3.18: full removed
   "burn_amount": 1350,
   "phase": 1
 }
@@ -603,10 +603,10 @@ GET /api/v1/node/status?activation_code={code}&node_id={id}
 ```json
 {
   "success": true,
-  "node_id": "full_node_abc123",
-  "node_type": "Full",
+  "node_id": "super_node_abc123",
+  "node_type": "Super",
   "is_online": true,
-  "heartbeat_count": 8,
+  "heartbeat_count": 9,
   "reputation": 85.5,
   "pending_rewards": 1500000000,
   "total_distributed_rewards": 50000000000,
@@ -625,12 +625,13 @@ GET /api/v1/node/status?activation_code={code}&node_id={id}
 - 1 epoch = 14,400 blocks = 4 hours (at 1 block/second)
 - Rewards distributed at blocks 14400, 28800, 43200, etc.
 
-**Three Reward Pools:**
+**Two Reward Pools (v3.18):**
 | Pool | Source | Distribution | Phase |
 |------|--------|--------------|-------|
 | Pool 1 | Base Emission | Equal to ALL eligible nodes | Both |
-| Pool 2 | Transaction Fees | Full/Super nodes only (50% each) | Both |
 | Pool 3 | Activation Payments | Equal to ALL eligible nodes | Phase 2 only |
+
+> **v3.18**: Pool 2 removed - transaction fees go directly to block producer.
 
 **Dynamic Emission (Pool 1):**
 - Initial: ~251,432 QNC per epoch
@@ -641,7 +642,6 @@ GET /api/v1/node/status?activation_code={code}&node_id={id}
 | Node Type | Pings Required | Timing |
 |-----------|----------------|--------|
 | Light | 1/1 attestation | Once per 4h window (sharded) |
-| Full | 8/10 heartbeats | Every ~24 min (deterministic) |
 | Super | 9/10 heartbeats | Every ~24 min (deterministic) |
 
 **Ping Window Calculation:**
@@ -765,11 +765,11 @@ GET /api/v1/rewards/pending?node_id={node_id}
 {
   "success": true,
   "node_id": "node_abc123",
-  "node_type": "Full",
+  "node_type": "Super",  // v3.18: Full removed
   "pending_rewards": 1.5,
   "pools": {
     "pool1_base_emission": 1.0,
-    "pool2_tx_fees": 0.5,
+    "pool2_tx_fees": 0,  // v3.18: Pool 2 removed
     "pool3_activation_bonus": 0.0
   },
   "ping_status": {
@@ -809,7 +809,7 @@ GET /api/v1/rewards/history/{node_id}?offset={offset}&limit={limit}
       "status": "claimed",
       "total_qnc": 1.5,
       "pool1_qnc": 1.0,
-      "pool2_qnc": 0.5,
+      "pool2_qnc": 0,  // v3.18: Pool 2 removed - fees direct to producer
       "pool3_qnc": 0.0,
       "claim_time": 1700100000,
       "tx_hash": "abc123..."
@@ -847,9 +847,9 @@ GET /api/v1/rewards/pools/{node_id}
       "current_epoch_qnc": 1.0,
       "description": "Base emission divided equally among all eligible nodes"
     },
-    "pool2_transaction_fees": {
-      "current_epoch_qnc": 0.5,
-      "description": "Share of transaction fees (Full/Super only)"
+    "pool2_transaction_fees": {  // v3.18: DEPRECATED - fees go direct to producer
+      "current_epoch_qnc": 0,  // Always 0 in v3.18+
+      "description": "DEPRECATED in v3.18 - fees go direct to producer"
     },
     "pool3_activation_bonus": {
       "current_epoch_qnc": 0.0,
@@ -870,8 +870,8 @@ GET /api/v1/rewards/pools/{node_id}
   "eligibility": {
     "is_eligible": true,
     "heartbeats": 10,
-    "required": 8,
-    "node_type": "Full"
+    "required": 9,
+    "node_type": "Super"  // v3.18: Full removed
   },
   "cached_at": 1700000000,
   "cache_ttl_seconds": 10
@@ -893,9 +893,9 @@ GET /api/v1/rewards/by-wallet/{wallet_address}
   "success": true,
   "wallet_address": "a1b2c3d4e5f6g7h8i9jeon...",
   "nodes": [
-    {
-      "node_id": "full_node_001",
-      "node_type": "Full",
+    {  // v3.18: Full nodes removed - example shows Super
+      "node_id": "super_node_001",
+      "node_type": "Super",
       "pending_qnc": 1.5,
       "is_eligible": true,
       "heartbeats": 10
@@ -1010,7 +1010,7 @@ GET /api/v1/rewards/summary/{node_id}
   "lifetime_stats": {
     "total_claimed_qnc": 150.5,
     "total_pool1_qnc": 100.0,
-    "total_pool2_qnc": 45.0,
+    "total_pool2_qnc": 0,  // v3.18: Pool 2 removed
     "total_pool3_qnc": 5.5,
     "epochs_participated": 100,
     "epochs_claimed": 95,
@@ -1082,7 +1082,7 @@ Content-Type: application/json
 ```json
 {
   "node_id": "node_abc123",
-  "node_type": "Full",
+  "node_type": "Super",  // v3.18: Full removed
   "wallet_address": "a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2",
   "public_key": "dilithium_pubkey_hex",
   "api_endpoint": "http://node_ip:8001"
@@ -1109,7 +1109,7 @@ GET /api/v1/node/health
 {
   "status": "healthy",
   "node_id": "node_abc123",
-  "node_type": "Full",
+  "node_type": "Super",  // v3.18: Full removed
   "block_height": 1234567,
   "peers_connected": 42,
   "mempool_size": 150,
@@ -1148,8 +1148,8 @@ GET /api/v1/stats
   "total_accounts": 250000,
   "total_nodes": 15000,
   "light_nodes": 12000,
-  "full_nodes": 2500,
-  "super_nodes": 500,
+  "full_nodes": 0,  // v3.18: Full nodes removed
+  "super_nodes": 2500,
   "tps_current": 1250,
   "tps_peak": 424411
 }
@@ -1187,8 +1187,8 @@ GET /api/v1/public/stats
 {
   "active_nodes": 85000,
   "light_nodes": 50000,
-  "full_nodes": 30000,
-  "super_nodes": 5000,
+  "full_nodes": 0,  // v3.18: Full nodes removed
+  "super_nodes": 35000,
   "height": 1234567,
   "phase": 1,
   "burn_percentage": 45.5,
@@ -1199,9 +1199,9 @@ GET /api/v1/public/stats
 
 | Field | Type | Description |
 |-------|------|-------------|
-| active_nodes | u64 | Total active nodes (Light + Full + Super) |
+| active_nodes | u64 | Total active nodes (Light + Super) |
 | light_nodes | u64 | Active Light nodes |
-| full_nodes | u64 | Active Full nodes |
+| full_nodes | u64 | Always 0 (v3.18: removed) |
 | super_nodes | u64 | Active Super nodes |
 | height | u64 | Current blockchain height |
 | phase | u8 | Current phase (1 = 1DEV burn, 2 = QNC) |
@@ -1221,7 +1221,7 @@ GET /api/v1/activation/price?type={node_type}
 **Query Parameters:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| type | string | No | Node type: `light`, `full`, `super`. Default: `light` |
+| type | string | No | Node type: `light`, `super`. Default: `light` |
 
 **Phase 1 Response (1DEV Burn):**
 ```json
@@ -1674,7 +1674,7 @@ Content-Type: application/json
 
 ## 🔗 P2P Endpoints
 
-> **Note (v2.19.22)**: Full/Super nodes use QUIC (UDP 10876) for P2P communication.
+> **Note (v2.19.22)**: Super nodes use QUIC (UDP 10876) for P2P communication.
 > These HTTP endpoints are for Light nodes and legacy compatibility only.
 
 ### P2P Message (Light Nodes Only)
@@ -1909,7 +1909,7 @@ ws.onmessage = (event) => {
     "node_id": "node_abc123",
     "pending_qnc": 1.5,
     "pool1_qnc": 1.0,
-    "pool2_qnc": 0.5,
+    "pool2_qnc": 0,  // v3.18: Pool 2 removed
     "pool3_qnc": 0.0,
     "is_eligible": true,
     "heartbeats": 10
@@ -2105,7 +2105,7 @@ GET /api/v1/snapshot/{height}
 - **OPTIMIZATION**: Emergency timeout increased to 10s (was 2s)
 - **RELIABILITY**: Pseudo-infinite retries for blocks (never discard critical data)
 - **RELIABILITY**: Exponential backoff: 10s (0-9) → 30s → 60s → 120s → 240s → 300s max
-- **MEMORY**: Adaptive buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
+- **MEMORY**: Adaptive buffer: Super 500 blocks (~50MB), Light 100 blocks (~10MB)
 - **SYNC**: Background re-request every 30s with exponential backoff
 
 ### v2.23 (December 2025)
@@ -2115,7 +2115,7 @@ GET /api/v1/snapshot/{height}
 - **OPTIMIZATION**: Kademlia K-neighbors for heartbeat routing (K=3)
 - **OPTIMIZATION**: Exponential backoff for failover (3s → 6s → 12s → 24s → 30s max)
 - **NEW**: `gossip_to_k_neighbors()` method for DHT-based message propagation
-- **SECURITY**: Heartbeat validation via active_full_super_nodes registry (NIST FIPS 204 compliant)
+- **SECURITY**: Heartbeat validation via active_super_nodes registry (NIST FIPS 204 compliant)
 
 ### v2.19.12 (November 2025)
 - **NEW**: QRC-20 Token endpoints:

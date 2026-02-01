@@ -17,7 +17,7 @@ export interface AddressData {
   isSystem?: boolean;
   nodeInfo?: {
     nodeId: string;
-    nodeType: 'SUPER' | 'FULL' | 'LIGHT';
+    nodeType: 'SUPER' | 'LIGHT';  // v3.18: FULL removed
     reputation: number;
     activatedAt: number;
     isActive: boolean;
@@ -181,7 +181,7 @@ export async function GET(
         transactions: txData,
       },
     });
-  } catch {
+  } catch (err) {
     return NextResponse.json({
       success: false,
       error: err instanceof Error ? err.message : 'Database error',

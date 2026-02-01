@@ -78,7 +78,7 @@ export class NetworkManager {
                 ping_history: response.ping_history || [],
                 reward_breakdown: response.reward_breakdown || {
                     pool1_description: 'Base emission (equal to all active nodes)',
-                    pool2_description: 'Transaction fees (70% Super, 30% Full, 0% Light)',
+                    pool2_description: 'v3.18: Pool 2 removed - fees go directly to block producer (always 0)',
                     pool3_description: 'Activation pool (Phase 2 only, equal to all active nodes)'
                 }
             };
@@ -154,8 +154,8 @@ export class NetworkManager {
             return {
                 pool2_total: response.pool2_total || 0,
                 distribution: {
-                    super_nodes: response.super_nodes || { percentage: 70, amount: 0 },
-                    full_nodes: response.full_nodes || { percentage: 30, amount: 0 },
+                    super_nodes: response.super_nodes || { percentage: 100, amount: 0 }, // v3.18: Full nodes removed
+                    full_nodes: { percentage: 0, amount: 0 }, // v3.18: Always 0 (Full node type removed)
                     light_nodes: response.light_nodes || { percentage: 0, amount: 0 }
                 },
                 last_distribution: response.last_distribution || 'Never',

@@ -482,7 +482,6 @@ impl BlockValidator {
                 // Validate node type
                 match node_type {
                     qnet_state::account::NodeType::Light | 
-                    qnet_state::account::NodeType::Full | 
                     qnet_state::account::NodeType::Super => {
                         // Valid node types
                     }
@@ -642,9 +641,10 @@ impl BlockValidator {
                 if node_id.is_empty() {
                     return Err(IntegrationError::ValidationError("Node ID cannot be empty".to_string()));
                 }
-                if !node_id.starts_with("light_") && !node_id.starts_with("full_") 
+                // v3.18: Full nodes removed
+                if !node_id.starts_with("light_") 
                     && !node_id.starts_with("super_") && !node_id.starts_with("genesis_node_") {
-                    return Err(IntegrationError::ValidationError(format!("Invalid node_id format: {}", node_id)));
+                    return Err(IntegrationError::ValidationError(format!("Invalid node_id format: {} (Full node type removed in v3.18)", node_id)));
                 }
                 
                 // Validate window heights
@@ -738,7 +738,7 @@ impl BlockValidator {
                 }
                 // amount_out_min can be 0 (no slippage protection - risky but allowed)
                 let _ = amount_out_min; // Explicitly mark as intentionally unused here
-                // Gas fee for swaps goes to Pool 2 (70% Super, 30% Full)
+                // v3.18: Gas fee goes directly to block producer (Pool 2 removed)
             }
             TransactionType::NodeRegistration { node_id, wallet_address, .. } => {
                 // v2.73: On-chain node registration validation

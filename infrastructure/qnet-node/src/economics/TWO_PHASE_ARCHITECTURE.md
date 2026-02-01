@@ -43,7 +43,7 @@ QNet uses a two-phase system for node activation that transitions from external 
 - **Migration Handler**: Free migration for 1DEV-era nodes
 
 ### Pricing:
-- Different base prices: Light 5,000 / Full 7,500 / Super 10,000 QNC
+- v3.18: Two-tier pricing: Light 10,000 / Super 7,500 QNC (Full node removed)
 - Network size multipliers: 0.5x (0-100k) / 1.0x (100k-300k) / 2.0x (300k-1M) / 3.0x (1M+)
 - All QNC transferred to Pool 3 for equal daily distribution
 

@@ -27,10 +27,10 @@ export class ActivationBridgeClient {
                 '1m-10m': 2.0,
                 '10m+': 3.0
             },
+            // v3.18: Only Light and Super nodes
             baseCosts: {
-                Light: 5000,
-                Full: 7500,
-                Super: 10000
+                Light: 10000,
+                Super: 7500
             }
         };
         
@@ -236,7 +236,8 @@ export class ActivationBridgeClient {
     async startPhase2Activation(eonAddress, nodeType, qncAmount) {
         try {
             // Validate inputs
-            if (!['Light', 'Full', 'Super'].includes(nodeType)) {
+            // v3.18: Only Light and Super nodes
+            if (!['Light', 'Super'].includes(nodeType)) {
                 throw new Error('Invalid node type');
             }
 
@@ -686,7 +687,8 @@ export class ActivationBridgeClient {
         const parts = code.split('-');
         // Extract node type from first char of segment1
         const nodeTypeMarker = parts[1][0];
-        const nodeTypes = { 'L': 'Light', 'F': 'Full', 'S': 'Super' };
+        // v3.18: Only Light and Super nodes (F kept for backward compat parsing)
+        const nodeTypes = { 'L': 'Light', 'S': 'Super' };
         
         return {
             prefix: parts[0], // 'QNET'

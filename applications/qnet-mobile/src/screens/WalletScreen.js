@@ -768,7 +768,7 @@ const WalletScreen = () => {
   const [termsAccepted, setTermsAccepted] = useState(false);
   const [showTermsModal, setShowTermsModal] = useState(false);
   const [customAlert, setCustomAlert] = useState(null); // {title, message, buttons}
-  const [nodeStatus, setNodeStatus] = useState(null); // 'light', 'full', or 'super'
+  const [nodeStatus, setNodeStatus] = useState(null); // v3.18: 'light' or 'super' only
   const [copiedAddress, setCopiedAddress] = useState(''); // Track which address was copied
   const [burnProgress, setBurnProgress] = useState('0.0'); // Real burn progress from blockchain
   const [activatingNode, setActivatingNode] = useState(false); // For node activation loading state
@@ -967,7 +967,8 @@ const WalletScreen = () => {
   // Load dynamic activation pricing
   const loadActivationPricing = async () => {
     try {
-      const pricing = await walletManager.calculateActivationCost('full');
+      // v3.18: Use 'light' as default for pricing display
+      const pricing = await walletManager.calculateActivationCost('light');
       setActivationPricing(pricing);
     } catch (error) {
       setActivationPricing(null);
@@ -2526,11 +2527,11 @@ const WalletScreen = () => {
             return;
           }
           
-          // Try to load existing or generate new
-          let code = await walletManager.loadActivationCode('full', password);
+          // v3.18: Generate code for super node (full removed)
+          let code = await walletManager.loadActivationCode('super', password);
           if (!code) {
-            code = walletManager.generateActivationCode('full', walletData.address);
-            await walletManager.storeActivationCode(code, 'full', password);
+            code = walletManager.generateActivationCode('super', walletData.address);
+            await walletManager.storeActivationCode(code, 'super', password);
           }
           
           showAlert(
@@ -3876,14 +3877,7 @@ const WalletScreen = () => {
                   </View>
                 )}
                 
-                {nodeStatus === 'full' && (
-                  <View style={[styles.warningBox, {backgroundColor: 'rgba(255, 170, 0, 0.1)', borderColor: 'rgba(255, 170, 0, 0.3)'}]}>
-                    <Text style={[styles.warningText, {color: '#ffaa00'}]}>
-                      ⚠️ Full nodes require server activation after code generation
-                    </Text>
-                   
-                  </View>
-                )}
+                {/* v3.18: Full Node removed - only Light and Super */}
                 
                 {nodeStatus === 'super' && (
                   <View style={[styles.warningBox, {backgroundColor: 'rgba(255, 170, 0, 0.1)', borderColor: 'rgba(255, 170, 0, 0.3)'}]}>
@@ -3921,32 +3915,7 @@ const WalletScreen = () => {
                 </Text>
               </TouchableOpacity>
 
-              <TouchableOpacity 
-                style={[
-                  styles.nodeTypeCard, 
-                  nodeStatus === 'full' && !activatedNodeType && styles.nodeTypeActive,
-                  activatedNodeType === 'full' && styles.nodeTypeActivated
-                ]}
-                onPress={() => !activatedNodeType && setNodeStatus('full')}
-                disabled={Boolean(activatedNodeType)}
-              >
-                <View style={styles.nodeTypeInfo}>
-                  <Text style={styles.nodeTypeName}>
-                    Full Node
-                  </Text>
-                  <Text style={styles.nodeTypeDesc}>
-                    {activatedNodeType === 'full' 
-                      ? 'Code received • Ready to use'
-                      : 'Server node with full validation.'}
-                  </Text>
-                </View>
-                <Text style={styles.nodeTypePrice}>
-                  {activatedNodeType === 'full' ? 'CODE RECEIVED' :
-                   activationPricing ? 
-                   `${activationPricing.cost} ${activationPricing.currency}` : 
-                   '...'}
-                </Text>
-              </TouchableOpacity>
+              {/* v3.18: Full Node card removed - only Light and Super */}
 
               <TouchableOpacity 
                 style={[
@@ -3999,15 +3968,16 @@ const WalletScreen = () => {
                 // Different messages for each node type with dynamic pricing
                 const activationCost = activationPricing ? `${activationPricing.cost} ${activationPricing.currency}` : '...';
                 
+                // v3.18: Only Light and Super nodes
                 const nodeMessages = {
                   light: `Get ${nodeTypeName} Code\n\n• No token burn required\n• Instant code generation\n• Basic validation node`,
-                  full: `Get ${nodeTypeName} Code\n\n• Server activation required\n• ${activationCost} burn required\n• Professional validator`,
                   super: `Get ${nodeTypeName} Code\n\n• Server activation required\n• ${activationCost} burn required\n• Enterprise grade node`
                 };
                 
                 const warningMessage = nodeMessages[nodeStatus];
                 
                 // Node detailed specifications (like in browser extension)
+                // v3.18: Only Light and Super nodes
                 const nodeSpecs = {
                   light: {
                     platform: 'Mobile',
@@ -4017,18 +3987,10 @@ const WalletScreen = () => {
                     role: 'Basic validation',
                     activation: '✓ Full activation in Mobile App'
                   },
-                  full: {
-                    platform: 'Server',
-                    storage: '50-100GB',
-                    rewards: '30% of fees',
-                    uptime: '80% required',
-                    role: 'Full validation',
-                    activation: '⚠️ Requires server activation'
-                  },
                   super: {
                     platform: 'High-end server',
                     storage: '2TB+',
-                    rewards: '70% of fees',
+                    rewards: 'Block fees',
                     uptime: '90% required',
                     role: 'Network backbone',
                     activation: '⚠️ Requires server activation'
@@ -4216,9 +4178,9 @@ const WalletScreen = () => {
                             
                             // Different status messages based on node type
                             const burnedAmount = result.burned || requiredAmount;
+                            // v3.18: Only Light and Super nodes
                             const statusMessages = {
                               light: `Paid (${burnedAmount} 1DEV burned)`,
-                              full: `Paid (${burnedAmount} 1DEV burned) • Server activation required`,
                               super: `Paid (${burnedAmount} 1DEV burned) • Server activation required`
                             };
                             
@@ -4576,7 +4538,7 @@ const WalletScreen = () => {
                       {!serverNodeStatus?.success && (
                         <View style={styles.serverActivationNotice}>
                           <Text style={styles.serverActivationText}>
-                            {activatedNodeType === 'full' ? 'Full' : 'Super'} nodes require server activation
+                            Super nodes require server activation
                           </Text>
                           <Text style={styles.serverActivationSubtext}>
                             Use your activation code on a dedicated server

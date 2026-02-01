@@ -19,23 +19,23 @@ fn test_network_growth_phases() {
     println!("\n{}", "=== NETWORK GROWTH PHASES TEST ===".green().bold());
     
     // QNet growth phases from whitepaper
+    // v3.18: Full nodes removed - only Super and Light remain
     let phases = vec![
-        ("Genesis", 5, 5, 0, 0, "Only 5 Super Genesis nodes"),
-        ("Early", 100, 10, 50, 40, "Mixed node types emerging"),
-        ("Growth", 10_000, 100, 5_000, 4_900, "Full nodes dominate"),
-        ("Mature", 100_000, 500, 20_000, 79_500, "Light nodes majority"),
-        ("Scale", 1_000_000, 1_000, 50_000, 949_000, "Mass adoption"),
-        ("Ultimate", 10_000_000, 5_000, 100_000, 9_895_000, "Global scale"),
+        ("Genesis", 5, 5, 0, "Only 5 Super Genesis nodes"),
+        ("Early", 100, 10, 90, "Mixed node types emerging"),
+        ("Growth", 10_000, 100, 9_900, "Super nodes for consensus"),
+        ("Mature", 100_000, 500, 99_500, "Light nodes majority"),
+        ("Scale", 1_000_000, 1_000, 999_000, "Mass adoption"),
+        ("Ultimate", 10_000_000, 5_000, 9_995_000, "Global scale"),
     ];
     
-    for (phase, total, super_nodes, full_nodes, light_nodes, description) in phases {
-        let consensus_eligible = super_nodes + full_nodes; // Light nodes DON'T participate!
+    for (phase, total, super_nodes, light_nodes, description) in phases {
+        let consensus_eligible = super_nodes; // Only Super nodes participate (v3.18: Full removed)
         let consensus_percentage = (consensus_eligible as f64 / total as f64) * 100.0;
         
         println!("  {} Phase ({}):", phase.yellow(), description.green());
         println!("    Total nodes: {}", format!("{:>10}", total.to_string()).cyan());
         println!("    Super: {:>10} ({:.1}%)", super_nodes, (super_nodes as f64 / total as f64) * 100.0);
-        println!("    Full:  {:>10} ({:.1}%)", full_nodes, (full_nodes as f64 / total as f64) * 100.0);
         println!("    Light: {:>10} ({:.1}%)", light_nodes, (light_nodes as f64 / total as f64) * 100.0);
         println!("    {} Consensus eligible: {} ({:.1}%)", 
             "→".red(),
@@ -43,11 +43,11 @@ fn test_network_growth_phases() {
             consensus_percentage
         );
         
-        // Verify Light nodes are excluded
+        // Verify Light nodes are excluded (v3.18: Full removed)
         assert_eq!(
             consensus_eligible,
-            super_nodes + full_nodes,
-            "Light nodes should NOT be in consensus"
+            super_nodes,
+            "Only Super nodes participate in consensus (v3.18: Full removed)"
         );
     }
     
@@ -61,14 +61,15 @@ fn test_validator_sampling_at_scale() {
     // QNet uses sampling for scalability - max 1000 validators per round
     const MAX_VALIDATORS: usize = 1000;
     
+    // v3.18: Full nodes removed
     let test_cases = vec![
-        (100, 60, 40, 0),           // 100 nodes total
-        (10_000, 100, 5_000, 4_900), // 10k nodes
-        (1_000_000, 1_000, 50_000, 949_000), // 1M nodes
+        (100, 60, 40),           // 100 nodes total (super, light)
+        (10_000, 100, 9_900), // 10k nodes (super, light)
+        (1_000_000, 1_000, 999_000), // 1M nodes (super, light)
     ];
     
-    for (total, super_count, full_count, light_count) in test_cases {
-        let eligible = super_count + full_count; // Light nodes excluded
+    for (total, super_count, light_count) in test_cases {
+        let eligible = super_count; // Only Super nodes eligible (v3.18: Full removed)
         let sampled = if eligible > MAX_VALIDATORS {
             MAX_VALIDATORS
         } else {
@@ -138,13 +139,7 @@ fn test_light_node_exclusion() {
         last_participation: 0,
     };
     
-    let full_node = ValidatorCandidate {
-        node_id: "full_node_001".to_string(),
-        node_type: ValidatorNodeType::Full,
-        reputation: 70.0,
-        last_participation: 0,
-    };
-    
+    // v3.18: Full nodes removed
     let super_node = ValidatorCandidate {
         node_id: "super_node_001".to_string(),
         node_type: ValidatorNodeType::Super,
@@ -156,16 +151,14 @@ fn test_light_node_exclusion() {
     let can_participate = |node: &ValidatorCandidate| -> bool {
         match node.node_type {
             ValidatorNodeType::Light => false, // NEVER eligible
-            ValidatorNodeType::Full | ValidatorNodeType::Super => node.reputation >= 70.0,
+            ValidatorNodeType::Super => node.reputation >= 70.0, // v3.18: Only Super eligible
         }
     };
     
     assert!(!can_participate(&light_node), "Light node should NEVER participate");
-    assert!(can_participate(&full_node), "Full node with 70% should participate");
     assert!(can_participate(&super_node), "Super node with 70% should participate");
     
     println!("  {} Light node (100% rep): {} for consensus", "❌".red(), "EXCLUDED".red());
-    println!("  {} Full node (70% rep): {} for consensus", "✅".green(), "ELIGIBLE".green());
     println!("  {} Super node (70% rep): {} for consensus", "✅".green(), "ELIGIBLE".green());
     
     println!("{}", "✅ Light nodes correctly excluded from consensus".green());
@@ -184,28 +177,19 @@ fn test_performance_at_scale() {
         1_000_000,
     ];
     
+    // v3.18: Full nodes removed - only Super nodes eligible
     for pool_size in pool_sizes {
-        // Create candidate pool (only Super and Full nodes)
+        // Create candidate pool (only Super nodes)
         let mut candidates = Vec::new();
         let mut rng = thread_rng();
         
-        // Distribute: 1% Super, 10% Full, 89% Light (but we only add S+F)
+        // Distribute: 1% Super, 99% Light (but we only add Super)
         let super_count = pool_size / 100;
-        let full_count = pool_size / 10;
         
         for i in 0..super_count {
             candidates.push(ValidatorCandidate {
                 node_id: format!("super_{}", i),
                 node_type: ValidatorNodeType::Super,
-                reputation: 70.0 + rng.gen_range(0.0..30.0),
-                last_participation: 0,
-            });
-        }
-        
-        for i in 0..full_count {
-            candidates.push(ValidatorCandidate {
-                node_id: format!("full_{}", i),
-                node_type: ValidatorNodeType::Full,
                 reputation: 70.0 + rng.gen_range(0.0..30.0),
                 last_participation: 0,
             });

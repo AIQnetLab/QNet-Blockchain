@@ -2,7 +2,7 @@
 //! Phase 1: 1DEV burn-to-join, Pool 3 DISABLED
 //! Phase 2: QNC spend-to-Pool3, Pool 3 ENABLED
 //! Pool 1: Dynamic base emission with sharp drop halving
-//! Pool 2: Transaction fees (70% Super, 30% Full, 0% Light)
+//! Pool 2: REMOVED in v3.18 - transaction fees go directly to block producer
 //! Pool 3: Activation pool (ONLY in Phase 2)
 
 use std::collections::{HashMap, HashSet};
@@ -22,9 +22,9 @@ pub enum QNetPhase {
 
 /// Node type for reward calculation
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// v3.18: Full node type REMOVED - only Light and Super remain
 pub enum NodeType {
     Light,
-    Full,
     Super,
 }
 
@@ -44,14 +44,9 @@ impl PingRequirements {
                 success_rate_threshold: 1.0, // 100% (binary: respond or not)
                 timeout_seconds: 60,         // 60 seconds to respond
             },
-            NodeType::Full => Self {
-                pings_per_4h_window: 10,     // 10 pings per 4 hours (every 24 minutes) - REDUCED for scalability
-                success_rate_threshold: 0.8, // 80% (8+ out of 10) - ADJUSTED for new ping count
-                timeout_seconds: 30,         // 30 seconds to respond
-            },
             NodeType::Super => Self {
                 pings_per_4h_window: 10,     // 10 pings per 4 hours (every 24 minutes) - REDUCED for scalability
-                success_rate_threshold: 0.9, // 90% (9+ out of 10) - ADJUSTED for new ping count  
+                success_rate_threshold: 0.9, // 90% (9+ out of 10) - Super nodes require higher reliability
                 timeout_seconds: 30,         // 30 seconds to respond
             },
         }
@@ -118,8 +113,8 @@ impl NodePingHistory {
                 // node should still be eligible as long as at least one succeeded
                 successful_pings >= 1
             },
-            NodeType::Full | NodeType::Super => {
-                // Full/Super nodes: percentage success rate
+            NodeType::Super => {
+                // Super nodes: percentage success rate
                 success_rate >= requirements.success_rate_threshold
             }
         }
@@ -387,8 +382,7 @@ impl PhaseAwareRewardManager {
             .map(|(node_id, history)| {
                 let node_type_u8 = match history.node_type {
                     NodeType::Light => 0,
-                    NodeType::Full => 1,
-                    NodeType::Super => 2,
+                    NodeType::Super => 1,
                 };
                 
                 HeartbeatSummaryData {
@@ -764,11 +758,12 @@ impl PhaseAwareRewardManager {
     /// - heartbeat_summaries: Eligible nodes from MacroBlock
     /// - pool2_total: Total transaction fees from MacroBlock (None = use local)
     /// - pool3_total: Total activation QNC from MacroBlock (None = use local, Phase 2 only)
+    /// Note: pool2_total kept for backward compatibility but always ignored (Pool 2 removed in v3.18)
     pub fn process_macroblock_heartbeats_deterministic(
         &mut self,
         macroblock_index: u64,
         heartbeat_summaries: &[HeartbeatSummaryData],
-        pool2_total: Option<u64>,
+        _pool2_total: Option<u64>, // v3.18: Pool 2 removed - ignored
         pool3_total: Option<u64>,
     ) -> Result<bool, ConsensusError> {
         // v2.90: CRITICAL - Prevent double-processing of emission MacroBlocks!
@@ -803,37 +798,37 @@ impl PhaseAwareRewardManager {
         
         let current_phase = self.get_current_phase();
         
+        // v3.18: Pool 2 removed - fees go directly to block producer
+        let _pool2_fees = 0; // Kept for backward compatibility
         // Use MacroBlock values if provided, otherwise fall back to local (legacy)
         // v2.51.1: Add accumulated remainders from previous period
-        let pool2_fees = pool2_total.unwrap_or(self.pool2_transaction_fees) 
-            + self.pool2_full_remainder + self.pool2_super_remainder;
         let pool3_activations = pool3_total.unwrap_or(self.pool3_activation_pool)
             + self.pool3_remainder;
         
         // Count eligible nodes from MacroBlock data
         let mut eligible_light_nodes = 0u32;
-        let mut eligible_full_nodes = 0u32;
         let mut eligible_super_nodes = 0u32;
         
+        // v3.18: Full nodes removed - node_type 1 is ignored
         for summary in heartbeat_summaries {
             if summary.is_eligible {
                 match summary.node_type {
                     0 => eligible_light_nodes += 1,  // Light
-                    1 => eligible_full_nodes += 1,   // Full
                     2 => eligible_super_nodes += 1,  // Super
-                    _ => {}
+                    _ => {} // Ignore node_type 1 (Full) and unknown types
                 }
             }
         }
         
-        let total_eligible_nodes = eligible_light_nodes + eligible_full_nodes + eligible_super_nodes;
+        let total_eligible_nodes = eligible_light_nodes + eligible_super_nodes;
         
         if total_eligible_nodes == 0 {
-            println!("[INFO][REWARDS] macroblock_heartbeats no_eligible_nodes pool2_carried={} pool3_carried={}",
-                     pool2_fees, pool3_activations);
+            println!("[INFO][REWARDS] macroblock_heartbeats no_eligible_nodes pool3_carried={}",
+                     pool3_activations);
             // Keep remainders for next period (no nodes to distribute to)
-            self.pool2_full_remainder = pool2_fees * 30 / 100;
-            self.pool2_super_remainder = pool2_fees * 70 / 100;
+            // v3.18: Pool 2 removed - all remainders are 0
+            self.pool2_full_remainder = 0;
+            self.pool2_super_remainder = 0;
             self.pool3_remainder = pool3_activations;
             // v2.96: Return true = processed (even though no rewards distributed)
             return Ok(true);
@@ -844,8 +839,8 @@ impl PhaseAwareRewardManager {
         // Calculate total distribution and remainders for each pool
         // ═══════════════════════════════════════════════════════════════════════════
         
-        let full_count = eligible_full_nodes as u64;
-        let super_count = eligible_super_nodes as u64;
+        // v3.18: Full nodes removed - super_count kept for future use
+        let _super_count = eligible_super_nodes as u64;
         let total_count = total_eligible_nodes as u64;
         
         // Pool 1: Base emission with remainder
@@ -853,20 +848,12 @@ impl PhaseAwareRewardManager {
         let pool1_per_node = if total_count > 0 { pool1_total / total_count } else { 0 };
         let pool1_new_remainder = if total_count > 0 { pool1_total % total_count } else { pool1_total };
         
-        // Pool 2: Calculate shares based on node availability
-        let (pool2_full_share, pool2_super_share) = match (full_count > 0, super_count > 0) {
-            (true, true) => (pool2_fees * 30 / 100, pool2_fees * 70 / 100),
-            (false, true) => (0, pool2_fees), // All to Super
-            (true, false) => (pool2_fees, 0), // All to Full
-            (false, false) => (0, 0),         // No validators (shouldn't happen)
-        };
-        
-        let pool2_per_full = if full_count > 0 { pool2_full_share / full_count } else { 0 };
-        let pool2_per_super = if super_count > 0 { pool2_super_share / super_count } else { 0 };
-        
-        // Calculate remainders
-        let pool2_full_new_remainder = if full_count > 0 { pool2_full_share % full_count } else { pool2_full_share };
-        let pool2_super_new_remainder = if super_count > 0 { pool2_super_share % super_count } else { pool2_super_share };
+        // v3.18: Pool 2 REMOVED - fees go directly to block producer
+        // All Pool 2 values are always 0 (kept for backward compatibility)
+        let pool2_per_full = 0;
+        let pool2_per_super = 0;
+        let pool2_full_new_remainder = 0;
+        let pool2_super_new_remainder = 0;
         
         // Pool 3: Equal distribution to all nodes (Phase 2 only)
         let pool3_per_node = match current_phase {
@@ -889,19 +876,15 @@ impl PhaseAwareRewardManager {
         // Calculate rewards for each eligible node
         for summary in heartbeat_summaries {
             if summary.is_eligible {
-                let node_type = match summary.node_type {
+                // v3.18: node_type no longer used for Pool 2 distribution (removed)
+                let _node_type = match summary.node_type {
                     0 => NodeType::Light,
-                    1 => NodeType::Full,
-                    2 => NodeType::Super,
-                    _ => NodeType::Full,
+                    1 => NodeType::Super,
+                    _ => NodeType::Super,
                 };
                 
-                // Pool 2 reward based on node type
-                let pool2_reward = match node_type {
-                    NodeType::Light => 0,
-                    NodeType::Full => pool2_per_full,
-                    NodeType::Super => pool2_per_super,
-                };
+                // v3.18: Pool 2 removed - fees go directly to block producer
+                let pool2_reward: u64 = 0;
                 
                 // Pool 3 reward (equal for all in Phase 2)
                 let pool3_reward = match current_phase {
@@ -984,18 +967,17 @@ impl PhaseAwareRewardManager {
     /// 
     /// CRITICAL FIX v2.51: Proper redistribution when one node type has 0 eligible nodes
     /// - If 0 Full nodes: their 30% goes to Super nodes
-    /// - If 0 Super nodes: their 70% goes to Full nodes  
-    /// - If 0 both: Pool 2 goes to next emission period (not implemented yet, funds lost)
     /// NOTE: Kept for reference/documentation - main logic in process_macroblock_heartbeats_deterministic
+    /// v3.18: Pool 2 removed - this function is deprecated but kept for backward compatibility
     #[allow(dead_code)]
     fn calculate_node_reward_with_pools(
         &self,
-        node_type: &NodeType,
+        _node_type: &NodeType,           // v3.18: Not used after Pool 2 removal
         current_phase: &QNetPhase,
         total_eligible_nodes: u32,
-        eligible_full_nodes: u32,
-        eligible_super_nodes: u32,
-        pool2_fees: u64,
+        _eligible_full_nodes: u32,       // v3.18: Full nodes removed
+        _eligible_super_nodes: u32,      // v3.18: Not used after Pool 2 removal
+        _pool2_fees: u64,                // v3.18: Pool 2 removed
         pool3_activations: u64,
     ) -> PhaseAwareReward {
         // Pool 1: Dynamic base emission (equal share for all eligible nodes)
@@ -1005,63 +987,9 @@ impl PhaseAwareRewardManager {
             0
         };
         
-        // ═══════════════════════════════════════════════════════════════════
-        // Pool 2: Transaction fees with REDISTRIBUTION
-        // Normal: 30% Full nodes, 70% Super nodes
-        // If 0 Full nodes: 100% to Super nodes
-        // If 0 Super nodes: 100% to Full nodes
-        // If 0 both: remainder accumulation handles this (see process_macroblock_heartbeats_deterministic)
-        // ═══════════════════════════════════════════════════════════════════
-        let pool2_transaction_fees = {
-            let full_count = eligible_full_nodes as u64;
-            let super_count = eligible_super_nodes as u64;
-            
-            match (full_count > 0, super_count > 0) {
-                // Normal case: both types have eligible nodes
-                (true, true) => {
-                    match node_type {
-                        NodeType::Light => 0, // 0% for Light nodes
-                        NodeType::Full => {
-                            // 30% to Full nodes, divided equally
-                            (pool2_fees * 30 / 100) / full_count
-                        },
-                        NodeType::Super => {
-                            // 70% to Super nodes, divided equally
-                            (pool2_fees * 70 / 100) / super_count
-                        },
-                    }
-                },
-                // No Full nodes: Super nodes get 100%
-                (false, true) => {
-                    match node_type {
-                        NodeType::Light => 0,
-                        NodeType::Full => 0, // No Full nodes eligible
-                        NodeType::Super => {
-                            // 100% to Super nodes (30% + 70%)
-                            pool2_fees / super_count
-                        },
-                    }
-                },
-                // No Super nodes: Full nodes get 100%
-                (true, false) => {
-                    match node_type {
-                        NodeType::Light => 0,
-                        NodeType::Full => {
-                            // 100% to Full nodes (30% + 70%)
-                            pool2_fees / full_count
-                        },
-                        NodeType::Super => 0, // No Super nodes eligible
-                    }
-                },
-                // No validators at all: handled by remainder accumulation in main logic
-                (false, false) => {
-                    // NOTE: This branch is only reached in legacy code path
-                    // Main logic (process_macroblock_heartbeats_deterministic) handles this
-                    // by accumulating remainders for next emission period
-                    0
-                },
-            }
-        };
+        // v3.18: Pool 2 REMOVED - fees go directly to block producer
+        // This function now always returns 0 for backward compatibility
+        let pool2_transaction_fees = 0;
         
         // Pool 3: Activation pool (ONLY in Phase 2, equal share for all eligible nodes)
         // Uses DETERMINISTIC value from MacroBlock

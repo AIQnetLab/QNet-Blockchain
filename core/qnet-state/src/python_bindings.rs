@@ -211,11 +211,11 @@ impl PyTransaction {
     #[staticmethod]
     fn node_activation(from: String, node_type: String, amount: u64, nonce: u64, gas_price: u64, gas_limit: u64) -> Self {
         // Parse node_type string to enum
+        // v3.18: Full nodes removed
         let node_type_enum = match node_type.to_lowercase().as_str() {
             "light" => NodeType::Light,
-            "full" => NodeType::Full,
             "super" => NodeType::Super,
-            _ => NodeType::Light, // Default to Light
+            _ => NodeType::Light, // Default to Light (ignore "full")
         };
         
         // Determine phase: Phase1 if amount == 0 (1DEV burn), Phase2 if amount > 0 (QNC transfer)

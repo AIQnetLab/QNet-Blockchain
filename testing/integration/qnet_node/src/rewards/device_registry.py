@@ -1,7 +1,7 @@
 """
 Device Registry System for QNet Nodes
 Handles multiple devices with same wallet/node_id
-ARCHITECTURAL SEPARATION: Mobile Light Nodes vs Server Full/Super Nodes
+v3.18: ARCHITECTURAL SEPARATION: Mobile Light Nodes vs Server Super Nodes (Full removed)
 """
 
 import time
@@ -16,7 +16,7 @@ class DeviceType(Enum):
     """Device types for ping routing"""
     MOBILE_LIGHT = "mobile_light"       # Mobile Light node - gets pinged
     BROWSER_MONITOR = "browser_monitor" # Browser extension - NO PINGS, monitoring only
-    SERVER_FULL = "server_full"         # Server Full node - pings handled by server
+    # v3.18: Only Super server nodes (Full removed)
     SERVER_SUPER = "server_super"       # Server Super node - pings handled by server
 
 class DeviceStatus(Enum):
@@ -62,16 +62,16 @@ class DeviceRegistry:
         
         # Success rate requirements by device type (FOR CURRENT 4-HOUR REWARD WINDOW ONLY!)
         self.success_rate_requirements = {
+            # v3.18: Only Light and Super (Full removed)
             DeviceType.MOBILE_LIGHT: 1.0,   # 100% for current 4-hour window (binary: respond or not)
-            DeviceType.SERVER_FULL: 0.95,   # 95% over current 4-hour window (60 pings)
-            DeviceType.SERVER_SUPER: 0.98,  # 98% over current 4-hour window (60 pings)
+            DeviceType.SERVER_SUPER: 0.90,  # 90% over current 4-hour window
             DeviceType.BROWSER_MONITOR: 0.0 # Not applicable - no pings
         }
         
         # Window sizes for current reward period (4 hours)
         self.current_window_requirements = {
+            # v3.18: Only Light and Super (Full removed)
             DeviceType.MOBILE_LIGHT: 1,     # 1 ping per 4-hour window (binary success)
-            DeviceType.SERVER_FULL: 60,     # 60 pings per 4-hour window (240min ÷ 4min)
             DeviceType.SERVER_SUPER: 60,    # 60 pings per 4-hour window (240min ÷ 4min)
             DeviceType.BROWSER_MONITOR: 0   # Not applicable
         }
@@ -90,9 +90,9 @@ class DeviceRegistry:
         # CRITICAL: Determine node type to enforce architecture rules
         node_type = self._determine_node_type(node_id)
         
-        # ARCHITECTURAL RULE: Full/Super nodes CAN have mobile devices but ONLY for monitoring!
-        if node_type in ['full', 'super'] and device_type == DeviceType.MOBILE_LIGHT:
-            logger.warning(f"Full/Super node {node_id} trying to register mobile device for pings - CONVERTING to monitoring only")
+        # v3.18: ARCHITECTURAL RULE: Super nodes CAN have mobile devices but ONLY for monitoring!
+        if node_type == 'super' and device_type == DeviceType.MOBILE_LIGHT:
+            logger.warning(f"Super node {node_id} trying to register mobile device for pings - CONVERTING to monitoring only")
             device_type = DeviceType.BROWSER_MONITOR  # Force to monitoring only
         
         # Auto-cleanup inactive devices before checking limits
@@ -323,7 +323,8 @@ class DeviceRegistry:
         
         mobile_devices = [d for d in devices if d.device_type == DeviceType.MOBILE_LIGHT]
         browser_monitors = [d for d in devices if d.device_type == DeviceType.BROWSER_MONITOR]
-        server_nodes = [d for d in devices if d.device_type in [DeviceType.SERVER_FULL, DeviceType.SERVER_SUPER]]
+        # v3.18: Only SERVER_SUPER (Full removed)
+        server_nodes = [d for d in devices if d.device_type == DeviceType.SERVER_SUPER]
         
         # Calculate success rate only for pingable devices
         pingable_devices = [d for d in devices if d.can_be_pinged]
@@ -350,9 +351,9 @@ class DeviceRegistry:
         }
     
     def is_server_node(self, node_id: str) -> bool:
-        """Check if node has server-type devices (Full/Super nodes)"""
+        """Check if node has server-type devices (v3.18: Super nodes only)"""
         devices = self.get_node_devices(node_id)
-        return any(d.device_type in [DeviceType.SERVER_FULL, DeviceType.SERVER_SUPER] for d in devices)
+        return any(d.device_type == DeviceType.SERVER_SUPER for d in devices)
     
     def get_node_type_from_devices(self, node_id: str) -> Optional[str]:
         """Determine node type from registered devices"""
@@ -365,8 +366,7 @@ class DeviceRegistry:
         for device in devices:
             if device.device_type == DeviceType.SERVER_SUPER:
                 return "super"
-            elif device.device_type == DeviceType.SERVER_FULL:
-                return "full"
+            # v3.18: SERVER_FULL removed
         
         # Check for mobile Light nodes
         if any(d.device_type == DeviceType.MOBILE_LIGHT for d in devices):
@@ -375,16 +375,15 @@ class DeviceRegistry:
         return "unknown"
     
     def _determine_node_type(self, node_id: str) -> str:
-        """Determine node type (light/full/super) - simplified logic for production"""
+        """Determine node type (v3.18: light/super only) - simplified logic for production"""
         # In production, this would query node registration database
         # For now, use simple heuristics
         
         # Check if node has server components registered
         devices = self.get_node_devices(node_id)
+        # v3.18: Only check for SERVER_SUPER (Full removed)
         for device in devices:
-            if device.device_type == DeviceType.SERVER_FULL:
-                return "full"
-            elif device.device_type == DeviceType.SERVER_SUPER:
+            if device.device_type == DeviceType.SERVER_SUPER:
                 return "super"
         
         # Default to light node

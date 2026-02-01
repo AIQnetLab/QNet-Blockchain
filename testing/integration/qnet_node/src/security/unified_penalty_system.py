@@ -373,11 +373,13 @@ class UnifiedPenaltySystem:
         absence_duration = current_time - excluded_info['excluded_at']
         
         # Get return timeout based on node type
+        # v3.18: Full nodes removed
         node_type = excluded_info['node_type']
         if node_type == "super":
             return_timeout = self.SUPER_RETURN_TIMEOUT
         elif node_type == "full":
-            return_timeout = self.FULL_RETURN_TIMEOUT
+            # v3.18: Full nodes removed - use Super timeout
+            return_timeout = self.SUPER_RETURN_TIMEOUT
         else:  # light
             return_timeout = self.LIGHT_RETURN_TIMEOUT
         
@@ -493,11 +495,13 @@ class UnifiedPenaltySystem:
             absence_duration = current_time - excluded_info['excluded_at']
             
             # Get return timeout
+            # v3.18: Full nodes removed
             node_type = excluded_info['node_type']
             if node_type == "super":
                 return_timeout = self.SUPER_RETURN_TIMEOUT
             elif node_type == "full":
-                return_timeout = self.FULL_RETURN_TIMEOUT
+                # v3.18: Full nodes removed - use Super timeout
+                return_timeout = self.SUPER_RETURN_TIMEOUT
             else:
                 return_timeout = self.LIGHT_RETURN_TIMEOUT
             

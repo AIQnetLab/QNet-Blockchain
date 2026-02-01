@@ -6,13 +6,11 @@ QNet uses a two-phase activation system transitioning from 1DEV burn on Solana t
 ## **CRITICAL DEVICE RESTRICTIONS (STRICTLY ENFORCED)**
 
 ### Server Deployment (Interactive Menu ONLY)
-- **Full Nodes**: ✅ Can be activated on servers via interactive menu
-- **Super Nodes**: ✅ Can be activated on servers via interactive menu  
+- **Super Nodes**: ✅ Can be activated on servers via interactive menu
 - **Light Nodes**: ❌ **ABSOLUTELY BLOCKED** - Cannot be activated on servers (enforced at code level)
 
 ### Mobile Device Deployment
 - **Light Nodes**: ✅ Can ONLY be activated on mobile devices
-- **Full Nodes**: ❌ Cannot be activated on mobile devices
 - **Super Nodes**: ❌ Cannot be activated on mobile devices
 
 ### **ENFORCEMENT MECHANISMS - FULLY IMPLEMENTED**
@@ -86,7 +84,8 @@ def generate_activation_code(burn_tx_hash: str, wallet_address: str,
     entropy = sha3_256(f"{burn_tx_hash}:{timestamp}".encode()).hexdigest()[:4]
     
     # Step 4: Build segments
-    node_type_marker = {'light': 'L', 'full': 'F', 'super': 'S'}[node_type]
+    # v3.18: Only Light and Super nodes (Full removed)
+    node_type_marker = {'light': 'L', 'super': 'S'}[node_type]
     timestamp_hex = hex(int(time.time()) % 0x100000)[2:].zfill(5)
     
     segment1 = f"{node_type_marker}{timestamp_hex}"[:6].upper()  # 6 chars
@@ -258,9 +257,9 @@ pub async fn verify_solana_burn(
 6. Direct activation through QNet blockchain
 
 **Dynamic Pricing by Node Type:**
-- **Light**: 2,500-15,000 QNC (base: 5,000 × network multiplier)
-- **Full**: 3,750-22,500 QNC (base: 7,500 × network multiplier)
-- **Super**: 5,000-30,000 QNC (base: 10,000 × network multiplier)
+- **Light**: 5,000-30,000 QNC (base: 10,000 × network multiplier)
+- **Super**: 3,750-22,500 QNC (base: 7,500 × network multiplier)
+NOTE: Full Node type removed in v3.18
 
 **Network Size Multipliers:**
 - 0-100K nodes: 0.5x (early network discount)
@@ -270,7 +269,7 @@ pub async fn verify_solana_burn(
 
 ## Activation Flow Architecture
 
-### Interactive Server Activation (Full/Super Nodes)
+### Interactive Server Activation (Super Nodes - v3.18: Full removed)
 ```bash
 # Server activation process with enhanced security
 cd development/qnet-integration
@@ -279,12 +278,12 @@ cd development/qnet-integration
 # Interactive prompts:
 # 1. Economic phase detection (1 or 2)
 # 2. Activation code input: QNET-XXXXXX-XXXXXX-XXXXXX (quantum-secure, 26 chars)
-# 3. Node type validation (Full/Super only - Light nodes BLOCKED)
+# 3. Node type validation (Super only - Light nodes BLOCKED, v3.18: Full removed)
 # 4. Cryptographic ownership verification
 # 5. Region auto-detection
 # 6. Port configuration  
 # 7. Blockchain sync initiation
-# 8. API server launch (Full/Super only)
+# 8. API server launch (Super only - v3.18: Full removed)
 ```
 
 ### Mobile Activation (Light Nodes Only)
@@ -339,17 +338,9 @@ const activationResult = await QNetMobile.activateNode({
 
 ## Node Type API Capabilities
 
-### Full Nodes (Server Only)
+### Super Nodes (Server Only)
 - ✅ Full blockchain validation
 - ✅ Complete REST API endpoints
-- ✅ JSON-RPC server
-- ✅ Microblock production
-- ✅ P2P networking
-- ✅ Prometheus metrics
-- ✅ **NEW**: Quantum-secure activation validation
-
-### Super Nodes (Server Only)
-- ✅ All Full node capabilities
 - ✅ Enhanced validation with cryptographic binding
 - ✅ Maximum reward distribution
 - ✅ Priority transaction processing
@@ -447,7 +438,7 @@ pub async fn check_and_replace_existing_node(
 ### **Node Replacement Scenarios**
 1. **Server Migration**: Activate same node type on new server → old automatically shuts down
 2. **Hardware Upgrade**: New server activation → seamless replacement
-3. **Node Type Upgrade**: Full → Super activation → Full node replaced
+3. **Node Type Upgrade**: N/A (v3.18: Only Super nodes for servers)
 4. **Recovery**: Lost server access → reactivate on new hardware
 
 ### **Security & Limitations**
@@ -471,7 +462,7 @@ pub async fn check_and_replace_existing_node(
 ```bash  
 # Production deployment with security
 export QNET_ACTIVATION_CODE=QNET-XXXXXX-XXXXXX-XXXXXX  # Quantum-secure code (26 chars)
-export QNET_NODE_TYPE=full                        # Full/Super only
+export QNET_NODE_TYPE=super                       # Super only (v3.18: Full removed)
 export QNET_PRODUCTION=1                          # Enable all security checks
 ./target/release/qnet-node
 ```

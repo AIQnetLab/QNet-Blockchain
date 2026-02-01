@@ -227,7 +227,7 @@ mod tests {
         // Test all NodeType variants exist and are distinct
         let types = vec![
             NodeType::Super,
-            NodeType::Full,
+            NodeType::Super,
             NodeType::Light,
         ];
         
