@@ -21,6 +21,8 @@ function mapTxType(type: string | object | undefined): string {
     'RewardDistribution': 'Reward',
     'ContractDeploy': 'Smart Contract',
     'ContractCall': 'Smart Contract',
+    'HeartbeatCommitment': 'Heartbeat',
+    'Heartbeat': 'Heartbeat',
     'CreateAccount': 'System',
     'BatchRewardClaims': 'Reward',
     'BatchNodeActivations': 'Node Activation',

@@ -3,20 +3,30 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
+import { setCache } from '@/lib/explorer-cache';
 
 interface TransactionData {
   hash: string;
   type: string;
+  tx_type?: string;
   status: 'confirmed' | 'pending';
-  block: number;
+  block: number | string;
+  block_height?: number | string;
   timestamp: number;
   from: string;
   to: string;
   amount: string;
+  amount_raw?: string;
   fee?: string;
-  nonce?: number;
+  nonce?: number | string;
+  gas_price?: string;
+  gas_limit?: string;
+  signature?: string;
+  public_key?: string;
   signature_type?: string;
+  is_quantum_signed?: boolean;
+  dilithium_signature?: string;
+  dilithium_public_key?: string;
 }
 
 // Truncate
@@ -71,22 +81,15 @@ export default function TransactionPage() {
   const params = useParams();
   const hash = params.hash as string;
   
-  // v2.102: Sync cache read for instant display
-  const cachedTx = hash ? getCache<TransactionData>('tx', hash) : null;
-  
-  const [tx, setTx] = useState<TransactionData | null>(cachedTx);
+  // v2.103: Initialize with null to avoid hydration mismatch (localStorage not available on server)
+  const [tx, setTx] = useState<TransactionData | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [hasFetched, setHasFetched] = useState(!!cachedTx);
+  const [hasFetched, setHasFetched] = useState(false);
   
   useEffect(() => {
     if (!hash) return;
     
-    // If we have fresh cache, skip fetch
-    if (cachedTx && !isCacheStale('tx', hash)) {
-      setHasFetched(true);
-      return;
-    }
-    
+    // v2.104: Always fetch fresh data, cache only for initial display
     const fetchTransaction = async () => {
       try {
         const res = await fetch(`/api/tx/${hash}`);
@@ -118,7 +121,7 @@ export default function TransactionPage() {
     };
     
     fetchTransaction();
-  }, [hash, cachedTx]);
+  }, [hash]);
   
   // Show error ONLY after fetch attempt
   if (hasFetched && (error || !tx)) {
@@ -197,26 +200,20 @@ export default function TransactionPage() {
           </div>
           <div className="detail-row">
             <span className="detail-label">Amount</span>
-            <span className="detail-value">{tx.amount}</span>
+            <span className="detail-value">{tx.amount || '0 QNC'}</span>
           </div>
-          {tx.fee && (
-            <div className="detail-row">
-              <span className="detail-label">Fee</span>
-              <span className="detail-value">{tx.fee}</span>
-            </div>
-          )}
-          {tx.nonce !== undefined && (
-            <div className="detail-row">
-              <span className="detail-label">Nonce</span>
-              <span className="detail-value">{tx.nonce}</span>
-            </div>
-          )}
-          {tx.signature_type && (
-            <div className="detail-row">
-              <span className="detail-label">Signature</span>
-              <span className="detail-value">{tx.signature_type}</span>
-            </div>
-          )}
+          <div className="detail-row">
+            <span className="detail-label">Fee</span>
+            <span className="detail-value">{tx.fee || '0 QNC'}</span>
+          </div>
+          <div className="detail-row">
+            <span className="detail-label">Nonce</span>
+            <span className="detail-value">{tx.nonce ?? 'N/A'}</span>
+          </div>
+          <div className="detail-row">
+            <span className="detail-label">Signature</span>
+            <span className="detail-value">{tx.signature_type || (tx.signature ? 'Ed25519' : 'System TX')}</span>
+          </div>
         </div>
       </div>
     </div>

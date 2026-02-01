@@ -120,7 +120,7 @@ const ITEMS_PER_PAGE = 50;
 
 // All available transaction types for filter
 // v2.95.3: Unified types - removed "Validator", added "Contract"
-const TX_TYPES = ['Transfer', 'Heartbeat', 'Reward', 'Registration', 'Activation', 'Contract', 'System', 'Swap'];
+const TX_TYPES = ['Transfer', 'Reward', 'Swap', 'Heartbeat', 'Registration', 'Activation', 'Contract', 'System'];
 
 export default function ExplorerPage() {
   // Initialize state without cache to avoid hydration mismatch
@@ -133,7 +133,7 @@ export default function ExplorerPage() {
   const [totalPages, setTotalPages] = useState(1);
   const [totalCount, setTotalCount] = useState(0);
   const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
-  const [typeFilters, setTypeFilters] = useState<string[]>([]); // Empty = show all
+  const [typeFilters, setTypeFilters] = useState<string[]>(['Transfer', 'Reward', 'Swap']); // Default active filters
   const [mounted, setMounted] = useState(false);
   const initialLoadDone = useRef(false);
 
