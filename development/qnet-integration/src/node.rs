@@ -7479,6 +7479,17 @@ impl BlockchainNode {
                 if !blocks_to_request.is_empty() {
                     if let Some(p2p) = &unified_p2p {
                         for (block_height, producer) in blocks_to_request {
+                            // v3.11 FIX: Don't request blocks that already exist in storage!
+                            // This prevents duplicate reception → false fork detection
+                            if storage.load_microblock(block_height).map(|opt| opt.is_some()).unwrap_or(false) {
+                                // Block already exists - just mark it as received
+                                mark_block_received(block_height);
+                                if is_debug() {
+                                    println!("[DBG][CONS] block_already_exists h={} skipping_request", block_height);
+                                }
+                                continue;
+                            }
+                            
                             if is_info() {
                                 println!("[INFO][CONS] requesting_missing_block h={} producer={}", 
                                          block_height, producer);
@@ -7882,28 +7893,58 @@ impl BlockchainNode {
         
         // 6. CRITICAL: Detect database substitution attack
         // If we already have this height, verify it's the same block
+        // v3.11 FIX: With EFFICIENT storage, raw bytes hash will NEVER match!
+        // EFFICIENT format stores TX hashes only (~32KB) vs RAW (~280KB)
+        // Solution: Compare merkle_root instead of raw bytes
         if let Ok(Some(existing_data)) = storage.load_microblock(microblock.height) {
-            use sha3::{Sha3_256, Digest};
-            let mut new_hasher = Sha3_256::new();
-            new_hasher.update(&block.data);
-            let new_hash = new_hasher.finalize();
-            
-            let mut existing_hasher = Sha3_256::new();
-            existing_hasher.update(&existing_data);
-            let existing_hash = existing_hasher.finalize();
-            
-            if new_hash != existing_hash {
-                // CRITICAL: Chain fork detected - need to determine which chain to follow
-                if is_warn() { println!("[WARN][SEC] fork_detected h={} existing={:?} new={:?}", 
-                         microblock.height, &existing_hash[0..8], &new_hash[0..8]); }
-                
-                // CRITICAL: Don't immediately reject - this might be a valid longer chain
-                // Mark for potential chain reorganization
-                return Err(format!(
-                    "FORK_DETECTED:{}:{}",
-                    microblock.height,
-                    microblock.producer
-                ));
+            // v3.11: Load existing block and compare merkle_root (format-independent)
+            // Use load_microblock_auto_format to handle both EFFICIENT and RAW formats
+            match storage.load_microblock_auto_format(microblock.height) {
+                Ok(Some(existing_block)) => {
+                    // Compare merkle_root - this is format-independent
+                    if existing_block.merkle_root == microblock.merkle_root 
+                       && existing_block.signature == microblock.signature {
+                        // Same block (duplicate) - skip silently
+                        if is_debug() { 
+                            println!("[DBG][SEC] duplicate_block h={} merkle_match=true", microblock.height); 
+                        }
+                        // Return OK since it's the same block - just a duplicate reception
+                        return Ok(());
+                    } else {
+                        // REAL FORK: Same height but different content!
+                        if is_warn() { 
+                            println!("[WARN][SEC] fork_detected h={} existing_merkle={:x} new_merkle={:x}", 
+                                     microblock.height,
+                                     u64::from_le_bytes([existing_block.merkle_root[0], existing_block.merkle_root[1], 
+                                                        existing_block.merkle_root[2], existing_block.merkle_root[3],
+                                                        existing_block.merkle_root[4], existing_block.merkle_root[5],
+                                                        existing_block.merkle_root[6], existing_block.merkle_root[7]]),
+                                     u64::from_le_bytes([microblock.merkle_root[0], microblock.merkle_root[1],
+                                                        microblock.merkle_root[2], microblock.merkle_root[3],
+                                                        microblock.merkle_root[4], microblock.merkle_root[5],
+                                                        microblock.merkle_root[6], microblock.merkle_root[7]])); 
+                        }
+                        return Err(format!(
+                            "FORK_DETECTED:{}:{}",
+                            microblock.height,
+                            microblock.producer
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    // Block data exists but couldn't deserialize - likely corruption
+                    // Log and continue with new block (will overwrite)
+                    if is_warn() { 
+                        println!("[WARN][SEC] existing_block_corrupt h={} bytes={}", 
+                                 microblock.height, existing_data.len()); 
+                    }
+                }
+                Err(e) => {
+                    // Deserialization error - log and continue
+                    if is_warn() { 
+                        println!("[WARN][SEC] existing_block_deser_fail h={} err={}", microblock.height, e); 
+                    }
+                }
             }
         }
         
@@ -11749,22 +11790,27 @@ impl BlockchainNode {
                             
                             // ═══════════════════════════════════════════════════════════════════
                             // v3.10 BUG 5 FIX: Improved fork detection logic
+                            // v3.11 FIX: Added minimum response threshold for network startup
                             // ═══════════════════════════════════════════════════════════════════
-                            // OLD BUG: `mismatches > matches && matches > 0` 
-                            //   → If ALL peers mismatch (matches=0), fork was NOT detected!
-                            //   → Node continued producing on fork
+                            // PROBLEM: At network startup, nodes may not have entropy yet
+                            //   → They return empty entropy → looks like mismatch
+                            //   → matches=0 triggered fork detection incorrectly!
                             //
-                            // NEW LOGIC:
-                            //   - If mismatches > 0 AND matches == 0 → DEFINITE FORK (nobody agrees)
-                            //   - If mismatches > matches → MAJORITY FORK (most disagree)
-                            //   - If matches > mismatches → MINORITY disagrees (continue)
+                            // FIX: Only trigger fork if:
+                            //   1. We have at least MIN_FORK_DETECTION_RESPONSES (3)
+                            //   2. AND all of them disagree (matches == 0)
+                            //   3. AND we're past Genesis phase (height > 10)
                             // ═══════════════════════════════════════════════════════════════════
+                            const MIN_FORK_DETECTION_RESPONSES: usize = 3;
+                            let total_responses = matches + mismatches;
+                            
                             if mismatches > 0 {
-                                // v3.10 BUG 5 FIX: CRITICAL - if NO ONE agrees, we're definitely on a fork!
-                                if matches == 0 {
-                                    // DEFINITE FORK: All responding peers have DIFFERENT entropy
-                                    println!("[ERR][CONS] FORK DETECTED! ALL {} peers have different entropy, 0 agree!", 
-                                             mismatches);
+                                // v3.11 FIX: Only detect fork if we have enough responses
+                                // At startup, lagging nodes return empty entropy - NOT a real fork!
+                                if matches == 0 && total_responses >= MIN_FORK_DETECTION_RESPONSES && next_block_height > 10 {
+                                    // DEFINITE FORK: Multiple peers responded with DIFFERENT entropy
+                                    println!("[ERR][CONS] FORK DETECTED! {} peers have different entropy, 0 agree (total={})", 
+                                             mismatches, total_responses);
                                     println!("[ERR][CONS] STOPPING production - we are on a fork!");
                                     
                                     // STATE MACHINE: Fork detected error
@@ -11780,6 +11826,11 @@ impl BlockchainNode {
                                     
                                     // Skip this rotation round to prevent fork
                                     continue;
+                                } else if matches == 0 && (total_responses < MIN_FORK_DETECTION_RESPONSES || next_block_height <= 10) {
+                                    // v3.11: Not enough data to confirm fork - likely startup/sync phase
+                                    // Log warning but continue production
+                                    println!("[WARN][CONS] potential_fork responses={} (need {}) h={} - continuing (startup phase)", 
+                                             total_responses, MIN_FORK_DETECTION_RESPONSES, next_block_height);
                                 } else if mismatches > matches {
                                     // MAJORITY FORK: More peers disagree than agree
                                     println!("[ERR][CONS] FORK DETECTED! {} peers disagree vs {} agree", 
