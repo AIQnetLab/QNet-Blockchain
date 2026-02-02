@@ -48,8 +48,15 @@ function formatAmount(amount: number): string {
 }
 
 // Map transaction type to display string
-function mapTxType(type: string): string {
+// v3.15: Claims from system_rewards_pool show as Transfer
+function mapTxType(type: string, fromAddress?: string): string {
   if (!type) return 'Transfer';
+  
+  // Claim rewards from pool = Transfer (not Reward)
+  if (fromAddress === 'system_rewards_pool') {
+    return 'Transfer';
+  }
+  
   const normalized = type.toLowerCase().replace(/_/g, '').replace(/-/g, '');
   
   const map: Record<string, string> = {
@@ -151,7 +158,7 @@ export async function GET(
     // Map transactions to response format
     const txData = transactions.map(tx => ({
       hash: tx.hash,
-      type: mapTxType(tx.tx_type),
+      type: mapTxType(tx.tx_type, tx.from_address),
       from: tx.from_address,
       to: tx.to_address || 'N/A',
       amount: formatAmount(tx.amount),

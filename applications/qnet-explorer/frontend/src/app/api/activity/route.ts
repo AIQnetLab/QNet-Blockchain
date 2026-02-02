@@ -23,7 +23,13 @@ function formatAmount(amount: number): string {
 
 // Map transaction type to display string
 // v2.95.3: Unified heartbeat types, removed "Validator" category
-function mapTxType(type: string): string {
+// v3.15: Claims from system_rewards_pool show as Transfer
+function mapTxType(type: string, fromAddress?: string): string {
+  // Claim rewards from pool = Transfer (not Reward)
+  if (fromAddress === 'system_rewards_pool') {
+    return 'Transfer';
+  }
+  
   const normalized = type.toLowerCase().replace(/_/g, '');
   
   const map: Record<string, string> = {
@@ -151,7 +157,7 @@ export async function GET(request: NextRequest) {
     // Note: perPage is already validated to max 500, so we use all transactions
     const responseData = transactions.map((tx) => ({
       hash: tx.hash,
-      type: mapTxType(tx.tx_type),
+      type: mapTxType(tx.tx_type, tx.from_address),
       from: tx.from_address,
       to: tx.to_address || 'N/A',
       amount: formatAmount(tx.amount),

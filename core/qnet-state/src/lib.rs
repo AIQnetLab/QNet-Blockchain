@@ -25,7 +25,7 @@ pub use transaction::{Transaction, TransactionReceipt, TransactionType, gas_limi
 pub use state_db::StateDB;
 pub use state_manager::StateManager;
 pub use errors::{StateError, StateResult};
-pub use state::{StateManager as State, MAX_QNC_SUPPLY, MAX_QNC_SUPPLY_NANO};
+pub use state::{StateManager as State, MAX_QNC_SUPPLY, MAX_QNC_SUPPLY_NANO, StateMerkleTree, BalanceProof};
 
 #[cfg(feature = "python")]
 pub use python_bindings::*;

@@ -1023,6 +1023,18 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_account_balance);
     
+    // v3.11: Balance with Merkle proof for Light clients
+    let account_balance_proof = api_v1
+        .and(warp::path("account"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("balance"))
+        .and(warp::path("proof"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_account_balance_with_proof);
+    
     let account_transactions = api_v1
         .and(warp::path("account"))
         .and(warp::path::param::<String>())
@@ -1946,6 +1958,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         
     let account_routes = account_info
         .or(account_balance)
+        .or(account_balance_proof)  // v3.11: Balance with Merkle proof
         .or(account_transactions)
         .or(batch_claim_rewards)
         .or(batch_transfer);
@@ -2946,6 +2959,74 @@ async fn handle_account_balance(
                 "details": e.to_string()
             });
             Ok(warp::reply::json(&error_response))
+        }
+    }
+}
+
+/// v3.11: Balance with Merkle proof for Light client trustless verification
+/// Endpoint: GET /api/v1/account/{address}/balance/proof
+/// 
+/// Response includes:
+/// - balance: Current balance in nanoQNC
+/// - merkle_proof: Array of [sibling_hash, is_right] for verification
+/// - state_root: Merkle state root this proof is valid for
+/// - block_height: Height at which state_root was computed
+/// 
+/// Light clients can verify: verify_proof(address, balance, proof, state_root)
+/// Then verify state_root is in a valid block header
+async fn handle_account_balance_with_proof(
+    address: String,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // v3.19: Rate limiting (higher limit for proof requests as they're more expensive)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Validate address parameter
+    if address.len() > 64 {
+        return Ok(warp::reply::json(&json!({
+            "error": "Invalid address",
+            "message": "Address parameter too long (max 64 characters)"
+        })));
+    }
+    
+    // Get balance with proof from state manager
+    match blockchain.get_balance_with_proof(&address).await {
+        Ok(proof) => {
+            // Convert proof to JSON-friendly format
+            let proof_array: Vec<serde_json::Value> = proof.proof.iter()
+                .map(|(hash, is_right)| {
+                    json!({
+                        "sibling": hex::encode(hash),
+                        "is_right": is_right
+                    })
+                })
+                .collect();
+            
+            Ok(warp::reply::json(&json!({
+                "address": proof.address,
+                "balance": proof.balance,
+                "nonce": proof.nonce,
+                "merkle_proof": proof_array,
+                "state_root": hex::encode(proof.state_root),
+                "block_height": proof.block_height,
+                "proof_valid": true
+            })))
+        }
+        Err(e) => {
+            // Account not found - return empty balance with proof
+            Ok(warp::reply::json(&json!({
+                "address": address,
+                "balance": 0,
+                "nonce": 0,
+                "merkle_proof": [],
+                "state_root": "",
+                "block_height": 0,
+                "error": e.to_string(),
+                "proof_valid": false
+            })))
         }
     }
 }

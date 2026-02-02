@@ -98,7 +98,7 @@ use qnet_consensus::deterministic_reputation::{
     DeterministicReputationState, BlockData, MacroBlockData,
     INITIAL_REPUTATION, MIN_CONSENSUS_REPUTATION,
 };
-use qnet_sharding::{ShardCoordinator, ParallelValidator, MAX_SHARDS};
+use qnet_sharding::{ShardCoordinator, ParallelValidator, MAX_SHARDS, CrossShardProof};
 use crate::quantum_poh::QuantumPoH;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -222,6 +222,130 @@ pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
 // v3.0: Event-driven sync completion (NOT polling!)
 // When process_received_blocks reaches this height, it clears SYNC_IN_PROGRESS
 // This is proper event-driven design - flag cleared at the SOURCE, not by polling
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v3.10: FORK PREVENTION - 4 Critical Bug Fixes
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUG 1: Block not received after consensus - need to request it
+// BUG 2: Production without sufficient consensus (votes < 40%)
+// BUG 3: Forked node spam blocks emergency recovery
+// BUG 4: Fork detection doesn't work for invalid blocks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// BUG 1 FIX: Track blocks awaiting after consensus passed
+// Key: block_height, Value: (consensus_time, producer_id, requested_count)
+lazy_static::lazy_static! {
+    static ref CONSENSUS_AWAITING_BLOCK: ParkingRwLock<std::collections::HashMap<u64, (std::time::Instant, String, u8)>> = 
+        ParkingRwLock::new(std::collections::HashMap::new());
+}
+
+/// BUG 1: Register that consensus passed for block, now waiting for data
+pub fn register_consensus_awaiting_block(height: u64, producer: &str) {
+    let mut awaiting = CONSENSUS_AWAITING_BLOCK.write();
+    awaiting.insert(height, (std::time::Instant::now(), producer.to_string(), 0));
+    if is_info() {
+        println!("[INFO][CONS] awaiting_block h={} producer={}", height, producer);
+    }
+}
+
+/// BUG 1: Mark block as received (remove from awaiting)
+pub fn mark_block_received(height: u64) {
+    let mut awaiting = CONSENSUS_AWAITING_BLOCK.write();
+    if awaiting.remove(&height).is_some() {
+        if is_debug() {
+            println!("[DBG][CONS] block_received h={}", height);
+        }
+    }
+}
+
+/// BUG 1: Check if any blocks are awaiting for too long and need request
+/// Returns list of (height, producer) pairs that need to be requested
+pub fn get_blocks_needing_request(timeout_secs: u64) -> Vec<(u64, String)> {
+    let mut awaiting = CONSENSUS_AWAITING_BLOCK.write();
+    let mut need_request = Vec::new();
+    let mut to_remove = Vec::new();
+    
+    for (height, (time, producer, request_count)) in awaiting.iter_mut() {
+        if time.elapsed().as_secs() >= timeout_secs {
+            // Max 5 requests per block
+            if *request_count < 5 {
+                need_request.push((*height, producer.clone()));
+                *request_count += 1;
+                *time = std::time::Instant::now(); // Reset timer
+                if is_warn() {
+                    println!("[WARN][CONS] block_timeout h={} producer={} retry={}", 
+                             height, producer, request_count);
+                }
+            } else {
+                // Too many retries - give up and mark for removal
+                to_remove.push(*height);
+                println!("[ERR][CONS] block_request_failed h={} producer={} max_retries", 
+                         height, producer);
+            }
+        }
+    }
+    
+    // Remove blocks that exceeded retry limit
+    for h in to_remove {
+        awaiting.remove(&h);
+    }
+    
+    need_request
+}
+
+// BUG 3 FIX: Track excluded/forked producers (lock-free with timestamp)
+// Key: producer_id, Value: (excluded_at, reason, excluded_until_height)
+lazy_static::lazy_static! {
+    static ref EXCLUDED_PRODUCERS: ParkingRwLock<std::collections::HashMap<String, (std::time::Instant, String, u64)>> = 
+        ParkingRwLock::new(std::collections::HashMap::new());
+}
+
+/// BUG 3: Mark producer as excluded (blocks from them will be ignored)
+pub fn exclude_producer(producer_id: &str, reason: &str, until_height: u64) {
+    let mut excluded = EXCLUDED_PRODUCERS.write();
+    excluded.insert(
+        producer_id.to_string(), 
+        (std::time::Instant::now(), reason.to_string(), until_height)
+    );
+    println!("[INFO][FORK] producer_excluded id={} reason={} until_h={}", 
+             producer_id, reason, until_height);
+}
+
+/// BUG 3: Check if producer is currently excluded
+pub fn is_producer_excluded(producer_id: &str, current_height: u64) -> bool {
+    let excluded = EXCLUDED_PRODUCERS.read();
+    if let Some((_, _, until_height)) = excluded.get(producer_id) {
+        if current_height < *until_height {
+            return true;
+        }
+    }
+    false
+}
+
+/// BUG 3: Clear expired exclusions
+pub fn clear_expired_exclusions(current_height: u64) {
+    let mut excluded = EXCLUDED_PRODUCERS.write();
+    excluded.retain(|_, (_, _, until_height)| current_height < *until_height);
+}
+
+/// BUG 4 FIX: Last runtime fork check timestamp
+static LAST_FORK_CHECK: StdAtomicU64 = StdAtomicU64::new(0);
+
+/// BUG 4: Check if runtime fork detection is needed (every 30 seconds)
+pub fn should_check_fork() -> bool {
+    let now = get_timestamp_safe();
+    let last = LAST_FORK_CHECK.load(StdOrdering::Relaxed);
+    if now - last >= 30 {
+        LAST_FORK_CHECK.store(now, StdOrdering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// BUG 2 FIX: Minimum consensus threshold (40% of nodes)
+/// If votes < this threshold, do NOT produce - trigger emergency instead
+pub const MIN_CONSENSUS_VOTES_PERCENT: u64 = 40;
 static SYNC_TARGET_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 // v3.5: Flag to skip slot timing after sync completion
@@ -5946,6 +6070,47 @@ impl BlockchainNode {
                 if is_debug() { println!("[DBG][BLOCK] retry h={}", received_block.height); }
             }
             
+            // ═══════════════════════════════════════════════════════════════════
+            // v3.10 BUG 3 FIX: Ignore blocks from excluded/forked producers
+            // This prevents forked nodes from spamming and blocking emergency recovery
+            // ═══════════════════════════════════════════════════════════════════
+            {
+                let current_height = *height.read().await;
+                
+                // Extract producer from block data (if available)
+                let block_producer: Option<String> = if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&received_block.data) {
+                    Some(microblock.producer.clone())
+                } else {
+                    None
+                };
+                
+                if let Some(ref producer) = block_producer {
+                    // Check if producer is excluded
+                    if is_producer_excluded(producer, current_height) {
+                        if is_debug() {
+                            println!("[DBG][FORK] ignored_block h={} producer={} reason=excluded", 
+                                     received_block.height, producer);
+                        }
+                        // Don't process - just skip
+                        continue;
+                    }
+                    
+                    // Also check if this block is way ahead of our chain (fork indicator)
+                    // If block height > local + 100, producer might be on a fork
+                    if received_block.height > current_height + 100 {
+                        println!("[WARN][FORK] suspicious_block h={} local={} producer={} gap={}", 
+                                 received_block.height, current_height, producer,
+                                 received_block.height - current_height);
+                        // Don't exclude yet, but log for monitoring
+                    }
+                }
+                
+                // Periodically clear expired exclusions
+                if received_block.height % 100 == 0 {
+                    clear_expired_exclusions(current_height);
+                }
+            }
+            
             // v3.0 FIX: Skip duplicate processing for NON-RETRY blocks
             // If block is already in pending_blocks and was added recently (< 1 sec), skip
             // This prevents memory growth from multiple peers sending same block
@@ -6825,6 +6990,9 @@ impl BlockchainNode {
             // Log storage results
             match store_result {
                 Ok(_) => {
+                    // v3.10 BUG 1 FIX: Mark block as received (remove from awaiting)
+                    mark_block_received(received_block.height);
+                    
                     if should_log {
                         if is_debug() { println!("[DBG][BLOCK] stored h={}", received_block.height); }
                     }
@@ -7236,6 +7404,90 @@ impl BlockchainNode {
             // This is separate from retry to avoid unnecessary overhead
             if last_cleanup_check.elapsed() > std::time::Duration::from_secs(30) {
                 last_cleanup_check = std::time::Instant::now();
+                
+                // ═══════════════════════════════════════════════════════════════════
+                // v3.10 BUG 4 FIX: Runtime fork detection every 30 seconds
+                // Detect if we're on a fork by comparing local vs network height
+                // ═══════════════════════════════════════════════════════════════════
+                if should_check_fork() {
+                    if let Some(p2p) = &unified_p2p {
+                        if let Ok(network_height) = p2p.sync_blockchain_height().await {
+                            let local_height = *height.read().await;
+                            
+                            // FORK INDICATOR 1: Local height significantly AHEAD of network
+                            // This means we're producing blocks that network doesn't accept
+                            if local_height > network_height + 20 && network_height > 100 {
+                                println!("[ERR][FORK] runtime_detected local={} network={} ahead_by={}", 
+                                         local_height, network_height, local_height - network_height);
+                                
+                                // v3.10 BUG 3 FIX: Self-exclude from production
+                                // Forked node should NOT produce blocks until synced
+                                let rotation_interval = 30u64;
+                                let exclude_until = ((network_height / rotation_interval) + 3) * rotation_interval;
+                                exclude_producer(&node_id, "runtime_fork_self_exclude", exclude_until);
+                                println!("[INFO][FORK] self_excluded until_h={}", exclude_until);
+                                
+                                // STATE MACHINE: Enter fork resolution
+                                set_node_state(NodeState::ResolvingFork {
+                                    fork_height: network_height,
+                                    our_hash: format!("runtime_ahead_{}", local_height - network_height),
+                                });
+                                
+                                // ROLLBACK: Delete blocks from network_height+1 to local_height
+                                println!("[INFO][FORK] rollback from={} to={}", network_height + 1, local_height);
+                                for h in (network_height + 1)..=local_height {
+                                    if let Err(e) = storage.delete_microblock(h) {
+                                        if is_debug() {
+                                            println!("[DBG][ROLLBACK] delete h={} err={}", h, e);
+                                        }
+                                    }
+                                }
+                                
+                                // Update chain height
+                                {
+                                    let mut height_guard = height.write().await;
+                                    *height_guard = network_height;
+                                }
+                                storage.set_chain_height(network_height).ok();
+                                
+                                println!("[INFO][FORK] rollback_complete new_height={}", network_height);
+                                
+                                // Clear pending blocks that were on the fork
+                                pending_blocks.retain(|h, _| *h <= network_height);
+                                
+                                // Return to IDLE state
+                                set_node_state(NodeState::Idle { last_height: network_height });
+                            }
+                            
+                            // FORK INDICATOR 2: Local height significantly BEHIND network
+                            // This is normal sync, but log for monitoring
+                            else if network_height > local_height + 50 {
+                                if is_warn() {
+                                    println!("[WARN][SYNC] behind_network local={} network={} gap={}", 
+                                             local_height, network_height, network_height - local_height);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // v3.10 BUG 1 FIX: Check for consensus blocks awaiting data
+                // If consensus passed but block not received within 5 seconds, request it
+                // WHY 5 SECONDS: Grace period = 5 sec, failover starts at 5+ sec
+                // We request IMMEDIATELY when grace expires, BEFORE failover selects new producer
+                let blocks_to_request = get_blocks_needing_request(5);
+                if !blocks_to_request.is_empty() {
+                    if let Some(p2p) = &unified_p2p {
+                        for (block_height, producer) in blocks_to_request {
+                            if is_info() {
+                                println!("[INFO][CONS] requesting_missing_block h={} producer={}", 
+                                         block_height, producer);
+                            }
+                            // Request block from producer or any peer
+                            let _ = p2p.request_specific_block(block_height).await;
+                        }
+                    }
+                }
                 
                 // CRITICAL v2.19.20: Don't remove expired pending blocks - re-request missing dependencies!
                 // Blocks are critical data, never throw them away
@@ -11130,6 +11382,16 @@ impl BlockchainNode {
                 let mut is_my_turn_to_produce = current_producer == node_id;
                 
                 // ═══════════════════════════════════════════════════════════════════════════
+                // v3.10 BUG 3 FIX: Check if we're excluded (e.g., after fork detection)
+                // If excluded, we cannot produce - let emergency failover handle it
+                // ═══════════════════════════════════════════════════════════════════════════
+                if is_my_turn_to_produce && is_producer_excluded(&node_id, next_block_height) {
+                    println!("[WARN][PROD] self_excluded h={} reason=fork_recovery", next_block_height);
+                    is_my_turn_to_produce = false;
+                    // Don't continue - let timeout_round failover handle it
+                }
+                
+                // ═══════════════════════════════════════════════════════════════════════════
                 // v2.104: SELF-EXCLUDE CHECK - Producer must be synced to produce
                 // ═══════════════════════════════════════════════════════════════════════════
                 // PROBLEM: If selected producer is significantly behind (>100 blocks), it cannot
@@ -11363,25 +11625,39 @@ impl BlockchainNode {
                             // ARCHITECTURE: Adaptive timeout based on network conditions
                             // Uses same logic as ShredProtocol fanout (unified_p2p.rs:5215-5243)
                             let avg_latency = p2p.get_average_peer_latency();
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v3.10: ENTROPY VOTING TIMEOUTS
+                            // ═══════════════════════════════════════════════════════════════════
+                            // CONSTRAINT: Total time < Grace Period (5 sec)
+                            //   Voting + Block creation (0.1s) + Broadcast (0.5s) < 5s
+                            //   Max safe voting timeout = 4 seconds
+                            //
+                            // LARGER VALUES = More reliable consensus but slower failover
+                            // SMALLER VALUES = Faster failover but may miss valid responses
+                            // ═══════════════════════════════════════════════════════════════════
                             let max_consensus_wait = match (qualified_producers, avg_latency) {
                                 // GENESIS PHASE (5-50 producers):
-                                // WAN latency expected, allow 2 seconds for certificate verification
-                                (0..=50, _) => tokio::time::Duration::from_millis(2000),
+                                // WAN latency expected, 3 seconds for certificate + propagation
+                                (0..=50, _) => tokio::time::Duration::from_millis(3000),
                                 
                                 // SMALL NETWORK (51-200 producers):
-                                // LAN: 1 second sufficient, WAN: 2 seconds for safety
-                                (51..=200, 0..=50) => tokio::time::Duration::from_millis(1000),
-                                (51..=200, _) => tokio::time::Duration::from_millis(2000),
+                                // LAN: 1.5 sec, WAN: 3 sec for reliability
+                                (51..=200, 0..=50) => tokio::time::Duration::from_millis(1500),
+                                (51..=200, _) => tokio::time::Duration::from_millis(3000),
                                 
-                                // MEDIUM/LARGE NETWORK (201+ producers):
-                                // Assume datacenter deployment, 1 second sufficient
-                                // LAN: 1 second, WAN: 1.5 seconds (most producers in same region)
-                                (201..=1000, 0..=50) => tokio::time::Duration::from_millis(1000),
-                                (201..=1000, _) => tokio::time::Duration::from_millis(1500),
+                                // MEDIUM NETWORK (201-1000 producers):
+                                // LAN: 1.5 sec, WAN: 2.5 sec (regional clustering assumed)
+                                (201..=1000, 0..=50) => tokio::time::Duration::from_millis(1500),
+                                (201..=1000, 51..=100) => tokio::time::Duration::from_millis(2500),
+                                (201..=1000, _) => tokio::time::Duration::from_millis(3000),
                                 
                                 // VERY LARGE (1000+ producers):
-                                // Production deployment with regional clustering
-                                _ => tokio::time::Duration::from_millis(1000),
+                                // Sample = 100 nodes, need 60 responses (60%)
+                                // LAN: 2 sec, Regional: 3 sec, Global: 4 sec (max safe)
+                                (1001.., 0..=50) => tokio::time::Duration::from_millis(2000),   // LAN/Datacenter
+                                (1001.., 51..=100) => tokio::time::Duration::from_millis(3000), // Regional WAN
+                                (1001.., 101..=200) => tokio::time::Duration::from_millis(3500), // Continental WAN
+                                (1001.., _) => tokio::time::Duration::from_millis(4000),        // Global WAN (MAX SAFE)
                             };
                             
                             let byzantine_threshold = ((sample_size as f64 * 0.6).ceil() as usize).max(1); // 60% of peers, minimum 1
@@ -11471,42 +11747,68 @@ impl BlockchainNode {
                                 }
                             }
                             
-                            // CRITICAL: Fork prevention - only stop if REAL mismatch detected
-                            // FINALITY_WINDOW ensures synchronized nodes have the same block
-                            // Lagging nodes (peer_entropy == 0) are NOT counted as mismatch
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v3.10 BUG 5 FIX: Improved fork detection logic
+                            // ═══════════════════════════════════════════════════════════════════
+                            // OLD BUG: `mismatches > matches && matches > 0` 
+                            //   → If ALL peers mismatch (matches=0), fork was NOT detected!
+                            //   → Node continued producing on fork
+                            //
+                            // NEW LOGIC:
+                            //   - If mismatches > 0 AND matches == 0 → DEFINITE FORK (nobody agrees)
+                            //   - If mismatches > matches → MAJORITY FORK (most disagree)
+                            //   - If matches > mismatches → MINORITY disagrees (continue)
+                            // ═══════════════════════════════════════════════════════════════════
                             if mismatches > 0 {
-                                // REAL FORK DETECTED: Some peers have DIFFERENT entropy (not just missing)
-                                if mismatches > matches && matches > 0 {
-                                    // Majority disagrees - STOP to prevent fork
-                                    println!("[ERR][CONS] FORK DETECTED! {} peers have different entropy vs {} agree", 
-                                        mismatches, matches);
-                                    println!("[ERR][CONS] STOPPING production - fork prevention!");
-                                    println!("[ERR][CONS] Cannot proceed - network has diverged");
+                                // v3.10 BUG 5 FIX: CRITICAL - if NO ONE agrees, we're definitely on a fork!
+                                if matches == 0 {
+                                    // DEFINITE FORK: All responding peers have DIFFERENT entropy
+                                    println!("[ERR][CONS] FORK DETECTED! ALL {} peers have different entropy, 0 agree!", 
+                                             mismatches);
+                                    println!("[ERR][CONS] STOPPING production - we are on a fork!");
                                     
                                     // STATE MACHINE: Fork detected error
                                     set_node_state(NodeState::Error {
-                                        reason: format!("Fork detected: {} mismatches vs {} matches", mismatches, matches),
+                                        reason: format!("Fork: {} mismatches, 0 matches - definite fork", mismatches),
                                         recoverable: true,
                                     });
-                                
-                                // Skip this rotation round to prevent fork
-                                continue;
+                                    
+                                    // v3.10: Self-exclude from production
+                                    let rotation_interval = 30u64;
+                                    let exclude_until = ((next_block_height / rotation_interval) + 3) * rotation_interval;
+                                    exclude_producer(&node_id, "entropy_fork_detected", exclude_until);
+                                    
+                                    // Skip this rotation round to prevent fork
+                                    continue;
+                                } else if mismatches > matches {
+                                    // MAJORITY FORK: More peers disagree than agree
+                                    println!("[ERR][CONS] FORK DETECTED! {} peers disagree vs {} agree", 
+                                             mismatches, matches);
+                                    println!("[ERR][CONS] STOPPING production - majority says we're on fork!");
+                                    
+                                    // STATE MACHINE: Fork detected error
+                                    set_node_state(NodeState::Error {
+                                        reason: format!("Fork: {} mismatches vs {} matches", mismatches, matches),
+                                        recoverable: true,
+                                    });
+                                    
+                                    // Skip this rotation round to prevent fork
+                                    continue;
                                 } else {
                                     // Minority disagrees - log warning but continue (Byzantine resilience)
+                                    // This is expected: some nodes may be lagging or on temporary fork
                                     println!("[WARN][CONS] {} peers have different entropy (minority), {} agree (majority)", 
                                             mismatches, matches);
-                                    if is_info() { println!("[INFO][CONS] bft_majority"); }
+                                    if is_info() { println!("[INFO][CONS] bft_majority_ok"); }
                                 }
                             } else if matches > 0 {
                                 // All responses match - perfect consensus
                                 if is_debug() { println!("[DBG][CONS] perfect agree={}", matches); }
                             } else {
-                                // No responses - peers are lagging (not a problem with FINALITY_WINDOW)
-                                // ARCHITECTURE: FINALITY_WINDOW ensures entropy block is Byzantine-finalized
-                                // If producer has correct block → entropy is correct
-                                // If producer has wrong block → other nodes will reject its blocks
-                                // Liveness: Network must continue even if peers are slow to respond
-                                println!("[WARN][CONS] no_entropy_responses - using FINALITY_WINDOW");
+                                // No responses at all - peers are lagging or network issue
+                                // CRITICAL: This is DIFFERENT from "all mismatches"!
+                                // Here: no one responded (timeout) vs above: everyone responded with different hash
+                                println!("[WARN][CONS] no_entropy_responses - peers may be lagging");
                             }
                             
                             // CRITICAL FIX: Check if selected producer is synchronized
@@ -13761,6 +14063,10 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // NOT producer for this block - wait for block from network
                     // Emergency producer logic already handled above at line 3122
                     
+                    // v3.10 BUG 1 FIX: Register that we're waiting for this block
+                    // If SHRED doesn't deliver it, we'll request it after timeout
+                    register_consensus_awaiting_block(next_block_height, &current_producer);
+                    
                     // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
                     if next_block_height % 10 == 0 && is_debug() {
                         println!("[DBG][MB] wait_block h={} producer={}", next_block_height, current_producer);
@@ -15143,15 +15449,31 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // Check timeout
             if consensus_start.elapsed() >= max_wait {
-                // No 66% consensus - use plurality (most votes, like LMD-GHOST)
+                // No 66% consensus - check if we have minimum votes (40%)
+                // v3.10 BUG 2 FIX: Do NOT produce with insufficient consensus!
                 if let Some((best_producer, best_count)) = vote_counts.iter()
                     .max_by_key(|(_, count)| *count) 
                 {
-                    if is_warn() {
-                        println!("[WARN][VOTE] no_66_consensus h={} plurality={} votes={}/{}", 
-                                 block_height, best_producer, best_count, total_candidates);
+                    // Calculate minimum required votes (40% of total candidates)
+                    let min_required = (total_candidates as u64 * MIN_CONSENSUS_VOTES_PERCENT / 100).max(2) as usize;
+                    
+                    if *best_count >= min_required {
+                        // Plurality with minimum threshold met
+                        if is_warn() {
+                            println!("[WARN][VOTE] no_66_consensus h={} plurality={} votes={}/{} min={}", 
+                                     block_height, best_producer, best_count, total_candidates, min_required);
+                        }
+                        consensus_producer = Some(best_producer.clone());
+                    } else {
+                        // v3.10 BUG 2 FIX: Insufficient votes - DO NOT SELECT PRODUCER!
+                        // This prevents node from producing blocks without network agreement
+                        // Emergency failover will handle this case
+                        println!("[ERR][VOTE] insufficient_consensus h={} best={} votes={}/{} min_required={}", 
+                                 block_height, best_producer, best_count, total_candidates, min_required);
+                        println!("[INFO][VOTE] triggering_emergency reason=insufficient_votes");
+                        // Return None - let emergency handler take over
+                        consensus_producer = None;
                     }
-                    consensus_producer = Some(best_producer.clone());
                 }
                 break;
             }
@@ -15289,6 +15611,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let mut candidates = Vec::new();
             
             println!("[EMERGENCY_SELECTION] ℹ️  Failed producer being excluded: {}", failed_producer);
+            
+            // v3.10 BUG 3 FIX: Exclude failed producer globally
+            // Blocks from this producer will be ignored for the next rotation cycle
+            // This prevents forked nodes from spamming and blocking emergency recovery
+            let rotation_interval = 30u64;
+            let exclude_until = ((current_height / rotation_interval) + 2) * rotation_interval;
+            exclude_producer(failed_producer, "emergency_failover", exclude_until);
+            if is_info() {
+                println!("[INFO][EMERGENCY] producer_excluded id={} until_h={}", failed_producer, exclude_until);
+            }
             
             // Use same candidate source as normal production
             {
@@ -18554,22 +18886,62 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     // Helper methods for production microblocks
     
+    /// v3.11: Calculate real Merkle root using qnet-core implementation
+    /// Enables trustless transaction proofs for Light clients and cross-shard verification
     fn calculate_merkle_root(txs: &[qnet_state::Transaction]) -> [u8; 32] {
-        use sha3::{Sha3_256, Digest};
-        
         if txs.is_empty() {
-            return [0u8; 32];
+            // Return hash of empty for empty block (consistent with merkle.rs)
+            use sha3::{Sha3_256, Digest};
+            let hasher = Sha3_256::new();
+            let result = hasher.finalize();
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&result);
+            return hash;
         }
         
-        let mut hasher = Sha3_256::new();
-        for tx in txs {
-            hasher.update(tx.hash.as_bytes());
-        }
+        // v3.11: Use real Merkle tree from qnet-core
+        // This enables generate_merkle_proof() and verify_merkle_proof() for Light clients
+        use qnet_core::crypto::merkle::compute_merkle_root;
         
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
+        let tx_hashes: Vec<String> = txs.iter()
+            .map(|tx| tx.hash.clone())
+            .collect();
+        
+        match compute_merkle_root(&tx_hashes) {
+            Ok(root_hex) => {
+                // Convert hex string to [u8; 32]
+                match hex::decode(&root_hex) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut hash = [0u8; 32];
+                        hash.copy_from_slice(&bytes);
+                        hash
+                    }
+                    _ => {
+                        // Fallback: hash the hex string if decode fails
+                        use sha3::{Sha3_256, Digest};
+                        let mut hasher = Sha3_256::new();
+                        hasher.update(root_hex.as_bytes());
+                        let result = hasher.finalize();
+                        let mut hash = [0u8; 32];
+                        hash.copy_from_slice(&result);
+                        hash
+                    }
+                }
+            }
+            Err(e) => {
+                // v3.11: Log error and fallback to simple hash (should not happen in production)
+                eprintln!("[ERR][MERKLE] compute_merkle_root_fail txs={} err={}", txs.len(), e);
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                for tx in txs {
+                    hasher.update(tx.hash.as_bytes());
+                }
+                let result = hasher.finalize();
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&result);
+                hash
+            }
+        }
     }
     
     /// PRODUCTION: Normalize node ID for consistent signature validation
@@ -21337,9 +21709,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 let to_shard = shard_coordinator.get_shard(to);
                 
                 if from_shard != to_shard {
-                    // This is a cross-shard transaction
-                    println!("[SHARDING] 🌐 Cross-shard transaction detected: shard {} → shard {}", 
-                             from_shard, to_shard);
+                    // v3.11: Cross-shard transaction with Merkle proof support
+                    if is_info() { 
+                        println!("[INFO][SHARD] cross_shard_tx detected from={} to={}", 
+                                 from_shard, to_shard); 
+                    }
                     
                     // Create cross-shard transaction record
                     let cross_shard_tx = qnet_sharding::CrossShardTx {
@@ -21355,11 +21729,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     
                     // Process through shard coordinator
                     if let Err(e) = shard_coordinator.process_cross_shard_tx(cross_shard_tx).await {
-                        println!("[SHARDING] ⚠️ Cross-shard processing failed: {}", e);
+                        if is_warn() { println!("[WARN][SHARD] cross_shard_process_fail err={}", e); }
                         // Continue with normal processing even if cross-shard fails
-                    } else {
-                        println!("[SHARDING] ✅ Cross-shard transaction queued for processing");
+                    } else if is_debug() {
+                        println!("[DBG][SHARD] cross_shard_tx_queued hash={}...", &tx.hash[..16]);
                     }
+                    
+                    // v3.11: Note - Merkle proofs are generated when block is finalized
+                    // Target shard can request proof via generate_cross_shard_proof()
                 }
             }
         }
@@ -22094,6 +22471,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     pub async fn get_balance(&self, address: &str) -> Result<u64, QNetError> {
         let state = self.state.read().await;
         Ok(state.get_balance(address))
+    }
+    
+    /// v3.11: Get balance with Merkle proof for Light client trustless verification
+    /// 
+    /// Returns BalanceProof that includes:
+    /// - Balance and nonce
+    /// - Merkle proof path
+    /// - State root and block height
+    /// 
+    /// Light clients can verify proof against state_root without trusting the API
+    pub async fn get_balance_with_proof(&self, address: &str) -> Result<qnet_state::BalanceProof, QNetError> {
+        let state = self.state.read().await;
+        state.get_balance_with_proof(address)
+            .ok_or_else(|| QNetError::StateError(format!("Account not found: {}", address)))
     }
     
     pub async fn get_stats(&self) -> Result<serde_json::Value, QNetError> {

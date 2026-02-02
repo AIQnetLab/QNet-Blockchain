@@ -2766,6 +2766,7 @@ export class WalletManager {
   }
   
   // Discover active nodes from network
+  // v3.13: Discover active nodes from network (stores reputation!)
   async discoverNodes(seedNodes) {
     try {
       // Query each seed node for their peer list
@@ -2779,12 +2780,15 @@ export class WalletManager {
           if (response.ok) {
             const data = await response.json();
             if (data.peers && Array.isArray(data.peers)) {
-              // Store discovered nodes
-              const discoveredNodes = data.peers.map(peer => ({
-                url: `http://${peer.address}`,
-                nodeType: peer.node_type,
-                lastSeen: Date.now()
-              }));
+              // v3.13: Store discovered nodes WITH reputation for filtering
+              const discoveredNodes = data.peers
+                .filter(peer => peer.address && peer.address.includes(':'))
+                .map(peer => ({
+                  url: `http://${peer.address}`,
+                  nodeType: peer.node_type,
+                  reputation: peer.reputation || 0, // v3.13: Store reputation!
+                  lastSeen: Date.now()
+                }));
               
               // Merge with existing cache
               const cachedNodes = await AsyncStorage.getItem('qnet_discovered_nodes');
@@ -2793,7 +2797,7 @@ export class WalletManager {
                 const existing = JSON.parse(cachedNodes);
                 allNodes = [...existing, ...discoveredNodes];
                 
-                // Remove duplicates
+                // Remove duplicates (prefer newer data)
                 const unique = {};
                 allNodes.forEach(node => {
                   unique[node.url] = node;
@@ -2812,7 +2816,7 @@ export class WalletManager {
         }
       }
     } catch (e) {
-      // Discovery failed, will use Genesis nodes
+      // Discovery failed silently
     }
   }
   
@@ -3110,6 +3114,359 @@ export class WalletManager {
       return 0;
     }
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // v3.11: TRUSTLESS BALANCE VERIFICATION with Merkle Proofs
+  // Light clients can verify balance without trusting the API
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get QNC balance with Merkle proof for trustless verification
+   * @param {string} address - Wallet address
+   * @param {boolean} verify - Whether to verify the proof
+   * @returns {Promise<{balance: number, verified: boolean, proof: object}>}
+   */
+  async getQNCBalanceWithProof(address, verify = true) {
+    try {
+      if (!address || typeof address !== 'string') {
+        return { balance: 0, verified: false, proof: null, error: 'Invalid address' };
+      }
+      
+      const apiUrl = this.getRandomBootstrapNode();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout for proof
+      
+      // v3.11: Request balance WITH Merkle proof
+      const response = await fetch(`${apiUrl}/api/v1/account/${address}/balance/proof`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        return { balance: 0, verified: false, proof: null, error: 'API error' };
+      }
+      
+      const data = await response.json();
+      const balanceNano = data.balance || 0;
+      const balanceQNC = balanceNano / 1e9;
+      
+      // Verify proof if requested
+      let verified = false;
+      if (verify && data.merkle_proof && data.merkle_proof.length > 0) {
+        // Step 1: Verify Merkle proof locally
+        const proofValid = await this.verifyMerkleProof(
+          address,
+          balanceNano,
+          data.nonce || 0,
+          data.merkle_proof,
+          data.state_root
+        );
+        
+        // Step 2: Verify state_root matches latest block (multi-node consensus)
+        if (proofValid) {
+          verified = await this.verifyStateRootFromMultipleNodes(
+            data.state_root,
+            data.block_height
+          );
+        }
+      }
+      
+      return {
+        balance: balanceQNC,
+        balanceNano: balanceNano,
+        nonce: data.nonce || 0,
+        verified: verified,
+        blockHeight: data.block_height,
+        stateRoot: data.state_root,
+        proof: data.merkle_proof
+      };
+    } catch (error) {
+      return { balance: 0, verified: false, proof: null, error: error.message };
+    }
+  }
+
+  /**
+   * Verify Merkle proof locally using SHA3-256
+   * This is the core trustless verification - no network calls needed
+   * 
+   * CRITICAL: Must match Rust implementation exactly!
+   * Rust uses raw bytes, not hex strings for hashing
+   */
+  async verifyMerkleProof(address, balance, nonce, proof, expectedRoot) {
+    try {
+      // Import js-sha3 for SHA3-256 (same as Rust implementation)
+      const { sha3_256 } = await import('js-sha3');
+      
+      // Hash address (same as Rust: b"QNET_ADDR:" + address.as_bytes())
+      const addrHashHex = sha3_256(this.concatBytes(
+        new TextEncoder().encode('QNET_ADDR:'),
+        new TextEncoder().encode(address)
+      ));
+      
+      // Hash account data (same as Rust: b"QNET_ACCOUNT:" + balance(8) + nonce(8) + pending_rewards(8) + address)
+      // CRITICAL: Use raw bytes, not hex strings!
+      const accountDataBytes = this.concatBytes(
+        new TextEncoder().encode('QNET_ACCOUNT:'),
+        this.uint64ToBytes(balance),           // 8 bytes little-endian
+        this.uint64ToBytes(nonce),             // 8 bytes little-endian
+        this.uint64ToBytes(0),                 // pending_rewards = 0 for basic proof
+        new TextEncoder().encode(address)      // address string bytes
+      );
+      let currentHash = sha3_256(accountDataBytes);
+      
+      // Walk up the Merkle tree
+      for (let i = 0; i < proof.length; i++) {
+        const sibling = proof[i].sibling;
+        const isRight = proof[i].is_right;
+        
+        // Check bit matches direction
+        const byteIdx = Math.floor(i / 8);
+        const bitIdx = 7 - (i % 8);
+        const addrByte = byteIdx < 32 ? 
+          parseInt(addrHashHex.substring(byteIdx * 2, byteIdx * 2 + 2), 16) : 0;
+        const expectedBit = ((addrByte >> bitIdx) & 1) === 1;
+        
+        if (isRight !== expectedBit) {
+          return false; // Proof direction mismatch
+        }
+        
+        // Combine hashes (convert hex to bytes first!)
+        const siblingBytes = this.hexToBytes(sibling);
+        const currentBytes = this.hexToBytes(currentHash);
+        
+        let combinedBytes;
+        if (isRight) {
+          combinedBytes = this.concatBytes(siblingBytes, currentBytes);
+        } else {
+          combinedBytes = this.concatBytes(currentBytes, siblingBytes);
+        }
+        
+        // Hash the combination
+        currentHash = sha3_256(combinedBytes);
+      }
+      
+      // Compare with expected root
+      return currentHash === expectedRoot;
+    } catch (error) {
+      console.warn('[MERKLE] Proof verification failed:', error.message);
+      return false;
+    }
+  }
+
+  // Helper: Concatenate byte arrays
+  concatBytes(...arrays) {
+    const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const arr of arrays) {
+      result.set(arr, offset);
+      offset += arr.length;
+    }
+    return result;
+  }
+
+  /**
+   * Verify state_root by querying multiple nodes (Byzantine fault tolerance)
+   * At least 2/3 nodes must agree on state_root for the block
+   * 
+   * v3.11: state_root is in MacroBlock, not MicroBlock
+   * MacroBlock index = floor(blockHeight / 90)
+   * 
+   * v3.12: FIXED - Use discovered nodes, NOT hardcoded Genesis!
+   * This prevents overloading Genesis nodes and is truly decentralized
+   */
+  async verifyStateRootFromMultipleNodes(stateRoot, blockHeight) {
+    try {
+      // v3.12: Get nodes from discovery system (NOT hardcoded!)
+      // This distributes load across ALL active nodes in the network
+      const nodes = await this.getNodesForVerification();
+      
+      if (nodes.length < 2) {
+        // Not enough nodes for consensus verification
+        console.warn('[MERKLE] Not enough nodes for verification:', nodes.length);
+        return false;
+      }
+      
+      // v3.11: state_root is in MacroBlock
+      // MacroBlock index = floor(blockHeight / 90)
+      const macroBlockIndex = Math.floor(blockHeight / 90);
+      
+      // Query state_root from multiple nodes in parallel (max 5 to limit load)
+      const nodesToQuery = nodes.slice(0, 5);
+      const queries = nodesToQuery.map(async (nodeUrl) => {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 3000);
+          
+          // v3.11: Use macroblock endpoint for state_root
+          const response = await fetch(`${nodeUrl}/api/v1/macroblock/${macroBlockIndex}`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal
+          });
+          
+          clearTimeout(timeoutId);
+          
+          if (!response.ok) return null;
+          
+          const macroblock = await response.json();
+          return macroblock.state_root || null;
+        } catch {
+          return null;
+        }
+      });
+      
+      const results = await Promise.all(queries);
+      const validResults = results.filter(r => r !== null);
+      
+      if (validResults.length < 2) {
+        return false; // Not enough responses
+      }
+      
+      // Count how many nodes agree on the state_root
+      const matchCount = validResults.filter(r => r === stateRoot).length;
+      const threshold = Math.ceil(validResults.length * 2 / 3); // 2/3 consensus
+      
+      return matchCount >= threshold;
+    } catch (error) {
+      console.warn('[MERKLE] State root verification failed:', error.message);
+      return false;
+    }
+  }
+
+  /**
+   * v3.14: Get HIGH-REPUTATION nodes for verification
+   * Uses RANDOM Genesis node if no discovered nodes (distributes load!)
+   */
+  async getNodesForVerification() {
+    const MIN_REPUTATION = 0.70;
+    
+    try {
+      // First: try to get cached discovered nodes
+      const cachedNodes = await AsyncStorage.getItem('qnet_discovered_nodes');
+      if (cachedNodes) {
+        const nodes = JSON.parse(cachedNodes);
+        
+        // Filter by HIGH REPUTATION and recent activity
+        const highRepNodes = nodes.filter(node => 
+          (Date.now() - node.lastSeen) < 86400000 &&
+          (node.reputation || 0) >= MIN_REPUTATION
+        );
+        
+        if (highRepNodes.length >= 2) {
+          highRepNodes.sort((a, b) => (b.reputation || 0) - (a.reputation || 0));
+          const top20 = highRepNodes.slice(0, 20);
+          return this.shuffleArray(top20.map(n => n.url));
+        }
+      }
+    } catch (e) {
+      // Cache error
+    }
+    
+    // v3.14: Use ALL Genesis nodes as fallback (distributed, no single point!)
+    // Trigger discovery in background
+    const randomGenesis = this.getRandomBootstrapNode();
+    this.discoverHighRepNodes(randomGenesis);
+    
+    // Return shuffled Genesis nodes (load distributed!)
+    return this.shuffleArray([
+      'http://154.38.160.39:8001',
+      'http://62.171.157.44:8001',
+      'http://161.97.86.81:8001',
+      'http://5.189.130.160:8001',
+      'http://162.244.25.114:8001'
+    ]);
+  }
+
+  /**
+   * v3.13: Discover high-reputation nodes from network
+   * Queries /api/v1/peers and saves nodes with reputation >= 70%
+   */
+  async discoverHighRepNodes(seedNodeUrl) {
+    const MIN_REPUTATION = 0.70;
+    
+    try {
+      const response = await fetch(`${seedNodeUrl}/api/v1/peers`, {
+        method: 'GET',
+        timeout: 5000
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        if (data.peers && Array.isArray(data.peers)) {
+          // Filter by high reputation
+          const highRepNodes = data.peers
+            .filter(peer => 
+              peer.address && 
+              (peer.reputation || 0) >= MIN_REPUTATION
+            )
+            .map(peer => ({
+              url: `http://${peer.address}`,
+              reputation: peer.reputation,
+              nodeType: peer.node_type,
+              lastSeen: Date.now()
+            }));
+          
+          if (highRepNodes.length > 0) {
+            // Merge with existing cache
+            let allNodes = highRepNodes;
+            try {
+              const cached = await AsyncStorage.getItem('qnet_discovered_nodes');
+              if (cached) {
+                const existing = JSON.parse(cached);
+                // Merge, preferring new data
+                const urlMap = {};
+                existing.forEach(n => urlMap[n.url] = n);
+                highRepNodes.forEach(n => urlMap[n.url] = n);
+                allNodes = Object.values(urlMap);
+              }
+            } catch (e) {}
+            
+            await AsyncStorage.setItem('qnet_discovered_nodes', JSON.stringify(allNodes));
+            console.log(`[MERKLE] Discovered ${highRepNodes.length} high-rep nodes`);
+          }
+        }
+      }
+    } catch (e) {
+      // Discovery failed silently
+    }
+  }
+
+  // Helper: Shuffle array (Fisher-Yates)
+  shuffleArray(array) {
+    const shuffled = [...array];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled;
+  }
+
+  // Helper: Convert uint64 to bytes (little-endian)
+  uint64ToBytes(value) {
+    const buffer = new ArrayBuffer(8);
+    const view = new DataView(buffer);
+    view.setBigUint64(0, BigInt(value), true); // little-endian
+    return new Uint8Array(buffer);
+  }
+
+  // Helper: Bytes to hex string
+  bytesToHex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  // Helper: Hex string to bytes
+  hexToBytes(hex) {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2) {
+      bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+    }
+    return bytes;
+  }
+
 
   // CACHE: Network size (avoid spamming bootstrap nodes)
   _networkSizeCache = null;

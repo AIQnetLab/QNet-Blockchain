@@ -9,8 +9,15 @@ const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 
 // Map transaction type to display string
-function mapTxType(type: string | object | undefined): string {
+// v3.15: Claims from system_rewards_pool show as Transfer
+function mapTxType(type: string | object | undefined, fromAddress?: string): string {
   if (!type) return 'Transfer';
+  
+  // Claim rewards from pool = Transfer (not Reward)
+  if (fromAddress === 'system_rewards_pool') {
+    return 'Transfer';
+  }
+  
   const typeStr = typeof type === 'object' ? Object.keys(type)[0] : String(type);
   
   const map: Record<string, string> = {
@@ -273,7 +280,7 @@ export async function GET(
         source: 'postgresql',
         data: {
           hash: dbTx.hash,
-          type: mapTxType(dbTx.tx_type),
+          type: mapTxType(dbTx.tx_type, dbTx.from_address),
           tx_type: dbTx.tx_type,
           status: dbTx.status || 'confirmed',
           block: dbTx.block,
@@ -383,7 +390,7 @@ export async function GET(
       source: 'rocksdb',
       data: {
         hash: tx.hash as string,
-        type: mapTxType((tx.tx_type || tx.type) as string),
+        type: mapTxType((tx.tx_type || tx.type) as string, (tx.from_address || tx.from) as string),
         tx_type: tx.tx_type || tx.type,
         status: (tx.status as string) || 'confirmed',
         block: blockHeight,

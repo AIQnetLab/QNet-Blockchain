@@ -1,8 +1,24 @@
 // QNet-core crypto module
+// v3.11: Added Merkle tree exports for proofs
 
 pub mod production_crypto;
 pub mod utils;
 pub mod merkle;
+
+// v3.11: Export Merkle tree types
+pub use merkle::{
+    compute_merkle_root,
+    compute_merkle_root_bytes,
+    generate_merkle_proof,
+    verify_merkle_proof,
+    verify_merkle_proof_bytes,
+    batch_verify_merkle_proofs,
+    compute_incremental_merkle_root,
+    StateMerkleTree,
+    generate_cross_shard_proof,
+    verify_cross_shard_proof,
+    HistoricalTxProof,
+};
 
 // Re-export main types for backward compatibility
 pub use production_crypto::{

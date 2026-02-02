@@ -16219,6 +16219,106 @@ impl SimplifiedP2P {
         }
     }
     
+    /// v3.10 BUG 1 FIX: Request specific block after consensus timeout
+    /// Uses same infrastructure as broadcast: validated active peers + QUIC parallel
+    /// 
+    /// WHY NOT Reed-Solomon: RS is for SENDING (erasure coding for fault tolerance)
+    /// For REQUESTING we use parallel requests to multiple peers - first response wins
+    pub async fn request_specific_block(&self, height: u64) -> Result<(), String> {
+        use futures::future::join_all;
+        use crate::p2p_transport::{P2PTransport, QUIC_PORT_OFFSET};
+        use crate::node::is_info;
+        use crate::node::is_debug;
+        
+        if is_info() {
+            println!("[INFO][CONS] request_after_consensus h={}", height);
+        }
+        
+        // Use same peer selection as broadcast - validated active peers with QUIC connections
+        let validated_peers = self.get_validated_active_peers();
+        
+        if validated_peers.is_empty() {
+            println!("[WARN][CONS] no_validated_peers h={}", height);
+            return Err("No validated peers available".to_string());
+        }
+        
+        // Sort by latency (same as broadcast) - fastest peers first
+        let mut sorted_peers = validated_peers;
+        sorted_peers.sort_by_key(|p| p.latency_ms);
+        
+        // Request from top peers (limit to avoid DoS on network)
+        // More than broadcast repair (3) but less than full broadcast
+        let peers_to_request = sorted_peers.iter().take(5).collect::<Vec<_>>();
+        
+        if is_info() {
+            println!("[INFO][CONS] requesting h={} from {} peers", height, peers_to_request.len());
+        }
+        
+        // QUIC parallel requests (same as broadcast)
+        // v3.14: Clone Arc (not RwLockGuard) for parallel futures
+        if let Some(ref quic_arc) = self.quic_transport {
+            let transport_arc = quic_arc.clone(); // Clone Arc, not the guard!
+            
+            // Parallel QUIC requests to all selected peers
+            let futures: Vec<_> = peers_to_request.iter().map(|peer| {
+                let transport = transport_arc.clone(); // Clone Arc for each future
+                let peer_addr = peer.addr.clone();
+                let peer_id = peer.id.clone();
+                let requester = self.node_id.clone();
+                
+                async move {
+                    // Parse IP and add QUIC port offset
+                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                        let quic_addr = std::net::SocketAddr::new(addr.ip(), addr.port() + QUIC_PORT_OFFSET);
+                        let request = NetworkMessage::RequestBlocks {
+                            from_height: height,
+                            to_height: height,
+                            requester_id: requester,
+                        };
+                        let guard = transport.read().await;
+                        match guard.send_message(quic_addr, &request).await {
+                            Ok(_) => Ok(peer_id),
+                            Err(e) => Err((peer_id, e))
+                        }
+                    } else {
+                        Err((peer_id, "Invalid peer address".to_string()))
+                    }
+                }
+            }).collect();
+            
+            // Wait for all requests (parallel execution)
+            let results = join_all(futures).await;
+            let success_count = results.iter().filter(|r| r.is_ok()).count();
+            
+            if is_debug() {
+                for result in &results {
+                    match result {
+                        Ok(peer_id) => println!("[DBG][CONS] quic_request_sent h={} peer={}", height, peer_id),
+                        Err((peer_id, e)) => println!("[DBG][CONS] quic_request_failed h={} peer={} err={}", height, peer_id, e),
+                    }
+                }
+            }
+            
+            if success_count > 0 {
+                if is_info() {
+                    println!("[INFO][CONS] block_requested h={} success={}/{}", 
+                             height, success_count, peers_to_request.len());
+                }
+                Ok(())
+            } else {
+                println!("[WARN][CONS] all_quic_requests_failed h={}", height);
+                // Fallback to legacy method
+                self.request_block_repair(height).await
+            }
+        } else {
+            // QUIC not available - use legacy method
+            if is_debug() {
+                println!("[DBG][CONS] quic_unavailable fallback_to_legacy h={}", height);
+            }
+            self.request_block_repair(height).await
+        }
+    }
+    
     /// Batch sync for catch-up - request blocks in batches
     pub async fn batch_sync(&self, from_height: u64, to_height: u64, batch_size: u64) -> Result<(), String> {
         println!("[SYNC] 🚀 Starting batch sync from {} to {} (batch size: {})", 
@@ -16244,7 +16344,7 @@ impl SimplifiedP2P {
     
     /// Request consensus state from peers for recovery
     pub async fn sync_consensus_state(&self, round: u64) -> Result<(), String> {
-        println!("[CONSENSUS] 🔄 Requesting consensus state for round {}", round);
+        println!("[INFO][CONS] Requesting consensus state for round {}", round);
         
         let peers = self.get_validated_active_peers();
         if peers.is_empty() {
@@ -16256,7 +16356,7 @@ impl SimplifiedP2P {
             .max_by(|a, b| a.reputation().partial_cmp(&b.reputation()).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for consensus sync")?;
         
-        println!("[CONSENSUS] 📡 Requesting from peer {} (network_quality: {:.1}%)",
+        println!("[INFO][CONS] Requesting from peer {} (network_quality: {:.1}%)",
                  best_peer.id, best_peer.network_score);
         
         // Create request message

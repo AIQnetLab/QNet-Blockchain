@@ -35,6 +35,146 @@ interface AddressData {
   }>;
 }
 
+// v3.11: Balance proof verification result
+interface BalanceProofResult {
+  verified: boolean;
+  balance: number;
+  blockHeight: number;
+  stateRoot: string;
+  proofSize: number;
+  verificationTime: number;
+  error?: string;
+}
+
+// v3.11: Balance Verification Component
+const BalanceVerification = ({ address }: { address: string }) => {
+  const [verifying, setVerifying] = useState(false);
+  const [result, setResult] = useState<BalanceProofResult | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  
+  const verifyBalance = async () => {
+    setVerifying(true);
+    setResult(null);
+    
+    const startTime = performance.now();
+    
+    try {
+      // Fetch balance with Merkle proof
+      const response = await fetch(`/api/address/${address}/balance-proof`);
+      const data = await response.json();
+      
+      if (data.success && data.verified !== undefined) {
+        setResult({
+          verified: data.verified,
+          balance: data.balance || 0,
+          blockHeight: data.blockHeight || 0,
+          stateRoot: data.stateRoot || '',
+          proofSize: data.proofSize || 0,
+          verificationTime: Math.round(performance.now() - startTime),
+        });
+      } else {
+        setResult({
+          verified: false,
+          balance: 0,
+          blockHeight: 0,
+          stateRoot: '',
+          proofSize: 0,
+          verificationTime: Math.round(performance.now() - startTime),
+          error: data.error || 'Verification failed',
+        });
+      }
+    } catch (err) {
+      setResult({
+        verified: false,
+        balance: 0,
+        blockHeight: 0,
+        stateRoot: '',
+        proofSize: 0,
+        verificationTime: Math.round(performance.now() - startTime),
+        error: err instanceof Error ? err.message : 'Unknown error',
+      });
+    } finally {
+      setVerifying(false);
+    }
+  };
+  
+  return (
+    <div className="verification-section">
+      <div className="verification-header">
+        <button 
+          onClick={verifyBalance} 
+          disabled={verifying}
+          className={`verify-btn ${result?.verified ? 'verified' : ''}`}
+        >
+          {verifying ? (
+            <>
+              <span className="spinner" /> Verifying...
+            </>
+          ) : result?.verified ? (
+            <>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+              Verified (Merkle Proof)
+            </>
+          ) : (
+            <>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+              </svg>
+              Verify Balance
+            </>
+          )}
+        </button>
+        
+        {result && (
+          <button 
+            onClick={() => setExpanded(!expanded)} 
+            className="details-toggle"
+          >
+            {expanded ? 'Hide Details' : 'Show Details'}
+          </button>
+        )}
+      </div>
+      
+      {result && expanded && (
+        <div className={`verification-details ${result.verified ? 'verified' : 'failed'}`}>
+          <div className="detail-row">
+            <span className="detail-label">Status</span>
+            <span className={`detail-value ${result.verified ? 'text-success' : 'text-error'}`}>
+              {result.verified ? 'Cryptographically Verified' : (result.error || 'Verification Failed')}
+            </span>
+          </div>
+          {result.verified && (
+            <>
+              <div className="detail-row">
+                <span className="detail-label">Block Height</span>
+                <span className="detail-value">{result.blockHeight.toLocaleString()}</span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-label">State Root</span>
+                <span className="detail-value mono">{result.stateRoot.slice(0, 16)}...</span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-label">Proof Size</span>
+                <span className="detail-value">{result.proofSize} nodes</span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-label">Verification Time</span>
+                <span className="detail-value">{result.verificationTime}ms</span>
+              </div>
+            </>
+          )}
+          <div className="verification-note">
+            Merkle proof verification ensures your balance is authentic without trusting any single node.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // Other Tokens collapsible component
 const OtherTokens = ({ tokens }: { tokens: Array<{ symbol: string; balance: string }> }) => {
   const [expanded, setExpanded] = useState(false);
@@ -217,6 +357,8 @@ export default function AddressPage() {
         <div className="balance-display">
           <div className="main-balance">{data.balance}</div>
         </div>
+        {/* v3.11: Merkle proof verification */}
+        <BalanceVerification address={address} />
       </div>
 
       {/* Other Tokens (collapsible) */}

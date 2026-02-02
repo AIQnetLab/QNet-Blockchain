@@ -10,8 +10,15 @@ import type { Block, BlockTransaction } from '@/lib/types';
 const NODE_RPC_URL = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
 
 // Map transaction type to display name
-function getTransactionType(txType: unknown): string {
+// v3.15: Claims from system_rewards_pool show as Transfer
+function getTransactionType(txType: unknown, fromAddress?: string): string {
   if (!txType) return 'Unknown';
+  
+  // Claim rewards from pool = Transfer (not Reward)
+  if (fromAddress === 'system_rewards_pool') {
+    return 'Transfer';
+  }
+  
   if (typeof txType === 'string') return txType;
   
   // Handle Rust enum serialization: { "Transfer": {...} } or { "NodeRegistration": {...} }
@@ -32,7 +39,7 @@ function getTransactionType(txType: unknown): string {
       'ContractCall': 'Contract',
       'BatchTransfers': 'Transfer',
       'BatchNodeActivations': 'Activation',
-      'BatchRewardClaims': 'Reward',
+      'BatchRewardClaims': 'Transfer',
     };
     return typeMap[typeKey] || typeKey || 'Unknown';
   }
@@ -132,7 +139,7 @@ function transformRpcBlock(raw: Record<string, unknown>): Block | null {
       const t = tx as Record<string, unknown>;
       return {
         hash: (t.hash as string) || '',
-        type: getTransactionType(t.tx_type),
+        type: getTransactionType(t.tx_type, (t.from as string)),
         from: (t.from as string) || '',
         to: (t.to as string) || (t.from as string) || '',
         amount: String(t.amount || 0),
@@ -166,7 +173,7 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
       
       const transactions: BlockTransaction[] = dbTransactions.map(tx => ({
         hash: tx.hash,
-        type: getTransactionType(tx.tx_type),
+        type: getTransactionType(tx.tx_type, tx.from_address),
         from: tx.from_address,
         to: tx.to_address || tx.from_address,
         amount: String(tx.amount || 0),

@@ -2512,6 +2512,135 @@ a[href*="play.google.com"] img {
   color: #1a1a2e;
 }
 
+/* v3.11: Balance Verification UI */
+.verification-section {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid #e9ecef;
+}
+
+.verification-header {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: center;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.verify-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #495057;
+  background: #f8f9fa;
+  border: 1px solid #dee2e6;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.verify-btn:hover:not(:disabled) {
+  background: #e9ecef;
+  border-color: #ced4da;
+}
+
+.verify-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.verify-btn.verified {
+  color: #198754;
+  background: #d1e7dd;
+  border-color: #a3cfbb;
+}
+
+.verify-btn .spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #dee2e6;
+  border-top-color: #495057;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.details-toggle {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
+  color: #6c757d;
+  background: transparent;
+  border: 1px solid #dee2e6;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.details-toggle:hover {
+  background: #f8f9fa;
+}
+
+.verification-details {
+  margin-top: 1rem;
+  padding: 1rem;
+  background: #f8f9fa;
+  border-radius: 8px;
+  font-size: 0.875rem;
+}
+
+.verification-details.verified {
+  background: #d1e7dd;
+  border: 1px solid #a3cfbb;
+}
+
+.verification-details.failed {
+  background: #f8d7da;
+  border: 1px solid #f5c2c7;
+}
+
+.verification-details .detail-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.35rem 0;
+}
+
+.verification-details .detail-label {
+  color: #6c757d;
+}
+
+.verification-details .detail-value {
+  font-weight: 500;
+  color: #212529;
+}
+
+.verification-details .detail-value.mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+}
+
+.verification-details .text-success {
+  color: #198754;
+}
+
+.verification-details .text-error {
+  color: #dc3545;
+}
+
+.verification-note {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid rgba(0,0,0,0.1);
+  font-size: 0.75rem;
+  color: #6c757d;
+  text-align: center;
+  font-style: italic;
+}
+
 /* Other Tokens expanded list */
 .tokens-list-expanded {
   padding: 0.5rem 1rem;
