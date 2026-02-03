@@ -1374,36 +1374,20 @@ impl BlockchainNode {
         // Track blocks per height to detect double-signing
         let mut blocks_at_height: HashMap<u64, Vec<(String, [u8; 32])>> = HashMap::new();
         
+        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format and Zstd compression
         for height in start_height..=end_height {
-            match storage.load_microblock(height) {
-                Ok(Some(block_data)) => {
-                    // Parse block to get producer and signature hash
-                    let (producer, sig_hash) = if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                        use sha3::{Sha3_256, Digest};
-                        let mut hasher = Sha3_256::new();
-                        hasher.update(&block.signature);
-                        let result = hasher.finalize();
-                        let mut hash = [0u8; 32];
-                        hash.copy_from_slice(&result);
-                        (block.producer.clone(), hash)
-                    } else if let Ok(efficient) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&block_data) {
-                        use sha3::{Sha3_256, Digest};
-                        let mut hasher = Sha3_256::new();
-                        hasher.update(&efficient.signature);
-                        let result = hasher.finalize();
-                        let mut hash = [0u8; 32];
-                        hash.copy_from_slice(&result);
-                        (efficient.producer.clone(), hash)
-                    } else {
-                        continue;
-                    };
-                    
-                    blocks_at_height
-                        .entry(height)
-                        .or_insert_with(Vec::new)
-                        .push((producer, sig_hash));
-                }
-                _ => {}
+            if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(&block.signature);
+                let result = hasher.finalize();
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&result);
+                
+                blocks_at_height
+                    .entry(height)
+                    .or_insert_with(Vec::new)
+                    .push((block.producer.clone(), hash));
             }
         }
         
@@ -3559,63 +3543,62 @@ impl BlockchainNode {
         // v2.89: Track processed Genesis to prevent duplicate TX processing
         let mut processed_genesis: std::collections::HashSet<String> = std::collections::HashSet::new();
         
+        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
         for height in scan_start..=window_end_height {
-            if let Ok(Some(block_bytes)) = storage.load_microblock(height) {
-                if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_bytes) {
-                    for tx in &block.transactions {
-                        if let qnet_state::TransactionType::LightNodeEligibilityBitmap {
-                            genesis_id,
-                            epoch: _,
-                            total_assigned,
-                            eligible_count,
-                            bitmap_compressed,
-                        } = &tx.tx_type {
-                            // v2.89: Skip duplicate TX from same Genesis (only process first)
-                            if processed_genesis.contains(genesis_id) {
-                                if is_warn() {
-                                    println!("[WARN][LIGHT-BITMAP] Skipping duplicate TX from {}", genesis_id);
-                                }
-                                continue;
+            if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
+                for tx in &block.transactions {
+                    if let qnet_state::TransactionType::LightNodeEligibilityBitmap {
+                        genesis_id,
+                        epoch: _,
+                        total_assigned,
+                        eligible_count,
+                        bitmap_compressed,
+                    } = &tx.tx_type {
+                        // v2.89: Skip duplicate TX from same Genesis (only process first)
+                        if processed_genesis.contains(genesis_id) {
+                            if is_warn() {
+                                println!("[WARN][LIGHT-BITMAP] Skipping duplicate TX from {}", genesis_id);
                             }
-                            processed_genesis.insert(genesis_id.clone());
+                            continue;
+                        }
+                        processed_genesis.insert(genesis_id.clone());
+                        
+                        // Decompress bitmap
+                        if let Ok(bitmap) = zstd::decode_all(&bitmap_compressed[..]) {
+                            // Parse genesis_id to get shard assignment
+                            let genesis_idx = genesis_id.strip_prefix("genesis_node_")
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .map(|n| n.saturating_sub(1))
+                                .unwrap_or(0) as usize;
                             
-                            // Decompress bitmap
-                            if let Ok(bitmap) = zstd::decode_all(&bitmap_compressed[..]) {
-                                // Parse genesis_id to get shard assignment
-                                let genesis_idx = genesis_id.strip_prefix("genesis_node_")
-                                    .and_then(|s| s.parse::<u32>().ok())
-                                    .map(|n| n.saturating_sub(1))
-                                    .unwrap_or(0) as usize;
-                                
-                                let shard_start = genesis_idx * nodes_per_genesis;
-                                
-                                // Read bitmap and add eligible nodes
-                                let mut local_count = 0u32;
-                                for (bit_idx, byte) in bitmap.iter().enumerate() {
-                                    for bit in 0..8 {
-                                        let local_idx = bit_idx * 8 + bit;
-                                        if local_idx >= *total_assigned as usize {
-                                            break;
-                                        }
-                                        if (byte >> bit) & 1 == 1 {
-                                            let global_idx = shard_start + local_idx;
-                                            if global_idx < total_light_nodes {
-                                                let node_id = &registry[global_idx];
-                                                bitmap_eligible.insert(node_id.clone(), 1);
-                                                local_count += 1;
-                                            }
+                            let shard_start = genesis_idx * nodes_per_genesis;
+                            
+                            // Read bitmap and add eligible nodes
+                            let mut local_count = 0u32;
+                            for (bit_idx, byte) in bitmap.iter().enumerate() {
+                                for bit in 0..8 {
+                                    let local_idx = bit_idx * 8 + bit;
+                                    if local_idx >= *total_assigned as usize {
+                                        break;
+                                    }
+                                    if (byte >> bit) & 1 == 1 {
+                                        let global_idx = shard_start + local_idx;
+                                        if global_idx < total_light_nodes {
+                                            let node_id = &registry[global_idx];
+                                            bitmap_eligible.insert(node_id.clone(), 1);
+                                            local_count += 1;
                                         }
                                     }
                                 }
-                                
-                                if is_info() {
-                                    println!("[INFO][LIGHT-BITMAP] Parsed {} bitmap: {} eligible (expected {})",
-                                             genesis_id, local_count, eligible_count);
-                                }
-                                found_bitmap_txs += 1;
-                            } else if is_warn() {
-                                println!("[WARN][LIGHT-BITMAP] Failed to decompress bitmap from {}", genesis_id);
                             }
+                            
+                            if is_info() {
+                                println!("[INFO][LIGHT-BITMAP] Parsed {} bitmap: {} eligible (expected {})",
+                                         genesis_id, local_count, eligible_count);
+                            }
+                            found_bitmap_txs += 1;
+                        } else if is_warn() {
+                            println!("[WARN][LIGHT-BITMAP] Failed to decompress bitmap from {}", genesis_id);
                         }
                     }
                 }
@@ -4788,38 +4771,35 @@ impl BlockchainNode {
         
         // CRITICAL v2.32: Genesis timestamp MUST come from Genesis block #0
         // NO FALLBACK to SystemTime::now() - this caused different nodes to have different timestamps!
-        let genesis_timestamp = match storage.load_microblock(0) {
-            Ok(Some(genesis_data)) => {
-                match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
-                    Ok(genesis_block) => {
-                        if is_info() { println!("[INFO][GEN] loaded_ts={}", genesis_block.timestamp); }
-                        genesis_block.timestamp
-                    }
-                    Err(e) => {
-                        if is_genesis_node {
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            eprintln!("[ERR][GEN] parse_fail err={} fallback_ts={}", e, now);
-                            now
-                        } else {
-                            if is_info() { println!("[INFO][GEN] waiting_for_sync"); }
-                            0 // Sentinel - will be updated
-                        }
-                    }
-                }
+        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
+        let genesis_timestamp = match storage.load_microblock_auto_format(0) {
+            Ok(Some(genesis_block)) => {
+                if is_info() { println!("[INFO][GEN] loaded_ts={}", genesis_block.timestamp); }
+                genesis_block.timestamp
             }
-            _ => {
+            Ok(None) => {
                 if is_genesis_node {
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    if is_info() { println!("[INFO][GEN] new_network ts={}", now); }
+                    if is_info() { println!("[INFO][GEN] no_genesis_block fallback_ts={}", now); }
                     now
                 } else {
-                    if is_info() { println!("[INFO][GEN] waiting_for_genesis"); }
+                    if is_info() { println!("[INFO][GEN] waiting_for_sync"); }
+                    0 // Sentinel - will be updated
+                }
+            }
+            Err(e) => {
+                if is_genesis_node {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    eprintln!("[ERR][GEN] load_fail err={} fallback_ts={}", e, now);
+                    now
+                } else {
+                    if is_info() { println!("[INFO][GEN] waiting_for_sync"); }
                     0 // Sentinel - will be updated
                 }
             }
@@ -5219,32 +5199,29 @@ impl BlockchainNode {
                     let mut macroblocks_processed = 0;
                     
                     // Process rotation blocks (every 30 blocks give +2% to producer)
+                    // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
                     for height in (30..=current_height).step_by(30) {
-                        if let Ok(Some(block_data)) = blockchain.storage.load_microblock(height) {
-                            if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                                // Count blocks by this producer in this rotation
-                                let rotation_start = height.saturating_sub(29);
-                                let mut blocks_by_producer = 0u32;
-                                for h in rotation_start..=height {
-                                    if let Ok(Some(b)) = blockchain.storage.load_microblock(h) {
-                                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&b) {
-                                            if mb.producer == microblock.producer {
-                                                blocks_by_producer += 1;
-                                            }
-                                        }
+                        if let Ok(Some(microblock)) = blockchain.storage.load_microblock_auto_format(height) {
+                            // Count blocks by this producer in this rotation
+                            let rotation_start = height.saturating_sub(29);
+                            let mut blocks_by_producer = 0u32;
+                            for h in rotation_start..=height {
+                                if let Ok(Some(mb)) = blockchain.storage.load_microblock_auto_format(h) {
+                                    if mb.producer == microblock.producer {
+                                        blocks_by_producer += 1;
                                     }
                                 }
-                                
-                                let block_data = BlockData {
-                                    height,
-                                    producer: microblock.producer.clone(),
-                                    timestamp: microblock.timestamp,
-                                    is_valid: true,
-                                    blocks_in_rotation: blocks_by_producer,
-                                };
-                                rep_state.process_block(&block_data);
-                                blocks_processed += 1;
                             }
+                            
+                            let block_data = BlockData {
+                                height,
+                                producer: microblock.producer.clone(),
+                                timestamp: microblock.timestamp,
+                                is_valid: true,
+                                blocks_in_rotation: blocks_by_producer,
+                            };
+                            rep_state.process_block(&block_data);
+                            blocks_processed += 1;
                         }
                     }
                     
@@ -6078,10 +6055,15 @@ impl BlockchainNode {
                 let current_height = *height.read().await;
                 
                 // Extract producer from block data (if available)
-                let block_producer: Option<String> = if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&received_block.data) {
-                    Some(microblock.producer.clone())
-                } else {
-                    None
+                // v3.15 FIX: Decompress before deserializing - data may be Zstd-compressed
+                let block_producer: Option<String> = {
+                    let decompressed = zstd::decode_all(&received_block.data[..])
+                        .unwrap_or_else(|_| received_block.data.clone());
+                    if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&decompressed) {
+                        Some(microblock.producer.clone())
+                    } else {
+                        None
+                    }
                 };
                 
                 if let Some(ref producer) = block_producer {
@@ -7013,18 +6995,17 @@ impl BlockchainNode {
                     
                     // CRITICAL v2.32: If we just received Genesis block, update GLOBAL_GENESIS_TIMESTAMP!
                     // This ensures non-genesis nodes get the correct timestamp from network
+                    // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
                     if received_block.height == 0 && received_block.block_type == "micro" {
-                        if let Ok(Some(genesis_data)) = storage.load_microblock(0) {
-                            if let Ok(genesis_block) = bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
-                                let current_ts = crate::GLOBAL_GENESIS_TIMESTAMP
-                                    .load(std::sync::atomic::Ordering::Relaxed);
-                                if current_ts == 0 || current_ts != genesis_block.timestamp {
-                                    crate::GLOBAL_GENESIS_TIMESTAMP.store(
-                                        genesis_block.timestamp,
-                                        std::sync::atomic::Ordering::Relaxed
-                                    );
-                                    if is_info() { println!("[INFO][GENESIS] synced_timestamp ts={}", genesis_block.timestamp); }
-                                }
+                        if let Ok(Some(genesis_block)) = storage.load_microblock_auto_format(0) {
+                            let current_ts = crate::GLOBAL_GENESIS_TIMESTAMP
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if current_ts == 0 || current_ts != genesis_block.timestamp {
+                                crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                                    genesis_block.timestamp,
+                                    std::sync::atomic::Ordering::Relaxed
+                                );
+                                if is_info() { println!("[INFO][GENESIS] synced_timestamp ts={}", genesis_block.timestamp); }
                             }
                         }
                     }
@@ -7096,14 +7077,13 @@ impl BlockchainNode {
                         if received_block.block_type == "micro" {
                             if let Some(ref producer_id) = block_producer_id {
                                 // Count blocks by this producer in this rotation
+                                // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
                                 let rotation_start = received_block.height.saturating_sub(29);
                                 let mut blocks_by_producer = 0u32;
                                 for h in rotation_start..=received_block.height {
-                                    if let Ok(Some(b)) = storage.load_microblock(h) {
-                                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&b) {
-                                            if mb.producer == *producer_id {
-                                                blocks_by_producer += 1;
-                                            }
+                                    if let Ok(Some(mb)) = storage.load_microblock_auto_format(h) {
+                                        if mb.producer == *producer_id {
+                                            blocks_by_producer += 1;
                                         }
                                     }
                                 }
@@ -7183,13 +7163,12 @@ impl BlockchainNode {
                             // CRITICAL FIX: Synchronous PoH sync to prevent race conditions
                             // Producer must wait for PoH sync before creating next block
                             // This prevents PoH counter regression at rotation boundaries
-                            if let Ok(Some(block_data)) = storage.load_microblock(received_block.height) {
-                                if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                                    if !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
-                                        poh.sync_from_checkpoint(&microblock.poh_hash, microblock.poh_count).await;
-                                        if is_debug() { println!("[DBG][POH] synced h={} count={}", 
-                                                microblock.height, microblock.poh_count); }
-                                    }
+                            // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
+                            if let Ok(Some(microblock)) = storage.load_microblock_auto_format(received_block.height) {
+                                if !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
+                                    poh.sync_from_checkpoint(&microblock.poh_hash, microblock.poh_count).await;
+                                    if is_debug() { println!("[DBG][POH] synced h={} count={}", 
+                                            microblock.height, microblock.poh_count); }
                                 }
                             }
                         }
@@ -9916,8 +9895,9 @@ impl BlockchainNode {
                         genesis_wait_attempts += 1;
                         
                         // Check if Genesis block arrived
-                        match storage.load_microblock(0) {
-                            Ok(Some(genesis_data)) => {
+                        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
+                        match storage.load_microblock_auto_format(0) {
+                            Ok(Some(genesis_block)) => {
                                 println!("[INFO][GEN] Genesis block received after {} attempts", 
                                         genesis_wait_attempts);
                                 // Update height from storage
@@ -9931,28 +9911,24 @@ impl BlockchainNode {
                                 // Without this, nodes 002-005 use their LOCAL start time instead of 
                                 // the actual Genesis timestamp from node 001, causing timestamp validation
                                 // to reject valid blocks as "too old" (delta=-85s)
-                                if let Ok(genesis_block) = bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
-                                    let old_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
-                                    crate::GLOBAL_GENESIS_TIMESTAMP.store(
-                                        genesis_block.timestamp,
-                                        std::sync::atomic::Ordering::Relaxed
-                                    );
-                                    if is_info() { println!("[INFO][GEN] genesis_ts_synced old={} new={}", old_ts, genesis_block.timestamp); }
-                                    
-                                    // CRITICAL FIX v3.15: Initialize LAST_BLOCK_PRODUCED_TIME to NOW
-                                    // This ensures delay calculation starts fresh from Genesis reception
-                                    // Without this, delay = current_time - genesis_ts could be large
-                                    // if nodes waited a long time before Genesis was created
-                                    let now = get_timestamp_safe();
-                                    LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
-                                    LAST_BLOCK_PRODUCED_HEIGHT.store(0, std::sync::atomic::Ordering::Relaxed);
-                                    if is_info() { println!("[INFO][GEN] last_block_time_init ts={} height=0", now); }
-                                    
-                                    // Also update reward manager with correct genesis timestamp
-                                    crate::update_global_pricing_state(0.0, 5, genesis_block.timestamp);
-                                } else {
-                                    println!("[WARN][GEN] Failed to deserialize Genesis block for timestamp sync");
-                                }
+                                let old_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+                                crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                                    genesis_block.timestamp,
+                                    std::sync::atomic::Ordering::Relaxed
+                                );
+                                if is_info() { println!("[INFO][GEN] genesis_ts_synced old={} new={}", old_ts, genesis_block.timestamp); }
+                                
+                                // CRITICAL FIX v3.15: Initialize LAST_BLOCK_PRODUCED_TIME to NOW
+                                // This ensures delay calculation starts fresh from Genesis reception
+                                // Without this, delay = current_time - genesis_ts could be large
+                                // if nodes waited a long time before Genesis was created
+                                let now = get_timestamp_safe();
+                                LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                                LAST_BLOCK_PRODUCED_HEIGHT.store(0, std::sync::atomic::Ordering::Relaxed);
+                                if is_info() { println!("[INFO][GEN] last_block_time_init ts={} height=0", now); }
+                                
+                                // Also update reward manager with correct genesis timestamp
+                                crate::update_global_pricing_state(0.0, 5, genesis_block.timestamp);
                                 
                                 // CRITICAL FIX: Broadcast certificate AFTER Genesis reception
                                 // This ensures ALL Genesis nodes have certificates for verification
@@ -12983,28 +12959,24 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             .load(std::sync::atomic::Ordering::Relaxed);
                         
                         // If not yet set, try to read from storage (one-time init)
+                        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
                         let genesis_timestamp = if genesis_timestamp == 0 {
-                            match storage.load_microblock(0) {
-                                Ok(Some(genesis_data)) => {
-                                    match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
-                                        Ok(genesis_block) => {
-                                            // Update global timestamp
-                                            crate::GLOBAL_GENESIS_TIMESTAMP.store(
-                                                genesis_block.timestamp,
-                                                std::sync::atomic::Ordering::Relaxed
-                                            );
-                                            println!("[TIMESTAMP] ✅ Loaded Genesis timestamp: {}", genesis_block.timestamp);
-                                            genesis_block.timestamp
-                                        }
-                                        Err(_) => {
-                                            println!("[TIMESTAMP] 🚨 CRITICAL: Can't parse Genesis block!");
-                                            // Return 0 - block production should not proceed without valid Genesis
-                                            0
-                                        }
-                                    }
+                            match storage.load_microblock_auto_format(0) {
+                                Ok(Some(genesis_block)) => {
+                                    // Update global timestamp
+                                    crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                                        genesis_block.timestamp,
+                                        std::sync::atomic::Ordering::Relaxed
+                                    );
+                                    if is_info() { println!("[INFO][GEN] loaded_ts={}", genesis_block.timestamp); }
+                                    genesis_block.timestamp
                                 }
-                                _ => {
-                                    println!("[TIMESTAMP] 🚨 CRITICAL: No Genesis block found!");
+                                Ok(None) => {
+                                    eprintln!("[ERR][GEN] no_genesis_block");
+                                    0
+                                }
+                                Err(e) => {
+                                    eprintln!("[ERR][GEN] load_genesis_fail err={}", e);
                                     0
                                 }
                             }
@@ -13712,14 +13684,13 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                         let producer_id = microblock.producer.clone();
                                         
                                         // Count OWN blocks in this rotation
+                                        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
                                         let rotation_start = height_for_storage.saturating_sub(29);
                                         let mut blocks_by_producer = 0u32;
                                         for h in rotation_start..=height_for_storage {
-                                            if let Ok(Some(b)) = storage_clone.load_microblock(h) {
-                                                if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&b) {
-                                                    if mb.producer == producer_id {
-                                                        blocks_by_producer += 1;
-                                                    }
+                                            if let Ok(Some(mb)) = storage_clone.load_microblock_auto_format(h) {
+                                                if mb.producer == producer_id {
+                                                    blocks_by_producer += 1;
                                                 }
                                             }
                                         }
