@@ -7125,16 +7125,24 @@ impl BlockchainNode {
                         if received_block.block_type == "micro" {
                             if let Some(ref producer_id) = block_producer_id {
                                 // Count blocks by this producer in this rotation
-                                // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
+                                // v3.21 FIX: Use spawn_blocking to avoid blocking Tokio runtime
+                                // Loading 30 blocks synchronously would block for ~2 seconds!
                                 let rotation_start = received_block.height.saturating_sub(29);
-                                let mut blocks_by_producer = 0u32;
-                                for h in rotation_start..=received_block.height {
-                                    if let Ok(Some(mb)) = storage.load_microblock_auto_format(h) {
-                                        if mb.producer == *producer_id {
-                                            blocks_by_producer += 1;
+                                let rotation_end = received_block.height;
+                                let producer_to_count = producer_id.clone();
+                                let storage_for_count = storage.clone();
+                                
+                                let blocks_by_producer = tokio::task::spawn_blocking(move || {
+                                    let mut count = 0u32;
+                                    for h in rotation_start..=rotation_end {
+                                        if let Ok(Some(mb)) = storage_for_count.load_microblock_auto_format(h) {
+                                            if mb.producer == producer_to_count {
+                                                count += 1;
+                                            }
                                         }
                                     }
-                                }
+                                    count
+                                }).await.unwrap_or(0);
                                 
                                 // Create BlockData for deterministic processing
                                 let block_data = BlockData {
@@ -8497,6 +8505,8 @@ impl BlockchainNode {
                     };
                     
                     // STEP 2: Check Genesis block exists
+                    // v3.21 FIX: Use lightweight check - just verify data exists, don't deserialize
+                    // load_microblock returns raw bytes without heavy reconstruction (~1ms vs ~70-100ms)
                     let has_genesis = self.storage.load_microblock(0)
                         .map(|opt| opt.is_some())
                         .unwrap_or(false);
@@ -9897,7 +9907,7 @@ impl BlockchainNode {
                                                                 // Additional delay to ensure peers are ready to receive
                                                                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                                                                 
-                                                                println!("[GENESIS] 🔐 Broadcasting certificate AFTER Genesis creation: {}", cert.serial_number);
+                                                                println!("[WARN][GEN] 🔐 Broadcasting certificate AFTER Genesis creation: {}", cert.serial_number);
                                                                 if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
                                                                     println!("[WARN][GEN] Certificate broadcast failed: {}", e);
                                                                 } else {
@@ -9947,8 +9957,16 @@ impl BlockchainNode {
                         genesis_wait_attempts += 1;
                         
                         // Check if Genesis block arrived
-                        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
-                        match storage.load_microblock_auto_format(0) {
+                        // v3.21 FIX: Use spawn_blocking to avoid blocking Tokio runtime!
+                        // load_microblock_auto_format is a heavy synchronous operation (~70-100ms)
+                        // that would block the async executor and starve other tasks (like block processing)
+                        // This was causing Genesis to stay in pending queue for 60s (TTL) before being saved
+                        let storage_for_check = storage.clone();
+                        let genesis_check = tokio::task::spawn_blocking(move || {
+                            storage_for_check.load_microblock_auto_format(0)
+                        }).await.unwrap_or(Ok(None));
+                        
+                        match genesis_check {
                             Ok(Some(genesis_block)) => {
                                 println!("[INFO][GEN] Genesis block received after {} attempts", 
                                         genesis_wait_attempts);
@@ -13731,32 +13749,40 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         if height_for_storage % 30 == 0 && height_for_storage > 0 {
                             if let Some(ref p2p) = p2p_for_reward {
                                 if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                                    let mut rep_state = rep_arc.write();
-                                        use qnet_consensus::deterministic_reputation::BlockData;
-                                        let producer_id = microblock.producer.clone();
-                                        
-                                        // Count OWN blocks in this rotation
-                                        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
-                                        let rotation_start = height_for_storage.saturating_sub(29);
-                                        let mut blocks_by_producer = 0u32;
-                                        for h in rotation_start..=height_for_storage {
-                                            if let Ok(Some(mb)) = storage_clone.load_microblock_auto_format(h) {
-                                                if mb.producer == producer_id {
-                                                    blocks_by_producer += 1;
+                                    use qnet_consensus::deterministic_reputation::BlockData;
+                                    let producer_id = microblock.producer.clone();
+                                    
+                                    // v3.21 FIX: Count blocks BEFORE acquiring write lock!
+                                    // Loading 30 blocks is ~3 seconds - cannot block inside write lock
+                                    let rotation_start = height_for_storage.saturating_sub(29);
+                                    let rotation_end = height_for_storage;
+                                    let storage_for_count = storage_clone.clone();
+                                    let producer_to_count = producer_id.clone();
+                                    
+                                    let blocks_by_producer = tokio::task::spawn_blocking(move || {
+                                        let mut count = 0u32;
+                                        for h in rotation_start..=rotation_end {
+                                            if let Ok(Some(mb)) = storage_for_count.load_microblock_auto_format(h) {
+                                                if mb.producer == producer_to_count {
+                                                    count += 1;
                                                 }
                                             }
                                         }
-                                        
-                                        let block_data = BlockData {
-                                            height: height_for_storage,
-                                            producer: producer_id.clone(),
-                                            timestamp: std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs(),
-                                            is_valid: true,
-                                            blocks_in_rotation: blocks_by_producer,
-                                        };
+                                        count
+                                    }).await.unwrap_or(0);
+                                    
+                                    // NOW acquire write lock - fast operation only
+                                    let mut rep_state = rep_arc.write();
+                                    let block_data = BlockData {
+                                        height: height_for_storage,
+                                        producer: producer_id.clone(),
+                                        timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        is_valid: true,
+                                        blocks_in_rotation: blocks_by_producer,
+                                    };
                                     rep_state.process_block(&block_data);
 
                                     let new_rep = rep_state.get_reputation(&producer_id,
@@ -13960,28 +13986,36 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     if microblock.height % 30 == 0 && microblock.height > 0 {
                         if let Some(ref p2p) = unified_p2p {
                             if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                                let mut rep_state = rep_arc.write();
-                                    use qnet_consensus::deterministic_reputation::BlockData;
-                                    
-                                    // Count OWN blocks in this rotation
-                                    let rotation_start = microblock.height.saturating_sub(29);
-                                    let mut blocks_by_producer = 0u32;
-                                    for h in rotation_start..=microblock.height {
-                                        // v3.20: Use load_microblock_auto_format for EfficientMicroBlock support
-                                        if let Ok(Some(mb)) = storage.load_microblock_auto_format(h) {
-                                            if mb.producer == microblock.producer {
-                                                blocks_by_producer += 1;
+                                use qnet_consensus::deterministic_reputation::BlockData;
+                                
+                                // v3.21 FIX: Count blocks BEFORE acquiring write lock!
+                                // Loading 30 blocks is ~3 seconds - cannot block inside write lock
+                                let rotation_start = microblock.height.saturating_sub(29);
+                                let rotation_end = microblock.height;
+                                let storage_for_count = storage.clone();
+                                let producer_to_count = microblock.producer.clone();
+                                
+                                let blocks_by_producer = tokio::task::spawn_blocking(move || {
+                                    let mut count = 0u32;
+                                    for h in rotation_start..=rotation_end {
+                                        if let Ok(Some(mb)) = storage_for_count.load_microblock_auto_format(h) {
+                                            if mb.producer == producer_to_count {
+                                                count += 1;
                                             }
                                         }
                                     }
-                                    
-                                    let block_data = BlockData {
-                                        height: microblock.height,
-                                        producer: microblock.producer.clone(),
-                                        timestamp: microblock.timestamp,
-                                        is_valid: true,
-                                        blocks_in_rotation: blocks_by_producer,
-                                    };
+                                    count
+                                }).await.unwrap_or(0);
+                                
+                                // NOW acquire write lock - fast operation only
+                                let mut rep_state = rep_arc.write();
+                                let block_data = BlockData {
+                                    height: microblock.height,
+                                    producer: microblock.producer.clone(),
+                                    timestamp: microblock.timestamp,
+                                    is_valid: true,
+                                    blocks_in_rotation: blocks_by_producer,
+                                };
                                 rep_state.process_block(&block_data);
 
                                 let new_rep = rep_state.get_reputation(&microblock.producer, microblock.timestamp);
@@ -20587,13 +20621,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let mut microblock_hashes = Vec::new();
         let mut state_accumulator = [0u8; 32];
         
-        // ═══════════════════════════════════════════════════════════════════════════
-        // QUANTUM RANDOMNESS BEACON (QRB) v3.0 - RANDAO-style accumulation
-        // XOR all QRB outputs from epoch's microblocks for unpredictable randomness
-        // ═══════════════════════════════════════════════════════════════════════════
-        let mut randomness_accumulator = [0u8; 32];
-        let mut vrf_contributions_count: u64 = 0;
-        
         for height in start_height..=end_height {
             match storage.load_microblock(height) {
                 Ok(Some(microblock_data)) => {
@@ -20611,16 +20638,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         state_accumulator[i] ^= byte;
                     }
                     
-                    // QRB: Accumulate randomness outputs via XOR (RANDAO-style)
-                    // v3.20: Use load_microblock_auto_format for unified format handling
-                    if let Ok(Some(microblock)) = storage.load_microblock_auto_format(height) {
-                        if let Some(vrf_output) = microblock.vrf_output {
-                            for (i, &byte) in vrf_output.iter().enumerate() {
-                                randomness_accumulator[i] ^= byte;
-                            }
-                            vrf_contributions_count += 1;
-                        }
-                    }
+                    // VRF accumulation moved to spawn_blocking after loop (v3.21)
                 },
                 _ => {
                     // Should not happen after waiting, but handle gracefully
@@ -20630,12 +20648,37 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         }
         
+        // v3.21 FIX: QRB VRF accumulation in spawn_blocking to avoid 100s block!
+        // Loading 1000 blocks with load_microblock_auto_format would take ~100 seconds
+        // This is done in parallel on blocking thread pool
+        let storage_for_vrf = storage.clone();
+        let vrf_start = start_height;
+        let vrf_end = end_height;
+        
+        let (mut randomness_accumulator, vrf_contributions_count) = tokio::task::spawn_blocking(move || {
+            let mut accumulator = [0u8; 32];
+            let mut count: u64 = 0;
+            
+            for height in vrf_start..=vrf_end {
+                if let Ok(Some(microblock)) = storage_for_vrf.load_microblock_auto_format(height) {
+                    if let Some(vrf_output) = microblock.vrf_output {
+                        for (i, &byte) in vrf_output.iter().enumerate() {
+                            accumulator[i] ^= byte;
+                        }
+                        count += 1;
+                    }
+                }
+            }
+            
+            (accumulator, count)
+        }).await.unwrap_or(([0u8; 32], 0));
+
         // Log QRB accumulation result
         if vrf_contributions_count > 0 {
-            println!("[QRB] 🎲 Quantum Randomness Beacon: {} VRF contributions accumulated", vrf_contributions_count);
-            println!("[QRB] 🔐 Beacon hash: {}...", hex::encode(&randomness_accumulator[0..8]));
+            println!("[INFO][QRB] Quantum Randomness Beacon: {} VRF contributions accumulated", vrf_contributions_count);
+            println!("[INFO][QRB] Beacon hash: {}...", hex::encode(&randomness_accumulator[0..8]));
         } else {
-            println!("[QRB] ⚠️ No VRF contributions in epoch - beacon will use fallback");
+            println!("[INFO][QRB] No VRF contributions in epoch - beacon will use fallback");
             // Fallback: hash of state accumulator for determinism
             randomness_accumulator = state_accumulator;
         }
