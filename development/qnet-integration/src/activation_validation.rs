@@ -1501,21 +1501,10 @@ impl BlockchainActivationRegistry {
             
             // Iterate through recent blocks and extract activation transactions
             for block_height in from_height..=snapshot_height {
-                if let Ok(Some(block)) = storage.load_microblock(block_height) {
-                    // Try to parse as MicroBlock (full transactions)
-                    let transactions = if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block) {
-                        microblock.transactions
-                    } else if let Ok(efficient_block) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&block) {
-                        // EfficientMicroBlock has only hashes, need to fetch transactions from pool
-                        let mut txs = Vec::new();
-                        for tx_hash in &efficient_block.transaction_hashes {
-                            // Try to get transaction from pool
-                            if let Some(tx) = storage.transaction_pool.get_transaction(tx_hash) {
-                                txs.push(tx);
-                            }
-                        }
-                        txs
-                    } else {
+                // v3.20: Use load_microblock_auto_format for unified format handling
+                if let Ok(Some(microblock)) = storage.load_microblock_auto_format(block_height) {
+                    let transactions = microblock.transactions;
+                    if transactions.is_empty() {
                         // Can't parse block, skip
                         continue;
                     };

@@ -9771,10 +9771,9 @@ async fn handle_stats(
                         let block_height = height.saturating_sub(i);
                         if block_height == 0 { break; }
                         
-                        if let Ok(Some(block)) = storage.load_microblock(block_height) {
-                            if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block) {
-                                total_txs += microblock.transactions.len() as u64;
-                            }
+                        // v3.20: Use load_microblock_auto_format for EfficientMicroBlock support
+                        if let Ok(Some(microblock)) = storage.load_microblock_auto_format(block_height) {
+                            total_txs += microblock.transactions.len() as u64;
                         }
                     }
                     // Average TPS over last 10 seconds (10 blocks)

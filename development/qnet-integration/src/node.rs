@@ -13967,11 +13967,10 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                     let rotation_start = microblock.height.saturating_sub(29);
                                     let mut blocks_by_producer = 0u32;
                                     for h in rotation_start..=microblock.height {
-                                        if let Ok(Some(b)) = storage.load_microblock(h) {
-                                            if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&b) {
-                                                if mb.producer == microblock.producer {
-                                                    blocks_by_producer += 1;
-                                                }
+                                        // v3.20: Use load_microblock_auto_format for EfficientMicroBlock support
+                                        if let Ok(Some(mb)) = storage.load_microblock_auto_format(h) {
+                                            if mb.producer == microblock.producer {
+                                                blocks_by_producer += 1;
                                             }
                                         }
                                     }
@@ -18206,18 +18205,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let genesis_timestamp = if genesis_ts > 0 {
             genesis_ts
         } else {
-            match storage.load_microblock(0) {
-                Ok(Some(genesis_data)) => {
-                    match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
-                        Ok(genesis_block) => {
-                            crate::GLOBAL_GENESIS_TIMESTAMP.store(genesis_block.timestamp, std::sync::atomic::Ordering::Relaxed);
-                            genesis_block.timestamp
-                        }
-                        Err(_) => {
-                            println!("[ERR][MB] No valid Genesis - skipping emergency macroblock");
-                            return Ok(());
-                        }
-                    }
+            // v3.20: Use load_microblock_auto_format for EfficientMicroBlock support
+            match storage.load_microblock_auto_format(0) {
+                Ok(Some(genesis_block)) => {
+                    crate::GLOBAL_GENESIS_TIMESTAMP.store(genesis_block.timestamp, std::sync::atomic::Ordering::Relaxed);
+                    genesis_block.timestamp
                 }
                 _ => {
                     println!("[ERR][MB] No Genesis block - skipping emergency macroblock");
@@ -19956,66 +19948,59 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         entropy_block_height: u64,
         current_height: u64,
     ) -> [u8; 32] {
-        match storage.load_microblock(entropy_block_height) {
-            Ok(Some(block_data)) => {
+        // v3.20: Use load_microblock_auto_format for EfficientMicroBlock support
+        match storage.load_microblock_auto_format(entropy_block_height) {
+            Ok(Some(microblock)) => {
                 // ═══════════════════════════════════════════════════════════════════
                 // PRODUCTION FIX: Verify block before using for entropy
                 // This prevents using potentially forked/invalid blocks
                 // ═══════════════════════════════════════════════════════════════════
                 
-                // Deserialize to verify structure
-                match bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                    Ok(microblock) => {
-                        // VERIFY 1: Block height matches expected
-                        if microblock.height != entropy_block_height {
-                            println!("[ERR][FINAL] Block height mismatch: expected {}, got {}", 
-                                     entropy_block_height, microblock.height);
-                            return [0u8; 32];
-                        }
-                        
-                        // VERIFY 2: Block has valid producer (not empty, not fallback)
-                        if microblock.producer.is_empty() || 
-                           microblock.producer.contains("_legacy_") ||
-                           microblock.producer == "unknown" {
-                            println!("[ERR][FINAL] Invalid producer in entropy block: {}", 
-                                     microblock.producer);
-                            return [0u8; 32];
-                        }
-                        
-                        // VERIFY 3: Block has signature (must be signed)
-                        if microblock.vrf_proof.is_none() && entropy_block_height > 0 {
-                            println!("[WARN][FINAL] Block #{} has no signature - not using for entropy", 
-                                     entropy_block_height);
-                            // Allow but log - Genesis block may not have vrf_proof
-                        }
-                        
-                        // Calculate deterministic hash from FULL block data
-                        // Using raw bytes ensures identical hash across all nodes with same block
-                        use sha3::{Sha3_256, Digest};
-                        let mut hasher = Sha3_256::new();
-                        hasher.update(&block_data);
-                        let result = hasher.finalize();
-                        let mut hash = [0u8; 32];
-                        hash.copy_from_slice(&result);
-                        
-                        // DEBUG: Log entropy source at rotation boundaries for fork detection
-                        if current_height > 30 && (current_height - 1) % 30 == 0 {
-                            println!("[FINALITY] 🔐 Entropy from block #{}: producer={}, hash={}", 
-                                     entropy_block_height, 
-                                     microblock.producer,
-                                     hex::encode(&hash[..8]));
-                        }
-                        
-                        hash
-                    },
-                    Err(e) => {
-                        println!("[ERR][FINAL] Failed to deserialize entropy block #{}: {}", 
-                                 entropy_block_height, e);
-                        [0u8; 32]
-                    }
+                // VERIFY 1: Block height matches expected
+                if microblock.height != entropy_block_height {
+                    println!("[ERR][FINAL] Block height mismatch: expected {}, got {}", 
+                             entropy_block_height, microblock.height);
+                    return [0u8; 32];
                 }
+                
+                // VERIFY 2: Block has valid producer (not empty, not fallback)
+                if microblock.producer.is_empty() || 
+                   microblock.producer.contains("_legacy_") ||
+                   microblock.producer == "unknown" {
+                    println!("[ERR][FINAL] Invalid producer in entropy block: {}", 
+                             microblock.producer);
+                    return [0u8; 32];
+                }
+                
+                // VERIFY 3: Block has signature (must be signed)
+                if microblock.vrf_proof.is_none() && entropy_block_height > 0 {
+                    println!("[WARN][FINAL] Block #{} has no signature - not using for entropy", 
+                             entropy_block_height);
+                    // Allow but log - Genesis block may not have vrf_proof
+                }
+                
+                // v3.20: Use merkle_root for deterministic entropy (format-independent)
+                // Both EfficientMicroBlock and raw MicroBlock have same merkle_root
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(&microblock.merkle_root);
+                hasher.update(&microblock.previous_hash);
+                hasher.update(microblock.height.to_le_bytes());
+                let result = hasher.finalize();
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&result);
+                
+                // DEBUG: Log entropy source at rotation boundaries for fork detection
+                if current_height > 30 && (current_height - 1) % 30 == 0 {
+                    println!("[FINALITY] Entropy from block #{}: producer={}, hash={}", 
+                             entropy_block_height, 
+                             microblock.producer,
+                             hex::encode(&hash[..8]));
+                }
+                
+                hash
             },
-            _ => {
+            Ok(None) | Err(_) => {
                 // Node not synchronized - cannot participate in production
                 println!("[WARN][FINAL] Cannot get finality block #{} for current height {}", 
                          entropy_block_height, current_height);
@@ -20627,16 +20612,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                     
                     // QRB: Accumulate randomness outputs via XOR (RANDAO-style)
-                    // Try to parse microblock to get QRB output
-                    if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&microblock_data) {
+                    // v3.20: Use load_microblock_auto_format for unified format handling
+                    if let Ok(Some(microblock)) = storage.load_microblock_auto_format(height) {
                         if let Some(vrf_output) = microblock.vrf_output {
-                            for (i, &byte) in vrf_output.iter().enumerate() {
-                                randomness_accumulator[i] ^= byte;
-                            }
-                            vrf_contributions_count += 1;
-                        }
-                    } else if let Ok(efficient) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&microblock_data) {
-                        if let Some(vrf_output) = efficient.vrf_output {
                             for (i, &byte) in vrf_output.iter().enumerate() {
                                 randomness_accumulator[i] ^= byte;
                             }
@@ -20680,15 +20658,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let genesis_timestamp = if genesis_ts > 0 {
             genesis_ts
         } else {
-            match storage.load_microblock(0) {
-                Ok(Some(data)) => {
-                    match bincode::deserialize::<qnet_state::MicroBlock>(&data) {
-                        Ok(gb) => {
-                            crate::GLOBAL_GENESIS_TIMESTAMP.store(gb.timestamp, std::sync::atomic::Ordering::Relaxed);
-                            gb.timestamp
-                        }
-                        Err(_) => 1704067200 // Emergency fallback
-                    }
+            // v3.20: Use load_microblock_auto_format for EfficientMicroBlock support
+            match storage.load_microblock_auto_format(0) {
+                Ok(Some(gb)) => {
+                    crate::GLOBAL_GENESIS_TIMESTAMP.store(gb.timestamp, std::sync::atomic::Ordering::Relaxed);
+                    gb.timestamp
                 }
                 _ => 1704067200 // Emergency fallback
             }
@@ -20700,18 +20674,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Capture PoH state from the LAST MICROBLOCK for deterministic consensus
         // CRITICAL: Use blockchain PoH, not local generator (same as microblock producer selection)
         // All nodes must agree on the same PoH state for Byzantine consensus
-        let (poh_hash, poh_count) = if let Ok(Some(last_micro_data)) = storage.load_microblock(end_height) {
-            match bincode::deserialize::<qnet_state::MicroBlock>(&last_micro_data) {
-                Ok(last_micro) => {
-                    println!("[INFO][MB] poh_from_last h={} count={}", 
-                            end_height, last_micro.poh_count);
-                    (last_micro.poh_hash, last_micro.poh_count)
-                }
-                Err(e) => {
-                    println!("[WARN][MB] Failed to deserialize last microblock: {}", e);
-                    (vec![0u8; 64], 0u64)
-                }
-            }
+        // v3.20: Use load_microblock_auto_format for EfficientMicroBlock support
+        let (poh_hash, poh_count) = if let Ok(Some(last_micro)) = storage.load_microblock_auto_format(end_height) {
+            println!("[INFO][MB] poh_from_last h={} count={}", 
+                    end_height, last_micro.poh_count);
+            (last_micro.poh_hash, last_micro.poh_count)
         } else {
             println!("[WARN][MB] Last microblock #{} not found, using zero PoH", end_height);
             (vec![0u8; 64], 0u64)
