@@ -6747,8 +6747,9 @@ impl BlockchainNode {
                                 }
                                 
                                 // Apply transaction to state (updates balances, nonces, etc)
-                                // WRITE lock is now taken ONCE before the loop (v2.76.1)
-                                if let Err(e) = state_guard.apply_transaction(tx) {
+                                // v3.22: Use lazy Merkle update - finalize once after all TX
+                                // Performance: O(1) per TX instead of O(n) per TX
+                                if let Err(e) = state_guard.apply_transaction_lazy(tx) {
                                     // Don't fail block processing for individual tx failures
                                     // Some transactions may fail validation (insufficient balance, etc)
                                     println!("[WARN][STATE] tx_apply_failed hash={} err={}", tx.hash, e);
@@ -6839,7 +6840,7 @@ impl BlockchainNode {
                                 };
                                 
                                 if !producer_wallet.is_empty() {
-                                    // Credit fees directly to producer (like Ethereum coinbase)
+                                    // Credit fees directly to producer
                                     if let Err(e) = state_guard.credit_producer_fees(&producer_wallet, microblock.fees_collected) {
                                         eprintln!("[ERR][FEES] credit_failed producer={} wallet={} fees={} err={}", 
                                                  microblock.producer, producer_wallet, microblock.fees_collected, e);
@@ -6850,6 +6851,18 @@ impl BlockchainNode {
                                                  &producer_wallet[..16.min(producer_wallet.len())],
                                                  microblock.fees_collected, microblock.height);
                                     }
+                                }
+                            }
+                            
+                            // v3.22: CRITICAL - Finalize Merkle tree ONCE after all TX applied
+                            // This is the key optimization: O(n) total instead of O(n²)
+                            if microblock.transactions.len() > 0 {
+                                let state_root = state_guard.finalize_merkle();
+                                if is_debug() && microblock.transactions.len() > 10 {
+                                    println!("[DBG][MERKLE] finalized h={} tx={} root={}...", 
+                                             microblock.height, 
+                                             microblock.transactions.len(),
+                                             hex::encode(&state_root[..8]));
                                 }
                             }
                             
@@ -13645,12 +13658,17 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // CRITICAL FIX v2.76: Apply transactions to state when PRODUCER creates block!
                         // Previously only validators applied TX - producer's own blocks didn't update state!
                         // This is WHY balances were always 0 - producer created blocks but didn't apply them!
+                        // v3.22: Use lazy Merkle updates for O(n) instead of O(n²)
                         {
                             let mut state_guard = state.write().await;
                             for tx in &txs {
-                                if let Err(e) = state_guard.apply_transaction(tx) {
+                                if let Err(e) = state_guard.apply_transaction_lazy(tx) {
                                     println!("[WARN][STATE] producer_tx_apply_failed hash={} err={}", tx.hash, e);
                                 }
+                            }
+                            // v3.22: Finalize Merkle after all TX applied
+                            if !txs.is_empty() {
+                                state_guard.finalize_merkle();
                             }
                         }
                         

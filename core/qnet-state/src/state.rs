@@ -25,14 +25,24 @@ const HASH_SIZE: usize = 32;
 const TREE_DEPTH: usize = 160; // Use 160-bit depth (enough for billions of accounts)
 
 /// State Merkle Tree for account proofs
-/// Optimized for QNet's account structure
+/// Optimized for QNet's account structure with batch operations for 100K+ TPS
+/// 
+/// # Performance Features
+/// - Lazy root computation (dirty flag)
+/// - Batch insert for block processing
+/// - O(1) insert, O(n) finalize once per block
 pub struct StateMerkleTree {
-    /// Root hash
+    /// Root hash (may be stale if dirty=true)
     root: [u8; HASH_SIZE],
     /// Stored account hashes (address_hash -> account_data_hash)
     leaves: HashMap<[u8; HASH_SIZE], [u8; HASH_SIZE]>,
     /// Pre-computed default hashes for each level
     default_hashes: Vec<[u8; HASH_SIZE]>,
+    /// v3.22: Dirty flag for lazy root computation
+    /// When true, root needs recomputation before use
+    dirty: bool,
+    /// v3.22: Pending updates count for logging
+    pending_updates: usize,
 }
 
 impl StateMerkleTree {
@@ -58,28 +68,100 @@ impl StateMerkleTree {
             root: default_hashes[TREE_DEPTH],
             leaves: HashMap::new(),
             default_hashes,
+            dirty: false,
+            pending_updates: 0,
         }
     }
     
-    /// Insert or update account
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v3.22: BATCH/LAZY OPERATIONS FOR 100K+ TPS
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Insert or update account WITH immediate root recomputation
+    /// Use for single updates outside block processing
+    /// For block processing, use insert_lazy() + finalize()
     pub fn insert(&mut self, address: &str, account: &Account) -> [u8; HASH_SIZE] {
         let addr_hash = Self::hash_address(address);
         let account_hash = Self::hash_account(account);
         self.leaves.insert(addr_hash, account_hash);
         self.recompute_root();
+        self.dirty = false;
+        self.pending_updates = 0;
         self.root
+    }
+    
+    /// v3.22: Insert or update account WITHOUT root recomputation (lazy)
+    /// Use during block processing - call finalize() once after all TX applied
+    /// O(1) operation - no tree traversal
+    pub fn insert_lazy(&mut self, address: &str, account: &Account) {
+        let addr_hash = Self::hash_address(address);
+        let account_hash = Self::hash_account(account);
+        self.leaves.insert(addr_hash, account_hash);
+        self.dirty = true;
+        self.pending_updates += 1;
+    }
+    
+    /// v3.22: Batch insert multiple accounts WITHOUT root recomputation
+    /// Use for Genesis block or large batch operations
+    /// O(m) where m = number of updates, no tree traversal
+    pub fn insert_batch(&mut self, updates: &[(String, Account)]) {
+        for (address, account) in updates {
+            let addr_hash = Self::hash_address(address);
+            let account_hash = Self::hash_account(account);
+            self.leaves.insert(addr_hash, account_hash);
+        }
+        self.dirty = true;
+        self.pending_updates += updates.len();
+    }
+    
+    /// v3.22: Finalize tree - recompute root if dirty
+    /// Call once after all block transactions applied
+    /// O(n) where n = total leaves, but called only ONCE per block
+    pub fn finalize(&mut self) -> [u8; HASH_SIZE] {
+        if self.dirty {
+            let updates = self.pending_updates;
+            self.recompute_root();
+            self.dirty = false;
+            self.pending_updates = 0;
+            if updates > 0 {
+                println!("[INF][MERKLE] state_root_finalized updates={} leaves={}", updates, self.leaves.len());
+            }
+        }
+        self.root
+    }
+    
+    /// v3.22: Check if tree needs finalization
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+    
+    /// v3.22: Get pending updates count
+    pub fn pending_count(&self) -> usize {
+        self.pending_updates
     }
     
     /// Remove account
     pub fn remove(&mut self, address: &str) -> [u8; HASH_SIZE] {
         let addr_hash = Self::hash_address(address);
         self.leaves.remove(&addr_hash);
-        self.recompute_root();
+        self.dirty = true;
+        self.pending_updates += 1;
+        // For remove, we recompute immediately (rare operation)
+        self.finalize()
+    }
+    
+    /// Get current root (with lazy recomputation if dirty)
+    /// Safe to call anytime - will finalize if needed
+    pub fn root(&mut self) -> [u8; HASH_SIZE] {
+        if self.dirty {
+            self.finalize();
+        }
         self.root
     }
     
-    /// Get current root
-    pub fn root(&self) -> [u8; HASH_SIZE] {
+    /// Get current root WITHOUT finalization (may be stale)
+    /// Use only when you know tree is not dirty or stale root is acceptable
+    pub fn root_unchecked(&self) -> [u8; HASH_SIZE] {
         self.root
     }
     
@@ -331,14 +413,24 @@ impl StateManager {
     }
     
     /// Update account
-    /// v3.11: Also updates State Merkle Tree
+    /// v3.22: Uses lazy Merkle update - call finalize_merkle() after batch updates
     pub fn update_account(&self, address: String, account: Account) {
-        // Update merkle tree
+        // v3.22: Lazy merkle update
+        {
+            let mut tree = self.merkle_tree.write();
+            tree.insert_lazy(&address, &account);
+        }
+        // Update accounts map
+        self.accounts.insert(address, account);
+    }
+    
+    /// v3.22: Update account with immediate Merkle finalization
+    /// Use for single updates outside block processing
+    pub fn update_account_finalize(&self, address: String, account: Account) {
         {
             let mut tree = self.merkle_tree.write();
             tree.insert(&address, &account);
         }
-        // Update accounts map
         self.accounts.insert(address, account);
     }
     
@@ -352,17 +444,18 @@ impl StateManager {
     /// BalanceProof that can be verified without full blockchain
     pub fn get_balance_with_proof(&self, address: &str) -> Option<BalanceProof> {
         let account = self.accounts.get(address)?;
-        let tree = self.merkle_tree.read();
+        let mut tree = self.merkle_tree.write();
         let chain_state = self.chain_state.read();
         
         let proof = tree.generate_proof(address);
+        let state_root = tree.root(); // v3.22: Finalize if dirty
         
         Some(BalanceProof {
             address: address.to_string(),
             balance: account.balance,
             nonce: account.nonce,
             proof,
-            state_root: tree.root(),
+            state_root,
             block_height: chain_state.height,
         })
     }
@@ -391,9 +484,15 @@ impl StateManager {
         )
     }
     
-    /// Get current Merkle state root
+    /// Get current Merkle state root (finalized)
     pub fn get_merkle_state_root(&self) -> [u8; HASH_SIZE] {
-        self.merkle_tree.read().root()
+        let mut tree = self.merkle_tree.write();
+        tree.root() // This will finalize if dirty
+    }
+    
+    /// v3.22: Get Merkle state root without finalization (may be stale)
+    pub fn get_merkle_state_root_unchecked(&self) -> [u8; HASH_SIZE] {
+        self.merkle_tree.read().root_unchecked()
     }
     
     /// Get balance
@@ -403,8 +502,9 @@ impl StateManager {
     
     /// v3.18: Credit block fees directly to producer's wallet
     /// v3.11: Also updates State Merkle Tree
+    /// v3.22: Uses lazy Merkle update - call finalize_merkle() after block processing
     /// This is called when a block is produced/validated to give fees to the producer
-    /// Fees are NOT a transaction - they are direct balance credit (like Ethereum coinbase)
+    /// Fees are NOT a transaction - they are direct balance credit
     pub fn credit_producer_fees(&self, producer_wallet: &str, fees: u64) -> StateResult<()> {
         if fees == 0 {
             return Ok(()); // No fees to credit
@@ -419,10 +519,10 @@ impl StateManager {
         // Credit fees (using saturating_add to prevent overflow)
         account.balance = account.balance.saturating_add(fees);
         
-        // v3.11: Update merkle tree
+        // v3.22: Lazy merkle update (finalized with block)
         {
             let mut tree = self.merkle_tree.write();
-            tree.insert(producer_wallet, &account);
+            tree.insert_lazy(producer_wallet, &account);
         }
         
         // Update account
@@ -431,8 +531,9 @@ impl StateManager {
         Ok(())
     }
     
-    /// Apply transaction
+    /// Apply transaction (with immediate Merkle update)
     /// v3.11: Also updates State Merkle Tree for all changed accounts
+    /// NOTE: For block processing, use apply_transaction_lazy() + finalize_merkle()
     pub fn apply_transaction(&self, tx: &Transaction) -> StateResult<()> {
         // Get mutable access to accounts
         let mut accounts_map = HashMap::new();
@@ -467,7 +568,89 @@ impl StateManager {
         Ok(())
     }
     
-    /// Apply block
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v3.22: BATCH TRANSACTION PROCESSING FOR 100K+ TPS
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// v3.22: Apply transaction with LAZY Merkle update (no root recomputation)
+    /// Use during block processing - call finalize_merkle() once after all TX applied
+    /// Performance: O(1) per TX instead of O(n) per TX
+    pub fn apply_transaction_lazy(&self, tx: &Transaction) -> StateResult<()> {
+        // Get mutable access to accounts
+        let mut accounts_map = HashMap::new();
+        
+        // Copy relevant accounts
+        if let Some(acc) = self.accounts.get(&tx.from) {
+            accounts_map.insert(tx.from.clone(), acc.clone());
+        }
+        
+        if let Some(to) = &tx.to {
+            if let Some(acc) = self.accounts.get(to) {
+                accounts_map.insert(to.clone(), acc.clone());
+            }
+        }
+        
+        // Apply transaction
+        tx.apply_to_state(&mut accounts_map)?;
+        
+        // v3.22: Lazy Merkle update - no root recomputation!
+        {
+            let mut tree = self.merkle_tree.write();
+            for (address, account) in &accounts_map {
+                tree.insert_lazy(address, account);
+            }
+        }
+        
+        // Write to accounts map
+        for (address, account) in accounts_map {
+            self.accounts.insert(address, account);
+        }
+        
+        Ok(())
+    }
+    
+    /// v3.22: Apply block with batch Merkle processing
+    /// Optimized for high TPS - single Merkle finalization after all TX
+    /// Performance: O(n) total instead of O(n²)
+    pub fn apply_block_batch(&self, transactions: &[Transaction]) -> StateResult<usize> {
+        let tx_count = transactions.len();
+        let mut applied = 0;
+        
+        // Apply all transactions with lazy merkle updates
+        for tx in transactions {
+            match self.apply_transaction_lazy(tx) {
+                Ok(_) => applied += 1,
+                Err(e) => {
+                    // Log but don't fail - some TX may be invalid
+                    println!("[WARN][STATE] tx_apply_failed hash={} err={}", tx.hash, e);
+                }
+            }
+        }
+        
+        // Single Merkle finalization for entire block
+        self.finalize_merkle();
+        
+        if tx_count > 10 {
+            println!("[INF][STATE] block_batch_applied tx_total={} tx_applied={}", tx_count, applied);
+        }
+        
+        Ok(applied)
+    }
+    
+    /// v3.22: Finalize Merkle tree after batch operations
+    /// Must be called after apply_transaction_lazy() or apply_block_batch()
+    pub fn finalize_merkle(&self) -> [u8; HASH_SIZE] {
+        let mut tree = self.merkle_tree.write();
+        tree.finalize()
+    }
+    
+    /// v3.22: Check if Merkle tree needs finalization
+    pub fn merkle_is_dirty(&self) -> bool {
+        self.merkle_tree.read().is_dirty()
+    }
+    
+    /// Apply block (legacy - uses apply_transaction which is O(n²))
+    /// For new code, use apply_block_batch() instead
     pub fn apply_block(&self, block: &Block) -> StateResult<()> {
         for tx in &block.transactions {
             self.apply_transaction(tx)?;
@@ -487,6 +670,7 @@ impl StateManager {
     
     /// v2.96: Update pending rewards for a node (after emission processing)
     /// v3.11: Also updates State Merkle Tree
+    /// v3.22: Uses lazy Merkle update - call finalize_merkle() after batch
     /// CRITICAL SECURITY: This ensures all nodes have same pending_rewards on-chain
     /// Prevents manipulation of local RocksDB to claim fraudulent rewards
     /// v2.100: BUGFIX - Use SET (=) not ADD (+=)!
@@ -500,11 +684,11 @@ impl StateManager {
         // reward_amount is already the TOTAL accumulated from PhaseAwareRewardManager
         account.pending_rewards = reward_amount;
         
-        // v3.11: Update merkle tree
+        // v3.22: Lazy merkle update (finalized with block)
         {
             let account_clone = account.clone();
             let mut tree = self.merkle_tree.write();
-            tree.insert(node_wallet, &account_clone);
+            tree.insert_lazy(node_wallet, &account_clone);
         }
         
         println!("[INFO][STATE] pending_rewards_updated wallet={}... amount={} QNC",
@@ -542,23 +726,28 @@ impl StateManager {
     }
     
     /// v2.98: Restore accounts from snapshot (after node restart or sync)
-    /// v3.11: Also rebuilds State Merkle Tree for proof generation
+    /// v3.22: Optimized with batch Merkle insert for O(n) instead of O(n²)
     /// This replaces in-memory DashMap with persisted blockchain state
     pub fn restore_accounts(&self, accounts: Vec<(String, Account)>) -> StateResult<()> {
+        let count = accounts.len();
         self.accounts.clear();
         
-        // v3.11: Rebuild merkle tree from scratch
+        // v3.22: Rebuild merkle tree with batch inserts
         let mut tree = self.merkle_tree.write();
         *tree = StateMerkleTree::new();
         
+        // v3.22: Use insert_lazy for O(1) per account instead of O(n)
         for (address, account) in &accounts {
-            tree.insert(address, account);
+            tree.insert_lazy(address, account);
             self.accounts.insert(address.clone(), account.clone());
         }
         
-        println!("[INFO][STATE] restored_accounts count={} merkle_root={}...", 
-                 self.accounts.len(),
-                 hex::encode(&tree.root()[..8]));
+        // v3.22: Single finalization at the end - O(n) total instead of O(n²)
+        let root = tree.finalize();
+        
+        println!("[INF][STATE] restored_accounts count={} merkle_root={}...", 
+                 count,
+                 hex::encode(&root[..8]));
         Ok(())
     }
     
@@ -566,8 +755,8 @@ impl StateManager {
     /// v3.11: Now uses Merkle tree root combined with chain state
     /// This enables trustless verification for Light clients
     pub fn calculate_state_root(&self) -> Result<[u8; 32], StateError> {
-        // v3.11: Get Merkle root from State Merkle Tree
-        let merkle_root = self.merkle_tree.read().root();
+        // v3.22: Get Merkle root (finalize if dirty)
+        let merkle_root = self.merkle_tree.write().root();
         
         // Combine with chain state for complete state root
         let mut hasher = Sha3_256::new();

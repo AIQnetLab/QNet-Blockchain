@@ -523,15 +523,21 @@ pub fn verify_merkle_proof_bytes(
 /// let (root, proof) = tree.get_proof("qnet_address_123");
 /// assert!(tree.verify_proof("qnet_address_123", &account_data, &proof, &root));
 /// ```
+/// State Merkle Tree for account balance proofs
+/// v3.22: Optimized with lazy root computation for 100K+ TPS
 pub struct StateMerkleTree {
-    /// Root hash of the tree
+    /// Root hash of the tree (may be stale if dirty=true)
     root: [u8; HASH_SIZE],
     /// Stored account hashes by address hash (sparse storage)
     leaves: HashMap<[u8; HASH_SIZE], [u8; HASH_SIZE]>,
     /// Cached intermediate nodes for proof generation
     cache: HashMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], [u8; HASH_SIZE])>,
-    /// Default hash for empty nodes (lazy computed)
+    /// Default hash for empty nodes (pre-computed)
     default_hashes: Vec<[u8; HASH_SIZE]>,
+    /// v3.22: Dirty flag - true if root needs recomputation
+    dirty: bool,
+    /// v3.22: Pending updates count
+    pending_updates: usize,
 }
 
 impl StateMerkleTree {
@@ -559,44 +565,88 @@ impl StateMerkleTree {
             leaves: HashMap::new(),
             cache: HashMap::new(),
             default_hashes,
+            dirty: false,
+            pending_updates: 0,
         }
     }
     
-    /// Insert or update account in tree
-    /// 
-    /// # Arguments
-    /// * `address` - Account address string
-    /// * `data` - Serialized account data (balance, nonce, etc.)
-    /// 
-    /// # Returns
-    /// New tree root hash
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v3.22: BATCH/LAZY OPERATIONS FOR 100K+ TPS
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Insert or update account in tree WITH immediate root recomputation
+    /// Use for single updates outside block processing
+    /// For block processing, use insert_lazy() + finalize()
     pub fn insert(&mut self, address: &str, data: &[u8]) -> [u8; HASH_SIZE] {
-        // Hash address to get leaf position
         let addr_hash = Self::hash_address(address);
-        
-        // Hash account data to get leaf value
         let leaf_hash = Self::hash_data(data);
-        
-        // Update leaf
         self.leaves.insert(addr_hash, leaf_hash);
         
-        // Clear cache and recompute root
         self.cache.clear();
         self.root = self.compute_root_from_leaves();
+        self.dirty = false;
+        self.pending_updates = 0;
         self.root
+    }
+    
+    /// v3.22: Insert WITHOUT root recomputation (lazy)
+    /// O(1) operation - use during block processing
+    pub fn insert_lazy(&mut self, address: &str, data: &[u8]) {
+        let addr_hash = Self::hash_address(address);
+        let leaf_hash = Self::hash_data(data);
+        self.leaves.insert(addr_hash, leaf_hash);
+        self.dirty = true;
+        self.pending_updates += 1;
+    }
+    
+    /// v3.22: Batch insert multiple accounts WITHOUT root recomputation
+    /// O(m) where m = number of updates
+    pub fn insert_batch(&mut self, updates: &[(&str, &[u8])]) {
+        for (address, data) in updates {
+            let addr_hash = Self::hash_address(address);
+            let leaf_hash = Self::hash_data(data);
+            self.leaves.insert(addr_hash, leaf_hash);
+        }
+        self.dirty = true;
+        self.pending_updates += updates.len();
+    }
+    
+    /// v3.22: Finalize tree - recompute root if dirty
+    /// Call once after all block updates
+    pub fn finalize(&mut self) -> [u8; HASH_SIZE] {
+        if self.dirty {
+            self.cache.clear();
+            self.root = self.compute_root_from_leaves();
+            self.dirty = false;
+            self.pending_updates = 0;
+        }
+        self.root
+    }
+    
+    /// v3.22: Check if tree needs finalization
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
     
     /// Remove account from tree
     pub fn remove(&mut self, address: &str) -> [u8; HASH_SIZE] {
         let addr_hash = Self::hash_address(address);
         self.leaves.remove(&addr_hash);
-        self.cache.clear();
-        self.root = self.compute_root_from_leaves();
+        self.dirty = true;
+        self.pending_updates += 1;
+        self.finalize() // For remove, finalize immediately
+    }
+    
+    /// Get current root hash (with lazy finalization if dirty)
+    pub fn root(&mut self) -> [u8; HASH_SIZE] {
+        if self.dirty {
+            self.finalize();
+        }
         self.root
     }
     
-    /// Get current root hash
-    pub fn root(&self) -> [u8; HASH_SIZE] {
+    /// Get root WITHOUT finalization (may be stale)
+    pub fn root_unchecked(&self) -> [u8; HASH_SIZE] {
         self.root
     }
     

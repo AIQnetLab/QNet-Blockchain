@@ -51,8 +51,9 @@ use tokio::sync::RwLock;
 use tracing::{info, error};
 use sha3::{Sha3_256, Digest};
 
-// Core imports with correct paths  
-pub use qnet_state::{StateManager, Account, Transaction, Block, StateDB, StateError, StateResult};
+// Core imports with correct paths
+// v3.22: Use State (not StateManager) - State has optimized Merkle methods
+pub use qnet_state::{State as StateManager, Account, Transaction, Block, StateDB, StateError, StateResult};
 pub use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 pub use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId};
 pub use qnet_sharding::{ShardCoordinator, ParallelValidator};
@@ -264,6 +265,7 @@ impl QNetBlockchain {
     }
     
     /// Process new block
+    /// v3.22: Optimized with batch Merkle updates - O(n) instead of O(n²)
     pub async fn process_block(&self, block: Block) -> IntegrationResult<()> {
         // Validate block
         self.validator.validate_block(&block)?;
@@ -271,11 +273,9 @@ impl QNetBlockchain {
         // Store block
         self.storage.save_block(&block).await?;
         
-        // Update state
-        let mut state = self.state_manager.write().await;
-        for tx in &block.transactions {
-            state.apply_transaction(tx)?;
-        }
+        // v3.22: Use batch apply for O(n) instead of O(n²)
+        let state = self.state_manager.write().await;
+        let _ = state.apply_block_batch(&block.transactions);
         
         info!("Processing block at height {}", block.height);
         
