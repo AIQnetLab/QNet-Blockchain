@@ -629,6 +629,51 @@ lazy_static::lazy_static! {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// MEMORY LEAK FIX v3.20: Periodic cleanup for global DashMaps
+// PROBLEM: ENTROPY_RESPONSES, PRODUCER_VOTES, REQUESTED_CERTIFICATES grow unbounded
+// SOLUTION: Remove entries older than current_height - CLEANUP_HEIGHT_WINDOW
+// ═══════════════════════════════════════════════════════════════════════════════
+const CLEANUP_HEIGHT_WINDOW: u64 = 500; // Keep last 500 microblocks (~8 min at 1 block/sec)
+static LAST_DASHMAP_CLEANUP_HEIGHT: StdAtomicU64 = StdAtomicU64::new(0);
+
+/// v3.20: Cleanup old entries from global DashMaps to prevent memory leaks
+/// Should be called periodically (every ~10 blocks)
+pub fn cleanup_global_hashmaps(current_height: u64) {
+    // Only cleanup every 10 blocks to avoid overhead
+    let last_cleanup = LAST_DASHMAP_CLEANUP_HEIGHT.load(StdOrdering::Relaxed);
+    if current_height < last_cleanup + 10 {
+        return;
+    }
+    LAST_DASHMAP_CLEANUP_HEIGHT.store(current_height, StdOrdering::Relaxed);
+    
+    let min_valid_height = current_height.saturating_sub(CLEANUP_HEIGHT_WINDOW);
+    
+    // Cleanup ENTROPY_RESPONSES - remove entries for old heights
+    let entropy_before = ENTROPY_RESPONSES.len();
+    ENTROPY_RESPONSES.retain(|k, _| k.0 >= min_valid_height);
+    let entropy_removed = entropy_before.saturating_sub(ENTROPY_RESPONSES.len());
+    
+    // Cleanup PRODUCER_VOTES - remove entries for old heights
+    let votes_before = PRODUCER_VOTES.len();
+    PRODUCER_VOTES.retain(|k, _| k.0 >= min_valid_height);
+    let votes_removed = votes_before.saturating_sub(PRODUCER_VOTES.len());
+    
+    // Cleanup REQUESTED_CERTIFICATES - keep only recent (last 5 minutes)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cert_before = REQUESTED_CERTIFICATES.len();
+    REQUESTED_CERTIFICATES.retain(|_, &mut timestamp| now.saturating_sub(timestamp) < 300);
+    let cert_removed = cert_before.saturating_sub(REQUESTED_CERTIFICATES.len());
+    
+    if (entropy_removed > 0 || votes_removed > 0 || cert_removed > 0) && is_info() {
+        println!("[INFO][MEM] cleanup h={} entropy_removed={} votes_removed={} certs_removed={}", 
+                 current_height, entropy_removed, votes_removed, cert_removed);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.50: Lock-free quantum crypto with OnceCell + Arc
 // 25x faster than Mutex-based approach - zero lock contention
 // Architecture: OnceCell guarantees single initialization, Arc enables zero-copy sharing
@@ -6091,6 +6136,9 @@ impl BlockchainNode {
                 if received_block.height % 100 == 0 {
                     clear_expired_exclusions(current_height);
                 }
+                
+                // v3.20: Cleanup global DashMaps to prevent memory leaks
+                cleanup_global_hashmaps(current_height);
             }
             
             // v3.0 FIX: Skip duplicate processing for NON-RETRY blocks
@@ -7383,6 +7431,10 @@ impl BlockchainNode {
             // This is separate from retry to avoid unnecessary overhead
             if last_cleanup_check.elapsed() > std::time::Duration::from_secs(30) {
                 last_cleanup_check = std::time::Instant::now();
+                
+                // v3.20: Cleanup global DashMaps on timer (in case no blocks received)
+                let cleanup_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+                cleanup_global_hashmaps(cleanup_height);
                 
                 // ═══════════════════════════════════════════════════════════════════
                 // v3.10 BUG 4 FIX: Runtime fork detection every 30 seconds

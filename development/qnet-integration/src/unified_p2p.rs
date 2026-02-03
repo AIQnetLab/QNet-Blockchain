@@ -742,6 +742,22 @@ pub static QUIC_FALLBACK_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atom
 pub static QUIC_FALLBACK_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static QUIC_FALLBACK_RATE_LIMITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// MEMORY LEAK FIX v3.20: Global trackers moved from function-local static
+// PROBLEM: Static inside functions had no cleanup mechanism
+// SOLUTION: Global statics with periodic cleanup in start_static_cache_cleanup_task
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+/// Track nodes returning empty responses (security monitoring)
+/// Key: node_id, Value: (count, first_seen_timestamp_secs)
+static EMPTY_RESPONSE_TRACKER: Lazy<Arc<DashMap<String, (u32, u64)>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Track invalid certificate attempts (security monitoring)
+/// Key: node_id, Value: (count, first_seen_instant)
+static INVALID_CERT_TRACKER: Lazy<Arc<DashMap<String, (std::sync::atomic::AtomicU64, std::time::Instant)>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
 /// Check if QUIC fallback is allowed for given node (rate limiting)
 /// Returns true if request is allowed, false if rate limited
 pub fn quic_fallback_rate_check(node_id: &str) -> bool {
@@ -3995,16 +4011,31 @@ impl SimplifiedP2P {
                 // v3.1: Cleanup PENDING_SYNC_MACROBLOCKS (TTL 120 seconds)
                 let pending_macro_removed = cleanup_pending_sync_macroblocks();
                 
+                // v3.20: Cleanup EMPTY_RESPONSE_TRACKER (TTL 10 minutes)
+                let empty_response_before = EMPTY_RESPONSE_TRACKER.len();
+                EMPTY_RESPONSE_TRACKER.retain(|_, (_, first_seen)| {
+                    current_time_secs.saturating_sub(*first_seen) < 600 // Keep last 10 min
+                });
+                let empty_response_removed = empty_response_before.saturating_sub(EMPTY_RESPONSE_TRACKER.len());
+                
+                // v3.20: Cleanup INVALID_CERT_TRACKER (TTL 10 minutes)
+                let invalid_cert_before = INVALID_CERT_TRACKER.len();
+                INVALID_CERT_TRACKER.retain(|_, (_, first_seen)| {
+                    first_seen.elapsed() < std::time::Duration::from_secs(600) // Keep last 10 min
+                });
+                let invalid_cert_removed = invalid_cert_before.saturating_sub(INVALID_CERT_TRACKER.len());
+                
                 // Log if anything was cleaned
-                let total_removed = retry_removed + fallback_removed + pending_sync_removed + pending_macro_removed;
+                let total_removed = retry_removed + fallback_removed + pending_sync_removed + pending_macro_removed + empty_response_removed + invalid_cert_removed;
                 if total_removed > 0 {
-                    println!("[INFO][CACHE_CLEANUP] peer_retry={} quic_fallback={} pending_sync={} pending_macro={}", 
-                             retry_removed, fallback_removed, pending_sync_removed, pending_macro_removed);
+                    println!("[INFO][CACHE_CLEANUP] peer_retry={} quic_fallback={} pending_sync={} pending_macro={} empty_resp={} invalid_cert={}", 
+                             retry_removed, fallback_removed, pending_sync_removed, pending_macro_removed, empty_response_removed, invalid_cert_removed);
                 }
                 
                 // Log current sizes for monitoring (only if significant)
                 let total_size = PEER_RETRY_COOLDOWN.len() + QUIC_FALLBACK_RATE_LIMITER.len() + 
-                                 PENDING_SYNC_BLOCKS.len() + PENDING_SYNC_MACROBLOCKS.len();
+                                 PENDING_SYNC_BLOCKS.len() + PENDING_SYNC_MACROBLOCKS.len() +
+                                 EMPTY_RESPONSE_TRACKER.len() + INVALID_CERT_TRACKER.len();
                 if total_size > 100 {
                     println!("[WARN][CACHE_SIZE] peer_retry={} quic_fallback={} pending_sync={} pending_macro={}", 
                              PEER_RETRY_COOLDOWN.len(), QUIC_FALLBACK_RATE_LIMITER.len(), 
@@ -12322,8 +12353,7 @@ impl SimplifiedP2P {
                 
                 // SECURITY: Track nodes that return suspiciously empty lists
                 // This could indicate an attack or node with corrupted state
-                static EMPTY_RESPONSE_TRACKER: Lazy<Arc<DashMap<String, (u32, u64)>>> = 
-                    Lazy::new(|| Arc::new(DashMap::new()));
+                // v3.20: Using global EMPTY_RESPONSE_TRACKER (moved from local static for cleanup)
                 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -19526,9 +19556,7 @@ impl SimplifiedP2P {
     /// Track invalid certificate from a node for malicious behavior detection
     /// SECURITY: Escalating punishment - 5 invalid certs in 10 minutes = ban
     pub fn track_invalid_certificate(&self, node_id: &str, reason: &str) {
-        // Use same infrastructure as invalid blocks but with different thresholds
-        static INVALID_CERT_TRACKER: Lazy<Arc<DashMap<String, (AtomicU64, Instant)>>> = 
-            Lazy::new(|| Arc::new(DashMap::new()));
+        // v3.20: Using global INVALID_CERT_TRACKER (moved from local static for cleanup)
         
         let entry = INVALID_CERT_TRACKER
             .entry(node_id.to_string())
