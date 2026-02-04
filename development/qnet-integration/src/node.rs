@@ -7056,24 +7056,28 @@ impl BlockchainNode {
                                          hex::encode(&microblock.state_root[..8]),
                                          hex::encode(&computed_state_root[..8]));
                                 
-                                // REJECT BLOCK - do not save!
+                                // v3.37: REJECT BLOCK but continue processing other blocks
+                                // Previously `return;` would exit entire P2P processing loop!
                                 println!("[ERR][STATE] Block rejected: state_root mismatch h={} expected={} computed={}",
                                     microblock.height,
                                     hex::encode(&microblock.state_root),
                                     hex::encode(&computed_state_root));
-                                return; // Skip this block
+                                
+                                // Return error to skip saving this block, but continue loop
+                                Err(format!("state_root_mismatch h={}", microblock.height))
+                            } else {
+                                // State root verified successfully
+                                if is_debug() && microblock.transactions.len() > 0 {
+                                    println!("[DBG][STATE] verified h={} root={} tx={}",
+                                             microblock.height,
+                                             hex::encode(&computed_state_root[..8]),
+                                             microblock.transactions.len());
+                                }
+                                
+                                // State verified - now save the block
+                                storage.save_microblock(received_block.height, &decompressed_data)
+                                    .map_err(|e| format!("Storage error: {:?}", e))
                             }
-                            
-                            if is_debug() && microblock.transactions.len() > 0 {
-                                println!("[DBG][STATE] verified h={} root={} tx={}",
-                                         microblock.height,
-                                         hex::encode(&computed_state_root[..8]),
-                                         microblock.transactions.len());
-                            }
-                            
-                            // State verified - now save the block
-                            storage.save_microblock(received_block.height, &decompressed_data)
-                                .map_err(|e| format!("Storage error: {:?}", e))
                         },
                         Err(e) => {
                             Err(format!("Failed to deserialize microblock for state update: {}", e))
@@ -9841,6 +9845,31 @@ impl BlockchainNode {
                                 state_root: [0u8; 32], // v3.27: Will be set after TX application
                             };
                             
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v3.37: CRITICAL FIX - Apply Genesis TX to StateManager!
+                            // Without this, Genesis creator has EMPTY state while receivers have FULL state
+                            // This caused state_root mismatch on block #1
+                            // State must be consistent across all nodes
+                            // ═══════════════════════════════════════════════════════════════════
+                            {
+                                let mut state_guard = state.write().await;
+                                // Use genesis_microblock.transactions (all_genesis_txs was moved there)
+                                let applied = state_guard.apply_block_batch(&genesis_microblock.transactions);
+                                match applied {
+                                    Ok(count) => {
+                                        println!("[INFO][GEN] genesis_tx_applied count={} to_state", count);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[ERR][GEN] genesis_tx_apply_failed err={}", e);
+                                    }
+                                }
+                                // Finalize Merkle tree to get state_root
+                                let computed_state_root = state_guard.finalize_merkle();
+                                genesis_microblock.state_root = computed_state_root;
+                                println!("[INFO][GEN] genesis_state_root computed root={}", 
+                                         hex::encode(&computed_state_root[..8]));
+                            }
+                            
                             // PRODUCTION: Use deterministic signature for Genesis Block
                             // CRITICAL: All nodes must generate IDENTICAL Genesis signature for consensus
                             // DO NOT use Dilithium here as it creates different signatures per node
@@ -9852,11 +9881,13 @@ impl BlockchainNode {
                                 hasher.update(&genesis_microblock.height.to_le_bytes());
                                 hasher.update(&genesis_microblock.timestamp.to_le_bytes());
                                 hasher.update(&genesis_microblock.merkle_root);
+                                // v3.37: Include state_root in signature for integrity
+                                hasher.update(&genesis_microblock.state_root);
                                 // Use existing constant for consistency
                                 hasher.update(b"qnet_genesis_block_2024");
                                 hasher.finalize().to_vec()
                             };
-                            println!("[GENESIS] 🔐 Genesis Block signed with deterministic quantum-resistant signature");
+                            println!("[GENESIS] Genesis Block signed with deterministic quantum-resistant signature");
                             
                             // Serialize and save Genesis Block
                             match bincode::serialize(&genesis_microblock) {
