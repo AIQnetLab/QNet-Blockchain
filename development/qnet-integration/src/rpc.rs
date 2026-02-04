@@ -300,9 +300,10 @@ impl ApiRateLimiter {
     fn new() -> Self {
         let mut configs = HashMap::new();
         
-        // Transaction submission: 10 requests/minute (prevent spam)
+        // Transaction submission: 100 requests/minute per IP (balance between usability and spam protection)
+        // Heavy users (exchanges, DApps) should use API key for unlimited access
         configs.insert("transaction".to_string(), RateLimitConfig {
-            max_requests: 10,
+            max_requests: 100,
             window_seconds: 60,
             block_duration: 300, // 5 min block
         });
@@ -412,12 +413,96 @@ impl ApiRateLimiter {
     }
 }
 
+// ============================================================================
+// SECURITY: API Key System for Unlimited Access (Explorer, Admin)
+// ============================================================================
+
+/// API keys for unlimited access (set via environment variables)
+/// QNET_API_KEY_EXPLORER - for official explorer servers
+/// QNET_API_KEY_ADMIN - for admin/monitoring tools
+/// QNET_WHITELIST_IPS - comma-separated list of whitelisted IPs
+static API_KEYS: Lazy<std::collections::HashSet<String>> = Lazy::new(|| {
+    let mut keys = std::collections::HashSet::new();
+    const MIN_KEY_LENGTH: usize = 16; // Minimum 16 chars to prevent brute-force
+    
+    // Load keys from environment with length validation
+    if let Ok(explorer_key) = std::env::var("QNET_API_KEY_EXPLORER") {
+        if explorer_key.len() >= MIN_KEY_LENGTH {
+            keys.insert(explorer_key);
+        } else if !explorer_key.is_empty() {
+            println!("[WARN][SECURITY] QNET_API_KEY_EXPLORER too short (min {} chars), ignoring", MIN_KEY_LENGTH);
+        }
+    }
+    if let Ok(admin_key) = std::env::var("QNET_API_KEY_ADMIN") {
+        if admin_key.len() >= MIN_KEY_LENGTH {
+            keys.insert(admin_key);
+        } else if !admin_key.is_empty() {
+            println!("[WARN][SECURITY] QNET_API_KEY_ADMIN too short (min {} chars), ignoring", MIN_KEY_LENGTH);
+        }
+    }
+    
+    // Default keys for development (CHANGE IN PRODUCTION!)
+    #[cfg(debug_assertions)]
+    {
+        keys.insert("dev_explorer_key_2024".to_string()); // 20 chars - OK
+        keys.insert("dev_admin_key_2024".to_string());    // 18 chars - OK
+    }
+    
+    if !keys.is_empty() {
+        println!("[INFO][SECURITY] api_keys_loaded count={}", keys.len());
+    }
+    keys
+});
+
+/// Whitelisted IPs that bypass rate limiting
+static WHITELIST_IPS: Lazy<std::collections::HashSet<IpAddr>> = Lazy::new(|| {
+    let mut ips = std::collections::HashSet::new();
+    
+    // Always whitelist localhost
+    ips.insert(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+    ips.insert(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+    
+    // Load from environment: QNET_WHITELIST_IPS=1.2.3.4,5.6.7.8
+    if let Ok(whitelist) = std::env::var("QNET_WHITELIST_IPS") {
+        for ip_str in whitelist.split(',') {
+            if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
+                ips.insert(ip);
+            }
+        }
+    }
+    
+    if ips.len() > 2 {
+        println!("[INFO][SECURITY] whitelist_ips_loaded count={}", ips.len());
+    }
+    ips
+});
+
+/// Check if request has valid API key (from X-API-Key header or query param)
+/// SECURITY: Keys must be at least 16 characters to prevent brute-force
+fn has_valid_api_key(api_key: Option<&str>) -> bool {
+    match api_key {
+        Some(key) if key.len() >= 16 => API_KEYS.contains(key),
+        _ => false,
+    }
+}
+
+/// Check if IP is whitelisted
+fn is_ip_whitelisted(ip: IpAddr) -> bool {
+    WHITELIST_IPS.contains(&ip)
+}
+
 /// Helper function to check rate limit and return error response if exceeded
+/// Bypasses rate limit for: whitelisted IPs, valid API keys
 fn check_api_rate_limit(ip: Option<std::net::SocketAddr>, endpoint_type: &str) -> Result<(), warp::reply::Json> {
     let ip_addr = match ip {
         Some(addr) => addr.ip(),
         None => return Ok(()), // Allow if no IP (shouldn't happen)
     };
+    
+    // SECURITY: Bypass rate limit for whitelisted IPs (localhost, explorer servers)
+    if is_ip_whitelisted(ip_addr) {
+        return Ok(());
+    }
     
     let (allowed, retry_after) = API_RATE_LIMITER.check_rate_limit(ip_addr, endpoint_type);
     
@@ -431,6 +516,21 @@ fn check_api_rate_limit(ip: Option<std::net::SocketAddr>, endpoint_type: &str) -
     }
     
     Ok(())
+}
+
+/// Extended rate limit check with API key support (for routes that accept X-API-Key header)
+fn check_api_rate_limit_with_key(
+    ip: Option<std::net::SocketAddr>, 
+    api_key: Option<String>,
+    endpoint_type: &str
+) -> Result<(), warp::reply::Json> {
+    // Check API key first
+    if has_valid_api_key(api_key.as_deref()) {
+        return Ok(());
+    }
+    
+    // Fall back to IP-based check
+    check_api_rate_limit(ip, endpoint_type)
 }
 
 // ============================================================================
@@ -864,18 +964,44 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let blockchain_clone_for_filter = blockchain.clone();
     let blockchain_filter = warp::any().map(move || blockchain_clone_for_filter.clone());
     
-    // JSON-RPC endpoints (existing)
+    // JSON-RPC endpoints with rate limiting + API key support
+    // X-API-Key header bypasses rate limit for authorized clients (Explorer, Admin)
+    // SECURITY: Limit body size to 1MB to prevent payload attacks
     let rpc_path = warp::path("rpc")
         .and(warp::post())
+        .and(warp::body::content_length_limit(1024 * 1024)) // 1MB max
         .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
-        .and_then(handle_rpc);
+        .and_then(|request: RpcRequest, remote_addr: Option<std::net::SocketAddr>, api_key: Option<String>, blockchain: Arc<BlockchainNode>| async move {
+            // Rate limit heavy RPC methods (bypass with valid API key)
+            let method = &request.method;
+            if method == "chain_getBlocks" || method == "chain_getBlock" {
+                if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, "read_only") {
+                    return Ok::<_, Rejection>(rate_limit_response.into_response());
+                }
+            }
+            handle_rpc(request, blockchain).await.map(|r| r.into_response())
+        });
     
     let root_path = warp::path::end()
         .and(warp::post())
+        .and(warp::body::content_length_limit(1024 * 1024)) // 1MB max
         .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
-        .and_then(handle_rpc);
+        .and_then(|request: RpcRequest, remote_addr: Option<std::net::SocketAddr>, api_key: Option<String>, blockchain: Arc<BlockchainNode>| async move {
+            // Rate limit heavy RPC methods (bypass with valid API key)
+            let method = &request.method;
+            if method == "chain_getBlocks" || method == "chain_getBlock" {
+                if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, "read_only") {
+                    return Ok::<_, Rejection>(rate_limit_response.into_response());
+                }
+            }
+            handle_rpc(request, blockchain).await.map(|r| r.into_response())
+        });
     
     // REST API endpoints (new)
     let api_v1 = warp::path("api").and(warp::path("v1"));
@@ -1035,6 +1161,16 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_account_balance_with_proof);
     
+    // v3.32: Validator set with Merkle proof for trustless light clients
+    let validators_proof = api_v1
+        .and(warp::path("validators"))
+        .and(warp::path("proof"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_validators_with_proof);
+    
     let account_transactions = api_v1
         .and(warp::path("account"))
         .and(warp::path::param::<String>())
@@ -1126,10 +1262,12 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and_then(handle_snapshot_download);
     
     // Transaction endpoints with IP-based rate limiting
+    // SECURITY: Limit transaction body to 64KB (typical TX is <1KB)
     let transaction_submit = api_v1
         .and(warp::path("transaction"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -1341,7 +1479,6 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::get())
         .and(blockchain_filter.clone())
         .and_then(handle_node_health);
-    
 
     // Gas recommendation endpoints
     let gas_recommendations = api_v1
@@ -1959,6 +2096,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let account_routes = account_info
         .or(account_balance)
         .or(account_balance_proof)  // v3.11: Balance with Merkle proof
+        .or(validators_proof)       // v3.32: Validator set with Merkle proof
         .or(account_transactions)
         .or(batch_claim_rewards)
         .or(batch_transfer);
@@ -3029,6 +3167,154 @@ async fn handle_account_balance_with_proof(
             })))
         }
     }
+}
+
+/// v3.32: GET /api/v1/validators/proof
+/// Returns validator set with Merkle proof for trustless light client verification
+/// 
+/// CRITICAL: Uses EXISTING data sources (no duplication!):
+/// 1. Connected peers from P2P layer
+/// 2. DeterministicReputationState from MacroBlocks (synced across all nodes)
+/// 3. Genesis nodes as fallback
+///
+/// Light clients verify: SHA3-256(sorted validators) == merkle_root
+/// Then compare merkle_root in latest MacroBlock header (signed by 2/3 validators)
+async fn handle_validators_with_proof(
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    // Get current chain height
+    let height = blockchain.get_height().await;
+    let epoch = height / 90; // MacroBlock epoch
+    
+    // v3.35 FIX: Get validators from BLOCKCHAIN (NodeRegistration TX)
+    // api_endpoint is part of NodeRegistration TX - stored ON-CHAIN!
+    // Genesis = always public (in genesis block)
+    // Super nodes = public by default, can hide with QNET_HIDE_IP=1
+    // Light nodes = NEVER public (privacy protection)
+    
+    let mut validators: Vec<serde_json::Value> = Vec::new();
+    
+    use crate::genesis_constants::{GENESIS_NODE_IPS, get_genesis_region_by_ip};
+    
+    // Get ALL nodes with public API endpoints from blockchain
+    // v3.35: Now returns (node_id, endpoint, type, reputation, last_seen, is_synced)
+    // This searches NodeRegistration TXs and filters by:
+    // - reputation >= 70%
+    // - last_seen < 5 minutes (from P2P heartbeat)
+    // - is_synced = true (not more than 5 blocks behind)
+    let public_nodes = blockchain.get_all_public_api_nodes().await;
+    
+    for (node_id, api_endpoint, _node_type, reputation, last_seen, is_synced) in &public_nodes {
+        // Determine region (from Genesis constants or Unknown for others)
+        let region = if node_id.starts_with("genesis_node_") {
+            let id = node_id.strip_prefix("genesis_node_").unwrap_or("001");
+            GENESIS_NODE_IPS.iter()
+                .find(|(_, gid)| *gid == id)
+                .and_then(|(ip, _)| get_genesis_region_by_ip(ip))
+                .unwrap_or("Europe")
+                .to_string()
+        } else {
+            "Unknown".to_string()
+        };
+        
+        validators.push(json!({
+            "node_id": node_id,
+            "address": api_endpoint,
+            "node_type": "Super",
+            "reputation": reputation,
+            "last_seen": last_seen, // v3.35: REAL last_seen from P2P heartbeat
+            "is_active": true,
+            "is_synced": is_synced, // v3.35: Sync status (not more than 5 blocks behind)
+            "region": region
+        }));
+    }
+    
+    if is_info() {
+        println!("[INFO][API] validators_from_blockchain total={} with_public_api={}", 
+                 public_nodes.len(), validators.len());
+    }
+    
+    // Source 2: Add Genesis nodes if not already present (fallback/bootstrap)
+    // v3.35: Get reputation from blockchain deterministic state
+    let rep_arc = blockchain.get_deterministic_reputation();
+    let rep_guard = rep_arc.read();
+    for (genesis_ip, genesis_id) in GENESIS_NODE_IPS.iter() {
+        let node_id = format!("genesis_node_{}", genesis_id);
+        let already_exists = validators.iter().any(|v| 
+            v["node_id"].as_str() == Some(node_id.as_str())
+        );
+        if !already_exists {
+            let real_rep = rep_guard.get_reputation(&node_id, current_time);
+            let region = get_genesis_region_by_ip(genesis_ip).unwrap_or("Europe");
+            validators.push(json!({
+                "node_id": node_id,
+                "address": format!("http://{}:8001", genesis_ip), // v3.35: Full URL format
+                "node_type": "Super",
+                "reputation": real_rep.max(0.7), // Genesis minimum 0.7
+                "last_seen": current_time,
+                "is_active": true,
+                "is_synced": true, // Genesis always synced
+                "region": region
+            }));
+        }
+    }
+    drop(rep_guard);
+    
+    // Sort validators by node_id for deterministic Merkle root
+    validators.sort_by(|a, b| {
+        a["node_id"].as_str().unwrap_or("").cmp(b["node_id"].as_str().unwrap_or(""))
+    });
+    
+    // Compute Merkle root (same algorithm as light client will use)
+    use sha3::{Sha3_256, Digest};
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"QNET_VALIDATOR_SET:");
+    hasher.update(&epoch.to_le_bytes());
+    
+    for v in &validators {
+        hasher.update(v["node_id"].as_str().unwrap_or("").as_bytes());
+        hasher.update(v["address"].as_str().unwrap_or("").as_bytes());
+        hasher.update(v["node_type"].as_str().unwrap_or("").as_bytes());
+        let rep = v["reputation"].as_f64().unwrap_or(0.0);
+        hasher.update(&rep.to_le_bytes());
+        let last_seen = v["last_seen"].as_u64().unwrap_or(0);
+        hasher.update(&last_seen.to_le_bytes());
+        let is_active = v["is_active"].as_bool().unwrap_or(false);
+        hasher.update(&[is_active as u8]);
+    }
+    
+    let merkle_root = hasher.finalize();
+    let merkle_root_hex = hex::encode(&merkle_root);
+    
+    let active_count = validators.iter()
+        .filter(|v| v["is_active"].as_bool().unwrap_or(false))
+        .count();
+    
+    if is_info() {
+        println!("[INFO][API] validators_proof epoch={} total={} active={} merkle_root={}...",
+                 epoch, validators.len(), active_count, &merkle_root_hex[..16]);
+    }
+    
+    Ok(warp::reply::json(&json!({
+        "validators": validators,
+        "epoch": epoch,
+        "merkle_root": merkle_root_hex,
+        "last_update_height": height,
+        "current_height": height,
+        "total_validators": validators.len(),
+        "active_validators": active_count
+    })))
 }
 
 async fn handle_account_transactions(
@@ -8548,25 +8834,20 @@ async fn handle_activations_by_wallet(
         
         // CRITICAL FIX v2.76: Genesis nodes are NOT in node_ownership!
         // Check if this wallet matches any genesis node wallet
-        // Genesis nodes: 001-005, each has a fixed wallet address from genesis_constants.rs
-        let genesis_wallets = vec![
-            ("genesis_node_001", "f36ff465a0944fd06cdeonfca0ad004ff9db46743"), // Genesis Node #1
-            ("genesis_node_002", "0bac6225a082de1f659eond0c96f1706cf19c35eb"), // Genesis Node #2
-            ("genesis_node_003", "d216bb23fbe7f853636eon3f16b378b91922701a6"), // Genesis Node #3
-            ("genesis_node_004", "e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e"), // Genesis Node #4
-            ("genesis_node_005", "02af45d56bd1f5d9002eon0eb1c522f96a2f440b8"), // Genesis Node #5
-        ];
+        // NO DUPLICATION: Use genesis_constants::GENESIS_WALLETS
+        use crate::genesis_constants::GENESIS_WALLETS;
         
-        for (genesis_id, genesis_wallet) in genesis_wallets {
-            if wallet_address == genesis_wallet {
+        for (bootstrap_id, genesis_wallet) in GENESIS_WALLETS.iter() {
+            let genesis_id = format!("genesis_node_{}", bootstrap_id);
+            if wallet_address == *genesis_wallet {
                 // Get pending rewards for this genesis node
-                let pending = reward_manager.get_pending_reward(genesis_id)
+                let pending = reward_manager.get_pending_reward(&genesis_id)
                     .map(|r| r.total_reward)
                     .unwrap_or(0);
                 
                 // Add to nodes list (genesis nodes are "super" type)
                 nodes.push((
-                    genesis_id.to_string(),
+                    genesis_id,
                     qnet_consensus::lazy_rewards::NodeType::Super,
                     pending
                 ));
@@ -9394,15 +9675,11 @@ async fn handle_p2p_message(
 
 /// OPTIMIZATION: Fast lookup for peer pseudonym with Genesis node fast path
 async fn lookup_peer_pseudonym(raw_ip: &str) -> String {
-    // FAST PATH: Direct check for Genesis nodes (O(1) - no registry needed)
-    // Genesis nodes have fixed IPs that never change
-    match raw_ip {
-        "154.38.160.39" => return "genesis_node_001".to_string(),
-        "62.171.157.44" => return "genesis_node_002".to_string(),
-        "161.97.86.81" => return "genesis_node_003".to_string(),
-        "5.189.130.160" => return "genesis_node_004".to_string(),
-        "162.244.25.114" => return "genesis_node_005".to_string(),
-        _ => {}
+    // FAST PATH: Direct check for Genesis nodes - NO DUPLICATION!
+    // Use genesis_constants::get_genesis_id_by_ip() for single source of truth
+    use crate::genesis_constants::get_genesis_id_by_ip;
+    if let Some(bootstrap_id) = get_genesis_id_by_ip(raw_ip) {
+        return format!("genesis_node_{}", bootstrap_id);
     }
     
     // ARCHITECTURE FIX: For non-Genesis nodes, use blake3 hash for privacy
@@ -11169,7 +11446,7 @@ async fn handle_ws_connection(
         .map(|s| parse_ws_channels(s))
         .unwrap_or_else(|| vec![WsChannel::Blocks]); // Default: subscribe to blocks
     
-    println!("[WS] 🔗 New WebSocket connection, subscribed to {} channels", channels.len());
+    if is_info() { println!("[INFO][WS] new_connection channels={}", channels.len()); }
     
     // Split WebSocket into sender and receiver
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -11196,7 +11473,7 @@ async fn handle_ws_connection(
             match result {
                 Ok(msg) => {
                     if msg.is_close() {
-                        println!("[WS] 🔌 Client disconnected");
+                        if is_info() { println!("[INFO][WS] client_disconnected"); }
                         break;
                     }
                     if msg.is_ping() {
@@ -11205,12 +11482,12 @@ async fn handle_ws_connection(
                     if msg.is_text() {
                         // Handle client commands (e.g., subscribe to new channels)
                         if let Ok(text) = msg.to_str() {
-                            println!("[WS] 📨 Received: {}", text);
+                            println!("[INFO][WS] Received: {}", text);
                         }
                     }
                 }
                 Err(e) => {
-                    println!("[WS] ❌ Error receiving message: {}", e);
+                    if is_warn() { println!("[WARN][WS] receive_error err={}", e); }
                     break;
                 }
             }
@@ -11226,14 +11503,14 @@ async fn handle_ws_connection(
                     // Serialize and send event
                     if let Ok(event_json) = serde_json::to_string(&event) {
                         if let Err(e) = ws_tx.send(Message::text(event_json)).await {
-                            println!("[WS] ❌ Error sending event: {}", e);
+                            if is_warn() { println!("[WARN][WS] send_error err={}", e); }
                             break;
                         }
                     }
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                println!("[WS] ⚠️ Client lagged, missed {} events", n);
+                if is_warn() { println!("[WARN][WS] client_lagged missed={}", n); }
                 // Send lag warning to client
                 let warning = json!({
                     "type": "warning",
@@ -11244,13 +11521,13 @@ async fn handle_ws_connection(
                 }
             }
             Err(broadcast::error::RecvError::Closed) => {
-                println!("[WS] 🔌 Broadcaster closed, disconnecting client");
+                if is_info() { println!("[INFO][WS] broadcaster_closed"); }
                 break;
             }
         }
     }
     
-    println!("[WS] 🔌 WebSocket connection closed");
+    if is_info() { println!("[INFO][WS] connection_closed"); }
 }
 
 /// Handle WebSocket connection with rate limiter cleanup on disconnect
@@ -11263,9 +11540,11 @@ async fn handle_ws_connection_with_cleanup(
 ) {
     // Log connection with IP (privacy: only show for debugging)
     let (total, unique_ips) = WS_RATE_LIMITER.get_stats();
-    println!("[WS] 🔗 New connection from {:?} (total: {}, unique IPs: {})", 
-             client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string()),
-             total, unique_ips);
+    if is_info() {
+        println!("[INFO][WS] new_connection ip={:?} total={} unique_ips={}", 
+                 client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                 total, unique_ips);
+    }
     
     // Parse subscription channels
     let channels = query.channels
@@ -11273,11 +11552,14 @@ async fn handle_ws_connection_with_cleanup(
         .map(|s| parse_ws_channels(s))
         .unwrap_or_else(|| vec![WsChannel::Blocks]); // Default: subscribe to blocks
     
-    println!("[WS] 📡 Subscribed to {} channels: {:?}", channels.len(), 
-             channels.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>());
+    if is_info() {
+        println!("[INFO][WS] subscribed channels={} types={:?}", channels.len(), 
+                 channels.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>());
+    }
     
-    // Split WebSocket into sender and receiver
-    let (mut ws_tx, mut ws_rx) = ws.split();
+    // Split WebSocket into sender and receiver (Arc<Mutex> for JSON-RPC support)
+    let (ws_tx, mut ws_rx) = ws.split();
+    let ws_tx = std::sync::Arc::new(tokio::sync::Mutex::new(ws_tx));
     
     // Subscribe to global event broadcaster
     let mut rx = WS_BROADCASTER.subscribe();
@@ -11299,28 +11581,101 @@ async fn handle_ws_connection_with_cleanup(
     });
     
     if let Ok(welcome_str) = serde_json::to_string(&welcome) {
-        let _ = ws_tx.send(Message::text(welcome_str)).await;
+        let _ = ws_tx.lock().await.send(Message::text(welcome_str)).await;
     }
     
-    // Spawn task to handle incoming messages (for ping/pong and unsubscribe)
+    // Spawn task to handle incoming messages (JSON-RPC requests + ping/pong)
+    // SECURITY: Rate limit JSON-RPC to 100 requests/minute per connection
     let channels_clone = channels.clone();
+    let blockchain_for_ws = blockchain.clone();
+    let ws_tx_for_rpc = ws_tx.clone();
     tokio::spawn(async move {
+        let mut rpc_request_count: u32 = 0;
+        let mut rpc_window_start = std::time::Instant::now();
+        const RPC_RATE_LIMIT: u32 = 100; // Max 100 RPC requests per minute
+        const RPC_WINDOW_SECS: u64 = 60;
+        
         while let Some(result) = ws_rx.next().await {
             match result {
                 Ok(msg) => {
                     if msg.is_close() {
-                        println!("[WS] 🔌 Client disconnected (close frame)");
+                        if is_info() { println!("[INFO][WS] client_disconnected reason=close_frame"); }
                         break;
                     }
                     if msg.is_text() {
-                        // Handle client commands (e.g., subscribe to new channels)
                         if let Ok(text) = msg.to_str() {
-                            println!("[WS] 📨 Received command: {}", text);
+                            // Try to parse as JSON-RPC request
+                            if let Ok(rpc_req) = serde_json::from_str::<serde_json::Value>(text) {
+                                if rpc_req.get("jsonrpc").is_some() && rpc_req.get("method").is_some() {
+                                    // SECURITY: Check rate limit
+                                    if rpc_window_start.elapsed().as_secs() >= RPC_WINDOW_SECS {
+                                        rpc_request_count = 0;
+                                        rpc_window_start = std::time::Instant::now();
+                                    }
+                                    rpc_request_count += 1;
+                                    
+                                    let id = rpc_req["id"].as_u64().unwrap_or(0);
+                                    
+                                    if rpc_request_count > RPC_RATE_LIMIT {
+                                        let error_resp = json!({
+                                            "jsonrpc": "2.0", 
+                                            "id": id, 
+                                            "error": {"code": -32029, "message": "Rate limit exceeded (100 req/min)"}
+                                        });
+                                        if let Ok(s) = serde_json::to_string(&error_resp) {
+                                            let _ = ws_tx_for_rpc.lock().await.send(Message::text(s)).await;
+                                        }
+                                        continue;
+                                    }
+                                    
+                                    // Handle JSON-RPC via WebSocket
+                                    let method = rpc_req["method"].as_str().unwrap_or("");
+                                    let params = rpc_req.get("params").cloned();
+                                    
+                                    let result = match method {
+                                        "chain_getBlocks" => {
+                                            let p = params.unwrap_or(json!({}));
+                                            let start = p["start"].as_u64().unwrap_or(0);
+                                            // SECURITY: Limit to 20 blocks per request via WS
+                                            let limit = p["limit"].as_u64().unwrap_or(10).min(20);
+                                            let mut blocks = Vec::new();
+                                            for h in start..start + limit {
+                                                if let Ok(Some(block)) = blockchain_for_ws.get_block(h).await {
+                                                    blocks.push(block);
+                                                }
+                                            }
+                                            json!({"jsonrpc": "2.0", "id": id, "result": blocks})
+                                        },
+                                        "chain_getBlock" => {
+                                            let p = params.unwrap_or(json!({}));
+                                            let height = p["height"].as_u64().unwrap_or(0);
+                                            if let Ok(Some(block)) = blockchain_for_ws.get_block(height).await {
+                                                json!({"jsonrpc": "2.0", "id": id, "result": block})
+                                            } else {
+                                                json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "Block not found"}})
+                                            }
+                                        },
+                                        "chain_getHeight" => {
+                                            let height = blockchain_for_ws.get_height().await;
+                                            json!({"jsonrpc": "2.0", "id": id, "result": {"height": height}})
+                                        },
+                                        _ => {
+                                            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Method not found"}})
+                                        }
+                                    };
+                                    
+                                    if let Ok(response_str) = serde_json::to_string(&result) {
+                                        let _ = ws_tx_for_rpc.lock().await.send(Message::text(response_str)).await;
+                                    }
+                                    continue;
+                                }
+                            }
+                            if is_info() { println!("[INFO][WS] command_received text={}", text); }
                         }
                     }
                 }
                 Err(e) => {
-                    println!("[WS] ❌ Error receiving message: {}", e);
+                    if is_warn() { println!("[WARN][WS] receive_error err={}", e); }
                     break;
                 }
             }
@@ -11335,25 +11690,25 @@ async fn handle_ws_connection_with_cleanup(
                 if event_matches_channels(&event, &channels_clone) {
                     // Serialize and send event
                     if let Ok(event_json) = serde_json::to_string(&event) {
-                        if let Err(e) = ws_tx.send(Message::text(event_json)).await {
-                            println!("[WS] ❌ Error sending event: {}", e);
+                        if let Err(e) = ws_tx.lock().await.send(Message::text(event_json)).await {
+                            if is_warn() { println!("[WARN][WS] send_error err={}", e); }
                             break;
                         }
                     }
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                println!("[WS] ⚠️ Client lagged, missed {} events", n);
+                if is_warn() { println!("[WARN][WS] client_lagged missed_events={}", n); }
                 let warning = json!({
                     "type": "warning",
                     "message": format!("Missed {} events due to slow connection", n)
                 });
                 if let Ok(warning_str) = serde_json::to_string(&warning) {
-                    let _ = ws_tx.send(Message::text(warning_str)).await;
+                    let _ = ws_tx.lock().await.send(Message::text(warning_str)).await;
                 }
             }
             Err(broadcast::error::RecvError::Closed) => {
-                println!("[WS] 🔌 Broadcaster closed, disconnecting client");
+                if is_info() { println!("[INFO][WS] broadcaster_closed action=disconnect"); }
                 break;
             }
         }
@@ -11362,7 +11717,7 @@ async fn handle_ws_connection_with_cleanup(
     // CRITICAL: Cleanup rate limiter on disconnect
     WS_RATE_LIMITER.remove_connection(client_ip);
     let (total, unique_ips) = WS_RATE_LIMITER.get_stats();
-    println!("[WS] 🔌 Connection closed, cleaned up (total: {}, unique IPs: {})", total, unique_ips);
+    if is_info() { println!("[INFO][WS] connection_closed total={} unique_ips={}", total, unique_ips); }
 }
 
 // ============================================================================

@@ -1648,11 +1648,16 @@ impl BlockchainNode {
     /// This TX is included in blocks and visible to all nodes
     /// For genesis TXs: use fixed_timestamp=Some(0) for deterministic hashes across all nodes
     /// For runtime TXs: use fixed_timestamp=None for current time
+    /// 
+    /// v3.35: api_endpoint parameter:
+    /// - Super/Genesis: pass public IP (e.g., "http://1.2.3.4:8001") or empty "" to hide
+    /// - Light: MUST be empty "" (mobile privacy protection)
     pub fn create_node_registration_tx_with_timestamp(
         node_id: &str,
         node_type: qnet_state::NodeType,
         wallet_address: &str,
         registration_proof: &str,
+        api_endpoint: &str,
         fixed_timestamp: Option<u64>,
     ) -> qnet_state::Transaction {
         use qnet_state::TransactionType;
@@ -1663,6 +1668,13 @@ impl BlockchainNode {
                 .unwrap_or_default()
                 .as_secs()
         });
+        
+        // SECURITY: Light nodes NEVER have api_endpoint
+        let final_endpoint = if node_type == qnet_state::NodeType::Light {
+            String::new()
+        } else {
+            api_endpoint.to_string()
+        };
         
         let mut tx = qnet_state::Transaction {
             hash: String::new(),
@@ -1680,8 +1692,9 @@ impl BlockchainNode {
                 node_type,
                 wallet_address: wallet_address.to_string(),
                 registration_proof: registration_proof.to_string(),
+                api_endpoint: final_endpoint.clone(),
             },
-            data: Some(format!("node_registration:{}:{}:{}", node_id, wallet_address, registration_proof)),
+            data: Some(format!("node_registration:{}:{}:{}:{}", node_id, wallet_address, registration_proof, final_endpoint)),
             dilithium_signature: None,
             dilithium_public_key: None,
         };
@@ -1691,46 +1704,66 @@ impl BlockchainNode {
     }
     
     /// Create NodeRegistration TX for runtime (uses current timestamp)
+    /// For Light nodes: api_endpoint is ignored (always empty for privacy)
+    /// For Super nodes: pass public API endpoint or empty to hide
     pub fn create_node_registration_tx(
         node_id: &str,
         node_type: qnet_state::NodeType,
         wallet_address: &str,
         registration_proof: &str,
     ) -> qnet_state::Transaction {
-        Self::create_node_registration_tx_with_timestamp(node_id, node_type, wallet_address, registration_proof, None)
+        // Default: no api_endpoint (Light nodes), caller should use _with_endpoint for Super
+        Self::create_node_registration_tx_with_timestamp(node_id, node_type, wallet_address, registration_proof, "", None)
+    }
+    
+    /// Create NodeRegistration TX with explicit API endpoint (for Super nodes)
+    pub fn create_node_registration_tx_with_endpoint(
+        node_id: &str,
+        node_type: qnet_state::NodeType,
+        wallet_address: &str,
+        registration_proof: &str,
+        api_endpoint: &str,
+    ) -> qnet_state::Transaction {
+        Self::create_node_registration_tx_with_timestamp(node_id, node_type, wallet_address, registration_proof, api_endpoint, None)
     }
     
     /// Find node registration in blockchain (searches all blocks)
     /// Returns (node_type, wallet_address) if found
     pub async fn find_node_registration(&self, node_id: &str) -> Option<(qnet_state::NodeType, String)> {
+        self.find_node_registration_full(node_id).await
+            .map(|(nt, wa, _)| (nt, wa))
+    }
+    
+    /// Find full node registration including api_endpoint
+    /// Returns (node_type, wallet_address, api_endpoint) if found
+    pub async fn find_node_registration_full(&self, node_id: &str) -> Option<(qnet_state::NodeType, String, String)> {
         use qnet_state::TransactionType;
         
-        // First check cache (in-memory for performance)
-        if let Some(cached) = self.get_cached_node_registration(node_id).await {
-            return Some(cached);
-        }
-        
-        // Search blockchain from genesis block
+        // Search blockchain from genesis block (block 0 contains Genesis registrations)
         let current_height = self.get_height().await;
         
-        // Optimization: Search backwards (recent registrations more likely to be queried)
+        // Search from genesis (block 0) forward - registrations are in early blocks
+        // But also search backwards for newer registrations (updates)
         for height in (0..=current_height).rev() {
             if let Ok(Some(block)) = self.storage.load_microblock_auto_format(height) {
                 for tx in &block.transactions {
                     if let TransactionType::NodeRegistration { 
                         node_id: reg_node_id, 
                         node_type, 
-                        wallet_address, 
+                        wallet_address,
+                        api_endpoint,
                         .. 
                     } = &tx.tx_type {
                         if reg_node_id == node_id {
                             // Cache for future lookups
                             self.cache_node_registration(node_id, node_type.clone(), wallet_address.clone()).await;
                             if is_debug() { 
-                                println!("[DBG][REG] found_onchain node={} wallet={}... h={}", 
-                                         node_id, &wallet_address[..16.min(wallet_address.len())], height); 
+                                println!("[DBG][REG] found_onchain node={} wallet={}... endpoint={} h={}", 
+                                         node_id, &wallet_address[..16.min(wallet_address.len())],
+                                         if api_endpoint.is_empty() { "hidden" } else { api_endpoint },
+                                         height); 
                             }
-                            return Some((node_type.clone(), wallet_address.clone()));
+                            return Some((node_type.clone(), wallet_address.clone(), api_endpoint.clone()));
                         }
                     }
                 }
@@ -1738,6 +1771,111 @@ impl BlockchainNode {
         }
         
         None
+    }
+    
+    /// Get all registered nodes with public API endpoints (for mobile app discovery)
+    /// Returns Vec<(node_id, api_endpoint, node_type, reputation, last_seen, is_synced)>
+    /// 
+    /// v3.35: FULL VALIDATION
+    /// - reputation >= 70% (consensus threshold)
+    /// - last_seen < 5 minutes (node is online) - from P2P heartbeat
+    /// - is_synced = true (not more than 5 blocks behind current height)
+    /// - Genesis nodes always included (infrastructure backbone)
+    pub async fn get_all_public_api_nodes(&self) -> Vec<(String, String, qnet_state::NodeType, f64, u64, bool)> {
+        use qnet_state::TransactionType;
+        
+        let mut result = Vec::new();
+        let current_height = self.get_height().await;
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // v3.35: Get P2P peer info for online/sync status
+        // Contains: (last_seen timestamp, last_block_height from heartbeat)
+        let peer_info: std::collections::HashMap<String, (u64, u64)> = if let Some(ref p2p) = self.unified_p2p {
+            p2p.get_validated_active_peers().iter()
+                .map(|p| (p.id.clone(), (p.last_seen, p.last_block_height)))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+        
+        // Collect all registrations (last one wins for each node_id)
+        let mut registrations: std::collections::HashMap<String, (String, qnet_state::NodeType)> = 
+            std::collections::HashMap::new();
+        
+        for height in 0..=current_height {
+            if let Ok(Some(block)) = self.storage.load_microblock_auto_format(height) {
+                for tx in &block.transactions {
+                    if let TransactionType::NodeRegistration { 
+                        node_id, 
+                        node_type, 
+                        api_endpoint,
+                        .. 
+                    } = &tx.tx_type {
+                        // Only include nodes with public API (non-empty endpoint)
+                        // Light nodes are automatically excluded (their endpoint is always empty)
+                        if !api_endpoint.is_empty() {
+                            registrations.insert(node_id.clone(), (api_endpoint.clone(), node_type.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Get reputation and filter by online/sync status
+        let det_rep = self.deterministic_reputation.read();
+        
+        for (node_id, (endpoint, node_type)) in registrations {
+            let reputation = det_rep.get_reputation(&node_id, current_time);
+            
+            // Only include nodes with good reputation (>=70%)
+            if reputation < 0.7 { continue; }
+            
+            // v3.35: Check online status and sync status
+            let is_genesis = node_id.starts_with("genesis_node_");
+            
+            if is_genesis {
+                // Genesis nodes always included (infrastructure backbone)
+                // last_seen = current_time (always online), is_synced = true
+                result.push((node_id, endpoint, node_type, reputation, current_time, true));
+            } else {
+                // For non-Genesis nodes: check P2P heartbeat data
+                if let Some((last_seen, peer_height)) = peer_info.get(&node_id) {
+                    let age_secs = current_time.saturating_sub(*last_seen);
+                    
+                    // Must be seen in last 5 minutes (300 sec)
+                    if age_secs > 300 {
+                        if is_debug() {
+                            println!("[DBG][API] skip_node node={} reason=stale age_secs={}", node_id, age_secs);
+                        }
+                        continue;
+                    }
+                    
+                    // Check sync status: not more than 5 blocks behind
+                    let is_synced = current_height <= *peer_height + 5;
+                    
+                    if !is_synced {
+                        if is_debug() {
+                            println!("[DBG][API] skip_node node={} reason=behind peer_h={} current_h={}", 
+                                     node_id, peer_height, current_height);
+                        }
+                        continue;
+                    }
+                    
+                    result.push((node_id, endpoint, node_type, reputation, *last_seen, is_synced));
+                } else {
+                    // Node not in P2P peers - skip (probably offline)
+                    if is_debug() {
+                        println!("[DBG][API] skip_node node={} reason=not_in_peers", node_id);
+                    }
+                    continue;
+                }
+            }
+        }
+        
+        result
     }
     
     /// Cache node registration for fast lookups
@@ -1806,17 +1944,26 @@ impl BlockchainNode {
         
         for (bootstrap_id, wallet) in crate::genesis_constants::GENESIS_WALLETS {
             let node_id = format!("genesis_node_{}", bootstrap_id);
+            
+            // v3.35: Genesis nodes are ALWAYS public - get IP from constants
+            let api_endpoint = crate::genesis_constants::GENESIS_NODE_IPS.iter()
+                .find(|(_, id)| *id == *bootstrap_id)
+                .map(|(ip, _)| format!("http://{}:8001", ip))
+                .unwrap_or_default();
+            
             let tx = Self::create_node_registration_tx_with_timestamp(
                 &node_id,
                 qnet_state::NodeType::Super,
                 wallet,
                 "genesis", // Proof for genesis nodes
+                &api_endpoint, // v3.35: Public API endpoint
                 Some(GENESIS_TX_TIMESTAMP), // Fixed timestamp for determinism
             );
             
             if is_info() { 
-                println!("[INFO][REG] genesis_tx_created node={} wallet={}... hash={}...", 
+                println!("[INFO][REG] genesis_tx_created node={} wallet={}... endpoint={} hash={}...", 
                          node_id, &wallet[..16.min(wallet.len())],
+                         api_endpoint,
                          &tx.hash[..16.min(tx.hash.len())]); 
             }
             txs.push(tx);
@@ -5133,15 +5280,13 @@ impl BlockchainNode {
         // FIX v2.21.5: Initialize Genesis nodes with starting reputation (70%)
         // This ensures get_reputation returns proper value before first macroblock
         // v2.96: parking_lot never panics on poisoned lock
+        // v3.32: NO DUPLICATION - use genesis_constants
         {
+            use crate::genesis_constants::GENESIS_NODE_IPS;
             let mut rep_state = deterministic_reputation.write();
-            let genesis_nodes = vec![
-                "genesis_node_001".to_string(),
-                "genesis_node_002".to_string(),
-                "genesis_node_003".to_string(),
-                "genesis_node_004".to_string(),
-                "genesis_node_005".to_string(),
-            ];
+            let genesis_nodes: Vec<String> = GENESIS_NODE_IPS.iter()
+                .map(|(_, id)| format!("genesis_node_{}", id))
+                .collect();
             rep_state.init_genesis_nodes(&genesis_nodes);
             if is_info() { println!("[INFO][REP] genesis_nodes={} reputation=70%", genesis_nodes.len()); }
         }
@@ -5687,6 +5832,13 @@ impl BlockchainNode {
                                 our_hash: format!("ahead_by_{}", local_height - network_height),
                             });
                             
+                            // v3.23: Start rollback protection before deleting blocks
+                            if !crate::storage::start_rollback_protection(network_height) {
+                                println!("[WARN][ROLLBACK] protection_failed skipping");
+                                set_node_state(NodeState::Idle { last_height: local_height });
+                                return; // Exit async task
+                            }
+                            
                             // ROLLBACK: Delete blocks from network_height+1 to local_height
                             // This ensures we're on the same chain as the network
                             let rollback_from = network_height + 1;
@@ -5706,6 +5858,9 @@ impl BlockchainNode {
                                 *height_guard = network_height;
                             }
                             blockchain_for_sync.storage.set_chain_height(network_height).ok();
+                            
+                            // End rollback protection
+                            crate::storage::end_rollback_protection();
                             
                             // NOTE: Macroblocks ahead of network will be overwritten during re-sync
                             // Storage uses height as key, so new macroblocks will replace old ones
@@ -6488,6 +6643,12 @@ impl BlockchainNode {
                                                         
                                                         // Rollback to fork point and resync
                                                         if fork_height <= local_height {
+                                                            // v3.23: Start rollback protection
+                                                            if !crate::storage::start_rollback_protection(fork_height - 1) {
+                                                                println!("[WARN][REORG] rollback_protection_busy");
+                                                                return; // Exit async task
+                                                            }
+                                                            
                                                             if is_info() { println!("[INFO][REORG] rollback from={} to={}", local_height, fork_height - 1); }
                                                             
                                                             for h in fork_height..=local_height {
@@ -6498,6 +6659,8 @@ impl BlockchainNode {
                                                             
                                                             *height_clone.write().await = fork_height - 1;
                                                             storage_clone.set_chain_height(fork_height - 1).ok();
+                                                            
+                                                            crate::storage::end_rollback_protection();
                                                         }
                                                         
                                                         // Sync missing blocks
@@ -6550,12 +6713,20 @@ impl BlockchainNode {
                                                         if high_rep_count >= MIN_PEERS_FOR_RESYNC {
                                                             if is_info() { println!("[INFO][REORG] resync validators={}", high_rep_count); }
                                                             
+                                                            // v3.23: Start rollback protection
+                                                            if !crate::storage::start_rollback_protection(fork_height - 1) {
+                                                                println!("[WARN][REORG] rollback_protection_busy case2");
+                                                                return; // Exit async task
+                                                            }
+                                                            
                                                             // Rollback to fork point
                                                             for h in fork_height..=local_height {
                                                                 let _ = storage_clone.delete_microblock(h);
                                                             }
                                                             *height_clone.write().await = fork_height - 1;
                                                             storage_clone.set_chain_height(fork_height - 1).ok();
+                                                            
+                                                            crate::storage::end_rollback_protection();
                                                             
                                                             // Request blocks from network
                                                             // sync_blocks() selects best_peer (highest combined reputation)
@@ -6815,16 +6986,11 @@ impl BlockchainNode {
                             }
                             
                             // ═══════════════════════════════════════════════════════════════════
-                            // v3.18: DIRECT FEE CREDITING - Credit fees to block producer
-                            // This replaces Pool 2 - fees go directly to producer, not pooled
-                            // IDEMPOTENCY: Only credit if block is NEW (not already in storage)
+                            // v3.26: ATOMIC FEE CREDITING - TOP L1 PATTERN
+                            // Uses credit_producer_fees_once() which has built-in race condition protection
+                            // Safe to call multiple times - fees credited EXACTLY ONCE per block
                             // ═══════════════════════════════════════════════════════════════════
-                            let block_is_new = match storage.load_microblock(microblock.height) {
-                                Ok(Some(_)) => false, // Block already exists
-                                _ => true, // Block is new
-                            };
-                            
-                            if microblock.fees_collected > 0 && block_is_new {
+                            if microblock.fees_collected > 0 {
                                 // Find producer's wallet from node registration
                                 let producer_wallet = match storage.load_node_registration(&microblock.producer) {
                                     Ok(Some((_, wallet, _))) => wallet,
@@ -6840,33 +7006,72 @@ impl BlockchainNode {
                                 };
                                 
                                 if !producer_wallet.is_empty() {
-                                    // Credit fees directly to producer
-                                    if let Err(e) = state_guard.credit_producer_fees(&producer_wallet, microblock.fees_collected) {
-                                        eprintln!("[ERR][FEES] credit_failed producer={} wallet={} fees={} err={}", 
-                                                 microblock.producer, producer_wallet, microblock.fees_collected, e);
-                                    } else if is_info() && microblock.fees_collected > 10_000_000 {
-                                        // Log only for significant fees (> 0.01 QNC)
-                                        println!("[INFO][FEES] credited producer={} wallet={}... fees={} nanoQNC h={}",
-                                                 microblock.producer, 
-                                                 &producer_wallet[..16.min(producer_wallet.len())],
-                                                 microblock.fees_collected, microblock.height);
+                                    // v3.26: Use atomic fee crediting with race condition protection
+                                    match state_guard.credit_producer_fees_once(
+                                        microblock.height, 
+                                        &producer_wallet, 
+                                        microblock.fees_collected
+                                    ) {
+                                        Ok(true) => {
+                                            // Fees credited successfully (first time)
+                                            if is_info() && microblock.fees_collected > 10_000_000 {
+                                                println!("[INFO][FEES] credited producer={} wallet={}... fees={} nanoQNC h={}",
+                                                         microblock.producer, 
+                                                         &producer_wallet[..16.min(producer_wallet.len())],
+                                                         microblock.fees_collected, microblock.height);
+                                            }
+                                        }
+                                        Ok(false) => {
+                                            // Already credited (race condition prevented)
+                                            if is_debug() {
+                                                println!("[DBG][FEES] skip_dup h={} (already credited)", microblock.height);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[ERR][FEES] credit_failed producer={} wallet={} fees={} err={}", 
+                                                     microblock.producer, producer_wallet, microblock.fees_collected, e);
+                                        }
                                     }
                                 }
                             }
                             
-                            // v3.22: CRITICAL - Finalize Merkle tree ONCE after all TX applied
-                            // This is the key optimization: O(n) total instead of O(n²)
-                            if microblock.transactions.len() > 0 {
-                                let state_root = state_guard.finalize_merkle();
-                                if is_debug() && microblock.transactions.len() > 10 {
-                                    println!("[DBG][MERKLE] finalized h={} tx={} root={}...", 
-                                             microblock.height, 
-                                             microblock.transactions.len(),
-                                             hex::encode(&state_root[..8]));
-                                }
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v3.27: STATE ROOT VERIFICATION - TOP L1 PATTERN
+                            // Finalize Merkle and VERIFY against block's state_root
+                            // If mismatch → REJECT block as invalid (prevents state divergence)
+                            // ═══════════════════════════════════════════════════════════════════
+                            let computed_state_root = state_guard.finalize_merkle();
+                            
+                            // Check state root only for v3.27+ blocks (non-zero state_root)
+                            let block_has_state_root = microblock.state_root != [0u8; 32];
+                            
+                            if block_has_state_root && computed_state_root != microblock.state_root {
+                                // STATE ROOT MISMATCH - CRITICAL ERROR!
+                                // This means either:
+                                // 1. Block producer computed different state
+                                // 2. Our state is corrupted/diverged
+                                // 3. Malicious block with wrong state_root
+                                eprintln!("[ERR][STATE] state_root_mismatch h={} expected={} computed={}",
+                                         microblock.height,
+                                         hex::encode(&microblock.state_root[..8]),
+                                         hex::encode(&computed_state_root[..8]));
+                                
+                                // REJECT BLOCK - do not save!
+                                println!("[ERR][STATE] Block rejected: state_root mismatch h={} expected={} computed={}",
+                                    microblock.height,
+                                    hex::encode(&microblock.state_root),
+                                    hex::encode(&computed_state_root));
+                                return; // Skip this block
                             }
                             
-                            // Now save the block after state is updated
+                            if is_debug() && microblock.transactions.len() > 0 {
+                                println!("[DBG][STATE] verified h={} root={} tx={}",
+                                         microblock.height,
+                                         hex::encode(&computed_state_root[..8]),
+                                         microblock.transactions.len());
+                            }
+                            
+                            // State verified - now save the block
                             storage.save_microblock(received_block.height, &decompressed_data)
                                 .map_err(|e| format!("Storage error: {:?}", e))
                         },
@@ -7458,66 +7663,29 @@ impl BlockchainNode {
                 cleanup_global_hashmaps(cleanup_height);
                 
                 // ═══════════════════════════════════════════════════════════════════
-                // v3.10 BUG 4 FIX: Runtime fork detection every 30 seconds
-                // Detect if we're on a fork by comparing local vs network height
+                // v3.24: REMOVED Runtime Height Check - caused FALSE POSITIVES
                 // ═══════════════════════════════════════════════════════════════════
+                // WHY REMOVED:
+                //   - Used CACHED heights from peers (can be stale by 30+ blocks)
+                //   - local > network + 20 triggered even when node was correct
+                //   - Entropy Voting already handles fork detection via HASH comparison
+                //   - MacroBlock BFT provides finality every 90 blocks
+                //
+                // CORRECT FORK DETECTION:
+                //   1. Entropy Voting: compares entropy HASHES (not heights)
+                //   2. MacroBlock validation: 2/3+ BFT consensus
+                //   3. Block hash comparison on receive (validate_received_microblock)
+                // ═══════════════════════════════════════════════════════════════════
+                
+                // MONITORING ONLY: Log if significantly behind network (not a fork, just sync needed)
                 if should_check_fork() {
                     if let Some(p2p) = &unified_p2p {
                         if let Ok(network_height) = p2p.sync_blockchain_height().await {
                             let local_height = *height.read().await;
                             
-                            // FORK INDICATOR 1: Local height significantly AHEAD of network
-                            // This means we're producing blocks that network doesn't accept
-                            if local_height > network_height + 20 && network_height > 100 {
-                                println!("[ERR][FORK] runtime_detected local={} network={} ahead_by={}", 
-                                         local_height, network_height, local_height - network_height);
-                                
-                                // v3.10 BUG 3 FIX: Self-exclude from production
-                                // Forked node should NOT produce blocks until synced
-                                let rotation_interval = 30u64;
-                                let exclude_until = ((network_height / rotation_interval) + 3) * rotation_interval;
-                                exclude_producer(&node_id, "runtime_fork_self_exclude", exclude_until);
-                                println!("[INFO][FORK] self_excluded until_h={}", exclude_until);
-                                
-                                // STATE MACHINE: Enter fork resolution
-                                set_node_state(NodeState::ResolvingFork {
-                                    fork_height: network_height,
-                                    our_hash: format!("runtime_ahead_{}", local_height - network_height),
-                                });
-                                
-                                // ROLLBACK: Delete blocks from network_height+1 to local_height
-                                println!("[INFO][FORK] rollback from={} to={}", network_height + 1, local_height);
-                                for h in (network_height + 1)..=local_height {
-                                    if let Err(e) = storage.delete_microblock(h) {
-                                        if is_debug() {
-                                            println!("[DBG][ROLLBACK] delete h={} err={}", h, e);
-                                        }
-                                    }
-                                }
-                                
-                                // Update chain height
-                                {
-                                    let mut height_guard = height.write().await;
-                                    *height_guard = network_height;
-                                }
-                                storage.set_chain_height(network_height).ok();
-                                
-                                println!("[INFO][FORK] rollback_complete new_height={}", network_height);
-                                
-                                // Clear pending blocks that were on the fork
-                                pending_blocks.retain(|h, _| *h <= network_height);
-                                
-                                // Return to IDLE state
-                                set_node_state(NodeState::Idle { last_height: network_height });
-                            }
-                            
-                            // FORK INDICATOR 2: Local height significantly BEHIND network
-                            // This is normal sync, but log for monitoring
-                            else if network_height > local_height + 50 {
-                                if is_warn() {
-                                    println!("[WARN][SYNC] behind_network local={} network={} gap={}", 
-                                             local_height, network_height, network_height - local_height);
-                                }
+                            if network_height > local_height + 50 {
+                                println!("[WARN][SYNC] behind_network local={} network={} gap={}", 
+                                         local_height, network_height, network_height - local_height);
                             }
                         }
                     }
@@ -9670,6 +9838,7 @@ impl BlockchainNode {
                                 vrf_output: None,
                                 vrf_proof: None,
                                 fees_collected: 0, // v3.18: Genesis block has no fees
+                                state_root: [0u8; 32], // v3.27: Will be set after TX application
                             };
                             
                             // PRODUCTION: Use deterministic signature for Genesis Block
@@ -10859,6 +11028,12 @@ impl BlockchainNode {
                                         let rollback_amount = 10; // Was 90, now only 10 blocks
                                         let rollback_to = microblock_height.saturating_sub(rollback_amount);
                                         
+                                        // v3.23: Start rollback protection
+                                        if !crate::storage::start_rollback_protection(rollback_to) {
+                                            println!("[WARN][FORK] rollback_protection_busy stall_recovery");
+                                            continue;
+                                        }
+                                        
                                         println!("[INFO][FORK] rollback from={} to={}", microblock_height, rollback_to);
                                         
                                         // Delete blocks from rollback_to+1 to current
@@ -10884,6 +11059,9 @@ impl BlockchainNode {
                                             *h = rollback_to;
                                         }
                                         storage.set_chain_height(rollback_to).ok();
+                                        
+                                        // End rollback protection
+                                        crate::storage::end_rollback_protection();
                                         
                                         println!("[INFO][FORK] rollback_complete new_h={}", rollback_to);
                                         
@@ -11860,21 +12038,78 @@ impl BlockchainNode {
                             //   2. AND all of them disagree (matches == 0)
                             //   3. AND we're past Genesis phase (height > 10)
                             // ═══════════════════════════════════════════════════════════════════
+                            // v3.24: CONSENSUS-BASED PRODUCTION CONTROL
+                            // ═══════════════════════════════════════════════════════════════════
+                            // ARCHITECTURE: Node CANNOT produce blocks without minimum consensus
+                            // This prevents isolated nodes from creating orphan chains.
+                            //
+                            // MIN_PRODUCTION_RESPONSES: Minimum peers that must respond before production
+                            //   - Prevents isolated node from producing blocks alone
+                            //   - Ensures at least basic network connectivity
+                            //   - Value 2 = at least 2 peers must confirm our entropy
+                            //
+                            // MIN_FORK_DETECTION_RESPONSES: Minimum for definite fork detection
+                            //   - Higher threshold for fork declaration (more certainty needed)
+                            //
+                            // EXCEPTION: Genesis phase (h <= 10) - allow bootstrap production
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v3.25: DYNAMIC MIN_PRODUCTION_RESPONSES based on network size
+                            // ═══════════════════════════════════════════════════════════════════
+                            // Problem: Static MIN=2 is unsafe for large networks!
+                            //   - Genesis (5 nodes): 2/5 = 40% → OK
+                            //   - Large (100 sample): 2/100 = 2% → DANGEROUS!
+                            //
+                            // Solution: MIN_PRODUCTION = 40% of sample_size (Byzantine safe)
+                            //   - Genesis: 40% of 5 = 2 (minimum)
+                            //   - Small: 40% of 20 = 8
+                            //   - Medium: 40% of 50 = 20
+                            //   - Large: 40% of 100 = 40
+                            //
+                            // This ensures: even if 33% malicious nodes collude, they cannot
+                            // produce blocks without 40% honest consensus (requires 7%+ honest)
+                            // ═══════════════════════════════════════════════════════════════════
                             const MIN_FORK_DETECTION_RESPONSES: usize = 3;
+                            
+                            // Dynamic MIN based on sample_size (defined at line 11648)
+                            // Use same sample_size variable for consistency
+                            let min_production_responses = match sample_size {
+                                0..=5 => 2,                                    // Genesis: 2/5 = 40%
+                                6..=20 => ((sample_size * 40) / 100).max(3),   // Small: 40%, min 3
+                                21..=50 => ((sample_size * 40) / 100).max(8),  // Medium: 40%, min 8
+                                _ => ((sample_size * 40) / 100).max(20),       // Large: 40%, min 20
+                            };
+                            
                             let total_responses = matches + mismatches;
+                            
+                            // v3.25: ISOLATION CHECK with dynamic threshold
+                            // Cannot produce without minimum consensus proportional to network size
+                            if total_responses < min_production_responses && next_block_height > 10 {
+                                println!("[ERR][CONS] isolated_node responses={} min_required={} sample={} h={}", 
+                                         total_responses, min_production_responses, sample_size, next_block_height);
+                                println!("[INFO][CONS] skip_production reason=insufficient_consensus");
+                                
+                                // STATE MACHINE: Isolated state
+                                set_node_state(NodeState::Error {
+                                    reason: format!("Isolated: {} responses, need {} (40% of {})", 
+                                                    total_responses, min_production_responses, sample_size),
+                                    recoverable: true,
+                                });
+                                
+                                // Do NOT produce - wait for network connectivity
+                                continue;
+                            }
                             
                             if mismatches > 0 {
                                 // v3.11 FIX: Only detect fork if we have enough responses
                                 // At startup, lagging nodes return empty entropy - NOT a real fork!
                                 if matches == 0 && total_responses >= MIN_FORK_DETECTION_RESPONSES && next_block_height > 10 {
                                     // DEFINITE FORK: Multiple peers responded with DIFFERENT entropy
-                                    println!("[ERR][CONS] FORK DETECTED! {} peers have different entropy, 0 agree (total={})", 
+                                    println!("[ERR][CONS] fork_detected mismatches={} matches=0 total={}", 
                                              mismatches, total_responses);
-                                    println!("[ERR][CONS] STOPPING production - we are on a fork!");
                                     
                                     // STATE MACHINE: Fork detected error
                                     set_node_state(NodeState::Error {
-                                        reason: format!("Fork: {} mismatches, 0 matches - definite fork", mismatches),
+                                        reason: format!("Fork: {} mismatches, 0 matches", mismatches),
                                         recoverable: true,
                                     });
                                     
@@ -11882,19 +12117,18 @@ impl BlockchainNode {
                                     let rotation_interval = 30u64;
                                     let exclude_until = ((next_block_height / rotation_interval) + 3) * rotation_interval;
                                     exclude_producer(&node_id, "entropy_fork_detected", exclude_until);
+                                    println!("[INFO][CONS] self_excluded until_h={}", exclude_until);
                                     
                                     // Skip this rotation round to prevent fork
                                     continue;
                                 } else if matches == 0 && (total_responses < MIN_FORK_DETECTION_RESPONSES || next_block_height <= 10) {
                                     // v3.11: Not enough data to confirm fork - likely startup/sync phase
-                                    // Log warning but continue production
-                                    println!("[WARN][CONS] potential_fork responses={} (need {}) h={} - continuing (startup phase)", 
+                                    println!("[WARN][CONS] potential_fork responses={} need={} h={} phase=startup", 
                                              total_responses, MIN_FORK_DETECTION_RESPONSES, next_block_height);
                                 } else if mismatches > matches {
                                     // MAJORITY FORK: More peers disagree than agree
-                                    println!("[ERR][CONS] FORK DETECTED! {} peers disagree vs {} agree", 
+                                    println!("[ERR][CONS] fork_detected mismatches={} matches={} majority=disagree", 
                                              mismatches, matches);
-                                    println!("[ERR][CONS] STOPPING production - majority says we're on fork!");
                                     
                                     // STATE MACHINE: Fork detected error
                                     set_node_state(NodeState::Error {
@@ -11905,20 +12139,18 @@ impl BlockchainNode {
                                     // Skip this rotation round to prevent fork
                                     continue;
                                 } else {
-                                    // Minority disagrees - log warning but continue (Byzantine resilience)
-                                    // This is expected: some nodes may be lagging or on temporary fork
-                                    println!("[WARN][CONS] {} peers have different entropy (minority), {} agree (majority)", 
-                                            mismatches, matches);
+                                    // Minority disagrees - continue (Byzantine resilience)
+                                    println!("[WARN][CONS] minority_disagree mismatches={} matches={}", mismatches, matches);
                                     if is_info() { println!("[INFO][CONS] bft_majority_ok"); }
                                 }
                             } else if matches > 0 {
                                 // All responses match - perfect consensus
-                                if is_debug() { println!("[DBG][CONS] perfect agree={}", matches); }
+                                if is_debug() { println!("[DBG][CONS] consensus_perfect matches={}", matches); }
                             } else {
-                                // No responses at all - peers are lagging or network issue
-                                // CRITICAL: This is DIFFERENT from "all mismatches"!
-                                // Here: no one responded (timeout) vs above: everyone responded with different hash
-                                println!("[WARN][CONS] no_entropy_responses - peers may be lagging");
+                                // No responses at all
+                                // v3.24: This case is now handled by isolation check above
+                                // If we reach here with 0 responses, it means h <= 10 (Genesis phase)
+                                println!("[WARN][CONS] no_responses h={} phase=genesis", next_block_height);
                             }
                             
                             // CRITICAL FIX: Check if selected producer is synchronized
@@ -13436,7 +13668,65 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         vrf_output: qrb_output,
                         vrf_proof: qrb_proof,
                         fees_collected: block_fees_collected, // v3.18: Direct to producer
+                        state_root: [0u8; 32], // v3.27: Will be set below after TX+fees application
                     };
+                    
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // v3.27: COMPUTE STATE ROOT - TOP L1 PATTERN
+                    // MUST happen BEFORE signing so signature covers state_root!
+                    // Order: apply_tx → credit_fees → finalize_merkle → get state_root
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    {
+                        let mut state_guard = state.write().await;
+                        
+                        // 1. Apply all transactions
+                        for tx in &txs {
+                            if let Err(e) = state_guard.apply_transaction_lazy(tx) {
+                                if is_warn() {
+                                    println!("[WARN][STATE] producer_tx_apply_failed hash={} err={}", tx.hash, e);
+                                }
+                            }
+                        }
+                        
+                        // 2. Get producer wallet for fee crediting
+                        let producer_wallet = match storage.load_node_registration(&node_id) {
+                            Ok(Some((_, wallet, _))) => wallet,
+                            _ => String::new()
+                        };
+                        
+                        // 3. Credit fees to producer (atomic)
+                        if block_fees_collected > 0 && !producer_wallet.is_empty() {
+                            match state_guard.credit_producer_fees_once(
+                                next_block_height,
+                                &producer_wallet,
+                                block_fees_collected
+                            ) {
+                                Ok(true) => {
+                                    if is_info() && block_fees_collected > 10_000_000 {
+                                        println!("[INFO][FEES] producer_credited h={} fees={} nanoQNC",
+                                                 next_block_height, block_fees_collected);
+                                    }
+                                }
+                                Ok(false) => {
+                                    if is_debug() {
+                                        println!("[DBG][FEES] skip_dup h={}", next_block_height);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[ERR][FEES] credit_failed h={} err={}", next_block_height, e);
+                                }
+                            }
+                        }
+                        
+                        // 4. Finalize Merkle and get state_root
+                        let computed_state_root = state_guard.finalize_merkle();
+                        microblock.state_root = computed_state_root;
+                        
+                        if is_debug() {
+                            println!("[DBG][STATE] state_root computed h={} root={}",
+                                     next_block_height, hex::encode(&computed_state_root[..8]));
+                        }
+                    }
                     
                     // QUANTUM VTS: Mix microblock into VTS chain for cryptographic time proof
                     if let Some(ref poh) = quantum_poh {
@@ -13446,7 +13736,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                 // CRITICAL FIX: If local PoH is behind network, sync it forward first!
                                 // This prevents nodes from getting stuck when receiving blocks from faster nodes
                                 if poh_entry.num_hashes <= poh_count {
-                                    println!("[QuantumPoH] ⚠️ Local PoH behind network: local={}, network={}", 
+                                    println!("[WARN][POH] local_behind local={} network={}", 
                                             poh_entry.num_hashes, poh_count);
                                     
                                     // Sync local PoH to network state + small increment
@@ -13456,19 +13746,19 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                     // Create new proof with synced PoH
                                     match poh.create_microblock_proof(&block_data).await {
                                         Ok(synced_entry) => {
-                                            println!("[QuantumPoH] ✅ Microblock #{} mixed after sync (hash_count: {})", 
+                                            println!("[INFO][POH] mixed_after_sync h={} count={}",
                                                     microblock_height, synced_entry.num_hashes);
                                             microblock.poh_hash = synced_entry.hash;
                                             microblock.poh_count = synced_entry.num_hashes;
                                         },
                                         Err(e) => {
-                                            println!("[QuantumPoH] ❌ Failed to mix after sync: {}", e);
+                                            println!("[WARN][POH] mix_after_sync_failed err={}", e);
                                             // Use network baseline + increment as fallback
                                             microblock.poh_count = synced_count;
                                         }
                                     }
                                 } else {
-                                    println!("[QuantumPoH] ✅ Microblock #{} mixed into PoH chain (hash_count: {})", 
+                                    println!("[INFO][POH] mixed h={} count={}",
                                             microblock_height, poh_entry.num_hashes);
                                     // Update block with new PoH state after mixing
                                     microblock.poh_hash = poh_entry.hash;
@@ -13476,7 +13766,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                 }
                             },
                             Err(e) => {
-                                println!("[QuantumPoH] ⚠️ Failed to mix microblock #{}: {} - using baseline", microblock_height, e);
+                                println!("[WARN][POH] mix_failed h={} err={} using_baseline", microblock_height, e);
                                 // Fallback: use baseline + increment instead of skipping
                                 // This prevents nodes from getting stuck
                                 microblock.poh_count = poh_count + 500_001;
@@ -13512,12 +13802,12 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                     if let Some(hybrid) = instances_guard.get(&normalized_id) {
                                         if let Some(cert) = hybrid.get_current_certificate() {
                                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
-                                                println!("[CERTIFICATE] 🔄 Certificate rotation broadcast at block #{}: {}", 
+                                                println!("[INFO][CERT] rotation_broadcast h={} serial={}",
                                                     microblock.height, cert.serial_number);
                                                 if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
-                                                    println!("[CERTIFICATE] ⚠️ Rotation broadcast failed: {}", e);
+                                                    println!("[WARN][CERT] rotation_broadcast_failed err={}", e);
                                                 } else {
-                                                    println!("[CERTIFICATE] ✅ Rotated certificate broadcasted to network");
+                                                    println!("[INFO][CERT] rotation_broadcast_complete");
                                                 }
                                             }
                                         }
@@ -13547,7 +13837,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     
                     // Validate microblock (production checks)
                     if let Err(e) = Self::validate_microblock_production(&microblock) {
-                        println!("[Microblock] ❌ Validation failed: {}", e);
+                        println!("[ERR][PROD] validation_failed err={}", e);
                         // v3.4: CRITICAL - Clear broadcast flag before continue
                         crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                         continue;
@@ -13653,24 +13943,13 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     let save_result = storage_clone.save_block_with_delta(height_for_storage, &microblock_data);
                     
                     if let Ok(_) = save_result {
-                        println!("[Storage] ✅ Microblock {} saved with delta/compression", height_for_storage);
-                        
-                        // CRITICAL FIX v2.76: Apply transactions to state when PRODUCER creates block!
-                        // Previously only validators applied TX - producer's own blocks didn't update state!
-                        // This is WHY balances were always 0 - producer created blocks but didn't apply them!
-                        // v3.22: Use lazy Merkle updates for O(n) instead of O(n²)
-                        {
-                            let mut state_guard = state.write().await;
-                            for tx in &txs {
-                                if let Err(e) = state_guard.apply_transaction_lazy(tx) {
-                                    println!("[WARN][STATE] producer_tx_apply_failed hash={} err={}", tx.hash, e);
-                                }
-                            }
-                            // v3.22: Finalize Merkle after all TX applied
-                            if !txs.is_empty() {
-                                state_guard.finalize_merkle();
-                            }
+                        if is_info() {
+                            println!("[INFO][STORAGE] block_saved h={} state_root={}",
+                                     height_for_storage, hex::encode(&microblock.state_root[..8]));
                         }
+                        
+                        // v3.27: TX and fees already applied BEFORE signing (for state_root)
+                        // No need to apply again here!
                         
                         // CRITICAL FIX v3.2: Cache NodeRegistration TXs when producer creates block
                         // This ensures producer can find wallet addresses for new nodes in reward distribution
@@ -13688,35 +13967,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             }
                         }
                         
-                        // ═══════════════════════════════════════════════════════════════════
-                        // v3.18: DIRECT FEE CREDITING - Credit fees to self (producer)
-                        // block_fees_collected was calculated before microblock creation
-                        // ═══════════════════════════════════════════════════════════════════
-                        if block_fees_collected > 0 {
-                            // Get producer's own wallet from node registration
-                            let producer_wallet = match storage_clone.load_node_registration(&node_id) {
-                                Ok(Some((_, wallet, _))) => wallet,
-                                _ => {
-                                    // Genesis nodes should have registration
-                                    if is_warn() {
-                                        println!("[WARN][FEES] producer_self_wallet_not_found node={}", node_id);
-                                    }
-                                    String::new()
-                                }
-                            };
-                            
-                            if !producer_wallet.is_empty() {
-                                let mut state_guard = state.write().await;
-                                if let Err(e) = state_guard.credit_producer_fees(&producer_wallet, block_fees_collected) {
-                                    eprintln!("[ERR][FEES] self_credit_failed wallet={} fees={} err={}", 
-                                             producer_wallet, block_fees_collected, e);
-                                } else if is_info() && block_fees_collected > 10_000_000 {
-                                    println!("[INFO][FEES] producer_credited self={} fees={} nanoQNC h={}",
-                                             &producer_wallet[..16.min(producer_wallet.len())],
-                                             block_fees_collected, height_for_storage);
-                                }
-                            }
-                        }
+                        // v3.27: Fee crediting moved BEFORE signing (for state_root computation)
+                        // credit_producer_fees_once() is idempotent - no need to call again
                         
                         // CRITICAL FIX v2.76: POOL #3 INTEGRATION for producer's own block
                         // Producer must also collect Pool #3 (activation payments) like validators do!
@@ -23774,11 +24026,38 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let registration_proof = registry.hash_activation_code_for_blockchain(code)
                 .unwrap_or_else(|_| blake3::hash(code.as_bytes()).to_hex().to_string());
             
-            let registration_tx = Self::create_node_registration_tx(
+            // v3.35: Auto-detect public API endpoint for Super nodes
+            // By default = PUBLIC (auto-detect IP)
+            // Set QNET_HIDE_IP=1 to hide your IP (empty endpoint)
+            let api_endpoint = if qnet_node_type == qnet_state::NodeType::Super {
+                if std::env::var("QNET_HIDE_IP").is_ok() {
+                    // Operator explicitly chose to hide IP
+                    String::new()
+                } else {
+                    // Auto-detect public IP and create endpoint
+                    let public_ip = std::env::var("QNET_PUBLIC_IP")
+                        .or_else(|_| std::env::var("EXTERNAL_IP"))
+                        .or_else(|_| std::env::var("HOST_IP"))
+                        .unwrap_or_default();
+                    
+                    if !public_ip.is_empty() {
+                        format!("http://{}:8001", public_ip)
+                    } else {
+                        // No IP detected - node won't serve mobile apps
+                        String::new()
+                    }
+                }
+            } else {
+                // Light nodes: NEVER have api_endpoint (privacy)
+                String::new()
+            };
+            
+            let registration_tx = Self::create_node_registration_tx_with_endpoint(
                 &self.node_id,
                 qnet_node_type,
                 &wallet_address,
                 &registration_proof,
+                &api_endpoint,
             );
             
             // Add to mempool for inclusion in next block

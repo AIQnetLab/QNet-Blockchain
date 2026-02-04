@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -746,6 +746,15 @@ const WalletScreen = () => {
     sol: 0,
     '1dev': 0
   });
+  // v3.29: Track pending TX with proper confirmation polling
+  // { txHash, expectedQnc, previousQnc, timestamp, status: 'pending'|'confirmed'|'failed' }
+  const pendingTxRef = useRef(null);
+  const txPollingRef = useRef(null); // Interval ID for cleanup
+  // v3.30: TX History with WebSocket real-time updates
+  const [txHistory, setTxHistory] = useState([]); // Array of { hash, from, to, amount, status, timestamp, type }
+  const wsRef = useRef(null); // WebSocket connection
+  // v3.27: Track Merkle proof verification status for trustless display
+  const [balanceVerified, setBalanceVerified] = useState(false);
   const [language, setLanguage] = useState('en');
   const [autoLockTime, setAutoLockTime] = useState('15');
   const [showChangePassword, setShowChangePassword] = useState(false);
@@ -1543,7 +1552,7 @@ const WalletScreen = () => {
   // Set amount as percentage of balance
   const setAmountPercentage = (percentage) => {
     if (!sendingToken) return;
-    const amount = (sendingToken.balance * percentage / 100).toFixed(sendingToken.symbol === 'QNC' ? 4 : 6);
+    const amount = (sendingToken.balance * percentage / 100).toFixed(sendingToken.symbol === 'QNC' ? 5 : 6);
     setSendAmount(amount);
   };
   
@@ -1551,6 +1560,85 @@ const WalletScreen = () => {
   const QNET_GAS_PRICE = 1; // nanoQNC
   const QNET_GAS_LIMIT = 10000; // for transfers
   const QNET_TX_FEE = (QNET_GAS_PRICE * QNET_GAS_LIMIT) / 1_000_000_000; // 0.00001 QNC
+  
+  // v3.29: Poll TX status until confirmed
+  // Uses ALL Genesis nodes in rotation for reliability
+  const startTxConfirmationPolling = (txHash, expectedBalance, previousBalance) => {
+    // Clear any existing polling
+    if (txPollingRef.current) {
+      clearInterval(txPollingRef.current);
+    }
+    
+    // v3.31: Use discovered nodes (not hardcoded Genesis!)
+    const allNodes = walletManager.getAvailableNodes();
+    
+    let attempts = 0;
+    const maxAttempts = 30; // 30 * 2sec = 60 sec max
+    
+    txPollingRef.current = setInterval(async () => {
+      attempts++;
+      
+      // Rotate through nodes on each attempt for better reliability
+      const nodeIndex = (attempts - 1) % allNodes.length;
+      const apiUrl = allNodes[nodeIndex];
+      
+      try {
+        // Check TX status via API
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 3000);
+        
+        const response = await fetch(`${apiUrl}/api/v1/transaction/${txHash}`, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (response.ok) {
+          const txData = await response.json();
+          
+          // TX found in blockchain = CONFIRMED
+          if (txData && (txData.hash || txData.tx_hash)) {
+            // TX confirmed! Update state
+            pendingTxRef.current = null;
+            clearInterval(txPollingRef.current);
+            txPollingRef.current = null;
+            
+            // Update txResult to show confirmed
+            setTxResult(prev => prev?.txHash === txHash 
+              ? { ...prev, confirming: false, confirmed: true }
+              : prev
+            );
+            
+            // v3.30: Update TX history status
+            updateTxStatus(txHash, 'confirmed');
+            
+            // Refresh balance from server (now it's accurate)
+            if (wallet?.publicKey) {
+              loadBalance(wallet.publicKey);
+            }
+            return;
+          }
+        }
+        
+        // TX not found yet - still pending
+        if (attempts >= maxAttempts) {
+          // Timeout - TX might have failed
+          pendingTxRef.current = null;
+          clearInterval(txPollingRef.current);
+          txPollingRef.current = null;
+          
+          // Revert to server balance
+          if (wallet?.publicKey) {
+            loadBalance(wallet.publicKey);
+          }
+        }
+      } catch (error) {
+        // Network error - will try next node on next attempt
+      }
+    }, 2000); // Poll every 2 seconds
+  };
   
   // Send QNC transaction (real blockchain transaction)
   const handleSendTransaction = async () => {
@@ -1604,22 +1692,49 @@ const WalletScreen = () => {
       );
       
       if (result.success) {
-        // Show success screen (not alert)
+        const previousBalance = sendingToken.balance;
+        const expectedBalance = sendingToken.symbol === 'QNC' 
+          ? Math.max(0, previousBalance - amount - QNET_TX_FEE)
+          : previousBalance;
+        
+        // Show success with "confirming" status
         setTxResult({
           success: true,
           txHash: result.txHash,
           amount: amount,
           to: sendAddress,
-          symbol: sendingToken.symbol
+          symbol: sendingToken.symbol,
+          confirming: true // Shows "Confirming..." in UI
         });
-        // Refresh balance
-        if (wallet && wallet.publicKey) {
-          loadBalance(wallet.publicKey);
+        
+        // v3.29: Set pending TX state
+        if (sendingToken.symbol === 'QNC') {
+          pendingTxRef.current = {
+            txHash: result.txHash,
+            expectedQnc: expectedBalance,
+            previousQnc: previousBalance,
+            timestamp: Date.now(),
+            status: 'pending'
+          };
+          
+          // Immediately show expected balance (optimistic update)
+          setTokenBalances(prev => ({
+            ...prev,
+            qnc: expectedBalance
+          }));
+          
+          // v3.30: Add to TX history with pending status
+          addPendingTxToHistory(result.txHash, sendAddress, amount, QNET_TX_FEE);
+          
+          // Start polling for TX confirmation
+          startTxConfirmationPolling(result.txHash, expectedBalance, previousBalance);
         }
       } else {
+        // TX rejected by node - no pending state needed
         setTxResult({ success: false, error: result.error || 'Transaction failed' });
       }
     } catch (error) {
+      // TX failed to send
       setTxResult({ success: false, error: error.message || 'Transaction failed' });
     } finally {
       setSendingTransaction(false);
@@ -1871,6 +1986,11 @@ const WalletScreen = () => {
 
       return () => {
         clearInterval(balanceInterval);
+        // v3.29: Also cleanup TX polling on tab change/unmount
+        if (txPollingRef.current) {
+          clearInterval(txPollingRef.current);
+          txPollingRef.current = null;
+        }
       };
     }
   }, [wallet, isTestnet, selectedNetwork, activeTab]); // Reload on any network or tab change
@@ -1976,6 +2096,29 @@ const WalletScreen = () => {
     };
   }, [wallet, password]);
 
+  // v3.31: Initialize node discovery + WebSocket + TX history when wallet ready
+  useEffect(() => {
+    if (wallet?.qnetAddress) {
+      // Load cached nodes and trigger discovery for load balancing
+      walletManager.loadNodesFromCache().then(() => {
+        walletManager.refreshNodeDiscovery();
+      });
+      
+      // Connect WebSocket for real-time notifications
+      connectWebSocket();
+      
+      // Load TX history
+      loadTxHistory();
+      
+      return () => {
+        // Cleanup WebSocket on unmount
+        if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+        }
+      };
+    }
+  }, [wallet?.qnetAddress]);
 
   const checkWalletExists = async () => {
     try {
@@ -2412,7 +2555,8 @@ const WalletScreen = () => {
       const currentWallet = wallet || await walletManager.getCurrentWallet();
       
       // Load balances in parallel for better performance
-      const [bal, oneDevBalance, qncBalance] = await Promise.all([
+      // v3.27: Use getQNCBalanceWithProof for trustless verification (TOP L1 pattern)
+      const [bal, oneDevBalance, qncResult] = await Promise.all([
         walletManager.getBalance(publicKey, isTestnet),
         walletManager.getTokenBalance(
           currentWallet?.solanaAddress || currentWallet?.address || publicKey,
@@ -2421,18 +2565,51 @@ const WalletScreen = () => {
             : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump', // Mainnet (pump.fun)
           isTestnet
         ),
-        // v2.76: CRITICAL FIX - Load real QNC balance from blockchain
-        walletManager.getQNCBalance(currentWallet?.qnetAddress)
+        // v3.27: TRUSTLESS - Get balance WITH Merkle proof verification
+        walletManager.getQNCBalanceWithProof(currentWallet?.qnetAddress, true)
       ]);
+      
+      // v3.27: Extract balance and verification status
+      const qncBalance = qncResult?.balance || 0;
+      const isBalanceVerified = qncResult?.verified || false;
+      
+      // v3.27: Log verification status for debugging
+      if (!isBalanceVerified && qncBalance > 0) {
+        console.warn('[BALANCE] QNC balance not verified via Merkle proof - node may be untrusted');
+      }
       
       setBalance(bal);
       
+      // v3.29: Simple pending TX handling - polling manages confirmation
+      let finalQncBalance = qncBalance;
+      
+      if (pendingTxRef.current && pendingTxRef.current.status === 'pending') {
+        const { expectedQnc, timestamp } = pendingTxRef.current;
+        const elapsed = Date.now() - timestamp;
+        
+        // If server shows higher balance than expected AND within timeout
+        // Keep showing expected (optimistic) - polling will confirm actual state
+        if (qncBalance > expectedQnc && elapsed < 60000) {
+          finalQncBalance = expectedQnc;
+        } else if (qncBalance <= expectedQnc) {
+          // TX confirmed! Clear pending (polling might not have caught it yet)
+          pendingTxRef.current = null;
+          if (txPollingRef.current) {
+            clearInterval(txPollingRef.current);
+            txPollingRef.current = null;
+          }
+        }
+      }
+      
       // Update all balances
       setTokenBalances({
-        qnc: qncBalance,
+        qnc: finalQncBalance,
         sol: bal,
         '1dev': oneDevBalance
       });
+      
+      // v3.27: Store verification status for UI indicators
+      setBalanceVerified && setBalanceVerified(isBalanceVerified);
       
       // Fetch real token prices (always mainnet prices as requested)
       await fetchTokenPrices();
@@ -2448,6 +2625,160 @@ const WalletScreen = () => {
         }, 2000);
       }
     }
+  };
+
+  // v3.31: WebSocket connection using discovered nodes
+  const connectWebSocket = () => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    
+    // Get nodes from discovery system (not hardcoded!)
+    const httpNodes = walletManager.getAvailableNodes();
+    // Convert HTTP URLs to WebSocket URLs
+    const wsNodes = httpNodes.map(url => url.replace('http://', 'ws://') + '/ws');
+    const wsUrl = wsNodes[Math.floor(Math.random() * wsNodes.length)];
+    
+    try {
+      wsRef.current = new WebSocket(wsUrl);
+      
+      wsRef.current.onopen = () => {
+        // Subscribe to TX notifications for our address
+        if (wallet?.qnetAddress) {
+          wsRef.current?.send(JSON.stringify({
+            type: 'subscribe',
+            channel: 'transactions',
+            address: wallet.qnetAddress
+          }));
+        }
+      };
+      
+      wsRef.current.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          
+          // New block with transactions
+          if (data.type === 'block' || data.type === 'microblock') {
+            const txs = data.transactions || data.block?.transactions || [];
+            const myAddress = wallet?.qnetAddress?.toLowerCase();
+            
+            txs.forEach(tx => {
+              const from = (tx.from || tx.sender || '').toLowerCase();
+              const to = (tx.to || tx.recipient || '').toLowerCase();
+              
+              // TX involves our wallet
+              if (from === myAddress || to === myAddress) {
+                const newTx = {
+                  hash: tx.hash || tx.tx_hash,
+                  from: tx.from || tx.sender,
+                  to: tx.to || tx.recipient,
+                  amount: (tx.amount || 0) / 1e9,
+                  status: 'confirmed',
+                  // v3.33: Convert Unix timestamp (seconds) to milliseconds, fallback to now
+                  timestamp: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
+                  type: from === myAddress ? 'send' : 'receive',
+                  fee: (tx.fee || tx.gas_used || 0) / 1e9
+                };
+                
+                // Add to history (avoid duplicates)
+                setTxHistory(prev => {
+                  if (prev.some(t => t.hash === newTx.hash)) return prev;
+                  return [newTx, ...prev].slice(0, 50); // Keep last 50
+                });
+                
+                // Update pending TX if this confirms it
+                if (pendingTxRef.current?.txHash === newTx.hash) {
+                  pendingTxRef.current = null;
+                  if (txPollingRef.current) {
+                    clearInterval(txPollingRef.current);
+                    txPollingRef.current = null;
+                  }
+                  setTxResult(prev => prev?.txHash === newTx.hash
+                    ? { ...prev, confirming: false, confirmed: true }
+                    : prev
+                  );
+                  loadBalance(wallet?.publicKey);
+                }
+                
+                // Refresh balance on incoming TX
+                if (to === myAddress) {
+                  loadBalance(wallet?.publicKey);
+                }
+              }
+            });
+          }
+        } catch (e) {
+          // Parse error - ignore
+        }
+      };
+      
+      wsRef.current.onclose = () => {
+        // Reconnect after 5 seconds
+        setTimeout(connectWebSocket, 5000);
+      };
+      
+      wsRef.current.onerror = () => {
+        wsRef.current?.close();
+      };
+    } catch (e) {
+      // WS not available - polling will handle it
+    }
+  };
+
+  // v3.30: Load TX history from API
+  const loadTxHistory = async () => {
+    if (!wallet?.qnetAddress) return;
+    
+    try {
+      const apiUrl = walletManager.getRandomBootstrapNode();
+      const response = await fetch(
+        `${apiUrl}/api/v1/account/${wallet.qnetAddress}/transactions?limit=50`,
+        { method: 'GET', headers: { 'Content-Type': 'application/json' } }
+      );
+      
+      if (response.ok) {
+        const data = await response.json();
+        const transactions = data.transactions || data || [];
+        
+        const myAddress = wallet.qnetAddress.toLowerCase();
+        const formattedTxs = transactions.map(tx => ({
+          hash: tx.hash || tx.tx_hash,
+          from: tx.from || tx.sender,
+          to: tx.to || tx.recipient,
+          amount: (tx.amount || 0) / 1e9,
+          status: 'confirmed',
+          // v3.33: Convert Unix timestamp (seconds) to milliseconds for Date()
+          timestamp: (tx.timestamp || 0) * 1000,
+          type: (tx.from || tx.sender || '').toLowerCase() === myAddress ? 'send' : 'receive',
+          fee: (tx.fee || tx.gas_used || 0) / 1e9
+        }));
+        
+        setTxHistory(formattedTxs);
+      }
+    } catch (e) {
+      // API error - keep existing history
+    }
+  };
+
+  // v3.30: Add pending TX to history
+  const addPendingTxToHistory = (txHash, to, amount, fee) => {
+    const pendingTx = {
+      hash: txHash,
+      from: wallet?.qnetAddress || '',
+      to: to,
+      amount: amount,
+      status: 'pending',
+      timestamp: Date.now(),
+      type: 'send',
+      fee: fee
+    };
+    
+    setTxHistory(prev => [pendingTx, ...prev.filter(t => t.hash !== txHash)]);
+  };
+
+  // v3.30: Update TX status in history
+  const updateTxStatus = (txHash, status) => {
+    setTxHistory(prev => prev.map(tx => 
+      tx.hash === txHash ? { ...tx, status } : tx
+    ));
   };
 
   const fetchTokenPrices = async () => {
@@ -2938,7 +3269,7 @@ const WalletScreen = () => {
           edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
         >
           <ScrollView 
-            contentContainerStyle={styles.centerContent}
+            contentContainerStyle={styles.formContent}
             showsVerticalScrollIndicator={true}
             bounces={true}
             scrollEnabled={true}
@@ -3051,7 +3382,7 @@ const WalletScreen = () => {
       return (
         <SafeAreaView style={styles.container}>
           <ScrollView 
-            contentContainerStyle={[styles.centerContent, {paddingBottom: 100}]}
+            contentContainerStyle={[styles.formContent, {paddingTop: 40, paddingBottom: 100}]}
             showsVerticalScrollIndicator={true}
             bounces={true}
             scrollEnabled={true}
@@ -3118,7 +3449,7 @@ const WalletScreen = () => {
             edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
           >
             <ScrollView 
-              contentContainerStyle={styles.centerContent}
+              contentContainerStyle={styles.formContent}
               showsVerticalScrollIndicator={true}
               bounces={true}
               scrollEnabled={true}
@@ -3220,7 +3551,7 @@ const WalletScreen = () => {
             edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
           >
             <ScrollView 
-              contentContainerStyle={styles.centerContent}
+              contentContainerStyle={styles.formContent}
               showsVerticalScrollIndicator={true}
               bounces={true}
               scrollEnabled={true}
@@ -3420,7 +3751,7 @@ const WalletScreen = () => {
               {/* Balance Info */}
               <View style={styles.sendBalanceInfo}>
                 <Text style={styles.sendBalanceLabel}>Available Balance</Text>
-                <Text style={styles.sendBalanceAmount}>{sendingToken.balance.toFixed(4)} {sendingToken.symbol}</Text>
+                <Text style={styles.sendBalanceAmount}>{sendingToken.balance.toFixed(5)} {sendingToken.symbol}</Text>
               </View>
               
               {/* Recipient Address */}
@@ -3623,7 +3954,7 @@ const WalletScreen = () => {
                     </View>
                   </View>
                   <View style={styles.tokenBalance}>
-                    <Text style={styles.tokenAmount}>{tokenBalances.qnc.toFixed(4)}</Text>
+                    <Text style={styles.tokenAmount}>{tokenBalances.qnc.toFixed(5)}</Text>
                   </View>
                 </TouchableOpacity>
               </View>
@@ -4291,6 +4622,109 @@ const WalletScreen = () => {
           </ScrollView>
         );
 
+      case 'history':
+        return (
+          <ScrollView 
+            key="history-tab"
+            style={styles.content}
+            contentContainerStyle={[
+              styles.scrollContentContainer,
+              Platform.OS === 'ios' && { paddingBottom: 50 }
+            ]}
+            showsVerticalScrollIndicator={true}
+            bounces={true}
+            scrollEnabled={true}
+            onScroll={handleUserActivity}
+            scrollEventThrottle={500}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={async () => {
+                  setRefreshing(true);
+                  await loadTxHistory();
+                  setRefreshing(false);
+                }}
+                colors={['#00d4ff']}
+                tintColor="#00d4ff"
+              />
+            }
+          >
+            <Text style={[styles.sectionTitle, { marginBottom: 16 }]}>Transaction History</Text>
+            
+            {txHistory.length === 0 ? (
+              <View style={{ alignItems: 'center', paddingVertical: 40 }}>
+                <Text style={{ color: '#666', fontSize: 16 }}>No transactions yet</Text>
+              </View>
+            ) : (
+              txHistory.map((tx, index) => (
+                <TouchableOpacity
+                  key={tx.hash || index}
+                  style={{
+                    backgroundColor: '#16213e',
+                    borderRadius: 12,
+                    padding: 16,
+                    marginBottom: 12,
+                    borderWidth: 1,
+                    borderColor: tx.status === 'pending' ? '#ffaa00' : '#1a1a2e'
+                  }}
+                  onPress={() => {
+                    Clipboard.setString(tx.hash);
+                    showAlert('Copied', 'Transaction hash copied');
+                  }}
+                >
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                      <View style={{
+                        width: 32,
+                        height: 32,
+                        borderRadius: 16,
+                        backgroundColor: tx.type === 'send' ? '#ff444420' : '#00ff8820',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        marginRight: 12
+                      }}>
+                        <Text style={{ color: tx.type === 'send' ? '#ff4444' : '#00ff88', fontSize: 18 }}>
+                          {tx.type === 'send' ? '↑' : '↓'}
+                        </Text>
+                      </View>
+                      <View>
+                        <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>
+                          {tx.type === 'send' ? 'Sent' : 'Received'}
+                        </Text>
+                        <Text style={{ color: '#666', fontSize: 12 }}>
+                          {tx.status === 'pending' ? '⏳ Pending...' : new Date(tx.timestamp).toLocaleString()}
+                        </Text>
+                      </View>
+                    </View>
+                    <View style={{ alignItems: 'flex-end' }}>
+                      <Text style={{ 
+                        color: tx.type === 'send' ? '#ff4444' : '#00ff88', 
+                        fontSize: 16, 
+                        fontWeight: '600' 
+                      }}>
+                        {tx.type === 'send' ? '-' : '+'}{tx.amount.toFixed(5)} QNC
+                      </Text>
+                      {tx.fee > 0 && (
+                        <Text style={{ color: '#666', fontSize: 11 }}>
+                          Fee: {tx.fee.toFixed(5)} QNC
+                        </Text>
+                      )}
+                    </View>
+                  </View>
+                  <View style={{ borderTopWidth: 1, borderTopColor: '#1a1a2e', paddingTop: 8 }}>
+                    <Text style={{ color: '#888', fontSize: 11 }}>
+                      {tx.type === 'send' ? 'To: ' : 'From: '}
+                      <Text style={{ color: '#00d4ff', fontFamily: 'monospace' }}>
+                        {(tx.type === 'send' ? tx.to : tx.from)?.slice(0, 12)}...{(tx.type === 'send' ? tx.to : tx.from)?.slice(-8)}
+                      </Text>
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              ))
+            )}
+          </ScrollView>
+        );
+
       case 'node':
         return (
           <ScrollView 
@@ -4952,6 +5386,16 @@ const WalletScreen = () => {
         </TouchableOpacity>
         
         <TouchableOpacity 
+          style={[styles.tab, activeTab === 'history' && styles.activeTab]}
+          onPress={() => {
+            setActiveTab('history');
+            loadTxHistory(); // Refresh history when tab opened
+          }}
+        >
+          <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]}>History</Text>
+        </TouchableOpacity>
+        
+        <TouchableOpacity 
           style={[styles.tab, activeTab === 'node' && styles.activeTab]}
           onPress={() => {
             setActiveTab('node');
@@ -5363,6 +5807,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     padding: 20,
     backgroundColor: '#0f0f1a', // Same as container for consistency
+  },
+  formContent: {
+    flexGrow: 1,
+    justifyContent: 'flex-start',
+    alignItems: 'center',
+    padding: 20,
+    paddingTop: 80,
+    backgroundColor: '#0f0f1a',
   },
   content: {
     flex: 1,

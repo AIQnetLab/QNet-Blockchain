@@ -6,15 +6,8 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import messaging from '@react-native-firebase/messaging';
 import BackgroundFetch from 'react-native-background-fetch';
-
-// Bootstrap node URLs
-const BOOTSTRAP_NODES = [
-  'http://154.38.160.39:8001',
-  'http://62.171.157.44:8001',
-  'http://161.97.86.81:8001',
-  'http://5.189.130.160:8001',
-  'http://162.244.25.114:8001',
-];
+// v3.35: Centralized node configuration (no duplication!)
+import { GENESIS_NODES, getRandomGenesisNode } from '../config/nodes';
 
 // Push types
 export const PushType = {
@@ -25,9 +18,10 @@ export const PushType = {
 
 /**
  * Get random bootstrap node URL
+ * v3.35: Use centralized config
  */
 function getRandomBootstrapNode() {
-  return BOOTSTRAP_NODES[Math.floor(Math.random() * BOOTSTRAP_NODES.length)];
+  return getRandomGenesisNode();
 }
 
 /**
@@ -527,92 +521,108 @@ export async function initializePushService() {
 /**
  * Check Server node (Full/Super/Genesis) status
  * Used for monitoring server nodes from mobile app
+ * v3.35: Added retry logic with different nodes
  */
-export async function checkServerNodeStatus(activationCode, nodeId = null) {
-  try {
-    const apiUrl = getRandomBootstrapNode();
-    
-    // GENESIS NODE SUPPORT: Convert Genesis activation code to node_id
-    // Genesis codes: QNET-BOOT-001-STRAP → genesis_node_001
-    let queryParams = '';
-    const genesisMatch = activationCode?.match(/^QNET-BOOT-00([1-5])-STRAP$/);
-    
-    if (genesisMatch) {
-      // Genesis node: use node_id format for API query
-      const bootstrapId = genesisMatch[1].padStart(3, '0');
-      const genesisNodeId = `genesis_node_${bootstrapId}`;
-      console.log(`[Push] Genesis node detected: ${activationCode} → ${genesisNodeId}`);
-      queryParams = `node_id=${encodeURIComponent(genesisNodeId)}`;
-    } else if (nodeId) {
-      // If nodeId is provided directly, use it
-      console.log(`[Push] Using provided nodeId: ${nodeId}`);
-      queryParams = `node_id=${encodeURIComponent(nodeId)}`;
-    } else if (activationCode) {
-      queryParams = `activation_code=${encodeURIComponent(activationCode)}`;
-    } else {
-      return { success: false, error: 'activation_code or node_id required' };
-    }
-    
-    const url = `${apiUrl}/api/v1/node/status?${queryParams}`;
-    console.log(`[Push] Checking server node status: ${url}`);
-    
-    const response = await fetch(url, { method: 'GET' });
-
-    const result = await response.json();
-    console.log(`[Push] Server node status response:`, {
-      success: result.success,
-      node_id: result.node_id,
-      node_type: result.node_type,
-      is_online: result.is_online,
-      heartbeat_count: result.heartbeat_count,
-      required_heartbeats: result.required_heartbeats,
-      pending_rewards: result.pending_rewards,
-      pending_rewards_type: typeof result.pending_rewards,
-      is_reward_eligible: result.is_reward_eligible,
-      reputation: result.reputation,
-      error: result.error,
-      full_response: JSON.stringify(result).substring(0, 500)
-    });
-
-    if (result.success) {
-      // Calculate required heartbeats based on node type if not provided by server
-      let requiredHeartbeats = result.required_heartbeats;
-      if (!requiredHeartbeats && result.node_type) {
-        // v3.18: Full nodes removed
-        if (result.node_type === 'super') {
-          requiredHeartbeats = 9; // Super nodes: 9/10 (90%)
-        } else if (result.node_type === 'full') {
-          // v3.18: Full nodes removed - ignore old node type
-          requiredHeartbeats = 0; // Reject Full nodes
-        } else {
-          requiredHeartbeats = 8; // Default fallback
-        }
-      }
-      
-      return {
-        success: true,
-        nodeId: result.node_id,
-        nodeType: result.node_type,
-        isOnline: result.is_online,
-        lastSeen: result.last_seen,
-        lastSeenAgoSeconds: result.last_seen_ago_seconds,
-        heartbeatCount: result.heartbeat_count || 0,
-        requiredHeartbeats: requiredHeartbeats || (result.node_type === 'super' ? 9 : 8),
-        isRewardEligible: result.is_reward_eligible,
-        reputation: result.reputation,
-        currentBlockHeight: result.current_block_height,
-        needsAttention: result.needs_attention,
-        message: result.message,
-        // Rewards info (QNC tokens in smallest units)
-        pendingRewards: result.pending_rewards,
-      };
-    }
-
-    return { success: false, error: result.error || 'Unknown error' };
-  } catch (error) {
-    // Silent fail - network errors are expected when nodes are offline
-    return { success: false, error: error.message };
+export async function checkServerNodeStatus(activationCode, nodeId = null, maxRetries = 3) {
+  // GENESIS NODE SUPPORT: Convert Genesis activation code to node_id
+  // Genesis codes: QNET-BOOT-001-STRAP → genesis_node_001
+  let queryParams = '';
+  const genesisMatch = activationCode?.match(/^QNET-BOOT-00([1-5])-STRAP$/);
+  
+  if (genesisMatch) {
+    // Genesis node: use node_id format for API query
+    const bootstrapId = genesisMatch[1].padStart(3, '0');
+    const genesisNodeId = `genesis_node_${bootstrapId}`;
+    console.log(`[Push] Genesis node detected: ${activationCode} → ${genesisNodeId}`);
+    queryParams = `node_id=${encodeURIComponent(genesisNodeId)}`;
+  } else if (nodeId) {
+    // If nodeId is provided directly, use it
+    console.log(`[Push] Using provided nodeId: ${nodeId}`);
+    queryParams = `node_id=${encodeURIComponent(nodeId)}`;
+  } else if (activationCode) {
+    queryParams = `activation_code=${encodeURIComponent(activationCode)}`;
+  } else {
+    return { success: false, error: 'activation_code or node_id required' };
   }
+  
+  let lastError = null;
+  const triedNodes = new Set();
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      // v3.35: Get random node, avoid retrying same node
+      let apiUrl = getRandomBootstrapNode();
+      let retryCount = 0;
+      while (triedNodes.has(apiUrl) && retryCount < 5) {
+        apiUrl = getRandomBootstrapNode();
+        retryCount++;
+      }
+      triedNodes.add(apiUrl);
+      
+      const url = `${apiUrl}/api/v1/node/status?${queryParams}`;
+      console.log(`[Push] Checking server node status (attempt ${attempt + 1}): ${url}`);
+      
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+      
+      const response = await fetch(url, { 
+        method: 'GET',
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const result = await response.json();
+
+      if (result.success) {
+        // v3.35: ONLY Super/Genesis nodes are real nodes
+        // Light nodes = regular mobile app users (NOT nodes)
+        // Full nodes = REMOVED from project
+        
+        // Required heartbeats for NETWORK LIVENESS (NOT rewards!)
+        // This is P2P heartbeat for node health, not transaction validation
+        let requiredHeartbeats = result.required_heartbeats;
+        if (!requiredHeartbeats && result.node_type === 'super') {
+          requiredHeartbeats = 9; // Super nodes: 9/10 (90%) for network liveness
+        }
+        // NO FALLBACK - if node_type is not 'super', it's invalid
+        
+        return {
+          success: true,
+          nodeId: result.node_id,
+          nodeType: result.node_type,
+          isOnline: result.is_online,
+          lastSeen: result.last_seen,
+          lastSeenAgoSeconds: result.last_seen_ago_seconds,
+          heartbeatCount: result.heartbeat_count || 0,
+          requiredHeartbeats: requiredHeartbeats || 9, // Super nodes only
+          isRewardEligible: result.is_reward_eligible,
+          reputation: result.reputation, // BLOCKCHAIN reputation from DeterministicReputationState
+          currentBlockHeight: result.current_block_height,
+          needsAttention: result.needs_attention,
+          message: result.message,
+          // Rewards info (QNC tokens in smallest units)
+          pendingRewards: result.pending_rewards,
+        };
+      }
+
+      return { success: false, error: result.error || 'Unknown error' };
+    } catch (error) {
+      lastError = error;
+      // v3.35: Wait before retry (exponential backoff)
+      if (attempt < maxRetries - 1) {
+        await new Promise(r => setTimeout(r, (attempt + 1) * 500));
+      }
+    }
+  }
+  
+  // All retries failed
+  console.warn(`[Push] Server node status failed after ${maxRetries} retries:`, lastError?.message);
+  return { success: false, error: lastError?.message || 'Network error' };
 }
 
 // NOTE: WebSocket support can be added later for real-time updates

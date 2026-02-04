@@ -11154,20 +11154,15 @@ impl SimplifiedP2P {
                             from_peer
                         };
                         
-                        // Convert IP to node_id using EXISTING logic
-                        // FAST PATH: Check Genesis nodes first (O(1))
-                        match sender_ip {
-                            "154.38.160.39" => "genesis_node_001".to_string(),
-                            "62.171.157.44" => "genesis_node_002".to_string(),
-                            "161.97.86.81" => "genesis_node_003".to_string(),
-                            "5.189.130.160" => "genesis_node_004".to_string(),
-                            "162.244.25.114" => "genesis_node_005".to_string(),
-                            _ => {
-                                // Non-Genesis node: use privacy ID
-                                // PRODUCTION: All nodes should send explicit sender_node_id
-                                // This fallback only for Genesis nodes with public IPs
-                                get_privacy_id_for_addr(sender_ip)
-                            }
+                        // Convert IP to node_id - NO DUPLICATION!
+                        // Use genesis_constants for single source of truth
+                        use crate::genesis_constants::get_genesis_id_by_ip;
+                        if let Some(bootstrap_id) = get_genesis_id_by_ip(sender_ip) {
+                            format!("genesis_node_{}", bootstrap_id)
+                        } else {
+                            // Non-Genesis node: use privacy ID
+                            // PRODUCTION: All nodes should send explicit sender_node_id
+                            get_privacy_id_for_addr(sender_ip)
                         }
                     };
                     

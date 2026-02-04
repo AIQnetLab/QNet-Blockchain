@@ -143,6 +143,12 @@ pub enum TransactionType {
         wallet_address: String,
         /// For Genesis: "genesis", For activated: activation_code hash, For Light: device signature hash
         registration_proof: String,
+        /// v3.35: Public API endpoint for mobile app discovery
+        /// Super/Genesis: IP is PUBLIC by default (auto-detected from connection)
+        /// Set to empty string "" to explicitly HIDE your IP
+        /// Light nodes: always empty (privacy protection - mobile apps!)
+        #[serde(default)]
+        api_endpoint: String,
     },
     
     /// Create new account
@@ -836,7 +842,7 @@ impl Transaction {
                 // Note: Full validation (decompression + popcount) done at MacroBlock collection
                 // Here we only do basic sanity checks for TX acceptance
             }
-            TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } => {
+            TransactionType::NodeRegistration { node_id, node_type, wallet_address, api_endpoint, .. } => {
                 // System transaction: validate node registration data
                 if node_id.is_empty() {
                     return Err("Node ID cannot be empty".to_string());
@@ -844,8 +850,24 @@ impl Transaction {
                 if wallet_address.is_empty() {
                     return Err("Wallet address cannot be empty".to_string());
                 }
-                // node_type is validated by enum
-                let _ = node_type; // Explicitly mark as used
+                // SECURITY: Light nodes MUST have empty api_endpoint (privacy protection!)
+                // Light nodes = mobile apps, their IP must NEVER be exposed!
+                if *node_type == NodeType::Light && !api_endpoint.is_empty() {
+                    return Err("Light nodes cannot have api_endpoint (mobile privacy)".to_string());
+                }
+                // Validate api_endpoint format if present (non-empty = public)
+                if !api_endpoint.is_empty() {
+                    if !api_endpoint.starts_with("http://") && !api_endpoint.starts_with("https://") {
+                        return Err("api_endpoint must start with http:// or https://".to_string());
+                    }
+                    // Block private IPs (SSRF protection)
+                    let ep_lower = api_endpoint.to_lowercase();
+                    if ep_lower.contains("localhost") || ep_lower.contains("127.0.0.1") ||
+                       ep_lower.contains("192.168.") || ep_lower.contains("10.0.") {
+                        return Err("api_endpoint must be a public IP, not localhost/private".to_string());
+                    }
+                }
+                // Empty api_endpoint = node chose to hide IP (valid for Super nodes)
             }
         }
         

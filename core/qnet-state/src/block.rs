@@ -74,6 +74,19 @@ pub struct MicroBlock {
     /// v3.18: Credited directly to producer's wallet, not pooled
     #[serde(default)]
     pub fees_collected: u64,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.27: STATE ROOT - TOP L1 PATTERN
+    // Root hash of the state Merkle tree AFTER applying all transactions + fees
+    // Enables state verification: all nodes must compute identical state_root
+    // If computed root != block.state_root → REJECT block as invalid!
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// State Merkle root after applying this block
+    /// Computed as: apply_transactions() → credit_fees() → finalize_merkle()
+    /// Validators MUST verify: computed_root == block.state_root
+    #[serde(default)]
+    pub state_root: [u8; 32],
 }
 
 /// Macroblock structure - consensus blocks that finalize microblocks
@@ -382,6 +395,14 @@ pub struct EfficientMicroBlock {
     /// Total transaction fees collected in this block (nanoQNC)
     #[serde(default)]
     pub fees_collected: u64,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.27: STATE ROOT
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// State Merkle root after applying all transactions and fees
+    #[serde(default)]
+    pub state_root: [u8; 32],
 }
 
 /// Light microblock header for mobile nodes
@@ -791,6 +812,8 @@ impl MicroBlock {
             vrf_proof: None,
             // v3.18: Direct fee collection (default 0)
             fees_collected: 0,
+            // v3.27: State root (computed after applying TX + fees)
+            state_root: [0u8; 32],
         }
     }
     
@@ -882,6 +905,8 @@ impl EfficientMicroBlock {
             vrf_proof: None,
             // v3.18: fees_collected for producer rewards
             fees_collected: 0,
+            // v3.27: state_root (computed after applying TX + fees)
+            state_root: [0u8; 32],
         }
     }
     
@@ -932,6 +957,8 @@ impl EfficientMicroBlock {
             vrf_proof: microblock.vrf_proof.clone(),
             // v3.18: Copy fees_collected from source microblock
             fees_collected: microblock.fees_collected,
+            // v3.27: Copy state_root from source microblock
+            state_root: microblock.state_root,
         }
     }
     

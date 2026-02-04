@@ -7,6 +7,7 @@ use std::path::Path;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hex;
 use sha3::{Sha3_256, Digest};
 use bincode;
@@ -14,6 +15,106 @@ use futures;
 use serde_json::{json, Value};
 use serde::{Serialize, Deserialize};
 use chrono;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROLLBACK PROTECTION v3.23: Prevent race condition between rollback and block save
+// ═══════════════════════════════════════════════════════════════════════════════
+// Problem: During rollback, parallel block receive can overwrite chain_height
+// Solution: Atomic flag + target height to block saves during rollback
+// Architecture: Lock-free design for maximum throughput (no mutex contention)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Flag indicating rollback is in progress - blocks with height > target will be rejected
+static ROLLBACK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Target height for rollback - blocks above this will not be saved
+static ROLLBACK_TARGET_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Timestamp when rollback started (for timeout protection)
+static ROLLBACK_START_TIME: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum rollback duration in seconds (prevents deadlock if rollback hangs)
+const ROLLBACK_TIMEOUT_SECS: u64 = 60;
+
+/// Start rollback protection - call BEFORE deleting blocks
+/// Returns false if another rollback is already in progress
+pub fn start_rollback_protection(target_height: u64) -> bool {
+    // Check if rollback is already in progress
+    if ROLLBACK_IN_PROGRESS.load(Ordering::Acquire) {
+        let start_time = ROLLBACK_START_TIME.load(Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        
+        // Allow new rollback if previous one timed out
+        if now - start_time < ROLLBACK_TIMEOUT_SECS {
+            println!("[WARN][ROLLBACK] Another rollback in progress, target={}", 
+                     ROLLBACK_TARGET_HEIGHT.load(Ordering::Relaxed));
+            return false;
+        }
+        println!("[WARN][ROLLBACK] Previous rollback timed out, forcing new rollback");
+    }
+    
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    
+    ROLLBACK_TARGET_HEIGHT.store(target_height, Ordering::Release);
+    ROLLBACK_START_TIME.store(now, Ordering::Release);
+    ROLLBACK_IN_PROGRESS.store(true, Ordering::Release);
+    
+    println!("[INFO][ROLLBACK] protection_started target_height={}", target_height);
+    true
+}
+
+/// End rollback protection - call AFTER rollback is complete
+pub fn end_rollback_protection() {
+    let target = ROLLBACK_TARGET_HEIGHT.load(Ordering::Relaxed);
+    ROLLBACK_IN_PROGRESS.store(false, Ordering::Release);
+    println!("[INFO][ROLLBACK] protection_ended target_was={}", target);
+}
+
+/// Check if a block at given height can be saved (not blocked by rollback)
+/// Returns true if save is allowed, false if blocked
+pub fn can_save_block(height: u64) -> bool {
+    if !ROLLBACK_IN_PROGRESS.load(Ordering::Acquire) {
+        return true;
+    }
+    
+    let target = ROLLBACK_TARGET_HEIGHT.load(Ordering::Acquire);
+    
+    // Allow saves at or below target height (these are valid blocks)
+    if height <= target {
+        return true;
+    }
+    
+    // Check for timeout
+    let start_time = ROLLBACK_START_TIME.load(Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    
+    if now - start_time >= ROLLBACK_TIMEOUT_SECS {
+        // Rollback timed out - allow save and clear flag
+        println!("[WARN][ROLLBACK] timeout_expired allowing_save height={}", height);
+        ROLLBACK_IN_PROGRESS.store(false, Ordering::Release);
+        return true;
+    }
+    
+    // Block save - rollback in progress
+    false
+}
+
+/// Get current rollback status for logging/debugging
+pub fn get_rollback_status() -> (bool, u64) {
+    (
+        ROLLBACK_IN_PROGRESS.load(Ordering::Relaxed),
+        ROLLBACK_TARGET_HEIGHT.load(Ordering::Relaxed)
+    )
+}
 
 /// Failover event for tracking producer failures
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1154,6 +1255,16 @@ impl PersistentStorage {
     }
     
     pub fn save_microblock(&self, height: u64, data: &[u8]) -> IntegrationResult<()> {
+        // v3.23: Check rollback protection before saving
+        // This prevents race condition where parallel block receive overwrites rollback
+        if !can_save_block(height) {
+            let (in_progress, target) = get_rollback_status();
+            println!("[WARN][STORAGE] block_save_blocked h={} rollback_in_progress={} target={}", 
+                     height, in_progress, target);
+            // Return Ok to avoid error propagation - block will be re-requested after rollback
+            return Ok(());
+        }
+        
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
         let metadata_cf = self.db.cf_handle("metadata")
@@ -1165,8 +1276,11 @@ impl PersistentStorage {
         let mut batch = WriteBatch::default();
         batch.put_cf(&microblocks_cf, key.as_bytes(), data);
         
-        // CRITICAL FIX: Update chain height when saving microblock
-        batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
+        // Update chain height - but only if not in rollback or height <= target
+        // Double-check protection in case of race between check and write
+        if can_save_block(height) {
+            batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
+        }
         
         self.db.write(batch)?;
         Ok(())
@@ -2654,6 +2768,19 @@ impl Storage {
     
     pub fn save_microblock(&self, height: u64, data: &[u8]) -> IntegrationResult<()> {
         // =====================================================================
+        // v3.23: ROLLBACK PROTECTION - Check before any save operation
+        // =====================================================================
+        // Prevents race condition where parallel block receive overwrites rollback.
+        // During rollback, blocks with height > target are silently skipped.
+        // They will be re-requested after rollback completes.
+        // =====================================================================
+        if !can_save_block(height) {
+            let (in_progress, target) = get_rollback_status();
+            println!("[WARN][STORAGE] block_save_blocked h={} rollback_target={}", height, target);
+            return Ok(()); // Silently skip - will be re-synced
+        }
+        
+        // =====================================================================
         // TIERED STORAGE + GRACEFUL DEGRADATION (v2.19.9)
         // =====================================================================
         // This method now includes:
@@ -2830,6 +2957,8 @@ impl Storage {
             vrf_proof: microblock.vrf_proof.clone(),
             // v3.18: Copy fees_collected for producer rewards
             fees_collected: microblock.fees_collected,
+            // v3.27: State root for verification
+            state_root: microblock.state_root,
         };
         
         // Step 3: Save PoH state separately for fast validation (v2.19.13)
@@ -3346,6 +3475,8 @@ impl Storage {
                         vrf_proof: efficient_block.vrf_proof,
                         // v3.18: Direct fee collection
                         fees_collected: efficient_block.fees_collected,
+                        // v3.27: State root for verification
+                        state_root: efficient_block.state_root,
                     };
                     
                     // Serialize as full MicroBlock for network transmission
@@ -3519,6 +3650,8 @@ impl Storage {
                 vrf_proof: efficient_block.vrf_proof,
                 // v3.18: fees_collected for producer rewards
                 fees_collected: efficient_block.fees_collected,
+                // v3.27: state_root for state verification
+                state_root: efficient_block.state_root,
             };
             
             return Ok(Some(microblock));
@@ -4579,7 +4712,8 @@ impl Storage {
     // SCALABILITY: NODE REGISTRY IN ROCKSDB
     // ============================================
     
-    /// Save node registration information
+    /// Save node registration information (for local cache only)
+    /// NOTE: api_endpoint is now stored ON-CHAIN in NodeRegistration TX!
     pub fn save_node_registration(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64) -> IntegrationResult<()> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
