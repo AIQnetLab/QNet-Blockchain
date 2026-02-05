@@ -3,7 +3,7 @@
 //! v3.26: Added atomic fee crediting protection (race condition fix)
 //! v3.39: Block snapshot for state_root mismatch recovery (rare error case)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, BTreeMap};
 use std::sync::Arc;
 use dashmap::DashMap;
 use parking_lot::RwLock as ParkingRwLock;
@@ -79,8 +79,11 @@ pub struct StateMerkleTree {
     /// Root hash (may be stale if dirty=true)
     root: [u8; HASH_SIZE],
     /// Stored account hashes (address_hash -> account_data_hash)
-    /// v3.39: Made pub(crate) for StateSnapshot access
-    pub(crate) leaves: HashMap<[u8; HASH_SIZE], [u8; HASH_SIZE]>,
+    /// v3.40: CRITICAL FIX - Changed from HashMap to BTreeMap!
+    /// HashMap uses RandomState with random seed per instance
+    /// This caused non-deterministic iteration order -> different state_root
+    /// BTreeMap sorts keys -> deterministic iteration -> identical state_root
+    pub(crate) leaves: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]>,
     /// Pre-computed default hashes for each level
     default_hashes: Vec<[u8; HASH_SIZE]>,
     /// v3.39: Dirty flag for lazy root computation
@@ -111,7 +114,7 @@ impl StateMerkleTree {
         
         Self {
             root: default_hashes[TREE_DEPTH],
-            leaves: HashMap::new(),
+            leaves: BTreeMap::new(),  // v3.40: BTreeMap for deterministic iteration
             default_hashes,
             dirty: false,
             pending_updates: 0,
@@ -333,7 +336,8 @@ impl StateMerkleTree {
         
         for depth in 0..TREE_DEPTH {
             let default = self.default_hashes[depth];
-            let mut next_level: HashMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> = HashMap::new();
+            // v3.40: BTreeMap for deterministic iteration order
+            let mut next_level: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> = BTreeMap::new();
             let mut processed: std::collections::HashSet<[u8; HASH_SIZE]> = std::collections::HashSet::new();
             
             for (key, value) in current_level.iter() {
