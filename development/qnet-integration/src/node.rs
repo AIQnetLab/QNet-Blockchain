@@ -19806,6 +19806,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             hasher.update(&microblock.height.to_le_bytes());
             hasher.update(&microblock.timestamp.to_le_bytes());
             hasher.update(&microblock.merkle_root);
+            // v3.37: Include state_root in verification (must match creation)
+            hasher.update(&microblock.state_root);
             hasher.update(b"qnet_genesis_block_2024");
             let expected_signature = hasher.finalize().to_vec();
             
