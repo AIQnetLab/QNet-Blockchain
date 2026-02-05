@@ -141,6 +141,14 @@ impl StateMerkleTree {
     pub fn insert_lazy(&mut self, address: &str, account: &Account) {
         let addr_hash = Self::hash_address(address);
         let account_hash = Self::hash_account(account);
+        
+        // v3.40: Diagnostic log for first account (to debug state_root mismatch)
+        if self.leaves.is_empty() {
+            println!("[DBG][MERKLE] first_account addr={} bal={} nonce={} addr_hash={} acct_hash={}",
+                     &address[..20.min(address.len())], account.balance, account.nonce,
+                     hex::encode(&addr_hash[..8]), hex::encode(&account_hash[..8]));
+        }
+        
         self.leaves.insert(addr_hash, account_hash);
         self.dirty = true;
         self.pending_updates += 1;
@@ -169,7 +177,8 @@ impl StateMerkleTree {
             self.dirty = false;
             self.pending_updates = 0;
             if updates > 0 {
-                println!("[INF][MERKLE] state_root_finalized updates={} leaves={}", updates, self.leaves.len());
+                println!("[INF][MERKLE] state_root_finalized updates={} leaves={} root={}", 
+                         updates, self.leaves.len(), hex::encode(&self.root[..8]));
             }
         }
         self.root
@@ -357,10 +366,14 @@ impl StateMerkleTree {
                 let mut parent_hash = [0u8; HASH_SIZE];
                 parent_hash.copy_from_slice(&result);
                 
-                // Clear the bit at depth to get actual parent key
+                // v3.40: CRITICAL FIX - Parent key must have bit CLEARED (set to 0)
+                // NOT flipped! Both siblings must map to SAME parent.
+                // Old code: only flipped for is_right, causing inconsistent parent keys
                 let mut actual_parent = *key;
-                if is_right {
-                    Self::flip_bit(&mut actual_parent, depth);
+                let byte_idx = depth / 8;
+                let bit_idx = 7 - (depth % 8);
+                if byte_idx < HASH_SIZE {
+                    actual_parent[byte_idx] &= !(1 << bit_idx);  // CLEAR bit, not flip!
                 }
                 
                 next_level.insert(actual_parent, parent_hash);
