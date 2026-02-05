@@ -879,16 +879,26 @@ impl StateManager {
     
     /// v3.39: Rollback entire block using snapshot
     /// Used ONLY when state_root verification fails after all TXs applied
+    /// CRITICAL: Must also reset Merkle tree to match snapshot accounts!
     pub fn rollback_block(&self, snapshot: &BlockSnapshot) {
+        // 1. Clear and restore accounts
         self.accounts.clear();
         for (address, account) in snapshot.accounts() {
             self.accounts.insert(address.clone(), account.clone());
         }
-        // Mark Merkle as dirty for recomputation
-        let mut tree = self.merkle_tree.write();
-        tree.dirty = true;
         
-        println!("[INFO][STATE] block_rollback h={} accounts={}", 
+        // 2. CRITICAL FIX: Reset Merkle tree completely and rebuild from snapshot
+        // Without this, leaves from failed attempt would corrupt future calculations!
+        let mut tree = self.merkle_tree.write();
+        *tree = StateMerkleTree::new();  // Reset to empty tree
+        
+        // 3. Rebuild Merkle tree from snapshot accounts
+        for (address, account) in snapshot.accounts() {
+            tree.insert_lazy(address, account);
+        }
+        // Tree is now dirty and will be finalized on next finalize_merkle() call
+        
+        println!("[INFO][STATE] block_rollback h={} accounts={} merkle_reset=true", 
                  snapshot.height(), snapshot.accounts().len());
     }
     
