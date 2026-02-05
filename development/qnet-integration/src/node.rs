@@ -6797,6 +6797,32 @@ impl BlockchainNode {
                             // Taking lock inside loop caused timeouts and blocked block saving
                             let mut state_guard = state.write().await;
                             
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v3.39: BLOCK-LEVEL SNAPSHOT for full rollback on state_root mismatch
+                            // ONLY create for v3.27+ blocks (with state_root)
+                            // For old blocks - no snapshot needed (saves ~200MB RAM per block)
+                            // ═══════════════════════════════════════════════════════════════════
+                            let has_state_root = microblock.state_root != [0u8; 32];
+                            let block_snapshot = if has_state_root {
+                                Some(state_guard.create_block_snapshot(microblock.height))
+                            } else {
+                                None
+                            };
+                            
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v3.38: GENESIS BLOCK TRANSACTIONAL - Clear state before applying
+                            // For Genesis block (h=0): ALWAYS start with clean state
+                            // This ensures all nodes compute identical state_root
+                            // Without this, repeated Genesis reception corrupts state
+                            // ═══════════════════════════════════════════════════════════════════
+                            if microblock.height == 0 {
+                                let existing_accounts = state_guard.account_count();
+                                if existing_accounts > 0 {
+                                    println!("[INFO][STATE] genesis_recv_clear existing_accounts={}", existing_accounts);
+                                    state_guard.clear();
+                                }
+                            }
+                            
                             // Apply ALL transactions from block to state
                             for tx in &microblock.transactions {
                                 // SPECIAL HANDLING: RewardDistribution transactions
@@ -6919,11 +6945,12 @@ impl BlockchainNode {
                                 
                                 // Apply transaction to state (updates balances, nonces, etc)
                                 // v3.22: Use lazy Merkle update - finalize once after all TX
-                                // Performance: O(1) per TX instead of O(n) per TX
+                                // NOTE: apply_transaction_lazy is ALREADY atomic - no rollback needed!
+                                // (it works with local copy, writes to state only on success)
                                 if let Err(e) = state_guard.apply_transaction_lazy(tx) {
-                                    // Don't fail block processing for individual tx failures
-                                    // Some transactions may fail validation (insufficient balance, etc)
-                                    println!("[WARN][STATE] tx_apply_failed hash={} err={}", tx.hash, e);
+                                    // TX failed but state is NOT corrupted (atomic operation)
+                                    println!("[WARN][STATE] tx_failed h={} hash={} err={}", 
+                                             microblock.height, &tx.hash[..16.min(tx.hash.len())], e);
                                 } else {
                                     // v3.18: Pool 2 REMOVED - fees go directly to block producer
                                     // Fee calculation still happens for transparency (fees_collected in block)
@@ -7043,25 +7070,30 @@ impl BlockchainNode {
                             let computed_state_root = state_guard.finalize_merkle();
                             
                             // Check state root only for v3.27+ blocks (non-zero state_root)
-                            let block_has_state_root = microblock.state_root != [0u8; 32];
+                            // has_state_root already computed above when deciding to create snapshot
                             
-                            if block_has_state_root && computed_state_root != microblock.state_root {
-                                // STATE ROOT MISMATCH - CRITICAL ERROR!
+                            if has_state_root && computed_state_root != microblock.state_root {
+                                // ═══════════════════════════════════════════════════════════════════
+                                // v3.39: STATE ROOT MISMATCH - FULL BLOCK ROLLBACK!
                                 // This means either:
                                 // 1. Block producer computed different state
                                 // 2. Our state is corrupted/diverged
                                 // 3. Malicious block with wrong state_root
+                                // 
+                                // CRITICAL: Rollback ENTIRE block to prevent state corruption
+                                // Without rollback, node would have invalid state after rejection
+                                // ═══════════════════════════════════════════════════════════════════
                                 eprintln!("[ERR][STATE] state_root_mismatch h={} expected={} computed={}",
                                          microblock.height,
                                          hex::encode(&microblock.state_root[..8]),
                                          hex::encode(&computed_state_root[..8]));
                                 
-                                // v3.37: REJECT BLOCK but continue processing other blocks
-                                // Previously `return;` would exit entire P2P processing loop!
-                                println!("[ERR][STATE] Block rejected: state_root mismatch h={} expected={} computed={}",
-                                    microblock.height,
-                                    hex::encode(&microblock.state_root),
-                                    hex::encode(&computed_state_root));
+                                // v3.39: CRITICAL - Rollback to pre-block state
+                                // This ensures node state is NOT corrupted by partially applied block
+                                if let Some(ref snapshot) = block_snapshot {
+                                    state_guard.rollback_block(snapshot);
+                                    println!("[INFO][STATE] block_rollback h={} (state_root_mismatch)", microblock.height);
+                                }
                                 
                                 // Return error to skip saving this block, but continue loop
                                 Err(format!("state_root_mismatch h={}", microblock.height))

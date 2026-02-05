@@ -28,6 +28,8 @@ pub use errors::{StateError, StateResult};
 pub use state::{StateManager as State, MAX_QNC_SUPPLY, MAX_QNC_SUPPLY_NANO, StateMerkleTree, BalanceProof};
 // v3.26: Atomic fee crediting protection
 pub use state::{should_credit_fees, clear_credited_fees_cache, credited_fees_count};
+// v3.39: Block-level snapshot for state_root mismatch recovery
+pub use state::BlockSnapshot;
 
 #[cfg(feature = "python")]
 pub use python_bindings::*;

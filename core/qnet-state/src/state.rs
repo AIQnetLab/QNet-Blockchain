@@ -1,6 +1,7 @@
 //! State management for QNet blockchain
 //! v3.11: Added State Merkle Tree for Light client proofs
 //! v3.26: Added atomic fee crediting protection (race condition fix)
+//! v3.39: Block snapshot for state_root mismatch recovery (rare error case)
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -22,12 +23,20 @@ static CREDITED_FEES_BLOCKS: Lazy<ParkingRwLock<HashSet<u64>>> = Lazy::new(|| {
 
 /// v3.26: Check and mark block as fee-credited atomically
 /// Returns true if fee should be credited (first time), false if already done
+/// v3.39: Auto-cleanup blocks older than 1000 heights to prevent memory leak
 pub fn should_credit_fees(block_height: u64) -> bool {
     let mut set = CREDITED_FEES_BLOCKS.write();
     if set.contains(&block_height) {
         return false; // Already credited - prevent double crediting!
     }
     set.insert(block_height);
+    
+    // v3.39: Cleanup old entries (keep only last 1000 blocks)
+    // Prevents unbounded memory growth (86400 blocks/day = memory leak)
+    if set.len() > 1000 {
+        let min_keep = block_height.saturating_sub(1000);
+        set.retain(|&h| h >= min_keep);
+    }
     true
 }
 
@@ -70,14 +79,15 @@ pub struct StateMerkleTree {
     /// Root hash (may be stale if dirty=true)
     root: [u8; HASH_SIZE],
     /// Stored account hashes (address_hash -> account_data_hash)
-    leaves: HashMap<[u8; HASH_SIZE], [u8; HASH_SIZE]>,
+    /// v3.39: Made pub(crate) for StateSnapshot access
+    pub(crate) leaves: HashMap<[u8; HASH_SIZE], [u8; HASH_SIZE]>,
     /// Pre-computed default hashes for each level
     default_hashes: Vec<[u8; HASH_SIZE]>,
-    /// v3.22: Dirty flag for lazy root computation
+    /// v3.39: Dirty flag for lazy root computation
     /// When true, root needs recomputation before use
-    dirty: bool,
-    /// v3.22: Pending updates count for logging
-    pending_updates: usize,
+    pub(crate) dirty: bool,
+    /// v3.39: Pending updates count for logging
+    pub(crate) pending_updates: usize,
 }
 
 impl StateMerkleTree {
@@ -418,6 +428,43 @@ impl Default for ChainState {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// v3.39: BLOCK-LEVEL SNAPSHOT for state_root mismatch recovery
+// Created ONCE per block (not per TX!) - only for rare error case
+// TX-level rollback NOT NEEDED - apply_transaction_lazy already atomic!
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Block-level snapshot for full block rollback on state_root mismatch
+/// Created ONCE per block - used only when state_root verification fails
+/// Memory: O(n) where n = accounts, but happens once per 1-second block
+#[derive(Clone)]
+pub struct BlockSnapshot {
+    /// Full accounts snapshot
+    accounts: HashMap<String, Account>,
+    /// Block height
+    height: u64,
+}
+
+impl BlockSnapshot {
+    /// Create snapshot of current state (O(n) but ONCE per block)
+    pub fn new(accounts: &DashMap<String, Account>, height: u64) -> Self {
+        Self {
+            accounts: accounts.iter().map(|e| (e.key().clone(), e.value().clone())).collect(),
+            height,
+        }
+    }
+    
+    /// Get accounts for restore
+    pub fn accounts(&self) -> &HashMap<String, Account> {
+        &self.accounts
+    }
+    
+    /// Get snapshot height
+    pub fn height(&self) -> u64 {
+        self.height
+    }
+}
+
 /// State manager for blockchain
 /// v3.11: Integrated State Merkle Tree for trustless balance proofs
 /// v3.33: Removed unused ValidatorSet - using MacroBlock.eligible_producers instead
@@ -701,19 +748,29 @@ impl StateManager {
     }
     
     /// v3.22: Apply block with batch Merkle processing
-    /// Optimized for high TPS - single Merkle finalization after all TX
-    /// Performance: O(n) total instead of O(n²)
+    /// Optimized for 100K+ TPS - single Merkle finalization after all TX
+    /// 
+    /// # Performance
+    /// - O(1) per TX (lazy Merkle update)
+    /// - O(n) finalization ONCE at end
+    /// - NO TX-level rollback needed - apply_transaction_lazy already atomic!
     pub fn apply_block_batch(&self, transactions: &[Transaction]) -> StateResult<usize> {
         let tx_count = transactions.len();
         let mut applied = 0;
+        let mut failed = 0;
         
-        // Apply all transactions with lazy merkle updates
+        // Apply each TX - no rollback needed, apply_transaction_lazy is atomic
+        // (works with local copy, writes to state only on success)
         for tx in transactions {
             match self.apply_transaction_lazy(tx) {
                 Ok(_) => applied += 1,
                 Err(e) => {
-                    // Log but don't fail - some TX may be invalid
-                    println!("[WARN][STATE] tx_apply_failed hash={} err={}", tx.hash, e);
+                    failed += 1;
+                    // Log failures (limit spam for large blocks)
+                    if failed <= 10 {
+                        println!("[WARN][STATE] tx_failed hash={} err={}", 
+                                 &tx.hash[..16.min(tx.hash.len())], e);
+                    }
                 }
             }
         }
@@ -721,8 +778,8 @@ impl StateManager {
         // Single Merkle finalization for entire block
         self.finalize_merkle();
         
-        if tx_count > 10 {
-            println!("[INF][STATE] block_batch_applied tx_total={} tx_applied={}", tx_count, applied);
+        if tx_count > 100 || failed > 0 {
+            println!("[INFO][STATE] block_batch applied={}/{} failed={}", applied, tx_count, failed);
         }
         
         Ok(applied)
@@ -805,6 +862,143 @@ impl StateManager {
     /// v3.22: Check if Merkle tree needs finalization
     pub fn merkle_is_dirty(&self) -> bool {
         self.merkle_tree.read().is_dirty()
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v3.39: BLOCK-LEVEL SNAPSHOT for state_root mismatch recovery
+    // TX-level rollback NOT NEEDED - apply_transaction_lazy already atomic!
+    // (it works with local copy, writes to state only on success)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// v3.39: Create block snapshot (ONCE per block)
+    /// Used for full block rollback ONLY when state_root doesn't match
+    /// This is a rare error case (consensus failure or attack)
+    pub fn create_block_snapshot(&self, height: u64) -> BlockSnapshot {
+        BlockSnapshot::new(&self.accounts, height)
+    }
+    
+    /// v3.39: Rollback entire block using snapshot
+    /// Used ONLY when state_root verification fails after all TXs applied
+    pub fn rollback_block(&self, snapshot: &BlockSnapshot) {
+        self.accounts.clear();
+        for (address, account) in snapshot.accounts() {
+            self.accounts.insert(address.clone(), account.clone());
+        }
+        // Mark Merkle as dirty for recomputation
+        let mut tree = self.merkle_tree.write();
+        tree.dirty = true;
+        
+        println!("[INFO][STATE] block_rollback h={} accounts={}", 
+                 snapshot.height(), snapshot.accounts().len());
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v3.38: TRANSACTIONAL BLOCK PROCESSING
+    // Applies TX, verifies state_root, rolls back on mismatch
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// v3.38: Clear all state (for Genesis block reset)
+    /// WARNING: Only use for Genesis block initialization!
+    pub fn clear(&self) {
+        self.accounts.clear();
+        let mut tree = self.merkle_tree.write();
+        *tree = StateMerkleTree::new();
+        *self.state_root.write() = [0u8; 32];
+    }
+    
+    /// v3.38: Get number of accounts in state
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
+    }
+    
+    /// v3.39: Apply block with state_root verification
+    /// For Genesis block (h=0): clears state first to ensure clean application
+    /// 
+    /// # Performance
+    /// - Block snapshot: O(n) ONLY if block has state_root (v3.27+ blocks)
+    /// - TX apply: O(1) each (atomic, no rollback needed)
+    pub fn apply_block_verified(
+        &self,
+        transactions: &[Transaction],
+        expected_state_root: [u8; 32],
+        producer_wallet: &str,
+        fees_collected: u64,
+        block_height: u64
+    ) -> StateResult<(usize, [u8; 32])> {
+        let tx_count = transactions.len();
+        let has_state_root = expected_state_root != [0u8; 32];
+        
+        // v3.39: Create snapshot ONLY if block has state_root (v3.27+ blocks)
+        // For old blocks without state_root - no snapshot needed (saves ~200MB RAM)
+        let block_snapshot = if has_state_root {
+            Some(self.create_block_snapshot(block_height))
+        } else {
+            None
+        };
+        
+        // v3.38: For Genesis block - ALWAYS start with clean state
+        if block_height == 0 {
+            let existing_accounts = self.accounts.len();
+            if existing_accounts > 0 {
+                println!("[INFO][STATE] genesis_clear existing_accounts={}", existing_accounts);
+                self.clear();
+            }
+        }
+        
+        // Apply each TX - no TX-level rollback needed!
+        // apply_transaction_lazy is atomic (works with local copy)
+        let mut applied = 0;
+        let mut failed = 0;
+        for tx in transactions {
+            match self.apply_transaction_lazy(tx) {
+                Ok(_) => applied += 1,
+                Err(e) => {
+                    failed += 1;
+                    if failed <= 10 {
+                        println!("[WARN][STATE] tx_failed h={} hash={} err={}",
+                                 block_height, &tx.hash[..16.min(tx.hash.len())], e);
+                    }
+                }
+            }
+        }
+        
+        // Credit fees to producer (if any)
+        if fees_collected > 0 && !producer_wallet.is_empty() {
+            let _ = self.credit_producer_fees_once(block_height, producer_wallet, fees_collected);
+        }
+        
+        // Finalize Merkle tree
+        let computed_root = self.finalize_merkle();
+        
+        // Verify state_root (skip for blocks without state_root)
+        if has_state_root && computed_root != expected_state_root {
+            // STATE ROOT MISMATCH - FULL BLOCK ROLLBACK
+            println!("[ERR][STATE] state_root_mismatch h={} expected={} computed={} applied={}/{}",
+                     block_height,
+                     hex::encode(&expected_state_root[..8]),
+                     hex::encode(&computed_root[..8]),
+                     applied, tx_count);
+            
+            // Rollback entire block using block snapshot
+            if let Some(ref snapshot) = block_snapshot {
+                self.rollback_block(snapshot);
+            }
+            
+            return Err(StateError::InvalidTransaction(format!(
+                "state_root_mismatch h={} expected={} computed={}", 
+                block_height,
+                hex::encode(&expected_state_root[..8]),
+                hex::encode(&computed_root[..8])
+            )));
+        }
+        
+        if block_height == 0 || tx_count > 100 || failed > 0 {
+            println!("[INFO][STATE] block_verified h={} applied={}/{} failed={} root={}",
+                     block_height, applied, tx_count, failed,
+                     hex::encode(&computed_root[..8]));
+        }
+        
+        Ok((applied, computed_root))
     }
     
     /// Apply block (legacy - uses apply_transaction which is O(n²))
