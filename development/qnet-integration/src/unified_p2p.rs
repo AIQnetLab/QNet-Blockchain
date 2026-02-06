@@ -758,6 +758,28 @@ static EMPTY_RESPONSE_TRACKER: Lazy<Arc<DashMap<String, (u32, u64)>>> =
 static INVALID_CERT_TRACKER: Lazy<Arc<DashMap<String, (std::sync::atomic::AtomicU64, std::time::Instant)>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
 
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// BFT TIMEOUT CONSENSUS v4.0: Deterministic failover without system clock dependency
+// ARCHITECTURE: Replaces NTP-based timeout with Byzantine consensus voting
+// Key: (height, timeout_round) -> collected votes
+// When 2/3+ votes collected, TimeoutCertificate is generated
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+/// Collected timeout votes per (height, round)
+/// Key: (height, timeout_round), Value: HashMap<voter_id, (signature, last_block_hash)>
+static TIMEOUT_VOTES: Lazy<Arc<DashMap<(u64, u64), HashMap<String, (Vec<u8>, [u8; 32])>>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Generated timeout certificates (cached for block validation)
+/// Key: (height, timeout_round), Value: TimeoutCertificate
+static TIMEOUT_CERTIFICATES: Lazy<Arc<DashMap<(u64, u64), TimeoutCertificate>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Track which heights we've already voted for timeout (prevent double-voting)
+/// Key: height, Value: timeout_round we voted for
+static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
 /// Check if QUIC fallback is allowed for given node (rate limiting)
 /// Returns true if request is allowed, false if rate limited
 pub fn quic_fallback_rate_check(node_id: &str) -> bool {
@@ -4025,21 +4047,42 @@ impl SimplifiedP2P {
                 });
                 let invalid_cert_removed = invalid_cert_before.saturating_sub(INVALID_CERT_TRACKER.len());
                 
+                // v4.0: Cleanup TIMEOUT_VOTES, TIMEOUT_CERTIFICATES, TIMEOUT_VOTED_HEIGHTS
+                // Retain only last 100 blocks worth of timeout data
+                let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                let min_height = current_height.saturating_sub(100);
+                
+                let timeout_votes_before = TIMEOUT_VOTES.len();
+                TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_height);
+                let timeout_votes_removed = timeout_votes_before.saturating_sub(TIMEOUT_VOTES.len());
+                
+                let timeout_certs_before = TIMEOUT_CERTIFICATES.len();
+                TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_height);
+                let timeout_certs_removed = timeout_certs_before.saturating_sub(TIMEOUT_CERTIFICATES.len());
+                
+                let timeout_voted_before = TIMEOUT_VOTED_HEIGHTS.len();
+                TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
+                let timeout_voted_removed = timeout_voted_before.saturating_sub(TIMEOUT_VOTED_HEIGHTS.len());
+                
+                let timeout_total_removed = timeout_votes_removed + timeout_certs_removed + timeout_voted_removed;
+                
                 // Log if anything was cleaned
-                let total_removed = retry_removed + fallback_removed + pending_sync_removed + pending_macro_removed + empty_response_removed + invalid_cert_removed;
+                let total_removed = retry_removed + fallback_removed + pending_sync_removed + pending_macro_removed + empty_response_removed + invalid_cert_removed + timeout_total_removed;
                 if total_removed > 0 {
-                    println!("[INFO][CACHE_CLEANUP] peer_retry={} quic_fallback={} pending_sync={} pending_macro={} empty_resp={} invalid_cert={}", 
-                             retry_removed, fallback_removed, pending_sync_removed, pending_macro_removed, empty_response_removed, invalid_cert_removed);
+                    println!("[INFO][CACHE_CLEANUP] peer_retry={} quic_fallback={} pending_sync={} pending_macro={} empty_resp={} invalid_cert={} timeout={}", 
+                             retry_removed, fallback_removed, pending_sync_removed, pending_macro_removed, empty_response_removed, invalid_cert_removed, timeout_total_removed);
                 }
                 
                 // Log current sizes for monitoring (only if significant)
                 let total_size = PEER_RETRY_COOLDOWN.len() + QUIC_FALLBACK_RATE_LIMITER.len() + 
                                  PENDING_SYNC_BLOCKS.len() + PENDING_SYNC_MACROBLOCKS.len() +
-                                 EMPTY_RESPONSE_TRACKER.len() + INVALID_CERT_TRACKER.len();
+                                 EMPTY_RESPONSE_TRACKER.len() + INVALID_CERT_TRACKER.len() +
+                                 TIMEOUT_VOTES.len() + TIMEOUT_CERTIFICATES.len() + TIMEOUT_VOTED_HEIGHTS.len();
                 if total_size > 100 {
-                    println!("[WARN][CACHE_SIZE] peer_retry={} quic_fallback={} pending_sync={} pending_macro={}", 
+                    println!("[WARN][CACHE_SIZE] peer_retry={} quic_fallback={} pending_sync={} pending_macro={} timeout_votes={} timeout_certs={}", 
                              PEER_RETRY_COOLDOWN.len(), QUIC_FALLBACK_RATE_LIMITER.len(), 
-                             PENDING_SYNC_BLOCKS.len(), PENDING_SYNC_MACROBLOCKS.len());
+                             PENDING_SYNC_BLOCKS.len(), PENDING_SYNC_MACROBLOCKS.len(),
+                             TIMEOUT_VOTES.len(), TIMEOUT_CERTIFICATES.len());
                 }
             }
         });
@@ -10428,6 +10471,39 @@ pub enum NetworkMessage {
         timestamp: u64,
         signature: String,  // v2.48: Dilithium signature for Byzantine safety
     },
+    
+    /// BFT Timeout Vote - deterministic failover without system time dependency
+    /// v4.0: Replaces NTP-based timeout with Byzantine consensus voting
+    /// When 2/3+ validators vote for timeout at (height, round), producer changes
+    TimeoutVote {
+        height: u64,              // Block height awaiting production
+        timeout_round: u64,       // Failover round (1, 2, 3...)
+        voter_id: String,         // Node voting for timeout
+        last_block_hash: Vec<u8>, // Hash of last known block (proves sync state) - 32 bytes
+        signature: Vec<u8>,       // Dilithium signature over vote data
+    },
+    
+    /// BFT Timeout Certificate - broadcast when 2/3+ votes collected
+    /// v4.0: Enables new/reconnecting nodes to sync timeout state
+    TimeoutCertificateBroadcast {
+        height: u64,
+        timeout_round: u64,
+        last_block_hash: Vec<u8>,
+        votes: Vec<(String, Vec<u8>)>, // (voter_id, signature) pairs
+    },
+    
+    /// Request timeout certificates for sync (new/reconnecting nodes)
+    RequestTimeoutCertificates {
+        from_height: u64,
+        to_height: u64,
+        requester_id: String,
+    },
+    
+    /// Response with timeout certificates
+    TimeoutCertificatesResponse {
+        certificates: Vec<(u64, u64, Vec<u8>, Vec<(String, Vec<u8>)>)>, // (height, round, hash, votes)
+        sender_id: String,
+    },
 
     /// Emergency producer change notification
     EmergencyProducerChange {
@@ -10734,7 +10810,40 @@ pub enum ConsensusMessage {
         timestamp: u64,
         signature: String,  // v2.48: Dilithium signature for Byzantine safety
     },
+    /// BFT Timeout Vote - deterministic failover without system time dependency
+    /// v4.0: Replaces NTP-based timeout with Byzantine consensus voting
+    TimeoutVote {
+        height: u64,              // Block height awaiting production
+        timeout_round: u64,       // Failover round (1, 2, 3...)
+        voter_id: String,         // Node voting for timeout
+        last_block_hash: [u8; 32], // Hash of last known block (proves sync state)
+        signature: Vec<u8>,       // Dilithium signature over vote data
+    },
 }
+
+/// BFT Timeout Proof - collection of 2/3+ signed votes
+/// ARCHITECTURE: No separate "certificate" - the votes themselves ARE the proof
+/// Each vote is signed with Dilithium, so 2/3+ votes = cryptographic proof
+/// This is simpler than a separate certificate and equally secure
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TimeoutProof {
+    pub height: u64,              // Block height for which timeout occurred
+    pub timeout_round: u64,       // Which failover round (1 = first backup, 2 = second, etc.)
+    pub last_block_hash: [u8; 32], // Hash of previous block (all voters must agree)
+    pub votes: Vec<SignedTimeoutVote>, // 2/3+ signed votes = proof
+}
+
+/// Individual signed timeout vote
+/// SECURITY: Each vote is independently verifiable via Dilithium signature
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SignedTimeoutVote {
+    pub voter_id: String,         // Node ID of voter
+    pub signature: Vec<u8>,       // Dilithium signature over "TIMEOUT:{height}:{round}:{hash}"
+}
+
+// Legacy alias for compatibility
+pub type TimeoutCertificate = TimeoutProof;
+pub type TimeoutVoteData = SignedTimeoutVote;
 
 /// Block received from P2P network for processing
 #[derive(Debug, Clone)]
@@ -11070,6 +11179,41 @@ impl SimplifiedP2P {
                     self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, nonce, timestamp, signature);
                 }
                 // Silently ignore microblock reveals - they don't need consensus
+            }
+            
+            // BFT Timeout Vote - v4.0 deterministic failover
+            NetworkMessage::TimeoutVote { height, timeout_round, voter_id, last_block_hash, signature } => {
+                self.update_peer_last_seen(&voter_id);
+                if crate::node::is_debug() { 
+                    println!("[DBG][TIMEOUT] vote_recv h={} round={} voter={}", height, timeout_round, voter_id); 
+                }
+                
+                // Process timeout vote and check if certificate is ready
+                self.handle_timeout_vote(height, timeout_round, voter_id, last_block_hash, signature);
+            }
+            
+            // BFT Timeout Proof received from network
+            NetworkMessage::TimeoutCertificateBroadcast { height, timeout_round, last_block_hash, votes } => {
+                if crate::node::is_info() {
+                    println!("[INFO][TIMEOUT] proof_recv h={} round={} votes={}", height, timeout_round, votes.len());
+                }
+                self.handle_timeout_proof_broadcast(height, timeout_round, last_block_hash, votes);
+            }
+            
+            // Request for timeout proofs (sync)
+            NetworkMessage::RequestTimeoutCertificates { from_height, to_height, requester_id } => {
+                if crate::node::is_debug() {
+                    println!("[DBG][TIMEOUT] proof_request h={}..{} from={}", from_height, to_height, requester_id);
+                }
+                self.handle_timeout_proof_request(from_height, to_height, &requester_id, from_peer);
+            }
+            
+            // Response with timeout proofs
+            NetworkMessage::TimeoutCertificatesResponse { certificates, sender_id } => {
+                if crate::node::is_debug() {
+                    println!("[DBG][TIMEOUT] proof_response count={} from={}", certificates.len(), sender_id);
+                }
+                self.handle_timeout_proof_response(certificates);
             }
 
             NetworkMessage::ShredProtocolChunk { chunk } => {
@@ -11571,7 +11715,7 @@ impl SimplifiedP2P {
                     // Perform cryptographic verification
                     match quantum_crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_sig, &cert.node_id).await {
                         Ok(true) => {
-                            println!("[P2P] ✅ Certificate {} cryptographically verified", cert_serial_clone);
+                            println!("[INFO][CERT] verified serial={} node={}", cert_serial_clone, cert.node_id);
                             
                             // COMPATIBILITY: Check certificate history to ensure smooth rotation
                             let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
@@ -11580,9 +11724,19 @@ impl SimplifiedP2P {
                             let is_compatible = if let Some(history) = cert_manager.certificate_history.get(&cert.node_id) {
                                 // This node has rotated certificates before
                                 if !history.is_empty() {
+                                    // FIX v3.41: Check if this is a DUPLICATE certificate (same serial already in history)
+                                    // This happens when nodes broadcast the same certificate multiple times
+                                    // Duplicate != Rotation - no need for rotation_signature
+                                    let is_duplicate = history.iter().any(|(serial, _)| serial == &cert_serial_clone);
+                                    
+                                    if is_duplicate {
+                                        // Same certificate received again - just accept it
+                                        println!("[DBG][CERT] duplicate_accepted serial={} node={}", cert_serial_clone, cert.node_id);
+                                        true
+                                    } else {
+                                    // This is ACTUAL rotation - different certificate serial
                                     let prev_count = history.len();
-                                    println!("[P2P] 🔄 Certificate rotation detected for {} (history: {} certs)", 
-                                             cert.node_id, prev_count);
+                                    println!("[INFO][CERT] rotation_detected node={} history_count={}", cert.node_id, prev_count);
                                     
                                     // PRODUCTION: Verify rotation signature with previous key
                                     // MANDATORY: All certificate rotations MUST be signed by the previous key
@@ -11604,53 +11758,53 @@ impl SimplifiedP2P {
                                                                 // Verify that new key is signed by old key
                                                                 match prev_verifying_key.verify(&cert.ed25519_public_key, &signature) {
                                                                     Ok(_) => {
-                                                                        println!("[P2P] ✅ Rotation signature verified - chain of trust maintained");
+                                                                        println!("[INFO][CERT] rotation_verified node={} chain_of_trust=ok", cert.node_id);
                                                                         true
                                                                     }
                                                                     Err(_) => {
-                                                                        println!("[P2P] ❌ SECURITY: Rotation signature INVALID - rejecting certificate");
-                                                                        println!("[P2P] 🚨 Potential attack: unauthorized key rotation attempt");
+                                                                        println!("[WARN][CERT] rotation_invalid node={} reason=signature_mismatch", cert.node_id);
+                                                                        println!("[WARN][SECURITY] unauthorized_rotation_attempt node={}", cert.node_id);
                                                                         false
                                                                     }
                                                                 }
                                                             }
                                                             Err(_) => {
-                                                                println!("[P2P] ⚠️ Failed to parse previous Ed25519 key");
+                                                                println!("[WARN][CERT] rotation_failed node={} reason=invalid_prev_key", cert.node_id);
                                                                 false
                                                             }
                                                         }
                                                     }
                                                     Err(_) => {
-                                                        println!("[P2P] ⚠️ Failed to parse rotation signature");
+                                                        println!("[WARN][CERT] rotation_failed node={} reason=invalid_signature_format", cert.node_id);
                                                         false
                                                     }
                                                 }
                                             }
                                             _ => {
-                                                println!("[P2P] ⚠️ Invalid rotation signature format");
+                                                println!("[WARN][CERT] rotation_failed node={} reason=invalid_sig_bytes", cert.node_id);
                                                 false
                                             }
                                         }
                                     } else {
                                         // PRODUCTION: No rotation signature - MANDATORY for rotations
                                         // This is a critical security requirement to prevent unauthorized key takeover
-                                        println!("[P2P] ❌ SECURITY: Certificate rotation WITHOUT signature - REJECTING!");
-                                        println!("[P2P] 🚨 ATTACK DETECTED: Attempting rotation without proof of previous key ownership");
-                                        println!("[P2P] 🔐 All rotations MUST be signed by previous key to maintain chain of trust");
+                                        println!("[WARN][CERT] rotation_rejected node={} reason=missing_signature", cert.node_id);
+                                        println!("[WARN][SECURITY] rotation_without_proof node={}", cert.node_id);
                                         false
                                     }
+                                    }  // end of is_duplicate else block
                                 } else {
                                     // Empty history but node exists - should not happen
-                                    println!("[P2P] ⚠️ Node has empty certificate history - accepting");
+                                    println!("[WARN][CERT] empty_history node={} action=accept", cert.node_id);
                                     true
                                 }
                             } else {
                                 // First certificate from this node
-                                println!("[P2P] 🆕 First certificate from node {}", cert.node_id);
+                                println!("[INFO][CERT] first_certificate node={}", cert.node_id);
                                 
                                 // First certificate should NOT have rotation signature
                                 if cert.rotation_signature.is_some() {
-                                    println!("[P2P] ⚠️ First certificate has rotation signature - suspicious but accepting");
+                                    println!("[WARN][CERT] first_cert_has_rotation_sig node={} action=accept", cert.node_id);
                                 }
                                 true
                             };
@@ -11671,26 +11825,25 @@ impl SimplifiedP2P {
                                 // This prevents race condition where cert is in neither cache
                                 cert_manager.store_remote_certificate(cert_serial_clone.clone(), certificate_clone);
                                 cert_manager.pending_certificates.remove(&cert_serial_clone);
-                                println!("[P2P] ✅ Certificate moved from PENDING to VERIFIED cache");
+                                println!("[INFO][CERT] stored serial={} status=verified", cert_serial_clone);
                                 
                                 // FIX v2.28: Signal retry loop that new certificate is available
                                 // This triggers immediate retry of buffered blocks
                                 crate::node::NEW_CERTIFICATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             } else {
-                                println!("[P2P] ❌ Certificate rotation incompatible - rejecting");
+                                println!("[WARN][CERT] rejected serial={} reason=rotation_incompatible", cert_serial_clone);
                                 // Remove from pending without storing
                                 cert_manager.pending_certificates.remove(&cert_serial_clone);
                             }
                         }
                         Ok(false) => {
-                            println!("[P2P] ❌ Certificate {} has INVALID signature from {}", 
-                                     cert_serial_clone, node_id_clone);
-                            println!("[P2P] 🚨 SECURITY: Potential attack - invalid certificate rejected");
+                            println!("[WARN][CERT] invalid_signature serial={} from={}", cert_serial_clone, node_id_clone);
+                            println!("[WARN][SECURITY] potential_attack type=invalid_cert from={}", node_id_clone);
                             
                             // CRITICAL: Remove invalid certificate from pending cache
                             let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             cert_manager.pending_certificates.remove(&cert_serial_clone);
-                            println!("[INFO][P2P] cert_removed reason=invalid");
+                            println!("[INFO][CERT] removed serial={} reason=invalid", cert_serial_clone);
                             
                             // Apply reputation penalty
                             if let Ok(mut rep) = reputation_system_clone.lock() {
@@ -11698,12 +11851,12 @@ impl SimplifiedP2P {
                             }
                         }
                         Err(e) => {
-                            println!("[P2P] ❌ Certificate verification error: {}", e);
+                            println!("[ERR][CERT] verification_error serial={} err={}", cert_serial_clone, e);
                             
                             // Remove failed certificate from pending cache
                             let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             cert_manager.pending_certificates.remove(&cert_serial_clone);
-                            println!("[INFO][P2P] cert_removed reason=failed");
+                            println!("[INFO][CERT] removed serial={} reason=verification_failed", cert_serial_clone);
                         }
                     }
                     
@@ -11717,7 +11870,7 @@ impl SimplifiedP2P {
                         cert_manager.pending_certificates.retain(|_, (_, timestamp, _)| {
                             now - *timestamp < 300 // Remove pending certs older than 5 minutes
                         });
-                        println!("[P2P] 🧹 Cleaned expired pending certificates");
+                        println!("[INFO][CERT] cleanup_expired pending_ttl=300s");
                     }
                 });
             }
@@ -11727,13 +11880,13 @@ impl SimplifiedP2P {
                 let handle = match tokio::runtime::Handle::try_current() {
                     Ok(h) => h,
                     Err(_) => {
-                        println!("[P2P] ⚠️ WARN: No Tokio runtime - certificate request skipped");
+                        println!("[WARN][CERT] no_runtime action=skip_request");
                         return;
                     }
                 };
 
                 self.update_peer_last_seen(&requester_id);
-                println!("[P2P] 📋 Certificate request from {} for {}", requester_id, cert_serial);
+                println!("[DBG][CERT] request_received from={} serial={}", requester_id, cert_serial);
                 
                 // Check if we have the certificate and send response
                 // MUST use write lock to track usage_count for proper LRU
@@ -11741,7 +11894,7 @@ impl SimplifiedP2P {
                 if let Some(certificate) = cert_manager.get_and_mark_used(&cert_serial) {
                     drop(cert_manager); // Release lock before network operations
                     
-                    println!("[P2P] ✅ Sending certificate {} to {}", cert_serial, requester_id);
+                    println!("[INFO][CERT] sending serial={} to={}", cert_serial, requester_id);
                     
                     // PRODUCTION: Send response back via network
                     let response = NetworkMessage::CertificateResponse {
@@ -16048,6 +16201,10 @@ impl SimplifiedP2P {
     ///         next call picked same peer again → deadlock
     pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), String> {
         
+        // v4.0: Also request timeout proofs for this range (BFT Timeout Protocol)
+        // This ensures syncing nodes get all necessary data for producer validation
+        self.request_timeout_proofs(from_height, to_height);
+        
         let peers = self.get_validated_active_peers();
         if peers.is_empty() {
             return Err("No peers available for sync".to_string());
@@ -18640,6 +18797,642 @@ impl SimplifiedP2P {
         // Round ID should correspond to macroblock height (every 90 blocks)
         // If round_id is divisible by 90, it's a macroblock consensus round
         round_id > 0 && (round_id % 90 == 0)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // BFT TIMEOUT CONSENSUS v4.0: Deterministic failover without system clock dependency
+    // ARCHITECTURE: When 2/3+ validators vote for timeout, generate TimeoutCertificate
+    // This replaces NTP-based delay calculation with Byzantine agreement
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    
+    /// Handle incoming timeout vote from peer
+    /// SECURITY: Verifies Dilithium signature before accepting vote
+    fn handle_timeout_vote(&self, height: u64, timeout_round: u64, voter_id: String, 
+                           last_block_hash: Vec<u8>, signature: Vec<u8>) {
+        // Validate vote data
+        if last_block_hash.len() != 32 {
+            if crate::node::is_warn() {
+                println!("[WARN][TIMEOUT] vote_invalid_hash h={} voter={} hash_len={}", 
+                         height, voter_id, last_block_hash.len());
+            }
+            return;
+        }
+        
+        // Convert to fixed array
+        let mut hash_arr = [0u8; 32];
+        hash_arr.copy_from_slice(&last_block_hash);
+        
+        // SECURITY: Verify Dilithium signature
+        // Vote message format: "TIMEOUT:{height}:{round}:{hash_hex}"
+        let vote_msg = format!("TIMEOUT:{}:{}:{}", height, timeout_round, hex::encode(&hash_arr));
+        if !self.verify_timeout_vote_signature(&voter_id, &vote_msg, &signature) {
+            if crate::node::is_warn() {
+                println!("[WARN][TIMEOUT] vote_sig_invalid h={} voter={}", height, voter_id);
+            }
+            return;
+        }
+        
+        // Check if we already have proof for this (height, round)
+        if TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round)) {
+            if crate::node::is_debug() {
+                println!("[DBG][TIMEOUT] proof_exists h={} round={} ignoring_vote", height, timeout_round);
+            }
+            return;
+        }
+        
+        // Get total validator count for Byzantine threshold calculation
+        let total_validators = self.get_active_validator_count();
+        let byzantine_threshold = (total_validators * 2 + 2) / 3; // 2/3+
+        
+        // Add vote to collection
+        let votes_count = {
+            let mut entry = TIMEOUT_VOTES.entry((height, timeout_round)).or_insert_with(HashMap::new);
+            
+            // Check for conflicting vote (different hash from same voter)
+            if let Some((_, existing_hash)) = entry.get(&voter_id) {
+                if *existing_hash != hash_arr {
+                    if crate::node::is_warn() {
+                        println!("[WARN][TIMEOUT] vote_equivocation h={} voter={}", height, voter_id);
+                    }
+                    // SLASHABLE: Equivocation detected - voter sent different hashes
+                    self.report_timeout_equivocation(&voter_id, height, timeout_round);
+                    return;
+                }
+                // Duplicate vote with same hash - ignore silently
+                return;
+            }
+            
+            entry.insert(voter_id.clone(), (signature.clone(), hash_arr));
+            entry.len()
+        };
+        
+        if crate::node::is_info() {
+            println!("[INFO][TIMEOUT] vote_collected h={} round={} voter={} count={}/{}", 
+                     height, timeout_round, voter_id, votes_count, byzantine_threshold);
+        }
+        
+        // Check if we have enough votes for proof
+        if votes_count >= byzantine_threshold {
+            self.generate_and_broadcast_timeout_proof(height, timeout_round, hash_arr);
+        }
+    }
+    
+    /// Verify timeout vote signature using node's Dilithium public key
+    fn verify_timeout_vote_signature(&self, voter_id: &str, message: &str, signature: &[u8]) -> bool {
+        // Get voter's public key from certificate manager or blockchain
+        // For now, use consensus signature verification which already handles this
+        self.verify_consensus_signature(voter_id, message, &hex::encode(signature))
+    }
+    
+    /// Report timeout equivocation for potential slashing
+    fn report_timeout_equivocation(&self, voter_id: &str, height: u64, round: u64) {
+        // Evidence for future slashing implementation
+        if crate::node::is_warn() {
+            println!("[WARN][SLASH] timeout_equivocation voter={} h={} round={}", voter_id, height, round);
+        }
+        // TODO: Add to slashing evidence queue for inclusion in next macroblock
+    }
+    
+    /// Generate and broadcast TimeoutProof when 2/3+ votes collected
+    /// ARCHITECTURE: Proof = collection of signed votes, no separate signature needed
+    fn generate_and_broadcast_timeout_proof(&self, height: u64, timeout_round: u64, last_block_hash: [u8; 32]) {
+        // Get all votes for this (height, round)
+        let votes = match TIMEOUT_VOTES.get(&(height, timeout_round)) {
+            Some(v) => v.clone(),
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][TIMEOUT] proof_gen_no_votes h={} round={}", height, timeout_round);
+                }
+                return;
+            }
+        };
+        
+        // Build signed vote list
+        let signed_votes: Vec<SignedTimeoutVote> = votes.iter()
+            .map(|(voter_id, (sig, _))| SignedTimeoutVote {
+                voter_id: voter_id.clone(),
+                signature: sig.clone(),
+            })
+            .collect();
+        
+        let proof = TimeoutProof {
+            height,
+            timeout_round,
+            last_block_hash,
+            votes: signed_votes.clone(),
+        };
+        
+        // Store proof locally
+        TIMEOUT_CERTIFICATES.insert((height, timeout_round), proof);
+        
+        if crate::node::is_info() {
+            println!("[INFO][TIMEOUT] proof_generated h={} round={} votes={}", 
+                     height, timeout_round, votes.len());
+        }
+        
+        // CRITICAL: Broadcast proof to all nodes (for sync/new nodes)
+        self.broadcast_timeout_proof(height, timeout_round, last_block_hash, signed_votes);
+        
+        // Notify local node about proof availability
+        if let Some(ref tx) = self.consensus_tx {
+            let msg = ConsensusMessage::TimeoutVote {
+                height,
+                timeout_round,
+                voter_id: "PROOF_READY".to_string(),
+                last_block_hash,
+                signature: vec![],
+            };
+            let _ = tx.send(msg);
+        }
+    }
+    
+    /// Broadcast timeout proof to all connected nodes
+    /// ARCHITECTURE: Same as broadcast_certificate_announce_tracked - parallel with retries
+    fn broadcast_timeout_proof(&self, height: u64, timeout_round: u64, 
+                               last_block_hash: [u8; 32], votes: Vec<SignedTimeoutVote>) {
+        let msg = NetworkMessage::TimeoutCertificateBroadcast {
+            height,
+            timeout_round,
+            last_block_hash: last_block_hash.to_vec(),
+            votes: votes.iter().map(|v| (v.voter_id.clone(), v.signature.clone())).collect(),
+        };
+        
+        // Get runtime handle
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        
+        let peers = self.get_all_validator_addresses();
+        let total_peers = peers.len();
+        
+        if total_peers == 0 {
+            return;
+        }
+        
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        let success_count = Arc::new(AtomicUsize::new(0));
+        
+        if crate::node::is_info() {
+            println!("[INFO][TIMEOUT] proof_broadcast h={} round={} peers={}", height, timeout_round, total_peers);
+        }
+        
+        // Spawn parallel broadcast task
+        handle.spawn(async move {
+            use futures::future::join_all;
+            
+            let mut tasks = Vec::with_capacity(total_peers);
+            
+            for peer_addr in peers {
+                // Skip peers in cooldown
+                if let Some(entry) = PEER_RETRY_COOLDOWN.get(&peer_addr) {
+                    let (_, cooldown_until) = entry.value();
+                    if std::time::Instant::now() < *cooldown_until {
+                        continue;
+                    }
+                }
+                
+                let msg_clone = msg.clone();
+                let quic_transport_clone = quic_transport.clone();
+                let success_count_clone = Arc::clone(&success_count);
+                let peer_addr_clone = peer_addr.clone();
+                
+                let task = tokio::spawn(async move {
+                    if quic_enabled {
+                        if let Some(ref transport) = quic_transport_clone {
+                            let parts: Vec<&str> = peer_addr_clone.split(':').collect();
+                            if let Some(ip) = parts.first() {
+                                let quic_addr_str = format!("{}:10876", ip);
+                                if let Ok(quic_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
+                                    let t = transport.read().await;
+                                    
+                                    match t.send_message(quic_addr, &msg_clone).await {
+                                        Ok(_) => {
+                                            success_count_clone.fetch_add(1, Ordering::SeqCst);
+                                            PEER_RETRY_COOLDOWN.remove(&peer_addr_clone);
+                                        }
+                                        Err(_) => {
+                                            // Apply exponential backoff
+                                            let (retry_count, _) = PEER_RETRY_COOLDOWN
+                                                .get(&peer_addr_clone)
+                                                .map(|e| *e.value())
+                                                .unwrap_or((0, std::time::Instant::now()));
+                                            
+                                            let new_retry_count = retry_count + 1;
+                                            let backoff_secs = std::cmp::min(
+                                                PEER_COOLDOWN_BASE_SECS * (1 << new_retry_count.min(4)),
+                                                PEER_COOLDOWN_MAX_SECS
+                                            );
+                                            let cooldown_until = std::time::Instant::now() + 
+                                                std::time::Duration::from_secs(backoff_secs);
+                                            
+                                            PEER_RETRY_COOLDOWN.insert(peer_addr_clone, (new_retry_count, cooldown_until));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                tasks.push(task);
+            }
+            
+            // Adaptive timeout based on network size
+            let timeout_secs = if total_peers <= 10 { 3 } else if total_peers <= 100 { 5 } else { 10 };
+            let timeout = tokio::time::Duration::from_secs(timeout_secs);
+            
+            match tokio::time::timeout(timeout, join_all(tasks)).await {
+                Ok(_) => {
+                    let successful = success_count.load(Ordering::SeqCst);
+                    if crate::node::is_info() {
+                        println!("[INFO][TIMEOUT] proof_delivered {}/{} peers", successful, total_peers);
+                    }
+                }
+                Err(_) => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][TIMEOUT] proof_broadcast_timeout");
+                    }
+                }
+            }
+        });
+    }
+    
+    /// Create and broadcast timeout vote for specified height/round
+    /// signature: Pre-computed hybrid signature from node's quantum_crypto
+    pub fn broadcast_timeout_vote(&self, height: u64, timeout_round: u64, 
+                                   last_block_hash: [u8; 32], signature: Vec<u8>) {
+        // Check if we already voted for this height
+        if let Some(voted_round) = TIMEOUT_VOTED_HEIGHTS.get(&height) {
+            if *voted_round >= timeout_round {
+                if crate::node::is_debug() {
+                    println!("[DBG][TIMEOUT] already_voted h={} round={}", height, timeout_round);
+                }
+                return;
+            }
+        }
+        
+        // Mark as voted
+        TIMEOUT_VOTED_HEIGHTS.insert(height, timeout_round);
+        
+        // Broadcast to all validators
+        let msg = NetworkMessage::TimeoutVote {
+            height,
+            timeout_round,
+            voter_id: self.node_id.clone(),
+            last_block_hash: last_block_hash.to_vec(),
+            signature,
+        };
+        
+        if crate::node::is_info() {
+            println!("[INFO][TIMEOUT] vote_broadcast h={} round={}", height, timeout_round);
+        }
+        
+        // ARCHITECTURE: Parallel broadcast with retries (same as certificate broadcast)
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        
+        let peers = self.get_all_validator_addresses();
+        let total_peers = peers.len();
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        let success_count = Arc::new(AtomicUsize::new(0));
+        
+        handle.spawn(async move {
+            use futures::future::join_all;
+            
+            let mut tasks = Vec::with_capacity(total_peers);
+            
+            for peer_addr in peers {
+                // Skip peers in cooldown
+                if let Some(entry) = PEER_RETRY_COOLDOWN.get(&peer_addr) {
+                    let (_, cooldown_until) = entry.value();
+                    if std::time::Instant::now() < *cooldown_until {
+                        continue;
+                    }
+                }
+                
+                let msg_clone = msg.clone();
+                let quic_transport_clone = quic_transport.clone();
+                let success_count_clone = Arc::clone(&success_count);
+                let peer_addr_clone = peer_addr.clone();
+                
+                let task = tokio::spawn(async move {
+                    if quic_enabled {
+                        if let Some(ref transport) = quic_transport_clone {
+                            let parts: Vec<&str> = peer_addr_clone.split(':').collect();
+                            if let Some(ip) = parts.first() {
+                                let quic_addr_str = format!("{}:10876", ip);
+                                if let Ok(quic_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
+                                    let t = transport.read().await;
+                                    
+                                    match t.send_message(quic_addr, &msg_clone).await {
+                                        Ok(_) => {
+                                            success_count_clone.fetch_add(1, Ordering::SeqCst);
+                                            PEER_RETRY_COOLDOWN.remove(&peer_addr_clone);
+                                        }
+                                        Err(_) => {
+                                            // Exponential backoff
+                                            let (retry_count, _) = PEER_RETRY_COOLDOWN
+                                                .get(&peer_addr_clone)
+                                                .map(|e| *e.value())
+                                                .unwrap_or((0, std::time::Instant::now()));
+                                        
+                                        let new_retry_count = retry_count + 1;
+                                        let backoff_secs = std::cmp::min(
+                                            PEER_COOLDOWN_BASE_SECS * (1 << new_retry_count.min(4)),
+                                            PEER_COOLDOWN_MAX_SECS
+                                        );
+                                        let cooldown_until = std::time::Instant::now() + 
+                                            std::time::Duration::from_secs(backoff_secs);
+                                        
+                                            PEER_RETRY_COOLDOWN.insert(peer_addr_clone, (new_retry_count, cooldown_until));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                tasks.push(task);
+            }
+            
+            // Adaptive timeout
+            let timeout_secs = if total_peers <= 10 { 2 } else if total_peers <= 100 { 3 } else { 5 };
+            let timeout = tokio::time::Duration::from_secs(timeout_secs);
+            
+            let _ = tokio::time::timeout(timeout, join_all(tasks)).await;
+        });
+    }
+    
+    /// Get current timeout proof if available
+    pub fn get_timeout_certificate(&self, height: u64, timeout_round: u64) -> Option<TimeoutProof> {
+        TIMEOUT_CERTIFICATES.get(&(height, timeout_round)).map(|v| v.clone())
+    }
+    
+    /// Check if timeout proof exists for given height/round
+    pub fn has_timeout_certificate(&self, height: u64, timeout_round: u64) -> bool {
+        TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round))
+    }
+    
+    /// Handle incoming timeout proof broadcast
+    /// SECURITY: Verifies all signatures before accepting
+    fn handle_timeout_proof_broadcast(&self, height: u64, timeout_round: u64, 
+                                       last_block_hash: Vec<u8>, votes: Vec<(String, Vec<u8>)>) {
+        // Skip if we already have this proof
+        if TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round)) {
+            return;
+        }
+        
+        if last_block_hash.len() != 32 {
+            if crate::node::is_warn() {
+                println!("[WARN][TIMEOUT] proof_invalid_hash h={} round={}", height, timeout_round);
+            }
+            return;
+        }
+        
+        let mut hash_arr = [0u8; 32];
+        hash_arr.copy_from_slice(&last_block_hash);
+        
+        // Verify Byzantine threshold
+        let total_validators = self.get_active_validator_count();
+        let byzantine_threshold = (total_validators * 2 + 2) / 3;
+        
+        if votes.len() < byzantine_threshold {
+            if crate::node::is_warn() {
+                println!("[WARN][TIMEOUT] proof_insufficient_votes h={} round={} votes={} need={}", 
+                         height, timeout_round, votes.len(), byzantine_threshold);
+            }
+            return;
+        }
+        
+        // Verify each signature
+        let vote_msg = format!("TIMEOUT:{}:{}:{}", height, timeout_round, hex::encode(&hash_arr));
+        let mut verified_votes = Vec::new();
+        
+        for (voter_id, signature) in &votes {
+            if self.verify_timeout_vote_signature(voter_id, &vote_msg, signature) {
+                verified_votes.push(SignedTimeoutVote {
+                    voter_id: voter_id.clone(),
+                    signature: signature.clone(),
+                });
+            } else {
+                if crate::node::is_warn() {
+                    println!("[WARN][TIMEOUT] proof_bad_sig h={} voter={}", height, voter_id);
+                }
+            }
+        }
+        
+        // Must have 2/3+ valid signatures
+        if verified_votes.len() < byzantine_threshold {
+            if crate::node::is_warn() {
+                println!("[WARN][TIMEOUT] proof_not_enough_valid h={} verified={} need={}", 
+                         height, verified_votes.len(), byzantine_threshold);
+            }
+            return;
+        }
+        
+        // Store valid proof
+        let proof = TimeoutProof {
+            height,
+            timeout_round,
+            last_block_hash: hash_arr,
+            votes: verified_votes,
+        };
+        
+        TIMEOUT_CERTIFICATES.insert((height, timeout_round), proof);
+        
+        if crate::node::is_info() {
+            println!("[INFO][TIMEOUT] proof_accepted h={} round={}", height, timeout_round);
+        }
+    }
+    
+    /// Handle request for timeout proofs (for syncing nodes)
+    fn handle_timeout_proof_request(&self, from_height: u64, to_height: u64, 
+                                     requester_id: &str, requester_addr: &str) {
+        let mut certificates = Vec::new();
+        
+        // Collect all proofs in range
+        for entry in TIMEOUT_CERTIFICATES.iter() {
+            let (h, r) = entry.key();
+            if *h >= from_height && *h <= to_height {
+                let proof = entry.value();
+                let votes: Vec<(String, Vec<u8>)> = proof.votes.iter()
+                    .map(|v| (v.voter_id.clone(), v.signature.clone()))
+                    .collect();
+                certificates.push((*h, *r, proof.last_block_hash.to_vec(), votes));
+            }
+        }
+        
+        if certificates.is_empty() {
+            return;
+        }
+        
+        // Send response
+        let msg = NetworkMessage::TimeoutCertificatesResponse {
+            certificates,
+            sender_id: self.node_id.clone(),
+        };
+        
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let quic_transport = self.quic_transport.clone();
+            let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+            let addr = requester_addr.to_string();
+            
+            handle.spawn(async move {
+                if quic_enabled {
+                    if let Some(ref transport) = quic_transport {
+                        let quic_addr_str = format!("{}:10876", addr.split(':').next().unwrap_or(&addr));
+                        if let Ok(quic_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
+                            let t = transport.read().await;
+                            let _ = t.send_message(quic_addr, &msg).await;
+                        }
+                    }
+                }
+            });
+        }
+    }
+    
+    /// Handle response with timeout proofs
+    fn handle_timeout_proof_response(&self, certificates: Vec<(u64, u64, Vec<u8>, Vec<(String, Vec<u8>)>)>) {
+        for (height, round, hash, votes) in certificates {
+            self.handle_timeout_proof_broadcast(height, round, hash, votes);
+        }
+    }
+    
+    /// Request timeout proofs for sync (called by syncing node)
+    /// ARCHITECTURE: Parallel requests to multiple peers with redundancy
+    pub fn request_timeout_proofs(&self, from_height: u64, to_height: u64) {
+        let msg = NetworkMessage::RequestTimeoutCertificates {
+            from_height,
+            to_height,
+            requester_id: self.node_id.clone(),
+        };
+        
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        
+        let peers = self.get_all_validator_addresses();
+        let total_peers = peers.len();
+        
+        if total_peers == 0 {
+            return;
+        }
+        
+        // Request from up to 5 peers for redundancy (any one can respond)
+        let max_peers = 5.min(total_peers);
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        
+        if crate::node::is_debug() {
+            println!("[DBG][TIMEOUT] proof_request h={}..{} peers={}", from_height, to_height, max_peers);
+        }
+        
+        handle.spawn(async move {
+            use futures::future::join_all;
+            
+            let mut tasks = Vec::with_capacity(max_peers);
+            
+            for peer_addr in peers.into_iter().take(max_peers) {
+                // Skip peers in cooldown
+                if let Some(entry) = PEER_RETRY_COOLDOWN.get(&peer_addr) {
+                    let (_, cooldown_until) = entry.value();
+                    if std::time::Instant::now() < *cooldown_until {
+                        continue;
+                    }
+                }
+                
+                let msg_clone = msg.clone();
+                let quic_transport_clone = quic_transport.clone();
+                
+                let task = tokio::spawn(async move {
+                    if quic_enabled {
+                        if let Some(ref transport) = quic_transport_clone {
+                            let parts: Vec<&str> = peer_addr.split(':').collect();
+                            if let Some(ip) = parts.first() {
+                                let quic_addr_str = format!("{}:10876", ip);
+                                if let Ok(quic_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
+                                    let t = transport.read().await;
+                                    let _ = t.send_message(quic_addr, &msg_clone).await;
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                tasks.push(task);
+            }
+            
+            // Short timeout - we just need ANY peer to respond
+            let timeout = tokio::time::Duration::from_secs(3);
+            let _ = tokio::time::timeout(timeout, join_all(tasks)).await;
+        });
+    }
+    
+    /// Get count of active validators for Byzantine threshold
+    /// ARCHITECTURE: Uses connected peers + 1 (self) for total network size
+    /// Byzantine threshold = (n * 2 + 2) / 3 ≈ 2/3+
+    /// Examples: 5 nodes → 4 votes, 10 nodes → 7 votes, 100 nodes → 67 votes
+    pub fn get_active_validator_count(&self) -> usize {
+        // connected_peers does NOT include self, so add 1
+        let connected = self.connected_peers_lockfree.len();
+        let total = connected + 1; // +1 for self
+        
+        // No artificial minimum - use real network size
+        // If network is partitioned, Byzantine consensus will naturally fail
+        // which is CORRECT behavior (better fail than wrong consensus)
+        total
+    }
+    
+    /// Get addresses of all validators for timeout vote broadcast
+    /// SCALABLE: Uses connected_peers_lockfree which includes ALL nodes (Genesis + Super + Full)
+    /// No hardcoded fallbacks - connected_peers is the single source of truth
+    pub fn get_all_validator_addresses(&self) -> Vec<String> {
+        // PRODUCTION: All validators are in connected_peers_lockfree
+        // Genesis nodes connect at startup and are maintained via QUIC heartbeat
+        self.connected_peers_lockfree
+            .iter()
+            .map(|entry| entry.value().addr.clone())
+            .collect()
+    }
+    
+    /// Get validator IDs for Byzantine threshold calculation
+    /// SCALABLE: Uses connected peers - no hardcoded Genesis fallback
+    pub fn get_validator_ids_from_peers(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.connected_peers_lockfree
+            .iter()
+            .map(|entry| entry.value().id.clone())
+            .collect();
+        
+        // Add self (not in connected_peers)
+        if !ids.contains(&self.node_id) {
+            ids.push(self.node_id.clone());
+        }
+        
+        ids.sort();
+        ids
+    }
+    
+    /// Clean up old timeout votes and certificates (memory management)
+    pub fn cleanup_old_timeout_data(&self, current_height: u64) {
+        const RETENTION_BLOCKS: u64 = 100;
+        
+        let min_height = current_height.saturating_sub(RETENTION_BLOCKS);
+        
+        // Remove old votes
+        TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_height);
+        
+        // Remove old certificates  
+        TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_height);
+        
+        // Remove old voted heights
+        TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
     }
     
     /// Handle emergency producer change notifications with sender tracking

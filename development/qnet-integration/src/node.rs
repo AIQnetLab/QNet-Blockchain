@@ -9144,6 +9144,16 @@ impl BlockchainNode {
                     }
                 }
             }
+            
+            // BFT Timeout Vote - handled by P2P layer, notify here for logging only
+            ConsensusMessage::TimeoutVote { height, timeout_round, voter_id, .. } => {
+                if voter_id == "PROOF_READY" {
+                    if is_info() { 
+                        println!("[INFO][TIMEOUT] proof_ready h={} round={}", height, timeout_round); 
+                    }
+                }
+                (voter_id, true, None)
+            }
         }
     }
     
@@ -10958,71 +10968,121 @@ impl BlockchainNode {
                     if genesis_ts > 0 && current_time > 0 {
                         // v3.14: Use LAST_BLOCK_PRODUCED_TIME (REAL time when block was received!)
                         // ═══════════════════════════════════════════════════════════════════════
-                        // WHY THIS WORKS:
-                        //   - LAST_BLOCK_PRODUCED_TIME = unix time when last block was received
-                        //   - Updated by ALL nodes when they receive/produce a block
-                        //   - All synced nodes receive blocks within ~1-2 seconds of each other
-                        //   - delay = current_time - last_block_time is SMALL (0-10 sec normally)
-                        //   - NTP drift (±2 sec) < grace period (5 sec) → SAME timeout_round!
+                        // BFT TIMEOUT CONSENSUS v4.0: Deterministic failover via Byzantine voting
+                        // ARCHITECTURE: Replaces NTP-based timeout with 2/3+ validator agreement
                         //
-                        // WHY block.timestamp WAS WRONG:
-                        //   - block.timestamp = genesis_ts + height (SLOT time, not real time!)
-                        //   - This is IDENTICAL to the old broken calculation!
+                        // OLD PROBLEM:
+                        //   - NTP drift between nodes caused different timeout_round calculations
+                        //   - Different timeout_round → different producer selection → FORK!
+                        //
+                        // NEW SOLUTION (like Tendermint/HotStuff/DiemBFT):
+                        //   - Each node votes for timeout when it detects stall (local detection)
+                        //   - When 2/3+ validators vote → TimeoutCertificate is generated
+                        //   - Certificate is deterministic proof that timeout occurred
+                        //   - All nodes use certificate's timeout_round for producer selection
                         // ═══════════════════════════════════════════════════════════════════════
-                        let last_block_time = LAST_BLOCK_PRODUCED_TIME.load(std::sync::atomic::Ordering::Relaxed);
                         
-                        // If no block received yet, use genesis time
+                        let last_block_time = LAST_BLOCK_PRODUCED_TIME.load(std::sync::atomic::Ordering::Relaxed);
                         let last_block_time = if last_block_time == 0 { genesis_ts } else { last_block_time };
                         
-                        // How long since we received the last block?
-                        let delay = current_time.saturating_sub(last_block_time + 1);
+                        // Local delay detection (triggers voting, NOT producer selection)
+                        let local_delay = current_time.saturating_sub(last_block_time + 1);
                         
-                        // v3.9: Calculate timeout_round from SLOT DELAY (DETERMINISTIC!)
-                        // Round 0: 0-5 sec delay (normal - block expected soon)
-                        // Round 1: 5-10 sec delay (first failover)
-                        // Round 2: 10-15 sec delay (second failover)
-                        // etc.
-                        let timeout_round = if delay <= 5 {
+                        // v4.0: BFT Timeout Constants (like Tendermint/HotStuff)
+                        // Grace period: time to wait before voting for timeout
+                        // Vote interval: time between timeout rounds
+                        // Max rounds: prevents infinite failover loops
+                        const TIMEOUT_GRACE_PERIOD: u64 = 30;  // 30s grace (Ethereum uses 12s slots)
+                        const TIMEOUT_VOTE_INTERVAL: u64 = 15; // 15s per round
+                        const MAX_TIMEOUT_ROUNDS: u64 = 10;    // Max 10 rounds = 150s max failover
+                        
+                        // Calculate which timeout_round we SHOULD vote for (local view)
+                        let proposed_timeout_round = if local_delay <= TIMEOUT_GRACE_PERIOD {
                             0
                         } else {
-                            ((delay - 5) / 5 + 1) as u64
+                            let round = ((local_delay - TIMEOUT_GRACE_PERIOD) / TIMEOUT_VOTE_INTERVAL + 1) as u64;
+                            round.min(MAX_TIMEOUT_ROUNDS) // Cap at max rounds
                         };
                         
-                        // Store timeout_round for producer selection (global function)
+                        // v4.0: Check for existing timeout certificate (deterministic!)
+                        let certified_timeout_round = if let Some(p2p) = &unified_p2p {
+                            // Search for highest certified round for this height
+                            let mut highest = 0u64;
+                            for round in 1..=MAX_TIMEOUT_ROUNDS {
+                                if p2p.has_timeout_certificate(next_height, round) {
+                                    highest = round;
+                                }
+                            }
+                            highest
+                        } else {
+                            0
+                        };
+                        
+                        // Use certified round if available, otherwise round 0
+                        let timeout_round = certified_timeout_round;
+                        
+                        // Store timeout_round for producer selection
                         set_timeout_round(timeout_round, next_height);
+                        update_failover_metrics(local_delay, timeout_round);
                         
-                        // v3.10: Update failover metrics for monitoring
-                        update_failover_metrics(delay, timeout_round);
-                        
-                        // v3.9: Stall detected when delay > 5 seconds
-                        if delay > 5 && microblock_height > 0 {
-                            if is_warn() {
-                                println!("[WARN][STALL] slot_delay={}s h={} timeout_round={}", 
-                                         delay, next_height, timeout_round);
+                        // v4.0: If we detect stall, vote for timeout (Byzantine consensus)
+                        if proposed_timeout_round > 0 && microblock_height > 0 {
+                            if is_info() {
+                                println!("[INFO][TIMEOUT] stall_detected h={} local_delay={}s proposed_round={} certified_round={}", 
+                                         next_height, local_delay, proposed_timeout_round, certified_timeout_round);
                             }
                             
                             // STATE MACHINE: Network stall detected
                             set_node_state(NodeState::Error {
-                                reason: format!("Slot delay: {}s, timeout_round={}", delay, timeout_round),
+                                reason: format!("Stall: delay={}s, voting_round={}", local_delay, proposed_timeout_round),
                                 recoverable: true,
                             });
                             
-                            // v3.9: Select producer with timeout_round - FULLY DETERMINISTIC!
-                            // NO BROADCAST NEEDED - all nodes compute same delay from same genesis_ts!
-                            if let Some(_p2p) = &unified_p2p {
-                                let current_producer = Self::select_microblock_producer_with_round(
-                                    next_height, &unified_p2p, &node_id, node_type,
-                                    Some(&storage), &quantum_poh, timeout_round
-                                ).await;
-                                
-                                if is_info() {
-                                    println!("[INFO][FAILOVER] h={} delay={}s round={} producer={}", 
-                                             next_height, delay, timeout_round, current_producer);
+                            // Broadcast timeout vote if we have higher round than certified
+                            if proposed_timeout_round > certified_timeout_round {
+                                if let Some(p2p) = &unified_p2p {
+                                    // Get last block hash for vote (use macroblock hash as anchor)
+                                    let last_block_hash = storage.get_latest_macroblock_hash()
+                                        .unwrap_or([0u8; 32]);
+                                    
+                                    // Create vote message for signing
+                                    let vote_msg = format!("TIMEOUT:{}:{}:{}", 
+                                        next_height, proposed_timeout_round, hex::encode(&last_block_hash));
+                                    
+                                    // Sign with quantum crypto (Dilithium)
+                                    if let Some(crypto) = try_get_quantum_crypto() {
+                                        match crypto.create_consensus_signature(&node_id, &vote_msg).await {
+                                            Ok(sig) => {
+                                                p2p.broadcast_timeout_vote(
+                                                    next_height, 
+                                                    proposed_timeout_round,
+                                                    last_block_hash,
+                                                    hex::decode(&sig.signature).unwrap_or_default()
+                                                );
+                                            }
+                                            Err(e) => {
+                                                if is_warn() {
+                                                    println!("[WARN][TIMEOUT] sign_fail err={}", e);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                                
-                                // v3.14: NO BROADCAST! All nodes compute same producer
-                                // because delay = current_time - last_block_time is SAME everywhere!
-                                // All synced nodes receive blocks within ~1-2 sec of each other!
+                            }
+                            
+                            // Select producer based on CERTIFIED timeout_round (deterministic!)
+                            if certified_timeout_round > 0 {
+                                if let Some(_p2p) = &unified_p2p {
+                                    let current_producer = Self::select_microblock_producer_with_round(
+                                        next_height, &unified_p2p, &node_id, node_type,
+                                        Some(&storage), &quantum_poh, certified_timeout_round
+                                    ).await;
+                                    
+                                    if is_info() {
+                                        println!("[INFO][FAILOVER] h={} certified_round={} producer={}", 
+                                                 next_height, certified_timeout_round, current_producer);
+                                    }
+                                }
                             }
                         }
                         
@@ -11040,7 +11100,7 @@ impl BlockchainNode {
                         // - 5 block gap → trigger sync (was 50)
                         // - Byzantine median height (2f+1 consensus across peers)
                         // ═══════════════════════════════════════════════════════════════════
-                        if delay > 15 {
+                        if local_delay > 15 {
                             if let Some(p2p) = &unified_p2p {
                                 // v2.44: Use Byzantine median from peer heights (QUIC HealthPing data)
                                 // This is MORE reliable than single cached value
@@ -11082,7 +11142,7 @@ impl BlockchainNode {
                                         LAST_ROLLBACK_TIME.store(now_secs, std::sync::atomic::Ordering::Relaxed);
                                         
                                         println!("[ERR][FORK] slot_delay={}s behind={} blocks threshold={}", 
-                                                 delay, height_gap, dynamic_threshold);
+                                                 local_delay, height_gap, dynamic_threshold);
                                         println!("[INFO][FORK] force_resync local={} network={} nodes={}", 
                                                  microblock_height, network_height, network_size);
                                         
@@ -24327,6 +24387,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Check if this device has been deactivated due to migration
     pub async fn check_device_deactivation(&self) -> Result<bool, QNetError> {
+        // Skip device deactivation check for Genesis/bootstrap nodes - they don't use activation codes
+        if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+            return Ok(false);
+        }
+        
         let activation_code = match self.load_activation_code().await? {
             Some((code, _)) => code,
             None => return Ok(false), // No activation code - not deactivated

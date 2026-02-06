@@ -98,8 +98,11 @@ async function getRpcWebSocket(): Promise<WebSocket> {
     });
     
     ws.on('message', (data: WebSocket.Data) => {
+      const raw = data.toString();
+      console.log(`[WS-RPC] RAW MESSAGE (${raw.length} bytes): ${raw.substring(0, 200)}...`);
       try {
-        const msg = JSON.parse(data.toString());
+        const msg = JSON.parse(raw);
+        console.log(`[WS-RPC] PARSED: id=${msg.id}, hasResult=${!!msg.result}, hasError=${!!msg.error}, type=${msg.type}`);
         // Handle JSON-RPC response
         if (msg.id !== undefined && rpcPending.has(msg.id)) {
           const pending = rpcPending.get(msg.id)!;
@@ -111,8 +114,8 @@ async function getRpcWebSocket(): Promise<WebSocket> {
             pending.resolve(msg.result);
           }
         }
-      } catch {
-        // Ignore non-JSON messages (events)
+      } catch (e) {
+        console.log(`[WS-RPC] Non-JSON message: ${raw.substring(0, 100)}`);
       }
     });
     
@@ -146,28 +149,37 @@ async function getRpcWebSocket(): Promise<WebSocket> {
 // Fetch blocks via WebSocket JSON-RPC (FAST - no HTTP overhead!)
 async function fetchBlocksViaRpc(start: number, limit: number): Promise<BlockData[]> {
   try {
+    console.log(`[WS-RPC] fetchBlocksViaRpc start=${start} limit=${limit}`);
     const ws = await getRpcWebSocket();
     const id = rpcRequestId++;
     const effectiveLimit = Math.min(limit, 20); // 20 blocks per request via WS
     
     return new Promise((resolve, reject) => {
+      // Genesis block is ~450KB, needs longer timeout
+      const timeoutMs = start === 0 ? 120000 : 30000;
       const timeout = setTimeout(() => {
+        console.error(`[WS-RPC] TIMEOUT for id=${id} start=${start} after ${timeoutMs}ms`);
         rpcPending.delete(id);
         reject(new Error('RPC timeout'));
-      }, 60000); // 60s timeout
+      }, timeoutMs);
       
       rpcPending.set(id, {
-        resolve: (result) => resolve(Array.isArray(result) ? result : []),
+        resolve: (result) => {
+          console.log(`[WS-RPC] GOT RESPONSE id=${id} blocks=${Array.isArray(result) ? result.length : 0}`);
+          resolve(Array.isArray(result) ? result : []);
+        },
         reject,
         timeout
       });
       
-      ws.send(JSON.stringify({
+      const request = {
         jsonrpc: '2.0',
         id,
         method: 'chain_getBlocks',
         params: { start, limit: effectiveLimit }
-      }));
+      };
+      console.log(`[WS-RPC] SENDING id=${id}: ${JSON.stringify(request)}`);
+      ws.send(JSON.stringify(request));
     });
   } catch (err) {
     console.error('[WS-RPC] fetchBlocksViaRpc error:', err);
@@ -321,7 +333,7 @@ function bytesToHex(bytes: unknown): string {
 // Fetch single block from node
 async function fetchBlock(height: number): Promise<{ block: BlockData; height: number } | null> {
   try {
-    const res = await fetch(`${NODE_RPC_URL}/api/v1/block/${height}`, {
+    const res = await fetch(`${NODE_RPC_URL}/api/v1/microblock/${height}`, {
       cache: 'no-store',
       headers: getApiHeaders(),
       signal: AbortSignal.timeout(30000), // 30 seconds timeout
@@ -852,8 +864,27 @@ async function runInitialSync(): Promise<void> {
       const batchSize = Math.min(RPC_BATCH_SIZE, networkHeight - currentHeight + 1);
       
       try {
-        // Fetch blocks via JSON-RPC (bypasses rate limits!)
-        const wsBlocks = await fetchBlocksViaRpc(currentHeight, batchSize);
+        // Genesis block is huge (~450KB) - use HTTP for reliability
+        let wsBlocks: BlockData[] | null = null;
+        if (currentHeight === 0) {
+          console.log('[Sync] Fetching Genesis via HTTP (large block)...');
+          const genesisBlock = await fetchBlock(0);
+          if (genesisBlock) {
+            wsBlocks = [genesisBlock.block];
+            console.log(`[Sync] Genesis HTTP: got block with ${Array.isArray(genesisBlock.block.transactions) ? genesisBlock.block.transactions.length : 0} TX`);
+          }
+        } else {
+          // Fetch blocks via JSON-RPC (bypasses rate limits!)
+          wsBlocks = await fetchBlocksViaRpc(currentHeight, batchSize);
+        }
+        
+        // DEBUG: Log what we got
+        console.log(`[DEBUG] fetchBlocksViaRpc(${currentHeight}, ${batchSize}) returned ${wsBlocks?.length || 0} blocks`);
+        if (wsBlocks && wsBlocks.length > 0 && currentHeight === 0) {
+          const firstBlock = wsBlocks[0] as any;
+          console.log(`[DEBUG] Block 0 keys: ${Object.keys(firstBlock).join(', ')}`);
+          console.log(`[DEBUG] Block 0 transactions: ${Array.isArray(firstBlock.transactions) ? firstBlock.transactions.length : 'NOT ARRAY'}`);
+        }
         
         if (wsBlocks && wsBlocks.length > 0) {
           const blocks = wsBlocks.map((block: any, idx: number) => ({
@@ -861,10 +892,14 @@ async function runInitialSync(): Promise<void> {
             block: block as BlockData
           }));
           
-          // Log blocks with TX
+          // DEBUG: Log ALL blocks including genesis
           for (const b of blocks) {
             const txs = Array.isArray(b.block.transactions) ? b.block.transactions.length : 0;
-            if (txs > 0) console.log(`[Sync] Block ${b.height} has ${txs} TX`);
+            if (b.height === 0) {
+              console.log(`[Sync] GENESIS Block 0: ${txs} TX, producer=${b.block.producer}`);
+            } else if (txs > 0) {
+              console.log(`[Sync] Block ${b.height} has ${txs} TX`);
+            }
           }
           
           const savedTx = await saveBlocksBatch(blocks);
