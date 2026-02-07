@@ -98,12 +98,9 @@ async function getRpcWebSocket(): Promise<WebSocket> {
     });
     
     ws.on('message', (data: WebSocket.Data) => {
-      const raw = data.toString();
-      console.log(`[WS-RPC] RAW MESSAGE (${raw.length} bytes): ${raw.substring(0, 200)}...`);
       try {
-        const msg = JSON.parse(raw);
-        console.log(`[WS-RPC] PARSED: id=${msg.id}, hasResult=${!!msg.result}, hasError=${!!msg.error}, type=${msg.type}`);
-        // Handle JSON-RPC response
+        const msg = JSON.parse(data.toString());
+        // Handle JSON-RPC response (ignore NewBlock events on this connection)
         if (msg.id !== undefined && rpcPending.has(msg.id)) {
           const pending = rpcPending.get(msg.id)!;
           clearTimeout(pending.timeout);
@@ -111,11 +108,13 @@ async function getRpcWebSocket(): Promise<WebSocket> {
           if (msg.error) {
             pending.reject(new Error(msg.error.message || 'RPC error'));
           } else {
+            const count = Array.isArray(msg.result) ? msg.result.length : 0;
+            log(`[WS-RPC] Response id=${msg.id}: ${count} blocks`);
             pending.resolve(msg.result);
           }
         }
-      } catch (e) {
-        console.log(`[WS-RPC] Non-JSON message: ${raw.substring(0, 100)}`);
+      } catch {
+        // Ignore non-JSON messages
       }
     });
     
@@ -155,8 +154,8 @@ async function fetchBlocksViaRpc(start: number, limit: number): Promise<BlockDat
     const effectiveLimit = Math.min(limit, 20); // 20 blocks per request via WS
     
     return new Promise((resolve, reject) => {
-      // Genesis block is ~450KB, needs longer timeout
-      const timeoutMs = start === 0 ? 120000 : 30000;
+      // Dilithium JSON makes blocks ~25KB each → 20 blocks = 500KB → needs time
+      const timeoutMs = start === 0 ? 120000 : 90000;
       const timeout = setTimeout(() => {
         console.error(`[WS-RPC] TIMEOUT for id=${id} start=${start} after ${timeoutMs}ms`);
         rpcPending.delete(id);
@@ -330,13 +329,45 @@ function bytesToHex(bytes: unknown): string {
   return '';
 }
 
-// Fetch single block from node
+// Fetch single block via HTTP RPC (faster than REST for large blocks like Genesis)
+async function fetchBlockViaHttpRpc(height: number): Promise<{ block: BlockData; height: number } | null> {
+  try {
+    const res = await fetch(`${NODE_RPC_URL}/rpc`, {
+      method: 'POST',
+      headers: getApiHeaders(),
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: Date.now(),
+        method: 'chain_getBlocks',
+        params: { start: height, limit: 1 }
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.result && Array.isArray(data.result) && data.result.length > 0) {
+      const block = data.result[0] as BlockData;
+      return { block, height };
+    }
+    return null;
+  } catch (err) {
+    error(`[Sync] HTTP-RPC fetch block ${height} failed:`, err);
+    return null;
+  }
+}
+
+// Fetch single block from node (REST API)
 async function fetchBlock(height: number): Promise<{ block: BlockData; height: number } | null> {
+  // Genesis is ~450KB - use HTTP RPC which is 10x faster
+  if (height === 0) {
+    console.log('[Sync] Genesis: using HTTP RPC (fast path)');
+    return fetchBlockViaHttpRpc(0);
+  }
   try {
     const res = await fetch(`${NODE_RPC_URL}/api/v1/microblock/${height}`, {
       cache: 'no-store',
       headers: getApiHeaders(),
-      signal: AbortSignal.timeout(30000), // 30 seconds timeout
+      signal: AbortSignal.timeout(30000),
     });
 
     if (!res.ok) return null;
@@ -561,96 +592,195 @@ async function syncBlocksPolling(): Promise<{ added: number; currentHeight: numb
   }
 }
 
-// Catchup sync: sync missed blocks after WebSocket reconnect
-// Catchup sync: sync missed blocks after WebSocket reconnect (TURBO MODE)
+// ============================================================================
+// CATCHUP SYNC: On startup/reconnect - scan ALL blocks, save ONLY those with TX
+// After catching up → NewBlock WS handles live sync at 1 block/sec
+// ============================================================================
+let isBackfillRunning = false;
+
 async function runCatchupSync(): Promise<void> {
   try {
-    // Get current network height
     const heightRes = await fetch(`${NODE_RPC_URL}/api/v1/height`, {
       cache: 'no-store',
       headers: getApiHeaders(),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(15000),
     });
-    
-    if (!heightRes.ok) {
-      console.error('[Sync] Failed to get network height for catchup sync');
-      return;
-    }
+    if (!heightRes.ok) return;
     
     const heightData = await heightRes.json();
     const networkHeight = heightData.height;
+    if (!networkHeight || networkHeight < 0) return;
     
-    if (!networkHeight || networkHeight < 0) {
-      console.error('[Sync] Invalid network height:', networkHeight);
-      return;
-    }
-    
-    // Get current sync state
     const syncState = await getSyncState();
     const lastHeight = typeof syncState?.last_height === 'number' 
       ? syncState.last_height 
       : Number(syncState?.last_height) || -1;
     
-    const missedBlocks = networkHeight - lastHeight - 1;
-    
-    if (missedBlocks <= 0) {
-      console.log('[Sync] Catchup: no missed blocks');
+    const gap = networkHeight - lastHeight - 1;
+    if (gap <= 0) {
+      console.log('[Sync] Catchup: already synced');
       return;
     }
     
-    console.log(`[Sync] Catchup TURBO: ${missedBlocks} blocks missed (${lastHeight + 1} to ${networkHeight})`);
+    console.log(`[Sync] Catchup: gap=${gap} blocks (local=${lastHeight}, network=${networkHeight})`);
     
-    // Prevent concurrent syncs
-    if (isSyncingBlocks) {
-      console.log('[Sync] Catchup skipped - sync already in progress');
-      return;
+    // 1) Jump last_height to live immediately so NewBlock WS can handle new blocks
+    await updateSyncState(networkHeight);
+    console.log(`[Sync] Catchup: jumped to live (height=${networkHeight})`);
+    
+    // 2) Start background backfill to scan ALL missed blocks, save ONLY those with TX
+    if (!isBackfillRunning) {
+      const scanFrom = Math.max(lastHeight + 1, 0);
+      const scanTo = networkHeight;
+      console.log(`[Sync] Backfill: starting scan ${scanFrom} → ${scanTo} (TX-only save)`);
+      // Don't await - runs in background
+      runBackfillScan(scanFrom, scanTo).catch(err => 
+        console.error('[Sync] Backfill failed:', err)
+      );
     }
-    isSyncingBlocks = true;
-    
-    // TURBO: 50 parallel HTTP, batch DB saves
-    const HTTP_PARALLEL = 50;
-    let synced = 0;
-    let currentHeight = lastHeight + 1;
-    const startTime = Date.now();
-    
+  } catch (err) {
+    console.error('[Sync] Catchup error:', err);
+  }
+}
+
+// Fetch a batch of blocks via HTTP RPC (POST /rpc) - faster than WS for parallel
+async function fetchBlocksViaHttpRpc(start: number, limit: number): Promise<BlockData[]> {
+  const effectiveLimit = Math.min(limit, 20);
+  // Retry up to 2 times on failure (TX blocks make response larger → slower)
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      while (currentHeight <= networkHeight) {
-        // Prepare batch of heights
-        const heights: number[] = [];
-        for (let i = 0; i < HTTP_PARALLEL && currentHeight + i <= networkHeight; i++) {
-          heights.push(currentHeight + i);
+      const res = await fetch(`${NODE_RPC_URL}/rpc`, {
+        method: 'POST',
+        headers: getApiHeaders(),
+        body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: rpcRequestId++,
+        method: 'chain_getBlocks',
+          params: { start, limit: effectiveLimit }
+        }),
+        signal: AbortSignal.timeout(120000), // 120s - TX blocks can be 500KB+
+      });
+      if (!res.ok) {
+        console.error(`[HTTP-RPC] ${start}: HTTP ${res.status}`);
+        continue;
+      }
+      const data = await res.json();
+      return Array.isArray(data.result) ? data.result : [];
+    } catch (err: any) {
+      console.error(`[HTTP-RPC] Batch ${start} attempt ${attempt + 1} failed: ${err.message}`);
+      if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  return [];
+}
+
+// Background scan: PARALLEL HTTP RPC - 5 streams × 20 blocks = 100 blocks/round
+async function runBackfillScan(fromHeight: number, toHeight: number): Promise<void> {
+  if (isBackfillRunning) {
+    console.log('[Sync] Backfill: already running');
+    return;
+  }
+  isBackfillRunning = true;
+  
+  const BATCH_SIZE = 20;
+  const PARALLEL = 10; // 10 parallel HTTP connections
+  const ROUND_SIZE = BATCH_SIZE * PARALLEL; // 200 blocks per round
+  const startTime = Date.now();
+  let scanned = 0;
+  let txBlocksSaved = 0;
+  let totalTxSaved = 0;
+  let currentHeight = fromHeight;
+  
+  try {
+    // Genesis first via dedicated fast path (HTTP RPC single block)
+    if (currentHeight === 0) {
+      console.log('[Backfill] Genesis via HTTP RPC...');
+      try {
+        const genesis = await fetchBlockViaHttpRpc(0);
+        if (genesis) {
+          const txCount = Array.isArray(genesis.block.transactions) ? genesis.block.transactions.length : 0;
+          if (txCount > 0) {
+            const saved = await saveBlocksBatch([{ height: 0, block: genesis.block }]);
+            txBlocksSaved++;
+            totalTxSaved += saved;
+            console.log(`[Backfill] Genesis: ${txCount} TX, ${saved} saved`);
+          }
         }
+      } catch (err) {
+        console.error('[Backfill] Genesis failed:', err);
+      }
+      currentHeight = 1;
+      scanned++;
+    }
+    
+    while (currentHeight <= toHeight) {
+      // Launch PARALLEL batch requests simultaneously
+      const promises: Promise<{ startH: number; blocks: BlockData[] }>[] = [];
+      
+      for (let p = 0; p < PARALLEL; p++) {
+        const batchStart = currentHeight + p * BATCH_SIZE;
+        if (batchStart > toHeight) break;
+        const batchLimit = Math.min(BATCH_SIZE, toHeight - batchStart + 1);
         
-        // FAST: Fetch + save in batch
-        const blocks = await fetchBlocksBatch(heights);
+        promises.push(
+          fetchBlocksViaHttpRpc(batchStart, batchLimit)
+            .then(blocks => ({ startH: batchStart, blocks }))
+            .catch(err => {
+              console.error(`[Backfill] LOST batch ${batchStart}-${batchStart + batchLimit - 1}: ${err.message}`);
+              return { startH: batchStart, blocks: [] as BlockData[] };
+            })
+        );
+      }
+      
+      // Wait for ALL parallel requests
+      const results = await Promise.all(promises);
+      
+      // Process results - save only blocks with TX
+      const txBlocks: { height: number; block: BlockData }[] = [];
+      let roundScanned = 0;
+      
+      for (const { startH, blocks } of results) {
         if (blocks.length > 0) {
-          await saveBlocksBatch(blocks);
-        }
-        
-        synced += heights.length;
-        currentHeight += heights.length;
-        
-        // Update sync state
-        await updateSyncState(heights[heights.length - 1]);
-        
-        // Log progress every 500 blocks
-        if (synced % 500 < HTTP_PARALLEL) {
-          const pct = ((synced / missedBlocks) * 100).toFixed(1);
-          const elapsed = (Date.now() - startTime) / 1000;
-          const speed = elapsed > 0 ? (synced / elapsed).toFixed(1) : '0';
-          console.log(`[Sync] Catchup: ${pct}% (${synced}/${missedBlocks}) - ${speed} b/s`);
+          for (let i = 0; i < blocks.length; i++) {
+            const block = blocks[i] as BlockData;
+            const height = startH + i;
+            const txCount = Array.isArray(block.transactions) ? block.transactions.length : 0;
+            if (txCount > 0) {
+              txBlocks.push({ height, block });
+              console.log(`[Backfill] Block ${height}: ${txCount} TX`);
+            }
+          }
+          roundScanned += blocks.length;
+        } else {
+          roundScanned += BATCH_SIZE;
         }
       }
       
-      const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`[Sync] Catchup complete: ${synced} blocks in ${totalTime}s`);
-    } finally {
-      isSyncingBlocks = false;
+      // Save TX blocks
+      if (txBlocks.length > 0) {
+        const saved = await saveBlocksBatch(txBlocks);
+        txBlocksSaved += txBlocks.length;
+        totalTxSaved += saved;
+      }
+      
+      scanned += roundScanned;
+      currentHeight += roundScanned;
+      
+      // Progress log every 500 blocks
+      if (scanned % 500 < ROUND_SIZE) {
+        const total = toHeight - fromHeight + 1;
+        const pct = ((scanned / total) * 100).toFixed(1);
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+        const speed = scanned > 0 ? (scanned / ((Date.now() - startTime) / 1000)).toFixed(1) : '0';
+        console.log(`[Backfill] ${pct}% (${scanned}/${total}) ${speed} blk/s | ${txBlocksSaved} TX-blocks, ${totalTxSaved} TX | ${elapsed}s`);
+      }
     }
     
-  } catch (err) {
-    console.error('[Sync] Catchup sync failed:', err);
-    isSyncingBlocks = false;
+    const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Backfill] DONE: scanned ${scanned} in ${totalTime}s | ${txBlocksSaved} TX-blocks, ${totalTxSaved} TX saved`);
+    
+  } finally {
+    isBackfillRunning = false;
   }
 }
 
@@ -806,143 +936,10 @@ async function processBlocksParallel(heights: number[]): Promise<number> {
   return totalTx;
 }
 
-// Initial sync: catch up with all missing blocks from 0 to current height (TURBO MODE)
+// Initial sync: delegates to runCatchupSync which handles everything
 async function runInitialSync(): Promise<void> {
-  console.log('[Sync] Initial sync starting (TURBO MODE)...');
-  
-  // Prevent concurrent syncs
-  if (isSyncingBlocks) {
-    console.log('[Sync] Initial sync skipped - sync already in progress');
-    return;
-  }
-  isSyncingBlocks = true;
-  
-  try {
-    // Get current network height
-    const heightRes = await fetch(`${NODE_RPC_URL}/api/v1/height`, {
-      cache: 'no-store',
-      headers: getApiHeaders(),
-      signal: AbortSignal.timeout(5000),
-    });
-    
-    if (!heightRes.ok) {
-      error('[Sync] Failed to get network height for initial sync');
-      return;
-    }
-    
-    const heightData = await heightRes.json();
-    const networkHeight = heightData.height;
-    
-    if (!networkHeight || networkHeight < 0) {
-      error('[Sync] Invalid network height:', networkHeight);
-      return;
-    }
-    
-    // Get current sync state
-    const syncState = await getSyncState();
-    const lastHeight = typeof syncState?.last_height === 'number' 
-      ? syncState.last_height 
-      : Number(syncState?.last_height) || -1;
-    
-    const missingBlocks = networkHeight - lastHeight - 1;
-    console.log(`[Sync] TURBO sync: network=${networkHeight}, local=${lastHeight}, missing=${missingBlocks}`);
-    
-    if (missingBlocks <= 0) {
-      console.log('[Sync] Initial sync: already up to date');
-      return;
-    }
-    
-    // WebSocket JSON-RPC mode: 20 blocks per request (fast!)
-    const RPC_BATCH_SIZE = 20;
-    let totalSynced = 0;
-    let currentHeight = lastHeight + 1;
-    const startTime = Date.now();
-    
-    console.log('[Sync] Using JSON-RPC for bulk fetch (no rate limits)');
-    
-    while (currentHeight <= networkHeight) {
-      const batchSize = Math.min(RPC_BATCH_SIZE, networkHeight - currentHeight + 1);
-      
-      try {
-        // Genesis block is huge (~450KB) - use HTTP for reliability
-        let wsBlocks: BlockData[] | null = null;
-        if (currentHeight === 0) {
-          console.log('[Sync] Fetching Genesis via HTTP (large block)...');
-          const genesisBlock = await fetchBlock(0);
-          if (genesisBlock) {
-            wsBlocks = [genesisBlock.block];
-            console.log(`[Sync] Genesis HTTP: got block with ${Array.isArray(genesisBlock.block.transactions) ? genesisBlock.block.transactions.length : 0} TX`);
-          }
-        } else {
-          // Fetch blocks via JSON-RPC (bypasses rate limits!)
-          wsBlocks = await fetchBlocksViaRpc(currentHeight, batchSize);
-        }
-        
-        // DEBUG: Log what we got
-        console.log(`[DEBUG] fetchBlocksViaRpc(${currentHeight}, ${batchSize}) returned ${wsBlocks?.length || 0} blocks`);
-        if (wsBlocks && wsBlocks.length > 0 && currentHeight === 0) {
-          const firstBlock = wsBlocks[0] as any;
-          console.log(`[DEBUG] Block 0 keys: ${Object.keys(firstBlock).join(', ')}`);
-          console.log(`[DEBUG] Block 0 transactions: ${Array.isArray(firstBlock.transactions) ? firstBlock.transactions.length : 'NOT ARRAY'}`);
-        }
-        
-        if (wsBlocks && wsBlocks.length > 0) {
-          const blocks = wsBlocks.map((block: any, idx: number) => ({
-            height: currentHeight + idx,
-            block: block as BlockData
-          }));
-          
-          // DEBUG: Log ALL blocks including genesis
-          for (const b of blocks) {
-            const txs = Array.isArray(b.block.transactions) ? b.block.transactions.length : 0;
-            if (b.height === 0) {
-              console.log(`[Sync] GENESIS Block 0: ${txs} TX, producer=${b.block.producer}`);
-            } else if (txs > 0) {
-              console.log(`[Sync] Block ${b.height} has ${txs} TX`);
-            }
-          }
-          
-          const savedTx = await saveBlocksBatch(blocks);
-          if (savedTx > 0) {
-            console.log(`[Sync] Saved ${savedTx} TX`);
-          }
-          
-          totalSynced += blocks.length;
-          currentHeight += blocks.length;
-        } else {
-          // Fallback to HTTP
-          const heights = [currentHeight];
-          const blocks = await fetchBlocksBatch(heights);
-          if (blocks.length > 0) await saveBlocksBatch(blocks);
-          totalSynced++;
-          currentHeight++;
-        }
-      } catch (err) {
-        // Skip on error
-        currentHeight++;
-        totalSynced++;
-      }
-      
-      await updateSyncState(currentHeight - 1);
-
-      // Log progress every 500 blocks
-      if (totalSynced % 500 < RPC_BATCH_SIZE) {
-        const progress = ((currentHeight / networkHeight) * 100).toFixed(1);
-        const elapsed = (Date.now() - startTime) / 1000;
-        const blocksPerSec = elapsed > 0 ? (totalSynced / elapsed).toFixed(1) : '0';
-        console.log(`[Sync] WS: ${progress}% (${currentHeight}/${networkHeight}) - ${blocksPerSec} blocks/sec`);
-      }
-    }
-    
-    const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-    const avgSpeed = (totalSynced / parseFloat(totalTime)).toFixed(1);
-    console.log(`[Sync] WS complete: ${totalSynced} blocks in ${totalTime}s (${avgSpeed} blocks/sec)`);
-    
-  } catch (err) {
-    error('[Sync] Initial sync failed:', err);
-  } finally {
-    isSyncingBlocks = false;
-  }
+  console.log('[Sync] Initial sync → delegating to catchup...');
+  await runCatchupSync();
 }
 
 // Verify data integrity
@@ -1102,70 +1099,62 @@ function connectWebSocket(): void {
         if (message.type === 'NewBlock') {
           const event = message as WsNewBlockEvent;
           const height = event.data.height;
+          const txCount = event.data.tx_count || 0;
           
-          log(`[WS] NewBlock received: height=${height}, txs=${event.data.tx_count}`);
-          
-          // CRITICAL: Check for GAP and sync missed blocks first!
+          // Check for gap
           const syncState = await getSyncState();
           const lastHeight = typeof syncState?.last_height === 'number' 
             ? syncState.last_height 
             : Number(syncState?.last_height) || -1;
           
           const gap = height - lastHeight - 1;
-          
-          if (gap > 0 && !isSyncingBlocks) {
-            // GAP detected! TURBO sync all missed blocks
-            console.log(`[WS] GAP TURBO: ${gap} blocks missed (${lastHeight + 1} to ${height - 1})`);
-            isSyncingBlocks = true;
-            
-            try {
-              // TURBO: 50 parallel HTTP
-              const HTTP_PARALLEL = 50;
-              let currentH = lastHeight + 1;
-              let synced = 0;
-              const startTime = Date.now();
-              
-              while (currentH < height) {
-                const heights: number[] = [];
-                for (let i = 0; i < HTTP_PARALLEL && currentH + i < height; i++) {
-                  heights.push(currentH + i);
-                }
-                
-                // FAST batch fetch + save
-                const blocks = await fetchBlocksBatch(heights);
-                if (blocks.length > 0) {
-                  await saveBlocksBatch(blocks);
-                }
-                
-                synced += heights.length;
-                currentH += heights.length;
-                
-                // Update sync state
-                await updateSyncState(heights[heights.length - 1]);
-                
-                // Log progress every 500 blocks
-                if (synced % 500 < HTTP_PARALLEL && gap > 500) {
-                  const pct = ((synced / gap) * 100).toFixed(1);
-                  const elapsed = (Date.now() - startTime) / 1000;
-                  const speed = elapsed > 0 ? (synced / elapsed).toFixed(0) : '0';
-                  console.log(`[WS] GAP: ${pct}% - ${speed} b/s`);
-                }
-              }
-              
-              const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-              console.log(`[WS] GAP sync complete: ${gap} blocks in ${totalTime}s`);
-            } finally {
-              isSyncingBlocks = false;
+          if (gap > 0) {
+            // Jump to live, backfill scans for TX blocks in background
+            await updateSyncState(height - 1);
+            if (gap > 20 && !isBackfillRunning) {
+              console.log(`[WS] Gap ${gap} blocks - backfill scan started`);
+              runBackfillScan(lastHeight + 1, height - 1).catch(() => {});
             }
-          } else if (gap > 0) {
-            log(`[WS] GAP ${gap} blocks - sync already in progress`);
           }
           
-          // Now process the current block
-          const added = await processSingleBlock(height);
-          
-          if (added > 0) {
-            log(`[WS] Block ${height}: +${added} transactions`);
+          // FAST PATH: empty blocks (99%+) - save metadata from WS event, NO HTTP!
+          if (txCount === 0) {
+            try {
+              const ts = event.data.timestamp > 1e12 ? event.data.timestamp : event.data.timestamp * 1000;
+              await insertBlock({
+                height,
+                hash: event.data.hash || `block_${height}`,
+                block_type: 'MICROBLOCK',
+                version: 1,
+                timestamp: ts,
+                previous_hash: null,
+                merkle_root: null,
+                state_root: null,
+                producer: event.data.producer || 'unknown',
+                producer_address: null,
+                tx_count: 0,
+                total_gas_used: 0,
+                poh_hash: null,
+                poh_count: 0,
+                signature_type: 'Dilithium3',
+                signature: null,
+                cert_serial: null,
+                qrb_output: null,
+                size_bytes: 0,
+                consensus_data: null,
+                micro_blocks: null,
+              });
+              await updateSyncState(height);
+            } catch (err: any) {
+              if (!err?.message?.includes('duplicate key')) {
+                error(`[WS] Block ${height} save error:`, err);
+              }
+            }
+          } else {
+            // Block has transactions - full HTTP fetch to get TX details
+            console.log(`[WS] Block ${height}: ${txCount} TX - full fetch`);
+            const added = await processSingleBlock(height);
+            if (added > 0) console.log(`[WS] Block ${height}: saved ${added} TX`);
           }
         }
       } catch (err) {

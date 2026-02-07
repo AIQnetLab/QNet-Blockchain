@@ -116,86 +116,58 @@ fn get_timestamp_safe() -> u64 {
 use std::env;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// v2.96: Lock-free emergency producer flag using atomics
-// Replaces std::sync::Mutex to avoid blocking in async context
+// DEPRECATED v4.0: Emergency producer flag replaced by BFT Timeout Protocol
+// ═══════════════════════════════════════════════════════════════════════════════
+// WHY REMOVED:
+// 1. Non-deterministic: Different nodes may have different flags
+// 2. Race condition: Flag set by one node, others don't know
+// 3. No consensus: Producer change without 2/3+ agreement
+//
+// NEW ARCHITECTURE:
+// - Failover uses BFT Timeout Protocol (2/3+ votes required)
+// - certified_timeout_round determines producer selection
+// - All nodes agree on same producer via consensus
 // ═══════════════════════════════════════════════════════════════════════════════
 use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as StdOrdering};
 use parking_lot::RwLock as ParkingRwLock;
 
-// CRITICAL: Global flag for emergency producer activation (lock-free)
-// Height stored atomically, producer string in fast parking_lot lock
+// DEPRECATED: Kept for backward compatibility, always returns None
 static EMERGENCY_PRODUCER_HEIGHT: StdAtomicU64 = StdAtomicU64::new(0);
-// v3.3: Store END of rotation cycle - emergency producer works until this height
 static EMERGENCY_PRODUCER_END_HEIGHT: StdAtomicU64 = StdAtomicU64::new(0);
 lazy_static::lazy_static! {
     static ref EMERGENCY_PRODUCER_ID: ParkingRwLock<String> = ParkingRwLock::new(String::new());
 }
 
-// CRITICAL: Public function to set emergency producer flag from other modules
-// v3.3: Emergency producer now works for ENTIRE remaining rotation cycle
-pub fn set_emergency_producer_flag(block_height: u64, producer: String) {
-    EMERGENCY_PRODUCER_HEIGHT.store(block_height, StdOrdering::SeqCst);
-    
-    // v3.4: Calculate end of rotation cycle (next rotation boundary)
-    // Rotation happens every 30 blocks starting from block 1: 31, 61, 91, 121...
-    // Emergency cycle is INCLUSIVE of the last block before rotation boundary
-    // Example: if emergency starts at h=1232, cycle 41 ends at h=1260
-    // end_height should be 1261 so that condition "h < end_height" includes 1260
-    let rotation_interval = 30u64;
-    let current_cycle = block_height / rotation_interval;
-    // +1 to include the last block of the cycle (e.g., 1260 when end_height=1261)
-    let end_height = (current_cycle + 1) * rotation_interval + 1;
-    EMERGENCY_PRODUCER_END_HEIGHT.store(end_height, StdOrdering::SeqCst);
-    
-    *EMERGENCY_PRODUCER_ID.write() = producer.clone();
-    
-    println!("[INFO][EMERGENCY] flag_set producer={} start_h={} end_h={} (full_cycle)", 
-             producer, block_height, end_height);
-}
-
-// Helper to get emergency producer (returns None if height is 0 or cycle ended)
-// v3.3: Returns (start_height, end_height, producer) - emergency producer for entire cycle
-pub fn get_emergency_producer() -> Option<(u64, String)> {
-    let height = EMERGENCY_PRODUCER_HEIGHT.load(StdOrdering::SeqCst);
-    if height == 0 {
-        None
-    } else {
-        let end_height = EMERGENCY_PRODUCER_END_HEIGHT.load(StdOrdering::SeqCst);
-        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-        
-        // v3.3: Emergency producer works until END of rotation cycle
-        // Only expire when we've passed the end_height (rotation boundary)
-        if current_height > end_height {
-            // Rotation cycle ended - clear emergency flag
-            EMERGENCY_PRODUCER_HEIGHT.store(0, StdOrdering::SeqCst);
-            EMERGENCY_PRODUCER_END_HEIGHT.store(0, StdOrdering::SeqCst);
-            *EMERGENCY_PRODUCER_ID.write() = String::new();
-            if is_debug() {
-                println!("[DBG][EMERGENCY] cycle_ended start_h={} end_h={} current_h={}", 
-                         height, end_height, current_height);
-            }
-            return None;
-        }
-        
-        let producer = EMERGENCY_PRODUCER_ID.read().clone();
-        if producer.is_empty() {
-            None
-        } else {
-            Some((height, producer))
-        }
+/// DEPRECATED v4.0: Use BFT Timeout Protocol instead
+#[deprecated(since = "4.0.0", note = "Use BFT Timeout Protocol for failover")]
+#[allow(dead_code)]
+pub fn set_emergency_producer_flag(_block_height: u64, _producer: String) {
+    // DEPRECATED v4.0: No-op, use BFT Timeout Protocol instead
+    if is_debug() {
+        println!("[DBG][DEPRECATED] set_emergency_producer_flag called but ignored");
     }
 }
 
-// v3.3: Get end height of emergency cycle
-pub fn get_emergency_end_height() -> u64 {
-    EMERGENCY_PRODUCER_END_HEIGHT.load(StdOrdering::SeqCst)
+/// DEPRECATED v4.0: Always returns None, use BFT Timeout Protocol instead
+#[deprecated(since = "4.0.0", note = "Use BFT Timeout Protocol for failover")]
+pub fn get_emergency_producer() -> Option<(u64, String)> {
+    // DEPRECATED v4.0: Always returns None
+    // Failover now handled by BFT Timeout Protocol (certified_timeout_round)
+    None
 }
 
-// Helper to clear emergency producer flag
+/// DEPRECATED v4.0: Always returns 0
+#[deprecated(since = "4.0.0", note = "Use BFT Timeout Protocol for failover")]
+#[allow(dead_code)]
+pub fn get_emergency_end_height() -> u64 {
+    0
+}
+
+/// DEPRECATED v4.0: No-op
+#[deprecated(since = "4.0.0", note = "Use BFT Timeout Protocol for failover")]
+#[allow(dead_code)]
 pub fn clear_emergency_producer() {
-    EMERGENCY_PRODUCER_HEIGHT.store(0, StdOrdering::SeqCst);
-    EMERGENCY_PRODUCER_END_HEIGHT.store(0, StdOrdering::SeqCst);
-    *EMERGENCY_PRODUCER_ID.write() = String::new();
+    // DEPRECATED v4.0: No-op
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2328,6 +2300,7 @@ impl BlockchainNode {
         // STEP 4: Create PingCommitmentWithSampling transaction
         // v2.65: System TX get MAX priority to ensure inclusion
         if total_pings > 0 {
+            let ping_epoch = window_start_height / EMISSION_INTERVAL_BLOCKS;
             let mut commitment_tx = qnet_state::Transaction {
                 from: "system_ping_commitment".to_string(),
                 to: None,
@@ -2347,7 +2320,7 @@ impl BlockchainNode {
                 public_key: None, // Not needed for system transactions
                 gas_price: u64::MAX, // MAX priority - system TX MUST be first in block
                 gas_limit: 0,
-                nonce: 0,
+                nonce: ping_epoch + 1, // PROTOCOL: Epoch-based nonce (deterministic unique per epoch)
                 data: Some(format!("Ping Commitment: {} total, {} successful, root: {}",
                                  total_pings, successful_pings, &merkle_root[..16])),
                 dilithium_signature: None,   // System TX - no quantum sig
@@ -2576,7 +2549,7 @@ impl BlockchainNode {
             public_key: None,
             gas_price: u64::MAX, // MAX priority - must be included before emission
             gas_limit: 0, // FREE system operation
-            nonce: 0,
+            nonce: current_epoch + 1, // PROTOCOL: Epoch-based nonce (deterministic unique per epoch)
             data: Some(format!(
                 "Heartbeat Commitment: {} heartbeats, epoch {}, root: {}",
                 heartbeat_count, current_epoch, &merkle_root[..16]
@@ -2815,7 +2788,7 @@ impl BlockchainNode {
             public_key: None,     // Will be filled with ephemeral Ed25519 pubkey
             gas_price: u64::MAX,
             gas_limit: 0,
-            nonce: 0,
+            nonce: current_epoch + 1, // PROTOCOL: Epoch-based nonce (deterministic unique per epoch)
             data: Some(format!("Heartbeat Commitment: {} heartbeats, epoch {}", heartbeat_count, current_epoch)),
             dilithium_signature: None,   // Will be filled with Dilithium signature
             dilithium_public_key: None,  // Node ID used for pubkey lookup
@@ -3298,7 +3271,7 @@ impl BlockchainNode {
             public_key: None,
             gas_price: u64::MAX, // System TX priority
             gas_limit: 0,        // FREE operation
-            nonce: 0,            // System TX
+            nonce: epoch + 1,    // PROTOCOL: Epoch-based nonce (deterministic unique per epoch)
             data: Some(format!("Light Node Bitmap: {} eligible / {} assigned, epoch {}", 
                               eligible_count, total_assigned, epoch)),
             dilithium_signature: None,
@@ -5551,6 +5524,35 @@ impl BlockchainNode {
             });
         }
         
+        // PROTOCOL: Periodic cleanup of included_tx_hashes (prevents unbounded memory growth)
+        {
+            let mempool_for_included = blockchain.mempool.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 min
+                loop {
+                    interval.tick().await;
+                    mempool_for_included.cleanup_included_tx_hashes();
+                }
+            });
+        }
+        
+        // PROTOCOL: Periodic cleanup of committed_epochs in state (keep last 3 epochs)
+        {
+            let state_for_cleanup = blockchain.state.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(600)); // 10 min
+                let epoch_interval: u64 = 14400;
+                loop {
+                    interval.tick().await;
+                    let state = state_for_cleanup.read().await;
+                    let chain_state = state.chain_state.read();
+                    let current_epoch = chain_state.height / epoch_interval;
+                    drop(chain_state);
+                    state.cleanup_committed_epochs(current_epoch);
+                }
+            });
+        }
+        
         // Register Genesis nodes in reward system and start processing
         if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
             let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
@@ -6248,8 +6250,9 @@ impl BlockchainNode {
             }
             
             // ═══════════════════════════════════════════════════════════════════
-            // v3.10 BUG 3 FIX: Ignore blocks from excluded/forked producers
-            // This prevents forked nodes from spamming and blocking emergency recovery
+            // v4.1: Ignore blocks from self-excluded producers (entropy_fork_detected only)
+            // v3.10 origin: was also used by emergency_failover, now removed (caused FORKS)
+            // Remaining use: node self-excludes when it detects entropy fork (line 12186)
             // ═══════════════════════════════════════════════════════════════════
             {
                 let current_height = *height.read().await;
@@ -7358,9 +7361,12 @@ impl BlockchainNode {
                             
                             if !tx_hashes.is_empty() {
                                 let tx_count = tx_hashes.len();
+                                // PROTOCOL: Record hashes FIRST (prevents re-add via delayed gossip)
+                                // Then remove from active mempool
+                                mempool.record_included_txs(&tx_hashes);
                                 mempool.batch_remove_transactions(&tx_hashes);
                                 if is_info() {
-                                    println!("[INFO][MEMPOOL] cleanup_received_block h={} removed={} tx", 
+                                    println!("[INFO][MEMPOOL] cleanup_received_block h={} tx_count={}", 
                                              received_block.height, tx_count);
                                 }
                             }
@@ -9388,31 +9394,8 @@ impl BlockchainNode {
                                                     }
                                                 }
                                                 
-                                                // Step 4: Check for emergency producer (failover scenario)
-                                                // If network stalled and emergency producer was activated, send to them too
-                                                // v3.3: Check if next_height is within emergency cycle
-                                                let emergency_target: Option<(u64, String)> = get_emergency_producer();
-                                                
-                                                if let Some((emergency_start, emergency_producer)) = emergency_target {
-                                                    let emergency_end = get_emergency_end_height();
-                                                    if next_height >= emergency_start && next_height < emergency_end && 
-                                                       emergency_producer != node_id &&
-                                                       !sent_to.contains(&emergency_producer) {
-                                                        if let Some(producer_addr) = p2p.get_peer_addr_by_id(&emergency_producer) {
-                                                            let tx_msg = NetworkMessage::Transaction { 
-                                                                data: tx_bytes_for_broadcast.clone() 
-                                                            };
-                                                            // v2.94: Use ACK for emergency producer
-                                                            if p2p.send_critical_tx_with_ack(&producer_addr, tx_msg).await.is_ok() {
-                                                                forwarded_to_producer = true;
-                                                                sent_to.push(emergency_producer.clone());
-                                                                if is_info() {
-                                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX ACK_CONFIRMED emergency_producer={}", emergency_producer);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                                // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
+                                                // Producer selection is deterministic via certified_timeout_round
                                                 
                                                 if is_info() && forwarded_to_producer {
                                                     println!("[INFO][HEARTBEAT-COMMITMENT] TX forwarded to producers={:?} next_h={}", 
@@ -9675,24 +9658,7 @@ impl BlockchainNode {
                                                         }
                                                     }
                                                     
-                                                    // Handle emergency producer (failover) - v3.3: check cycle
-                                                    if let Some((emergency_start, emergency_producer)) = get_emergency_producer() {
-                                                        let emergency_end = get_emergency_end_height();
-                                                        if next_height >= emergency_start && next_height < emergency_end && 
-                                                           emergency_producer != node_id &&
-                                                           emergency_producer != producer_next &&
-                                                           emergency_producer != producer_next_plus_one {
-                                                            if let Some(producer_addr) = p2p.get_peer_addr_by_id(&emergency_producer) {
-                                                                let tx_msg = NetworkMessage::Transaction { 
-                                                                    data: tx_bytes_for_broadcast.clone() 
-                                                                };
-                                                                p2p.send_network_message(&producer_addr, tx_msg);
-                                                                if is_info() {
-                                                                    println!("[INFO][LIGHT-BITMAP] TX forwarded to EMERGENCY producer={}", emergency_producer);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
+                                                    // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
                                                     
                                                     // Backup gossip
                                                     if let Err(e) = p2p.broadcast_transaction(tx_bytes_for_broadcast) {
@@ -11057,7 +11023,7 @@ impl BlockchainNode {
                                                     next_height, 
                                                     proposed_timeout_round,
                                                     last_block_hash,
-                                                    hex::decode(&sig.signature).unwrap_or_default()
+                                                    sig.signature.as_bytes().to_vec()
                                                 );
                                             }
                                             Err(e) => {
@@ -11844,29 +11810,8 @@ impl BlockchainNode {
                     }
                 }
                 
-                // CRITICAL FIX: Check if we're emergency producer for this block
-                // v3.3: Emergency producer works for ENTIRE rotation cycle
-                if !is_my_turn_to_produce {
-                    if let Some((start_h, producer)) = get_emergency_producer() {
-                        let end_h = get_emergency_end_height();
-                        // Check if current block is within emergency cycle
-                        if next_block_height >= start_h && next_block_height < end_h && producer == node_id {
-                            if is_info() {
-                                println!("[INFO][EMERGENCY] override h={} cycle=[{},{}]", 
-                                         next_block_height, start_h, end_h);
-                            }
-                            
-                            // STATE MACHINE: Emergency producer mode
-                            set_node_state(NodeState::Producing { 
-                                round: (next_block_height - 1) / 30, 
-                                current_height: next_block_height,
-                            });
-                            
-                            current_producer = node_id.clone();
-                            is_my_turn_to_produce = true;
-                        }
-                    }
-                }
+                // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
+                // Producer selection is deterministic via certified_timeout_round from 2/3+ votes
                 
                 // DEBUG: Log producer selection for first blocks
                 if next_block_height <= 5 {
@@ -12534,45 +12479,13 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         }
                     }
                     
-                    // v3.3: Check if we're emergency producer for THIS block (within emergency cycle)
-                    // Emergency producer works for ENTIRE rotation cycle, not just one block
-                    let (is_emergency_producer, emergency_producer_id) = if let Some((start_h, producer)) = get_emergency_producer() {
-                        let end_h = get_emergency_end_height();
-                        // Check if current block is within emergency cycle
-                        if next_block_height >= start_h && next_block_height < end_h {
-                            (producer == node_id, Some(producer))
-                        } else {
-                            (false, None)
-                        }
-                    } else {
-                        (false, None)
-                    };
+                    // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
+                    // Producer selection is deterministic via certified_timeout_round from 2/3+ votes
+                    let is_emergency_producer = false; // Legacy variable kept for compatibility
                     
-                    // v3.3: CRITICAL - If there's an emergency producer and it's NOT us, we CANNOT produce!
-                    // This prevents the original producer from creating blocks during emergency cycle
-                    if let Some(ref ep) = emergency_producer_id {
-                        if ep != &node_id {
-                            if is_info() {
-                                println!("[INFO][PROD] blocked_by_emergency h={} emergency_producer={} end_h={}", 
-                                         next_block_height, ep, get_emergency_end_height());
-                            }
-                            // Skip this iteration - emergency producer handles this block
-                            // Wait 1 block interval (1 second) before checking again
-                            // This matches block production rate and prevents spam
-                            // v3.4: CRITICAL - Clear broadcast flag before continue to prevent stuck flag
-                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                            continue;
-                        }
-                    }
-                    
-                    // CRITICAL FIX: DO NOT clear emergency flag here - it causes deadlock!
-                    // Flag will be cleared AFTER block is successfully created and saved
-                    // This prevents the node from forgetting it's emergency producer in next iteration
-                    
-                    // CRITICAL FIX: Emergency producer MUST check sync status before producing
-                    // Prevents emergency production when node is behind due to fork or network issues
+                    // Check sync status before producing
                     let can_produce = if is_emergency_producer {
+                        // This branch is never reached (is_emergency_producer = false)
                         println!("[EMERGENCY] 🚀 Emergency producer activated for block #{}", next_block_height);
                         
                         // CRITICAL: Check if we're synchronized before emergency production
@@ -12585,9 +12498,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             println!("[EMERGENCY] 🔄 Node is lagging or has fork - clearing emergency flag");
                             println!("[EMERGENCY] 💡 Background sync will resolve the issue");
                             
-                            // Clear emergency flag - we can't produce - v2.96: lock-free
-                            clear_emergency_producer();
-                            println!("[EMERGENCY] 🔧 Cleared emergency flag - node not synchronized");
+                            // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
+                            println!("[INFO][BFT] node_not_synchronized h={}", next_block_height);
                             
                             false // Cannot produce
                         } else {
@@ -12616,11 +12528,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                         println!("[EMERGENCY][WAIT] h={} attempt={}/{} status=arrived elapsed={:.1}s action=skip_this_block", 
                                                  next_block_height, attempt, max_attempts, elapsed);
                                         
-                                        // v3.3: DON'T clear emergency flag - we remain emergency producer for the cycle
-                                        // Just skip this specific block since someone else created it
-                                        // Emergency producer continues to handle remaining blocks in the cycle
-                                        println!("[INFO][EMERGENCY] block_arrived_skip h={} remaining_emergency_until={}", 
-                                                 next_block_height, get_emergency_end_height());
+                                        // v4.0: BFT Timeout Protocol handles failover - block arrived from another producer
+                                        println!("[INFO][BFT] block_arrived_skip h={}", next_block_height);
                                         
                                         block_arrived = true;
                                         break;
@@ -14083,10 +13992,12 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // This prevents re-processing the same TX in future blocks
                         // v2.26: Direct access - SimpleMempool is already thread-safe
                         if !included_tx_hashes.is_empty() {
+                            // PROTOCOL: Record hashes as confirmed (prevents re-add via delayed gossip)
+                            mempool.record_included_txs(&included_tx_hashes);
                             mempool.batch_remove_transactions(&included_tx_hashes);
-                            if included_tx_hashes.len() > 0 {
-                                println!("[MEMPOOL] ✅ Cleaned {} TX after block #{}", 
-                                         included_tx_hashes.len(), height_for_storage);
+                            if is_info() {
+                                println!("[INFO][MEMPOOL] block_produced_cleanup h={} tx_count={}", 
+                                         height_for_storage, included_tx_hashes.len());
                             }
                         }
                         
@@ -14335,21 +14246,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // This prevents phantom height where node claims height N without having block N
                     if is_debug() { println!("[DBG][PROD] saved h={}", microblock.height); }
                     
-                    // v3.3: Emergency producer works for ENTIRE rotation cycle
-                    // Only clear flag when rotation boundary is reached (end of cycle)
-                    if is_emergency_producer {
-                        let end_height = get_emergency_end_height();
-                        // Clear only when we've created the LAST block of the cycle
-                        // (rotation boundary - 1, because rotation boundary is the NEXT cycle's first block)
-                        if end_height > 0 && microblock.height >= end_height - 1 {
-                            println!("[INFO][EMERGENCY] cycle_complete h={} end_h={} clearing_flag", 
-                                     microblock.height, end_height);
-                                clear_emergency_producer();
-                        } else if is_debug() {
-                            println!("[DBG][EMERGENCY] continuing h={} end_h={} remaining={}", 
-                                     microblock.height, end_height, end_height.saturating_sub(microblock.height));
-                        }
-                    }
+                    // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
                     
                     // CRITICAL FIX: Update global last block time for stall detection
                     LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
@@ -14927,86 +14824,47 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     }
                                     
                                     // ═══════════════════════════════════════════════════════════════════════════
-                                    // Network does NOT have the block - proceed with emergency
+                                    // v4.1: Network does NOT have the block - BFT Timeout Protocol handles this
                                     // ═══════════════════════════════════════════════════════════════════════════
+                                    // OLD (BROKEN): Called select_emergency_producer() → exclude_producer()
+                                    //   → Each node excluded producers LOCALLY after 4s → NON-DETERMINISTIC
+                                    //   → Blocks from real producer REJECTED → NETWORK STALL + FORK
+                                    //
+                                    // NEW (CORRECT): BFT Timeout Protocol (30s grace + 2/3+ voting)
+                                    //   → All nodes vote after 30s grace period
+                                    //   → TimeoutCertificate generated at 2/3+ votes
+                                    //   → certified_timeout_round used in select_microblock_producer_with_round()
+                                    //   → DETERMINISTIC failover, no local exclusions needed
+                                    // ═══════════════════════════════════════════════════════════════════════════
+                                    
+                                    let timeout_duration = actual_timeout.as_secs();
                                     
                                     match &check_result {
                                         BlockExistenceResult::Uncertain { cache_peers_with, cache_total } => {
-                                            println!("[EMERGENCY][FAILOVER] h={} result=uncertain cache={}/{} http=all_failed action=emergency_needed", 
-                                                     expected_height_timeout, cache_peers_with, cache_total);
+                                            if is_warn() {
+                                                println!("[WARN][FAILOVER] h={} result=uncertain cache={}/{} timeout={}s producer={} action=bft_timeout_handles",
+                                                         expected_height_timeout, cache_peers_with, cache_total, timeout_duration, current_producer_timeout);
+                                            }
                                         },
                                         BlockExistenceResult::NoPeers => {
-                                            println!("[EMERGENCY][FAILOVER] h={} result=no_peers action=emergency_needed", 
-                                                     expected_height_timeout);
+                                            if is_warn() {
+                                                println!("[WARN][FAILOVER] h={} result=no_peers timeout={}s producer={} action=bft_timeout_handles",
+                                                         expected_height_timeout, timeout_duration, current_producer_timeout);
+                                            }
                                         },
                                         _ => {}
                                     }
                                     
-                                    // Use the actual timeout duration for logging (calculated above)
-                                    let timeout_duration = actual_timeout.as_secs();
-                                    
-                                    // Special logging for rotation boundaries
-                                    if is_rotation_boundary {
-                                        if is_warn() { println!("[WARN][FAIL] rotation_deadlock h={} timeout={}s producer={}", 
-                                                 expected_height_timeout, timeout_duration, current_producer_timeout); }
-                                    } else {
-                                        if is_warn() { println!("[WARN][FAIL] timeout h={} secs={} producer={}", 
-                                                 expected_height_timeout, timeout_duration, current_producer_timeout); }
+                                    // BFT Timeout Protocol flow (main loop at lines 10950-11050):
+                                    // 1. After 30s grace: nodes vote for timeout with Dilithium signatures
+                                    // 2. At 2/3+ votes: TimeoutCertificate generated
+                                    // 3. certified_timeout_round > 0 → select_microblock_producer_with_round()
+                                    // 4. Deterministic exclusion of failed producers by round number
+                                    // 5. All nodes converge on SAME backup producer
+                                    if is_info() {
+                                        println!("[INFO][FAILOVER] h={} timeout_detected producer_was={} waiting_for_bft_timeout_certificate",
+                                                 expected_height_timeout, current_producer_timeout);
                                     }
-                                    
-                                    // ✅ CRITICAL FIX v2.62: DO NOT invalidate cache on failover!
-                                    // WHY: Emergency producer should TAKE OVER the rotation cycle
-                                    // MECHANISM: Cache will be UPDATED below to emergency producer
-                                    // RESULT: Emergency producer completes the 30-block rotation period
-                                    
-                                    // v3.6: REMOVED add_failed_producer() - it caused NON-DETERMINISTIC selection!
-                                    // Each node had DIFFERENT failed lists → DIFFERENT emergency producers → FORK
-                                    // Now: failed_producer is passed EXPLICITLY to select_emergency_producer
-                                    
-                                    // EXISTING: Use same emergency selection as implemented in select_emergency_producer
-                                    let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
-                                        &current_producer_timeout,
-                                        expected_height_timeout, // Use expected height directly (already next block height)
-                                        &Some(p2p_timeout.clone()),
-                                        &node_id_timeout,
-                                        node_type_timeout,
-                                        Some(storage_timeout.clone()),  // Pass storage for deterministic entropy
-                                    ).await;
-                                    
-                                    if is_info() { println!("[INFO][FAIL] emergency_producer={}", emergency_producer); }
-                                    
-                                    // ✅ CRITICAL FIX v2.62: UPDATE CACHE to emergency producer!
-                                    // WHY: Emergency producer should TAKE OVER the rotation cycle (30 blocks)
-                                    // MECHANISM: Update producer cache so next block uses emergency producer
-                                    // RESULT: Emergency producer completes the 30-block rotation period
-                                    let rotation_interval = 30u64;
-                                    let leadership_round = if expected_height_timeout <= 30 {
-                                        0
-                                    } else {
-                                        (expected_height_timeout - 1) / rotation_interval
-                                    };
-                                    
-                                    // v2.96: Lock-free cache update with DashMap
-                                    use producer_cache::CACHED_PRODUCER_SELECTION;
-                                    let existing_candidates = CACHED_PRODUCER_SELECTION.get(&leadership_round)
-                                        .map(|entry| entry.value().1.clone())
-                                        .unwrap_or_default();
-                                    
-                                    // v3.9: NO BROADCAST NEEDED! timeout_round handles failover DETERMINISTICALLY
-                                    // 
-                                    // HOW IT WORKS:
-                                    // 1. This background task detected timeout
-                                    // 2. slot_delay is already > 5 seconds (that's why we're here)
-                                    // 3. Main loop will compute timeout_round from slot_delay
-                                    // 4. ALL nodes compute SAME timeout_round → SAME producer
-                                    // 5. No broadcast needed - pure deterministic failover!
-                                    //
-                                    // REMOVED: broadcast_emergency_producer_change (non-deterministic!)
-                                    // REMOVED: set_emergency_producer_flag (non-deterministic!)
-                                    // REMOVED: cache update (timeout_round doesn't use cache for failover!)
-                                    
-                                    println!("[INFO][FAILOVER] h={} timeout_detected producer_was={} (timeout_round handles failover)", 
-                                             expected_height_timeout, current_producer_timeout);
                                 }
                                 
                                 // CRITICAL: Clear failover flag when task completes
@@ -15348,24 +15206,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // CRITICAL FIX: Clear cache at rotation boundaries to ensure new producer selection
             // This prevents using stale cached producer when entering new round
-            // v3.6: Check for ACTIVE emergency using global flag (DETERMINISTIC!)
-            // Replaced get_failed_producers() which used LOCAL non-deterministic DashMap
+            // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
+            // Cache clearing happens at rotation boundaries (normal operation)
             if current_height > 0 && (current_height - 1) % rotation_interval == 0 {
                 // We're at a rotation boundary (blocks 31, 61, 91...)
-                // v3.6: Check global emergency flag - SAME value on all nodes!
-                let has_emergency = get_emergency_producer().is_some();
-                
-                if has_emergency {
-                    // Emergency in progress - DO NOT clear cache!
-                    // Cache contains emergency producer, clearing would restart selection loop
-                    if is_info() { println!("[INFO][PROD] rotation_boundary h={} emergency_active=true cache_preserved", current_height); }
-                } else {
-                    // Normal rotation - clear cache for new producer selection
-                    // v2.96: Lock-free remove with DashMap
-                    CACHED_PRODUCER_SELECTION.remove(&leadership_round);
-                    // Don't use cache for first block of new round
-                    can_use_cache = false;
-                }
+                // Normal rotation - clear cache for new producer selection
+                // v2.96: Lock-free remove with DashMap
+                CACHED_PRODUCER_SELECTION.remove(&leadership_round);
+                // Don't use cache for first block of new round
+                can_use_cache = false;
             }
             
             // Check if we have cached result for this round
@@ -16086,8 +15935,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
-    /// CRITICAL: Emergency producer selection when current producer fails
-    /// NOTE: Does NOT use PoH to ensure 100% determinism even for out-of-sync nodes
+    /// DEPRECATED v4.1: Emergency producer selection replaced by BFT Timeout Protocol
+    /// BFT uses select_microblock_producer_with_round(height, certified_timeout_round)
+    /// which deterministically excludes failed producers by round number.
+    /// This function is kept for reference but no longer called.
+    #[allow(dead_code)]
     async fn select_emergency_producer(
         failed_producer: &str,
         current_height: u64,
@@ -22737,15 +22589,37 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Err(QNetError::ValidationError("Transfer amount cannot be zero".to_string()));
         }
         
-        // Nonce validation (skip for commitment TX - they use nonce=0 as system TX)
-        // PRODUCTION v2.82: Commitment TX are per-epoch, not per-account sequence
-        // v2.89: Added LightNodeEligibilityBitmap (Genesis bitmap TX)
+        // PROTOCOL: Commitment TXs skip standard account nonce (they use epoch-based semantics)
+        // Deduplication is enforced at STATE level via committed_epochs (deterministic across all nodes)
         let skip_nonce_check = matches!(tx.tx_type,
             qnet_state::TransactionType::HeartbeatCommitment { .. } |
             qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
             qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
             qnet_state::TransactionType::RewardDistribution { .. }
         );
+        
+        // PROTOCOL: State-level dedup check for commitment TXs (prevents duplicate per node per epoch)
+        if skip_nonce_check {
+            let state = self.state.read().await;
+            let epoch_interval: u64 = 14400;
+            let is_duplicate = match &tx.tx_type {
+                qnet_state::TransactionType::HeartbeatCommitment { node_id, window_start_height, .. } => {
+                    state.is_epoch_committed("heartbeat", node_id, window_start_height / epoch_interval)
+                }
+                qnet_state::TransactionType::PingCommitmentWithSampling { window_start_height, .. } => {
+                    state.is_epoch_committed("ping", &tx.from, window_start_height / epoch_interval)
+                }
+                qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
+                    state.is_epoch_committed("bitmap", genesis_id, *epoch)
+                }
+                _ => false, // RewardDistribution — no epoch dedup
+            };
+            if is_duplicate {
+                return Err(QNetError::ValidationError(
+                    format!("duplicate commitment TX: already committed for this epoch hash={}", &tx.hash[..16.min(tx.hash.len())])
+                ));
+            }
+        }
         
         if !skip_nonce_check {
             let state = self.state.read().await;

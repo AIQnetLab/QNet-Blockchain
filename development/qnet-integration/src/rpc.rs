@@ -9577,8 +9577,9 @@ async fn handle_p2p_message(
                 let msg_type = match &message {
                     NetworkMessage::Block { height, block_type, .. } => 
                         format!("{} block #{}", block_type, height),
-                    NetworkMessage::EmergencyProducerChange { block_height, .. } => 
-                        format!("EmergencyProducerChange at block #{}", block_height),
+                    #[allow(deprecated)]
+                    NetworkMessage::EmergencyProducerChange { block_height, .. } =>
+                        format!("EmergencyProducerChange at block #{} (deprecated)", block_height),
                     NetworkMessage::EntropyRequest { block_height, .. } => 
                         format!("EntropyRequest for block #{}", block_height),
                     NetworkMessage::EntropyResponse { block_height, .. } => 
@@ -10357,14 +10358,8 @@ async fn handle_producer_status(
         node_id.clone()  // Solo mode
     };
     
-    // CRITICAL FIX: Check emergency producer flag (same as node.rs line 3147-3155)
-    // If emergency producer is set for this height, use it instead
-    use crate::node::get_emergency_producer;
-    if let Some((height, producer)) = get_emergency_producer() {
-        if height == next_height {
-            current_producer = producer;
-        }
-    }
+    // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
+    // Producer selection is deterministic via certified_timeout_round
     
     let status = json!({
         "current_height": current_height,

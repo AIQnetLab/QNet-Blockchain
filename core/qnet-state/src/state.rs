@@ -8,7 +8,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use parking_lot::RwLock as ParkingRwLock;
 use once_cell::sync::Lazy;
-use crate::{Account, Block, Transaction, StateError, StateResult};
+use crate::{Account, Block, Transaction, TransactionType, StateError, StateResult};
 use sha3::{Sha3_256, Digest};
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -494,6 +494,10 @@ pub struct StateManager {
     state_root: Arc<parking_lot::RwLock<[u8; 32]>>,
     /// v3.11: State Merkle Tree for Light client proofs
     merkle_tree: Arc<parking_lot::RwLock<StateMerkleTree>>,
+    /// PROTOCOL: Tracks committed epochs per node_id to prevent duplicate commitment TXs
+    /// Key: "commitment_type:sender_id", Value: last committed epoch
+    /// Deterministic: populated from block application, identical across all nodes
+    committed_epochs: Arc<DashMap<String, u64>>,
 }
 
 impl StateManager {
@@ -504,6 +508,89 @@ impl StateManager {
             chain_state: Arc::new(parking_lot::RwLock::new(ChainState::default())),
             state_root: Arc::new(parking_lot::RwLock::new([0u8; 32])),
             merkle_tree: Arc::new(parking_lot::RwLock::new(StateMerkleTree::new())),
+            committed_epochs: Arc::new(DashMap::new()),
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PROTOCOL: Commitment deduplication (prevents duplicate system TXs)
+    // Deterministic: all nodes apply same blocks → same committed_epochs state
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Check if a commitment from sender_id for given epoch already exists in state
+    /// Used at: mempool validation, block validation, block production
+    pub fn is_epoch_committed(&self, commitment_type: &str, sender_id: &str, epoch: u64) -> bool {
+        let key = format!("{}:{}", commitment_type, sender_id);
+        self.committed_epochs.get(&key)
+            .map(|last_epoch| *last_epoch >= epoch)
+            .unwrap_or(false)
+    }
+    
+    /// Mark a commitment as applied in state (called during block application)
+    /// CRITICAL: Must be called from apply_to_state path for determinism
+    pub fn mark_epoch_committed(&self, commitment_type: &str, sender_id: &str, epoch: u64) {
+        let key = format!("{}:{}", commitment_type, sender_id);
+        self.committed_epochs.insert(key, epoch);
+    }
+    
+    /// Cleanup old committed_epochs entries (keep only recent 3 epochs)
+    /// Called periodically to prevent unbounded growth
+    pub fn cleanup_committed_epochs(&self, current_epoch: u64) {
+        if current_epoch < 3 { return; }
+        let min_epoch = current_epoch - 3;
+        self.committed_epochs.retain(|_, epoch| *epoch >= min_epoch);
+    }
+    
+    /// PROTOCOL: Check if this TX is a duplicate commitment (already applied in a previous block)
+    /// Returns Err if duplicate → TX will be rejected during block application
+    /// This is deterministic: all nodes have same committed_epochs from same block history
+    fn check_duplicate_commitment(&self, tx: &Transaction) -> StateResult<()> {
+        let epoch_interval: u64 = 14400; // EMISSION_BLOCK_INTERVAL
+        match &tx.tx_type {
+            TransactionType::HeartbeatCommitment { node_id, window_start_height, .. } => {
+                let epoch = window_start_height / epoch_interval;
+                if self.is_epoch_committed("heartbeat", node_id, epoch) {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "duplicate HeartbeatCommitment: node={} epoch={} already committed", node_id, epoch
+                    )));
+                }
+            }
+            TransactionType::PingCommitmentWithSampling { window_start_height, .. } => {
+                let epoch = window_start_height / epoch_interval;
+                if self.is_epoch_committed("ping", &tx.from, epoch) {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "duplicate PingCommitment: from={} epoch={} already committed", tx.from, epoch
+                    )));
+                }
+            }
+            TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
+                if self.is_epoch_committed("bitmap", genesis_id, *epoch) {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "duplicate LightNodeBitmap: genesis={} epoch={} already committed", genesis_id, epoch
+                    )));
+                }
+            }
+            _ => {} // Non-commitment TXs — no dedup check needed
+        }
+        Ok(())
+    }
+    
+    /// PROTOCOL: After successful apply_to_state, mark this commitment in committed_epochs
+    fn mark_commitment_from_tx(&self, tx: &Transaction) {
+        let epoch_interval: u64 = 14400; // EMISSION_BLOCK_INTERVAL
+        match &tx.tx_type {
+            TransactionType::HeartbeatCommitment { node_id, window_start_height, .. } => {
+                let epoch = window_start_height / epoch_interval;
+                self.mark_epoch_committed("heartbeat", node_id, epoch);
+            }
+            TransactionType::PingCommitmentWithSampling { window_start_height, .. } => {
+                let epoch = window_start_height / epoch_interval;
+                self.mark_epoch_committed("ping", &tx.from, epoch);
+            }
+            TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
+                self.mark_epoch_committed("bitmap", genesis_id, *epoch);
+            }
+            _ => {} // Non-commitment TXs — nothing to mark
         }
     }
     /// Get account
@@ -690,6 +777,9 @@ impl StateManager {
     /// v3.11: Also updates State Merkle Tree for all changed accounts
     /// NOTE: For block processing, use apply_transaction_lazy() + finalize_merkle()
     pub fn apply_transaction(&self, tx: &Transaction) -> StateResult<()> {
+        // PROTOCOL: Check for duplicate commitment TXs before applying
+        self.check_duplicate_commitment(tx)?;
+        
         // Get mutable access to accounts
         let mut accounts_map = HashMap::new();
         
@@ -706,6 +796,9 @@ impl StateManager {
         
         // Apply transaction
         tx.apply_to_state(&mut accounts_map)?;
+        
+        // PROTOCOL: Mark commitment as applied after successful apply_to_state
+        self.mark_commitment_from_tx(tx);
         
         // v3.11: Write back changes AND update Merkle tree
         {
@@ -731,6 +824,10 @@ impl StateManager {
     /// Use during block processing - call finalize_merkle() once after all TX applied
     /// Performance: O(1) per TX instead of O(n) per TX
     pub fn apply_transaction_lazy(&self, tx: &Transaction) -> StateResult<()> {
+        // PROTOCOL: Check for duplicate commitment TXs before applying
+        // Deterministic: same check on all nodes → same accept/reject decisions
+        self.check_duplicate_commitment(tx)?;
+        
         // Get mutable access to accounts
         let mut accounts_map = HashMap::new();
         
@@ -747,6 +844,9 @@ impl StateManager {
         
         // Apply transaction
         tx.apply_to_state(&mut accounts_map)?;
+        
+        // PROTOCOL: Mark commitment as applied after successful apply_to_state
+        self.mark_commitment_from_tx(tx);
         
         // v3.22: Lazy Merkle update - no root recomputation!
         {

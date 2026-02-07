@@ -1,6 +1,6 @@
 //! Optimized mempool with binary storage support
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::{VecDeque, BTreeMap};
@@ -43,6 +43,10 @@ pub struct SimpleMempool {
     // Key: gas_price (u64), Value: FIFO queue of tx hashes at that price
     by_gas_price: Arc<RwLock<BTreeMap<u64, VecDeque<String>>>>,
     use_binary: bool, // Toggle for binary storage
+    // PROTOCOL-LEVEL: TX hashes confirmed in recent blocks (prevents re-inclusion after gossip)
+    // Analogous to processed transaction signatures - standard L1 mechanism
+    // Prevents race condition: TX removed from mempool by block → re-arrives via P2P → re-added
+    included_tx_hashes: Arc<DashSet<String>>,
 }
 
 impl SimpleMempool {
@@ -56,6 +60,7 @@ impl SimpleMempool {
             transactions: Arc::new(DashMap::new()),
             by_gas_price: Arc::new(RwLock::new(BTreeMap::new())),
             use_binary,
+            included_tx_hashes: Arc::new(DashSet::new()),
         }
     }
     
@@ -70,6 +75,11 @@ impl SimpleMempool {
         if self.transactions.len() >= self.config.max_size {
             eprintln!("[WARN][MEMPOOL] full size={} max={} hash={}", 
                      self.transactions.len(), self.config.max_size, &hash[..16.min(hash.len())]);
+            return false;
+        }
+        
+        // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
+        if self.included_tx_hashes.contains(&hash) {
             return false;
         }
         
@@ -136,6 +146,11 @@ impl SimpleMempool {
         if self.transactions.len() >= self.config.max_size {
             eprintln!("[WARN][MEMPOOL] full size={} max={} hash={}", 
                      self.transactions.len(), self.config.max_size, &hash[..16.min(hash.len())]);
+            return false;
+        }
+        
+        // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
+        if self.included_tx_hashes.contains(&hash) {
             return false;
         }
         
@@ -355,6 +370,12 @@ impl SimpleMempool {
             return;
         }
         
+        // PROTOCOL: Record ALL hashes as included BEFORE removing from mempool
+        // This prevents race condition: remove → gossip arrives → re-add
+        for hash in hashes {
+            self.included_tx_hashes.insert(hash.clone());
+        }
+        
         // Step 1: Remove from transactions map (fast O(1) per hash)
         let mut removed_count = 0;
         for hash in hashes {
@@ -375,7 +396,29 @@ impl SimpleMempool {
         }
         
         if removed_count > 0 {
-            println!("[MEMPOOL] 🗑️ Removed {} transactions after block inclusion", removed_count);
+            println!("[INFO][MEMPOOL] block_cleanup removed={} included_set={}", removed_count, self.included_tx_hashes.len());
+        }
+    }
+    
+    /// PROTOCOL: Record TX hashes from a received block (may not have been in our mempool)
+    /// Prevents re-inclusion of confirmed TXs arriving via delayed P2P gossip
+    pub fn record_included_txs(&self, hashes: &[String]) {
+        for hash in hashes {
+            self.included_tx_hashes.insert(hash.clone());
+        }
+    }
+    
+    /// Periodic cleanup of included_tx_hashes to prevent unbounded growth
+    /// Safe to call periodically - removes oldest entries when set exceeds threshold
+    /// ARCHITECTURE: 100K entries ≈ 100K blocks worth of TXs (at ~1 TX/block avg)
+    /// At 1 block/sec that's ~28 hours of history - more than enough for gossip delay
+    pub fn cleanup_included_tx_hashes(&self) {
+        const MAX_INCLUDED_SIZE: usize = 100_000;
+        let current_size = self.included_tx_hashes.len();
+        if current_size > MAX_INCLUDED_SIZE {
+            // Clear entire set - TXs older than this are no longer gossiped
+            self.included_tx_hashes.clear();
+            println!("[INFO][MEMPOOL] included_set_cleanup cleared={}", current_size);
         }
     }
     

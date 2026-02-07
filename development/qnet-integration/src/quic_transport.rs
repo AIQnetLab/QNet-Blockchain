@@ -1186,6 +1186,7 @@ impl QuicTransport {
             NetworkMessage::HealthPing { .. } => 4,
             NetworkMessage::ConsensusCommit { .. } => 5,
             NetworkMessage::ConsensusReveal { .. } => 6,
+            #[allow(deprecated)]
             NetworkMessage::EmergencyProducerChange { .. } => 7,
             NetworkMessage::ShredProtocolChunk { .. } => 8,
             #[allow(deprecated)]

@@ -264,6 +264,7 @@ impl MessageType {
             NetworkMessage::HealthPing { .. } => Self::HealthPing,
             NetworkMessage::ConsensusCommit { .. } => Self::ConsensusCommit,
             NetworkMessage::ConsensusReveal { .. } => Self::ConsensusReveal,
+            #[allow(deprecated)]
             NetworkMessage::EmergencyProducerChange { .. } => Self::EmergencyChange,
             NetworkMessage::ShredProtocolChunk { .. } => Self::ShredProtocolChunk,
             #[allow(deprecated)]
