@@ -1254,6 +1254,11 @@ pub struct BlockchainNode {
     // Replaces old P2P gossip-based reputation system (eliminated Sybil attacks)
     // v2.96: Uses parking_lot::RwLock for 2-3x faster access (no poisoning)
     deterministic_reputation: Arc<ParkingRwLock<DeterministicReputationState>>,
+    
+    // v3.35: O(1) node registration cache — replaces O(N) blockchain scan
+    // Maps node_id -> (NodeType, wallet_address, api_endpoint)
+    // Populated on startup from blockchain + updated when NodeRegistration TXs are processed
+    node_registration_cache: Arc<DashMap<String, (qnet_state::NodeType, String, String)>>,
 }
 
 impl BlockchainNode {
@@ -1267,9 +1272,11 @@ impl BlockchainNode {
         self.state.clone()
     }
     
-    /// PRODUCTION v2.78: Cleanup old heartbeats and attestations from RocksDB (>24h)
+    /// PRODUCTION v2.78 / v3.41: Cleanup ALL ephemeral data from RocksDB (>24h)
     /// Called every hour by continuous pinging loop
     /// SAFETY: Only removes data older than 24h, current epoch (4h) data is preserved
+    /// v3.41: Extended to clean ping_history, poh_state, consensus, failover_events,
+    /// old snapshots + compaction to physically reclaim disk space
     pub async fn cleanup_old_storage_data(&self) {
         // CRITICAL: cutoff = now - 24h, so only data older than 24h is removed
         // Current epoch is 4h, so last 6 epochs (24h) are kept safe
@@ -1302,6 +1309,18 @@ impl BlockchainNode {
             Err(e) => {
                 if is_warn() {
                     println!("[WARN][CLEANUP] rocksdb_attestations_cleanup_failed err={}", e);
+                }
+            }
+        }
+        
+        // v3.41: Cleanup ALL ephemeral CFs + compaction to reclaim disk space
+        // Gets current height for height-based cleanup (poh_state, consensus)
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        match self.storage.run_ephemeral_cleanup(current_height, cutoff) {
+            Ok(()) => {}
+            Err(e) => {
+                if is_warn() {
+                    println!("[WARN][CLEANUP] ephemeral_cleanup_failed err={}", e);
                 }
             }
         }
@@ -1708,14 +1727,41 @@ impl BlockchainNode {
     
     /// Find full node registration including api_endpoint
     /// Returns (node_type, wallet_address, api_endpoint) if found
+    /// v3.35: 3-LEVEL LOOKUP for O(1) performance:
+    ///   Level 1: DashMap in-memory cache (fastest, ~1ns)
+    ///   Level 2: RocksDB persistent cache (~10μs)
+    ///   Level 3: Blockchain scan (slow, O(N) — only on cold start/miss)
     pub async fn find_node_registration_full(&self, node_id: &str) -> Option<(qnet_state::NodeType, String, String)> {
         use qnet_state::TransactionType;
         
-        // Search blockchain from genesis block (block 0 contains Genesis registrations)
+        // LEVEL 1: In-memory DashMap — O(1), ~1ns
+        if let Some(entry) = self.node_registration_cache.get(node_id) {
+            let (nt, wallet, endpoint) = entry.value().clone();
+            return Some((nt, wallet, endpoint));
+        }
+        
+        // LEVEL 2: RocksDB persistent cache -- O(1), ~10us
+        if let Ok(Some((type_str, wallet, _rep))) = self.storage.load_node_registration(node_id) {
+            let type_lower = type_str.to_lowercase();
+            // BACKWARD COMPAT: RocksDB may contain "full" from pre-v3.18 data
+            if type_lower == "full" && is_warn() {
+                println!("[WARN][REG] legacy_full_type node={} (mapped to Super, re-register to fix)", node_id);
+            }
+            let node_type = match type_lower.as_str() {
+                "super" | "full" => qnet_state::NodeType::Super,
+                _ => qnet_state::NodeType::Light,
+            };
+            // Promote to Level 1 cache (endpoint not stored in RocksDB — use empty)
+            self.node_registration_cache.insert(
+                node_id.to_string(), 
+                (node_type.clone(), wallet.clone(), String::new())
+            );
+            return Some((node_type, wallet, String::new()));
+        }
+        
+        // LEVEL 3: Full blockchain scan — O(N), SLOW (only on cache miss after restart)
         let current_height = self.get_height().await;
         
-        // Search from genesis (block 0) forward - registrations are in early blocks
-        // But also search backwards for newer registrations (updates)
         for height in (0..=current_height).rev() {
             if let Ok(Some(block)) = self.storage.load_microblock_auto_format(height) {
                 for tx in &block.transactions {
@@ -1727,7 +1773,11 @@ impl BlockchainNode {
                         .. 
                     } = &tx.tx_type {
                         if reg_node_id == node_id {
-                            // Cache for future lookups
+                            // Populate BOTH caches for future O(1) lookups
+                            self.node_registration_cache.insert(
+                                node_id.to_string(),
+                                (node_type.clone(), wallet_address.clone(), api_endpoint.clone())
+                            );
                             self.cache_node_registration(node_id, node_type.clone(), wallet_address.clone()).await;
                             if is_debug() { 
                                 println!("[DBG][REG] found_onchain node={} wallet={}... endpoint={} h={}", 
@@ -1861,11 +1911,11 @@ impl BlockchainNode {
         let _ = self.storage.save_node_registration(node_id, type_str, &wallet, 1.0);
     }
     
-    /// Get cached node registration
+    /// Get cached node registration (RocksDB only, no DashMap)
     async fn get_cached_node_registration(&self, node_id: &str) -> Option<(qnet_state::NodeType, String)> {
         match self.storage.load_node_registration(node_id) {
             Ok(Some((type_str, wallet, _))) => {
-                // v3.18: Full node type removed - map "full" to Super
+                // BACKWARD COMPAT: "full" from pre-v3.18 mapped to Super
                 let node_type = match type_str.to_lowercase().as_str() {
                     "super" | "full" => qnet_state::NodeType::Super,
                     _ => qnet_state::NodeType::Light,
@@ -1880,18 +1930,29 @@ impl BlockchainNode {
     /// This ensures block CREATOR (not just receivers) has wallet addresses cached
     /// Required for: genesis block creator, regular block producers with NodeRegistration TXs
     /// Without this, producer can't look up wallet addresses for reward distribution
-    fn cache_node_registrations_from_transactions(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
+    /// v3.35: Also populates DashMap in-memory cache for O(1) lookups
+    fn cache_node_registrations_from_transactions_with_dashmap(
+        storage: &crate::storage::Storage, 
+        transactions: &[qnet_state::Transaction],
+        cache: &DashMap<String, (qnet_state::NodeType, String, String)>,
+    ) {
         use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         
         for tx in transactions {
             if let qnet_state::TransactionType::NodeRegistration { 
-                node_id, node_type, wallet_address, .. 
+                node_id, node_type, wallet_address, api_endpoint, .. 
             } = &tx.tx_type {
                 // v3.18: Full node type removed
                 let type_str = match node_type {
                     qnet_state::NodeType::Super => "super",
                     qnet_state::NodeType::Light => "light",
                 };
+                // Level 1: DashMap in-memory cache
+                cache.insert(
+                    node_id.clone(),
+                    (node_type.clone(), wallet_address.clone(), api_endpoint.clone())
+                );
+                // Level 2: RocksDB persistent cache
                 if let Err(e) = storage.save_node_registration(node_id, type_str, wallet_address, INITIAL_REPUTATION) {
                     eprintln!("[WARN][REG] cache_from_block_fail node={} err={}", node_id, e);
                 } else if is_info() {
@@ -1900,6 +1961,11 @@ impl BlockchainNode {
                 }
             }
         }
+    }
+    
+    /// Legacy wrapper for backward compatibility (static calls without DashMap)
+    fn cache_node_registrations_from_transactions(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
+        Self::cache_node_registrations_from_transactions_with_dashmap(storage, transactions, &DashMap::new());
     }
     
     /// Register all 5 Genesis nodes on-chain (called once at blockchain start)
@@ -2170,7 +2236,7 @@ impl BlockchainNode {
                 .map(|(_, wallet, _)| wallet)
                 .unwrap_or_else(|| generate_eon_address_from_id(&node_id));
             
-            // v3.18: Full node type removed
+            // BACKWARD COMPAT: "full" from pre-v3.18 mapped to Super
             let reward_type = match node_type.to_lowercase().as_str() {
                 "super" | "full" => RewardNodeType::Super,
                 _ => RewardNodeType::Light,
@@ -4376,6 +4442,9 @@ impl BlockchainNode {
                 // PRODUCTION v2.50: Set global storage using OnceCell (lock-free)
                 init_global_storage(storage_arc.clone());
                 
+                // v3.36: Initialize dynamic gas pricing (EIP-1559 style)
+                qnet_state::init_dynamic_gas_pricing();
+                
                 // PRODUCTION: Set storage path for registry to read activations
                 std::env::set_var("QNET_STORAGE_PATH", data_dir);
                 if is_debug() { println!("[DBG][NODE] storage_path_env={}", data_dir); }
@@ -4995,8 +5064,7 @@ impl BlockchainNode {
                             
                             let (node_type, wallet) = match registration {
                                 Ok(Some((node_type_str, wallet, _reputation))) => {
-                                    // Normal case: node found in storage
-                                    // v3.18: Full node type removed - map to Super
+                                    // BACKWARD COMPAT: "full" from pre-v3.18 mapped to Super
                                     let nt = match node_type_str.to_lowercase().as_str() {
                                         "light" => RewardNodeType::Light,
                                         "super" | "full" => RewardNodeType::Super,
@@ -5337,6 +5405,7 @@ impl BlockchainNode {
             pre_execution,
             block_event_tx,
             deterministic_reputation,
+            node_registration_cache: Arc::new(DashMap::new()),
         };
         
         if is_debug() { println!("[DBG][NODE] created node_id={}", node_id); }
@@ -6955,6 +7024,9 @@ impl BlockchainNode {
                                     println!("[WARN][STATE] tx_failed h={} hash={} err={}", 
                                              microblock.height, &tx.hash[..16.min(tx.hash.len())], e);
                                 } else {
+                                    // v3.36: Gas refund — return unused gas to sender (EIP-1559)
+                                    let _ = state_guard.apply_gas_refund(tx, microblock.height);
+                                    
                                     // v3.18: Pool 2 REMOVED - fees go directly to block producer
                                     // Fee calculation still happens for transparency (fees_collected in block)
                                     // Actual crediting happens AFTER all TXs are processed (see below)
@@ -8341,8 +8413,7 @@ impl BlockchainNode {
                                  ping_samples.len(), total_ping_count,
                                  (ping_samples.len() as f64 / *total_ping_count as f64) * 100.0); }
                         
-                        println!("[PING-COMMITMENT] 🎉 Ping commitment fully validated!");
-                        println!("[PING-COMMITMENT] 📊 Total: {}, Successful: {}, Root: {}",
+                        println!("[INFO][PING-COMMITMENT] validated total={} ok={} root={}",
                                  total_ping_count, successful_ping_count, &merkle_root[..16]);
                     }
                 } else {
@@ -8389,16 +8460,16 @@ impl BlockchainNode {
                     // Calculate expected maximum (Pool1 + conservative Pool2/Pool3 estimates)
                     let expected_maximum = pool1_emission + MAX_POOL2_ESTIMATE + MAX_POOL3_ESTIMATE;
                     
-                    println!("[EMISSION] 📊 Range validation (halving-aware):");
-                    println!("[EMISSION] 📊   Pool1 base (deterministic): {} QNC", pool1_emission / 1_000_000_000);
-                    println!("[EMISSION] 📊   Expected range: {} - {} QNC", 
-                             expected_minimum / 1_000_000_000,
-                             expected_maximum / 1_000_000_000);
-                    println!("[EMISSION] ⚠️  Note: Exact validation requires on-chain ping attestations (future)");
+                    if is_info() {
+                        println!("[INFO][EMISSION] range_validation pool1={} range={}-{} QNC (halving-aware)", 
+                                 pool1_emission / 1_000_000_000,
+                                 expected_minimum / 1_000_000_000,
+                                 expected_maximum / 1_000_000_000);
+                    }
                     
                     // Validate: emission must be within expected range
                     if tx.amount > expected_maximum {
-                        println!("[EMISSION] ❌ Emission {} QNC exceeds maximum {} QNC", 
+                        println!("[ERR][EMISSION] amount={} exceeds_max={} QNC", 
                                  tx.amount / 1_000_000_000, expected_maximum / 1_000_000_000);
                         return Err(format!(
                             "Emission amount {} exceeds expected maximum {} (Pool1: {}, Pool2 est: {}, Pool3 est: {})",
@@ -8410,9 +8481,9 @@ impl BlockchainNode {
                         ));
                     }
                     
-                    println!("[EMISSION] ✅ Emission {} QNC within valid range", tx.amount / 1_000_000_000);
+                    if is_info() { println!("[INFO][EMISSION] validated amount={} QNC", tx.amount / 1_000_000_000); }
                 } else {
-                    println!("[EMISSION] ⚠️ Reward manager not available - using fallback validation");
+                    if is_warn() { println!("[WARN][EMISSION] reward_manager unavailable, fallback_validation"); }
                     
                     // Fallback: Conservative maximum without reward manager
                     // Use initial Pool1 value (251,432 QNC) + Pool2/Pool3 estimates
@@ -8422,7 +8493,7 @@ impl BlockchainNode {
                     const REASONABLE_MAX_EMISSION_PER_WINDOW: u64 = INITIAL_POOL1 + MAX_POOL2_ESTIMATE + MAX_POOL3_ESTIMATE;
                     
                     if tx.amount > REASONABLE_MAX_EMISSION_PER_WINDOW {
-                        println!("[EMISSION] ❌ Emission {} QNC exceeds fallback maximum {} QNC", 
+                        println!("[ERR][EMISSION] amount={} exceeds_fallback_max={} QNC", 
                                  tx.amount / 1_000_000_000, REASONABLE_MAX_EMISSION_PER_WINDOW / 1_000_000_000);
                         return Err(format!(
                             "Emission amount {} exceeds reasonable maximum for single window",
@@ -8433,13 +8504,13 @@ impl BlockchainNode {
                 
                 // 4. Signature should be None (no central authority)
                 if tx.signature.is_some() {
-                    println!("[EMISSION] ⚠️ Emission transaction has unexpected signature (ignoring)");
+                    if is_warn() { println!("[WARN][EMISSION] unexpected_signature (ignoring)"); }
                 }
                 
                 // 5. Final validation happens in StateManager.emit_rewards()
                 // which checks remaining supply and prevents exceeding MAX_SUPPLY
                 
-                println!("[EMISSION] ✅ Emission transaction fully validated with halving support");
+                if is_info() { println!("[INFO][EMISSION] tx_fully_validated halving_support=true"); }
         }
         
         println!("[VALIDATION] ✅ Microblock #{} fully validated", microblock.height);
@@ -13679,8 +13750,14 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     let mut block_fees_collected: u64 = 0;
                     for tx in &txs {
                         // QUANTUM v2.25: Use effective_gas_price() for +50% Dilithium TX fee
+                        // v3.36: Use compute_gas_used() for metered blocks (EIP-1559 gas refund)
                         if !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
-                            let fee_amount = tx.effective_gas_price() * tx.gas_limit;
+                            let charged_gas = if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                                tx.compute_gas_used()
+                            } else {
+                                tx.gas_limit
+                            };
+                            let fee_amount = tx.effective_gas_price() * charged_gas;
                             block_fees_collected = block_fees_collected.saturating_add(fee_amount);
                         }
                     }
@@ -13712,11 +13789,43 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         let mut state_guard = state.write().await;
                         
                         // 1. Apply all transactions
+                        // v3.33: CRITICAL - Producer must also sync claim state!
+                        // Without this, producer's reward_manager diverges from other nodes
+                        // because synced_claim only runs in the block SYNC path, not PRODUCTION path.
                         for tx in &txs {
+                            // v3.33: Handle CLAIM transactions on producer side
+                            // Same logic as sync path (line ~6935) to ensure reward_manager consistency
+                            if tx.tx_type == qnet_state::TransactionType::RewardDistribution 
+                               && tx.from == "system_rewards_pool" {
+                                if let Some(ref data) = tx.data {
+                                    let parts: Vec<&str> = data.split(':').collect();
+                                    if parts.len() >= 2 && parts[0] == "reward_claim" {
+                                        let claimed_node_id = parts[1];
+                                        
+                                        // Remove from reward_manager (RAM)
+                                        {
+                                            let mut reward_mgr = reward_manager_for_spawn.write().await;
+                                            let _ = reward_mgr.clear_pending_reward(claimed_node_id);
+                                        }
+                                        
+                                        // Remove from storage (RocksDB)
+                                        if let Err(e) = storage.delete_pending_reward(claimed_node_id) {
+                                            if is_debug() { println!("[DBG][CLAIM] producer_delete_fail node={} err={}", claimed_node_id, e); }
+                                        } else {
+                                            println!("[INFO][CLAIM] producer_synced_claim node={} amount={} QNC", 
+                                                     claimed_node_id, tx.amount / 1_000_000_000);
+                                        }
+                                    }
+                                }
+                            }
+                            
                             if let Err(e) = state_guard.apply_transaction_lazy(tx) {
                                 if is_warn() {
                                     println!("[WARN][STATE] producer_tx_apply_failed hash={} err={}", tx.hash, e);
                                 }
+                            } else {
+                                // v3.36: Gas refund — return unused gas to sender (EIP-1559)
+                                let _ = state_guard.apply_gas_refund(tx, next_block_height);
                             }
                         }
                         
@@ -14041,6 +14150,21 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                     }
                                 }
                                 _ => {} // Other transaction types don't contribute to Pool 3
+                            }
+                        }
+                        
+                        // v3.36: Dynamic gas pricing — update after each block produced
+                        // EIP-1559 style: adjust base_fee based on mempool congestion + block utilization
+                        {
+                            let current_mempool_size = mempool.size();
+                            let max_tx = 10_000u64; // max_tx_per_microblock target
+                            let block_utilization = txs.len() as f64 / max_tx as f64;
+                            let mut pricing = qnet_state::DynamicGasPricing::new();
+                            pricing.update_network_load(current_mempool_size, block_utilization);
+                            qnet_state::update_dynamic_gas_pricing(pricing);
+                            if is_debug() {
+                                println!("[DBG][GAS] dynamic_update h={} mempool={} util={:.2}%",
+                                    height_for_storage, current_mempool_size, block_utilization * 100.0);
                             }
                         }
                         
@@ -21937,7 +22061,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if is_system_transaction {
             // System transactions are validated through consensus, not signatures
             if tx.from == "system_emission" {
-                println!("[EMISSION] 📝 System emission transaction accepted (validated through consensus)");
+                if is_info() { println!("[INFO][EMISSION] system_emission_tx_accepted (validated through consensus)"); }
             } else if tx.from == "system_ping_commitment" {
                 // v2.53: Ping commitments are system transactions, validated by merkle proofs
                 if is_info() { println!("[INFO][REWARDS] ping_commitment_accepted system_tx"); }
@@ -21985,23 +22109,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
             }
             
-            // v2.95.3: Check if signature was already verified by REST API (rpc.rs)
-            // REST API sets "signature_verified": true in tx.data after verification
-            // This prevents double verification with incompatible message formats
-            let already_verified = tx.data.as_ref()
-                .map(|d| d.contains("\"signature_verified\":true") || d.contains("\"signature_verified\": true"))
-                .unwrap_or(false);
+            // v3.35: ALWAYS verify signature cryptographically — no shortcuts!
+            // Previous v2.95.3 used "signature_verified":true in data field as shortcut,
+            // which was a security anti-pattern (string match in user-accessible field).
+            // Now that build_canonical_verify_message() ensures consistent formats
+            // across RPC and gossip paths, we always verify.
             
-            if already_verified {
-                // Signature already verified by REST API entry point
-                if is_debug() {
-                    println!("[DBG][SIGVERIFY] skip_double_check tx={} reason=already_verified_by_api", 
-                             &tx.hash[..16.min(tx.hash.len())]);
-                }
-            } else {
-                // P2P transaction - verify signature here
-            // CRITICAL SECURITY v2.25: Cryptographic signature verification
-            // PRODUCTION v2.57: Verify on SIGVERIFY_RUNTIME (isolated from main event loop)
+            // CRITICAL SECURITY: Cryptographic signature verification
             // Step 1: Ed25519 signature (ALWAYS required)
             if let Some(ref sig) = tx.signature {
                 if let Some(ref pubkey) = tx.public_key {
@@ -22024,7 +22138,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
                 if is_info() {
                     println!("[INFO][SIGVERIFY] dilithium_verified tx={}", &tx.hash[..16.min(tx.hash.len())]);
-                    }
                 }
             }
         }
@@ -22196,21 +22309,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         signature_hex: &str,
         public_key_hex: &str
     ) -> Result<bool, QNetError> {
-        let to_str = tx.to.clone().unwrap_or_default();
-        let from = tx.from.clone();
-        let amount = tx.amount;
-        let nonce = tx.nonce;
-        let gas_price = tx.gas_price;
-        let gas_limit = tx.gas_limit;
-        let timestamp = tx.timestamp;
         let sig_hex = signature_hex.to_string();
         let pk_hex = public_key_hex.to_string();
+        
+        // CRITICAL FIX v3.31: Use type-aware canonical message
+        let canonical_msg = Self::build_canonical_verify_message(tx);
         
         let handle = crate::unified_p2p::spawn_sigverify(async move {
             tokio::task::spawn_blocking(move || {
                 use ed25519_dalek::{Signature, VerifyingKey, Verifier};
                 
-                let message = format!("{}|{}|{}|{}|{}|{}|{}", from, to_str, amount, nonce, gas_price, gas_limit, timestamp);
+                let message = canonical_msg;
                 let message_bytes = message.as_bytes();
                 
                 let sig_bytes = hex::decode(&sig_hex).map_err(|e| format!("Invalid sig hex: {}", e))?;
@@ -22245,11 +22354,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     ) -> Result<bool, QNetError> {
         use ed25519_dalek::{Signature, VerifyingKey, Verifier};
         
-        let to_str = tx.to.as_ref().map(|s| s.as_str()).unwrap_or("");
-        let message = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp
-        );
+        // CRITICAL FIX v3.31: Use type-aware canonical message
+        let message = Self::build_canonical_verify_message(tx);
         let message_bytes = message.as_bytes();
         
         let sig_bytes = hex::decode(signature_hex)
@@ -22296,15 +22402,26 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let mut tx_indices: Vec<usize> = Vec::with_capacity(transactions.len());
         
         for (idx, tx) in transactions.iter().enumerate() {
-            // CRITICAL FIX v2.82: Only RewardDistribution skips Ed25519 batch check
-            // HeartbeatCommitment and PingCommitment NOW have Ed25519 signatures (v2.82)
-            // They will be verified normally in the batch
+            // CRITICAL FIX v3.31.1: Skip UNSIGNED system TXs in batch Ed25519 check
+            // These TX types are either:
+            // - Created by block producer (included directly in block, not gossiped individually)
+            // - Validated through consensus mechanism, not user signatures
+            // - NodeRegistration/LightNodeBitmap: system ops without user Ed25519
+            // 
+            // NOTE: HeartbeatCommitment and PingCommitment from NODES have signatures (v2.82)
+            // and WILL be verified normally. Only unsigned variants are skipped.
             let is_unsigned_system_tx = matches!(tx.tx_type,
-                qnet_state::TransactionType::RewardDistribution { .. }
+                qnet_state::TransactionType::RewardDistribution { .. } |
+                qnet_state::TransactionType::NodeRegistration { .. } |
+                qnet_state::TransactionType::NodeActivation { .. } |
+                qnet_state::TransactionType::CreateAccount { .. } |
+                qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
+                qnet_state::TransactionType::BatchRewardClaims { .. } |
+                qnet_state::TransactionType::BatchNodeActivations { .. }
             );
             
             if is_unsigned_system_tx {
-                // RewardDistribution - validated through consensus, no Ed25519
+                // System TX - validated through consensus/block verification, not Ed25519
                 valid_indices.push(idx);
                 continue;
             }
@@ -22315,12 +22432,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 _ => continue,
             };
             
-            // Create canonical message
-            let to_str = tx.to.as_ref().map(|s| s.as_str()).unwrap_or("");
-            let message = format!(
-                "{}|{}|{}|{}|{}|{}|{}",
-                tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp
-            );
+            // CRITICAL FIX v3.31: Use type-aware canonical message
+            // See build_canonical_verify_message() for details on format mismatch
+            let message = Self::build_canonical_verify_message(tx);
             
             // Decode signature
             let sig_bytes = match hex::decode(sig_hex) {
@@ -22403,6 +22517,100 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// PERFORMANCE: ~1,000 verifications/sec/core (10x slower than Ed25519)
     /// SECURITY: CRYSTALS-Dilithium3 - NIST PQC Standard
     /// ═══════════════════════════════════════════════════════════════════════════
+    /// CRITICAL FIX v3.31: Build canonical message matching the format used at signing time.
+    /// User TXs (signed by mobile app) use "transfer:from:to:amount:nonce:gas_price:gas_limit".
+    /// System TXs (signed by nodes) use "from|to|amount|nonce|gas_price|gas_limit|timestamp".
+    /// Without this, Ed25519/Dilithium verification fails for gossiped user TXs.
+    /// CRITICAL v3.31.1: Build canonical message for signature verification
+    /// This MUST match EXACTLY how the client/RPC signed the message!
+    /// 
+    /// FORMAT MATRIX (source of truth):
+    /// ┌─────────────────────┬──────────────────────────────────────────────────────────┬──────────────┐
+    /// │ TX Type             │ Canonical Message Format                                 │ Signed By    │
+    /// ├─────────────────────┼──────────────────────────────────────────────────────────┼──────────────┤
+    /// │ Transfer            │ transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas}  │ User (mobile)│
+    /// │ BatchTransfers      │ batch_transfer:{from}:{total}:{count}:{batch_id}         │ User (batch) │
+    /// │ ContractDeploy      │ contract_deploy:{from}:{code_hash}:{nonce}               │ User (dApp)  │
+    /// │ ContractCall        │ contract_call:{from}:{contract}:{method}:{nonce}          │ User (dApp)  │
+    /// │ HeartbeatCommitment │ {from}|{to}|{amount}|{nonce}|{gas_price}|{gas}|{ts}      │ Node (hybrid)│
+    /// │ PingCommitment      │ {from}|{to}|{amount}|{nonce}|{gas_price}|{gas}|{ts}      │ Node (hybrid)│
+    /// │ RewardDistribution  │ (SKIPPED in batch verify — auto-valid)                   │ System       │
+    /// │ NodeRegistration    │ (SKIPPED in batch verify — unsigned system TX)            │ System       │
+    /// │ LightNodeBitmap     │ (SKIPPED in batch verify — unsigned system TX)            │ System       │
+    /// └─────────────────────┴──────────────────────────────────────────────────────────┴──────────────┘
+    fn build_canonical_verify_message(tx: &qnet_state::Transaction) -> String {
+        let to_str = tx.to.as_ref().map(|s| s.as_str()).unwrap_or("");
+        match &tx.tx_type {
+            // === USER TRANSACTIONS (signed by mobile/dApp) ===
+            
+            // Transfer: matches WalletManager.js:5514 and rpc.rs:3923
+            qnet_state::TransactionType::Transfer { .. } => {
+                format!("transfer:{}:{}:{}:{}:{}:{}",
+                    tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit)
+            }
+            
+            // BatchTransfers: matches rpc.rs:4645
+            // CRITICAL FIX v3.31.1: 4th param is batch_id (NOT nonce!)
+            // RPC signs: batch_transfer:{from}:{total_amount}:{count}:{batch_id}
+            qnet_state::TransactionType::BatchTransfers { transfers, batch_id } => {
+                let total_amount: u64 = transfers.iter().map(|t| t.amount).sum();
+                format!("batch_transfer:{}:{}:{}:{}",
+                    tx.from, total_amount, transfers.len(), batch_id)
+            }
+            
+            // ContractDeploy: matches rpc.rs:10825
+            // CRITICAL FIX v3.31.1: code_hash is stored in tx.data JSON, NOT sha3(data)!
+            // RPC computes: sha3(base64_decode(wasm_code)) → hex → stores in data.code_hash
+            // We extract code_hash from the JSON data field
+            qnet_state::TransactionType::ContractDeploy => {
+                let code_hash = if let Some(ref data) = tx.data {
+                    // tx.data is a JSON string: {"code_hash":"abc...","code_size":...,"security":...}
+                    // Extract code_hash field from JSON
+                    serde_json::from_str::<serde_json::Value>(data)
+                        .ok()
+                        .and_then(|v| v.get("code_hash").and_then(|h| h.as_str().map(String::from)))
+                        .unwrap_or_else(|| {
+                            // Fallback: if data is not JSON (legacy), hash the raw data
+                            use sha3::{Digest, Sha3_256};
+                            let mut hasher = Sha3_256::new();
+                            hasher.update(data.as_bytes());
+                            format!("{:x}", hasher.finalize())
+                        })
+                } else {
+                    String::new()
+                };
+                format!("contract_deploy:{}:{}:{}", tx.from, code_hash, tx.nonce)
+            }
+            
+            // ContractCall: matches rpc.rs:11179
+            // CRITICAL FIX v3.31.1: method is stored in tx.data JSON, NOT tx.data itself!
+            // RPC signs: contract_call:{from}:{contract}:{method}:{nonce}
+            // tx.data is JSON: {"contract":"...","method":"transfer","args":[...],"security":{...}}
+            qnet_state::TransactionType::ContractCall => {
+                let contract = to_str;
+                let method = if let Some(ref data) = tx.data {
+                    // tx.data is a JSON string — extract "method" field
+                    serde_json::from_str::<serde_json::Value>(data)
+                        .ok()
+                        .and_then(|v| v.get("method").and_then(|m| m.as_str().map(String::from)))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                format!("contract_call:{}:{}:{}:{}", tx.from, contract, method, tx.nonce)
+            }
+            
+            // === NODE-SIGNED SYSTEM TRANSACTIONS (signed with ephemeral Ed25519 + Dilithium) ===
+            // HeartbeatCommitment, PingCommitmentWithSampling — use pipe-separated format
+            // This matches node.rs:2817/2997 where nodes sign with:
+            //   format!("{}|{}|{}|{}|{}|{}|{}", from, to, amount, nonce, gas_price, gas_limit, timestamp)
+            _ => {
+                format!("{}|{}|{}|{}|{}|{}|{}",
+                    tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp)
+            }
+        }
+    }
+    
     async fn verify_dilithium_tx_signature_async(tx: &qnet_state::Transaction) -> Result<bool, QNetError> {
         use crate::quantum_crypto::DilithiumSignature;
         
@@ -22418,15 +22626,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             )),
         };
         
-        let to_str = tx.to.clone().unwrap_or_default();
         let from = tx.from.clone();
-        let amount = tx.amount;
-        let nonce = tx.nonce;
-        let gas_price = tx.gas_price;
-        let gas_limit = tx.gas_limit;
         let timestamp = tx.timestamp;
         
-        let message = format!("{}|{}|{}|{}|{}|{}|{}", from, to_str, amount, nonce, gas_price, gas_limit, timestamp);
+        // CRITICAL FIX v3.31: Use type-aware canonical message
+        let message = Self::build_canonical_verify_message(tx);
         let sig_struct = DilithiumSignature {
             signature: dilithium_sig,
             algorithm: "CRYSTALS-Dilithium3".to_string(),
@@ -22470,12 +22674,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             )),
         };
         
-        let to_str = tx.to.clone().unwrap_or_default();
         let from = tx.from.clone();
-        let message = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp
-        );
+        // CRITICAL FIX v3.31: Use type-aware canonical message
+        let message = Self::build_canonical_verify_message(tx);
         
         let sig_struct = DilithiumSignature {
             signature: dilithium_sig,
@@ -22525,8 +22726,34 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // - PingCommitmentWithSampling: validated through Dilithium signatures + Merkle proofs + TX signature (v2.82)
             // - HeartbeatCommitment: validated through Dilithium signatures in samples + Merkle proofs + TX signature (v2.82)
             if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) && tx.from != "system_emission" {
-                if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
-                    return Err(QNetError::ValidationError("Reward claim must be signed".to_string()));
+                // v3.35: FULL crypto verification for RewardDistribution (not just presence check!)
+                // Prevents forged claim TXs from being injected via gossip
+                let (sig, pubkey) = match (&tx.signature, &tx.public_key) {
+                    (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => (s, p),
+                    _ => return Err(QNetError::ValidationError(
+                        "Reward claim must have Ed25519 signature and public_key".to_string()
+                    )),
+                };
+                
+                // CRITICAL v3.35: Verify Ed25519 signature on claim message
+                // The message format is "claim_rewards:{node_id}:{wallet}" — same as RPC path
+                // This ensures gossip path has same security level as direct RPC
+                if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
+                    return Err(QNetError::ValidationError(
+                        "Invalid Ed25519 signature on reward claim TX (gossip)".to_string()
+                    ));
+                }
+                
+                // Validate data field format
+                if tx.data.as_ref().map_or(true, |d| !d.starts_with("reward_claim:")) {
+                    return Err(QNetError::ValidationError(
+                        "Reward claim must have valid data field (reward_claim:...)".to_string()
+                    ));
+                }
+                
+                if is_info() { 
+                    println!("[INFO][VERIFY] reward_claim_signature_verified_gossip to={}", 
+                             tx.to.as_deref().unwrap_or("none")); 
                 }
             }
             
@@ -25550,6 +25777,7 @@ impl Clone for BlockchainNode {
             sent_ping_commitments: self.sent_ping_commitments.clone(),
             height: self.height.clone(),
             is_running: self.is_running.clone(),
+            node_registration_cache: self.node_registration_cache.clone(),
             current_microblocks: self.current_microblocks.clone(),
             last_microblock_time: self.last_microblock_time.clone(),
             microblock_interval: self.microblock_interval,

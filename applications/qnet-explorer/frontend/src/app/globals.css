@@ -3184,11 +3184,12 @@ a[href*="play.google.com"] img {
 
 .explorer-page {
   padding: 1.5rem 2rem;
-  width: 80%;
-  max-width: 80%;
+  width: 100%;
+  max-width: 1400px;
   margin: 0 auto;
   min-height: 100vh;
   background: transparent;
+  box-sizing: border-box;
 }
 
 /* Header */
@@ -3215,6 +3216,8 @@ a[href*="play.google.com"] img {
   display: flex;
   max-width: 700px;
   margin: 0 auto 2rem;
+  padding: 0 0.5rem;
+  box-sizing: border-box;
 }
 
 .explorer-search input {
@@ -3264,6 +3267,7 @@ a[href*="play.google.com"] img {
   background: rgba(0,30,45,0.75);
   border: 1px solid rgba(0,40,60,0.3);
   border-radius: 12px;
+  overflow: hidden;
 }
 
 .activity-header {
@@ -3272,6 +3276,8 @@ a[href*="play.google.com"] img {
   align-items: center;
   padding: 1rem 1.5rem;
   border-bottom: 1px solid rgba(0,200,220,0.12);
+  flex-wrap: wrap;
+  gap: 0.75rem;
 }
 
 .activity-header h2 {
@@ -3284,10 +3290,34 @@ a[href*="play.google.com"] img {
 /* Table */
 .table-wrapper {
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Visible scrollbar for table on small screens */
+@media (max-width: 1024px) {
+  .table-wrapper {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0,200,220,0.4) rgba(0,30,45,0.5);
+  }
+  .table-wrapper::-webkit-scrollbar {
+    height: 8px;
+  }
+  .table-wrapper::-webkit-scrollbar-track {
+    background: rgba(0,30,45,0.5);
+    border-radius: 4px;
+  }
+  .table-wrapper::-webkit-scrollbar-thumb {
+    background: rgba(0,200,220,0.4);
+    border-radius: 4px;
+  }
+  .table-wrapper::-webkit-scrollbar-thumb:hover {
+    background: rgba(0,220,240,0.6);
+  }
 }
 
 .activity-table {
   width: 100%;
+  min-width: 600px;
   border-collapse: collapse;
 }
 
@@ -3321,7 +3351,7 @@ a[href*="play.google.com"] img {
 }
 
 .col-hash {
-  min-width: 170px;
+  min-width: 130px;
 }
 
 .col-hash a {
@@ -3621,7 +3651,7 @@ a[href*="play.google.com"] img {
   white-space: nowrap;
   font-size: 0.82rem;
   font-family: 'JetBrains Mono', monospace;
-  min-width: 150px;  /* v3.0: Wider for full numbers like 100,570.00 QNC */
+  min-width: 100px;
   text-align: right;
 }
 
@@ -3647,21 +3677,61 @@ a[href*="play.google.com"] img {
   color: #00e5f0 !important;
 }
 
-/* Responsive */
-@media (max-width: 1100px) {
-  .explorer-page { 
-    width: 95%;
-    max-width: 95%;
-    padding: 1rem; 
+/* ===== Responsive Explorer ===== */
+
+/* Large tablets / small desktops */
+@media (max-width: 1200px) {
+  .explorer-page {
+    padding: 1rem 1.5rem;
   }
-  .activity-table th:nth-child(5),
-  .activity-table td:nth-child(5) { display: none; }
 }
 
+/* Tablets */
+@media (max-width: 1024px) {
+  .explorer-page {
+    padding: 1rem;
+  }
+  .activity-controls { flex-wrap: wrap; }
+  .filter-chips { flex-wrap: wrap; }
+}
+
+/* Small tablets */
 @media (max-width: 800px) {
-  .activity-table th:nth-child(4),
-  .activity-table td:nth-child(4) { display: none; }
-  .col-addresses { font-size: 0.7rem; }
+  .explorer-page {
+    padding: 0.75rem 0.5rem;
+  }
+  .explorer-header h1 { font-size: 1.5rem; }
+  .explorer-header p { font-size: 0.85rem; }
+  .activity-header { padding: 0.75rem 1rem; }
+  .activity-header h2 { font-size: 1rem; }
+}
+
+/* Large phones */
+@media (max-width: 640px) {
+  .explorer-page {
+    padding: 0.5rem 0.25rem;
+  }
+  .explorer-header { margin-bottom: 1rem; }
+  .explorer-header h1 { font-size: 1.25rem; }
+  .explorer-header p { font-size: 0.78rem; }
+  .explorer-search input { font-size: 0.82rem; padding: 0.7rem 0.8rem; }
+  .activity-header { padding: 0.6rem 0.75rem; flex-direction: column; align-items: flex-start; }
+  .filter-chips { flex-wrap: wrap; }
+  .filter-chip { font-size: 0.65rem; padding: 0.25rem 0.5rem; }
+  .tx-count { font-size: 0.75rem; }
+}
+
+/* Small phones */
+@media (max-width: 420px) {
+  .explorer-page {
+    padding: 0.25rem 0.15rem;
+  }
+  .explorer-header h1 { font-size: 1.1rem; }
+  .explorer-header p { font-size: 0.7rem; }
+  .explorer-search { margin: 0 auto 1rem; }
+  .explorer-search input { font-size: 0.75rem; padding: 0.6rem 0.6rem; }
+  .search-btn { padding: 0 0.6rem; }
+  .filter-chip { font-size: 0.6rem; padding: 0.2rem 0.4rem; }
 }
 
 /* Pagination Controls */
@@ -3738,14 +3808,15 @@ a[href*="play.google.com"] img {
   margin-top: 1rem;
 }
 
-@media (max-width: 600px) {
+@media (max-width: 640px) {
   .pagination-controls {
     gap: 0.3rem;
+    padding: 1rem 0.5rem;
   }
   .page-btn {
-    min-width: 35px;
-    height: 35px;
-    font-size: 0.8rem;
+    min-width: 32px;
+    height: 32px;
+    font-size: 0.75rem;
   }
   .page-info {
     width: 100%;
@@ -3754,5 +3825,7 @@ a[href*="play.google.com"] img {
     padding: 0.5rem 0 0 0;
     border-left: none;
     border-top: 1px solid rgba(0,200,220,0.1);
+    font-size: 0.75rem;
   }
+  .page-ellipsis { font-size: 0.75rem; }
 }

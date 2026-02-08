@@ -3953,7 +3953,7 @@ async fn handle_transaction_submit(
              &tx_request.to[..8.min(tx_request.to.len())]);
     
     // v2.95.3: Verify Dilithium signature if present (quantum-resistant)
-    // CRITICAL: Must verify BEFORE setting signature_verified flag!
+    // CRITICAL: Must verify Dilithium BEFORE creating transaction!
     let dilithium_verified = if let (Some(ref dil_sig), Some(ref dil_pk)) = 
         (&tx_request.dilithium_signature, &tx_request.dilithium_public_key) 
     {
@@ -4008,7 +4008,6 @@ async fn handle_transaction_submit(
             amount: tx_request.amount,
         },
         Some(serde_json::to_string(&json!({
-            "signature_verified": true,
             "dilithium_verified": dilithium_verified,
             "public_key": tx_request.public_key,
             "standard": if dilithium_verified { "NIST FIPS 186-5 + CRYSTALS-Dilithium3" } else { "NIST FIPS 186-5 (Ed25519)" }
@@ -4444,14 +4443,29 @@ async fn handle_batch_claim_rewards(
     let mut failed_nodes: Vec<serde_json::Value> = Vec::new();
     
     // Process each node's reward claim
-    for node_id in &request.node_ids {        // SECURITY: Get pending reward BEFORE claim to validate amount
-        let pending_reward = {
-            let reward_manager_arc = blockchain.get_reward_manager();
-            let reward_manager = reward_manager_arc.read().await;
-            reward_manager.get_pending_reward(node_id).cloned()
+    for node_id in &request.node_ids {
+        // v3.34: SECURITY - Read pending amount from BLOCKCHAIN STATE (like single claim)
+        // Previously read from reward_manager which could diverge from StateManager
+        let wallet_address_for_node = blockchain.get_node_wallet(node_id).await;
+        let blockchain_pending = match &wallet_address_for_node {
+            Some(wallet) => {
+                let state = blockchain.get_state_manager();
+                let state_guard = state.read().await;
+                state_guard.get_pending_rewards(wallet)
+            }
+            None => 0
         };
         
-        // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
+        if blockchain_pending == 0 {
+            failed_nodes.push(json!({
+                "node_id": node_id,
+                "error": "No pending rewards in blockchain state",
+                "status": "rejected"
+            }));
+            continue;
+        }
+        
+        // Claim from reward_manager (clears in-memory state)
         let claim_result = {
             let reward_manager_arc = blockchain.get_reward_manager();
             let mut reward_manager = reward_manager_arc.write().await;
@@ -4460,29 +4474,14 @@ async fn handle_batch_claim_rewards(
         
         if claim_result.success {
             if let Some(reward) = claim_result.reward {
-                let reward_amount = reward.total_reward;
+                // v3.34: Use blockchain_pending as the authoritative amount
+                // reward_manager amount used for pool breakdown display only
+                let reward_amount = blockchain_pending;
                 
-                // SECURITY CRITICAL: Validate claimed amount matches pre-claim pending
-                // This prevents amount manipulation between pending calculation and claim
-                if let Some(ref pending) = pending_reward {
-                    if pending.total_reward != reward_amount {
-                        eprintln!("[SECURITY] ❌ CRITICAL: Reward amount mismatch for node {}", node_id);
-                        eprintln!("  Expected (pending): {} QNC", pending.total_reward);
-                        eprintln!("  Claimed: {} QNC", reward_amount);
-                        eprintln!("  REJECTING CLAIM - possible manipulation attempt!");
-                        
-                        failed_nodes.push(json!({
-                            "node_id": node_id,
-                            "error": format!("Security: Amount mismatch (expected {}, got {})", 
-                                           pending.total_reward, reward_amount),
-                            "status": "rejected"
-                        }));
-                        continue; // Skip this claim
-                    }
-                    println!("[SECURITY] ✅ Reward amount validated: {} QNC matches pending", reward_amount);
-                } else {
-                    // No pending reward existed - this shouldn't happen if claim succeeded
-                    eprintln!("[SECURITY] ⚠️ WARNING: No pending reward found for node {} but claim succeeded", node_id);
+                // Cross-check: warn if reward_manager disagrees with blockchain
+                if reward.total_reward != blockchain_pending {
+                    eprintln!("[WARN][CLAIM] batch_amount_mismatch node={} blockchain={} reward_mgr={}", 
+                             node_id, blockchain_pending, reward.total_reward);
                 }
                 total_rewards += reward_amount;
                 processed_nodes.push(json!({
@@ -4494,8 +4493,19 @@ async fn handle_batch_claim_rewards(
                     "pool3_activation": reward.pool3_activation_bonus,
                     "phase": format!("{:?}", reward.current_phase)
                 }));
-                println!("[REWARDS] ✅ Claimed {} QNC for node {} by wallet {}...", 
-                         reward_amount, node_id, &request.owner_address[..8.min(request.owner_address.len())]);
+                println!("[INFO][CLAIM] batch_claimed node={} amount={} QNC wallet={}...", 
+                         node_id, reward_amount / 1_000_000_000, &request.owner_address[..8.min(request.owner_address.len())]);
+                
+                // v3.33: Delete pending reward from RocksDB (same as single claim handler)
+                // Prevents double-claim after restart before block is processed
+                {
+                    let storage = blockchain.get_storage();
+                    if let Err(e) = storage.delete_pending_reward(node_id) {
+                        if crate::node::is_debug() { println!("[DBG][CLAIM] batch_delete_pending_fail node={} err={}", node_id, e); }
+                    } else {
+                        if crate::node::is_debug() { println!("[DBG][CLAIM] batch_pending_deleted node={}", node_id); }
+                    }
+                }
                 
                 // Create RewardDistribution transaction for actual payout
                 let current_time = SystemTime::now()
@@ -4503,12 +4513,10 @@ async fn handle_batch_claim_rewards(
                     .unwrap_or_default()
                     .as_secs();
                 
-                // DECENTRALIZED: Reward claim transaction without signature
-                // Validation already done:
+                // Reward claim transaction - validation already done:
                 // 1. pending_reward existence checked
                 // 2. amount validated against pending
                 // 3. reward_manager.claim_rewards() validated eligibility
-                // No central authority signature needed!
                 let mut reward_tx = qnet_state::Transaction {
                     from: "system_rewards_pool".to_string(),
                     to: Some(request.owner_address.clone()),
@@ -4516,24 +4524,24 @@ async fn handle_batch_claim_rewards(
                     tx_type: qnet_state::TransactionType::RewardDistribution,
                     timestamp: current_time,
                     hash: String::new(),
-                    signature: None, // No signature - already validated through claim process
-                    public_key: None, // Not needed for system transactions
-                    gas_price: 0, // No gas for rewards
-                    gas_limit: 0, // No gas for rewards
+                    signature: None,
+                    public_key: None,
+                    gas_price: 0,
+                    gas_limit: 0,
                     nonce: 0,
-                    data: Some(format!("Claim for node: {}", node_id)), // Track which node claimed
-                    dilithium_signature: None,   // System TX - no quantum sig
+                    data: Some(format!("reward_claim:{}:{}:batch", node_id, reward_amount)), // v3.33: Match sync handler format
+                    dilithium_signature: None,
                     dilithium_public_key: None,
                 };
                 
                 // Calculate hash using SHA3-256 (NIST compliant)
                 reward_tx.hash = reward_tx.calculate_hash();
                 
-                println!("[REWARDS] 📝 Reward claim transaction created (no signature, validated through claim)");
+                println!("[INFO][CLAIM] batch_tx_created node={} hash={}", node_id, &reward_tx.hash[..16.min(reward_tx.hash.len())]);
                 
                 // Submit transaction to blockchain
                 if let Err(e) = blockchain.submit_transaction(reward_tx).await {
-                    eprintln!("[REWARDS] ❌ Failed to submit reward transaction: {}", e);
+                    eprintln!("[ERR][CLAIM] batch_tx_submit_fail node={} err={}", node_id, e);
                     failed_nodes.push(json!({
                         "node_id": node_id,
                         "error": format!("Failed to submit transaction: {}", e),
@@ -4621,12 +4629,16 @@ async fn handle_batch_transfer(
     // PRODUCTION: Process real batch transfers via blockchain transaction
     let total_amount: u64 = request.transfers.iter().map(|t| t.amount).sum();
     
-    // Get current nonce from state (use timestamp-based nonce for batch transfers)
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let nonce = timestamp; // Use timestamp as nonce for batch transfers
+    // v3.34: Read correct sequential nonce from StateManager
+    // Previously used timestamp as nonce which ALWAYS failed nonce check (nonce != sender.nonce + 1)
+    let nonce = {
+        let state = blockchain.get_state_manager();
+        let state_guard = state.read().await;
+        match state_guard.get_account(&from_address) {
+            Some(acc) => acc.nonce + 1,
+            None => 1, // First transaction for new account
+        }
+    };
     
     // Build message to verify (canonical format for batch)
     let message_to_sign = format!("batch_transfer:{}:{}:{}:{}", 
@@ -4676,7 +4688,6 @@ async fn handle_batch_transfer(
             batch_id: request.batch_id.clone()
         },
         Some(serde_json::to_string(&json!({        // data
-            "signature_verified": true,
             "public_key": request.public_key,
             "standard": "NIST FIPS 186-5 (Ed25519)"
         })).unwrap_or_default()),
@@ -6968,6 +6979,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
         }
         
         let mut last_reannounce = std::time::Instant::now();
+        let mut last_flush = std::time::Instant::now(); // v3.41: WAL flush tracker
         
         loop {
             check_interval.tick().await;
@@ -7000,6 +7012,28 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                     // PRODUCTION v2.78: RocksDB cleanup (persistent storage)
                     blockchain_for_pings.cleanup_old_storage_data().await;
                 }
+            }
+            
+            // ================================================================
+            // v3.41: PERIODIC WAL FLUSH (every 5 minutes)
+            // Forces all CF memtables to SST, allowing old WAL files to be deleted.
+            // Without this, rarely-written CFs keep stale memtables indefinitely,
+            // preventing WAL cleanup even with set_max_total_wal_size.
+            // ================================================================
+            if last_flush.elapsed().as_secs() >= 300 {
+                match blockchain_for_pings.get_storage().flush_all() {
+                    Ok(()) => {
+                        if crate::node::is_debug() {
+                            println!("[DBG][STORAGE] periodic_flush_done interval=5m");
+                        }
+                    }
+                    Err(e) => {
+                        if crate::node::is_warn() {
+                            println!("[WARN][STORAGE] periodic_flush_failed err={}", e);
+                        }
+                    }
+                }
+                last_flush = std::time::Instant::now();
             }
             
             // ================================================================
@@ -7690,41 +7724,71 @@ async fn handle_get_pending_rewards(
     };
     let is_eligible = heartbeat_count >= required_heartbeats;
     
-    // v2.75: Show REAL pending rewards only (no estimated!)
-    // Eligibility check happens at emission time - if rewards exist, they are claimable
+    // v3.34: TOTAL from StateManager (source of truth), BREAKDOWN from reward_manager
+    // Previously read everything from reward_manager which could diverge from blockchain state
     let (pending_amount, pool1, pool2, pool3, phase, is_claimable) = {
+        // 1. Get authoritative TOTAL from blockchain state
+        let blockchain_total = {
+            if let Some(wallet) = blockchain.get_node_wallet(&node_id).await {
+                let state = blockchain.get_state_manager();
+                let state_guard = state.read().await;
+                state_guard.get_pending_rewards(&wallet)
+            } else {
+                0
+            }
+        };
+        
+        // 2. Get pool BREAKDOWN from reward_manager (StateManager only stores total)
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
         
-        // First check reward_manager (RAM)
         if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
+            // Cross-check: if reward_manager disagrees with blockchain, log warning
+            if reward.total_reward != blockchain_total && blockchain_total > 0 {
+                eprintln!("[WARN][REWARDS] pending_mismatch node={} blockchain={} reward_mgr={}", 
+                         node_id, blockchain_total, reward.total_reward);
+            }
             (
-                reward.total_reward,
+                blockchain_total, // Use blockchain total as authoritative value
                 reward.pool1_base_emission,
                 reward.pool2_transaction_fees,
                 reward.pool3_activation_bonus,
                 format!("{:?}", reward.current_phase),
-                reward.total_reward >= 1_000_000_000, // Claimable if >= 1 QNC
+                blockchain_total >= 1_000_000_000, // Claimable if >= 1 QNC
             )
         } else {
-            // FALLBACK: Check RocksDB for persisted pending rewards
-            let storage = blockchain.get_storage();
-            match storage.load_pending_reward(&node_id) {
-                Ok(Some(reward)) => {
-                    (
-                        reward.total_reward,
-                        reward.pool1_base_emission,
-                        reward.pool2_transaction_fees,
-                        reward.pool3_activation_bonus,
-                        format!("{:?}", reward.current_phase),
-                        reward.total_reward >= 1_000_000_000,
-                    )
-                }
-                _ => {
-                    // No rewards yet - show 0 (NOT estimated!)
-                    let stats = reward_manager.get_reward_stats();
-                    let phase_str = format!("{:?}", stats.current_phase);
-                    (0, 0, 0, 0, phase_str, false)
+            // No breakdown in reward_manager — check if blockchain has a total anyway
+            if blockchain_total > 0 {
+                // Blockchain has rewards but reward_manager doesn't — show total without breakdown
+                let stats = reward_manager.get_reward_stats();
+                (
+                    blockchain_total,
+                    blockchain_total, // All in pool1 (no breakdown available)
+                    0,
+                    0,
+                    format!("{:?}", stats.current_phase),
+                    blockchain_total >= 1_000_000_000,
+                )
+            } else {
+                // FALLBACK: Check RocksDB for persisted pending rewards
+                let storage = blockchain.get_storage();
+                match storage.load_pending_reward(&node_id) {
+                    Ok(Some(reward)) => {
+                        (
+                            reward.total_reward,
+                            reward.pool1_base_emission,
+                            reward.pool2_transaction_fees,
+                            reward.pool3_activation_bonus,
+                            format!("{:?}", reward.current_phase),
+                            reward.total_reward >= 1_000_000_000,
+                        )
+                    }
+                    _ => {
+                        // No rewards yet - show 0 (NOT estimated!)
+                        let stats = reward_manager.get_reward_stats();
+                        let phase_str = format!("{:?}", stats.current_phase);
+                        (0, 0, 0, 0, phase_str, false)
+                    }
                 }
             }
         }
@@ -8049,7 +8113,20 @@ async fn handle_get_rewards_by_wallet(
     };
     
     for node_id in nodes {
-        // Get pending rewards for each node
+        // v3.34: TOTAL from StateManager (source of truth), breakdown from reward_manager
+        let blockchain_total = {
+            if let Some(wallet) = blockchain.get_node_wallet(&node_id).await {
+                let state = blockchain.get_state_manager();
+                let state_guard = state.read().await;
+                state_guard.get_pending_rewards(&wallet)
+            } else {
+                // For the wallet we're querying — check directly
+                let state = blockchain.get_state_manager();
+                let state_guard = state.read().await;
+                state_guard.get_pending_rewards(&wallet_address)
+            }
+        };
+        
         let reward_manager = blockchain.get_reward_manager();
         let rm = reward_manager.read().await;
         let pending = rm.get_pending_reward(&node_id).cloned();
@@ -8086,14 +8163,19 @@ async fn handle_get_rewards_by_wallet(
             .map(|(_, _, ls)| (now.saturating_sub(*ls) < 15 * 60, *ls)) // Online if seen in last 15 min
             .unwrap_or((false, 0)); // Not in active list = offline
         
+        // v3.34: Use blockchain_total as authoritative, breakdown from reward_manager
         let (total, pool1, pool2, pool3, phase) = if let Some(ref reward) = pending {
+            let authoritative_total = if blockchain_total > 0 { blockchain_total } else { reward.total_reward };
             (
-                reward.total_reward as f64 / 1_000_000_000.0,
+                authoritative_total as f64 / 1_000_000_000.0,
                 reward.pool1_base_emission as f64 / 1_000_000_000.0,
                 reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
                 reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
                 format!("{:?}", reward.current_phase),
             )
+        } else if blockchain_total > 0 {
+            // Blockchain has rewards but reward_manager doesn't
+            (blockchain_total as f64 / 1_000_000_000.0, blockchain_total as f64 / 1_000_000_000.0, 0.0, 0.0, "Phase1".to_string())
         } else {
             (0.0, 0.0, 0.0, 0.0, "Phase1".to_string())
         };
@@ -8160,14 +8242,26 @@ async fn handle_get_pending_rewards_batch(
     let current_height = blockchain.get_height().await;
     let current_epoch = (current_height / 14400) + 1;
     
+    // v3.34: Read authoritative totals from StateManager
+    let state_arc = blockchain.get_state_manager();
+    let state_guard = state_arc.read().await;
+    
     let mut results = Vec::new();
     let mut total_pending = 0.0f64;
     
     for node_id in &request.node_ids {
         let pending = reward_manager.get_pending_reward(node_id).cloned();
         
+        // v3.34: Get authoritative total from blockchain state
+        let blockchain_total = if let Some(wallet) = blockchain.get_node_wallet(node_id).await {
+            state_guard.get_pending_rewards(&wallet)
+        } else {
+            0
+        };
+        
         let (total, pool1, pool2, pool3) = if let Some(ref reward) = pending {
-            let t = reward.total_reward as f64 / 1_000_000_000.0;
+            let authoritative = if blockchain_total > 0 { blockchain_total } else { reward.total_reward };
+            let t = authoritative as f64 / 1_000_000_000.0;
             total_pending += t;
             (
                 t,
@@ -8175,6 +8269,10 @@ async fn handle_get_pending_rewards_batch(
                 reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
                 reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
             )
+        } else if blockchain_total > 0 {
+            let t = blockchain_total as f64 / 1_000_000_000.0;
+            total_pending += t;
+            (t, t, 0.0, 0.0)
         } else {
             (0.0, 0.0, 0.0, 0.0)
         };
@@ -8189,6 +8287,8 @@ async fn handle_get_pending_rewards_batch(
             }
         }));
     }
+    
+    drop(state_guard);
     
     Ok(warp::reply::json(&json!({
         "success": true,
@@ -8807,10 +8907,18 @@ async fn handle_activations_by_wallet(
         // Merge both sources into unified list
         let mut nodes: Vec<(String, qnet_consensus::lazy_rewards::NodeType, u64)> = Vec::new();
         
+        // v3.34: ARCHITECTURE — 1 wallet = 1 node (strictly enforced)
+        // Read pending_rewards from StateManager (blockchain state = source of truth)
+        // per-wallet == per-node since mapping is always 1:1
+        let blockchain_pending = {
+            let state_arc = blockchain.get_state_manager();
+            let state_guard = state_arc.read().await;
+            state_guard.get_pending_rewards(&wallet_address)
+        };
+        
         // Add nodes from storage first (primary source)
         for (node_id, node_type_str, _rep) in &storage_nodes {
-            // v3.1: NO DEFAULT - skip unknown types instead of assuming Full
-            // v3.18: Full nodes removed
+            // v3.18: Full nodes removed — only Light and Super
             let node_type = match node_type_str.as_str() {
                 "light" => qnet_consensus::lazy_rewards::NodeType::Light,
                 "super" => qnet_consensus::lazy_rewards::NodeType::Super,
@@ -8819,16 +8927,13 @@ async fn handle_activations_by_wallet(
                     continue; // Skip unknown types
                 }
             };
-            let pending = reward_manager.get_pending_reward(node_id)
-                .map(|r| r.total_reward)
-                .unwrap_or(0);
-            nodes.push((node_id.clone(), node_type, pending));
+            nodes.push((node_id.clone(), node_type, blockchain_pending));
         }
         
         // Add any additional nodes from reward_manager that weren't in storage
-        for (node_id, node_type, pending) in &rm_nodes {
+        for (node_id, node_type, _pending) in &rm_nodes {
             if !nodes.iter().any(|(id, _, _)| id == node_id) {
-                nodes.push((node_id.clone(), node_type.clone(), *pending));
+                nodes.push((node_id.clone(), node_type.clone(), blockchain_pending));
             }
         }
         
@@ -8840,16 +8945,11 @@ async fn handle_activations_by_wallet(
         for (bootstrap_id, genesis_wallet) in GENESIS_WALLETS.iter() {
             let genesis_id = format!("genesis_node_{}", bootstrap_id);
             if wallet_address == *genesis_wallet {
-                // Get pending rewards for this genesis node
-                let pending = reward_manager.get_pending_reward(&genesis_id)
-                    .map(|r| r.total_reward)
-                    .unwrap_or(0);
-                
-                // Add to nodes list (genesis nodes are "super" type)
+                // v3.34: Get pending from StateManager (1 wallet = 1 genesis node)
                 nodes.push((
                     genesis_id,
                     qnet_consensus::lazy_rewards::NodeType::Super,
-                    pending
+                    blockchain_pending
                 ));
             }
         }
@@ -10985,60 +11085,83 @@ async fn handle_contract_call(
         })));
     }
     
-    // For view calls, no signature required - execute directly via VM
+    // For view calls, no signature required — read directly from blockchain state
     if request.is_view {
-        // Execute via Contract VM (REAL implementation)
-        let storage = blockchain.get_storage();
-        let vm = crate::contract_vm::ContractVM::new(storage);
-        
-        let args: Vec<serde_json::Value> = request.args.as_array()
-            .cloned()
-            .unwrap_or_default();
-        
-        match vm.execute_contract(&request.contract_address, &request.method, &args, &request.from) {
-            Ok(result) => {
-                // Parse return data based on method
-                let return_value: serde_json::Value = match request.method.as_str() {
-                    "balanceOf" | "balance_of" | "totalSupply" | "total_supply" => {
-                        if result.return_data.len() >= 8 {
-                            let balance = u64::from_le_bytes(result.return_data[..8].try_into().unwrap_or([0u8; 8]));
-                            json!(balance)
-                        } else {
-                            json!(0)
+        // v3.40: Read from StateManager (blockchain) instead of local RocksDB VM
+        match blockchain.get_account(&request.contract_address).await {
+            Ok(Some(account)) if account.is_contract => {
+                let cs = &account.contract_storage;
+                let is_qrc20 = cs.get("type").map(|t| t == "qrc20").unwrap_or(false);
+                
+                let return_value: serde_json::Value = if is_qrc20 {
+                    match request.method.as_str() {
+                        "balanceOf" | "balance_of" => {
+                            let holder = request.args.as_array()
+                                .and_then(|a| a.get(0))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&request.from);
+                            let key = format!("balance:{}", holder);
+                            let bal: u64 = cs.get(&key).and_then(|s| s.parse().ok()).unwrap_or(0);
+                            json!(bal)
                         }
-                    }
-                    "name" | "symbol" => {
-                        json!(String::from_utf8_lossy(&result.return_data).to_string())
-                    }
-                    "decimals" => {
-                        json!(result.return_data.first().copied().unwrap_or(18))
-                    }
-                    _ => {
-                        if result.return_data == vec![1] {
-                            json!(true)
-                        } else if result.return_data == vec![0] {
-                            json!(false)
-                        } else {
-                            json!(hex::encode(&result.return_data))
+                        "totalSupply" | "total_supply" => {
+                            let supply: u64 = cs.get("total_supply").and_then(|s| s.parse().ok()).unwrap_or(0);
+                            json!(supply)
                         }
+                        "name" => json!(cs.get("name").cloned().unwrap_or_default()),
+                        "symbol" => json!(cs.get("symbol").cloned().unwrap_or_default()),
+                        "decimals" => {
+                            let d: u8 = cs.get("decimals").and_then(|s| s.parse().ok()).unwrap_or(9);
+                            json!(d)
+                        }
+                        "allowance" => {
+                            let owner = request.args.as_array().and_then(|a| a.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+                            let spender = request.args.as_array().and_then(|a| a.get(1)).and_then(|v| v.as_str()).unwrap_or("");
+                            let key = format!("allowance:{}:{}", owner, spender);
+                            let val: u64 = cs.get(&key).and_then(|s| s.parse().ok()).unwrap_or(0);
+                            json!(val)
+                        }
+                        _ => json!(null)
+                    }
+                } else {
+                    // Generic contract — fall back to contract_vm for execution
+                    let storage = blockchain.get_storage();
+                    let vm = crate::contract_vm::ContractVM::new(storage);
+                    let args: Vec<serde_json::Value> = request.args.as_array().cloned().unwrap_or_default();
+                    match vm.execute_contract(&request.contract_address, &request.method, &args, &request.from) {
+                        Ok(result) => {
+                            if result.return_data.len() >= 8 {
+                                json!(u64::from_le_bytes(result.return_data[..8].try_into().unwrap_or([0u8; 8])))
+                            } else {
+                                json!(hex::encode(&result.return_data))
+                            }
+                        }
+                        Err(e) => json!(format!("error: {:?}", e))
                     }
                 };
                 
                 return Ok(warp::reply::json(&json!({
-                    "success": result.success,
+                    "success": true,
                     "is_view": true,
                     "contract_address": request.contract_address,
                     "method": request.method,
                     "result": return_value,
-                    "gas_used": result.gas_used,
-                    "error": result.error
+                    "gas_used": 0,
+                    "source": "blockchain_state"
+                })));
+            }
+            Ok(_) => {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "is_view": true,
+                    "error": "Contract not found"
                 })));
             }
             Err(e) => {
                 return Ok(warp::reply::json(&json!({
                     "success": false,
                     "is_view": true,
-                    "error": format!("VM execution failed: {:?}", e)
+                    "error": format!("State query failed: {:?}", e)
                 })));
             }
         }
@@ -11746,6 +11869,12 @@ struct TokenDeployRequest {
 fn default_decimals() -> u8 { 9 } // QNet standard: 9 decimals (like SOL, QNC)
 
 /// Handle QRC-20 token deployment
+/// v3.40: CRITICAL FIX — Token deploy now goes THROUGH BLOCKCHAIN (ContractDeploy TX),
+/// NOT directly to local RocksDB. This ensures:
+/// 1. Token state is replicated to ALL nodes via block gossip
+/// 2. Token state survives node restart (replayed from blocks)
+/// 3. Token deploy is auditable on-chain (has TX hash)
+/// 4. Deterministic contract address (same on all nodes)
 async fn handle_token_deploy(
     request: TokenDeployRequest,
     remote_addr: Option<std::net::SocketAddr>,
@@ -11805,38 +11934,102 @@ async fn handle_token_deploy(
         })));
     }
     
-    // Deploy token via VM
-    let storage = blockchain.get_storage();
-    let vm = crate::contract_vm::ContractVM::new(storage);
+    // v3.40: Get nonce from state for replay protection
+    let nonce = {
+        let state_manager = blockchain.get_state_manager();
+        let state = state_manager.read().await;
+        match state.get_account(&request.from) {
+            Some(acc) => acc.nonce + 1,
+            None => 1, // First TX for this account
+        }
+    };
     
-    match vm.deploy_qrc20_token(
-        &request.from,
-        &request.name,
-        &request.symbol,
-        request.decimals,
-        request.initial_supply,
-    ) {
-        Ok(token) => {
-            println!("[TOKEN] 🪙 QRC-20 deployed: {} ({}) by {}", 
-                     token.name, token.symbol, &request.from[..16.min(request.from.len())]);
+    // v3.40: Deterministic contract address from deployer + nonce (same on ALL nodes)
+    let contract_address = {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"qrc20:");
+        hasher.update(request.from.as_bytes());
+        hasher.update(b":");
+        hasher.update(nonce.to_le_bytes());
+        let hash = hex::encode(hasher.finalize());
+        let part1 = &hash[0..19];
+        let part2 = &hash[19..34];
+        use sha2::{Sha256, Digest as Sha2Digest};
+        let mut checksum_hasher = Sha256::new();
+        checksum_hasher.update(format!("{}eon{}", part1, part2).as_bytes());
+        let checksum = hex::encode(&checksum_hasher.finalize()[..2]);
+        format!("{}eon{}{}", part1, part2, checksum)
+    };
+    
+    // v3.40: Code hash for QRC-20 standard (deterministic from token params)
+    let code_hash = {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"QRC20:");
+        hasher.update(request.name.as_bytes());
+        hasher.update(b":");
+        hasher.update(request.symbol.as_bytes());
+        hex::encode(hasher.finalize())
+    };
+    
+    // v3.40: Create ContractDeploy transaction — goes to mempool -> block -> all nodes
+    // QRC-20 metadata is stored in tx.data as JSON so apply_to_state can parse it
+    let gas_price = 1000u64; // Standard QRC-20 deploy gas price
+    let gas_limit = 50_000u64; // QRC-20 deploy gas limit
+    
+    let mut tx = qnet_state::Transaction {
+        hash: String::new(),
+        from: request.from.clone(),
+        to: Some(contract_address.clone()),
+        amount: 0,
+        nonce,
+        gas_price,
+        gas_limit,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+        signature: Some(request.signature.clone()),
+        public_key: Some(request.public_key.clone()),
+        tx_type: qnet_state::TransactionType::ContractDeploy,
+        data: Some(serde_json::to_string(&json!({
+            "qrc20": true,
+            "name": request.name,
+            "symbol": request.symbol,
+            "decimals": request.decimals,
+            "initial_supply": request.initial_supply,
+            "code_hash": code_hash
+        })).unwrap_or_default()),
+        dilithium_signature: request.dilithium_signature.clone(),
+        dilithium_public_key: request.dilithium_public_key.clone(),
+    };
+    
+    // Calculate hash BEFORE submit (same as all other TX handlers)
+    tx.hash = tx.calculate_hash();
+    let tx_hash = tx.hash.clone();
+    
+    // Submit to mempool -> included in block -> apply_to_state on ALL nodes
+    match blockchain.submit_transaction(tx).await {
+        Ok(_) => {
+            println!("[INFO][TOKEN] qrc20_deploy_submitted name={} symbol={} supply={} contract={} hash={}",
+                     request.name, request.symbol, request.initial_supply,
+                     &contract_address[..16.min(contract_address.len())],
+                     &tx_hash[..16.min(tx_hash.len())]);
             
             Ok(warp::reply::json(&json!({
                 "success": true,
+                "tx_hash": tx_hash,
                 "token": {
-                    "contract_address": token.contract_address,
-                    "name": token.name,
-                    "symbol": token.symbol,
-                    "decimals": token.decimals,
-                    "total_supply": token.total_supply,
+                    "contract_address": contract_address,
+                    "name": request.name,
+                    "symbol": request.symbol,
+                    "decimals": request.decimals,
+                    "total_supply": request.initial_supply,
                     "creator": request.from
                 },
-                "message": "QRC-20 token deployed successfully"
+                "message": "QRC-20 token deployment submitted to blockchain (pending confirmation)"
             })))
         }
         Err(e) => {
             Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": "Token deployment failed",
+                "error": "Token deployment failed — could not submit to mempool",
                 "details": format!("{:?}", e)
             })))
         }
@@ -11844,27 +12037,41 @@ async fn handle_token_deploy(
 }
 
 /// Handle token info query
+/// v3.40: Reads FROM BLOCKCHAIN STATE (StateManager), not local RocksDB.
+/// Token metadata is stored in Account.contract_storage via apply_to_state(ContractDeploy).
 async fn handle_token_info(
     contract_address: String,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    let storage = blockchain.get_storage();
-    let vm = crate::contract_vm::ContractVM::new(storage);
-    
-    match vm.get_token_info(&contract_address) {
-        Ok(Some(token)) => {
-            Ok(warp::reply::json(&json!({
-                "success": true,
-                "token": {
-                    "contract_address": token.contract_address,
-                    "name": token.name,
-                    "symbol": token.symbol,
-                    "decimals": token.decimals,
-                    "total_supply": token.total_supply
-                }
-            })))
+    // Read contract account from blockchain state (single source of truth)
+    match blockchain.get_account(&contract_address).await {
+        Ok(Some(account)) if account.is_contract => {
+            let storage = &account.contract_storage;
+            let is_qrc20 = storage.get("type").map(|t| t == "qrc20").unwrap_or(false);
+            
+            if is_qrc20 {
+                Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "token": {
+                        "contract_address": contract_address,
+                        "name": storage.get("name").cloned().unwrap_or_default(),
+                        "symbol": storage.get("symbol").cloned().unwrap_or_default(),
+                        "decimals": storage.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9),
+                        "total_supply": storage.get("total_supply").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                        "deployer": storage.get("deployer").cloned().unwrap_or_default(),
+                        "deployed_at": storage.get("deployed_at").cloned().unwrap_or_default()
+                    },
+                    "source": "blockchain_state"
+                })))
+            } else {
+                Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Contract exists but is not a QRC-20 token",
+                    "contract_address": contract_address
+                })))
+            }
         }
-        Ok(None) => {
+        Ok(_) => {
             Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "Token not found",
@@ -11882,27 +12089,38 @@ async fn handle_token_info(
 }
 
 /// Handle token balance query
+/// v3.40: Reads FROM BLOCKCHAIN STATE (StateManager), not local RocksDB.
+/// Token balances are stored in Account.contract_storage["balance:{address}"] 
+/// via apply_to_state(ContractCall/ContractDeploy).
 async fn handle_token_balance(
     contract_address: String,
     holder_address: String,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    let storage = blockchain.get_storage();
-    let vm = crate::contract_vm::ContractVM::new(storage);
-    
-    match vm.balance_of_qrc20(&contract_address, &holder_address) {
-        Ok(balance) => {
-            // Get token info for context
-            let token_info = vm.get_token_info(&contract_address).ok().flatten();
+    // Read contract account from blockchain state (single source of truth)
+    match blockchain.get_account(&contract_address).await {
+        Ok(Some(account)) if account.is_contract => {
+            let storage = &account.contract_storage;
+            let balance_key = format!("balance:{}", holder_address);
+            let balance: u64 = storage.get(&balance_key)
+                .and_then(|s| s.parse().ok()).unwrap_or(0);
             
             Ok(warp::reply::json(&json!({
                 "success": true,
                 "contract_address": contract_address,
                 "holder_address": holder_address,
                 "balance": balance,
-                "token_name": token_info.as_ref().map(|t| &t.name),
-                "token_symbol": token_info.as_ref().map(|t| &t.symbol),
-                "decimals": token_info.as_ref().map(|t| t.decimals).unwrap_or(18)
+                "token_name": storage.get("name").cloned().unwrap_or_default(),
+                "token_symbol": storage.get("symbol").cloned().unwrap_or_default(),
+                "decimals": storage.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9),
+                "source": "blockchain_state"
+            })))
+        }
+        Ok(_) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Token contract not found",
+                "contract_address": contract_address
             })))
         }
         Err(e) => {
@@ -11916,41 +12134,46 @@ async fn handle_token_balance(
 }
 
 /// Handle query for all tokens owned by an address
+/// v3.40: Reads FROM BLOCKCHAIN STATE (StateManager).
+/// Scans all contract accounts for balance:{address} entries.
 async fn handle_tokens_for_address(
     address: String,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    let storage = blockchain.get_storage();
-    let vm = crate::contract_vm::ContractVM::new(storage);
+    let state_manager = blockchain.get_state_manager();
+    let state = state_manager.read().await;
     
-    match vm.get_tokens_for_address(&address) {
-        Ok(balances) => {
-            let tokens: Vec<serde_json::Value> = balances.iter().map(|b| {
-                let token_info = vm.get_token_info(&b.token_address).ok().flatten();
-                json!({
-                    "contract_address": b.token_address,
-                    "balance": b.balance,
-                    "name": token_info.as_ref().map(|t| &t.name),
-                    "symbol": token_info.as_ref().map(|t| &t.symbol),
-                    "decimals": token_info.as_ref().map(|t| t.decimals).unwrap_or(18)
-                })
-            }).collect();
-            
-            Ok(warp::reply::json(&json!({
-                "success": true,
-                "address": address,
-                "tokens": tokens,
-                "token_count": tokens.len()
-            })))
-        }
-        Err(e) => {
-            Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Failed to query tokens",
-                "details": format!("{:?}", e)
-            })))
+    let balance_key = format!("balance:{}", address);
+    let mut tokens: Vec<serde_json::Value> = Vec::new();
+    
+    // Scan contract accounts in blockchain state for this holder's balance
+    for (addr, account) in state.get_all_accounts() {
+        if !account.is_contract { continue; }
+        let cs = &account.contract_storage;
+        if cs.get("type").map(|t| t == "qrc20").unwrap_or(false) {
+            if let Some(bal_str) = cs.get(&balance_key) {
+                let balance: u64 = bal_str.parse().unwrap_or(0);
+                if balance > 0 {
+                    tokens.push(json!({
+                        "contract_address": addr,
+                        "balance": balance,
+                        "name": cs.get("name").cloned().unwrap_or_default(),
+                        "symbol": cs.get("symbol").cloned().unwrap_or_default(),
+                        "decimals": cs.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9)
+                    }));
+                }
+            }
         }
     }
+    
+    let count = tokens.len();
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "address": address,
+        "tokens": tokens,
+        "token_count": count,
+        "source": "blockchain_state"
+    })))
 }
 
 // ============================================================================

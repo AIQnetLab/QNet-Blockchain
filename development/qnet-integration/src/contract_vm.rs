@@ -100,10 +100,16 @@ impl ContractVM {
     }
     
     // =========================================================================
-    // QRC-20 TOKEN OPERATIONS
+    // QRC-20 TOKEN OPERATIONS (LOCAL RocksDB)
+    // v3.40: DEPRECATED — All QRC-20 state now lives in blockchain via
+    // apply_to_state(ContractDeploy/ContractCall) in transaction.rs.
+    // These methods are kept for backward compatibility / tests only.
+    // DO NOT call these from production RPC handlers!
     // =========================================================================
     
     /// Deploy a new QRC-20 token
+    /// DEPRECATED v3.40: Use POST /api/v1/token/deploy → ContractDeploy TX instead
+    #[deprecated(note = "v3.40: Token deploy now goes through blockchain TX. Use handle_token_deploy RPC.")]
     pub fn deploy_qrc20_token(
         &self,
         creator: &str,
@@ -190,6 +196,8 @@ impl ContractVM {
     }
     
     /// Transfer QRC-20 tokens
+    /// DEPRECATED v3.40: Token transfers now execute on-chain via ContractCall TX apply_to_state
+    #[deprecated(note = "v3.40: Token transfer now goes through blockchain TX (ContractCall).")]
     pub fn transfer_qrc20(
         &self,
         contract_address: &str,
@@ -274,6 +282,8 @@ impl ContractVM {
     }
     
     /// Approve QRC-20 spending allowance
+    /// DEPRECATED v3.40: Approve now executes on-chain via ContractCall TX apply_to_state
+    #[deprecated(note = "v3.40: Token approve now goes through blockchain TX (ContractCall).")]
     pub fn approve_qrc20(
         &self,
         contract_address: &str,
@@ -308,6 +318,9 @@ impl ContractVM {
     }
     
     /// Transfer QRC-20 tokens from allowance
+    /// DEPRECATED v3.40: transferFrom now executes on-chain via ContractCall TX apply_to_state
+    #[deprecated(note = "v3.40: Token transferFrom now goes through blockchain TX (ContractCall).")]
+    #[allow(deprecated)]
     pub fn transfer_from_qrc20(
         &self,
         contract_address: &str,
@@ -402,6 +415,7 @@ impl ContractVM {
     // =========================================================================
     
     /// Execute a contract method
+    #[allow(deprecated)]
     pub fn execute_contract(
         &self,
         contract_address: &str,

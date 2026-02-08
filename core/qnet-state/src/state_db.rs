@@ -77,7 +77,10 @@ impl StateDB {
                     reputation: 0.0,
                     created_at: timestamp,
                     updated_at: timestamp,
-                    pending_rewards: 0, // v2.96: Initialize pending rewards
+                    pending_rewards: 0,
+                    is_contract: false,
+                    contract_code_hash: None,
+                    contract_storage: std::collections::HashMap::new(),
                 }
             });
             
@@ -121,7 +124,10 @@ impl StateDB {
                     reputation: 0.0,
                     created_at: timestamp,
                     updated_at: timestamp,
-                    pending_rewards: 0, // v2.96: Initialize pending rewards
+                    pending_rewards: 0,
+                    is_contract: false,
+                    contract_code_hash: None,
+                    contract_storage: std::collections::HashMap::new(),
                 }
             });
             

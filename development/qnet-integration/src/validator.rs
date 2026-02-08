@@ -1,4 +1,15 @@
-//! Block and transaction validation for QNet blockchain
+//!
+//! DEPRECATED v3.35: This module is NOT used in the production validation path!
+//!
+//! Production validation is handled by:
+//! - `node.rs::submit_transaction()` -- for RPC-submitted TXs
+//! - `node.rs::validate_and_add_network_transaction()` -- for gossip-received TXs
+//! - `transaction.rs::validate()` -- canonical per-TX validation
+//! - `transaction.rs::apply_to_state()` -- deterministic state transition
+//!
+//! This file contains legacy validation helpers that may be used for testing
+//! or future offline validation tools. Do NOT call from production hot path.
+//!
 
 use std::sync::Arc;
 use crate::errors::{IntegrationError, IntegrationResult};
@@ -6,12 +17,14 @@ use crate::storage::PersistentStorage;
 use qnet_state::{Block, Transaction, TransactionType};
 use sha3::{Sha3_256, Digest};
 
-/// Block and transaction validator
+/// DEPRECATED: Block and transaction validator (not used in production)
+#[deprecated(since = "3.35.0", note = "Use node.rs validation path instead")]
 pub struct BlockValidator {
     /// Storage for validation against historical data
     storage: Option<Arc<PersistentStorage>>,
 }
 
+#[allow(deprecated)]
 impl BlockValidator {
     /// Create new validator
     pub fn new() -> Self {

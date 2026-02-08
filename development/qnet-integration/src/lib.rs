@@ -64,6 +64,7 @@ pub use unified_p2p::NetworkMessage;
 // Re-export for external use
 pub use errors::{IntegrationError, IntegrationResult};
 pub use storage::PersistentStorage;
+#[allow(deprecated)]
 pub use validator::BlockValidator;
 pub use node::{BlockchainNode, NodeType, Region};
 pub use unified_p2p::SimplifiedP2P;
@@ -114,6 +115,7 @@ pub struct QNetBlockchain {
     consensus: Arc<qnet_consensus::ConsensusEngine>,
     
     /// Validator
+    #[allow(deprecated)]
     validator: Arc<validator::BlockValidator>,
     
     /// Node running flag
@@ -153,6 +155,7 @@ impl QNetBlockchain {
         let consensus = Arc::new(qnet_consensus::ConsensusEngine::new("node1".to_string(), consensus_config));
         
         // Initialize validator
+        #[allow(deprecated)]
         let validator = Arc::new(validator::BlockValidator::new());
         
         // Initialize sharding

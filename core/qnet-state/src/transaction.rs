@@ -10,12 +10,50 @@ use crate::Account;
 use std::collections::HashSet;
 use crate::account::{NodeType, ActivationPhase};
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU8, Ordering};
 use once_cell::sync::Lazy;
+
+/// v3.35: Conditional logging -- only log in DEBUG/INFO mode, not in production hot path
+/// Controlled by LOG_LEVEL env var (default: "info")
+/// 0=none, 1=error, 2=warn, 3=info, 4=debug
+static LOG_LEVEL: Lazy<AtomicU8> = Lazy::new(|| {
+    let level = std::env::var("LOG_LEVEL")
+        .map(|l| match l.to_lowercase().as_str() {
+            "none" | "off" => 0u8,
+            "error" => 1,
+            "warn" => 2,
+            "info" => 3,
+            "debug" | "trace" => 4,
+            _ => 3,
+        })
+        .unwrap_or(3);
+    AtomicU8::new(level)
+});
+
+fn is_info_log() -> bool {
+    LOG_LEVEL.load(Ordering::Relaxed) >= 3
+}
+
+fn is_debug_log() -> bool {
+    LOG_LEVEL.load(Ordering::Relaxed) >= 4
+}
 
 /// QNet native transaction fee units (OPTIMIZED for mobile)
 pub const QNC_DECIMALS: u8 = 9; // 1 QNC = 10^9 smallest units (nanoQNC)
 pub const BASE_FEE_NANO_QNC: u64 = 100_000; // 0.0001 QNC base fee (5x cheaper!)
 pub const PRIORITY_MULTIPLIER: u64 = 10; // 10x for priority transactions
+
+/// v3.36: Gas metering activation height (EIP-1559 style gas refund)
+/// Below this height: charge gas_limit * gas_price (legacy, preserves consensus)
+/// At and above: charge gas_used * gas_price + refund unused gas to sender
+/// ACTIVATED: block 100_000 — change if current chain is above this height
+pub const GAS_METERING_ACTIVATION_HEIGHT: u64 = 100_000;
+
+/// v3.42: Maximum entries in a single contract's contract_storage HashMap.
+/// Prevents unbounded growth of Account → Merkle tree for popular QRC-20 tokens.
+/// At 1M entries (~80 bytes per KV pair) this is ~80 MB per contract — safe for testnet.
+/// Mainnet will use sharded storage (separate trie per contract) to remove this limit.
+pub const MAX_CONTRACT_STORAGE_ENTRIES: usize = 1_000_000;
 
 /// Gas price in nanoQNC (QNet native units)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -159,19 +197,26 @@ pub enum TransactionType {
     
     
     
-    /// Batch reward claims
+    /// Batch reward claims (DEPRECATED — never instantiated, dead code)
+    /// Architecture: 1 wallet = 1 node → batch claim unnecessary.
+    /// handle_batch_claim_rewards() creates individual RewardDistribution TXs directly.
+    /// Kept in enum ONLY for backward-compatible deserialization of historical blocks.
     BatchRewardClaims {
         node_ids: Vec<String>,
         batch_id: String,
     },
     
-    /// Batch node activations
+    /// Batch node activations (DEPRECATED — no route, no handler, never instantiated)
+    /// Architecture: 1 wallet = 1 node → user activates via single NodeActivation TX.
+    /// Kept in enum ONLY for backward-compatible deserialization.
     BatchNodeActivations {
         activation_data: Vec<BatchNodeActivationData>,
         batch_id: String,
     },
     
-    /// Batch transfers
+    /// Batch transfers (UNUSED — handler exists but mobile app never calls it)
+    /// Potentially useful for multi-recipient transfers in future.
+    /// Kept in enum for forward/backward compatibility.
     BatchTransfers {
         transfers: Vec<BatchTransferData>,
         batch_id: String,
@@ -469,6 +514,49 @@ impl Transaction {
         self
     }
     
+    /// v3.34: Get ALL addresses that will be read/written by this transaction
+    /// CRITICAL for apply_transaction_lazy: must pre-load ALL accounts to prevent
+    /// balance overwrites when apply_to_state creates accounts via entry().or_insert_with()
+    /// Without this: BatchTransfers recipients get balance=0 (existing balance LOST!)
+    pub fn get_all_affected_addresses(&self) -> Vec<String> {
+        let mut addresses = vec![self.from.clone()];
+        if let Some(ref to) = self.to {
+            if !addresses.contains(to) {
+                addresses.push(to.clone());
+            }
+        }
+        match &self.tx_type {
+            TransactionType::Transfer { from, to, .. } => {
+                // Inner from/to may differ from tx.from/tx.to — ensure both loaded
+                if !addresses.contains(from) { addresses.push(from.clone()); }
+                if !addresses.contains(to) { addresses.push(to.clone()); }
+            }
+            TransactionType::BatchTransfers { transfers, .. } => {
+                for transfer in transfers {
+                    if !addresses.contains(&transfer.to_address) {
+                        addresses.push(transfer.to_address.clone());
+                    }
+                }
+            }
+            TransactionType::BatchNodeActivations { activation_data, .. } => {
+                for data in activation_data {
+                    if !addresses.contains(&data.owner_address) {
+                        addresses.push(data.owner_address.clone());
+                    }
+                }
+            }
+            TransactionType::Swap { from, pool_address, .. } => {
+                if !addresses.contains(from) { addresses.push(from.clone()); }
+                if !addresses.contains(pool_address) { addresses.push(pool_address.clone()); }
+            }
+            TransactionType::ContractCall => {
+                // tx.to (contract address) is already added above
+            }
+            _ => {} // Other types only touch tx.from / tx.to
+        }
+        addresses
+    }
+    
     /// QUANTUM v2.78: Check if transaction uses HYBRID signature (quantum-resistant)
     /// ARCHITECTURE: Two TX signature types:
     /// - Ed25519 only: Fast, classical (64 bytes, standard gas)
@@ -485,6 +573,61 @@ impl Transaction {
             self.gas_price + (self.gas_price / 2)
         } else {
             self.gas_price
+        }
+    }
+
+    /// v3.36: Gas metering -- compute ACTUAL gas consumed per TX type
+    /// Ethereum-style: user pays for gas_used, not gas_limit.
+    /// gas_limit serves as maximum cap (out-of-gas if exceeded).
+    /// For ContractDeploy/Call: includes per-byte cost for code/data.
+    /// For future WASM VM: will return execution-measured gas instead of estimates.
+    pub fn compute_gas_used(&self) -> u64 {
+        match &self.tx_type {
+            TransactionType::Transfer { .. } => gas_limits::TRANSFER,
+            TransactionType::CreateAccount { .. } => gas_limits::TRANSFER,
+            TransactionType::NodeActivation { .. } => gas_limits::NODE_ACTIVATION,
+            TransactionType::ContractDeploy => {
+                // Base cost + 10 gas per byte of contract bytecode
+                let code_bytes = self.data.as_ref().map(|d| d.len()).unwrap_or(0);
+                gas_limits::CONTRACT_DEPLOY + (code_bytes as u64 * 10)
+            }
+            TransactionType::ContractCall => {
+                // Base cost + 5 gas per byte of call data
+                let data_bytes = self.data.as_ref().map(|d| d.len()).unwrap_or(0);
+                gas_limits::CONTRACT_CALL + (data_bytes as u64 * 5)
+            }
+            TransactionType::Swap { .. } => gas_limits::CONTRACT_CALL,
+            // System transactions: free (no gas)
+            TransactionType::RewardDistribution => 0,
+            TransactionType::PingAttestation { .. } => 0,
+            TransactionType::PingCommitmentWithSampling { .. } => 0,
+            TransactionType::HeartbeatCommitment { .. } => 0,
+            TransactionType::LightNodeEligibilityBitmap { .. } => 0,
+            TransactionType::NodeRegistration { .. } => 0,
+            // Deprecated batch types: per-item gas based on operation type
+            TransactionType::BatchRewardClaims { node_ids, .. } => {
+                gas_limits::REWARD_CLAIM * node_ids.len() as u64
+            }
+            TransactionType::BatchNodeActivations { activation_data, .. } => {
+                gas_limits::NODE_ACTIVATION * activation_data.len() as u64
+            }
+            TransactionType::BatchTransfers { transfers, .. } => {
+                gas_limits::TRANSFER * transfers.len() as u64
+            }
+        }
+    }
+
+    /// v3.36: Compute gas refund amount (Ethereum EIP-1559 style)
+    /// Returns the nanoQNC to refund to sender: (gas_limit - gas_used) * effective_gas_price
+    /// IMPORTANT: Caller must credit this to sender AFTER apply_to_state() succeeds.
+    /// ACTIVATION: Only apply refund for blocks >= GAS_METERING_ACTIVATION_HEIGHT
+    /// to preserve consensus for historical blocks.
+    pub fn compute_gas_refund(&self) -> u64 {
+        let gas_used = self.compute_gas_used();
+        if gas_used > 0 && self.gas_limit > gas_used {
+            (self.gas_limit - gas_used) * self.effective_gas_price()
+        } else {
+            0
         }
     }
     
@@ -950,7 +1093,9 @@ impl Transaction {
                 sender.activate_node(format!("{:?}", node_type), self.timestamp);
             }
             TransactionType::ContractDeploy => {
-                // Contract deployment
+                // Contract deployment -- v3.40: FULL blockchain state (QRC-20 + generic WASM)
+                // ALL contract/token state is stored in Account.contract_storage
+                // which is part of the Merkle tree -> replicated to ALL nodes via blocks
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
                 
@@ -974,12 +1119,87 @@ impl Transaction {
                 // Deduct deployment fee
                 sender.balance -= fee;
                 sender.nonce += 1;
+
+                // Compute contract address from deployer + nonce (deterministic)
+                let contract_address = if let Some(to) = &self.to {
+                    to.clone()
+                } else {
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(self.from.as_bytes());
+                    hasher.update(self.nonce.to_le_bytes());
+                    format!("contract_{}", hex::encode(&hasher.finalize()[..20]))
+                };
+
+                // Parse tx.data to determine contract type
+                let data_str = self.data.as_ref().ok_or_else(|| {
+                    StateError::InvalidTransaction("ContractDeploy requires data field".to_string())
+                })?;
                 
-                // Contract deployment logic would go here
-                println!("Contract deployed by {} with fee {} QNC", self.from, fee);
+                // Try to parse as JSON (QRC-20 tokens have {"qrc20":true,...})
+                let is_qrc20 = data_str.contains("\"qrc20\"");
+                
+                // Compute code hash
+                let code_hash = {
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(data_str.as_bytes());
+                    hex::encode(hasher.finalize())
+                };
+
+                // Create or update the contract account in blockchain state
+                let contract = accounts.entry(contract_address.clone())
+                    .or_insert_with(|| Account::new(contract_address.clone()));
+                contract.is_contract = true;
+                contract.contract_code_hash = Some(code_hash.clone());
+                
+                // Base metadata (all contracts)
+                contract.contract_storage.insert(
+                    "deployer".to_string(), self.from.clone()
+                );
+                contract.contract_storage.insert(
+                    "deployed_at".to_string(), self.timestamp.to_string()
+                );
+
+                // v3.40: QRC-20 token initialization — FULL state in blockchain
+                // This is the SINGLE SOURCE OF TRUTH for token data.
+                // contract_vm.rs reads FROM this state (via StateManager/RocksDB).
+                if is_qrc20 {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data_str) {
+                        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let symbol = parsed.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                        let decimals = parsed.get("decimals").and_then(|v| v.as_u64()).unwrap_or(9);
+                        let initial_supply = parsed.get("initial_supply").and_then(|v| v.as_u64()).unwrap_or(0);
+                        
+                        // Token metadata — stored on-chain, readable by all nodes
+                        contract.contract_storage.insert("type".to_string(), "qrc20".to_string());
+                        contract.contract_storage.insert("name".to_string(), name.to_string());
+                        contract.contract_storage.insert("symbol".to_string(), symbol.to_string());
+                        contract.contract_storage.insert("decimals".to_string(), decimals.to_string());
+                        contract.contract_storage.insert("total_supply".to_string(), initial_supply.to_string());
+                        // Creator receives initial supply — ON-CHAIN balance
+                        contract.contract_storage.insert(
+                            format!("balance:{}", self.from), initial_supply.to_string()
+                        );
+                        
+                        if is_info_log() {
+                            println!("[INFO][TOKEN] qrc20_deployed name={} symbol={} supply={} addr={} by={}",
+                                name, symbol, initial_supply,
+                                &contract_address[..contract_address.len().min(20)],
+                                &self.from[..self.from.len().min(16)]);
+                        }
+                    }
+                } else {
+                    // Generic contract (WASM) — just store code_hash + deployer
+                    if is_info_log() {
+                        println!("[INFO][CONTRACT] deployed addr={} code_hash={}..{} fee={} by={}",
+                            &contract_address[..contract_address.len().min(20)],
+                            &code_hash[..8], &code_hash[code_hash.len()-8..],
+                            fee, &self.from[..self.from.len().min(16)]);
+                    }
+                }
             }
             TransactionType::ContractCall => {
-                // Contract interaction
+                // Contract interaction -- v3.40: QRC-20 token operations execute ON-CHAIN
+                // transfer, approve, transferFrom all modify contract_storage in blockchain state
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
                 
@@ -1005,9 +1225,187 @@ impl Transaction {
                 // Deduct fee and value
                 sender.balance -= total_cost;
                 sender.nonce += 1;
+                let sender_addr = self.from.clone();
+
+                // Verify target is a contract account
+                let contract_addr = self.to.as_ref().ok_or_else(|| {
+                    StateError::InvalidTransaction("ContractCall requires 'to' address".to_string())
+                })?.clone();
+
+                let contract = accounts.entry(contract_addr.clone())
+                    .or_insert_with(|| Account::new(contract_addr.clone()));
+
+                if !contract.is_contract {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Target {} is not a deployed contract", contract_addr
+                    )));
+                }
+
+                // Credit contract with sent value (if any)
+                if self.amount > 0 {
+                    contract.balance += self.amount;
+                }
+
+                // v3.40: Execute QRC-20 operations ON-CHAIN (deterministic on all nodes)
+                let is_qrc20 = contract.contract_storage.get("type")
+                    .map(|t| t == "qrc20").unwrap_or(false);
                 
-                // Contract call logic would go here
-                println!("Contract call by {} with fee {} QNC, value {} QNC", self.from, fee, self.amount);
+                if is_qrc20 {
+                    if let Some(ref data) = self.data {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                            let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                            let args = parsed.get("args");
+                            
+                            match method {
+                                "transfer" => {
+                                    // QRC-20 transfer: move tokens from sender to recipient
+                                    let to = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
+                                        .ok_or_else(|| StateError::InvalidTransaction(
+                                            "transfer: missing 'to' argument".to_string()))?;
+                                    let amount = args.and_then(|a| a.get(1)).and_then(|v| v.as_u64())
+                                        .ok_or_else(|| StateError::InvalidTransaction(
+                                            "transfer: missing 'amount' argument".to_string()))?;
+                                    
+                                    let from_key = format!("balance:{}", sender_addr);
+                                    let from_bal: u64 = contract.contract_storage.get(&from_key)
+                                        .and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    
+                                    if from_bal < amount {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "QRC-20 transfer: insufficient balance (have={}, need={})", from_bal, amount)));
+                                    }
+                                    
+                                    let to_key = format!("balance:{}", to);
+                                    let to_bal: u64 = contract.contract_storage.get(&to_key)
+                                        .and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    
+                                    // v3.42: Cap contract_storage to prevent unbounded Merkle growth
+                                    // Only reject if this is a NEW holder (existing holders can always receive)
+                                    if to_bal == 0 && contract.contract_storage.len() >= MAX_CONTRACT_STORAGE_ENTRIES {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "QRC-20 transfer: contract storage limit reached ({} entries, max {}). \
+                                             Deploy sharded contract or use L2.",
+                                            contract.contract_storage.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+                                    }
+                                    
+                                    contract.contract_storage.insert(from_key, (from_bal - amount).to_string());
+                                    contract.contract_storage.insert(to_key, (to_bal + amount).to_string());
+                                    
+                                    if is_info_log() {
+                                        println!("[INFO][QRC20] transfer {} -> {} amount={} contract={}",
+                                            &sender_addr[..sender_addr.len().min(16)],
+                                            &to[..to.len().min(16)], amount,
+                                            &contract_addr[..contract_addr.len().min(16)]);
+                                    }
+                                }
+                                "approve" => {
+                                    // QRC-20 approve: set allowance for spender
+                                    let spender = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
+                                        .ok_or_else(|| StateError::InvalidTransaction(
+                                            "approve: missing 'spender' argument".to_string()))?;
+                                    let amount = args.and_then(|a| a.get(1)).and_then(|v| v.as_u64())
+                                        .ok_or_else(|| StateError::InvalidTransaction(
+                                            "approve: missing 'amount' argument".to_string()))?;
+                                    
+                                    let allowance_key = format!("allowance:{}:{}", sender_addr, spender);
+                                    
+                                    // v3.42: Cap contract_storage — only reject NEW allowance entries
+                                    let is_new_entry = !contract.contract_storage.contains_key(&allowance_key);
+                                    if is_new_entry && contract.contract_storage.len() >= MAX_CONTRACT_STORAGE_ENTRIES {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "QRC-20 approve: contract storage limit reached ({} entries, max {})",
+                                            contract.contract_storage.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+                                    }
+                                    
+                                    contract.contract_storage.insert(allowance_key, amount.to_string());
+                                    
+                                    if is_info_log() {
+                                        println!("[INFO][QRC20] approve owner={} spender={} amount={}",
+                                            &sender_addr[..sender_addr.len().min(16)],
+                                            &spender[..spender.len().min(16)], amount);
+                                    }
+                                }
+                                "transferFrom" | "transfer_from" => {
+                                    // QRC-20 transferFrom: spend from approved allowance
+                                    let from = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
+                                        .ok_or_else(|| StateError::InvalidTransaction(
+                                            "transferFrom: missing 'from' argument".to_string()))?;
+                                    let to = args.and_then(|a| a.get(1)).and_then(|v| v.as_str())
+                                        .ok_or_else(|| StateError::InvalidTransaction(
+                                            "transferFrom: missing 'to' argument".to_string()))?;
+                                    let amount = args.and_then(|a| a.get(2)).and_then(|v| v.as_u64())
+                                        .ok_or_else(|| StateError::InvalidTransaction(
+                                            "transferFrom: missing 'amount' argument".to_string()))?;
+                                    
+                                    // Check allowance
+                                    let allowance_key = format!("allowance:{}:{}", from, sender_addr);
+                                    let allowance: u64 = contract.contract_storage.get(&allowance_key)
+                                        .and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    if allowance < amount {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "QRC-20 transferFrom: insufficient allowance (have={}, need={})", allowance, amount)));
+                                    }
+                                    
+                                    // Check balance of 'from'
+                                    let from_key = format!("balance:{}", from);
+                                    let from_bal: u64 = contract.contract_storage.get(&from_key)
+                                        .and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    if from_bal < amount {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "QRC-20 transferFrom: insufficient balance (have={}, need={})", from_bal, amount)));
+                                    }
+                                    
+                                    // Execute transfer + deduct allowance
+                                    let to_key = format!("balance:{}", to);
+                                    let to_bal: u64 = contract.contract_storage.get(&to_key)
+                                        .and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    
+                                    // v3.42: Cap contract_storage — only reject if NEW holder
+                                    if to_bal == 0 && contract.contract_storage.len() >= MAX_CONTRACT_STORAGE_ENTRIES {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "QRC-20 transferFrom: contract storage limit reached ({} entries, max {})",
+                                            contract.contract_storage.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+                                    }
+                                    
+                                    contract.contract_storage.insert(from_key, (from_bal - amount).to_string());
+                                    contract.contract_storage.insert(to_key, (to_bal + amount).to_string());
+                                    contract.contract_storage.insert(allowance_key, (allowance - amount).to_string());
+                                    
+                                    if is_info_log() {
+                                        println!("[INFO][QRC20] transferFrom {} -> {} amount={} spender={}",
+                                            &from[..from.len().min(16)],
+                                            &to[..to.len().min(16)], amount,
+                                            &sender_addr[..sender_addr.len().min(16)]);
+                                    }
+                                }
+                                _ => {
+                                    // Unknown QRC-20 method — record as generic call
+                                    if is_debug_log() {
+                                        println!("[DBG][QRC20] unknown_method={} contract={}",
+                                            method, &contract_addr[..contract_addr.len().min(16)]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Generic contract call — record in storage (capped)
+                    const MAX_CALL_RECORDS: usize = 10_000;
+                    if contract.contract_storage.len() < MAX_CALL_RECORDS {
+                        let call_key = format!("call:{}:{}", self.timestamp, &sender_addr[..sender_addr.len().min(16)]);
+                        let call_value = format!("value={},gas={},data_len={}",
+                            self.amount, fee,
+                            self.data.as_ref().map(|d| d.len()).unwrap_or(0));
+                        contract.contract_storage.insert(call_key, call_value);
+                    }
+                }
+
+                if is_info_log() && !is_qrc20 {
+                    println!("[INFO][CONTRACT-CALL] {} -> {} fee={} value={} nanoQNC",
+                        &sender_addr[..sender_addr.len().min(16)],
+                        &contract_addr[..contract_addr.len().min(20)],
+                        fee, self.amount);
+                }
             }
             TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, amount_out, pool_address } => {
                 // Token swap via DEX
@@ -1052,20 +1450,44 @@ impl Transaction {
                 // Deduct fee (always in QNC)
                 sender.balance -= fee;
                 
-                // If swapping QNC for another token, deduct amount_in
+                // If swapping QNC for another token, deduct amount_in from sender
                 if token_in == "QNC" {
                     sender.balance -= amount_in;
                 }
                 
-                // If receiving QNC, add amount_out
+                // If receiving QNC, add amount_out to sender
                 if token_out == "QNC" {
                     sender.balance += amount_out;
                 }
                 
                 sender.nonce += 1;
                 
-                println!("[SWAP] 🔄 {} swapped {} {} for {} {} via pool {} (fee: {} QNC → Producer)", 
-                         from, amount_in, token_in, amount_out, token_out, pool_address, fee);
+                // v3.34: Update pool balance (conservation of value)
+                // Without this, QNC was burned/minted instead of transferred to/from pool
+                let pool = accounts.entry(pool_address.clone())
+                    .or_insert_with(|| Account::new(pool_address.clone()));
+                
+                if token_in == "QNC" {
+                    // Pool receives QNC from sender
+                    pool.balance += amount_in;
+                }
+                if token_out == "QNC" {
+                    // Pool sends QNC to sender — must have sufficient liquidity
+                    if pool.balance < *amount_out {
+                        return Err(StateError::InsufficientBalance {
+                            have: pool.balance,
+                            need: *amount_out,
+                        });
+                    }
+                    pool.balance -= amount_out;
+                }
+                
+                // Swap -- currently inactive (no RPC handler), logic preserved for future DEX
+                if is_info_log() {
+                    println!("[INFO][SWAP] {} swapped {} {} for {} {} via pool {} (fee: {} nanoQNC)",
+                        &from[..from.len().min(16)], amount_in, token_in, amount_out, token_out,
+                        &pool_address[..pool_address.len().min(16)], fee);
+                }
             }
             TransactionType::RewardDistribution => {
                 // System transaction for reward distribution
@@ -1082,8 +1504,8 @@ impl Transaction {
                     // v2.99: EMISSION TX - blockchain record ONLY!
                     // Rewards ALREADY distributed via emit_rewards() + update_pending_rewards()
                     // This TX is ONLY for transparency/auditing - DO NOT process rewards again!
-                    println!("[INFO][EMISSION] emission_tx_recorded amount={} QNC", self.amount / 1_000_000_000);
-                    return Ok(()); // ✅ No account changes - already handled!
+                    if is_info_log() { println!("[INFO][EMISSION] emission_tx_recorded amount={} QNC", self.amount / 1_000_000_000); }
+                    return Ok(()); // No account changes - already handled!
                 }
                 
                 // v2.96: CLAIM TX - validate and process reward claim
@@ -1105,14 +1527,21 @@ impl Transaction {
                     recipient.pending_rewards -= self.amount;
                     recipient.balance += self.amount;
                     
-                    println!("[INFO][REWARDS] reward_claimed amount={} QNC to={} pending_remaining={} QNC", 
-                             self.amount / 1_000_000_000, 
-                             &to[..to.len().min(16)],
-                             recipient.pending_rewards / 1_000_000_000);
+                    if is_info_log() {
+                        println!("[INFO][REWARDS] reward_claimed amount={} QNC to={} pending_remaining={} QNC",
+                            self.amount / 1_000_000_000,
+                            &to[..to.len().min(16)],
+                            recipient.pending_rewards / 1_000_000_000);
+                    }
                 }
             }
             TransactionType::BatchRewardClaims { node_ids, .. } => {
-                // Batch reward claims - single nonce increment for the entire batch
+                // DEPRECATED: This TX type is never created in production.
+                // Architecture: 1 wallet = 1 node → no batch needed.
+                // handle_batch_claim_rewards() creates individual RewardDistribution TXs.
+                // This code path exists only for backward-compatible processing of
+                // historical blocks that might contain this TX type.
+                // It only deducts the gas fee — actual claims go through RewardDistribution.
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
 
@@ -1138,9 +1567,10 @@ impl Transaction {
                 sender.balance -= total_fee;
                 sender.nonce += 1;
 
-                // Log batch reward claim
-                println!("Batch reward claim for {} nodes by {} with total fee {} QNC", 
-                        node_ids.len(), self.from, total_fee);
+                if is_info_log() {
+                    println!("[INFO][BATCH-CLAIM-FEE] {} nodes by {} fee={} nanoQNC",
+                        node_ids.len(), &self.from[..self.from.len().min(16)], total_fee);
+                }
             }
             TransactionType::BatchNodeActivations { activation_data, .. } => {
                 // Batch node activations - single nonce increment for the entire batch
@@ -1171,9 +1601,17 @@ impl Transaction {
                 sender.balance -= total_cost;
                 sender.nonce += 1;
 
-                // Log batch node activation
-                println!("Batch node activation for {} nodes by {} with total cost {} QNC", 
-                        activation_data.len(), self.from, total_cost);
+                // v3.34: Actually activate each node (previously only deducted fees)
+                for data in activation_data {
+                    let owner = accounts.entry(data.owner_address.clone())
+                        .or_insert_with(|| Account::new(data.owner_address.clone()));
+                    owner.activate_node(format!("{:?}", data.node_type), self.timestamp);
+                }
+
+                if is_info_log() {
+                    println!("[INFO][BATCH-ACTIVATION] {} nodes by {} cost={} nanoQNC",
+                        activation_data.len(), &self.from[..self.from.len().min(16)], total_cost);
+                }
             }
             TransactionType::BatchTransfers { transfers, .. } => {
                 // Batch transfers - single nonce increment for the entire batch
@@ -1211,21 +1649,25 @@ impl Transaction {
                     recipient.balance += transfer.amount;
                 }
 
-                // Log batch transfer
-                println!("Batch transfer of {} QNC to {} recipients by {} with total fee {} QNC", 
-                        total_transfer_amount, transfers.len(), self.from, total_fee);
+                if is_info_log() {
+                    println!("[INFO][BATCH-TRANSFER] {} nanoQNC to {} recipients by {} fee={} nanoQNC",
+                        total_transfer_amount, transfers.len(),
+                        &self.from[..self.from.len().min(16)], total_fee);
+                }
             }
             TransactionType::PingAttestation { from_node, to_node, response_time_ms, success } => {
                 // Ping attestations are FREE system operations (gas = 0)
                 // They don't modify account balances, only recorded on-chain for emission calculation
-                println!("[PING] 📡 On-chain attestation: {} -> {} ({}ms, success: {})", 
-                         from_node, to_node, response_time_ms, success);
+                // PingAttestation -- legacy type, kept for backward compat
+                if is_debug_log() {
+                    println!("[DEBUG][PING] on-chain attestation: {} -> {} ({}ms, success: {})",
+                        from_node, to_node, response_time_ms, success);
+                }
                 // No state modification needed - ping history will be read from blockchain
             }
             TransactionType::PingCommitmentWithSampling { 
                 window_start_height,
                 window_end_height, 
-                merkle_root, 
                 total_ping_count,
                 successful_ping_count,
                 ping_samples,
@@ -1233,31 +1675,28 @@ impl Transaction {
             } => {
                 // Ping commitments are FREE system operations (gas = 0)
                 // They don't modify account balances, only provide deterministic data for emission
-                println!("[PING-COMMITMENT] 🌳 Merkle commitment for window {}-{}", 
-                         window_start_height, window_end_height);
-                println!("[PING-COMMITMENT] 📊 Total: {}, Successful: {}, Samples: {}, Root: {}",
-                         total_ping_count, successful_ping_count, ping_samples.len(), 
-                         &merkle_root[..16]);
+                if is_debug_log() {
+                    println!("[DEBUG][PING-COMMITMENT] Merkle window={}-{} total={} ok={} samples={}",
+                        window_start_height, window_end_height,
+                        total_ping_count, successful_ping_count, ping_samples.len());
+                }
                 // No state modification needed - commitment will be validated during emission check
             }
             TransactionType::HeartbeatCommitment {
                 node_id,
                 window_start_height,
                 window_end_height,
-                merkle_root,
                 heartbeat_count,
-                first_heartbeat_time,
-                last_heartbeat_time,
                 heartbeat_samples,
                 ..
             } => {
                 // Heartbeat commitments are FREE system operations (gas = 0)
                 // They don't modify account balances, only provide deterministic data for emission
-                println!("[HEARTBEAT-COMMITMENT] 🌳 Merkle commitment node={} window={}-{}", 
-                         node_id, window_start_height, window_end_height);
-                println!("[HEARTBEAT-COMMITMENT] 📊 Count: {}, Samples: {}, Root: {}, Time: {}-{}",
-                         heartbeat_count, heartbeat_samples.len(), &merkle_root[..16],
-                         first_heartbeat_time, last_heartbeat_time);
+                if is_debug_log() {
+                    println!("[DEBUG][HEARTBEAT-COMMITMENT] node={} window={}-{} count={} samples={}",
+                        node_id, window_start_height, window_end_height,
+                        heartbeat_count, heartbeat_samples.len());
+                }
                 // No state modification needed - commitment will be validated during emission check
             }
             TransactionType::LightNodeEligibilityBitmap {
@@ -1270,15 +1709,19 @@ impl Transaction {
                 // v2.89: Light Node Eligibility Bitmap - FREE system operation
                 // Genesis nodes submit compressed bitmaps of eligible Light nodes
                 // MacroBlock will collect and merge all bitmaps for reward distribution
-                println!("[LIGHT-BITMAP] 🗺️ Genesis {} epoch {} - {} eligible / {} assigned ({} bytes compressed)",
-                         genesis_id, epoch, eligible_count, total_assigned, bitmap_compressed.len());
+                if is_debug_log() {
+                    println!("[DEBUG][LIGHT-BITMAP] genesis={} epoch={} eligible={}/{} compressed={} bytes",
+                        genesis_id, epoch, eligible_count, total_assigned, bitmap_compressed.len());
+                }
                 // No state modification needed - bitmap will be read by MacroBlock
             }
             TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } => {
                 // System transaction: on-chain node registration
                 // No balance changes, only registers node_id -> wallet_address binding
-                println!("[NODE-REG] 📋 On-chain registration: {} ({:?}) -> {}", 
-                         node_id, node_type, &wallet_address[..20.min(wallet_address.len())]);
+                if is_info_log() {
+                    println!("[INFO][NODE-REG] registered: {} ({:?}) -> {}",
+                        node_id, node_type, &wallet_address[..20.min(wallet_address.len())]);
+                }
                 // Registration data is stored in blockchain for immutable lookup
             }
         }
@@ -1505,13 +1948,14 @@ impl TransactionProcessor {
         tx.apply_to_state(accounts)?;
         
         // v3.18: Pool 2 removed - fees go directly to block producer
-        // Calculate fee - Phase 1 activations are FREE!
+        // v3.36: Use compute_gas_used() for accurate fee calculation
         // QUANTUM v2.25: Use effective_gas_price() which adds +50% for Dilithium TX
+        let gas_used = tx.compute_gas_used();
         let fee_amount = match &tx.tx_type {
             TransactionType::NodeActivation { phase: ActivationPhase::Phase1, .. } => {
                 0 // Phase 1 activations are completely FREE - no QNC gas fees!
             },
-            _ => tx.effective_gas_price() * tx.gas_limit // Normal fees (+50% for quantum TX)
+            _ => tx.effective_gas_price() * gas_used
         };
         
         if fee_amount > 0 {
@@ -1519,10 +1963,10 @@ impl TransactionProcessor {
                 if let Err(e) = integration.process_transaction_fee(
                     tx.hash.clone(),
                     tx.amount,
-                    tx.gas_limit,
+                    gas_used,
                     tx.gas_price,
                 ) {
-                    eprintln!("Warning: Failed to process transaction fee: {}", e);
+                    eprintln!("[WARN] Failed to process transaction fee: {}", e);
                 }
             }
         }
@@ -1536,7 +1980,7 @@ impl TransactionProcessor {
                     *amount,
                     tx.hash.clone(),
                 ) {
-                    eprintln!("Warning: Failed to process node activation: {}", e);
+                    eprintln!("[WARN] Failed to process node activation: {}", e);
                 }
             }
         }

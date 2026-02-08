@@ -8,8 +8,9 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use parking_lot::RwLock as ParkingRwLock;
 use once_cell::sync::Lazy;
-use crate::{Account, Block, Transaction, TransactionType, StateError, StateResult};
+use crate::{Account, Block, Transaction, TransactionType, StateError, StateResult, GAS_METERING_ACTIVATION_HEIGHT};
 use sha3::{Sha3_256, Digest};
+use tracing::{info, debug, warn, error};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.26: ATOMIC FEE CREDITING PROTECTION
@@ -660,6 +661,9 @@ impl StateManager {
             reputation: 0.70, // Default reputation
             created_at: 0,
             updated_at: 0,
+            is_contract: false,
+            contract_code_hash: None,
+            contract_storage: std::collections::HashMap::new(),
         };
         
         StateMerkleTree::verify_proof(
@@ -780,17 +784,13 @@ impl StateManager {
         // PROTOCOL: Check for duplicate commitment TXs before applying
         self.check_duplicate_commitment(tx)?;
         
-        // Get mutable access to accounts
+        // v3.34: Load ALL affected accounts (same logic as apply_transaction_lazy)
+        // CRITICAL: Without this, batch TX recipients lose existing balance!
         let mut accounts_map = HashMap::new();
         
-        // Copy relevant accounts
-        if let Some(acc) = self.accounts.get(&tx.from) {
-            accounts_map.insert(tx.from.clone(), acc.clone());
-        }
-        
-        if let Some(to) = &tx.to {
-            if let Some(acc) = self.accounts.get(to) {
-                accounts_map.insert(to.clone(), acc.clone());
+        for address in tx.get_all_affected_addresses() {
+            if let Some(acc) = self.accounts.get(&address) {
+                accounts_map.insert(address, acc.clone());
             }
         }
         
@@ -828,17 +828,15 @@ impl StateManager {
         // Deterministic: same check on all nodes → same accept/reject decisions
         self.check_duplicate_commitment(tx)?;
         
-        // Get mutable access to accounts
+        // v3.34: Load ALL affected accounts (not just from/to)
+        // CRITICAL: Without this, BatchTransfers recipients lose existing balance!
+        // apply_to_state uses accounts.entry().or_insert_with(Account::new) which
+        // creates balance=0 accounts — if not pre-loaded, existing balances are overwritten
         let mut accounts_map = HashMap::new();
         
-        // Copy relevant accounts
-        if let Some(acc) = self.accounts.get(&tx.from) {
-            accounts_map.insert(tx.from.clone(), acc.clone());
-        }
-        
-        if let Some(to) = &tx.to {
-            if let Some(acc) = self.accounts.get(to) {
-                accounts_map.insert(to.clone(), acc.clone());
+        for address in tx.get_all_affected_addresses() {
+            if let Some(acc) = self.accounts.get(&address) {
+                accounts_map.insert(address, acc.clone());
             }
         }
         
@@ -864,14 +862,45 @@ impl StateManager {
         Ok(())
     }
     
+    /// v3.36: Apply gas refund for metered blocks (EIP-1559 style)
+    /// Returns unused gas (gas_limit - gas_used) * effective_gas_price to sender.
+    /// ACTIVATION: Only for blocks at height >= GAS_METERING_ACTIVATION_HEIGHT.
+    /// Deterministic: compute_gas_used() is pure function of TX type → identical on all nodes.
+    /// Must be called AFTER apply_transaction_lazy() for each TX.
+    pub fn apply_gas_refund(&self, tx: &Transaction, block_height: u64) -> StateResult<()> {
+        if block_height < GAS_METERING_ACTIVATION_HEIGHT {
+            return Ok(());
+        }
+        let refund = tx.compute_gas_refund();
+        if refund == 0 {
+            return Ok(());
+        }
+        // Credit refund back to sender
+        if let Some(mut account) = self.accounts.get_mut(&tx.from) {
+            account.balance = account.balance.saturating_add(refund);
+            // Lazy merkle update so finalize_merkle() picks it up
+            let mut tree = self.merkle_tree.write();
+            tree.insert_lazy(&tx.from, &account);
+        }
+        Ok(())
+    }
+    
     /// v3.22: Apply block with batch Merkle processing
     /// Optimized for 100K+ TPS - single Merkle finalization after all TX
+    /// v3.42: Added block_height parameter for gas refund support (EIP-1559)
     /// 
     /// # Performance
     /// - O(1) per TX (lazy Merkle update)
     /// - O(n) finalization ONCE at end
     /// - NO TX-level rollback needed - apply_transaction_lazy already atomic!
     pub fn apply_block_batch(&self, transactions: &[Transaction]) -> StateResult<usize> {
+        // Legacy call without block height — no gas refund (genesis / pre-activation blocks)
+        self.apply_block_batch_at_height(transactions, 0)
+    }
+    
+    /// v3.42: Apply block batch with gas refund support
+    /// Same as apply_block_batch but applies EIP-1559 gas refunds for blocks >= GAS_METERING_ACTIVATION_HEIGHT
+    pub fn apply_block_batch_at_height(&self, transactions: &[Transaction], block_height: u64) -> StateResult<usize> {
         let tx_count = transactions.len();
         let mut applied = 0;
         let mut failed = 0;
@@ -880,7 +909,11 @@ impl StateManager {
         // (works with local copy, writes to state only on success)
         for tx in transactions {
             match self.apply_transaction_lazy(tx) {
-                Ok(_) => applied += 1,
+                Ok(_) => {
+                    applied += 1;
+                    // v3.42: Gas refund for metered blocks (EIP-1559)
+                    let _ = self.apply_gas_refund(tx, block_height);
+                }
                 Err(e) => {
                     failed += 1;
                     // Log failures (limit spam for large blocks)
@@ -906,11 +939,13 @@ impl StateManager {
     /// This is the SINGLE POINT where fees are credited to producer
     /// Ensures idempotency: calling multiple times with same block = same result
     /// Ensures determinism: all nodes get identical state_root
+    /// v3.42: Added block_height for gas refund (EIP-1559)
     /// 
     /// # Arguments
     /// * `transactions` - Block transactions to apply
     /// * `producer_wallet` - Wallet address of block producer (for fee credit)
     /// * `fees_collected` - Total fees from all transactions in block
+    /// * `block_height` - Block height (for gas refund activation check)
     /// 
     /// # Returns
     /// * `(applied_count, state_root)` - Number of applied TXs and final state root
@@ -920,12 +955,27 @@ impl StateManager {
         producer_wallet: &str,
         fees_collected: u64,
     ) -> StateResult<(usize, [u8; HASH_SIZE])> {
+        self.apply_block_with_fees_at_height(transactions, producer_wallet, fees_collected, 0)
+    }
+    
+    /// v3.42: ATOMIC block processing with fee crediting + gas refund
+    pub fn apply_block_with_fees_at_height(
+        &self,
+        transactions: &[Transaction],
+        producer_wallet: &str,
+        fees_collected: u64,
+        block_height: u64,
+    ) -> StateResult<(usize, [u8; HASH_SIZE])> {
         let mut applied = 0;
         
         // 1. Apply all transactions with lazy merkle updates
         for tx in transactions {
             match self.apply_transaction_lazy(tx) {
-                Ok(_) => applied += 1,
+                Ok(_) => {
+                    applied += 1;
+                    // v3.42: Gas refund for metered blocks (EIP-1559)
+                    let _ = self.apply_gas_refund(tx, block_height);
+                }
                 Err(e) => {
                     // Log but don't fail - some TX may be invalid
                     if applied == 0 || transactions.len() < 100 {

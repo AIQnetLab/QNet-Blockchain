@@ -610,6 +610,15 @@ impl PersistentStorage {
         opts.set_max_background_jobs(2);  // Reduced from 4
         opts.set_disable_auto_compactions(false);
         
+        // v3.41: CRITICAL WAL CLEANUP - limits total WAL size to 64MB
+        // Without this, WAL files accumulate indefinitely with 17 column families
+        // because a WAL can only be deleted when ALL CFs flush past it.
+        // Rarely-written CFs (failover_events, poh_state) keep stale memtables,
+        // preventing WAL deletion → 463 files / 1.8GB in 23 hours.
+        // With this setting, RocksDB force-flushes oldest CF memtables when
+        // total WAL exceeds 64MB, enabling old WAL cleanup.
+        opts.set_max_total_wal_size(67_108_864); // 64MB max WAL (was: unlimited)
+        
         // v3.19: AGGRESSIVE compaction settings
         opts.set_level_compaction_dynamic_level_bytes(true);
         opts.set_max_bytes_for_level_base(67108864); // 64MB base level
@@ -1008,10 +1017,15 @@ impl PersistentStorage {
         let mut flush_opts = FlushOptions::default();
         flush_opts.set_wait(true); // Wait for flush to complete
         
-        // Flush all column families
-        let cf_names = ["metadata", "blocks", "macroblocks", "attestations", "heartbeats", 
-                        "pending_rewards", "light_eligibility", "shred_chunks", "index", 
-                        "accounts", "transactions"];
+        // v3.41: Flush ALL column families (including ephemeral CFs)
+        // CRITICAL: WAL can only be deleted when ALL CFs are flushed past it.
+        // Missing CFs here caused WAL accumulation (1.8GB in 23h).
+        // Must match EXACTLY the CFs in DB::open_cf_descriptors (line 668-686)
+        let cf_names = ["blocks", "transactions", "accounts", "metadata",
+                        "microblocks", "consensus", "sync_state",
+                        "pending_rewards", "node_registry", "ping_history",
+                        "failover_events", "snapshots", "tx_index",
+                        "tx_by_address", "attestations", "heartbeats", "poh_state"];
         
         for cf_name in &cf_names {
             if let Some(cf) = self.db.cf_handle(cf_name) {
@@ -1148,10 +1162,17 @@ impl PersistentStorage {
         Ok(())
     }
     
-    /// v3.19: Compact all column families to reclaim disk space
+    /// v3.19 / v3.41: Compact all column families to reclaim disk space
+    /// CRITICAL: Without compaction after delete operations, RocksDB marks
+    /// keys as tombstones but doesn't physically reclaim disk space until
+    /// compaction runs. This must be called after cleanup operations.
+    /// Must match EXACTLY the CFs in DB::open_cf_descriptors (line 668-686)
     pub fn compact_all(&self) -> IntegrationResult<()> {
-        let cf_names = ["microblocks", "heartbeats", "attestations", "ping_history", 
-                        "consensus", "poh_state", "blocks", "transactions"];
+        let cf_names = ["blocks", "transactions", "accounts", "metadata",
+                        "microblocks", "consensus", "sync_state",
+                        "pending_rewards", "node_registry", "ping_history",
+                        "failover_events", "snapshots", "tx_index",
+                        "tx_by_address", "attestations", "heartbeats", "poh_state"];
         
         for cf_name in &cf_names {
             if let Some(cf) = self.db.cf_handle(cf_name) {
@@ -1159,7 +1180,7 @@ impl PersistentStorage {
             }
         }
         
-        println!("[STORAGE] v3.19: Compaction triggered on all CFs");
+        println!("[INFO][STORAGE] compaction_triggered cfs={}", cf_names.len());
         Ok(())
     }
     
@@ -5077,6 +5098,258 @@ impl Storage {
         Ok(removed)
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.41: EPHEMERAL DATA CLEANUP - all CFs older than 24h
+    // WAL files can only be deleted when ALL CFs flush. Rarely-written CFs
+    // (ping_history, poh_state, consensus, failover_events) keep stale memtables
+    // preventing WAL cleanup. These methods + compact_all() reclaim disk space.
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// v3.41: Cleanup old ping_history entries (older than cutoff_timestamp)
+    pub fn cleanup_old_pings_all(&self, cutoff_timestamp: u64) -> IntegrationResult<u32> {
+        let ping_cf = self.persistent.db.cf_handle("ping_history")
+            .ok_or_else(|| IntegrationError::StorageError("ping_history column family not found".to_string()))?;
+        
+        let iter = self.persistent.db.iterator_cf(&ping_cf, rocksdb::IteratorMode::Start);
+        let mut batch = WriteBatch::default();
+        let mut removed = 0u32;
+        
+        for item in iter {
+            let (key, value) = item?;
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
+                let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
+                if timestamp > 0 && timestamp < cutoff_timestamp {
+                    batch.delete_cf(&ping_cf, &key);
+                    removed += 1;
+                    if removed % 1000 == 0 {
+                        self.persistent.db.write(batch)?;
+                        batch = WriteBatch::default();
+                    }
+                }
+            }
+        }
+        
+        if batch.len() > 0 {
+            self.persistent.db.write(batch)?;
+        }
+        
+        Ok(removed)
+    }
+    
+    /// v3.41: Cleanup old poh_state entries (older than retention_height)
+    /// PoH state keys: "poh_{height}" — only current state needed for consensus
+    pub fn cleanup_old_poh_state(&self, current_height: u64, retention_blocks: u64) -> IntegrationResult<u32> {
+        let poh_cf = self.persistent.db.cf_handle("poh_state")
+            .ok_or_else(|| IntegrationError::StorageError("poh_state column family not found".to_string()))?;
+        
+        if current_height <= retention_blocks {
+            return Ok(0);
+        }
+        
+        let cutoff_height = current_height - retention_blocks;
+        let iter = self.persistent.db.iterator_cf(&poh_cf, rocksdb::IteratorMode::Start);
+        let mut batch = WriteBatch::default();
+        let mut removed = 0u32;
+        
+        for item in iter {
+            let (key, _value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+            if let Some(height_str) = key_str.strip_prefix("poh_") {
+                if let Ok(height) = height_str.parse::<u64>() {
+                    if height < cutoff_height {
+                        batch.delete_cf(&poh_cf, &key);
+                        removed += 1;
+                        if removed % 1000 == 0 {
+                            self.persistent.db.write(batch)?;
+                            batch = WriteBatch::default();
+                        }
+                    }
+                }
+            }
+        }
+        
+        if batch.len() > 0 {
+            self.persistent.db.write(batch)?;
+        }
+        
+        Ok(removed)
+    }
+    
+    /// v3.41: Cleanup old consensus rounds (keep only recent rounds)
+    /// Consensus keys: "round_{number}" — only current round needed
+    pub fn cleanup_old_consensus(&self, current_round: u64, retention_rounds: u64) -> IntegrationResult<u32> {
+        let consensus_cf = self.persistent.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        
+        if current_round <= retention_rounds {
+            return Ok(0);
+        }
+        
+        let cutoff_round = current_round - retention_rounds;
+        let iter = self.persistent.db.iterator_cf(&consensus_cf, rocksdb::IteratorMode::Start);
+        let mut batch = WriteBatch::default();
+        let mut removed = 0u32;
+        
+        for item in iter {
+            let (key, _value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+            // Skip "latest_round" meta-key
+            if let Some(round_str) = key_str.strip_prefix("round_") {
+                if let Ok(round) = round_str.parse::<u64>() {
+                    if round < cutoff_round {
+                        batch.delete_cf(&consensus_cf, &key);
+                        removed += 1;
+                        if removed % 1000 == 0 {
+                            self.persistent.db.write(batch)?;
+                            batch = WriteBatch::default();
+                        }
+                    }
+                }
+            }
+        }
+        
+        if batch.len() > 0 {
+            self.persistent.db.write(batch)?;
+        }
+        
+        Ok(removed)
+    }
+    
+    /// v3.41: Cleanup old failover events (older than cutoff_timestamp)
+    /// Key format: "failover_{height:012}_{timestamp}" (see save_failover_event)
+    /// Value format: bincode-serialized FailoverEvent (timestamp is i64, NOT fixed offset)
+    /// SAFE: Parse timestamp from KEY (reliable) instead of value (variable layout)
+    pub fn cleanup_old_failover_events(&self, cutoff_timestamp: u64) -> IntegrationResult<u32> {
+        let failover_cf = self.persistent.db.cf_handle("failover_events")
+            .ok_or_else(|| IntegrationError::StorageError("failover_events column family not found".to_string()))?;
+        
+        let iter = self.persistent.db.iterator_cf(&failover_cf, rocksdb::IteratorMode::Start);
+        let mut batch = WriteBatch::default();
+        let mut removed = 0u32;
+        
+        for item in iter {
+            let (key, _value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+            
+            // Parse timestamp from key: "failover_{height:012}_{timestamp}"
+            // Also handle keys that don't match the expected format
+            let is_old = if key_str.starts_with("failover_") {
+                let parts: Vec<&str> = key_str.splitn(3, '_').collect();
+                if parts.len() == 3 {
+                    // parts[2] is the timestamp (i64 stored as string)
+                    if let Ok(ts) = parts[2].parse::<i64>() {
+                        ts > 0 && (ts as u64) < cutoff_timestamp
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            
+            if is_old {
+                batch.delete_cf(&failover_cf, &key);
+                removed += 1;
+                if removed % 1000 == 0 {
+                    self.persistent.db.write(batch)?;
+                    batch = WriteBatch::default();
+                }
+            }
+        }
+        
+        if batch.len() > 0 {
+            self.persistent.db.write(batch)?;
+        }
+        
+        Ok(removed)
+    }
+    
+    /// v3.41: Cleanup old snapshots, keeping only the latest `keep_count`
+    /// Snapshot keys: "snapshot_{height}" — only latest 2-3 needed for sync
+    pub fn cleanup_old_snapshots(&self, keep_count: usize) -> IntegrationResult<u32> {
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        
+        // Collect all snapshot heights
+        let mut snapshot_heights: Vec<u64> = Vec::new();
+        let iter = self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::Start);
+        
+        for item in iter {
+            let (key, _value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+            if let Some(height_str) = key_str.strip_prefix("snapshot_") {
+                if let Ok(height) = height_str.parse::<u64>() {
+                    snapshot_heights.push(height);
+                }
+            }
+        }
+        
+        if snapshot_heights.len() <= keep_count {
+            return Ok(0); // Not enough snapshots to prune
+        }
+        
+        // Sort descending — keep the latest `keep_count`
+        snapshot_heights.sort_unstable_by(|a, b| b.cmp(a));
+        let to_delete = &snapshot_heights[keep_count..];
+        
+        let mut batch = WriteBatch::default();
+        let mut removed = 0u32;
+        
+        for height in to_delete {
+            let key = format!("snapshot_{}", height);
+            batch.delete_cf(&snapshots_cf, key.as_bytes());
+            removed += 1;
+        }
+        
+        if batch.len() > 0 {
+            self.persistent.db.write(batch)?;
+        }
+        
+        Ok(removed)
+    }
+    
+    /// v3.41: Run full ephemeral data cleanup cycle + compaction
+    /// Cleans: ping_history, poh_state, consensus, failover_events, old snapshots
+    /// Then triggers compaction on ALL CFs to physically reclaim disk space
+    pub fn run_ephemeral_cleanup(&self, current_height: u64, cutoff_timestamp: u64) -> IntegrationResult<()> {
+        let start = std::time::Instant::now();
+        
+        // 1. Ping history (>24h)
+        let pings_removed = self.cleanup_old_pings_all(cutoff_timestamp).unwrap_or(0);
+        
+        // 2. PoH state — keep last 86400 blocks (~24h at 1 block/sec)
+        let poh_removed = self.cleanup_old_poh_state(current_height, 86_400).unwrap_or(0);
+        
+        // 3. Consensus rounds — keep last 1000 rounds
+        let current_round = current_height / 90; // macroblock every 90 blocks
+        let consensus_removed = self.cleanup_old_consensus(current_round, 1000).unwrap_or(0);
+        
+        // 4. Failover events (>24h)
+        let failover_removed = self.cleanup_old_failover_events(cutoff_timestamp).unwrap_or(0);
+        
+        // 5. Old snapshots — keep latest 3
+        let snapshots_removed = self.cleanup_old_snapshots(3).unwrap_or(0);
+        
+        let total_removed = pings_removed + poh_removed + consensus_removed + failover_removed + snapshots_removed;
+        
+        // 6. Trigger compaction on ALL CFs to physically reclaim disk space
+        if total_removed > 0 {
+            if let Err(e) = self.persistent.compact_all() {
+                println!("[WARN][CLEANUP] compaction_failed err={}", e);
+            }
+        }
+        
+        let elapsed = start.elapsed();
+        if total_removed > 0 {
+            println!("[INFO][CLEANUP] ephemeral_cleanup_done elapsed={:?} pings={} poh={} consensus={} failover={} snapshots={} total={}",
+                     elapsed, pings_removed, poh_removed, consensus_removed, failover_removed, snapshots_removed, total_removed);
+        }
+        
+        Ok(())
+    }
+    
     // ============================================
     // PRODUCTION: HEARTBEAT STORAGE (Full/Super nodes)
     // ============================================
@@ -5519,7 +5792,7 @@ impl Storage {
                  account_count, rewards_count, compressed.len(), duration.as_secs_f64());
         
         // PRODUCTION: Clean up old snapshots (keep only last 5)
-        self.cleanup_old_snapshots(height, 5)?;
+        self.cleanup_old_snapshots(5)?;
         
         Ok(())
     }
@@ -5717,43 +5990,7 @@ impl Storage {
         Ok(())
     }
     
-    /// Clean up old snapshots, keeping only the most recent ones
-    fn cleanup_old_snapshots(&self, current_height: u64, keep_count: usize) -> IntegrationResult<()> {
-        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
-            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
-        
-        // Find all snapshots
-        let mut snapshots = Vec::new();
-        let iter = self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::Start);
-        
-        for item in iter {
-            let (key, _) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-            if key_str.starts_with("snapshot_") {
-                if let Some(height_str) = key_str.strip_prefix("snapshot_") {
-                    if let Ok(height) = height_str.parse::<u64>() {
-                        snapshots.push(height);
-                    }
-                }
-            }
-        }
-        
-        // Sort and keep only recent ones
-        snapshots.sort_unstable();
-        snapshots.reverse(); // Most recent first
-        
-        if snapshots.len() > keep_count {
-            let mut batch = WriteBatch::default();
-            for &height in &snapshots[keep_count..] {
-                let key = format!("snapshot_{}", height);
-                batch.delete_cf(&snapshots_cf, key.as_bytes());
-                println!("[SNAPSHOT] 🗑️ Removing old snapshot at height {}", height);
-            }
-            self.persistent.db.write(batch)?;
-        }
-        
-        Ok(())
-    }
+    // v3.41: cleanup_old_snapshots unified into the ephemeral cleanup section above
     
     // PRODUCTION: IPFS integration for decentralized snapshot distribution
     

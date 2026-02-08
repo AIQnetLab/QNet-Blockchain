@@ -7551,8 +7551,10 @@ impl SimplifiedP2P {
                     };
                     
                     if cache_age.as_secs() < cache_ttl {
-                        println!("[FAILOVER] 📋 Using cached Genesis connectivity ({} working, cache age: {}s, TTL: {}s)", 
-                                 cached_working_nodes.len(), cache_age.as_secs(), cache_ttl);
+                        if crate::node::is_debug() {
+                            println!("[CONNECTIVITY] cached peers={} age={}s ttl={}s", 
+                                     cached_working_nodes.len(), cache_age.as_secs(), cache_ttl);
+                        }
                         return cached_working_nodes.clone();
                     }
                 }
@@ -7563,7 +7565,9 @@ impl SimplifiedP2P {
         let mut working_nodes = Vec::new();
         let mut test_results = Vec::new();
         
-        println!("[FAILOVER] 🔍 Testing connectivity to {} Genesis nodes... (REFRESHING CACHE)", nodes.len());
+        if crate::node::is_info() {
+            println!("[INFO][CONNECTIVITY] refresh_start peers={} strategy=tcp_probe", nodes.len());
+        }
         
         for ip in &nodes {
             let addr = format!("{}:8001", ip);
@@ -7595,39 +7599,40 @@ impl SimplifiedP2P {
                 
                 if connection_success {
                     working_nodes.push(ip.clone());
-                    test_results.push((ip.clone(), response_time_ms, "✅ ONLINE"));
-                    println!("[FAILOVER] ✅ Genesis node {} is reachable ({}ms)", get_privacy_id_for_addr(ip), response_time_ms);
+                    test_results.push((ip.clone(), response_time_ms, "online"));
+                    if crate::node::is_debug() {
+                        println!("[DBG][CONNECTIVITY] peer={} status=online rtt={}ms", get_privacy_id_for_addr(ip), response_time_ms);
+                    }
                 } else {
-                    test_results.push((ip.clone(), 0, "❌ OFFLINE"));
-                    println!("[FAILOVER] ❌ Genesis node {} is unreachable after 3 attempts", get_privacy_id_for_addr(ip));
+                    test_results.push((ip.clone(), 0, "offline"));
+                    if crate::node::is_warn() {
+                        println!("[WARN][CONNECTIVITY] peer={} status=offline attempts=3", get_privacy_id_for_addr(ip));
+                    }
                 }
             } else {
-                test_results.push((ip.clone(), 0, "❌ INVALID"));
-                    println!("[FAILOVER] ❌ Genesis node {} has invalid address format", get_privacy_id_for_addr(ip));
+                test_results.push((ip.clone(), 0, "invalid"));
+                if crate::node::is_warn() {
+                    println!("[WARN][CONNECTIVITY] peer={} status=invalid_addr", get_privacy_id_for_addr(ip));
+                }
             }
         }
         
-        // PRODUCTION: Log detailed failover report
-        println!("[FAILOVER] 📊 Genesis Node Connectivity Report:");
-        for (ip, response_time, status) in test_results {
-            // PRIVACY: Use pseudonym for IP addresses in logs
-            if response_time > 0 {
-                println!("[FAILOVER]   {} {} ({}ms)", status, get_privacy_id_for_addr(&ip), response_time);
-            } else {
-                println!("[FAILOVER]   {} {}", status, get_privacy_id_for_addr(&ip));
-            }
+        // Log connectivity report
+        if crate::node::is_info() {
+            let online = test_results.iter().filter(|(_, _, s)| *s == "online").count();
+            let offline = test_results.iter().filter(|(_, _, s)| *s != "online").count();
+            println!("[INFO][CONNECTIVITY] refresh_done online={} offline={} total={}", online, offline, test_results.len());
         }
         
         // SECURITY: Require minimum number of working Genesis nodes
         let min_required_nodes = 2; // Minimum for network security
         
         if working_nodes.len() < min_required_nodes {
-            println!("[FAILOVER] ⚠️ SECURITY WARNING: Only {} Genesis nodes reachable, minimum {} required", 
+            println!("[WARN][CONNECTIVITY] low_peers reachable={} min_required={}", 
                      working_nodes.len(), min_required_nodes);
             
             if working_nodes.is_empty() {
-                println!("[FAILOVER] 🚨 CRITICAL: No Genesis nodes reachable!");
-                println!("[FAILOVER] 🔄 Using all configured nodes (network might be starting)");
+                println!("[WARN][CONNECTIVITY] no_peers_reachable fallback=all_configured");
                 
                 // Cache the fallback result (all nodes) for short period to prevent repeated failures
                 if let Ok(mut cache) = connectivity_cache.lock() {
@@ -7635,8 +7640,6 @@ impl SimplifiedP2P {
                 }
                 
                 return nodes; // Last resort - use all nodes
-            } else {
-                println!("[FAILOVER] ⚠️ Proceeding with {} working nodes (below minimum)", working_nodes.len());
             }
         }
         
@@ -7661,7 +7664,9 @@ impl SimplifiedP2P {
             }
         }
         
-        println!("[FAILOVER] ✅ Selected {} working Genesis nodes for production use", working_nodes.len());
+        if crate::node::is_info() {
+            println!("[INFO][CONNECTIVITY] cache_updated working={}", working_nodes.len());
+        }
         working_nodes
     }
     

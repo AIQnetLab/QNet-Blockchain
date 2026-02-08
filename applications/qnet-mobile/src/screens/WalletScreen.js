@@ -794,6 +794,7 @@ const WalletScreen = () => {
   const [serverNodeStatus, setServerNodeStatus] = useState(null); // Full/Super node network status
   const [allUserNodes, setAllUserNodes] = useState([]); // All nodes owned by this wallet (unified view)
   const [loadingAllNodes, setLoadingAllNodes] = useState(false); // Loading state for all nodes
+  const [nodeInitializing, setNodeInitializing] = useState(true); // True until first load cycle completes
   const [reactivatingNode, setReactivatingNode] = useState(false); // Reactivation in progress
   const [nodeActivating, setNodeActivating] = useState(false); // Node activation in progress
   const [unlockError, setUnlockError] = useState(''); // Error message for unlock screen
@@ -918,37 +919,26 @@ const WalletScreen = () => {
   // - NEW: Load ALL nodes owned by this wallet for unified display
   useEffect(() => {
     if (activeTab === 'node' && wallet) {
-      // UNIFIED: Load ALL nodes for this wallet (Light + Full + Super + Genesis)
-      // Uses QNet address for lookup (Genesis nodes use QNet addresses)
-      loadAllUserNodes();
+      // Load ALL nodes + specific node data in parallel (not waterfall)
+      const promises = [];
       
-      // Also load specific node data if activated
+      // UNIFIED: Load ALL nodes for this wallet (Light + Full + Super + Genesis)
+      promises.push(loadAllUserNodes());
+      
+      // Also load specific node data if activated (runs in PARALLEL with loadAllUserNodes)
       if (activatedNodeType && activationCode) {
         if (activatedNodeType === 'light') {
-          // LIGHT NODES: App IS the node
-          // - Load rewards (local tracking)
-          // - Check ping status from network
-          // - Start ping interval for responding to challenges
           loadNodeRewards();
           loadLightNodeStatus();
-          
-          // No automatic ping interval - user can manually refresh
-          
-          // NO POLLING - user can pull-to-refresh
-          // Light nodes get push notifications for pings anyway
-          
         } else {
-          // FULL/SUPER/GENESIS NODES: Server IS the node
-          // - Single API call gets ALL info (status, heartbeats, rewards)
-          // - Server handles heartbeats automatically every 24 min
-          // - Rewards calculated at end of 4h window on server
-          loadServerNodeStatus();
-          
-          // NO POLLING - server nodes don't need real-time updates from app
-          // User can pull-to-refresh when they want to check
-          // This saves battery significantly!
+          // Only fetch fresh status if we don't have cached data
+          // (cached data was already restored from AsyncStorage on mount)
+          promises.push(loadServerNodeStatus());
         }
       }
+      
+      // Ensure nodeInitializing is cleared even if no nodes found
+      Promise.all(promises).finally(() => setNodeInitializing(false));
     }
   }, [activeTab, activatedNodeType, activationCode, nodePseudonym, wallet]); // Load when tab opens
   
@@ -1016,6 +1006,14 @@ const WalletScreen = () => {
       // Set status (UI will show appropriate state based on success flag)
       setServerNodeStatus(status);
       
+      // Cache server status for instant restore on next open
+      if (status.success) {
+        AsyncStorage.setItem('qnet_cached_server_status', JSON.stringify({
+          ...status,
+          cachedAt: Date.now()
+        })).catch(() => {});
+      }
+      
       // Also load pseudonym for display
       await loadNodePseudonym(activationCode);
       
@@ -1058,24 +1056,34 @@ const WalletScreen = () => {
             const bootstrapId = genesisNode.node_id.replace('genesis_node_', '');
             const genesisCode = `QNET-BOOT-${bootstrapId}-STRAP`;
             
-            // Set activation state
+            // Set activation state + fetch status immediately (single network call)
             setActivationCode(genesisCode);
             setActivatedNodeType('super'); // Genesis nodes are Super nodes
             setNodePseudonym(genesisNode.node_id);
             
-            // Save to AsyncStorage
-            await AsyncStorage.setItem(`node_pseudonym_${genesisCode}`, genesisNode.node_id);
-            await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+            // Save to AsyncStorage (non-blocking)
+            AsyncStorage.setItem(`node_pseudonym_${genesisCode}`, genesisNode.node_id).catch(() => {});
+            AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
               nodeType: 'super',
               code: genesisCode,
               pseudonym: genesisNode.node_id,
               isGenesis: true,
               bootstrapId: bootstrapId,
               timestamp: Date.now()
-            }));
+            })).catch(() => {});
             
-            // Load server status immediately
-            loadServerNodeStatus();
+            // Fetch server status inline (avoids separate render cycle)
+            try {
+              const status = await checkServerNodeStatus(genesisCode, genesisNode.node_id);
+              setServerNodeStatus(status);
+              if (status.success) {
+                AsyncStorage.setItem('qnet_cached_server_status', JSON.stringify({
+                  ...status, cachedAt: Date.now()
+                })).catch(() => {});
+              }
+            } catch (e) {
+              // Will show "Connecting to node..." in UI
+            }
             return; // Don't process other nodes if Genesis found
           }
           
@@ -1087,26 +1095,36 @@ const WalletScreen = () => {
           if (otherServerNodes.length > 0) {
             // Auto-link first active server node found
             const serverNode = otherServerNodes[0];
-            const activationCode = serverNode.activation_code || serverNode.node_id;
+            const nodeActivationCode = serverNode.activation_code || serverNode.node_id;
             
             // Set activation state
-            setActivationCode(activationCode);
+            setActivationCode(nodeActivationCode);
             setActivatedNodeType(serverNode.node_type);
             setNodePseudonym(serverNode.node_id || serverNode.pseudonym);
             
-            // Save to AsyncStorage
+            // Save to AsyncStorage (non-blocking)
             if (serverNode.node_id) {
-              await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, serverNode.node_id);
+              AsyncStorage.setItem(`node_pseudonym_${nodeActivationCode}`, serverNode.node_id).catch(() => {});
             }
-            await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+            AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
               nodeType: serverNode.node_type,
-              code: activationCode,
+              code: nodeActivationCode,
               pseudonym: serverNode.node_id || serverNode.pseudonym,
               timestamp: Date.now()
-            }));
+            })).catch(() => {});
             
-            // Load server status immediately
-            loadServerNodeStatus();
+            // Fetch server status inline
+            try {
+              const status = await checkServerNodeStatus(nodeActivationCode, serverNode.node_id);
+              setServerNodeStatus(status);
+              if (status.success) {
+                AsyncStorage.setItem('qnet_cached_server_status', JSON.stringify({
+                  ...status, cachedAt: Date.now()
+                })).catch(() => {});
+              }
+            } catch (e) {
+              // Will show "Connecting to node..." in UI
+            }
             
             console.log(`[Nodes] Auto-linked ${serverNode.node_type} node`);
           }
@@ -1169,24 +1187,27 @@ const WalletScreen = () => {
                 if (status.success && status.isOnline) {
                   console.log(`[Nodes] Genesis node ${genesisNodeId} is active - auto-linking`);
                   
-                  // Set activation state
+                  // Set ALL state at once to avoid intermediate renders
                   setActivationCode(genesisCode);
                   setActivatedNodeType('super');
                   setNodePseudonym(genesisNodeId);
+                  // Reuse already-fetched status (no second network call needed)
+                  setServerNodeStatus(status);
                   
-                  // Save to AsyncStorage
-                  await AsyncStorage.setItem(`node_pseudonym_${genesisCode}`, genesisNodeId);
-                  await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                  // Save to AsyncStorage (parallel, non-blocking)
+                  AsyncStorage.setItem(`node_pseudonym_${genesisCode}`, genesisNodeId).catch(() => {});
+                  AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
                     nodeType: 'super',
                     code: genesisCode,
                     pseudonym: genesisNodeId,
                     isGenesis: true,
                     bootstrapId: bootstrapId,
                     timestamp: Date.now()
-                  }));
-                  
-                  // Load server status immediately
-                  loadServerNodeStatus();
+                  })).catch(() => {});
+                  AsyncStorage.setItem('qnet_cached_server_status', JSON.stringify({
+                    ...status,
+                    cachedAt: Date.now()
+                  })).catch(() => {});
                   
                   break; // Found matching Genesis node, stop checking
                 }
@@ -1202,6 +1223,7 @@ const WalletScreen = () => {
       console.error('Failed to load all user nodes:', error);
     } finally {
       setLoadingAllNodes(false);
+      setNodeInitializing(false);
     }
   };
   
@@ -1561,8 +1583,13 @@ const WalletScreen = () => {
   const QNET_GAS_LIMIT = 10000; // for transfers
   const QNET_TX_FEE = (QNET_GAS_PRICE * QNET_GAS_LIMIT) / 1_000_000_000; // 0.00001 QNC
   
-  // v3.29: Poll TX status until confirmed
-  // Uses ALL Genesis nodes in rotation for reliability
+  // v3.34: Poll TX status until confirmed
+  // ARCHITECTURE: Polling only updates UI status (confirming → confirmed)
+  // It does NOT clear pendingTxRef — that's loadBalance's job!
+  // WHY: Polling may confirm TX on Node 1, but loadBalance queries Node 3
+  // which hasn't received the block yet → stale balance without protection.
+  // loadBalance clears pendingTxRef ONLY when the queried node's balance
+  // actually reflects the TX (qncBalance <= expectedQnc).
   const startTxConfirmationPolling = (txHash, expectedBalance, previousBalance) => {
     // Clear any existing polling
     if (txPollingRef.current) {
@@ -1598,10 +1625,17 @@ const WalletScreen = () => {
         if (response.ok) {
           const txData = await response.json();
           
-          // TX found in blockchain = CONFIRMED
-          if (txData && (txData.hash || txData.tx_hash)) {
-            // TX confirmed! Update state
-            pendingTxRef.current = null;
+          // v3.34: FIX — Check transaction object AND status, not tx_hash!
+          // BEFORE: txData.tx_hash was ALWAYS present (even when not_found) → false positive
+          // NOW: Check that transaction object exists AND status is not "not_found"
+          const txFound = txData && txData.transaction && txData.status !== 'not_found';
+          if (txFound) {
+            // v3.34: DON'T clear pendingTxRef here!
+            // loadBalance will clear it when the queried node's balance catches up.
+            // This prevents the bounce: polling confirms on Node 1, but loadBalance
+            // queries Node 3 which still has old balance → stale data without protection.
+            
+            // Stop polling (TX is confirmed, no need to keep checking)
             clearInterval(txPollingRef.current);
             txPollingRef.current = null;
             
@@ -1614,17 +1648,21 @@ const WalletScreen = () => {
             // v3.30: Update TX history status
             updateTxStatus(txHash, 'confirmed');
             
-            // Refresh balance from server (now it's accurate)
+            // Trigger balance refresh (loadBalance will handle pendingTxRef clearing)
             if (wallet?.publicKey) {
               loadBalance(wallet.publicKey);
             }
+            
+            // v3.35: Refresh full TX history from blockchain
+            // This ensures the confirmed TX appears with correct block data
+            loadTxHistory();
             return;
           }
         }
         
         // TX not found yet - still pending
         if (attempts >= maxAttempts) {
-          // Timeout - TX might have failed
+          // Timeout - TX might have failed, clear optimistic state
           pendingTxRef.current = null;
           clearInterval(txPollingRef.current);
           txPollingRef.current = null;
@@ -1994,6 +2032,25 @@ const WalletScreen = () => {
       };
     }
   }, [wallet, isTestnet, selectedNetwork, activeTab]); // Reload on any network or tab change
+
+  // v3.35: Auto-refresh TX history when on History tab
+  // Without this, TX history only refreshes on manual pull-to-refresh or tab click
+  // With WebSocket fix (NewBlock events), most updates come via WS,
+  // but this timer serves as a reliable fallback
+  useEffect(() => {
+    if (wallet?.qnetAddress && activeTab === 'history') {
+      // Load immediately when switching to history tab
+      loadTxHistory();
+      
+      const historyInterval = setInterval(() => {
+        if (wallet?.qnetAddress && activeTab === 'history') {
+          loadTxHistory();
+        }
+      }, 10000); // Refresh every 10 seconds when on History tab
+      
+      return () => clearInterval(historyInterval);
+    }
+  }, [wallet, activeTab]);
 
   // Check for existing activation codes when wallet is loaded
   useEffect(() => {
@@ -2455,8 +2512,11 @@ const WalletScreen = () => {
       // Load balance in parallel
       loadBalance(loadedWallet.publicKey);
       
-      // Restore activation state from AsyncStorage immediately
-      AsyncStorage.getItem('qnet_last_activated_node').then(async savedState => {
+      // Restore activation state + cached server status from AsyncStorage immediately
+      Promise.all([
+        AsyncStorage.getItem('qnet_last_activated_node'),
+        AsyncStorage.getItem('qnet_cached_server_status'),
+      ]).then(async ([savedState, cachedStatus]) => {
         if (savedState) {
           try {
             const state = JSON.parse(savedState);
@@ -2472,11 +2532,27 @@ const WalletScreen = () => {
                   setNodePseudonym(savedPseudonym);
                 }
               }
+              
+              // Restore cached server status (show instantly, refresh in background)
+              if (cachedStatus && state.nodeType !== 'light') {
+                try {
+                  const cached = JSON.parse(cachedStatus);
+                  // Use cache if less than 10 minutes old
+                  if (cached.success && cached.cachedAt && (Date.now() - cached.cachedAt < 600000)) {
+                    setServerNodeStatus(cached);
+                  }
+                } catch (e) {
+                  // Silent fail
+                }
+              }
             }
           } catch (e) {
             // Silent fail
           }
         }
+        setNodeInitializing(false);
+      }).catch(() => {
+        setNodeInitializing(false);
       });
       
       // Sync activation codes in background (non-blocking)
@@ -2580,24 +2656,39 @@ const WalletScreen = () => {
       
       setBalance(bal);
       
-      // v3.29: Simple pending TX handling - polling manages confirmation
+      // v3.34: Optimistic balance protection
+      // Only loadBalance clears pendingTxRef — polling/WS only update UI status.
+      // This prevents bounce: 191K → 181K → 191K → 181K caused by
+      // polling confirming TX on Node 1 while loadBalance queries Node 3
+      // which hasn't propagated the block yet.
       let finalQncBalance = qncBalance;
       
-      if (pendingTxRef.current && pendingTxRef.current.status === 'pending') {
+      if (pendingTxRef.current) {
         const { expectedQnc, timestamp } = pendingTxRef.current;
         const elapsed = Date.now() - timestamp;
         
-        // If server shows higher balance than expected AND within timeout
-        // Keep showing expected (optimistic) - polling will confirm actual state
-        if (qncBalance > expectedQnc && elapsed < 60000) {
-          finalQncBalance = expectedQnc;
-        } else if (qncBalance <= expectedQnc) {
-          // TX confirmed! Clear pending (polling might not have caught it yet)
+        if (qncBalance <= expectedQnc) {
+          // ✅ Server balance matches or is below expected → TX confirmed on THIS node
+          // Safe to clear pending — the node we queried has the correct balance
           pendingTxRef.current = null;
           if (txPollingRef.current) {
             clearInterval(txPollingRef.current);
             txPollingRef.current = null;
           }
+          // Use server balance (it's correct)
+          finalQncBalance = qncBalance;
+        } else if (elapsed < 120000) {
+          // ⏳ Server still shows OLD (higher) balance AND within 2 min timeout
+          // Keep showing optimistic balance — block hasn't reached this node yet
+          finalQncBalance = expectedQnc;
+        } else {
+          // ⏰ Safety timeout (2 min) — TX might have been dropped, revert to server
+          pendingTxRef.current = null;
+          if (txPollingRef.current) {
+            clearInterval(txPollingRef.current);
+            txPollingRef.current = null;
+          }
+          finalQncBalance = qncBalance;
         }
       }
       
@@ -2627,80 +2718,123 @@ const WalletScreen = () => {
     }
   };
 
-  // v3.31: WebSocket connection using discovered nodes
+  // v3.35: WebSocket connection using discovered nodes
+  // FIX: Correct URL path (/ws/subscribe) and channels via query params (not JSON message)
+  // FIX: Handle NewBlock events (which only have metadata, not full TX data)
+  // FIX: Auto-refresh TX history when block with TXs arrives
   const connectWebSocket = () => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
     
     // Get nodes from discovery system (not hardcoded!)
     const httpNodes = walletManager.getAvailableNodes();
-    // Convert HTTP URLs to WebSocket URLs
-    const wsNodes = httpNodes.map(url => url.replace('http://', 'ws://') + '/ws');
+    const myAddress = wallet?.qnetAddress || '';
+    
+    // v3.35: Correct WS URL format: /ws/subscribe?channels=blocks,account:ADDRESS
+    // BEFORE: /ws + JSON subscribe message (Rust ignores JSON messages, reads from URL params)
+    // NOW: /ws/subscribe?channels=... (matches Rust warp route)
+    const channels = myAddress 
+      ? `blocks,account:${myAddress}` 
+      : 'blocks';
+    const wsNodes = httpNodes.map(url => {
+      const wsBase = url.replace('http://', 'ws://').replace('https://', 'wss://');
+      return `${wsBase}/ws/subscribe?channels=${encodeURIComponent(channels)}`;
+    });
     const wsUrl = wsNodes[Math.floor(Math.random() * wsNodes.length)];
     
     try {
       wsRef.current = new WebSocket(wsUrl);
       
       wsRef.current.onopen = () => {
-        // Subscribe to TX notifications for our address
-        if (wallet?.qnetAddress) {
-          wsRef.current?.send(JSON.stringify({
-            type: 'subscribe',
-            channel: 'transactions',
-            address: wallet.qnetAddress
-          }));
-        }
+        // v3.35: No need to send subscribe message — channels are in URL params
+        console.log('[WS] Connected to', wsUrl.replace(/channels=.*/, 'channels=...'));
       };
       
       wsRef.current.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
           
-          // New block with transactions
+          // v3.35: Handle NewBlock events from Rust node
+          // Rust sends: { type: "NewBlock", data: { height, hash, timestamp, tx_count, producer } }
+          // NOTE: NewBlock does NOT include individual TX data!
+          // When block has TXs → refresh history from API to get confirmed TXs
+          if (data.type === 'NewBlock' && data.data) {
+            const txCount = data.data.tx_count || 0;
+            
+            if (txCount > 0) {
+              // Block has transactions — refresh TX history to pick up confirmed TXs
+              // Small delay to allow block propagation to the node we'll query
+              setTimeout(() => {
+                loadTxHistory();
+                // Also refresh balance in case we received funds
+                if (wallet?.publicKey) {
+                  loadBalance(wallet.publicKey);
+                }
+              }, 1000);
+            }
+          }
+          
+          // v3.35: Handle BalanceUpdate events (account:ADDRESS channel)
+          // Rust sends: { type: "BalanceUpdate", data: { address, new_balance, change, tx_hash } }
+          if (data.type === 'BalanceUpdate' && data.data) {
+            const updateAddr = (data.data.address || '').toLowerCase();
+            const myAddr = myAddress.toLowerCase();
+            
+            if (updateAddr === myAddr) {
+              // Our balance changed — update immediately
+              const newBalanceQnc = (data.data.new_balance || 0) / 1e9;
+              
+              // Check if this is our pending TX being confirmed
+              if (pendingTxRef.current?.txHash === data.data.tx_hash) {
+                // Stop polling (WS already confirmed)
+                if (txPollingRef.current) {
+                  clearInterval(txPollingRef.current);
+                  txPollingRef.current = null;
+                }
+                setTxResult(prev => prev?.txHash === data.data.tx_hash
+                  ? { ...prev, confirming: false, confirmed: true }
+                  : prev
+                );
+                // Update TX history status
+                updateTxStatus(data.data.tx_hash, 'confirmed');
+              }
+              
+              // Refresh balance and history
+              if (wallet?.publicKey) {
+                loadBalance(wallet.publicKey);
+              }
+              loadTxHistory();
+            }
+          }
+          
+          // v3.35: Handle PendingTx events (mempool channel — not subscribed by default)
+          // Keep legacy block/microblock handler for backward compatibility
           if (data.type === 'block' || data.type === 'microblock') {
             const txs = data.transactions || data.block?.transactions || [];
-            const myAddress = wallet?.qnetAddress?.toLowerCase();
+            const myAddr = myAddress.toLowerCase();
             
             txs.forEach(tx => {
               const from = (tx.from || tx.sender || '').toLowerCase();
               const to = (tx.to || tx.recipient || '').toLowerCase();
               
-              // TX involves our wallet
-              if (from === myAddress || to === myAddress) {
+              if (from === myAddr || to === myAddr) {
                 const newTx = {
                   hash: tx.hash || tx.tx_hash,
                   from: tx.from || tx.sender,
                   to: tx.to || tx.recipient,
                   amount: (tx.amount || 0) / 1e9,
                   status: 'confirmed',
-                  // v3.33: Convert Unix timestamp (seconds) to milliseconds, fallback to now
                   timestamp: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
-                  type: from === myAddress ? 'send' : 'receive',
+                  type: from === myAddr ? 'send' : 'receive',
                   fee: (tx.fee || tx.gas_used || 0) / 1e9
                 };
                 
-                // Add to history (avoid duplicates)
                 setTxHistory(prev => {
                   if (prev.some(t => t.hash === newTx.hash)) return prev;
-                  return [newTx, ...prev].slice(0, 50); // Keep last 50
+                  return [newTx, ...prev].slice(0, 50);
                 });
                 
-                // Update pending TX if this confirms it
-                if (pendingTxRef.current?.txHash === newTx.hash) {
-                  pendingTxRef.current = null;
-                  if (txPollingRef.current) {
-                    clearInterval(txPollingRef.current);
-                    txPollingRef.current = null;
-                  }
-                  setTxResult(prev => prev?.txHash === newTx.hash
-                    ? { ...prev, confirming: false, confirmed: true }
-                    : prev
-                  );
-                  loadBalance(wallet?.publicKey);
-                }
-                
-                // Refresh balance on incoming TX
-                if (to === myAddress) {
-                  loadBalance(wallet?.publicKey);
+                if (wallet?.publicKey) {
+                  loadBalance(wallet.publicKey);
                 }
               }
             });
@@ -2723,7 +2857,10 @@ const WalletScreen = () => {
     }
   };
 
-  // v3.30: Load TX history from API
+  // v3.35: Load TX history from API
+  // FIX: Preserve pending TXs that haven't been confirmed yet
+  // BEFORE: setTxHistory(formattedTxs) — REPLACED everything, pending TX disappeared
+  // NOW: Merge — keep pending TXs that aren't yet in blockchain response
   const loadTxHistory = async () => {
     if (!wallet?.qnetAddress) return;
     
@@ -2751,7 +2888,16 @@ const WalletScreen = () => {
           fee: (tx.fee || tx.gas_used || 0) / 1e9
         }));
         
-        setTxHistory(formattedTxs);
+        // v3.35: MERGE with pending TXs instead of replacing
+        // Keep pending TXs that are NOT yet in the blockchain response
+        // This prevents pending TX from disappearing when user switches to History tab
+        setTxHistory(prev => {
+          const confirmedHashes = new Set(formattedTxs.map(t => t.hash));
+          // Keep pending TXs whose hash is NOT in the confirmed set (still in mempool)
+          const stillPending = prev.filter(t => t.status === 'pending' && !confirmedHashes.has(t.hash));
+          // Pending TXs on top, then confirmed from blockchain
+          return [...stillPending, ...formattedTxs];
+        });
       }
     } catch (e) {
       // API error - keep existing history
@@ -4692,7 +4838,11 @@ const WalletScreen = () => {
                           {tx.type === 'send' ? 'Sent' : 'Received'}
                         </Text>
                         <Text style={{ color: '#666', fontSize: 12 }}>
-                          {tx.status === 'pending' ? '⏳ Pending...' : new Date(tx.timestamp).toLocaleString()}
+                          {tx.status === 'pending' 
+                            ? '⏳ Pending...' 
+                            : (!tx.timestamp || tx.timestamp === 0 || tx.timestamp < 1000000)
+                              ? 'Genesis'
+                              : new Date(tx.timestamp).toLocaleString()}
                         </Text>
                       </View>
                     </View>
@@ -4768,61 +4918,17 @@ const WalletScreen = () => {
           >
             <Text style={styles.tabTitle}>Node Monitoring</Text>
             
-            {/* Show server node found via wallet lookup (1 wallet = 1 node rule) */}
-            {/* This shows when user has a Full/Super node on server linked to this wallet */}
-            {allUserNodes.length > 0 && allUserNodes[0] && !activatedNodeType && (
-              <View style={[styles.nodeMonitoringCard, {marginBottom: 16}]}>
-                <View style={{
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                }}>
-                  <View style={{flex: 1}}>
-                    <Text style={styles.nodeMonitoringValue}>
-                      {allUserNodes[0].node_type?.charAt(0).toUpperCase() + allUserNodes[0].node_type?.slice(1)} Node
-                    </Text>
-                    <Text style={[styles.nodeMonitoringLabel, {fontSize: 11, marginTop: 4}]}>
-                      {allUserNodes[0].node_id || 'Pending activation'}
-                    </Text>
-                  </View>
-                  <View style={{alignItems: 'flex-end'}}>
-                    <Text style={[styles.statusBadgeText, {
-                      color: allUserNodes[0].status === 'active' ? '#34c759' : '#ff9500'
-                    }]}>
-                      {allUserNodes[0].status === 'active' ? 'ONLINE' : 'PENDING'}
-                    </Text>
-                    {allUserNodes[0].pending_rewards > 0 && (
-                      <Text style={[styles.nodeMonitoringLabel, {color: '#ffd700', fontSize: 11, marginTop: 4}]}>
-                        {(allUserNodes[0].pending_rewards / 1e9).toFixed(2)} QNC pending
-                      </Text>
-                    )}
-                  </View>
-                </View>
-                
-                {/* Auto-link button for server nodes */}
-                {allUserNodes[0].node_type !== 'light' && allUserNodes[0].status === 'active' && (
-                  <TouchableOpacity 
-                    style={[styles.button, styles.primaryButton, {marginTop: 16}]}
-                    onPress={async () => {
-                      // Auto-link this server node to the app
-                      const node = allUserNodes[0];
-                      setActivatedNodeType(node.node_type);
-                      setNodePseudonym(node.node_id);
-                      // Load full status
-                      loadServerNodeStatus();
-                      showAlert('Node Linked', `Your ${node.node_type} node is now linked to this app.`);
-                    }}
-                  >
-                    <Text style={styles.buttonText}>Link This Node</Text>
-                  </TouchableOpacity>
-                )}
+            {/* Loading state - shown while initializing (prevents flash of "Get Activation Code") */}
+            {(nodeInitializing || loadingAllNodes) && !activatedNodeType && (
+              <View style={[styles.nodeMonitoringCard, {marginBottom: 16, alignItems: 'center', paddingVertical: 32}]}>
+                <Text style={[styles.nodeMonitoringLabel, {color: '#00d4ff', fontSize: 14}]}>
+                  Loading node data...
+                </Text>
               </View>
             )}
             
-            {/* Loading indicator - hidden, runs silently in background */}
-            
-            {/* No node yet - show how to activate */}
-            {!loadingAllNodes && allUserNodes.length === 0 && !activatedNodeType && (
+            {/* No node yet - show how to activate (only after loading completes) */}
+            {!nodeInitializing && !loadingAllNodes && allUserNodes.length === 0 && !activatedNodeType && (
               <View style={[styles.nodeMonitoringCard, {marginBottom: 16}]}>
                 <Text style={[styles.nodeMonitoringLabel, {marginBottom: 8}]}>
                   No Node Active
@@ -4968,8 +5074,8 @@ const WalletScreen = () => {
                     )
                   ) : (
                     <>
-                      {/* Server Node Status from Network - Status shown in badge, no need for separate notice */}
-                      {!serverNodeStatus?.success && (
+                      {/* Server Node Status - only show activation notice for truly unlinked nodes */}
+                      {!serverNodeStatus?.success && !nodePseudonym && (
                         <View style={styles.serverActivationNotice}>
                           <Text style={styles.serverActivationText}>
                             Super nodes require server activation

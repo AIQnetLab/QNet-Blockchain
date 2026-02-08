@@ -21,7 +21,7 @@ mod python_bindings;
 
 pub use account::{Account, AccountState, NodeType};
 pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock, StoredMicroBlock, PoHState, storage_version, SlashingEventData, AutomaticJailData, EligibleProducer, RewardHeartbeat, HeartbeatSummary, ExcludedProducerEntry};
-pub use transaction::{Transaction, TransactionReceipt, TransactionType, gas_limits, PingSampleData, HeartbeatSampleData, ShardHeartbeatSummary};
+pub use transaction::{Transaction, TransactionReceipt, TransactionType, gas_limits, PingSampleData, HeartbeatSampleData, ShardHeartbeatSummary, GAS_METERING_ACTIVATION_HEIGHT, MAX_CONTRACT_STORAGE_ENTRIES, DynamicGasPricing, init_dynamic_gas_pricing, update_dynamic_gas_pricing, get_dynamic_gas_pricing};
 pub use state_db::StateDB;
 pub use state_manager::StateManager;
 pub use errors::{StateError, StateResult};

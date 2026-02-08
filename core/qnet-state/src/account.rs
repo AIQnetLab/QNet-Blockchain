@@ -28,6 +28,17 @@ pub struct Account {
     // CRITICAL: #[serde(default)] is MANDATORY for backward compatibility with old blocks!
     #[serde(default)]
     pub pending_rewards: u64,
+
+    // v3.35: Smart contract support -- store contract code hash and metadata
+    // is_contract = true when account is a deployed contract
+    // contract_code_hash: SHA3-256 of deployed WASM bytecode (stored in storage separately)
+    // contract_storage: key-value storage for contract state
+    #[serde(default)]
+    pub is_contract: bool,
+    #[serde(default)]
+    pub contract_code_hash: Option<String>,
+    #[serde(default)]
+    pub contract_storage: HashMap<String, String>,
 }
 
 /// Account state (alias for compatibility)
@@ -76,16 +87,19 @@ impl Default for AccountState {
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
-            pending_rewards: 0, // v2.96: Initialize pending rewards to 0
+            pending_rewards: 0,
+            is_contract: false,
+            contract_code_hash: None,
+            contract_storage: HashMap::new(),
         }
     }
 }
 
 impl AccountState {
     
-    /// Check if account is a contract
-    pub fn is_contract(&self) -> bool {
-        self.node_type.is_some()
+    /// Check if account is a smart contract (has deployed code)
+    pub fn is_smart_contract(&self) -> bool {
+        self.is_contract && self.contract_code_hash.is_some()
     }
     
     /// Check if account is a node
@@ -141,7 +155,10 @@ impl Account {
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
-            pending_rewards: 0, // v2.96: Initialize pending rewards to 0
+            pending_rewards: 0,
+            is_contract: false,
+            contract_code_hash: None,
+            contract_storage: HashMap::new(),
         }
     }
     
@@ -157,7 +174,10 @@ impl Account {
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
-            pending_rewards: 0, // v2.96: Initialize pending rewards to 0
+            pending_rewards: 0,
+            is_contract: false,
+            contract_code_hash: None,
+            contract_storage: HashMap::new(),
         }
     }
     
