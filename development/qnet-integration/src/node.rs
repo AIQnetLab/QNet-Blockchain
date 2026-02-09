@@ -22534,7 +22534,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// │ ContractCall        │ contract_call:{from}:{contract}:{method}:{nonce}          │ User (dApp)  │
     /// │ HeartbeatCommitment │ {from}|{to}|{amount}|{nonce}|{gas_price}|{gas}|{ts}      │ Node (hybrid)│
     /// │ PingCommitment      │ {from}|{to}|{amount}|{nonce}|{gas_price}|{gas}|{ts}      │ Node (hybrid)│
-    /// │ RewardDistribution  │ (SKIPPED in batch verify — auto-valid)                   │ System       │
+    /// │ RewardDistribution  │ claim_rewards:{node_id}:{wallet} (system_rewards_pool)   │ Client Ed25519│
+    /// │ RewardDistribution  │ (SKIPPED in batch verify — emission/unsigned)             │ System       │
     /// │ NodeRegistration    │ (SKIPPED in batch verify — unsigned system TX)            │ System       │
     /// │ LightNodeBitmap     │ (SKIPPED in batch verify — unsigned system TX)            │ System       │
     /// └─────────────────────┴──────────────────────────────────────────────────────────┴──────────────┘
@@ -22598,6 +22599,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     String::new()
                 };
                 format!("contract_call:{}:{}:{}:{}", tx.from, contract, method, tx.nonce)
+            }
+            
+            // === REWARD CLAIM (signed by client with Ed25519) ===
+            // matches rpc.rs:7406 — client signs "claim_rewards:{node_id}:{wallet_address}"
+            // node_id is extracted from tx.data: "reward_claim:{node_id}:{amount}:..."
+            // CRITICAL FIX v3.42: Without this, gossip nodes reject claim TXs because
+            // the default pipe-format doesn't match the signed message, causing ~6min delays
+            qnet_state::TransactionType::RewardDistribution if tx.from == "system_rewards_pool" => {
+                let node_id = tx.data.as_ref()
+                    .and_then(|d| d.strip_prefix("reward_claim:"))
+                    .and_then(|rest| rest.split(':').next())
+                    .unwrap_or("");
+                format!("claim_rewards:{}:{}", node_id, to_str)
             }
             
             // === NODE-SIGNED SYSTEM TRANSACTIONS (signed with ephemeral Ed25519 + Dilithium) ===

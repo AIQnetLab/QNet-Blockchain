@@ -37,14 +37,20 @@ export interface AddressData {
 }
 
 // Format amount from nanoQNC to QNC
-function formatAmount(amount: number): string {
-  if (!amount) return '0.00 QNC';
-  const qnc = amount / 1e9;
-  // v3.0: Show FULL numbers with thousand separators (like Etherscan)
-  return qnc.toLocaleString('en-US', { 
-    minimumFractionDigits: 2, 
-    maximumFractionDigits: 2 
-  }) + ' QNC';
+// v3.52: Full precision, no zero-padding — 1,234.56 not 1,234.56000
+function formatAmount(amount: number | string): string {
+  const numAmount = Number(amount);
+  if (!numAmount || !Number.isFinite(numAmount)) return '0 QNC';
+  const qnc = numAmount / 1e9;
+  
+  // Up to 9 decimals (nanoQNC precision), trim trailing zeros
+  const fixed = qnc.toFixed(9);
+  const trimmed = fixed.replace(/\.?0+$/, '');
+  
+  // Add thousand separators to integer part
+  const [intPart, decPart] = trimmed.split('.');
+  const intFormatted = Number(intPart).toLocaleString('en-US');
+  return decPart ? intFormatted + '.' + decPart + ' QNC' : intFormatted + ' QNC';
 }
 
 // Map transaction type to display string
@@ -118,33 +124,50 @@ export async function GET(
   }
   
   try {
-    // Fetch transactions from PostgreSQL
-    const { transactions, total } = await getTransactionsByAddress(address, 1, 100);
+    // v3.50: Fetch REAL balance from node API (single source of truth)
+    // Previous approach: calculating balance from TX history was WRONG because:
+    // 1. PostgreSQL BIGINT → JS string → "balance += string" = string concatenation → -Infinity
+    // 2. Failed TXs (e.g. duplicate reward claims) are in blocks but didn't change state
+    // 3. Gas fees not accounted for properly
+    // NOW: Use node API for balance, PostgreSQL only for TX history
+    const NODE_API = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
+    const API_KEY = process.env.QNET_API_KEY || '';
+    const nodeHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (API_KEY) nodeHeaders['X-API-Key'] = API_KEY;
     
-    // Calculate balance, first seen, last active from transactions
+    // Parallel: fetch balance from node + TX history from PostgreSQL
+    const [accountResponse, txResult] = await Promise.all([
+      fetch(`${NODE_API}/api/v1/account/${address}`, {
+        headers: nodeHeaders,
+        signal: AbortSignal.timeout(10000),
+      }).then(r => r.ok ? r.json() : null).catch(() => null),
+      getTransactionsByAddress(address, 1, 100),
+    ]);
+    
+    const { transactions, total } = txResult;
+    
+    // Balance from node (nanoQNC) — authoritative source
     let balance = 0;
+    if (accountResponse && typeof accountResponse.balance === 'number') {
+      balance = accountResponse.balance;
+    } else if (accountResponse && accountResponse.balance) {
+      balance = Number(accountResponse.balance) || 0;
+    }
+    
+    // Calculate first seen, last active from transactions
     let firstSeen = 0;
     let lastActive = 0;
     
     if (transactions.length > 0) {
-      // Calculate balance (simplified: sum of received - sum of sent)
       for (const tx of transactions) {
-        if (tx.to_address === address) {
-          balance += tx.amount;
-        } else if (tx.from_address === address) {
-          balance -= tx.amount;
-        }
-        
         // Track timestamps (handle both seconds and milliseconds)
-        // Convert to milliseconds for comparison if needed
-        let txTsMs = tx.timestamp;
+        let txTsMs = Number(tx.timestamp) || 0;
         if (txTsMs > 0 && txTsMs < 1e12) {
           txTsMs = txTsMs * 1000; // Convert seconds to milliseconds
         }
         
         // Only use valid timestamps (after 2000-01-01)
-        if (txTsMs > 946684800000) { // After 2000-01-01 in milliseconds
-          // Use milliseconds format for firstSeen and lastActive
+        if (txTsMs > 946684800000) {
           if (firstSeen === 0 || txTsMs < firstSeen) {
             firstSeen = txTsMs;
           }
@@ -161,10 +184,10 @@ export async function GET(
       type: mapTxType(tx.tx_type, tx.from_address),
       from: tx.from_address,
       to: tx.to_address || 'N/A',
-      amount: formatAmount(tx.amount),
+      amount: formatAmount(Number(tx.amount) || 0),
       // Convert timestamp to milliseconds if needed, and ensure it's valid
       timestamp: (() => {
-        let ts = tx.timestamp;
+        let ts = Number(tx.timestamp) || 0;
         if (ts > 0 && ts < 1e12) {
           ts = ts * 1000; // Convert seconds to milliseconds
         }
@@ -177,13 +200,13 @@ export async function GET(
     
     return NextResponse.json({
       success: true,
-      source: 'postgresql',
+      source: 'node+postgresql',
       data: {
         address,
         balance: formatAmount(balance),
         txCount: total,
-        firstSeen: firstSeen, // Already validated in loop (after 2000-01-01 in ms)
-        lastActive: lastActive, // Already validated in loop (after 2000-01-01 in ms)
+        firstSeen: firstSeen,
+        lastActive: lastActive,
         tokens: [],
         transactions: txData,
       },

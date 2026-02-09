@@ -41,17 +41,19 @@ function mapTxType(type: string | object | undefined, fromAddress?: string): str
 }
 
 // Format amount from nanoQNC to QNC (ALWAYS divide by 1e9)
+// v3.52: Full precision, no zero-padding
 function formatAmount(amount: number | string | undefined): string {
   if (!amount) return '0 QNC';
   const num = typeof amount === 'string' ? parseFloat(amount) : amount;
-  if (num === 0) return '0 QNC';
-  // ALWAYS convert from nanoQNC to QNC (1 QNC = 1,000,000,000 nanoQNC)
+  if (num === 0 || !Number.isFinite(num)) return '0 QNC';
   const qnc = num / 1e9;
-  if (qnc < 0.000001) {
-    // Very small amounts - show in scientific notation or nanoQNC
-    return qnc.toExponential(2) + ' QNC';
-  }
-  return qnc.toLocaleString('en-US', { maximumFractionDigits: 9 }) + ' QNC';
+  
+  const fixed = qnc.toFixed(9);
+  const trimmed = fixed.replace(/\.?0+$/, '');
+  
+  const [intPart, decPart] = trimmed.split('.');
+  const intFormatted = Number(intPart).toLocaleString('en-US');
+  return decPart ? intFormatted + '.' + decPart + ' QNC' : intFormatted + ' QNC';
 }
 
 // Validate and sanitize NODE_RPC_URL to prevent SSRF

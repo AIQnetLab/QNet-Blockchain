@@ -35,20 +35,22 @@ const truncate = (str: string, start = 8, end = 6): string => {
   return `${str.slice(0, start)}...${str.slice(-end)}`;
 };
 
-// Format timestamp (same logic as blocks page)
+// Format timestamp → dd.mm.yyyy, HH:MM:SS
 const formatTime = (ts: number | string | undefined): string => {
-  // Ensure ts is a valid number (PostgreSQL BIGINT may come as string)
   const timestamp = Number(ts);
   if (!timestamp || !Number.isFinite(timestamp) || timestamp <= 0) {
     return 'Genesis Transaction';
   }
-  // Convert to milliseconds if in seconds
   const ms = timestamp > 1e12 ? timestamp : timestamp * 1000;
   const date = new Date(ms);
-  if (isNaN(date.getTime())) {
-    return 'Invalid Date';
-  }
-  return date.toUTCString();
+  if (isNaN(date.getTime())) return 'Invalid Date';
+  const dd = String(date.getDate()).padStart(2, '0');
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const yyyy = date.getFullYear();
+  const hh = String(date.getHours()).padStart(2, '0');
+  const min = String(date.getMinutes()).padStart(2, '0');
+  const ss = String(date.getSeconds()).padStart(2, '0');
+  return `${dd}.${mm}.${yyyy}, ${hh}:${min}:${ss}`;
 };
 
 // Copy button

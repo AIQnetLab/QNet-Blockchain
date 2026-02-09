@@ -928,6 +928,14 @@ impl StateManager {
         // Single Merkle finalization for entire block
         self.finalize_merkle();
         
+        // v3.50: Update chain_state.height so balance proofs return correct block_height
+        if block_height > 0 {
+            let mut chain_state = self.chain_state.write();
+            if block_height > chain_state.height {
+                chain_state.height = block_height;
+            }
+        }
+        
         if tx_count > 100 || failed > 0 {
             println!("[INFO][STATE] block_batch applied={}/{} failed={}", applied, tx_count, failed);
         }
@@ -1009,6 +1017,14 @@ impl StateManager {
         
         // 3. Single Merkle finalization (includes producer balance!)
         let state_root = self.finalize_merkle();
+        
+        // v3.50: Update chain_state.height so balance proofs return correct block_height
+        if block_height > 0 {
+            let mut chain_state = self.chain_state.write();
+            if block_height > chain_state.height {
+                chain_state.height = block_height;
+            }
+        }
         
         if transactions.len() > 10 || fees_collected > 0 {
             println!("[INF][STATE] block_with_fees applied={}/{} fees={} producer={}",
@@ -1167,6 +1183,14 @@ impl StateManager {
                 hex::encode(&expected_state_root[..8]),
                 hex::encode(&computed_root[..8])
             )));
+        }
+        
+        // v3.50: Update chain_state.height so balance proofs return correct block_height
+        {
+            let mut chain_state = self.chain_state.write();
+            if block_height > chain_state.height {
+                chain_state.height = block_height;
+            }
         }
         
         if block_height == 0 || tx_count > 100 || failed > 0 {

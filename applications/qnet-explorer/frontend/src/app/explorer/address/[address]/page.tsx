@@ -69,7 +69,7 @@ const BalanceVerification = ({ address }: { address: string }) => {
           balance: data.balance || 0,
           blockHeight: data.blockHeight || 0,
           stateRoot: data.stateRoot || '',
-          proofSize: data.proofSize || 0,
+          proofSize: data.nodesAgreed || data.proofSize || 0,
           verificationTime: Math.round(performance.now() - startTime),
         });
       } else {
@@ -116,7 +116,7 @@ const BalanceVerification = ({ address }: { address: string }) => {
                 <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
                 <polyline points="22 4 12 14.01 9 11.01"/>
               </svg>
-              Verified (Merkle Proof)
+              Verified (Multi-Node Consensus)
             </>
           ) : (
             <>
@@ -157,8 +157,8 @@ const BalanceVerification = ({ address }: { address: string }) => {
                 <span className="detail-value mono">{result.stateRoot.slice(0, 16)}...</span>
               </div>
               <div className="detail-row">
-                <span className="detail-label">Proof Size</span>
-                <span className="detail-value">{result.proofSize} nodes</span>
+                <span className="detail-label">Nodes Agreed</span>
+                <span className="detail-value">{result.proofSize} / 5 nodes</span>
               </div>
               <div className="detail-row">
                 <span className="detail-label">Verification Time</span>
@@ -167,7 +167,7 @@ const BalanceVerification = ({ address }: { address: string }) => {
             </>
           )}
           <div className="verification-note">
-            Merkle proof verification ensures your balance is authentic without trusting any single node.
+            Multi-node consensus verification ensures your balance is authentic without trusting any single node.
           </div>
         </div>
       )}
@@ -213,36 +213,24 @@ const formatTimeAgo = (timestamp: number): string => {
   return `${days}d ago`;
 };
 
-// Format date (handle both seconds and milliseconds)
+// Format date → dd.mm.yyyy, HH:MM:SS (handle both seconds and milliseconds)
 const formatDate = (timestamp: number | string | undefined): string => {
-  // Convert to number if string
   const tsNum = typeof timestamp === 'string' ? Number(timestamp) : timestamp;
-  
   if (!tsNum || tsNum === 0 || !Number.isFinite(tsNum)) return 'N/A';
   
-  // Convert to milliseconds if needed
-  let msTs: number;
-  if (tsNum < 1e12) {
-    msTs = tsNum * 1000;
-  } else {
-    msTs = tsNum;
-  }
-  
-  // Validate timestamp (must be after 2000-01-01)
-  if (msTs < 946684800000) { // Before 2000-01-01
-    return 'N/A';
-  }
+  const msTs = tsNum < 1e12 ? tsNum * 1000 : tsNum;
+  if (msTs < 946684800000) return 'N/A';
   
   try {
     const date = new Date(msTs);
-    if (isNaN(date.getTime())) {
-      return 'N/A';
-    }
-    return date.toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-    });
+    if (isNaN(date.getTime())) return 'N/A';
+    const dd = String(date.getDate()).padStart(2, '0');
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    const yyyy = date.getFullYear();
+    const hh = String(date.getHours()).padStart(2, '0');
+    const min = String(date.getMinutes()).padStart(2, '0');
+    const ss = String(date.getSeconds()).padStart(2, '0');
+    return `${dd}.${mm}.${yyyy}, ${hh}:${min}:${ss}`;
   } catch {
     return 'N/A';
   }
@@ -284,7 +272,7 @@ export default function AddressPage() {
   const params = useParams();
   const address = params.address as string;
   
-  // v2.102: Sync cache read for instant display
+  // v3.52: Show cached data instantly, but ALWAYS fetch fresh data + auto-refresh
   const cachedData = address ? getCache<AddressData>('address', address) : null;
   
   const [data, setData] = useState<AddressData | null>(cachedData);
@@ -293,36 +281,41 @@ export default function AddressPage() {
   const [txPage, setTxPage] = useState(1);
   const TX_PER_PAGE = 10;
   
+  // v3.52: Reusable fetch — used on mount + polling interval
+  const fetchAddress = useCallback(async () => {
+    if (!address) return;
+    try {
+      const res = await fetch(`/api/address/${address}`);
+      const result = await res.json();
+      
+      if (result.success && result.data) {
+        setData(result.data);
+        setCache('address', address, result.data);
+        setError(null);
+      } else {
+        // Only set error on first load, don't wipe data on poll failure
+        if (!data) setError(result.error || 'Address not found');
+      }
+    } catch {
+      if (!data) setError('Failed to load address');
+    } finally {
+      setHasFetched(true);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [address]);
+  
+  // v3.52: Initial fetch — ALWAYS fetch fresh data (cache is only for instant display)
+  useEffect(() => {
+    fetchAddress();
+  }, [fetchAddress]);
+  
+  // v3.52: Auto-refresh every 5 seconds (like main explorer page)
+  // Ensures new transactions appear within 5s of block inclusion
   useEffect(() => {
     if (!address) return;
-    
-    // If we have fresh cache, skip fetch
-    if (cachedData && !isCacheStale('address', address)) {
-      setHasFetched(true);
-      return;
-    }
-    
-    const fetchAddress = async () => {
-      try {
-        const res = await fetch(`/api/address/${address}`);
-        const result = await res.json();
-        
-        if (result.success && result.data) {
-          setData(result.data);
-          setCache('address', address, result.data);
-          setError(null);
-        } else {
-          setError(result.error || 'Address not found');
-        }
-      } catch {
-        setError('Failed to load address');
-      } finally {
-        setHasFetched(true);
-      }
-    };
-    
-    fetchAddress();
-  }, [address, cachedData]);
+    const interval = setInterval(fetchAddress, 5000);
+    return () => clearInterval(interval);
+  }, [address, fetchAddress]);
   
   // Show error ONLY after fetch attempt
   if (hasFetched && (error || !data)) {
@@ -357,8 +350,9 @@ export default function AddressPage() {
         <div className="balance-display">
           <div className="main-balance">{data.balance}</div>
         </div>
-        {/* v3.11: Merkle proof verification */}
+        {/* v3.11: Merkle proof verification — temporarily hidden
         <BalanceVerification address={address} />
+        */}
       </div>
 
       {/* Other Tokens (collapsible) */}

@@ -68,8 +68,9 @@ function getNodeWsUrl(): string {
 
 const NODE_RPC_URL = getNodeRpcUrl();
 const NODE_WS_URL = getNodeWsUrl();
-const SYNC_INTERVAL = 30000; // Fallback polling: 30 seconds (less aggressive)
+const SYNC_INTERVAL = 5000; // v3.35: Fallback polling: 5 seconds (was 30s — too slow for user-facing TX)
 const INTEGRITY_CHECK_INTERVAL = 600000; // 10 minutes
+const RECOVERY_INTERVAL = 300000; // 5 minutes — periodic scan for missing TXs
 const WS_RECONNECT_DELAY_BASE = 1000; // Initial reconnect delay: 1 second
 const WS_RECONNECT_DELAY_MAX = 60000; // Max reconnect delay: 60 seconds
 
@@ -209,7 +210,28 @@ interface TransactionFromNode {
 // Map transaction type to string
 function mapTxType(type: string | object | undefined): string {
   if (!type) return 'Transfer';
-  if (typeof type === 'string') return type;
+  if (typeof type === 'string') {
+    // Handle Rust Debug format: "Transfer { from: \"...\", to: \"...\", amount: 123 }"
+    // Extract just the type name before the opening brace
+    const braceIdx = type.indexOf(' {');
+    if (braceIdx > 0) {
+      const typeName = type.substring(0, braceIdx).trim();
+      if (typeName.length > 0 && typeName.length <= 50) return typeName;
+    }
+    // Handle plain JSON object strings like '{"Transfer":{}}'
+    if (type.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(type);
+        if (typeof parsed === 'object' && parsed !== null) {
+          const keys = Object.keys(parsed);
+          return keys[0] || 'Transfer';
+        }
+      } catch { /* not JSON, use as-is */ }
+    }
+    // Plain type name — truncate if somehow too long
+    if (type.length > 50) return type.substring(0, 50);
+    return type;
+  }
   const keys = Object.keys(type as object);
   return keys[0] || 'Transfer';
 }
@@ -231,11 +253,12 @@ function transformTransaction(
     return null;
   }
 
-  let rawTs = Number(tx.timestamp) || 0;
-  if (rawTs === 0) rawTs = blockTimestamp;
+  // Use tx.timestamp (client-set) for display — closer to "when user sent it"
+  // Fallback to blockTimestamp if tx.timestamp is missing
+  let rawTs = Number(tx.timestamp) || blockTimestamp || 0;
   if (!Number.isFinite(rawTs) || rawTs < 0) {
-    warn('[Sync] Invalid timestamp, using block timestamp:', rawTs);
-    rawTs = blockTimestamp;
+    warn('[Sync] Invalid timestamp, fallback to 0:', rawTs);
+    rawTs = 0;
   }
   const timestamp = rawTs > 1e12 ? rawTs : rawTs * 1000;
 
@@ -495,6 +518,7 @@ async function processSingleBlock(height: number): Promise<number> {
   }
 
   // Batch insert transactions
+  let insertedOk = false;
   if (uniqueTransactions.length > 0) {
     const MAX_BATCH_SIZE = 1000;
     for (let i = 0; i < uniqueTransactions.length; i += MAX_BATCH_SIZE) {
@@ -520,8 +544,11 @@ async function processSingleBlock(height: number): Promise<number> {
           status: tx.status,
           is_quantum_signed: tx.is_quantum_signed
         })));
+        insertedOk = true;
       } catch (err) {
-        error(`[Sync] Failed to insert batch:`, err);
+        error(`[Sync] Failed to insert batch for block ${height}:`, err);
+        // Return 0 so retry mechanism picks this up
+        return 0;
       }
     }
   }
@@ -529,7 +556,7 @@ async function processSingleBlock(height: number): Promise<number> {
   // Update sync state
   await updateSyncState(height);
 
-  return uniqueTransactions.length;
+  return insertedOk ? uniqueTransactions.length : 0;
 }
 
 // Sync blocks using polling (fallback mode - ONLY when WebSocket is down)
@@ -936,10 +963,96 @@ async function processBlocksParallel(heights: number[]): Promise<number> {
   return totalTx;
 }
 
+// Recover missing transactions by scanning recent blocks from the NODE (not blocks table)
+// Uses parallel scanning (like backfill) for speed
+// scanDepth: 5000 at startup (full recovery), 500 for periodic checks (fast)
+async function recoverMissingTransactions(scanDepth: number = 5000): Promise<void> {
+  try {
+    const syncState = await getSyncState();
+    const lastHeight = Number(syncState?.last_height) || 0;
+    if (lastHeight <= 0) return;
+
+    const SCAN_RANGE = scanDepth;
+    const fromHeight = Math.max(1, lastHeight - SCAN_RANGE);
+    const BATCH_SIZE = 20;
+    const PARALLEL = 10; // 10 parallel RPC streams
+    let recovered = 0;
+    let blocksWithMissingTx: number[] = [];
+
+    console.log(`[Recovery] Scanning blocks ${fromHeight}→${lastHeight} for missing TXs (parallel)...`);
+
+    // Phase 1: Parallel scan — find blocks with TXs that are missing from DB
+    for (let h = fromHeight; h <= lastHeight; h += BATCH_SIZE * PARALLEL) {
+      const promises: Promise<number[]>[] = [];
+
+      for (let p = 0; p < PARALLEL; p++) {
+        const batchStart = h + p * BATCH_SIZE;
+        if (batchStart > lastHeight) break;
+        const batchLimit = Math.min(BATCH_SIZE, lastHeight - batchStart + 1);
+
+        promises.push(
+          (async () => {
+            const missing: number[] = [];
+            try {
+              const blocks = await fetchBlocksViaHttpRpc(batchStart, batchLimit);
+              for (const block of blocks) {
+                const txs = Array.isArray(block.transactions) ? block.transactions : [];
+                if (txs.length === 0) continue;
+                const height = (block.height as number) ?? batchStart;
+                const result = await query<{ cnt: string }>(
+                  'SELECT COUNT(*) AS cnt FROM transactions WHERE block = $1',
+                  [height]
+                );
+                const actualCount = Number(result.rows[0]?.cnt) || 0;
+                if (actualCount < txs.length) {
+                  missing.push(height);
+                }
+              }
+            } catch { /* skip failed batch */ }
+            return missing;
+          })()
+        );
+      }
+
+      const results = await Promise.all(promises);
+      for (const missing of results) {
+        blocksWithMissingTx.push(...missing);
+      }
+    }
+
+    if (blocksWithMissingTx.length === 0) {
+      console.log(`[Recovery] All blocks have complete TX data`);
+      return;
+    }
+
+    // Phase 2: Re-process blocks with missing TXs
+    console.log(`[Recovery] Found ${blocksWithMissingTx.length} blocks with missing TXs: ${blocksWithMissingTx.join(', ')}`);
+
+    for (const height of blocksWithMissingTx) {
+      try {
+        const added = await processSingleBlock(height);
+        if (added > 0) {
+          recovered += added;
+          console.log(`[Recovery] Block ${height}: recovered ${added} TX`);
+        }
+      } catch (err) {
+        console.error(`[Recovery] Block ${height} failed:`, err);
+      }
+    }
+
+    console.log(`[Recovery] Done — recovered ${recovered} TXs from ${blocksWithMissingTx.length} blocks`);
+  } catch (err) {
+    console.error('[Recovery] Error during missing TX recovery:', err);
+  }
+}
+
 // Initial sync: delegates to runCatchupSync which handles everything
 async function runInitialSync(): Promise<void> {
   console.log('[Sync] Initial sync → delegating to catchup...');
   await runCatchupSync();
+
+  // After catchup, recover any TXs that were lost due to previous validation bugs
+  await recoverMissingTransactions();
 }
 
 // Verify data integrity
@@ -1061,12 +1174,125 @@ async function verifyDataIntegrity(): Promise<void> {
 
 // ============================================================================
 // WEBSOCKET SYNC (PRIMARY MODE)
+// v3.53: PARALLEL block processing + retry for failed TX blocks
+// v3.52 used serialized queue which caused 2400+ block lag (reverted)
 // ============================================================================
 
 let wsConnection: WebSocket | null = null;
 let wsReconnectDelay = WS_RECONNECT_DELAY_BASE;
 let wsReconnectTimeout: NodeJS.Timeout | null = null;
 let isWsConnected = false;
+
+// v3.53: Retry queue for blocks with TX that failed to process
+// If HTTP fetch fails, the TX block is retried instead of silently lost
+const failedTxBlocks: Map<number, { txCount: number; retries: number; nextRetry: number }> = new Map();
+const MAX_TX_RETRIES = 10;
+const TX_RETRY_INTERVAL = 2000; // 2 seconds between retries
+let retryTimer: NodeJS.Timeout | null = null;
+
+// v3.53: PARALLEL block processing — each block handled independently
+// Empty blocks (99%+) complete in <100ms. TX blocks run in background.
+// CRITICAL FIX: The v3.52 serialized queue caused 2400+ block lag because
+// one TX block (HTTP fetch 2-30s) blocked ALL subsequent empty blocks.
+// With parallel processing, empty blocks are never blocked by TX fetches.
+async function handleNewBlockEvent(event: WsNewBlockEvent): Promise<void> {
+  const height = event.data.height;
+  const txCount = event.data.tx_count || 0;
+
+  // FAST PATH: empty blocks (99%+) — save metadata from WS event, NO HTTP!
+  if (txCount === 0) {
+    try {
+      const ts = event.data.timestamp > 1e12 ? event.data.timestamp : event.data.timestamp * 1000;
+      await insertBlock({
+        height,
+        hash: event.data.hash || `block_${height}`,
+        block_type: 'MICROBLOCK',
+        version: 1,
+        timestamp: ts,
+        previous_hash: null,
+        merkle_root: null,
+        state_root: null,
+        producer: event.data.producer || 'unknown',
+        producer_address: null,
+        tx_count: 0,
+        total_gas_used: 0,
+        poh_hash: null,
+        poh_count: 0,
+        signature_type: 'Dilithium3',
+        signature: null,
+        cert_serial: null,
+        qrb_output: null,
+        size_bytes: 0,
+        consensus_data: null,
+        micro_blocks: null,
+      });
+      await updateSyncState(height);
+    } catch (err: any) {
+      if (!err?.message?.includes('duplicate key')) {
+        error(`[WS] Block ${height} save error:`, err);
+      }
+    }
+    return;
+  }
+
+  // TX BLOCK: advance sync state first (so subsequent empty blocks aren't seen as gap)
+  // then fetch full block data in background — does NOT block WS handler
+  console.log(`[WS] Block ${height}: ${txCount} TX — background fetch`);
+  try { await updateSyncState(height); } catch { /* non-critical */ }
+
+  // Fire-and-forget: processSingleBlock runs in background
+  processSingleBlock(height).then(added => {
+    if (added > 0) {
+      console.log(`[WS] Block ${height}: saved ${added} TX ✓`);
+    } else {
+      console.error(`[WS] Block ${height}: FAILED to fetch ${txCount} TX — queued for retry`);
+      failedTxBlocks.set(height, { txCount, retries: 0, nextRetry: Date.now() + TX_RETRY_INTERVAL });
+      startRetryTimer();
+    }
+  }).catch(err => {
+    error(`[WS] Block ${height}: fetch error — queued for retry`, err);
+    failedTxBlocks.set(height, { txCount, retries: 0, nextRetry: Date.now() + TX_RETRY_INTERVAL });
+    startRetryTimer();
+  });
+}
+
+// v3.52: Retry failed TX blocks (runs every 3 seconds until queue is empty)
+function startRetryTimer(): void {
+  if (retryTimer) return;
+  retryTimer = setInterval(async () => {
+    if (failedTxBlocks.size === 0) {
+      if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
+      return;
+    }
+    
+    const now = Date.now();
+    for (const [height, info] of failedTxBlocks) {
+      if (now < info.nextRetry) continue;
+      
+      console.log(`[Retry] Block ${height}: attempt ${info.retries + 1}/${MAX_TX_RETRIES}`);
+      const added = await processSingleBlock(height);
+      
+      if (added > 0) {
+        console.log(`[Retry] Block ${height}: SUCCESS — saved ${added} TX`);
+        failedTxBlocks.delete(height);
+      } else {
+        info.retries++;
+        if (info.retries >= MAX_TX_RETRIES) {
+          console.error(`[Retry] Block ${height}: GAVE UP after ${MAX_TX_RETRIES} attempts`);
+          failedTxBlocks.delete(height);
+        } else {
+          // Exponential backoff: 3s, 6s, 12s, 24s, 48s
+          info.nextRetry = now + TX_RETRY_INTERVAL * Math.pow(2, info.retries);
+        }
+      }
+    }
+    
+    if (failedTxBlocks.size === 0 && retryTimer) {
+      clearInterval(retryTimer);
+      retryTimer = null;
+    }
+  }, TX_RETRY_INTERVAL);
+}
 
 function connectWebSocket(): void {
   if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
@@ -1092,73 +1318,19 @@ function connectWebSocket(): void {
       }
     });
 
-    wsConnection.on('message', async (data: WebSocket.Data) => {
+    // v3.53: PARALLEL processing — each block handled independently
+    // Empty blocks complete instantly, TX blocks run in background
+    // Fire-and-forget: handler is async but NOT awaited by WS event loop
+    wsConnection.on('message', (data: WebSocket.Data) => {
       try {
         const message = JSON.parse(data.toString());
-        
         if (message.type === 'NewBlock') {
-          const event = message as WsNewBlockEvent;
-          const height = event.data.height;
-          const txCount = event.data.tx_count || 0;
-          
-          // Check for gap
-          const syncState = await getSyncState();
-          const lastHeight = typeof syncState?.last_height === 'number' 
-            ? syncState.last_height 
-            : Number(syncState?.last_height) || -1;
-          
-          const gap = height - lastHeight - 1;
-          if (gap > 0) {
-            // Jump to live, backfill scans for TX blocks in background
-            await updateSyncState(height - 1);
-            if (gap > 20 && !isBackfillRunning) {
-              console.log(`[WS] Gap ${gap} blocks - backfill scan started`);
-              runBackfillScan(lastHeight + 1, height - 1).catch(() => {});
-            }
-          }
-          
-          // FAST PATH: empty blocks (99%+) - save metadata from WS event, NO HTTP!
-          if (txCount === 0) {
-            try {
-              const ts = event.data.timestamp > 1e12 ? event.data.timestamp : event.data.timestamp * 1000;
-              await insertBlock({
-                height,
-                hash: event.data.hash || `block_${height}`,
-                block_type: 'MICROBLOCK',
-                version: 1,
-                timestamp: ts,
-                previous_hash: null,
-                merkle_root: null,
-                state_root: null,
-                producer: event.data.producer || 'unknown',
-                producer_address: null,
-                tx_count: 0,
-                total_gas_used: 0,
-                poh_hash: null,
-                poh_count: 0,
-                signature_type: 'Dilithium3',
-                signature: null,
-                cert_serial: null,
-                qrb_output: null,
-                size_bytes: 0,
-                consensus_data: null,
-                micro_blocks: null,
-              });
-              await updateSyncState(height);
-            } catch (err: any) {
-              if (!err?.message?.includes('duplicate key')) {
-                error(`[WS] Block ${height} save error:`, err);
-              }
-            }
-          } else {
-            // Block has transactions - full HTTP fetch to get TX details
-            console.log(`[WS] Block ${height}: ${txCount} TX - full fetch`);
-            const added = await processSingleBlock(height);
-            if (added > 0) console.log(`[WS] Block ${height}: saved ${added} TX`);
-          }
+          handleNewBlockEvent(message as WsNewBlockEvent).catch(err =>
+            error('[WS] NewBlock handler error:', err)
+          );
         }
       } catch (err) {
-        error('[WS] Error processing message:', err);
+        error('[WS] Error parsing message:', err);
       }
     });
 
@@ -1218,6 +1390,7 @@ function disconnectWebSocket(): void {
 
 let syncInterval: NodeJS.Timeout | null = null;
 let integrityInterval: NodeJS.Timeout | null = null;
+let recoveryInterval: NodeJS.Timeout | null = null;
 let isSyncing = false;
 
 export function startSyncService(): void {
@@ -1229,7 +1402,7 @@ export function startSyncService(): void {
   
   // Initial sync: catch up with missing blocks (runs once at startup)
   console.log('[Sync] Running initial sync to catch up with missing blocks...');
-  runInitialSync();
+  runInitialSync().catch(err => console.error('[Sync] Initial sync/recovery FAILED:', err));
 
   // Fallback polling (runs if WebSocket is disconnected)
   syncInterval = setInterval(() => {
@@ -1266,7 +1439,16 @@ export function startSyncService(): void {
     });
   }, INTEGRITY_CHECK_INTERVAL);
 
-  console.log('[Sync] Sync service started');
+  // v3.56: Periodic recovery — scan last 500 blocks every 5 minutes
+  // Catches any blocks where fire-and-forget processSingleBlock failed
+  // AND the retry mechanism gave up (e.g., node was temporarily unreachable)
+  recoveryInterval = setInterval(() => {
+    recoverMissingTransactions(500).catch(err => {
+      error('[Recovery] Periodic recovery failed:', err);
+    });
+  }, RECOVERY_INTERVAL);
+
+  console.log('[Sync] Sync service started (with periodic recovery every 5min)');
 }
 
 export async function stopSyncService(): Promise<void> {
@@ -1274,6 +1456,13 @@ export async function stopSyncService(): Promise<void> {
   
   // Stop WebSocket
   disconnectWebSocket();
+  
+  // v3.52: Stop retry timer
+  if (retryTimer) {
+    clearInterval(retryTimer);
+    retryTimer = null;
+  }
+  failedTxBlocks.clear();
   
   // Stop intervals
   if (syncInterval) {
@@ -1283,6 +1472,10 @@ export async function stopSyncService(): Promise<void> {
   if (integrityInterval) {
     clearInterval(integrityInterval);
     integrityInterval = null;
+  }
+  if (recoveryInterval) {
+    clearInterval(recoveryInterval);
+    recoveryInterval = null;
   }
   
   // Wait for current sync to finish
@@ -1319,6 +1512,7 @@ export async function stopSyncService(): Promise<void> {
   
   console.log('[Sync] Sync service stopped');
 }
+
 
 export async function getSyncServiceStatus(): Promise<{
   isRunning: boolean;

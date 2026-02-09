@@ -313,39 +313,50 @@ export async function insertTransactionsBatch(transactions: Omit<TransactionRow,
 
   isBatchInserting = true;
 
-  // Validate all transactions before insert
+  // Validate transactions before insert — skip invalid ones instead of failing the entire batch
+  const validTransactions: typeof transactions = [];
   for (const tx of transactions) {
-    validateHash(tx.hash);
-    if (!tx.from_address || typeof tx.from_address !== 'string' || tx.from_address.length > 128) {
-      throw new Error(`Invalid from_address in transaction ${tx.hash.substring(0, 16)}`);
+    try {
+      validateHash(tx.hash);
+      if (!tx.from_address || typeof tx.from_address !== 'string' || tx.from_address.length > 128) {
+        throw new Error(`Invalid from_address in transaction ${tx.hash.substring(0, 16)}`);
+      }
+      if (tx.to_address && (typeof tx.to_address !== 'string' || tx.to_address.length > 128)) {
+        throw new Error(`Invalid to_address in transaction ${tx.hash.substring(0, 16)}`);
+      }
+      if (!Number.isInteger(tx.amount) || tx.amount < 0) {
+        throw new Error(`Invalid amount in transaction ${tx.hash.substring(0, 16)}`);
+      }
+      if (!Number.isInteger(tx.nonce) || tx.nonce < 0) {
+        throw new Error(`Invalid nonce in transaction ${tx.hash.substring(0, 16)}`);
+      }
+      if (!Number.isInteger(tx.block) || tx.block < 0) {
+        throw new Error(`Invalid block in transaction ${tx.hash.substring(0, 16)}`);
+      }
+      if (!Number.isInteger(tx.timestamp) || tx.timestamp < 0) {
+        throw new Error(`Invalid timestamp in transaction ${tx.hash.substring(0, 16)}`);
+      }
+      if (!Number.isInteger(tx.gas_price) || tx.gas_price < 0) {
+        throw new Error(`Invalid gas_price in transaction ${tx.hash.substring(0, 16)}`);
+      }
+      if (!Number.isInteger(tx.gas_limit) || tx.gas_limit < 0) {
+        throw new Error(`Invalid gas_limit in transaction ${tx.hash.substring(0, 16)}`);
+      }
+      if (!tx.tx_type || typeof tx.tx_type !== 'string' || tx.tx_type.length > 100) {
+        throw new Error(`Invalid tx_type '${String(tx.tx_type).substring(0, 40)}...' in transaction ${tx.hash.substring(0, 16)}`);
+      }
+      if (tx.data && (typeof tx.data !== 'string' || tx.data.length > 100000)) {
+        throw new Error(`Invalid data size in transaction ${tx.hash.substring(0, 16)}`);
+      }
+      validTransactions.push(tx);
+    } catch (validationErr) {
+      console.error(`[DB] Skipping invalid TX ${tx.hash?.substring(0, 16)}: ${validationErr}`);
     }
-    if (tx.to_address && (typeof tx.to_address !== 'string' || tx.to_address.length > 128)) {
-      throw new Error(`Invalid to_address in transaction ${tx.hash.substring(0, 16)}`);
-    }
-    if (!Number.isInteger(tx.amount) || tx.amount < 0) {
-      throw new Error(`Invalid amount in transaction ${tx.hash.substring(0, 16)}`);
-    }
-    if (!Number.isInteger(tx.nonce) || tx.nonce < 0) {
-      throw new Error(`Invalid nonce in transaction ${tx.hash.substring(0, 16)}`);
-    }
-    if (!Number.isInteger(tx.block) || tx.block < 0) {
-      throw new Error(`Invalid block in transaction ${tx.hash.substring(0, 16)}`);
-    }
-    if (!Number.isInteger(tx.timestamp) || tx.timestamp < 0) {
-      throw new Error(`Invalid timestamp in transaction ${tx.hash.substring(0, 16)}`);
-    }
-    if (!Number.isInteger(tx.gas_price) || tx.gas_price < 0) {
-      throw new Error(`Invalid gas_price in transaction ${tx.hash.substring(0, 16)}`);
-    }
-    if (!Number.isInteger(tx.gas_limit) || tx.gas_limit < 0) {
-      throw new Error(`Invalid gas_limit in transaction ${tx.hash.substring(0, 16)}`);
-    }
-    if (!tx.tx_type || typeof tx.tx_type !== 'string' || tx.tx_type.length > 100) {
-      throw new Error(`Invalid tx_type in transaction ${tx.hash.substring(0, 16)}`);
-    }
-    if (tx.data && (typeof tx.data !== 'string' || tx.data.length > 100000)) {
-      throw new Error(`Invalid data size in transaction ${tx.hash.substring(0, 16)}`);
-    }
+  }
+
+  if (validTransactions.length === 0) {
+    isBatchInserting = false;
+    return;
   }
 
   const db = getDbPool();
@@ -354,7 +365,7 @@ export async function insertTransactionsBatch(transactions: Omit<TransactionRow,
   try {
     await client.query('BEGIN');
 
-    for (const tx of transactions) {
+    for (const tx of validTransactions) {
       await client.query(
         `INSERT INTO transactions (
           hash, from_address, to_address, amount, nonce, block, timestamp,

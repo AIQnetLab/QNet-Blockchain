@@ -4842,7 +4842,16 @@ const WalletScreen = () => {
                             ? '⏳ Pending...' 
                             : (!tx.timestamp || tx.timestamp === 0 || tx.timestamp < 1000000)
                               ? 'Genesis'
-                              : new Date(tx.timestamp).toLocaleString()}
+                              : (() => {
+                                  const d = new Date(tx.timestamp);
+                                  const dd = String(d.getDate()).padStart(2, '0');
+                                  const mm = String(d.getMonth() + 1).padStart(2, '0');
+                                  const yyyy = d.getFullYear();
+                                  const HH = String(d.getHours()).padStart(2, '0');
+                                  const MM = String(d.getMinutes()).padStart(2, '0');
+                                  const SS = String(d.getSeconds()).padStart(2, '0');
+                                  return `${dd}.${mm}.${yyyy}, ${HH}:${MM}:${SS}`;
+                                })()}
                         </Text>
                       </View>
                     </View>
@@ -4852,7 +4861,7 @@ const WalletScreen = () => {
                         fontSize: 16, 
                         fontWeight: '600' 
                       }}>
-                        {tx.type === 'send' ? '-' : '+'}{tx.amount.toFixed(5)} QNC
+                        {tx.type === 'send' ? '-' : '+'}{tx.amount.toLocaleString('en-US', { minimumFractionDigits: 5, maximumFractionDigits: 9 })} QNC
                       </Text>
                       {tx.fee > 0 && (
                         <Text style={{ color: '#666', fontSize: 11 }}>

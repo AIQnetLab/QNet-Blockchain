@@ -10,15 +10,21 @@ const RATE_LIMIT_MAX = 100;
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 
 // Format amount from nanoQNC to QNC
-function formatAmount(amount: number): string {
-  if (!amount) return '0.00 QNC';
-  const qnc = amount / 1e9;
-  // v3.0: Show FULL numbers with thousand separators (like Etherscan)
-  // No K/M abbreviations - they confuse users
-  return qnc.toLocaleString('en-US', { 
-    minimumFractionDigits: 2, 
-    maximumFractionDigits: 2 
-  }) + ' QNC';
+// v3.52: Dynamic precision — never lose small amounts
+function formatAmount(amount: number | string): string {
+  const numAmount = Number(amount);
+  if (!numAmount || !Number.isFinite(numAmount)) return '0.00 QNC';
+  const qnc = numAmount / 1e9;
+  
+  if (qnc >= 0.01) {
+    return qnc.toLocaleString('en-US', { 
+      minimumFractionDigits: 2, 
+      maximumFractionDigits: 2 
+    }) + ' QNC';
+  }
+  
+  const full = qnc.toFixed(9).replace(/0+$/, '').replace(/\.$/, '');
+  return full + ' QNC';
 }
 
 // Map transaction type to display string
