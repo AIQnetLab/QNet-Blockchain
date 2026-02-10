@@ -2,8 +2,11 @@
 const nextConfig = {
   reactStrictMode: false,
   compiler: {
-    removeConsole: process.env.NODE_ENV === 'production',
+    // MUST keep all console methods - sync-service uses console.log for critical initialization
+    removeConsole: false,
   },
+  // Server-side packages that should not be bundled
+  serverExternalPackages: ['ws', 'pg'],
   images: {
     unoptimized: true,
     domains: [
