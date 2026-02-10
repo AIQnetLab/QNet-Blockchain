@@ -203,7 +203,16 @@ const OtherTokens = ({ tokens }: { tokens: Array<{ symbol: string; balance: stri
 
 // Format time ago
 const formatTimeAgo = (timestamp: number): string => {
-  const seconds = Math.floor((Date.now() - timestamp) / 1000);
+  if (!timestamp || timestamp === 0) return 'Genesis';
+  
+  // Handle both seconds and milliseconds timestamps
+  const ts = timestamp > 1e12 ? timestamp : timestamp * 1000;
+  
+  // If timestamp is before year 2024 (chain launch), treat as Genesis
+  if (ts < 1704067200000) return 'Genesis';
+  
+  const seconds = Math.floor((Date.now() - ts) / 1000);
+  if (seconds < 0) return 'just now';
   if (seconds < 60) return `${seconds}s ago`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m ago`;
@@ -216,10 +225,11 @@ const formatTimeAgo = (timestamp: number): string => {
 // Format date → dd.mm.yyyy, HH:MM:SS (handle both seconds and milliseconds)
 const formatDate = (timestamp: number | string | undefined): string => {
   const tsNum = typeof timestamp === 'string' ? Number(timestamp) : timestamp;
-  if (!tsNum || tsNum === 0 || !Number.isFinite(tsNum)) return 'N/A';
+  if (!tsNum || tsNum === 0 || !Number.isFinite(tsNum)) return 'Genesis';
   
   const msTs = tsNum < 1e12 ? tsNum * 1000 : tsNum;
-  if (msTs < 946684800000) return 'N/A';
+  // Before 2024 (chain launch) = Genesis
+  if (msTs < 1704067200000) return 'Genesis';
   
   try {
     const date = new Date(msTs);

@@ -6655,6 +6655,20 @@ impl SimplifiedP2P {
             }
         };
         
+        // CRITICAL FIX v2.105: Update producer's peer height from ShredProtocol certificate
+        // ShredProtocol is the PRIMARY block delivery mechanism, but previously set
+        // from_peer="shred_protocol" which never updated real peer heights.
+        // This caused network_height to freeze at initial sync values on nodes that
+        // did catchup sync (001, 005), while nodes without catchup (002, 003, 004)
+        // accidentally showed correct height via unwrap_or(local_height) fallback.
+        let producer_id = if let Some(ref cert) = assembly.certificate {
+            let pid = cert.node_id.clone();
+            self.update_peer_last_seen_with_height(&pid, Some(height));
+            pid
+        } else {
+            "shred_protocol".to_string()
+        };
+        
         // PRODUCTION v2.21.3: Cache chunks for retransmit before processing
         self.cache_chunks_for_retransmit(
             height,
@@ -6674,8 +6688,8 @@ impl SimplifiedP2P {
         
         let elapsed = assembly.started_at.elapsed();
         if height % 10 == 0 {
-            println!("[SHRED_PROTOCOL] ✅ Block #{} reconstructed from {} chunks in {:?}", 
-                     height, assembly.total_chunks, elapsed);
+            println!("[SHRED_PROTOCOL] ✅ Block #{} reconstructed from {} chunks in {:?} (producer: {})", 
+                     height, assembly.total_chunks, elapsed, producer_id);
         }
         
         // Send reconstructed block through normal block channel
@@ -6701,7 +6715,7 @@ impl SimplifiedP2P {
                 data: block_data,
                 // PRODUCTION: Use block type from chunk metadata (supports both micro and macro)
                 block_type,
-                from_peer: "shred_protocol".to_string(),
+                from_peer: producer_id,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -6723,6 +6737,17 @@ impl SimplifiedP2P {
         // Block already marked as processed in handle_shred_protocol_chunk
         // PRODUCTION: Real Reed-Solomon reconstruction
         if let Some((_, assembly)) = self.shred_protocol_assemblies.remove(&height) {
+            // CRITICAL FIX v2.105: Update producer's peer height from certificate
+            // Same fix as reconstruct_block_from_shred_protocol - ShredProtocol
+            // must update peer heights for correct network_height tracking
+            let producer_id = if let Some(ref cert) = assembly.certificate {
+                let pid = cert.node_id.clone();
+                self.update_peer_last_seen_with_height(&pid, Some(height));
+                pid
+            } else {
+                "shred_protocol-rs".to_string()
+            };
+            
             // PRODUCTION v2.21.3: Cache chunks for retransmit before processing
             self.cache_chunks_for_retransmit(
                 height,
@@ -6857,7 +6882,7 @@ impl SimplifiedP2P {
                     data: block_data,
                     // PRODUCTION: Use block type from chunk metadata (supports both micro and macro)
                     block_type,
-                    from_peer: "shred_protocol-rs".to_string(),
+                    from_peer: producer_id,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()

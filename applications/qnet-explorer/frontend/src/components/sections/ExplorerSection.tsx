@@ -5,7 +5,16 @@ import Link from 'next/link';
 
 // Helper function to format time ago
 const formatTimeAgo = (timestamp: number): string => {
-  const seconds = Math.floor((Date.now() - timestamp) / 1000);
+  if (!timestamp || timestamp === 0) return 'Genesis';
+  
+  // Handle both seconds and milliseconds timestamps
+  const ts = timestamp > 1e12 ? timestamp : timestamp * 1000;
+  
+  // If timestamp is before year 2024 (chain launch), treat as Genesis
+  if (ts < 1704067200000) return 'Genesis';
+  
+  const seconds = Math.floor((Date.now() - ts) / 1000);
+  if (seconds < 0) return 'just now';
   if (seconds < 60) return `${seconds} seconds ago`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes} minutes ago`;

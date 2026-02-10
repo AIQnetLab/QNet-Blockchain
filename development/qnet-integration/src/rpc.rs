@@ -4786,8 +4786,10 @@ async fn handle_node_health(
         validated_peers = validated.len();
         
         // API DEADLOCK FIX: Use cached height to avoid circular calls
+        // CRITICAL FIX v2.105: Use max(local, cached) to prevent stale peer heights
+        // from showing network_height lower than local_height (ShredProtocol bug)
         if let Some(cached_height) = p2p.get_cached_network_height() {
-            network_height = cached_height;
+            network_height = std::cmp::max(height, cached_height);
             if height < network_height {
                 sync_status = "syncing";
             }
@@ -10488,14 +10490,17 @@ async fn handle_sync_status(
     
     let local_height = blockchain.get_height().await;
     
+    // CRITICAL FIX v2.105: Use max(local, cached) to prevent stale peer heights
+    // from ShredProtocol causing network_height < local_height
     let network_height = if let Some(p2p) = blockchain.get_unified_p2p() {
-        p2p.get_cached_network_height().unwrap_or(local_height)
+        let cached = p2p.get_cached_network_height().unwrap_or(local_height);
+        std::cmp::max(local_height, cached)
     } else {
         local_height
     };
     
     let is_syncing = local_height < network_height;
-    let is_ahead = local_height > network_height;
+    let is_ahead = false; // Node that is synced cannot be "ahead" of network
     let blocks_behind = network_height.saturating_sub(local_height);
     let blocks_ahead = local_height.saturating_sub(network_height);
     

@@ -60,12 +60,19 @@ function getBadgeClass(type: string): string {
 
 // Calculate relative time CLIENT-SIDE from absolute timestamp
 // This ensures time display is always consistent and updates naturally
-function formatTimeAgo(timestamp: number): string {
+function formatTimeAgo(timestamp: number, blockHeight?: number): string {
+  // Genesis block or genesis transactions (block 0)
+  if (blockHeight === 0) return 'Genesis';
   if (!timestamp || timestamp === 0) return 'Genesis';
   
   const now = Date.now();
   // Handle both seconds and milliseconds timestamps
   const ts = timestamp > 1e12 ? timestamp : timestamp * 1000;
+  
+  // If timestamp is before year 2024 (chain launch), treat as Genesis
+  // 1704067200000 = 2024-01-01T00:00:00Z
+  if (ts < 1704067200000) return 'Genesis';
+  
   const diff = now - ts;
   
   if (diff < 0) return 'just now';
@@ -78,7 +85,7 @@ function formatTimeAgo(timestamp: number): string {
 const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) {
   // Calculate relative time from absolute timestamp CLIENT-SIDE
   // This ensures time is STABLE and doesn't flicker on data updates
-  const displayTime = formatTimeAgo(item.timestamp);
+  const displayTime = formatTimeAgo(item.timestamp, item.block);
   
   return (
     <tr className="activity-row">

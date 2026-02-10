@@ -1199,6 +1199,23 @@ async function handleNewBlockEvent(event: WsNewBlockEvent): Promise<void> {
   const height = event.data.height;
   const txCount = event.data.tx_count || 0;
 
+  // Check for gap (e.g. after sleep/disconnect — WS reconnected but blocks were missed)
+  const syncState = await getSyncState();
+  const lastHeight = typeof syncState?.last_height === 'number'
+    ? syncState.last_height
+    : Number(syncState?.last_height) || -1;
+
+  const gap = height - lastHeight - 1;
+  if (gap > 0) {
+    // Jump sync state to just before this block so WS can continue
+    await updateSyncState(height - 1);
+    // Launch backfill scan for ALL missed blocks in background
+    if (gap > 5 && !isBackfillRunning) {
+      console.log(`[WS] Gap ${gap} blocks (${lastHeight + 1}→${height - 1}) — backfill scan started`);
+      runBackfillScan(lastHeight + 1, height - 1).catch(() => {});
+    }
+  }
+
   // FAST PATH: empty blocks (99%+) — save metadata from WS event, NO HTTP!
   if (txCount === 0) {
     try {
