@@ -11678,6 +11678,47 @@ impl BlockchainNode {
                         } else {
                             if is_info() { println!("[INFO][CONS] emrg_sync {:?}", sync_start.elapsed()); }
                         }
+                        
+                        // BUG FIX: After emergency sync, repair chain_height metadata
+                        // Problem: blocks stored via ShredProtocol/P2P update individual block storage
+                        // but metadata chain_height can lag behind. Emergency sync finds blocks as
+                        // dup_storage (already in storage) and doesn't advance chain_height.
+                        // This causes infinite loop: sync → dup → height unchanged → sync again.
+                        // Solution: Run verify_and_repair to advance chain_height to actual storage.
+                        match storage.verify_and_repair_chain_height() {
+                            Ok(true) => {
+                                let repaired_height = storage.get_chain_height().unwrap_or(local_stored_height);
+                                if repaired_height > microblock_height {
+                                    println!("[INFO][SYNC] height_repaired {} -> {}", microblock_height, repaired_height);
+                                    microblock_height = repaired_height;
+                                    *height.write().await = microblock_height;
+                                } else if repaired_height > local_stored_height {
+                                    println!("[INFO][SYNC] chain_height_repaired {} -> {}", local_stored_height, repaired_height);
+                                }
+                            }
+                            Ok(false) => {
+                                // No repair needed — check if blocks exist ahead of chain_height
+                                // Walk forward from chain_height to advance microblock_height
+                                let mut advance_height = local_stored_height;
+                                while advance_height < expected_height {
+                                    if storage.load_microblock(advance_height + 1).unwrap_or(None).is_some() {
+                                        advance_height += 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if advance_height > microblock_height {
+                                    println!("[INFO][SYNC] height_walk_advanced {} -> {}", microblock_height, advance_height);
+                                    microblock_height = advance_height;
+                                    *height.write().await = microblock_height;
+                                    // Also update chain_height metadata to match
+                                    let _ = storage.set_chain_height(advance_height);
+                                }
+                            }
+                            Err(e) => {
+                                println!("[WARN][SYNC] chain_height_repair_err: {}", e);
+                            }
+                        }
                     }
                     
                     // Skip this consensus round
@@ -12017,6 +12058,45 @@ impl BlockchainNode {
                                 }
                             }
                             
+                            // ═══════════════════════════════════════════════════════════════
+                            // SCALABILITY FIX: Always query the SELECTED PRODUCER for entropy
+                            // ═══════════════════════════════════════════════════════════════
+                            // Problem: peers.iter().take(sample_size) is a RANDOM sample.
+                            // In large networks (1000 producers, sample=100), the QRDS-selected
+                            // producer may NOT be in the sample. Then:
+                            //   Node A (sampled producer): entropy=0 → fallback triggered
+                            //   Node B (didn't sample):   None     → assumes synced → NO fallback
+                            //   → Nodes disagree on producer → consensus break!
+                            //
+                            // Fix: After random sampling, explicitly query the selected producer.
+                            // ALL nodes selected the SAME producer (deterministic QRDS), so ALL
+                            // nodes query the SAME node → get SAME response → deterministic check.
+                            // ═══════════════════════════════════════════════════════════════
+                            if !ENTROPY_RESPONSES.contains_key(&(entropy_height, current_producer.clone())) {
+                                // Try to reach producer: first via peer_id_to_addr index (O(1)),
+                                // then fallback to peers list. Works even if producer is not in
+                                // the random sample — all that matters is we're connected to them.
+                                let producer_addr = p2p.get_peer_addr_by_id(&current_producer)
+                                    .or_else(|| peers.iter()
+                                        .find(|p| p.id == current_producer)
+                                        .map(|p| p.addr.clone()));
+                                
+                                if let Some(addr) = producer_addr {
+                                    let entropy_request = crate::unified_p2p::NetworkMessage::EntropyRequest {
+                                        block_height: entropy_height,
+                                        requester_id: node_id.clone(),
+                                    };
+                                    p2p.send_network_message(&addr, entropy_request);
+                                    if is_info() {
+                                        println!("[INFO][CONS] explicit_producer_query producer={} entropy_h={}", 
+                                                 current_producer, entropy_height);
+                                    }
+                                } else {
+                                    // Can't reach producer directly — will rely on BFT timeout
+                                    println!("[WARN][CONS] producer_unreachable={} — timeout will handle", current_producer);
+                                }
+                            }
+                            
                             // CRITICAL FIX: WAIT for entropy consensus at rotation boundaries
                             // This prevents forks by ensuring all nodes agree on entropy before proceeding
                             println!("[INFO][CONS] entropy_requests peers={}", 
@@ -12323,32 +12403,37 @@ impl BlockchainNode {
                             
                             // If producer is NOT synchronized, select next candidate
                             if !producer_is_synchronized {
-                                if is_info() { println!("[INFO][PROD] fallback_select reason=not_synced"); }
+                                if is_info() { println!("[INFO][PROD] fallback_select reason=not_synced producer={}", current_producer); }
                                 
-                                // v2.96: Lock-free iteration with DashMap
-                                // Get list of candidates who ARE synchronized (returned valid entropy)
-                                let synchronized_candidates: Vec<String> = ENTROPY_RESPONSES.iter()
-                                    .filter(|entry| {
-                                        let (height, _) = entry.key();
-                                        let entropy = entry.value();
-                                        *height == entropy_height && 
-                                        *entropy != [0u8; 32] && // Has valid entropy
-                                        *entropy == our_entropy   // Matches consensus
-                                    })
-                                    .map(|entry| entry.key().1.clone())
-                                    .collect();
+                                // ═══════════════════════════════════════════════════════════════════
+                                // SCALABLE FIX: Use DETERMINISTIC candidates from macroblock snapshot
+                                // ═══════════════════════════════════════════════════════════════════
+                                // OLD (BROKEN for >5 nodes): Used ENTROPY_RESPONSES (non-deterministic sampling)
+                                //   Each node samples different 100/1000 peers → different ENTROPY_RESPONSES
+                                //   → different synchronized_candidates → different SHA3-512 → NO CONSENSUS
+                                //
+                                // NEW (SCALABLE): Use calculate_qualified_candidates() — same deterministic
+                                //   source as select_microblock_producer_with_round (macroblock snapshot).
+                                //   All nodes have IDENTICAL candidate list. Exclude only the not_synced
+                                //   producer. Works for 5 nodes AND 1000+ nodes identically.
+                                // ═══════════════════════════════════════════════════════════════════
+                                let fallback_candidates: Vec<(String, f64)> = if let Some(ref p2p) = unified_p2p {
+                                    let all_candidates = Self::calculate_qualified_candidates(
+                                        p2p, &node_id, node_type, next_block_height
+                                    ).await;
+                                    // Exclude only the not_synced producer — deterministic exclusion
+                                    all_candidates.into_iter()
+                                        .filter(|(id, _)| id != &current_producer)
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
                                 
-                                if synchronized_candidates.is_empty() {
+                                if fallback_candidates.is_empty() {
                                     // ═══════════════════════════════════════════════════════════════════════════
                                     // PRODUCTION v2.54: AGGRESSIVE SYNC on desync detection
                                     // ═══════════════════════════════════════════════════════════════════════════
-                                    // Problem: Network can deadlock when all producers are desynchronized
-                                    // Solution: Trigger immediate sync instead of passive waiting
-                                    // - Check network height vs local height
-                                    // - If behind: trigger macroblock sync (fastest recovery)
-                                    // - Continue after short delay to allow sync to progress
-                                    // ═══════════════════════════════════════════════════════════════════════════
-                                    println!("[WARN][PROD] no_sync_candidates - triggering aggressive sync");
+                                    println!("[WARN][PROD] no_fallback_candidates - triggering aggressive sync");
                                     
                                     if let Some(ref p2p) = unified_p2p {
                                         let local_height = *height.read().await;
@@ -12390,21 +12475,16 @@ impl BlockchainNode {
                                     continue;
                                 }
                                 
-                                // Select from synchronized candidates using SAME quantum-resistant algorithm
-                                // ARCHITECTURE: Identical to primary producer selection (lines 7325-7360)
-                                // - SHA3-512 (NIST approved, post-quantum secure hash)
-                                // - Entropy from Dilithium-signed blocks (quantum-resistant signatures)
-                                // - Deterministic across all nodes for Byzantine consensus
-                                // NIST/Cisco compliant: SHA3-512 is quantum-resistant hash function
+                                // DETERMINISTIC fallback selection using SHA3-512
+                                // Uses the SAME quantum-resistant algorithm as primary QRDS selection
+                                // Candidate list is from macroblock snapshot → IDENTICAL on all nodes
                                 use sha3::{Sha3_512, Digest};
                                 let mut selector = Sha3_512::new();
                                 
-                                // CRITICAL: Use same structure as primary selection for consistency
-                                // Domain separator prevents cross-protocol attacks
-                                selector.update(b"QNet_Quantum_Fallback_Producer_Selection_v1");
+                                // Domain separator (different from primary to avoid collision)
+                                selector.update(b"QNet_Quantum_Fallback_Producer_Selection_v2");
                                 
-                                // Entropy source: comes from Dilithium-signed blocks (quantum-resistant)
-                                // This is the SAME entropy used in primary selection
+                                // Entropy source: from Dilithium-signed blocks (quantum-resistant)
                                 selector.update(&our_entropy);
                                 
                                 // Add block height and round for uniqueness
@@ -12413,11 +12493,16 @@ impl BlockchainNode {
                                 selector.update(&next_block_height.to_le_bytes());
                                 selector.update(&entropy_height.to_le_bytes());
                                 
-                                // Sort candidates for determinism (CRITICAL for Byzantine consensus)
-                                let mut sorted_candidates = synchronized_candidates.clone();
+                                // Deterministic exclusion marker — hash includes who was excluded
+                                selector.update(current_producer.as_bytes());
+                                
+                                // Sort candidates by node_id for determinism (CRITICAL for Byzantine consensus)
+                                let mut sorted_candidates: Vec<String> = fallback_candidates.iter()
+                                    .map(|(id, _)| id.clone())
+                                    .collect();
                                 sorted_candidates.sort();
                                 
-                                // Include candidate list in hash for additional entropy
+                                // Include full candidate list in hash
                                 for candidate in &sorted_candidates {
                                     selector.update(candidate.as_bytes());
                                 }
@@ -12433,14 +12518,15 @@ impl BlockchainNode {
                                 let selection_index = (selection_value % sorted_candidates.len() as u64) as usize;
                                 
                                 let new_producer = sorted_candidates[selection_index].clone();
-if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted_candidates.len()); }
+                                println!("[INFO][PROD] fallback={} excluded={} cand={}", 
+                                         new_producer, current_producer, sorted_candidates.len());
                                 
                                 // Update producer for this round
                                 current_producer = new_producer.clone();
                                 is_my_turn_to_produce = current_producer == node_id;
                                 
                                 if is_my_turn_to_produce {
-                                    if is_info() { println!("[INFO][PROD] fallback_selected h={}", next_block_height); }
+                                    println!("[INFO][PROD] fallback_selected_self h={}", next_block_height);
                                 }
                             }
                         }
@@ -15731,10 +15817,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     .collect();
                 
                 let winner = if final_candidates.is_empty() {
-                    // All candidates exhausted - wrap around to original list
+                    // All candidates exhausted — wrap around to full deterministic list
+                    // SCALABILITY FIX: Do NOT use ENTROPY_RESPONSES for filtering here.
+                    // ENTROPY_RESPONSES is populated by sampling (100/1000 peers) and differs
+                    // between nodes → non-deterministic filtering → consensus break.
+                    //
+                    // Instead: use deterministic candidates list with timeout_round offset.
+                    // If selected node turns out to be not_synced, the entropy consensus check
+                    // in the main loop (producer_is_synchronized) will catch it and trigger
+                    // deterministic fallback via calculate_qualified_candidates (BUG #2 fix).
+                    //
+                    // Two-layer defense (both fully deterministic):
+                    //   Layer 1: timeout rotation cycles through candidates (this code)
+                    //   Layer 2: entropy check + fallback excludes not_synced (main loop)
                     if is_warn() {
-                        println!("[WARN][TIMEOUT] h={} all_candidates_exhausted timeout_round={}", 
-                                 current_height, timeout_round);
+                        println!("[WARN][TIMEOUT] h={} all_candidates_exhausted timeout_round={} wrapping_to_full_list={}", 
+                                 current_height, timeout_round, candidates.len());
                     }
                     select_for_round(&candidates, timeout_round)
                 } else {

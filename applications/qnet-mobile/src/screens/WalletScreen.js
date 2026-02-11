@@ -791,7 +791,7 @@ const WalletScreen = () => {
   const [showActivationInput, setShowActivationInput] = useState(false); // Show activation code input modal
   const [activationInputCode, setActivationInputCode] = useState(''); // Input activation code
   const [lightNodeStatus, setLightNodeStatus] = useState(null); // Light node network status
-  const [serverNodeStatus, setServerNodeStatus] = useState(null); // Full/Super node network status
+  const [serverNodeStatus, setServerNodeStatus] = useState(null); // Super node network status
   const [allUserNodes, setAllUserNodes] = useState([]); // All nodes owned by this wallet (unified view)
   const [loadingAllNodes, setLoadingAllNodes] = useState(false); // Loading state for all nodes
   const [nodeInitializing, setNodeInitializing] = useState(true); // True until first load cycle completes
@@ -915,7 +915,7 @@ const WalletScreen = () => {
   // Load node data when on node tab
   // ARCHITECTURE:
   // - Light nodes: App is the node, needs local rewards tracking + network ping status
-  // - Full/Super/Genesis: Server is the node, app just monitors via single API call
+  // - Super/Genesis: Server is the node, app just monitors via single API call
   // - NEW: Load ALL nodes owned by this wallet for unified display
   useEffect(() => {
     if (activeTab === 'node' && wallet) {
@@ -990,7 +990,7 @@ const WalletScreen = () => {
     }
   };
   
-  // Load Server node (Full/Super/Genesis) network status
+  // Load Server node (Super/Genesis) network status
   // This single API call returns ALL info: status, heartbeats, rewards
   const loadServerNodeStatus = async () => {
     if (activatedNodeType === 'light' || !activationCode) return;
@@ -1087,7 +1087,7 @@ const WalletScreen = () => {
             return; // Don't process other nodes if Genesis found
           }
           
-          // Priority 2: Auto-link other server nodes (Full/Super)
+          // Priority 2: Auto-link other server nodes (Super)
           const otherServerNodes = serverNodes.filter(n => 
             !n.node_id || !n.node_id.startsWith('genesis_node_')
           );
@@ -1848,7 +1848,7 @@ const WalletScreen = () => {
     }
   };
   
-  // Claim rewards for Server nodes (Full/Super/Genesis) - uses server-side pending rewards
+  // Claim rewards for Server nodes (Super/Genesis) - uses server-side pending rewards
   const handleClaimServerNodeRewards = async () => {
     const pendingRewards = serverNodeStatus?.pendingRewards || 0;
     if (pendingRewards <= 0 || processingValidation) return;
@@ -3287,7 +3287,7 @@ const WalletScreen = () => {
     return (
       <SafeAreaView style={styles.container}>
         <ScrollView 
-          contentContainerStyle={styles.centerContent}
+          contentContainerStyle={styles.seedConfirmContent}
           showsVerticalScrollIndicator={true}
           bounces={true}
           scrollEnabled={true}
@@ -3298,7 +3298,7 @@ const WalletScreen = () => {
           </Text>
           
           {positions.map(pos => (
-            <View key={pos} style={styles.formGroup}>
+            <View key={pos} style={styles.seedConfirmGroup}>
               <Text style={styles.label}>Select word #{pos + 1}</Text>
               <View style={styles.wordChoicesContainer}>
                 {wordChoices[pos]?.map((word, idx) => (
@@ -4354,7 +4354,7 @@ const WalletScreen = () => {
                   </View>
                 )}
                 
-                {/* v3.18: Full Node removed - only Light and Super */}
+                {/* Node types: Light and Super only */}
                 
                 {nodeStatus === 'super' && (
                   <View style={[styles.warningBox, {backgroundColor: 'rgba(255, 170, 0, 0.1)', borderColor: 'rgba(255, 170, 0, 0.3)'}]}>
@@ -4381,7 +4381,7 @@ const WalletScreen = () => {
                   <Text style={styles.nodeTypeDesc}>
                     {activatedNodeType === 'light' 
                       ? 'Code received • Ready to use'
-                      : 'Mobile node for smartphones.'}
+                      : 'Mobile wallet user, own TX history.'}
                   </Text>
                 </View>
                 <Text style={styles.nodeTypePrice}>
@@ -4392,7 +4392,7 @@ const WalletScreen = () => {
                 </Text>
               </TouchableOpacity>
 
-              {/* v3.18: Full Node card removed - only Light and Super */}
+              {/* Node types: Light and Super only */}
 
               <TouchableOpacity 
                 style={[
@@ -4447,22 +4447,21 @@ const WalletScreen = () => {
                 
                 // v3.18: Only Light and Super nodes
                 const nodeMessages = {
-                  light: `Get ${nodeTypeName} Code\n\n• No token burn required\n• Instant code generation\n• Basic validation node`,
+                  light: `Get ${nodeTypeName} Code\n\n• No token burn required\n• Instant code generation\n• Mobile wallet user`,
                   super: `Get ${nodeTypeName} Code\n\n• Server activation required\n• ${activationCost} burn required\n• Enterprise grade node`
                 };
                 
                 const warningMessage = nodeMessages[nodeStatus];
                 
                 // Node detailed specifications (like in browser extension)
-                // v3.18: Only Light and Super nodes
                 const nodeSpecs = {
                   light: {
                     platform: 'Mobile',
-                    storage: '~100MB',
+                    storage: 'Own TX history only',
                     rewards: 'Pool 1',
                     uptime: 'Flexible',
-                    role: 'Basic validation',
-                    activation: '✓ Full activation in Mobile App'
+                    role: 'Wallet user',
+                    activation: '✓ Instant activation in Mobile App'
                   },
                   super: {
                     platform: 'High-end server',
@@ -4554,25 +4553,13 @@ const WalletScreen = () => {
                       onPress: async () => {
                         setActivatingNode(true);
                         try {
-                          // Check if already activated (prevent duplicates)
+                          // Quick local check for existing activation (no slow RPC calls)
                           const existingCodes = await walletManager.getStoredActivationCodes(password);
                           if (existingCodes && Object.keys(existingCodes).length > 0) {
                             setActivatingNode(false);
                             Alert.alert(
                               'Already Activated',
                               'This wallet already has an activated node. One wallet can only activate one node.',
-                              [{ text: 'OK' }]
-                            );
-                            return;
-                          }
-                          
-                          // Also check blockchain to prevent concurrent activation attempts
-                          const activatedNodes = await walletManager.checkBlockchainForActivations(wallet.publicKey);
-                          if (activatedNodes && activatedNodes.length > 0) {
-                            setActivatingNode(false);
-                            Alert.alert(
-                              'Already Activated',
-                              'This wallet has a node activation on blockchain. Please wait for sync to complete.',
                               [{ text: 'OK' }]
                             );
                             return;
@@ -4589,10 +4576,9 @@ const WalletScreen = () => {
                             walletManager.getBalance(wallet.publicKey, isTestnet)
                           ]);
                           
-                          // Fix floating point precision issue (0.01 might be 0.009999999)
-                          const minSolRequired = 0.009; // Slightly less than 0.01 to account for precision
+                          const minSolRequired = 0.001;
                           if (solBalance < minSolRequired) {
-                            throw new Error(`Insufficient SOL for transaction fees.\nNeed at least 0.01 SOL, have: ${solBalance.toFixed(4)}`);
+                            throw new Error(`Insufficient SOL for transaction fees.\nNeed at least 0.001 SOL, have: ${solBalance.toFixed(4)}`);
                           }
                           
                           const oneDevMint = isTestnet 
@@ -4611,7 +4597,7 @@ const WalletScreen = () => {
                             result = await walletManager.activateLightNode(wallet.publicKey, password);
                             code = result.activationCode;
                           } else {
-                            // Full/Super nodes - also require burn BEFORE generating code
+                            // Super nodes - also require burn BEFORE generating code
                             const burnResult = await walletManager.burnTokensForNode(
                               nodeStatus, 
                               requiredAmount, 
@@ -4943,7 +4929,7 @@ const WalletScreen = () => {
                   No Node Active
                 </Text>
                 <Text style={[styles.nodeMonitoringLabel, {fontSize: 12, color: '#888', marginBottom: 12}]}>
-                  Activate a Light node here, or use your EON address when setting up a Full/Super node on a server.
+                  Activate a Light node here, or use your EON address when setting up a Super node on a server.
                 </Text>
                 
                 {/* Copy QNet EON address for server activation */}
@@ -5142,7 +5128,7 @@ const WalletScreen = () => {
                     </>
                   )}
                   
-                  {/* SERVER NODES (Full/Super/Genesis): Show server-side data */}
+                  {/* SERVER NODES (Super/Genesis): Show server-side data */}
                   {activatedNodeType !== 'light' && serverNodeStatus?.success && (
                     <>
                       <View style={styles.rewardItem}>
@@ -6109,6 +6095,18 @@ const styles = StyleSheet.create({
   formGroup: {
     marginBottom: 20,
   },
+  seedConfirmContent: {
+    flexGrow: 1,
+    justifyContent: 'flex-start',
+    alignItems: 'stretch',
+    padding: 20,
+    paddingTop: 40,
+    backgroundColor: '#0f0f1a',
+  },
+  seedConfirmGroup: {
+    marginBottom: 24,
+    width: '100%',
+  },
   label: {
     color: '#b0b0b0',
     fontSize: 14,
@@ -6488,6 +6486,7 @@ const styles = StyleSheet.create({
   wordChoicesContainer: {
     flexDirection: 'row',
     flexWrap: 'wrap',
+    justifyContent: 'space-between',
     gap: 10,
     marginTop: 10,
   },
@@ -6498,7 +6497,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.3)',
-    minWidth: '45%',
+    width: '48%',
   },
   wordChoiceSelected: {
     backgroundColor: 'rgba(0, 212, 255, 0.2)',

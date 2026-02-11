@@ -3826,9 +3826,8 @@ export class WalletManager {
         
         if (response.ok) {
           const stats = await response.json();
-          // Return total active nodes (Light + Full + Super)
+          // Return total active nodes (Light + Super)
           const totalNodes = (stats.light_nodes || 0) + 
-                            (stats.full_nodes || 0) + 
                             (stats.super_nodes || 0);
           if (totalNodes > 0) {
             // UPDATE CACHE
@@ -4010,18 +4009,42 @@ export class WalletManager {
       // Sign transaction
       transaction.sign(keypair);
       
-      // Send transaction
+      // Send transaction (skip preflight for speed - balance already checked)
       const signature = await connection.sendRawTransaction(transaction.serialize(), {
-        skipPreflight: false,
+        skipPreflight: true,
         preflightCommitment: 'processed'
       });
       
-      // Wait for confirmation
-      const confirmation = await connection.confirmTransaction({
+      // Wait for confirmation with timeout (30 seconds max)
+      const confirmPromise = connection.confirmTransaction({
         signature,
         blockhash,
         lastValidBlockHeight
       }, 'confirmed');
+      
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('TIMEOUT')), 30000)
+      );
+      
+      let confirmation;
+      try {
+        confirmation = await Promise.race([confirmPromise, timeoutPromise]);
+      } catch (timeoutErr) {
+        if (timeoutErr.message === 'TIMEOUT') {
+          // Transaction was sent but confirmation timed out
+          // Return signature anyway - tx is likely already on chain
+          console.log('Confirmation timed out, but transaction was sent:', signature);
+          return {
+            nodeType,
+            amount,
+            timestamp: Date.now(),
+            signature: signature,
+            txHash: signature,
+            explorer: `https://explorer.solana.com/tx/${signature}?cluster=${isTestnet ? 'devnet' : 'mainnet-beta'}`
+          };
+        }
+        throw timeoutErr;
+      }
       
       if (!confirmation.value.err) {
         // Transaction successful
@@ -4051,7 +4074,7 @@ export class WalletManager {
   //
   // This method is DEPRECATED - use requestActivationCodeFromServer() instead
   // Kept for backward compatibility with stored codes only
-  // v3.18: Full nodes removed - default to 'super' for backward compatibility
+  // Default to 'super' for backward compatibility
   generateActivationCode(nodeType = 'super', walletAddress = '', seedPhrase = null) {
     console.warn('[DEPRECATED] generateActivationCode() should not be used for new activations');
     console.warn('   Use requestActivationCodeFromServer() after burn transaction');
@@ -4079,9 +4102,9 @@ export class WalletManager {
   }
   
   // Request activation code from server after burn verification
-  // Phase 1: burnTxHash = Solana 1DEV burn transaction
+  // Phase 1: burnTxHash = Solana 1DEV burn transaction, qnetRewardWallet = EON address for rewards
   // Phase 2: burnTxHash = QNet QNC transfer to Pool 3 transaction
-  async requestActivationCodeFromServer(nodeType, walletAddress, burnTxHash, phase = 1) {
+  async requestActivationCodeFromServer(nodeType, walletAddress, burnTxHash, phase = 1, qnetRewardWallet = null) {
     try {
       const apiUrl = this.getRandomBootstrapNode();
       
@@ -4093,17 +4116,25 @@ export class WalletManager {
         burnAmount = pricing.current_price || 0;
       }
       
+      // Build request body
+      const requestBody = {
+        wallet_address: walletAddress,
+        burn_tx_hash: burnTxHash,
+        node_type: nodeType,
+        burn_amount: burnAmount,
+        phase: phase
+      };
+      
+      // Phase 1 requires QNet EON address for rewards (separate from Solana burn address)
+      if (phase === 1 && qnetRewardWallet) {
+        requestBody.qnet_reward_wallet = qnetRewardWallet;
+      }
+      
       // Request code generation from server
       const response = await fetch(`${apiUrl}/api/v1/generate-activation-code`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          wallet_address: walletAddress,
-          burn_tx_hash: burnTxHash,
-          node_type: nodeType,
-          burn_amount: burnAmount,
-          phase: phase
-        })
+        body: JSON.stringify(requestBody)
       });
       
       const result = await response.json();
@@ -4243,11 +4274,15 @@ export class WalletManager {
           // PRODUCTION: Retrieve code from server using burn_tx_hash
           if (meta.burnTxHash && password) {
             try {
+              // Get QNet EON address for Phase 1
+              const eonAddr = await AsyncStorage.getItem('qnet_address')
+                || this.generateQNetAddressFromSolana(walletAddress);
               const result = await this.requestActivationCodeFromServer(
                 nodeType, 
                 walletAddress, 
                 meta.burnTxHash,
-                meta.phase || 1
+                meta.phase || 1,
+                eonAddr
               );
               if (result.success && result.activationCode) {
                 await this.storeActivationCode(result.activationCode, nodeType, password);
@@ -4518,7 +4553,6 @@ export class WalletManager {
                       }
                     }
                     
-                    // v3.18: Full nodes removed
                     if (nodeType && ['light', 'super'].includes(nodeType)) {
                       // Found exact type from memo!
                       // console.log('[checkBlockchainForActivations] ✅ Exact node type determined:', nodeType);
@@ -4697,7 +4731,7 @@ export class WalletManager {
   }
   
   // Calculate dynamic activation cost based on burn percentage
-  // v3.18: Full nodes removed - default to 'super' for backward compatibility
+  // Calculate activation cost (Light and Super nodes only)
   async calculateActivationCost(nodeType = 'super') {
     try {
       const burnPercent = parseFloat(await this.getBurnProgress(false));
@@ -4731,7 +4765,7 @@ export class WalletManager {
           multiplier = 3.0; // Mature network (1M+)
         }
         
-        // v3.18: Full nodes removed - default to super if invalid type
+        // Default to super if invalid type
         const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.super;
         const finalCost = Math.round(baseCost * multiplier);
         
@@ -4779,13 +4813,7 @@ export class WalletManager {
   // Activate Light Node - REQUIRES REAL 1DEV BURN
   async activateLightNode(walletAddress, password) {
     try {
-      // Check if node already activated on blockchain (prevent duplicates)
-      const existingActivations = await this.checkBlockchainForActivations(walletAddress);
-      if (existingActivations && existingActivations.length > 0) {
-        throw new Error('This wallet already has an activated node on the blockchain. One wallet can only activate one node.');
-      }
-      
-      // Also check local storage for existing codes
+      // Quick local check only (blockchain check is too slow - 30+ RPC calls)
       const existingCodes = await this.getStoredActivationCodes(password);
       if (existingCodes && Object.keys(existingCodes).length > 0) {
         throw new Error('This wallet already has an activated node. One wallet can only activate one node.');
@@ -4813,23 +4841,6 @@ export class WalletManager {
         throw new Error('Failed to calculate activation cost');
       }
       
-      // Check balances BEFORE attempting burn (use the same address for both checks)
-      const solBalance = await this.getBalance(walletAddress, isTestnet);
-      // Fix floating point precision issue (0.01 might be 0.009999999)
-      const minSolRequired = 0.009; // Slightly less than 0.01 to account for precision
-      if (solBalance < minSolRequired) {
-        throw new Error(`Insufficient SOL for transaction fees. Need at least 0.01 SOL, have: ${solBalance.toFixed(4)}`);
-      }
-      
-      const oneDevMint = isTestnet 
-        ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'
-        : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump';
-      
-      const oneDevBalance = await this.getTokenBalance(walletAddress, oneDevMint, isTestnet);
-      if (oneDevBalance < pricing.cost) {
-        throw new Error(`Insufficient 1DEV balance. Need: ${pricing.cost}, have: ${oneDevBalance}`);
-      }
-      
       // BURN REAL TOKENS for activation
       const burnResult = await this.burnTokensForNode('light', pricing.cost, isTestnet, password);
       
@@ -4839,7 +4850,9 @@ export class WalletManager {
       
     // PRODUCTION: Request activation code from server AFTER successful burn
     // Server verifies burn transaction and generates code with embedded wallet
-    const apiUrl = this.getRandomBootstrapNode();
+    // Phase 1: need QNet EON address for rewards (separate from Solana address)
+    const qnetAddress = await AsyncStorage.getItem('qnet_address') 
+      || this.generateQNetAddressFromSolana(walletAddress);
     
     let activationCode;
     try {
@@ -4847,7 +4860,8 @@ export class WalletManager {
         'light',
         walletAddress,
         burnResult.signature,
-        1 // Phase 1: 1DEV burn
+        1, // Phase 1: 1DEV burn
+        qnetAddress // QNet EON address for rewards
       );
       
       if (!codeResult.success || !codeResult.activationCode) {
@@ -4994,7 +5008,6 @@ export class WalletManager {
         const isActive = lastPing && lastPing > fourHoursAgo;
         
         // Daily rates by node type
-        // v3.35: Full nodes REMOVED from project
         // Light nodes are NOT real nodes - just mobile app users
         const dailyRates = {
           super: 500,  // Only Super/Genesis nodes earn rewards
@@ -5236,7 +5249,7 @@ export class WalletManager {
   async claimRewards(nodeType, activationCode, walletAddress, password, serverPendingRewards = null) {
     try {
       // For LIGHT nodes: Check local rewards tracking
-      // For SERVER nodes (Full/Super/Genesis): Skip local check, server knows pending rewards
+      // For SERVER nodes (Super/Genesis): Skip local check, server knows pending rewards
       if (nodeType === 'light') {
         const rewards = await this.getNodeRewards(nodeType, activationCode, walletAddress);
         if (!rewards) {

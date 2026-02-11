@@ -519,7 +519,7 @@ export async function initializePushService() {
 }
 
 /**
- * Check Server node (Full/Super/Genesis) status
+ * Check Server node (Super/Genesis) status
  * Used for monitoring server nodes from mobile app
  * v3.35: Added retry logic with different nodes
  */
@@ -579,9 +579,8 @@ export async function checkServerNodeStatus(activationCode, nodeId = null, maxRe
       const result = await response.json();
 
       if (result.success) {
-        // v3.35: ONLY Super/Genesis nodes are real nodes
+        // Only Super/Genesis nodes are real nodes
         // Light nodes = regular mobile app users (NOT nodes)
-        // Full nodes = REMOVED from project
         
         // Required heartbeats for NETWORK LIVENESS (NOT rewards!)
         // This is P2P heartbeat for node health, not transaction validation
@@ -685,7 +684,7 @@ export default {
   checkNodeStatus,
   reactivateNode,
   
-  // Server node status (Full/Super/Genesis - single API call)
+  // Server node status (Super/Genesis - single API call)
   checkServerNodeStatus,
   
   // Get all nodes by wallet (unified view)
