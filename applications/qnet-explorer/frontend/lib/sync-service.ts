@@ -672,7 +672,7 @@ async function runCatchupSync(): Promise<void> {
 
 // Fetch a batch of blocks via HTTP RPC (POST /rpc) - faster than WS for parallel
 async function fetchBlocksViaHttpRpc(start: number, limit: number): Promise<BlockData[]> {
-  const effectiveLimit = Math.min(limit, 20);
+  const effectiveLimit = Math.min(limit, 10); // 10 blocks/req optimal (5→1.7s, 10→2.7s, 20→21s)
   // Retry up to 2 times on failure (TX blocks make response larger → slower)
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -701,7 +701,7 @@ async function fetchBlocksViaHttpRpc(start: number, limit: number): Promise<Bloc
   return [];
 }
 
-// Background scan: PARALLEL HTTP RPC - 5 streams × 20 blocks = 100 blocks/round
+// Background scan: PARALLEL HTTP RPC - 15 streams × 10 blocks = 150 blocks/round
 async function runBackfillScan(fromHeight: number, toHeight: number): Promise<void> {
   if (isBackfillRunning) {
     console.log('[Sync] Backfill: already running');
@@ -709,14 +709,15 @@ async function runBackfillScan(fromHeight: number, toHeight: number): Promise<vo
   }
   isBackfillRunning = true;
   
-  const BATCH_SIZE = 20;
-  const PARALLEL = 10; // 10 parallel HTTP connections
-  const ROUND_SIZE = BATCH_SIZE * PARALLEL; // 200 blocks per round
+  const BATCH_SIZE = 10;
+  const PARALLEL = 15; // 15 parallel HTTP connections (sweet spot for throughput)
+  const ROUND_SIZE = BATCH_SIZE * PARALLEL; // 150 blocks per round
   const startTime = Date.now();
   let scanned = 0;
   let txBlocksSaved = 0;
   let totalTxSaved = 0;
   let currentHeight = fromHeight;
+  let failedBatchRanges: { start: number; end: number }[] = [];
   
   try {
     // Genesis first via dedicated fast path (HTTP RPC single block)
@@ -764,22 +765,28 @@ async function runBackfillScan(fromHeight: number, toHeight: number): Promise<vo
       
       // Process results - save only blocks with TX
       const txBlocks: { height: number; block: BlockData }[] = [];
-      let roundScanned = 0;
+      let maxHeightSeen = currentHeight - 1;
       
       for (const { startH, blocks } of results) {
         if (blocks.length > 0) {
           for (let i = 0; i < blocks.length; i++) {
             const block = blocks[i] as BlockData;
-            const height = startH + i;
+            // Use block.height from node if available, fall back to startH + i
+            const height = typeof block.height === 'number' ? block.height : (startH + i);
+            if (height > maxHeightSeen) maxHeightSeen = height;
             const txCount = Array.isArray(block.transactions) ? block.transactions.length : 0;
             if (txCount > 0) {
               txBlocks.push({ height, block });
               console.log(`[Backfill] Block ${height}: ${txCount} TX`);
             }
           }
-          roundScanned += blocks.length;
         } else {
-          roundScanned += BATCH_SIZE;
+          // Failed batch — DON'T skip! Track highest expected height for retry
+          const batchEnd = startH + BATCH_SIZE - 1;
+          if (batchEnd > maxHeightSeen) maxHeightSeen = batchEnd;
+          console.warn(`[Backfill] RETRY: batch ${startH}-${batchEnd} failed, will be retried`);
+          // Queue failed range for immediate retry
+          failedBatchRanges.push({ start: startH, end: Math.min(batchEnd, toHeight) });
         }
       }
       
@@ -790,8 +797,10 @@ async function runBackfillScan(fromHeight: number, toHeight: number): Promise<vo
         totalTxSaved += saved;
       }
       
-      scanned += roundScanned;
-      currentHeight += roundScanned;
+      // Advance currentHeight based on actual max height seen
+      const roundScanned = maxHeightSeen - currentHeight + 1;
+      scanned += Math.max(roundScanned, 0);
+      currentHeight = maxHeightSeen + 1;
       
       // Progress log every 500 blocks
       if (scanned % 500 < ROUND_SIZE) {
@@ -800,6 +809,41 @@ async function runBackfillScan(fromHeight: number, toHeight: number): Promise<vo
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
         const speed = scanned > 0 ? (scanned / ((Date.now() - startTime) / 1000)).toFixed(1) : '0';
         console.log(`[Backfill] ${pct}% (${scanned}/${total}) ${speed} blk/s | ${txBlocksSaved} TX-blocks, ${totalTxSaved} TX | ${elapsed}s`);
+      }
+    }
+    
+    // Retry failed batches (up to 3 attempts)
+    for (let retryAttempt = 0; retryAttempt < 3 && failedBatchRanges.length > 0; retryAttempt++) {
+      const toRetry = [...failedBatchRanges];
+      failedBatchRanges = [];
+      console.log(`[Backfill] Retrying ${toRetry.length} failed batches (attempt ${retryAttempt + 1}/3)...`);
+      await new Promise(r => setTimeout(r, 2000)); // Wait before retry
+      
+      for (const range of toRetry) {
+        try {
+          const blocks = await fetchBlocksViaHttpRpc(range.start, range.end - range.start + 1);
+          if (blocks.length > 0) {
+            const txB: { height: number; block: BlockData }[] = [];
+            for (let i = 0; i < blocks.length; i++) {
+              const block = blocks[i] as BlockData;
+              const height = typeof block.height === 'number' ? block.height : (range.start + i);
+              const txCount = Array.isArray(block.transactions) ? block.transactions.length : 0;
+              if (txCount > 0) {
+                txB.push({ height, block });
+                console.log(`[Backfill-Retry] Block ${height}: ${txCount} TX`);
+              }
+            }
+            if (txB.length > 0) {
+              const saved = await saveBlocksBatch(txB);
+              txBlocksSaved += txB.length;
+              totalTxSaved += saved;
+            }
+          } else {
+            failedBatchRanges.push(range);
+          }
+        } catch {
+          failedBatchRanges.push(range);
+        }
       }
     }
     
@@ -1051,8 +1095,24 @@ async function runInitialSync(): Promise<void> {
   console.log('[Sync] Initial sync → delegating to catchup...');
   await runCatchupSync();
 
+  // Wait for backfill to complete before running recovery
+  // (backfill and recovery both scan blocks — running them in parallel
+  //  doubles the load on the node and causes rate limiting / slowdowns)
+  if (isBackfillRunning) {
+    console.log('[Sync] Waiting for backfill to complete before recovery...');
+    while (isBackfillRunning) {
+      await new Promise(r => setTimeout(r, 5000));
+    }
+    console.log('[Sync] Backfill completed, starting recovery scan...');
+  }
+
   // After catchup, recover any TXs that were lost due to previous validation bugs
-  await recoverMissingTransactions();
+  // Use FULL chain depth to catch all missing TXs (not just last 5000)
+  const syncState = await getSyncState();
+  const lastHeight = Number(syncState?.last_height) || 0;
+  const fullDepth = Math.max(lastHeight, 5000);
+  console.log(`[Sync] Initial recovery: scanning ALL ${fullDepth} blocks for missing TXs...`);
+  await recoverMissingTransactions(fullDepth);
 }
 
 // Verify data integrity
@@ -1326,12 +1386,17 @@ function connectWebSocket(): void {
       isWsConnected = true;
       wsReconnectDelay = WS_RECONNECT_DELAY_BASE; // Reset delay on successful connect
       
-      // CRITICAL: Catchup sync on reconnect - sync any blocks missed during disconnect
-      console.log('[WS] Running catchup sync for missed blocks...');
-      try {
-        await runCatchupSync();
-      } catch (err) {
-        console.error('[WS] Catchup sync failed:', err);
+      // Only run catchup from WS if initial sync is already done
+      // (otherwise initial sync handles it and WS catchup would race/override it)
+      if (initialSyncDone) {
+        console.log('[WS] Running catchup sync for missed blocks...');
+        try {
+          await runCatchupSync();
+        } catch (err) {
+          console.error('[WS] Catchup sync failed:', err);
+        }
+      } else {
+        console.log('[WS] Initial sync in progress — skipping WS catchup (backfill handles it)');
       }
     });
 
@@ -1410,16 +1475,21 @@ let integrityInterval: NodeJS.Timeout | null = null;
 let recoveryInterval: NodeJS.Timeout | null = null;
 let isSyncing = false;
 
+let initialSyncDone = false;
+
 export function startSyncService(): void {
   console.log('[Sync] Starting sync service (WebSocket primary, polling fallback)...');
 
-  // Start WebSocket IMMEDIATELY for realtime sync
+  // Start WebSocket for realtime sync (new blocks)
   console.log('[Sync] Starting WebSocket connection...');
   connectWebSocket();
   
-  // Initial sync: catch up with missing blocks (runs once at startup)
+  // Initial sync: catch up with ALL missing blocks from the very beginning
+  // CRITICAL: This reads last_height BEFORE WS open handler can change it
   console.log('[Sync] Running initial sync to catch up with missing blocks...');
-  runInitialSync().catch(err => console.error('[Sync] Initial sync/recovery FAILED:', err));
+  runInitialSync()
+    .then(() => { initialSyncDone = true; })
+    .catch(err => { console.error('[Sync] Initial sync/recovery FAILED:', err); initialSyncDone = true; });
 
   // Fallback polling (runs if WebSocket is disconnected)
   syncInterval = setInterval(() => {
