@@ -1304,9 +1304,21 @@ impl BlockchainNode {
         let sk_bytes = SkTrait::as_bytes(&sk).to_vec();
 
         // Create WalletIdentity (seed → wallet address + keypair reference)
-        let identity = WalletIdentity::from_seed_and_keys(wallet_seed, pk_bytes, sk_bytes)?;
+        let identity = WalletIdentity::from_seed_and_keys(wallet_seed, pk_bytes.clone(), sk_bytes)?;
 
         println!("[INFO][NODE] wallet={} pk_len={}", identity.wallet_address, identity.dilithium_pk.len());
+
+        // v4.2: Register own VRF public key in global registry + persist to RocksDB
+        // Without this, other nodes cannot verify our VRF claims
+        crate::genesis_constants::register_vrf_public_key(&self.node_id, &pk_bytes);
+        let pk_hex = hex::encode(&pk_bytes);
+        if let Err(e) = self.storage.save_vrf_public_key(&self.node_id, &pk_hex) {
+            println!("[WARN][VRF] pk_persist err={}", e);
+        }
+        if is_info() {
+            println!("[INFO][VRF] self_pk_registered node={} pk_hash={}",
+                     self.node_id, &pk_hex[..16]);
+        }
 
         // Create VRF instance from this identity
         let vrf = identity.create_vrf(&self.node_id)?;
@@ -15842,12 +15854,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                  leadership_round, own_rep, total_rep);
                                     }
                                     if let Some(ref p2p) = unified_p2p {
+                                        let own_pk = vrf.get_public_key().unwrap_or_default();
                                         p2p.broadcast_leader_claim(
                                             leadership_round,
                                             vrf_out.output,
                                             vrf_out.proof.clone(),
                                             slot_input,
                                             own_rep,
+                                            own_pk,
                                         );
                                     }
                                 }

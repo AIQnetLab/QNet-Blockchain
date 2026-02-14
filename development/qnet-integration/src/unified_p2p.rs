@@ -10560,9 +10560,10 @@ pub enum NetworkMessage {
         sender_id: String,
     },
 
-    /// v4.0: VRF Leader Claim — Algorand-style secret leader election
+    /// v4.2: VRF Leader Claim — secret leader election with inline public key
     /// Each elected node broadcasts its VRF proof at rotation boundary
     /// All nodes verify and select lowest VRF output as winner
+    /// vrf_public_key included so claims are self-verifiable without prior key exchange
     VrfLeaderClaim {
         round: u64,              // Leadership round (= rotation period)
         node_id: String,         // Claiming node
@@ -10571,6 +10572,7 @@ pub enum NetworkMessage {
         slot_seed: Vec<u8>,      // 32-byte slot seed (for verification)
         reputation: f64,         // Node's reputation at claim time
         timestamp: u64,          // Claim timestamp
+        vrf_public_key: Vec<u8>, // 1952-byte Dilithium3 public key (self-verifiable claims)
     },
 
     /// DEPRECATED v4.0: EmergencyProducerChange replaced by BFT Timeout Protocol
@@ -11265,7 +11267,7 @@ impl SimplifiedP2P {
             // ═══════════════════════════════════════════════════════════════
             // v4.0: VRF Leader Claim — verify and store
             // ═══════════════════════════════════════════════════════════════
-            NetworkMessage::VrfLeaderClaim { round, node_id, vrf_output, vrf_proof, slot_seed, reputation, timestamp } => {
+            NetworkMessage::VrfLeaderClaim { round, node_id, vrf_output, vrf_proof, slot_seed, reputation, timestamp, vrf_public_key } => {
                 self.update_peer_last_seen(&node_id);
                 
                 // Validate sizes
@@ -11275,28 +11277,58 @@ impl SimplifiedP2P {
                                  node_id, vrf_output.len(), slot_seed.len());
                     }
                 } else {
-                    // Verify VRF proof against registered public key
-                    let verified = match crate::genesis_constants::get_vrf_public_key(&node_id) {
-                        Some(pk_bytes) => {
-                            let mut out = [0u8; 32];
-                            out.copy_from_slice(&vrf_output);
-                            let vrf_result = crate::crypto::vrf::VrfOutput {
-                                output: out,
-                                proof: vrf_proof.clone(),
-                            };
-                            crate::crypto::vrf::DilithiumVrf::verify_static(
-                                &pk_bytes, &slot_seed, &vrf_result,
-                            ).unwrap_or(false)
-                        }
+                    // v4.2: Get pk from registry, or use inline pk from claim (self-verifiable)
+                    let pk_for_verify = match crate::genesis_constants::get_vrf_public_key(&node_id) {
+                        Some(pk_bytes) => Some(pk_bytes),
                         None => {
-                            if crate::node::is_debug() {
-                                println!("[DBG][VRF] claim_no_pk node={}", node_id);
+                            // First claim from this node — use inline public key
+                            if vrf_public_key.len() == crate::crypto::vrf::D3_PK_BYTES {
+                                Some(vrf_public_key.clone())
+                            } else {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][VRF] claim_no_pk node={} inline_len={}",
+                                             node_id, vrf_public_key.len());
+                                }
+                                None
                             }
-                            false
                         }
                     };
 
+                    let verified = if let Some(pk_bytes) = &pk_for_verify {
+                        let mut out = [0u8; 32];
+                        out.copy_from_slice(&vrf_output);
+                        let vrf_result = crate::crypto::vrf::VrfOutput {
+                            output: out,
+                            proof: vrf_proof.clone(),
+                        };
+                        crate::crypto::vrf::DilithiumVrf::verify_static(
+                            pk_bytes, &slot_seed, &vrf_result,
+                        ).unwrap_or(false)
+                    } else {
+                        false
+                    };
+
                     if verified {
+                        // v4.2: Auto-register pk on first verified claim (trust-on-first-verify)
+                        if !crate::genesis_constants::has_vrf_key(&node_id) {
+                            if let Some(ref pk_bytes) = pk_for_verify {
+                                crate::genesis_constants::register_vrf_public_key(&node_id, pk_bytes);
+                                // Persist to RocksDB for restart survival
+                                if let Some(ref storage) = self.storage {
+                                    let pk_hex = hex::encode(pk_bytes);
+                                    if let Err(e) = storage.save_vrf_public_key(&node_id, &pk_hex) {
+                                        if crate::node::is_debug() {
+                                            println!("[DBG][VRF] pk_persist_err node={} err={}", node_id, e);
+                                        }
+                                    }
+                                }
+                                if crate::node::is_info() {
+                                    println!("[INFO][VRF] pk_auto_registered node={} pk_hash={}",
+                                             node_id, hex::encode(&pk_bytes[..8]));
+                                }
+                            }
+                        }
+
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -11322,8 +11354,10 @@ impl SimplifiedP2P {
                             }
                         }
                     } else {
-                        println!("[WARN][VRF] claim_rejected round={} node={} reason=invalid_proof",
-                                 round, node_id);
+                        if crate::node::is_warn() {
+                            println!("[WARN][VRF] claim_rejected round={} node={} reason=invalid_proof",
+                                     round, node_id);
+                        }
                     }
                 }
             }
@@ -19219,6 +19253,7 @@ impl SimplifiedP2P {
         vrf_proof: Vec<u8>,
         slot_seed: [u8; 32],
         reputation: f64,
+        vrf_public_key: Vec<u8>,
     ) {
         // Prevent double broadcast for same round
         if OWN_CLAIM_BROADCAST.contains_key(&round) {
@@ -19239,6 +19274,7 @@ impl SimplifiedP2P {
             slot_seed: slot_seed.to_vec(),
             reputation,
             timestamp: now,
+            vrf_public_key: vrf_public_key.clone(),
         };
 
         // Also store own claim locally (verified by definition)
