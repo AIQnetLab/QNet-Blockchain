@@ -285,8 +285,14 @@ function transformTransaction(
     return null;
   }
 
-  // Skip genesis benchmark transactions
+  // Skip genesis benchmark transactions (initial 1000 account creation)
   if (blockHeight === 0 && from === 'genesis' && to && to.startsWith('EON1be')) {
+    return null;
+  }
+
+  // Skip benchmark transactions (from/to EON1benchmark* test accounts)
+  // These are synthetic load-test TXs that should not appear in Explorer
+  if (from.startsWith('EON1benchmark') || (to && to.startsWith('EON1benchmark'))) {
     return null;
   }
 

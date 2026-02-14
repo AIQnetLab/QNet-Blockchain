@@ -409,12 +409,12 @@ Explorer → Node RPC (RocksDB)
   - 100 ticks per second (10ms intervals) for smooth entropy generation
   - 5,000 hashes per tick (optimized for 1-second microblocks)
   - Sequential ordering via SHA3-512 every 4th hash (limits parallelization, not formal VDF)
-  - Integrated into QRDS (Quantum-Resistant Deterministic Selection) for consensus
+  - Integrated into Dilithium3-VRF Secret Leader Election for consensus
   - Checkpoint persistence with zstd compression (every 1M hashes)
   - Clock drift: 5-7% (excellent for production)
   - 72 bytes overhead per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
-- **QRDS (Quantum-Resistant Deterministic Selection)**: SHA3-512 deterministic selection with FINALITY_WINDOW entropy, Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
+- **Dilithium3-VRF Secret Leader Election**: Post-quantum VRF (NIST FIPS 204, ML-DSA-65) with macroblock N-2 entropy, unpredictable and verifiable leader selection for Byzantine-safe consensus
 - **Hybrid Parallel Executor Execution**: 5-stage pipeline with 10,000 parallel transactions
 - **Adaptive BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
@@ -860,28 +860,29 @@ Fair penalties - equal for ALL nodes (including Genesis):
 | **Network Flooding** | >100 msgs/sec from single node | -10.0 points |
 | **Invalid Consensus** | Malformed commit/reveal | -5.0 points |
 
-### **Deterministic Producer Selection (Not VRF)**
+### **Dilithium3-VRF Secret Leader Election (v4.0)**
 ```rust
-// Quantum-resistant deterministic selection for fair producer rotation
-// All nodes compute the same selection deterministically using finality window
-let entropy_height = current_height - FINALITY_WINDOW; // 10 blocks back
-let entropy_source = get_block_hash(entropy_height); // Byzantine-finalized
+// Post-quantum VRF leader election — unpredictable, verifiable, bias-resistant
+// NIST FIPS 204 (ML-DSA-65) Dilithium3 detached signature as VRF proof
 
-selection_hash = SHA3_512(
-    leadership_round + 
-    sorted_candidates +
-    entropy_source  // Finalized block hash (SHA3(prev + elig))
-);
+// Step 1: Compute deterministic slot seed (same on all nodes)
+let slot_seed = SHA3_256(macroblock_N2_hash || leadership_round);
 
-// DETERMINISTIC: All nodes select the same producer
-let selection_value = u64::from_bytes(selection_hash[0..8]);
-let selection_index = (selection_value % candidates.len()) as usize;
-let selected_producer = candidates[selection_index];
+// Step 2: Each node evaluates VRF with their secret key
+let (vrf_output, vrf_proof) = VRF_eval(my_secret_key, slot_seed);
 
-// ⚠️  LIMITATION: Not true VRF (no private key randomness)
-// ⚠️  Biasable by 67%+ Byzantine coalition controlling entropy source
-// ✅ SECURITY: Finality window prevents individual producer manipulation
-// ✅ BENEFIT: No per-node VRF keys, simpler verification, lower overhead
+// Step 3: If elected (output < threshold), broadcast claim to peers
+if vrf_output < calculate_threshold(my_rep, total_rep) {
+    broadcast_leader_claim(round, vrf_output, vrf_proof);
+}
+
+// Step 4: All nodes collect claims, winner = lowest VRF output
+let winner = verified_claims.min_by(|a, b| a.vrf_output.cmp(&b.vrf_output));
+
+// ✅ UNPREDICTABLE: VRF output = f(secret_key, slot_seed) — unknowable without sk
+// ✅ VERIFIABLE: Any node can verify(pk, slot_seed, proof) → output
+// ✅ BIAS-RESISTANT: Dilithium3 signing is deterministic (no nonce manipulation)
+// ✅ POST-QUANTUM: NIST FIPS 204 Level 3 (128-bit PQ security)
 ```
 
 ## 🔄 Advanced Synchronization
@@ -1097,13 +1098,91 @@ git pull origin testnet
 
 # Build production Docker image
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
+```
 
-# Run interactive production node
-docker run -it --name qnet-node --restart=always \
+#### 🔑 Genesis Node Launch (hardcoded bootstrap nodes only)
+
+```bash
+# Genesis Node #1 (example — replace ID and seed for each genesis node)
+docker run -d --name qnet-genesis-001 --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=001 \
+  -e QNET_GENESIS_SEED="your twelve or twenty four word mnemonic phrase here" \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
-  -v $(pwd)/node_data:/app/node_data \
+  -v $(pwd)/genesis_001_data:/app/data \
   qnet-production
 ```
+
+#### 🚀 Super Node Launch (requires activation code from 1DEV burn)
+
+```bash
+# Super Node — --name is Docker container name (any name you like, for docker management only)
+# Network node_id is auto-generated from your activation code: super_QNET-XXXX-XXXX-XXXX-XXXX
+docker run -d --name my-qnet-node --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_ACTIVATION_CODE="QNET-XXXX-XXXX-XXXX-XXXX" \
+  -e QNET_WALLET_SEED="your twelve or twenty four word mnemonic phrase here" \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+  -v $(pwd)/super_node_data:/app/data \
+  qnet-production
+```
+
+> **💡 Container name (`--name`)**: This is your local Docker label — pick any name you want (e.g. `my-qnet-node`, `qnet-super-eu`, `validator-1`). It is NOT your network identity.
+>
+> **🔗 Network node_id**: Auto-generated from your activation code as `super_{activation_code}` (e.g. `super_QNET-AB12-CD34-EF56-GH78`). Genesis nodes use `genesis_node_001` format. You don't set this manually.
+>
+> **⚠️ Mnemonic Seed Phrase**: Both 12-word (128-bit) and 24-word (256-bit) BIP39 mnemonics are supported.
+> The seed phrase derives your wallet address and stays **only in process memory** (not saved to disk).
+> Dilithium3 keypair is generated on first launch, encrypted with **AES-256-GCM**, and stored in the Docker volume with `chmod 600`.
+
+#### 🔐 Key Storage & Security
+
+| Data | Storage | Format | Protection |
+|------|---------|--------|------------|
+| Mnemonic seed | Environment variable (RAM only) | Text, 12 or 24 BIP39 words | Process memory isolation |
+| Wallet address | In-memory + blockchain | 41-char EON format | Public data |
+| Dilithium3 PK | Docker volume (`/app/data/keys/`) | 1952 bytes | AES-256-GCM encrypted, chmod 600 |
+| Dilithium3 SK | Docker volume (`/app/data/keys/`) | 4000 bytes | AES-256-GCM encrypted, chmod 600 |
+| VRF public keys | RocksDB (`/app/data/blockchain/`) | Hex-encoded | Persistent, public data |
+
+#### 🚚 Node Migration to Another Server
+
+When moving a node to a different server, you **must** copy the key files:
+
+```bash
+# On OLD server: backup key data from Docker volume
+docker cp my-qnet-node:/app/data/keys ./keys_backup
+
+# On NEW server: restore key data before starting
+mkdir -p $(pwd)/super_node_data/keys
+cp -r ./keys_backup/* $(pwd)/super_node_data/keys/
+
+# Then start the node with the SAME mnemonic and SAME activation code
+docker run -d --name my-qnet-node --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_ACTIVATION_CODE="QNET-XXXX-XXXX-XXXX-XXXX" \
+  -e QNET_WALLET_SEED="your twelve or twenty four word mnemonic phrase here" \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+  -v $(pwd)/super_node_data:/app/data \
+  qnet-production
+```
+
+> **⚠️ CRITICAL**: The Dilithium3 keypair is generated randomly (not from seed).
+> If you lose the key files, the network will not recognize your node even with the correct mnemonic.
+> The mnemonic only derives the wallet address — the cryptographic keys are separate.
+> Always backup your Docker volume (`/app/data/keys/`) when migrating!
 
 **Clean Build & Cache:**
 
@@ -1504,6 +1583,7 @@ For genesis bootstrap nodes (production network initialization):
 # PRODUCTION Genesis Nodes (each on separate server):
 # Genesis Node #001 (154.38.160.39 - North America)
 docker run -d --name qnet-genesis-001 --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=001 \
   -e DOCKER_ENV=1 \
@@ -1515,6 +1595,7 @@ docker run -d --name qnet-genesis-001 --restart=always \
 
 # Genesis Node #002 (62.171.157.44 - Europe)
 docker run -d --name qnet-genesis-002 --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=002 \
   -e DOCKER_ENV=1 \
@@ -1526,6 +1607,7 @@ docker run -d --name qnet-genesis-002 --restart=always \
 
 # Genesis Node #003 (161.97.86.81 - Europe)
 docker run -d --name qnet-genesis-003 --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=003 \
   -e DOCKER_ENV=1 \
@@ -1537,6 +1619,7 @@ docker run -d --name qnet-genesis-003 --restart=always \
 
 # Genesis Node #004 (5.189.130.160 - Europe)
 docker run -d --name qnet-genesis-004 --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=004 \
   -e DOCKER_ENV=1 \
@@ -1548,6 +1631,7 @@ docker run -d --name qnet-genesis-004 --restart=always \
 
 # Genesis Node #005 (162.244.25.114 - Europe)
 docker run -d --name qnet-genesis-005 --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=005 \
   -e DOCKER_ENV=1 \

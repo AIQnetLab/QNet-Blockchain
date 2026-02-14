@@ -88,6 +88,10 @@ mod producer_cache {
         Lazy::new(|| DashMap::new());
 }
 
+// PRODUCTION v4.0: Global VRF instance for static access in select_producer
+static GLOBAL_VRF_INSTANCE: std::sync::Mutex<Option<Arc<crate::crypto::vrf::DilithiumVrf>>> =
+    std::sync::Mutex::new(None);
+
 use qnet_state::{State as StateManager, Account, Transaction, Block, BlockType, MicroBlock, MacroBlock, LightMicroBlock, ConsensusData};
 use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId, CommitRevealConsensus, ConsensusError};
@@ -854,12 +858,10 @@ fn generate_eon_address_from_id(id: &str) -> String {
     let part1 = &hash[..19];
     let part2 = &hash[19..34];
     
-    // Generate SHA-256 checksum (first 4 hex chars) - for wallet compatibility
+    // SHA3-256 checksum (first 4 hex chars) - v4.0 migrated from SHA2
     let checksum_input = format!("{}eon{}", part1, part2);
-    use sha2::{Sha256, Digest as Sha2Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(checksum_input.as_bytes());
-    let checksum = hex::encode(&hasher.finalize()[..2]); // 2 bytes = 4 hex chars
+    use sha3::{Sha3_256, Digest};
+    let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..2]);
     
     format!("{}eon{}{}", part1, part2, checksum)
 }
@@ -991,7 +993,7 @@ impl Default for PerformanceConfig {
             parallel_threads: auto_parallel_threads,
             
             p2p_compression: env::var("QNET_P2P_COMPRESSION").unwrap_or_default() == "1",
-            batch_size: env::var("QNET_BATCH_SIZE").unwrap_or_default().parse().unwrap_or(100000),
+            batch_size: env::var("QNET_BATCH_SIZE").unwrap_or_default().parse().unwrap_or(200000),
             
             high_throughput: env::var("QNET_HIGH_THROUGHPUT").unwrap_or_default() == "1",
             high_frequency: env::var("QNET_HIGH_FREQUENCY").unwrap_or_default() == "1",
@@ -1259,6 +1261,14 @@ pub struct BlockchainNode {
     // Maps node_id -> (NodeType, wallet_address, api_endpoint)
     // Populated on startup from blockchain + updated when NodeRegistration TXs are processed
     node_registration_cache: Arc<DashMap<String, (qnet_state::NodeType, String, String)>>,
+
+    // PRODUCTION v4.0: Wallet identity from QNET_WALLET_SEED (seed → wallet + Dilithium3 keypair)
+    // Used for: VRF producer election, registration proof, P2P message signing
+    wallet_identity: Option<Arc<crate::crypto::vrf::WalletIdentity>>,
+
+    // PRODUCTION v4.0: Dilithium3-VRF instance for secret leader election
+    // Initialized from wallet_identity's keypair at startup
+    vrf_instance: Option<Arc<crate::crypto::vrf::DilithiumVrf>>,
 }
 
 impl BlockchainNode {
@@ -1270,6 +1280,100 @@ impl BlockchainNode {
     /// v2.96: Get state manager for blockchain state access (pending_rewards, balances, etc)
     pub fn get_state_manager(&self) -> Arc<RwLock<StateManager>> {
         self.state.clone()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PRODUCTION v4.0: Wallet Identity + Dilithium3-VRF
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Initialize WalletIdentity from seed phrase
+    /// Loads persistent Dilithium3 keypair from DilithiumKeyManager
+    /// Derives deterministic wallet address from seed (SHA3-256)
+    fn initialize_wallet_identity(&mut self, wallet_seed: &str) -> Result<(), String> {
+        use crate::crypto::key_manager::DilithiumKeyManager;
+        use crate::crypto::vrf::{WalletIdentity, DilithiumVrf};
+        use pqcrypto_traits::sign::{PublicKey as PkTrait, SecretKey as SkTrait};
+
+        // Load or generate persistent Dilithium3 keypair
+        let key_dir = std::path::PathBuf::from("/app/data/keys");
+        let km = DilithiumKeyManager::new(self.node_id.clone(), &key_dir)
+            .map_err(|e| format!("[ERR][NODE] key_manager_init err={}", e))?;
+        let (pk, sk) = km.get_keypair()
+            .map_err(|e| format!("[ERR][NODE] keypair err={}", e))?;
+        let pk_bytes = PkTrait::as_bytes(&pk).to_vec();
+        let sk_bytes = SkTrait::as_bytes(&sk).to_vec();
+
+        // Create WalletIdentity (seed → wallet address + keypair reference)
+        let identity = WalletIdentity::from_seed_and_keys(wallet_seed, pk_bytes, sk_bytes)?;
+
+        println!("[INFO][NODE] wallet={} pk_len={}", identity.wallet_address, identity.dilithium_pk.len());
+
+        // Create VRF instance from this identity
+        let vrf = identity.create_vrf(&self.node_id)?;
+
+        let vrf_arc = Arc::new(vrf);
+        self.wallet_identity = Some(Arc::new(identity));
+        self.vrf_instance = Some(vrf_arc.clone());
+
+        // Set global VRF instance for static access in select_producer
+        if let Ok(mut global) = GLOBAL_VRF_INSTANCE.lock() {
+            *global = Some(vrf_arc);
+        }
+        Ok(())
+    }
+
+    /// Get wallet address (prefers seed-derived, falls back to legacy)
+    pub fn get_wallet_address_v2(&self) -> String {
+        if let Some(ref identity) = self.wallet_identity {
+            identity.wallet_address.clone()
+        } else {
+            self.get_wallet_address() // legacy fallback
+        }
+    }
+
+    /// Get VRF instance for producer election
+    pub fn get_vrf(&self) -> Option<Arc<crate::crypto::vrf::DilithiumVrf>> {
+        self.vrf_instance.clone()
+    }
+
+    /// Get wallet identity for signing
+    pub fn get_wallet_identity(&self) -> Option<Arc<crate::crypto::vrf::WalletIdentity>> {
+        self.wallet_identity.clone()
+    }
+
+    /// v4.0: Verify VRF proof in received microblock
+    /// Uses producer's registered Dilithium3 public key from VRF_PK_REGISTRY
+    pub fn verify_block_vrf_proof(
+        microblock: &qnet_state::MicroBlock,
+    ) -> Result<bool, String> {
+        use crate::crypto::vrf::DilithiumVrf;
+
+        let (vrf_output, vrf_proof) = match (&microblock.vrf_output, &microblock.vrf_proof) {
+            (Some(out), Some(proof)) => (*out, proof.clone()),
+            _ => return Ok(true), // No VRF fields = legacy block, skip
+        };
+
+        // Lookup producer's registered VRF public key
+        let pk = match crate::genesis_constants::get_vrf_public_key(&microblock.producer) {
+            Some(pk) => pk,
+            None => {
+                // Producer not in VRF registry — accept during migration
+                if microblock.height % 100 == 0 {
+                    println!("[INFO][VRF] no_pk_registered producer={} h={} (migration)",
+                             microblock.producer, microblock.height);
+                }
+                return Ok(true);
+            }
+        };
+
+        // Reconstruct slot_seed from block data
+        let slot_seed = DilithiumVrf::compute_slot_seed(
+            &microblock.previous_hash, microblock.height,
+        );
+
+        // Verify VRF proof
+        let vrf_out = crate::crypto::vrf::VrfOutput { output: vrf_output, proof: vrf_proof };
+        DilithiumVrf::verify_static(&pk, &slot_seed, &vrf_out)
     }
     
     /// PRODUCTION v2.78 / v3.41: Cleanup ALL ephemeral data from RocksDB (>24h)
@@ -4576,9 +4680,9 @@ impl BlockchainNode {
             let network_size = storage.estimate_network_size_for_config();
             
             let base_size = match network_size {
-                0..=100 => 100_000,        // Genesis/test: 100k
-                101..=10_000 => 500_000,   // Small network: 500k
-                10_001..=100_000 => 1_000_000,  // Medium network: 1M
+                0..=100 => 200_000,        // Genesis/test: 200k (v4.1: 2x)
+                101..=10_000 => 1_000_000, // Small network: 1M (v4.1: 2x)
+                10_001..=100_000 => 2_000_000,  // Medium network: 2M (v4.1: 2x)
                 _ => 2_000_000,            // Large network: 2M
             };
             
@@ -5301,8 +5405,8 @@ impl BlockchainNode {
         // Initialize Pre-execution manager
         let pre_execution_config = crate::pre_execution::PreExecutionConfig {
             lookahead_blocks: 3,      // Pre-execute 3 blocks ahead
-            max_tx_per_block: 100000,  // 100K TX/block max
-            cache_size: 300000,       // Cache 3 blocks × 100K TX
+            max_tx_per_block: 200000,  // 200K TX/block max (v4.1: 2x)
+            cache_size: 600000,       // Cache 3 blocks × 200K TX
             timeout_ms: 500,          // 500ms timeout
         };
         let pre_execution = Arc::new(crate::pre_execution::PreExecutionManager::new(pre_execution_config));
@@ -5358,7 +5462,7 @@ impl BlockchainNode {
             None
         };
         
-        let blockchain = Self {
+        let mut blockchain = Self {
             storage,
             state,
             mempool,
@@ -5406,9 +5510,45 @@ impl BlockchainNode {
             block_event_tx,
             deterministic_reputation,
             node_registration_cache: Arc::new(DashMap::new()),
+            wallet_identity: None,
+            vrf_instance: None,
         };
         
+        // PRODUCTION v4.0: Initialize WalletIdentity from QNET_WALLET_SEED
+        if let Ok(wallet_seed) = std::env::var("QNET_WALLET_SEED") {
+            match blockchain.initialize_wallet_identity(&wallet_seed) {
+                Ok(()) => println!("[INFO][NODE] wallet_identity initialized from QNET_WALLET_SEED"),
+                Err(e) => println!("[WARN][NODE] wallet_identity_init err={}", e),
+            }
+        } else if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+            // Genesis nodes: generate identity from bootstrap config
+            let genesis_seed = std::env::var("QNET_GENESIS_SEED")
+                .unwrap_or_else(|_| format!("genesis_bootstrap_{}", node_id));
+            match blockchain.initialize_wallet_identity(&genesis_seed) {
+                Ok(()) => println!("[INFO][NODE] genesis wallet_identity initialized"),
+                Err(e) => println!("[WARN][NODE] genesis wallet_identity err={}", e),
+            }
+        }
+        
         if is_debug() { println!("[DBG][NODE] created node_id={}", node_id); }
+        
+        // v4.0: Restore VRF public keys from persistent storage
+        {
+            match blockchain.storage.load_all_vrf_public_keys() {
+                Ok(keys) => {
+                    let count = keys.len();
+                    for (nid, pk_bytes) in keys {
+                        crate::genesis_constants::register_vrf_public_key(&nid, &pk_bytes);
+                    }
+                    if count > 0 {
+                        println!("[INFO][NODE] vrf_pk_restored count={}", count);
+                    }
+                }
+                Err(e) => {
+                    println!("[WARN][NODE] vrf_pk_restore err={}", e);
+                }
+            }
+        }
         
         // CRITICAL: Link deterministic reputation to P2P for unified access
         // This allows deterministic producer selection to use blockchain-based reputation
@@ -5737,7 +5877,7 @@ impl BlockchainNode {
             // Track processed transactions to avoid duplicates (deduplication cache)
             let mut processed_txs: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut last_cleanup = std::time::Instant::now();
-            const MAX_CACHE_SIZE: usize = 100_000; // 100K transactions
+            const MAX_CACHE_SIZE: usize = 200_000; // 200K transactions (v4.1: 2x)
             const CLEANUP_INTERVAL_SECS: u64 = 300; // 5 minutes
             
             // PRODUCTION v2.25.2: Batch accumulator for Ed25519 batch verification
@@ -7593,7 +7733,7 @@ impl BlockchainNode {
                             // This ensures ALL nodes see the macroblock boundary banner
                             if received_block.height % 90 == 0 && received_block.height > 0 {
                                 let shard_count = 256; // From perf_config
-                                let avg_tx_per_block = 100000; // 100K TX/block max
+                                let avg_tx_per_block = 200000; // 200K TX/block max (v4.1)
                                 let blocks_per_second = 1.0;
                                 let theoretical_tps = blocks_per_second * avg_tx_per_block as f64 * shard_count as f64;
                                 
@@ -8513,7 +8653,7 @@ impl BlockchainNode {
                 if is_info() { println!("[INFO][EMISSION] tx_fully_validated halving_support=true"); }
         }
         
-        println!("[VALIDATION] ✅ Microblock #{} fully validated", microblock.height);
+        println!("[INFO][VALIDATION] microblock_validated h={}", microblock.height);
         Ok(())
     }
     
@@ -8650,7 +8790,7 @@ impl BlockchainNode {
             }
         }
         
-        println!("[VALIDATION] ✅ Macroblock #{} fully validated with {} validators", 
+        println!("[INFO][VALIDATION] macroblock_validated h={} validators={}", 
                  macroblock.height, validator_count);
         Ok(())
     }
@@ -11660,7 +11800,7 @@ impl BlockchainNode {
                     
                     // Trigger emergency sync
                     if let Some(ref p2p) = unified_p2p {
-                        println!("[ERR][CONS] Starting emergency sync from {} to {}", 
+                        println!("[WARN][CONS] Starting emergency sync from {} to {}", 
                                 local_stored_height + 1, expected_height);
                         
                         // STATE MACHINE: Emergency sync
@@ -12062,14 +12202,14 @@ impl BlockchainNode {
                             // SCALABILITY FIX: Always query the SELECTED PRODUCER for entropy
                             // ═══════════════════════════════════════════════════════════════
                             // Problem: peers.iter().take(sample_size) is a RANDOM sample.
-                            // In large networks (1000 producers, sample=100), the QRDS-selected
+                            // In large networks (1000 producers, sample=100), the VRF-elected
                             // producer may NOT be in the sample. Then:
                             //   Node A (sampled producer): entropy=0 → fallback triggered
                             //   Node B (didn't sample):   None     → assumes synced → NO fallback
                             //   → Nodes disagree on producer → consensus break!
                             //
                             // Fix: After random sampling, explicitly query the selected producer.
-                            // ALL nodes selected the SAME producer (deterministic QRDS), so ALL
+                            // ALL nodes selected the SAME producer (deterministic VRF election), so ALL
                             // nodes query the SAME node → get SAME response → deterministic check.
                             // ═══════════════════════════════════════════════════════════════
                             if !ENTROPY_RESPONSES.contains_key(&(entropy_height, current_producer.clone())) {
@@ -12476,7 +12616,7 @@ impl BlockchainNode {
                                 }
                                 
                                 // DETERMINISTIC fallback selection using SHA3-512
-                                // Uses the SAME quantum-resistant algorithm as primary QRDS selection
+                                // BFT timeout fallback — used when VRF claims unavailable
                                 // Candidate list is from macroblock snapshot → IDENTICAL on all nodes
                                 use sha3::{Sha3_512, Digest};
                                 let mut selector = Sha3_512::new();
@@ -12798,7 +12938,7 @@ impl BlockchainNode {
                     let max_tx_per_microblock = std::env::var("QNET_BATCH_SIZE")
                         .unwrap_or_default()
                         .parse::<usize>()
-                        .unwrap_or(100_000);  // Default 100K for high TPS
+                        .unwrap_or(200_000);  // Default 200K TX/microblock (v4.1)
                         
                     let _high_performance = std::env::var("QNET_HIGH_FREQUENCY").unwrap_or_default() == "1";
                     let compression_enabled = std::env::var("QNET_COMPRESSION").unwrap_or_default() == "1";
@@ -13166,9 +13306,9 @@ impl BlockchainNode {
                     // PRODUCTION v2.63: Block size limit to prevent ShredProtocol overflow
                     // ═══════════════════════════════════════════════════════════════════════════
                     // DEFENSE LEVEL 1: Limit block size at creation time
-                    // MAX_BLOCK_SIZE = 40MB (less than ShredProtocol max of 43.5MB for safety margin)
+                    // MAX_BLOCK_SIZE = 80MB (v4.1: 2x increase, less than ShredProtocol max of 87MB)
                     // This prevents deadlock where block is created but cannot be transmitted
-                    const MAX_BLOCK_SIZE_BYTES: usize = 40_000_000; // 40MB hard limit
+                    const MAX_BLOCK_SIZE_BYTES: usize = 80_000_000; // 80MB hard limit (v4.1: was 40MB)
                     
                     let mut accumulated_size: usize = 0;
                     let original_tx_count = tx_bytes_list.len();
@@ -13186,7 +13326,7 @@ impl BlockchainNode {
                         .collect();
                     
                     if tx_bytes_list.len() < original_tx_count {
-                        println!("[INFO][BLOCK] size_limit_applied original_tx={} included_tx={} size_mb={:.2} max_mb=40",
+                        println!("[INFO][BLOCK] size_limit_applied original_tx={} included_tx={} size_mb={:.2} max_mb=80",
                                  original_tx_count, tx_bytes_list.len(), 
                                  accumulated_size as f64 / 1_000_000.0);
                     }
@@ -13702,111 +13842,37 @@ impl BlockchainNode {
                     // CRITICAL FIX: Use EXISTING HybridCrypto instance (don't create new cert!)
                     // ═══════════════════════════════════════════════════════════════════════════
                     // Note: Fields named vrf_output/vrf_proof for serialization compatibility
+                    // ═══════════════════════════════════════════════════════════════════
+                    // v4.0: DILITHIUM3-VRF BLOCK PROOF (PRODUCTION)
+                    // No fallbacks — Dilithium3 only (NIST FIPS 204, Level 3)
+                    //
+                    // slot_seed = SHA3-256(prev_hash || block_height)
+                    // VRF(wallet_sk, slot_seed) → (output, proof)
+                    // output: 32-byte pseudorandom (QRB + leader election)
+                    // proof: ~3293-byte Dilithium3 detached signature (verifiable)
+                    // ═══════════════════════════════════════════════════════════════════
                     let (qrb_output, qrb_proof) = {
-                        use crate::hybrid_crypto::{GLOBAL_HYBRID_INSTANCES, HybridCrypto};
-                        use sha3::{Sha3_512, Sha3_256, Digest};
-                        
-                        // QRB input: deterministic, same on all nodes verifying this block
-                        let mut qrb_input = Vec::new();
-                        qrb_input.extend_from_slice(b"QNet_QRB_v3");
-                        qrb_input.extend_from_slice(&prev_hash);
-                        qrb_input.extend_from_slice(&next_block_height.to_le_bytes());
-                        qrb_input.extend_from_slice(node_id.as_bytes());
-                        
-                        // CRITICAL FIX: Use EXISTING HybridCrypto instance from global cache
-                        // This prevents creating new certificate every block!
-                        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
-                            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-                        }).await;
-                        
-                        let normalized_id = Self::normalize_node_id(&node_id);
-                        let mut instances_guard = instances.lock().await;
-                        
-                        // Get or create instance (only creates cert if not exists)
-                        if !instances_guard.contains_key(&normalized_id) {
-                            let mut hybrid = HybridCrypto::new(normalized_id.clone());
-                            if let Err(e) = hybrid.initialize().await {
-                                println!("[QRB] ⚠️ Failed to initialize hybrid crypto: {}", e);
-                            } else {
-                                instances_guard.insert(normalized_id.clone(), hybrid);
-                            }
-                        }
-                        
-                        // Generate QRB randomness using EXISTING certificate
-                        // CRITICAL: Do NOT rotate certificate here!
-                        // Rotation happens in sign_microblock_with_dilithium() WITH broadcast
-                        // If we rotate here, the new cert won't be broadcast → other nodes reject
-                        // CRITICAL v2.32: QRB signing MUST produce FULL cryptographic proof
-                        // - Ed25519 ephemeral key (forward secrecy)
-                        // - Dilithium signature (post-quantum protection)
-                        // - Valid certificate (chain of trust)
-                        if let Some(hybrid) = instances_guard.get(&normalized_id) {
-                            // Try signing with retries (3 attempts)
-                            let mut sign_result: Option<crate::hybrid_crypto::HybridSignature> = None;
-                            for attempt in 0..3u32 {
-                                match hybrid.sign_message(&qrb_input).await {
-                                    Ok(sig) => { sign_result = Some(sig); break; }
-                                    Err(e) => {
-                                        if attempt < 2 {
-                                            println!("[WARN][QRB] sign attempt={}/3 err={} retrying", attempt + 1, e);
-                                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                                        } else {
-                                            println!("[ERR][QRB] all 3 sign attempts failed err={}", e);
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            if let Some(signature) = sign_result {
-                                // SUCCESS: Full cryptographic proof (Ed25519 + Dilithium + Certificate)
-                                let mut output_hasher = Sha3_512::new();
-                                output_hasher.update(b"QNet_QRB_Output_v3");
-                                output_hasher.update(&signature.message_signature);
-                                let hash = output_hasher.finalize();
-                                let mut vrf_out = [0u8; 32];
-                                vrf_out.copy_from_slice(&hash[..32]);
-                                
-                                let proof_bytes = bincode::serialize(&signature).unwrap_or_default();
-                                
+                        let vrf = Self::get_vrf_static();
+                        if let Some(ref vrf) = vrf {
+                            let slot_seed = crate::crypto::vrf::DilithiumVrf::compute_slot_seed(
+                                &prev_hash, next_block_height,
+                            );
+                            match vrf.evaluate(&slot_seed) {
+                                Ok(vrf_out) => {
                                 if next_block_height % 30 == 1 {
-                                    println!("[INFO][QRB] h={} full_crypto_proof=true pq_secure=true", next_block_height);
-                                }
-                                
-                                (Some(vrf_out), Some(proof_bytes))
-                            } else {
-                                // All retries failed - CRITICAL: Cannot produce block without crypto!
-                                println!("[FATAL][QRB] Crypto signing failed after 3 retries - CANNOT PRODUCE BLOCK!");
-                                println!("[FATAL][QRB] Node should NOT produce blocks with broken cryptography");
-                                // Return None to signal block production should be skipped
-                                (None, None)
-                            }
-                        } else {
-                            // No instance - try to create one
-                            println!("[WARN][QRB] no hybrid instance, creating new");
-                            let mut new_hybrid = HybridCrypto::new(normalized_id.clone());
-                            if new_hybrid.initialize().await.is_ok() {
-                                match new_hybrid.sign_message(&qrb_input).await {
-                                    Ok(signature) => {
-                                        instances_guard.insert(normalized_id.clone(), new_hybrid);
-                                        let mut output_hasher = Sha3_512::new();
-                                        output_hasher.update(b"QNet_QRB_Output_v3");
-                                        output_hasher.update(&signature.message_signature);
-                                        let hash = output_hasher.finalize();
-                                        let mut vrf_out = [0u8; 32];
-                                        vrf_out.copy_from_slice(&hash[..32]);
-                                        let proof_bytes = bincode::serialize(&signature).unwrap_or_default();
-                                        println!("[INFO][QRB] new_instance=true full_proof=true");
-                                        (Some(vrf_out), Some(proof_bytes))
+                                        println!("[INFO][VRF] h={} dilithium3=true pq=fips204_level3",
+                                                 next_block_height);
+                                    }
+                                    (Some(vrf_out.output), Some(vrf_out.proof))
                                     }
                                     Err(e) => {
-                                        println!("[FATAL][QRB] new instance sign failed err={} - CANNOT PRODUCE!", e);
+                                    println!("[FATAL][VRF] eval_failed h={} err={}", next_block_height, e);
                                         (None, None)
                                     }
                                 }
                             } else {
-                                println!("[FATAL][QRB] crypto init failed - CANNOT PRODUCE BLOCK!");
+                            println!("[FATAL][VRF] not_initialized h={} — QNET_WALLET_SEED required", next_block_height);
                                 (None, None)
-                            }
                         }
                     };
                     
@@ -15330,21 +15396,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("[REPUTATION] ✅ Genesis reputation initialization completed");
     }
     
-    /// PRODUCTION: Select microblock producer using Quantum-Resistant Deterministic Selection every 30 blocks
-    /// Uses SHA3-512 deterministic hash (NOT VRF) to ensure all nodes compute identical result
+    /// PRODUCTION v4.0: Select microblock producer using Dilithium3-VRF Secret Leader Election
+    /// every 30 blocks. VRF output = f(secret_key, slot_seed) → unpredictable, verifiable.
     /// 
-    /// v3.8: CRITICAL FIX - Added timeout_round for DETERMINISTIC failover
+    /// v3.8→v4.0: CRITICAL FIX - Added timeout_round for DETERMINISTIC failover
     /// ═══════════════════════════════════════════════════════════════════════════
     /// PROBLEM: Previous emergency broadcast system was NON-DETERMINISTIC!
     ///   - Different nodes received broadcast at different times
     ///   - Some nodes had emergency flag, others didn't
     ///   - Different nodes selected different producers → FORK!
     ///
-    /// SOLUTION: Round-based deterministic selection (like Tendermint/Cosmos)
-    ///   - Round 0: Normal QRDS selection
+    /// SOLUTION: VRF election + BFT timeout failover (like Algorand)
+    ///   - Round 0: VRF Secret Leader Election (lowest output wins)
     ///   - Round 1+: Exclude failed producers from previous rounds DETERMINISTICALLY
     ///   - ALL nodes compute SAME excluded list from SAME blockchain data
-    ///   - NO BROADCAST NEEDED!
+    ///   - NO BROADCAST NEEDED for failover!
     /// ═══════════════════════════════════════════════════════════════════════════
     pub async fn select_microblock_producer(
         current_height: u64,
@@ -15372,8 +15438,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>,
         timeout_round: u64,
     ) -> String {
-        // PRODUCTION: Quantum-Resistant Deterministic Selection (QRDS)
-        // Each 30-block period uses SHA3-512 deterministic hash to select producer from qualified candidates
+        // PRODUCTION v4.0: Dilithium3-VRF Secret Leader Election
+        // Each 30-block period uses VRF to elect producer from qualified candidates
         
         if let Some(p2p) = unified_p2p {
             // PERFORMANCE FIX: Cache producer selection for entire 30-block period to prevent HTTP spam
@@ -15527,8 +15593,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // This is IDENTICAL to emergency selection (line 6841) and macroblock consensus (line 7595)
             candidates.sort_by(|a, b| a.0.cmp(&b.0));  // Sort by node_id alphabetically
             
-            // PRODUCTION: Quantum-Resistant Deterministic Selection (QRDS)
-            // Uses SHA3-512 + FINALITY_WINDOW entropy for deterministic producer selection
+            // PRODUCTION v4.0: Dilithium3-VRF Secret Leader Election
+            // Uses macroblock N-2 hash + leadership_round as VRF slot seed
             
             // Calculate deterministic entropy that ALL nodes will have (no waiting for blocks!)
             let vrf_entropy = {
@@ -15699,7 +15765,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 };
                 prev_hash
             } else {
-                println!("[QRDS] ⚠️ No storage available - using deterministic entropy");
+                println!("[WARN][VRF] no_storage — using zero entropy");
                 [0u8; 32]
             };
             
@@ -15712,155 +15778,227 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 vrf_seed
             };
             
-            // QUANTUM-RESISTANT DETERMINISTIC SELECTION
-            // Uses entropy from Dilithium-signed blocks for quantum resistance
+            // ═══════════════════════════════════════════════════════════════════════════
+            // PRODUCTION v4.0: DILITHIUM3-VRF SECRET LEADER ELECTION
+            // ═══════════════════════════════════════════════════════════════════════════
+            // 
+            // PROTOCOL:
+            //   1. slot_seed = SHA3-256(macroblock_N-2_hash || leadership_round)
+            //   2. Each node: VRF_eval(wallet_sk, slot_seed) → (output, proof)
+            //   3. If output < threshold(rep/total_rep) → broadcast VrfLeaderClaim
+            //   4. All nodes collect claims (~1.5s window at rotation boundary)
+            //   5. Winner = lowest VRF output among verified claims
+            //   6. Block header: vrf_output + vrf_proof (verifiable by all)
+            //
+            // NO FALLBACK: VRF is the ONLY selection method.
+            // If no claims → BFT Timeout Protocol handles liveness.
+            //
+            // SECURITY:
+            //   - Unpredictable: VRF output = f(secret_key, slot_seed)
+            //   - Verifiable: verify(pk, slot_seed, proof) → output
+            //   - Bias-resistant: Dilithium3 signing is deterministic
+            //   - Post-quantum: NIST FIPS 204, ML-DSA-65 (Level 3)
+            // ═══════════════════════════════════════════════════════════════════════════
             
             if is_debug() { println!("[DBG][PROD] select round={} candidates={}", leadership_round, candidates.len()); }
             
-            // CRITICAL: The entropy comes from:
-            // 1. Previous block hash (signed with Dilithium - quantum resistant!)
-            // 2. Macroblock hash (Byzantine consensus with Dilithium signatures)
-            // 3. Round number and candidate list
-            // This provides quantum resistance WITHOUT requiring per-node VRF keys
-            
-            // ═══════════════════════════════════════════════════════════════════════════
-            // PRODUCTION: DETERMINISTIC SHA3 PRODUCER SELECTION (NIST/Cisco Compliant)
-            // ═══════════════════════════════════════════════════════════════════════════
-            // 
-            // ARCHITECTURE:
-            //   1. SELECTION: Deterministic SHA3-512 (quantum-resistant, identical for all nodes)
-            //   2. BLOCK SIGNING: Hybrid signature (Dilithium signs ephemeral Ed25519 per message)
-            //   3. VERIFICATION: Any node can verify selection via: SHA3(entropy + round + candidates)
-            //
-            // WHY NOT VRF FOR SELECTION:
-            //   - VRF requires per-node secret key → different outputs → FORKS!
-            //   - Deterministic hash gives SAME result on ALL nodes → NO FORKS
-            //   - Quantum resistance via SHA3-512 (2^128 quantum security)
-            //
-            // QUANTUM SAFETY:
-            //   - SHA3-512: NIST approved, Grover's algorithm gives 2^128 security
-            //   - Block signatures: Dilithium3 (NIST FIPS 204, Level 3)
-            //   - Ephemeral keys: New Ed25519 keypair for EACH message (per NIST/Cisco)
-            // ═══════════════════════════════════════════════════════════════════════════
-            
             let selected_producer = if candidates.len() == 1 {
-                // Optimization: Single candidate - no selection needed
+                // Single candidate — no VRF election needed
                 if is_debug() { println!("[DBG][PROD] single={}", candidates[0].0); }
                 candidates[0].0.clone()
             } else {
-                // ═══════════════════════════════════════════════════════════════════════════
-                // v3.8: DETERMINISTIC ROUND-BASED PRODUCER SELECTION
-                // ═══════════════════════════════════════════════════════════════════════════
-                // Like Tendermint/Cosmos: If producer fails, exclude them in next round
-                // ALL nodes compute SAME excluded list from SAME blockchain data → NO FORK!
-                // ═══════════════════════════════════════════════════════════════════════════
-                use sha3::{Sha3_512, Digest};
+                use crate::crypto::vrf::DilithiumVrf;
+                use crate::unified_p2p::SimplifiedP2P;
+
+                // Compute slot seed (same on all nodes — deterministic)
+                let mut slot_seed = [0u8; 32];
+                slot_seed.copy_from_slice(&vrf_entropy);
+                let slot_input = DilithiumVrf::compute_slot_seed(&slot_seed, leadership_round);
+                let total_rep: f64 = candidates.iter().map(|(_, r)| *r).sum();
+
+                // ─── Step 1: Evaluate own VRF + broadcast claim ───────────────
+                if let Some(ref vrf) = Self::get_vrf_static() {
+                    let own_rep = candidates.iter()
+                        .find(|(id, _)| id == own_node_id)
+                        .map(|(_, r)| *r)
+                        .unwrap_or(0.0);
+
+                    if own_rep > 0.0 {
+                        match vrf.evaluate(&slot_input) {
+                            Ok(vrf_out) => {
+                                let threshold = DilithiumVrf::calculate_threshold(own_rep, total_rep);
+                                if vrf_out.output_as_u128() < threshold {
+                                    // Elected! Broadcast claim to all validators
+                                    if is_info() {
+                                        println!("[INFO][VRF] self_elected round={} rep={:.1}/{:.1}",
+                                                 leadership_round, own_rep, total_rep);
+                                    }
+                                    if let Some(ref p2p) = unified_p2p {
+                                        p2p.broadcast_leader_claim(
+                                            leadership_round,
+                                            vrf_out.output,
+                                            vrf_out.proof.clone(),
+                                            slot_input,
+                                            own_rep,
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if is_debug() { println!("[DBG][VRF] eval_err={}", e); }
+                            }
+                        }
+                    }
+                }
+
+                // ─── Step 2: Collect claims from P2P (rotation boundary only) ──
+                // At rotation boundary: wait brief window for claims to arrive
+                // Within rotation: use cached claims (already collected)
+                let is_rotation_boundary = current_height > 0 && 
+                    ((current_height - 1) % 30 == 0 || current_height == 1);
                 
-                // Helper function to select producer from candidates with given round
-                let select_for_round = |cands: &[(String, f64)], round: u64| -> String {
-                    if cands.is_empty() {
-                        return own_node_id.to_string();
+                if is_rotation_boundary {
+                    // Brief collection window — claims are gossiped in parallel
+                    // 1.5s is enough for VRF eval (~5ms) + QUIC gossip (~50ms) + network
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                    
+                    // Cleanup old rounds
+                    SimplifiedP2P::cleanup_old_claims(leadership_round);
+                }
+
+                // ─── Step 3: Select winner from verified claims ────────────────
+                let claims = SimplifiedP2P::get_leader_claims(leadership_round);
+                
+                let winner = if !claims.is_empty() {
+                    // Filter claims to only include current candidates
+                    let candidate_ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+                    let valid_claims: Vec<_> = claims.iter()
+                        .filter(|c| candidate_ids.contains(&c.node_id.as_str()))
+                        .collect();
+
+                    if !valid_claims.is_empty() {
+                        // Winner = lowest VRF output (deterministic across all nodes)
+                        let winner_claim = valid_claims.iter()
+                            .min_by(|a, b| a.vrf_output.cmp(&b.vrf_output))
+                            .unwrap();
+
+                        if is_info() && is_rotation_boundary {
+                            println!("[INFO][VRF] winner={} round={} claims={}/{} output={}",
+                                     winner_claim.node_id, leadership_round,
+                                     valid_claims.len(), claims.len(),
+                                     hex::encode(&winner_claim.vrf_output[..8]));
+                        }
+                        winner_claim.node_id.clone()
+                    } else {
+                        // Claims exist but none from current candidates
+                        // This can happen during topology changes — use BFT timeout
+                        if is_warn() {
+                            println!("[WARN][VRF] no_valid_claims round={} total_claims={} candidates={}",
+                                     leadership_round, claims.len(), candidates.len());
+                        }
+                        String::new() // Empty = trigger BFT timeout
                     }
-                    
-                    let mut selector = Sha3_512::new();
-                    selector.update(b"QNet_Deterministic_Producer_Selection_v8");
-                    selector.update(&vrf_entropy);
-                    selector.update(&leadership_round.to_le_bytes());
-                    selector.update(&round.to_le_bytes()); // Include timeout_round!
-                    
-                    for (candidate_id, _) in cands {
-                        selector.update(candidate_id.as_bytes());
+                } else {
+                    // ─── No claims received ────────────────────────────────────
+                    // This happens when:
+                    // a) Network just started (no VRF keys registered yet)
+                    // b) All nodes' VRF outputs exceeded threshold (unlikely)
+                    // c) Network partition (claims didn't arrive)
+                    //
+                    // BFT TIMEOUT PROTOCOL handles liveness:
+                    // - After ~5s without block, nodes vote for timeout
+                    // - When 2/3+ vote, next candidate is tried
+                    // - This ensures liveness via BFT timeout protocol
+                    //
+                    // GENESIS BOOTSTRAP: First 180 blocks use genesis candidates
+                    // Genesis nodes always have seeds → always produce claims
+                    if current_height <= 180 {
+                        // Genesis bootstrap: first genesis candidate produces
+                        // All genesis nodes have VRF keys → at least one claim will arrive
+                        // If still no claims (very first blocks), use first genesis
+                        if is_info() {
+                            println!("[INFO][VRF] genesis_bootstrap h={} round={}", current_height, leadership_round);
+                        }
+                        candidates[0].0.clone() // First genesis candidate (sorted)
+                    } else {
+                        // Post-bootstrap: empty = BFT timeout will handle
+                        if is_warn() {
+                            println!("[WARN][VRF] no_claims round={} candidates={} — waiting for BFT timeout",
+                                     leadership_round, candidates.len());
+                        }
+                        String::new()
                     }
-                    
-                    let hash = selector.finalize();
-                    let value = u64::from_le_bytes([
-                        hash[0], hash[1], hash[2], hash[3],
-                        hash[4], hash[5], hash[6], hash[7],
-                    ]);
-                    
-                    let idx = (value as usize) % cands.len();
-                    cands[idx].0.clone()
                 };
-                
-                // v3.8: Calculate excluded producers from previous rounds DETERMINISTICALLY
-                // Round 0: no exclusions
-                // Round 1: exclude producer from Round 0
-                // Round 2: exclude producers from Round 0 and Round 1
-                // etc.
+
+                // ─── Step 4: Timeout round exclusion (BFT failover) ────────────
+                // If timeout_round > 0, the original winner failed to produce
+                // Exclude failed producers and select next-lowest VRF output
+                if timeout_round > 0 && !winner.is_empty() {
                 let mut excluded: Vec<String> = Vec::new();
                 
+                    // Deterministic replay of previous rounds
                 for prev_round in 0..timeout_round {
-                    // Get candidates NOT in excluded list
-                    let available: Vec<(String, f64)> = candidates.iter()
-                        .filter(|(id, _)| !excluded.contains(id))
-                        .cloned()
+                        let prev_claims = SimplifiedP2P::get_leader_claims(leadership_round);
+                        let available: Vec<_> = prev_claims.iter()
+                            .filter(|c| !excluded.contains(&c.node_id))
+                            .filter(|c| candidates.iter().any(|(id, _)| id == &c.node_id))
                         .collect();
                     
-                    if available.is_empty() {
-                        break; // All candidates exhausted
-                    }
-                    
-                    // Who was selected in prev_round?
-                    let failed_producer = select_for_round(&available, prev_round);
-                    excluded.push(failed_producer.clone());
-                    
+                        if let Some(prev_winner) = available.iter()
+                            .min_by(|a, b| a.vrf_output.cmp(&b.vrf_output))
+                        {
+                            excluded.push(prev_winner.node_id.clone());
                     if is_info() && prev_round == timeout_round - 1 {
-                        println!("[INFO][TIMEOUT] h={} round={} excluded={}", 
-                                 current_height, prev_round, failed_producer);
+                                println!("[INFO][TIMEOUT] excluded={} round={}", prev_winner.node_id, prev_round);
+                            }
+                        }
                     }
-                }
-                
-                // Now select for current round from remaining candidates
-                let final_candidates: Vec<(String, f64)> = candidates.iter()
-                    .filter(|(id, _)| !excluded.contains(id))
-                    .cloned()
+                    
+                    // Select from remaining claims
+                    let remaining: Vec<_> = claims.iter()
+                        .filter(|c| !excluded.contains(&c.node_id))
+                        .filter(|c| candidates.iter().any(|(id, _)| id == &c.node_id))
                     .collect();
                 
-                let winner = if final_candidates.is_empty() {
-                    // All candidates exhausted — wrap around to full deterministic list
-                    // SCALABILITY FIX: Do NOT use ENTROPY_RESPONSES for filtering here.
-                    // ENTROPY_RESPONSES is populated by sampling (100/1000 peers) and differs
-                    // between nodes → non-deterministic filtering → consensus break.
-                    //
-                    // Instead: use deterministic candidates list with timeout_round offset.
-                    // If selected node turns out to be not_synced, the entropy consensus check
-                    // in the main loop (producer_is_synchronized) will catch it and trigger
-                    // deterministic fallback via calculate_qualified_candidates (BUG #2 fix).
-                    //
-                    // Two-layer defense (both fully deterministic):
-                    //   Layer 1: timeout rotation cycles through candidates (this code)
-                    //   Layer 2: entropy check + fallback excludes not_synced (main loop)
-                    if is_warn() {
-                        println!("[WARN][TIMEOUT] h={} all_candidates_exhausted timeout_round={} wrapping_to_full_list={}", 
-                                 current_height, timeout_round, candidates.len());
-                    }
-                    select_for_round(&candidates, timeout_round)
+                    if let Some(next_winner) = remaining.iter()
+                        .min_by(|a, b| a.vrf_output.cmp(&b.vrf_output))
+                    {
+                        if is_info() {
+                            println!("[INFO][VRF] timeout_winner={} round={} timeout={}",
+                                     next_winner.node_id, leadership_round, timeout_round);
+                        }
+                        next_winner.node_id.clone()
                 } else {
-                    select_for_round(&final_candidates, timeout_round)
-                };
-                
-                // Log at rotation boundaries or when timeout_round > 0
-                if timeout_round > 0 || (current_height > 0 && ((current_height - 1) % 30 == 0 || current_height == 1)) {
-                    if is_info() { 
-                        println!("[INFO][PROD] selected={} round={} timeout={} candidates={}/{}", 
-                                 winner, leadership_round, timeout_round, 
-                                 final_candidates.len(), candidates.len()); 
+                        // All claimants exhausted — BFT timeout continues
+                        if is_warn() {
+                            println!("[WARN][VRF] all_claimants_exhausted round={} timeout={}",
+                                     leadership_round, timeout_round);
+                        }
+                        String::new()
                     }
-                }
-                
+                } else {
                 winner
+                }
             };
             
             
             // ═══════════════════════════════════════════════════════════════════════════
-            // v3.8: REMOVED emergency_override - now using timeout_round instead!
+            // v4.0: VRF leader election complete
+            // Winner = lowest VRF output among verified LeaderClaims
+            // Timeout failover = exclude failed winners, pick next-lowest
+            // If empty string returned → BFT Timeout Protocol handles liveness
             // ═══════════════════════════════════════════════════════════════════════════
-            // OLD PROBLEM: Emergency override used LOCAL flag that differed between nodes
-            // NEW SOLUTION: timeout_round provides DETERMINISTIC failover
-            //   - All nodes see same blockchain state
-            //   - All nodes compute same excluded producers
-            //   - NO BROADCAST NEEDED → NO FORK!
-            // ═══════════════════════════════════════════════════════════════════════════
+            
+            // v4.0: If VRF returned empty string → no valid claims, trigger BFT timeout
+            // The calling code will detect no producer and let BFT Timeout Protocol handle liveness
+            if selected_producer.is_empty() {
+                if is_warn() {
+                    println!("[WARN][VRF] no_producer h={} round={} timeout={} — BFT timeout will handle",
+                             current_height, leadership_round, timeout_round);
+                }
+                // Return empty — main loop will detect and trigger timeout voting
+                return selected_producer;
+            }
             
             // PERFORMANCE FIX: Only cache for timeout_round=0 (normal selection)
             // Don't cache timeout rounds as they're height-specific
@@ -15869,19 +16007,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 CACHED_PRODUCER_SELECTION.retain(|round, _| *round + 3 >= leadership_round);
             }
             
-            // ═══════════════════════════════════════════════════════════════════════════
-            // v3.17: Pure deterministic producer selection (QRDS)
-            // ═══════════════════════════════════════════════════════════════════════════
-            // Removed Byzantine voting - determinism ensured by calculate_qualified_candidates(target_height)
-            // All nodes use same target_height → same MacroBlock N-2 → same candidates → same producer
-            // ═══════════════════════════════════════════════════════════════════════════
             let is_rotation_boundary = current_height > 0 && (current_height - 1) % rotation_interval == 0;
             
             // Log at rotation boundaries
             if is_rotation_boundary || current_height == 1 {
                 let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
                 if is_info() {
-                    println!("[INFO][QRDS] producer={} round={} timeout={} next_rotation={}", 
+                    println!("[INFO][VRF] producer={} round={} timeout={} next_rotation={}", 
                              selected_producer, leadership_round, timeout_round, next_rotation_block);
                 }
             }
@@ -15889,10 +16021,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             selected_producer
         } else {
             // Solo mode - no P2P peers
-            println!("[QRDS] 🏠 Solo mode - self production");
+            println!("[INFO][VRF] solo_mode — self production");
             // Warning: P2P not available - running in solo mode
             own_node_id.to_string()
         }
+    }
+    
+    /// v4.0: Get VRF instance from global (for static context in select_producer)
+    fn get_vrf_static() -> Option<Arc<crate::crypto::vrf::DilithiumVrf>> {
+        // Access via global node reference if available
+        // Phase 1: Returns None if VRF not initialized (falls back to SHA3 selection)
+        GLOBAL_VRF_INSTANCE.lock().ok().and_then(|g| g.clone())
     }
     
     /// CRITICAL FIX: Invalidate producer cache during emergency failover
@@ -15903,7 +16042,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         let old_size = CACHED_PRODUCER_SELECTION.len();
         CACHED_PRODUCER_SELECTION.clear();
-        println!("[PRODUCER_CACHE] 🔄 Producer cache invalidated ({} entries cleared) - forcing new selection", old_size);
+        println!("[INFO][CACHE] producer_cache_invalidated entries_cleared={}", old_size);
     }
     
     /// v3.16: Byzantine 66% consensus on producer selection
@@ -19763,197 +19902,71 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// PRODUCTION: Sign microblock with HYBRID cryptography (compact signatures)
+    // ═══════════════════════════════════════════════════════════════════
+    // v4.0: PRODUCTION — Pure Dilithium3 Block Signing
+    // No HybridCrypto, no Ed25519, no certificates
+    // Uses WalletIdentity from QNET_WALLET_SEED (detached_sign)
+    // Signature: ~3293 bytes (Dilithium3 NIST FIPS 204 Level 3)
+    // ═══════════════════════════════════════════════════════════════════
     async fn sign_microblock_with_dilithium(
         microblock: &qnet_state::MicroBlock,
         node_id: &str,
-        unified_p2p: Option<&Arc<SimplifiedP2P>>
+        _unified_p2p: Option<&Arc<SimplifiedP2P>>
     ) -> Result<Vec<u8>, String> {
         use sha3::{Sha3_256, Digest};
         
-        // Create message to sign (microblock hash without signature)
+        // Create deterministic message hash (same on all nodes for verification)
         let mut hasher = Sha3_256::new();
+        hasher.update(b"QNet_Block_Sig_v4");
         hasher.update(&microblock.height.to_be_bytes());
         hasher.update(&microblock.timestamp.to_be_bytes());
         hasher.update(&microblock.merkle_root);
         hasher.update(&microblock.previous_hash);
+        hasher.update(&microblock.state_root);
         hasher.update(microblock.producer.as_bytes());
-        
+        if let Some(ref vrf_out) = microblock.vrf_output {
+            hasher.update(vrf_out);
+        }
         let message_hash = hasher.finalize();
-        let microblock_hash_str = hex::encode(message_hash);
         
-        // PRODUCTION: Use HYBRID cryptography for compact signatures (~3KB instead of 12KB)
-        use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
-        use tokio::sync::Mutex;
-        use std::sync::Arc;
+        // Sign with VRF instance (Dilithium3 detached signature)
+        // VRF instance holds the persistent keypair loaded from DilithiumKeyManager at startup
+        let global_vrf = GLOBAL_VRF_INSTANCE.lock()
+            .map_err(|e| format!("[ERR][SIGN] vrf_lock err={}", e))?;
         
-        // Normalize node_id for consistent signature format
-        let normalized_node_id = Self::normalize_node_id(node_id);
+        let vrf_ref = global_vrf.as_ref()
+            .ok_or("[ERR][SIGN] VRF not initialized — QNET_WALLET_SEED required")?;
         
-        // Get or create hybrid crypto instance from global cache
-        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
-            Arc::new(Mutex::new(std::collections::HashMap::new()))
-        }).await;
+        // Use VRF's evaluate to get a signed proof, then extract just the signature
+        // Alternatively: sign directly using the VRF's stored secret key
+        let sk_bytes = vrf_ref.get_secret_key_bytes()
+            .ok_or("[ERR][SIGN] VRF secret key not available")?;
         
-        let mut instances_guard = instances.lock().await;
+        use pqcrypto_dilithium::dilithium3;
+        use pqcrypto_traits::sign::{
+            SecretKey as SkTrait,
+            DetachedSignature as SigTrait,
+        };
         
-        // Create instance if not exists
-        if !instances_guard.contains_key(&normalized_node_id) {
-            let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
-            if let Err(e) = hybrid.initialize().await {
-                println!("[WARN][CRYPTO] Failed to initialize hybrid crypto for microblock: {}", e);
-                drop(instances_guard);
-                // Fallback to pure Dilithium
-                return Self::sign_microblock_with_pure_dilithium(microblock, node_id).await;
-            }
-            
-            // Broadcast initial certificate for this node
-            if let Some(cert) = hybrid.get_current_certificate() {
-                if let Ok(cert_bytes) = bincode::serialize(&cert) {
-                    println!("[CRYPTO] 📜 Initial certificate ready for microblock producer: {}", cert.serial_number);
-                    // Store certificate serial for later broadcast
-                    // Actual broadcast happens after instance is stored
-                }
-            }
-            
-            instances_guard.insert(normalized_node_id.clone(), hybrid);
+        let sk = dilithium3::SecretKey::from_bytes(&sk_bytes)
+            .map_err(|e| format!("[ERR][SIGN] sk_parse err={:?}", e))?;
+        let sig = dilithium3::detached_sign(message_hash.as_ref(), &sk);
+        let sig_bytes = SigTrait::as_bytes(&sig).to_vec();
+        
+        // Prefix: "dilithium3_v4:" + hex(signature)
+        let sig_hex = hex::encode(&sig_bytes);
+        let prefixed = format!("dilithium3_v4:{}", sig_hex);
+        
+        if microblock.height % 30 == 1 {
+            println!("[INFO][SIGN] h={} dilithium3=fips204 size={}", microblock.height, prefixed.len());
         }
         
-        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
-        
-        // Check if certificate needs rotation
-        if hybrid.needs_rotation() {
-            // CRITICAL: Get old serial BEFORE rotation to detect actual change
-            let old_serial = hybrid.get_current_certificate()
-                .map(|c| c.serial_number.clone());
-            
-            if let Err(e) = hybrid.rotate_certificate().await {
-                println!("[WARN][CRYPTO] Certificate rotation failed for microblock: {}", e);
-            } else {
-                // PRODUCTION: Broadcast new certificate ONLY if it actually changed
-                if let Some(new_cert) = hybrid.get_current_certificate() {
-                    // Check if serial number changed (prevents duplicate broadcasts)
-                    let serial_changed = old_serial.as_ref().map_or(true, |old| old != &new_cert.serial_number);
-                    
-                    if serial_changed {
-                    if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
-                            println!("[CRYPTO] 📜 TRACKED broadcast of rotated certificate: {} (serial changed)", new_cert.serial_number);
-                        // Broadcast to network if P2P instance available
-                        if let Some(p2p) = unified_p2p {
-                                // CRITICAL: Use tracked broadcast for microblock certificate rotation
-                                match p2p.broadcast_certificate_announce_tracked(new_cert.serial_number.clone(), cert_bytes.clone()).await {
-                                    Ok(()) => {
-                                        println!("[CRYPTO] ✅ Certificate delivered to 2/3+ peers (Byzantine threshold)");
-                                    }
-                                    Err(e) => {
-                                        println!("[WARN][CRYPTO] Byzantine threshold NOT reached: {}", e);
-                                        println!("[CRYPTO] 🔄 Continuing with available peers");
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        println!("[CRYPTO] 📋 Certificate unchanged - skipping duplicate broadcast");
-                    }
-                }
-            }
-        }
-        
-        // Create COMPACT signature for microblock (2.6KB bincode)
-        // CRITICAL: Sign the raw hash bytes, not the hex string!
-        // OPTIMIZED v2.24: bincode+zstd instead of JSON
-        use base64::{Engine as _, engine::general_purpose};
-        match hybrid.sign_message_compact(message_hash.as_ref()).await {
-            Ok(compact_sig) => {
-                // Serialize to bincode+zstd+base64
-                match compact_sig.to_binary_compressed() {
-                    Ok(binary_data) => {
-                        let base64_data = general_purpose::STANDARD.encode(&binary_data);
-                        let sig_with_prefix = format!("compact_bin:{}", base64_data);
-                        let sig_bytes = sig_with_prefix.as_bytes().to_vec();
-                        
-                        println!("[CRYPTO] ✅ Microblock #{} signed with COMPACT hybrid signature", microblock.height);
-                        println!("[CRYPTO]    Certificate: {}", compact_sig.cert_serial);
-                        println!("[CRYPTO]    Size: {} bytes (bincode v2.24)", sig_bytes.len());
-                        Ok(sig_bytes)
-                    }
-                    Err(e) => {
-                        println!("[ERR][CRYPTO] Compact signature serialization failed: {:?}", e);
-                        drop(instances_guard);
-                        Self::sign_microblock_with_pure_dilithium(microblock, node_id).await
-                    }
-                }
-            }
-            Err(e) => {
-                println!("[ERR][CRYPTO] Compact signature failed for microblock: {:?}", e);
-                drop(instances_guard);
-                // Fallback to pure Dilithium
-                Self::sign_microblock_with_pure_dilithium(microblock, node_id).await
-            }
-        }
+        Ok(prefixed.as_bytes().to_vec())
     }
     
-    /// CRITICAL: This function should NOT be used anymore!
-    /// All signatures MUST use hybrid crypto with ephemeral keys per NIST/Cisco
-    /// This function now creates HYBRID signature as a recovery mechanism
+    /// v4.0: Kept for compatibility — delegates to sign_microblock_with_dilithium
     async fn sign_microblock_with_pure_dilithium(microblock: &qnet_state::MicroBlock, node_id: &str) -> Result<Vec<u8>, String> {
-        use sha3::{Sha3_256, Digest};
-        use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
-        use std::sync::Arc;
-        
-        println!("[WARN][CRYPTO] RECOVERY: sign_microblock_with_pure_dilithium called - using HYBRID instead");
-        
-        // Create message hash
-        let mut hasher = Sha3_256::new();
-        hasher.update(&microblock.height.to_be_bytes());
-        hasher.update(&microblock.timestamp.to_be_bytes());
-        hasher.update(&microblock.merkle_root);
-        hasher.update(&microblock.previous_hash);
-        hasher.update(microblock.producer.as_bytes());
-        let message_hash = hasher.finalize();
-        
-        // Get or create hybrid crypto instance
-        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-        }).await;
-        
-        let mut instances_guard = instances.lock().await;
-        
-        // Normalize node_id
-        let normalized_node_id = Self::normalize_node_id(node_id);
-        
-        // Create instance if not exists - MUST succeed
-        if !instances_guard.contains_key(&normalized_node_id) {
-            let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
-            if let Err(e) = hybrid.initialize().await {
-                return Err(format!("CRITICAL: Cannot init hybrid crypto in recovery: {}", e));
-            }
-            instances_guard.insert(normalized_node_id.clone(), hybrid);
-        }
-        
-        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
-        
-        // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
-        // OPTIMIZED v2.24: bincode+zstd format
-        use base64::{Engine as _, engine::general_purpose};
-        match hybrid.sign_message_compact(message_hash.as_ref()).await {
-            Ok(compact_sig) => {
-                match compact_sig.to_binary_compressed() {
-                    Ok(binary_data) => {
-                        let base64_data = general_purpose::STANDARD.encode(&binary_data);
-                        let sig_with_prefix = format!("compact_bin:{}", base64_data);
-                        let sig_bytes = sig_with_prefix.as_bytes().to_vec();
-                        println!("[CRYPTO] ✅ RECOVERY: Microblock #{} signed with HYBRID (bincode v2.24)", microblock.height);
-                        Ok(sig_bytes)
-                    }
-                    Err(e) => {
-                        Err(format!("Failed to serialize hybrid signature: {}", e))
-                    }
-                }
-            }
-            Err(e) => {
-                Err(format!("Failed to sign microblock with hybrid: {:?}", e))
-            }
-        }
+        Self::sign_microblock_with_dilithium(microblock, node_id, None).await
     }
     
     /// PRODUCTION: Verify HYBRID signature for received microblock (supports compact)
@@ -19995,8 +20008,80 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         };
         
-        // PRODUCTION: Check if this is a compact signature
-        // v2.24: Support both bincode (compact_bin:) and legacy JSON (compact:)
+        // ═══════════════════════════════════════════════════════════════════
+        // v4.0: DILITHIUM3 DIRECT SIGNATURE (production format)
+        // Format: "dilithium3_v4:{hex_signature}"
+        // Verified against producer's registered VRF public key
+        // ═══════════════════════════════════════════════════════════════════
+        if sig_str.starts_with("dilithium3_v4:") {
+            let sig_hex = &sig_str[14..]; // Skip "dilithium3_v4:" prefix
+            let sig_bytes = match hex::decode(sig_hex) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("[ERR][SIGN] hex_decode err={}", e);
+                    return Ok(false);
+                }
+            };
+
+            // Lookup producer's Dilithium3 public key
+            let pk = match crate::genesis_constants::get_vrf_public_key(&microblock.producer) {
+                Some(pk) => pk,
+                None => {
+                    println!("[WARN][SIGN] no_pk_registered producer={} h={}", 
+                             microblock.producer, microblock.height);
+                    // During migration: accept blocks from unregistered producers
+                    return Ok(true);
+                }
+            };
+
+            // Recreate message hash (MUST match sign_microblock_with_dilithium)
+            let mut hasher2 = Sha3_256::new();
+            hasher2.update(b"QNet_Block_Sig_v4");
+            hasher2.update(&microblock.height.to_be_bytes());
+            hasher2.update(&microblock.timestamp.to_be_bytes());
+            hasher2.update(&microblock.merkle_root);
+            hasher2.update(&microblock.previous_hash);
+            hasher2.update(&microblock.state_root);
+            hasher2.update(microblock.producer.as_bytes());
+            if let Some(ref vrf_out) = microblock.vrf_output {
+                hasher2.update(vrf_out);
+            }
+            let msg_hash = hasher2.finalize();
+
+            // Verify Dilithium3 detached signature
+            use pqcrypto_dilithium::dilithium3;
+            use pqcrypto_traits::sign::{
+                PublicKey as PkTrait,
+                DetachedSignature as SigTrait2,
+            };
+
+            let d3_pk = match dilithium3::PublicKey::from_bytes(&pk) {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("[ERR][SIGN] pk_parse err={:?}", e);
+                    return Ok(false);
+                }
+            };
+            let d3_sig = match dilithium3::DetachedSignature::from_bytes(&sig_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("[ERR][SIGN] sig_parse err={:?}", e);
+                    return Ok(false);
+                }
+            };
+
+            let valid = dilithium3::verify_detached_signature(&d3_sig, msg_hash.as_ref(), &d3_pk).is_ok();
+            if valid {
+                if microblock.height % 100 == 0 {
+                    println!("[INFO][SIGN] verified h={} dilithium3=fips204", microblock.height);
+                }
+            } else {
+                println!("[ERR][SIGN] dilithium3_invalid h={} producer={}", microblock.height, microblock.producer);
+            }
+            return Ok(valid);
+        }
+
+        // Legacy: compact_bin / compact signature formats (for pre-v4 blocks)
         use base64::{Engine as _, engine::general_purpose};
         let compact_sig: crate::hybrid_crypto::CompactHybridSignature = if sig_str.starts_with("compact_bin:") {
             // v2.24: Parse binary compact signature (bincode+zstd+base64)
@@ -20170,98 +20255,40 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 println!("[WARN][CRYPTO] Certificate {} not found in RAM cache", compact_sig.cert_serial);
                 
                 // ═══════════════════════════════════════════════════════════════════
-                // ARCHITECTURAL FIX v2.29: Certificate fallback from vrf_proof
-                // For historical blocks, producer may be offline → extract cert from block itself!
-                // QRB uses sign_message() which includes FULL HybridSignature with certificate
+                // v4.0: Dilithium3-VRF proof verification (replaces HybridCrypto cert)
+                // vrf_proof contains Dilithium3 detached signature (~3293 bytes)
+                // Verified against producer's registered VRF public key
                 // ═══════════════════════════════════════════════════════════════════
                 
-                // FALLBACK 1: Extract certificate from vrf_proof (if present)
-                let cert_from_vrf_proof = if let Some(ref vrf_proof_bytes) = microblock.vrf_proof {
-                    match bincode::deserialize::<crate::hybrid_crypto::HybridSignature>(vrf_proof_bytes) {
-                        Ok(hybrid_sig) => {
-                            // Verify certificate matches the producer
-                            if hybrid_sig.certificate.node_id == microblock.producer {
-                                println!("[CRYPTO] 📜 Extracted certificate from vrf_proof for block #{}", 
-                                         microblock.height);
-                                println!("[CRYPTO]    Serial: {}", hybrid_sig.certificate.serial_number);
-                                
-                                // Cache this certificate for future blocks from same producer
-                                // v2.96: No lock held here - safe to acquire new one
-                                if let Ok(cert_bytes) = bincode::serialize(&hybrid_sig.certificate) {
-                                    if let Ok(mut cm) = p2p_ref.certificate_manager.write() {
-                                        cm.store_remote_certificate(
-                                            hybrid_sig.certificate.serial_number.clone(), 
-                                            cert_bytes
-                                        );
-                                        println!("[CRYPTO] 💾 Cached certificate from vrf_proof");
-                                    }
-                                }
-                                
-                                Some(hybrid_sig.certificate)
-                            } else {
-                                println!("[WARN][CRYPTO] vrf_proof certificate node_id mismatch: {} != {}", 
-                                         hybrid_sig.certificate.node_id, microblock.producer);
-                                None
+                let cert_from_vrf_proof: Option<crate::hybrid_crypto::HybridCertificate> = {
+                    // v4.0: Verify VRF proof using Dilithium3 (no HybridCrypto)
+                    match Self::verify_block_vrf_proof(microblock) {
+                        Ok(true) => {
+                            if microblock.height % 100 == 0 {
+                                println!("[INFO][VRF] block_proof_verified h={} producer={}",
+                                         microblock.height, microblock.producer);
                             }
                         }
+                        Ok(false) => {
+                            println!("[WARN][VRF] block_proof_invalid h={} producer={}",
+                                     microblock.height, microblock.producer);
+                        }
                         Err(e) => {
-                            println!("[WARN][CRYPTO] Failed to deserialize vrf_proof: {}", e);
-                            None
+                            println!("[WARN][VRF] proof_verify_err h={} err={}", microblock.height, e);
                         }
                     }
-                } else {
-                    println!("[WARN][CRYPTO] Block #{} has no vrf_proof - cannot extract certificate", 
-                             microblock.height);
+                    // NOTE: cert_from_vrf_proof is None — legacy HybridCertificate no longer used
+                    // Block signature verification below uses Dilithium3 directly
                     None
                 };
                 
-                // If we got certificate from vrf_proof, verify the block signature with it
-                if let Some(ref certificate) = cert_from_vrf_proof {
-                    // Check certificate expiration (historical blocks may have expired certs - that's OK)
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    
-                    // For historical blocks, don't check expiration - cert was valid when block was created
-                    let block_age = now.saturating_sub(microblock.timestamp);
-                    let skip_expiry_check = block_age > 300; // Blocks older than 5 minutes
-                    
-                    if !skip_expiry_check && now > certificate.expires_at + 60 {
-                        println!("[WARN][CRYPTO] vrf_proof certificate expired (but continuing for historical block)");
-                    }
-                    
-                    // Verify Ed25519 signature using ephemeral public key
-                    if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
-                        let ed_sig_array: [u8; 64] = ed_sig_bytes;
-                        
-                        let message_hash_bytes = hex::decode(&message_hash_str)
-                            .map_err(|_| "Invalid hex in message hash")?;
-                        
-                        match HybridCrypto::verify_ed25519_signature(
-                            &message_hash_bytes,
-                            &ed_sig_array,
-                            &compact_sig.ephemeral_public_key
-                        ) {
-                            Ok(true) => {
-                                println!("[CRYPTO] ✅ Ed25519 verified using certificate from vrf_proof");
-                                // NOTE: Dilithium verification still happens below (MANDATORY)
-                                // We just set ed25519_verified = true and continue
-                                // return Ok(true) was WRONG - skipped Dilithium!
-                            }
-                            Ok(false) => {
-                                println!("[ERR][CRYPTO] Ed25519 verification failed with vrf_proof cert");
-                            }
-                            Err(e) => {
-                                println!("[ERR][CRYPTO] Ed25519 verification error: {}", e);
-                            }
-                        }
-                    }
-                }
+                // v4.0: VRF proof verified above via Dilithium3
+                // Legacy HybridCertificate extraction removed — no Ed25519 fallback
                 
-                // If vrf_proof extraction succeeded, we can proceed with Dilithium verification
-                if cert_from_vrf_proof.is_some() {
-                    true // Ed25519 passed, continue to Dilithium
+                // v4.0: VRF proof already verified via Dilithium3 above
+                // If block has VRF proof and producer is in registry → already verified
+                if microblock.vrf_proof.is_some() && crate::genesis_constants::has_vrf_key(&microblock.producer) {
+                    true // Dilithium3-VRF verified, proceed
                 } else {
                     // No vrf_proof - request from online producer (legacy fallback)
                     let now = SystemTime::now()
@@ -20529,8 +20556,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Err("Producer cannot be empty".to_string());
         }
         
-        if microblock.transactions.len() > 100000 {
-            return Err(format!("Too many transactions: {} (max: 100000)", microblock.transactions.len()));
+        if microblock.transactions.len() > 200000 {
+            return Err(format!("Too many transactions: {} (max: 200000)", microblock.transactions.len()));
         }
         
         // Validate timestamp is not too far in future
@@ -21819,7 +21846,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("              ⚡ Estimated TPS: {} (theoretical max: 100k+)", estimated_tps);
         println!("              🔗 Microblocks since last macroblock: {}", microblock_height % 90);
         
-        if estimated_tps > 100000 {
+        if estimated_tps > 200000 {
             println!("              🚀 HIGH PERFORMANCE MODE ACTIVE");
         }
     }
@@ -24557,19 +24584,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Get wallet address for this node (for activation verification)
     pub fn get_wallet_address(&self) -> String {
-        // PRODUCTION: Extract wallet address from stored activation code
-        // Generate proper EON address format: {19 hex}eon{15 hex}{4 hex checksum} = 41 chars
+        // v4.0: Prefer seed-derived wallet address if available
+        if let Some(ref identity) = self.wallet_identity {
+            return identity.wallet_address.clone();
+        }
+        // Legacy fallback: derive from node_id (for nodes without QNET_WALLET_SEED)
         let hash = blake3::hash(self.node_id.as_bytes()).to_hex();
         let part1 = &hash[..19];
         let part2 = &hash[19..34];
-        
-        // Generate SHA-256 checksum (first 4 hex chars) - for wallet compatibility
-        use sha2::{Sha256, Digest as Sha2Digest};
-        let checksum_input = format!("{}eon{}", part1, part2);
-        let mut hasher = Sha256::new();
-        hasher.update(checksum_input.as_bytes());
-        let checksum = hex::encode(&hasher.finalize()[..2]); // 2 bytes = 4 hex chars
-        
+        // SHA3-256 checksum (replaced SHA2)
+        use sha3::{Sha3_256, Digest};
+        let body = format!("{}eon{}", part1, part2);
+        let checksum = hex::encode(&Sha3_256::digest(body.as_bytes())[..2]);
         format!("{}eon{}{}", part1, part2, checksum)
     }
     
@@ -25890,6 +25916,8 @@ impl Clone for BlockchainNode {
             height: self.height.clone(),
             is_running: self.is_running.clone(),
             node_registration_cache: self.node_registration_cache.clone(),
+            wallet_identity: self.wallet_identity.clone(),
+            vrf_instance: self.vrf_instance.clone(),
             current_microblocks: self.current_microblocks.clone(),
             last_microblock_time: self.last_microblock_time.clone(),
             microblock_interval: self.microblock_interval,

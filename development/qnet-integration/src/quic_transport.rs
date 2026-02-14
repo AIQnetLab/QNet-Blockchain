@@ -62,10 +62,10 @@ const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
 /// Connection timeout (v2.45: kept at 3s for reliability)
 pub const CONNECT_TIMEOUT_SECS: u64 = 3;
 
-/// Send/receive timeout (v2.45: reduced from 5s to 3s - balanced)
-/// At 100Mbps: 43.5MB takes ~3.5s, so 3s timeout may need increase for large blocks (v2.63)
-/// Combined with CONNECT_RETRY_ATTEMPTS=3: max 9s per send (was 25s)
-pub const MESSAGE_TIMEOUT_SECS: u64 = 3;
+/// Send/receive timeout (v4.1: increased from 3s to 10s for 87MB blocks)
+/// At 100Mbps: 87MB takes ~7s, 10s gives safety margin
+/// Combined with CONNECT_RETRY_ATTEMPTS=3: max 30s per send
+pub const MESSAGE_TIMEOUT_SECS: u64 = 10;
 
 /// Keep-alive interval (same as HTTP TCP keepalive: 30s)
 pub const KEEP_ALIVE_SECS: u64 = 30;

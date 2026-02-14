@@ -770,14 +770,12 @@ impl QNetQuantumCrypto {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| {
                     // Fallback: Generate proper EON address format: {19}eon{15}{4 checksum} = 41 chars
-                    use sha2::{Sha256, Digest as Sha2Digest};
+                    use sha3::{Sha3_256, Digest};
                     let hash = blake3::hash(genesis_node_id.as_bytes()).to_hex();
                     let part1 = &hash[..19];
                     let part2 = &hash[19..34];
                     let checksum_input = format!("{}eon{}", part1, part2);
-                    let mut hasher = Sha256::new();
-                    hasher.update(checksum_input.as_bytes());
-                    let checksum = hex::encode(&hasher.finalize()[..2]);
+                    let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..2]);
                     format!("{}eon{}{}", part1, part2, checksum)
                 });
             
@@ -843,12 +841,10 @@ impl QNetQuantumCrypto {
         let full_hex = hex::encode(&wallet_hash);
         let part1 = &full_hex[..19];
         let part2 = &full_hex[19..34];
-        // Generate SHA-256 checksum for wallet compatibility
+        // SHA3-256 checksum (v4.0: migrated from SHA2)
         let checksum_input = format!("{}eon{}", part1, part2);
-        use sha2::{Sha256, Digest as Sha2Digest};
-        let mut checksum_hasher = Sha256::new();
-        checksum_hasher.update(checksum_input.as_bytes());
-        let checksum = hex::encode(&checksum_hasher.finalize()[..2]); // 4 hex chars
+        use sha3::{Sha3_256, Digest};
+        let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..2]);
         let wallet_address = format!("{}eon{}{}", part1, part2, checksum);
 
         // Calculate amount based on phase and node type (EXISTING ECONOMIC LOGIC)

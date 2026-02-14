@@ -618,11 +618,8 @@ fn validate_eon_address(address: &str) -> bool {
     // Verify SHA-256 checksum (for wallet compatibility)
     let address_without_checksum = format!("{}eon{}", part1, part2);
     let computed_checksum = {
-        use sha2::{Sha256, Digest as Sha2Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(address_without_checksum.as_bytes());
-        let hash = hasher.finalize();
-        hex::encode(&hash[..2]) // First 2 bytes = 4 hex chars
+        use sha3::{Sha3_256, Digest};
+        hex::encode(&Sha3_256::digest(address_without_checksum.as_bytes())[..2])
     };
     
     checksum == computed_checksum
@@ -657,11 +654,8 @@ fn validate_eon_address_with_error(address: &str) -> Result<(), String> {
     // Verify SHA-256 checksum (for wallet compatibility)
     let address_without_checksum = format!("{}eon{}", part1, part2);
     let computed_checksum = {
-        use sha2::{Sha256, Digest as Sha2Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(address_without_checksum.as_bytes());
-        let hash = hasher.finalize();
-        hex::encode(&hash[..2])
+        use sha3::{Sha3_256, Digest};
+        hex::encode(&Sha3_256::digest(address_without_checksum.as_bytes())[..2])
     };
     
     if checksum != computed_checksum {
@@ -1697,6 +1691,16 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_generate_activation_code);
 
+    // Secure activation code recovery endpoint
+    let recover_activation_code = api_v1
+        .and(warp::path("recover-activation-code"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_recover_activation_code);
+
     // Graceful shutdown endpoint for node replacement
     let graceful_shutdown = api_v1
         .and(warp::path("shutdown"))
@@ -2166,6 +2170,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(register_node)
         .or(activations_by_wallet)
         .or(generate_activation_code)
+        .or(recover_activation_code)
         .or(node_secure_info);
 
     let consensus_routes = consensus_commit
@@ -2245,7 +2250,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .with(cors);
     
     println!("🚀 Starting comprehensive API server on port {}", port);
-    println!("📡 JSON-RPC available at: http://0.0.0.0:{}/rpc", port);
+    println!("[INFO][RPC] json_rpc addr=0.0.0.0:{}/rpc", port);
     println!("🔌 REST API available at: http://0.0.0.0:{}/api/v1/", port);
     println!("🔗 WebSocket available at: ws://0.0.0.0:{}/ws/subscribe", port);
     println!("📱 Light Node services: Registration, FCM Push, Reward Claims");
@@ -5499,20 +5504,70 @@ async fn handle_light_node_register(
         })));
     }
     
+    // SECURITY: Validate activation code against BlockchainActivationRegistry
+    // Code contains XOR-encrypted wallet address — verify it matches the requester
+    // Prevents: (1) registration without 1DEV burn, (2) using stolen code from different wallet
+    {
+        let registry = &*GLOBAL_ACTIVATION_REGISTRY;
+        match registry.verify_code_ownership(&register_request.node_id, &register_request.wallet_address).await {
+            Ok(true) => {
+                println!("[INFO][LIGHT] code_ownership_verified wallet={}...", 
+                    &register_request.wallet_address[..16.min(register_request.wallet_address.len())]);
+            }
+            Ok(false) => {
+                println!("[WARN][LIGHT] code_ownership_rejected wallet={}... code={}...",
+                    &register_request.wallet_address[..16.min(register_request.wallet_address.len())],
+                    &register_request.node_id[..12.min(register_request.node_id.len())]);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Invalid activation code or code belongs to different wallet",
+                    "hint": "Burn 1DEV to get a valid activation code for this wallet"
+                })));
+            }
+            Err(e) => {
+                // SECURITY: Do NOT allow registration if code verification fails
+                // Could be: quantum crypto not initialized, corrupted code, forged code
+                println!("[ERROR][LIGHT] code_verification_failed wallet={}... err={}",
+                    &register_request.wallet_address[..16.min(register_request.wallet_address.len())], e);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Activation code verification unavailable. Try again later.",
+                    "hint": "Node may still be initializing. Retry in 30 seconds."
+                })));
+            }
+        }
+    }
+    
     // PRIVACY: Generate quantum-secure pseudonym for Light node (mobile privacy protection)
     let light_node_pseudonym = generate_light_node_pseudonym(&register_request.wallet_address);
     
-    // Verify quantum signature using pseudonym instead of raw node_id
-    let signature_valid = verify_dilithium_signature(
-        &light_node_pseudonym, 
-        &register_request.device_token, 
-        &register_request.quantum_signature
-    ).await;
+    // Verify quantum signature using CLIENT's public key (not genesis node keys!)
+    // Client signs wallet_address with Dilithium3, server verifies with client's quantum_pubkey
+    // Android DilithiumModule format: "dilithium_sig_{nodeId}_{base64}"
+    // base64 decodes to: [signed_msg_len(4 LE)] [signature(3293) + message(N)] [pk_len(4 LE)] [pk(1952)]
+    // MANDATORY: Dilithium3 quantum signature required — no fallback allowed
+    if register_request.quantum_pubkey.is_empty() 
+        || register_request.quantum_signature.is_empty() 
+        || register_request.quantum_signature.len() < 32 
+    {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Dilithium3 quantum signature is required for node registration",
+            "hint": "Client must provide quantum_pubkey and quantum_signature (ML-DSA-65)"
+        })));
+    }
+    
+    let signature_valid = verify_mobile_dilithium_signature(
+        &register_request.wallet_address,
+        &register_request.quantum_signature,
+        &register_request.quantum_pubkey
+    );
     
     if !signature_valid {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Invalid quantum signature for Light node registration"
+            "error": "Invalid Dilithium3 quantum signature for Light node registration",
+            "hint": "Client must sign wallet_address with Dilithium3 (ML-DSA-65)"
         })));
     }
     
@@ -5604,7 +5659,14 @@ async fn handle_light_node_register(
         crate::unified_p2p::PushType::Polling => "Polling",
     };
     
-    println!("[LIGHT] 📱 Light node registered: {} (push: {}, quantum-secured)", 
+    // v4.0: Register VRF public key for light node
+    if !register_request.quantum_pubkey.is_empty() {
+        if let Ok(pk_bytes) = hex::decode(&register_request.quantum_pubkey) {
+            crate::genesis_constants::register_vrf_public_key(&light_node_pseudonym, &pk_bytes);
+        }
+    }
+
+    println!("[INFO][LIGHT] node_registered pseudonym={} push={} quantum_secured=true", 
              light_node_pseudonym, push_type_str);
     
     // CRITICAL: Gossip Light node registration to P2P network for decentralized sync
@@ -5639,7 +5701,7 @@ async fn handle_light_node_register(
             is_active: true,              // Active by default
         };
         p2p.register_light_node(registration);
-        println!("[GOSSIP] 📤 Light node registration gossiped to network ({})", push_type_str);
+        println!("[INFO][GOSSIP] light_node_gossiped pseudonym={} push={}", light_node_pseudonym, push_type_str);
         
         // v2.71: Create ON-CHAIN NodeRegistration TX for Light nodes (only for NEW nodes)
         if registration_result == "node_created" {
@@ -5768,14 +5830,14 @@ async fn handle_shred_protocol_metrics(blockchain: Arc<BlockchainNode>) -> Resul
     
     let metrics = json!({
         "enabled": true,
-        "chunk_size": 262144,  // v2.63: 256KB (was 128KB - increased for 100K TPS)
+        "chunk_size": 524288,   // v4.1: 512KB (was 256KB - 2x for 200K TX/block)
         "fanout": fanout,  // REAL-TIME: Adaptive fanout (4-32)
         "qualified_producers": producers,  // REAL-TIME: Producers with reputation >= 70%
         "average_latency_ms": latency,  // REAL-TIME: Network performance
         "redundancy_factor": 1.5,
         "max_chunks": 170,           // v2.63: 170 data chunks (GF(2^8) limit: 170+85=255)
-        "chunk_size_kb": 256,        // v2.63: 256KB chunks (was 128KB - increased for 100K TPS)
-        "max_block_size": 43515904,  // v2.63: 170 × 256KB = 43.5 MB (supports 100K+ TPS)
+        "chunk_size_kb": 512,        // v4.1: 512KB chunks (was 256KB - 2x for 200K TX/block)
+        "max_block_size": 89128960,  // v4.1: 170 × 512KB = 87 MB (supports 200K TX/block)
         "status": "active"
     });
     
@@ -5815,7 +5877,7 @@ async fn handle_parallel_executor_metrics(blockchain: Arc<BlockchainNode>) -> Re
         "enabled": blockchain.get_parallel_executor().is_some(),
         "pipeline_stages": 5,
         "stages": ["Validation", "DependencyAnalysis", "Execution", "DilithiumSignature", "Commitment"],
-        "max_parallel_tx": 10000,
+        "max_parallel_tx": 200000,
         "status": if blockchain.get_parallel_executor().is_some() { "active" } else { "disabled" }
     });
     
@@ -5829,8 +5891,8 @@ async fn handle_pre_execution_status(blockchain: Arc<BlockchainNode>) -> Result<
     let status = json!({
         "enabled": true,
         "lookahead_blocks": 3,
-        "max_tx_per_block": 100000, // 100K TX/block max
-        "cache_size": 100000, // Match max TX per block
+        "max_tx_per_block": 200000, // 200K TX/block max (v4.1)
+        "cache_size": 200000, // Match max TX per block
         "total_pre_executed": metrics.total_pre_executed,
         "cache_hits": metrics.cache_hits,
         "cache_misses": metrics.cache_misses,
@@ -8580,13 +8642,64 @@ async fn handle_register_node(
     let wallet_address = body["wallet_address"].as_str().unwrap_or("");
     let activation_code = body["activation_code"].as_str().unwrap_or("");
     let device_id = body["device_id"].as_str().unwrap_or("");
-    let quantum_pubkey = body["quantum_pubkey"].as_str().unwrap_or("default_quantum_key");
+    let quantum_pubkey = body["quantum_pubkey"].as_str().unwrap_or("");
+    let quantum_signature = body["quantum_signature"].as_str().unwrap_or("");
     
     if wallet_address.is_empty() || activation_code.is_empty() {
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "Missing required fields: wallet_address and activation_code"
         })));
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // v4.0: MANDATORY Dilithium3 signature verification for Super nodes
+    // No Ed25519 fallback — Dilithium3 only (NIST FIPS 204)
+    // ═══════════════════════════════════════════════════════════════════
+    if node_type == "super" {
+        if quantum_pubkey.is_empty() || quantum_signature.is_empty() {
+            println!("[WARN][REGISTER] super_node_rejected reason=missing_dilithium wallet={}", wallet_address);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Super node registration requires Dilithium3 quantum_pubkey and quantum_signature"
+            })));
+        }
+        
+        // Verify Dilithium3 signature (proves wallet ownership)
+        let sig_msg = format!("register:{}:{}:{}", wallet_address, activation_code, node_type);
+        let sig_valid = verify_mobile_dilithium_signature(&sig_msg, quantum_signature, quantum_pubkey);
+        if sig_valid {
+            println!("[INFO][REGISTER] dilithium_verified wallet={} pk_hash={}",
+                     wallet_address, &quantum_pubkey[..16.min(quantum_pubkey.len())]);
+        } else {
+            println!("[WARN][REGISTER] dilithium_invalid wallet={}", wallet_address);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Dilithium3 signature verification failed"
+            })));
+        }
+    }
+    
+    // v4.0: Verify activation code ownership (code must be bound to this wallet)
+    {
+        let registry = &*GLOBAL_ACTIVATION_REGISTRY;
+        match registry.verify_code_ownership(activation_code, wallet_address).await {
+            Ok(true) => {
+                println!("[INFO][REGISTER] code_verified wallet={}", wallet_address);
+            }
+            Ok(false) => {
+                println!("[WARN][REGISTER] code_mismatch wallet={} code={}...",
+                         wallet_address, &activation_code[..8.min(activation_code.len())]);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Activation code does not belong to this wallet"
+                })));
+            }
+            Err(e) => {
+                // Genesis/bootstrap codes may not be in registry — allow
+                println!("[INFO][REGISTER] code_check_skip reason={}", e);
+            }
+        }
     }
     
     // Generate node ID
@@ -8613,13 +8726,13 @@ async fn handle_register_node(
             node_type_enum,
             wallet_address.to_string()
         ) {
-            println!("[NODE] Warning: Failed to register node with reward manager: {:?}", e);
+            println!("[WARN][REGISTER] reward_manager err={:?}", e);
         }
         
         // CRITICAL: Save node registration to storage (survive restarts)
         use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         if let Err(e) = blockchain.get_storage().save_node_registration(&node_id, node_type, &wallet_address, INITIAL_REPUTATION) {
-            println!("[STORAGE] ⚠️ Failed to save node registration: {}", e);
+            println!("[WARN][STORAGE] save_registration err={}", e);
         }
     }
     
@@ -8677,16 +8790,28 @@ async fn handle_register_node(
         if let Some(p2p) = blockchain.get_unified_p2p() {
             // Trigger active node announcement (ASYNC - proper Dilithium signature)
             p2p.register_as_active_node_async().await;
-            println!("[NODE] 📡 {} node announced to P2P network", node_type);
+            println!("[INFO][REGISTER] p2p_announce type={}", node_type);
         }
     }
     
-    println!("[NODE] ✅ Registered {} node: {} for wallet: {}", 
+    // v4.0: Register VRF public key in global registry + persist to storage
+    if !quantum_pubkey.is_empty() && quantum_pubkey != "default_quantum_key" {
+        if let Ok(pk_bytes) = hex::decode(quantum_pubkey) {
+            crate::genesis_constants::register_vrf_public_key(&node_id, &pk_bytes);
+            // Persist to RocksDB for restart survival
+            if let Err(e) = blockchain.get_storage().save_vrf_public_key(&node_id, quantum_pubkey) {
+                println!("[WARN][REGISTER] vrf_pk_persist err={}", e);
+            }
+        }
+    }
+
+    println!("[INFO][REGISTER] success type={} node={} wallet={}",
              node_type, node_id, wallet_address);
     
     Ok(warp::reply::json(&json!({
         "success": true,
         "node_id": node_id,
+        "quantum_pubkey": quantum_pubkey,
         "message": format!("{} node registered successfully", node_type)
     })))
 }
@@ -9202,34 +9327,42 @@ async fn handle_generate_activation_code(
     // Check is ALWAYS by QNet EON address (the reward wallet)
     let registry = &*GLOBAL_ACTIVATION_REGISTRY;
     
-    // First check: Does QNet wallet already have ANY node?
-    match registry.check_wallet_has_any_node(&qnet_wallet_for_rewards).await {
-        Ok(Some((existing_type, existing_code))) => {
-            println!("🚫 [SECURITY] QNet wallet already has {} node - rejecting new {} activation", 
-                     existing_type, request.node_type);
-            let response = json!({
-                "success": false,
-                "error": "QNet wallet already has an active node",
-                "existing_node_type": existing_type,
-                "qnet_wallet": qnet_wallet_for_rewards,
-                "requested_node_type": request.node_type,
-                "message": "1 wallet = 1 node rule: Each QNet wallet can only activate ONE node (Light, Full, or Super)"
-            });
-            return Ok(warp::reply::json(&response));
-        }
-        Ok(None) => {
-            // Wallet has no nodes - eligible for activation
-            println!("✅ Wallet has no existing nodes - proceeding with activation");
-        }
-        Err(e) => {
-            println!("⚠️ Registry query error: {} - proceeding with generation", e);
-        }
+    // ══════════════════════════════════════════════════════════════
+    // CODE RECOVERY — return existing code BEFORE "1 wallet = 1 node" rejection
+    // Safe because code is cryptographically wallet-bound (XOR-encrypted wallet inside)
+    // ══════════════════════════════════════════════════════════════
+    
+    // 1) Try recovery by burn_tx_hash + wallet_address (encrypted, defense-in-depth)
+    let recovered = registry.recover_code_by_burn_tx(
+        &request.burn_tx_hash, &request.wallet_address
+    ).await;
+    // 1b) Fallback: try with stored wallet (Solana vs EON address mismatch)
+    let recovered = match recovered {
+        Some(code) => Some(code),
+        None => registry.recover_code_by_burn_tx_any_wallet(&request.burn_tx_hash).await,
+    };
+    if let Some(recovered_code) = recovered {
+        println!("[RECOVERY] Code recovered for burn TX: {}...", 
+                 &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
+        let response = json!({
+            "success": true,
+            "activation_code": recovered_code,
+            "wallet_address": request.wallet_address,
+            "node_type": request.node_type,
+            "phase": request.phase,
+            "cached": true,
+            "recovered": true,
+            "message": "Activation code recovered"
+        });
+        return Ok(warp::reply::json(&response));
     }
     
-    // Legacy check for same type (backward compatibility for existing codes)
-    match registry.query_activation_by_wallet_and_type(&request.wallet_address, request.phase, &request.node_type).await {
-        Ok(Some(existing_code)) => {
-            println!("✅ Existing activation code found - returning cached code");
+    // 2) Try legacy: query by wallet + type (may return actual code from active_nodes)
+    if let Ok(Some(existing_code)) = registry.query_activation_by_wallet_and_type(
+        &request.wallet_address, request.phase, &request.node_type
+    ).await {
+        if !existing_code.starts_with("HASH_FOUND:") && !existing_code.starts_with("HASH:") {
+            println!("Existing activation code found in active nodes");
             let response = json!({
                 "success": true,
                 "activation_code": existing_code,
@@ -9241,9 +9374,27 @@ async fn handle_generate_activation_code(
             });
             return Ok(warp::reply::json(&response));
         }
+    }
+    
+    // 3) 1 wallet = 1 node: Reject if wallet already has ANY node (no recoverable code found)
+    match registry.check_wallet_has_any_node(&qnet_wallet_for_rewards).await {
+        Ok(Some((existing_type, _existing_code))) => {
+            println!("🚫 [SECURITY] QNet wallet already has {} node — code not recoverable (generated before recovery system)", 
+                     existing_type);
+            let response = json!({
+                "success": false,
+                "error": "QNet wallet already has an active node. Code was generated before secure recovery was enabled.",
+                "existing_node_type": existing_type,
+                "qnet_wallet": qnet_wallet_for_rewards,
+                "requested_node_type": request.node_type,
+                "hint": "If you lost your code, contact support with your burn transaction hash",
+                "message": "1 wallet = 1 node rule: Each QNet wallet can only activate ONE node (Light, Full, or Super)"
+            });
+            return Ok(warp::reply::json(&response));
+        }
         Ok(None) => {
-            // No existing code - need to generate new one
-            println!("🔄 No existing code found - generating new activation code");
+            // Wallet has no nodes - eligible for activation
+            println!("✅ Wallet has no existing nodes - proceeding with activation");
         }
         Err(e) => {
             println!("⚠️ Registry query error: {} - proceeding with generation", e);
@@ -9279,6 +9430,14 @@ async fn handle_generate_activation_code(
                 // Continue anyway - user can still use the code
             }
 
+            // SECURE RECOVERY: Also store recovery mapping for Solana address
+            // (register_activation_on_blockchain stores for QNet EON address)
+            if qnet_wallet_for_rewards != request.wallet_address {
+                registry.store_code_for_recovery(
+                    &activation_code, &request.burn_tx_hash, &request.wallet_address
+                ).await;
+            }
+
             let response = json!({
                 "success": true,
                 "activation_code": activation_code,
@@ -9304,6 +9463,91 @@ async fn handle_generate_activation_code(
             Ok(warp::reply::json(&error_response))
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECURE ACTIVATION CODE RECOVERY
+// ═══════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+struct RecoverActivationCodeRequest {
+    burn_tx_hash: String,
+    wallet_address: String,
+    #[serde(default = "default_recovery_phase")]
+    phase: u8,
+    #[serde(default)]
+    node_type: Option<String>,
+}
+
+fn default_recovery_phase() -> u8 { 1 }
+
+async fn handle_recover_activation_code(
+    request: RecoverActivationCodeRequest,
+    remote_addr: Option<std::net::SocketAddr>,
+    _blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "recovery") {
+        return Ok(rate_limit_response);
+    }
+
+    println!("[RECOVERY] 🔐 Secure code recovery request");
+    println!("   Burn TX: {}...", &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
+    println!("   Wallet: {}...", &request.wallet_address[..8.min(request.wallet_address.len())]);
+
+    // Validate inputs
+    if request.burn_tx_hash.len() < 32 || request.burn_tx_hash.len() > 128 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid burn transaction hash format"
+        })));
+    }
+    if request.wallet_address.len() < 20 || request.wallet_address.len() > 64 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid wallet address format"
+        })));
+    }
+
+    let registry = &*GLOBAL_ACTIVATION_REGISTRY;
+
+    // Try decryption with provided wallet_address
+    if let Some(recovered_code) = registry.recover_code_by_burn_tx(
+        &request.burn_tx_hash, &request.wallet_address
+    ).await {
+        println!("[RECOVERY] Code recovered for burn TX: {}...", 
+                 &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
+        return Ok(warp::reply::json(&json!({
+            "success": true,
+            "activation_code": recovered_code,
+            "wallet_address": request.wallet_address,
+            "recovered": true,
+            "message": "Activation code recovered successfully"
+        })));
+    }
+
+    // Fallback: try with the wallet stored in the record (Solana vs EON mismatch)
+    if let Some(recovered_code) = registry.recover_code_by_burn_tx_any_wallet(
+        &request.burn_tx_hash
+    ).await {
+        println!("[RECOVERY] Code recovered via stored wallet fallback");
+        return Ok(warp::reply::json(&json!({
+            "success": true,
+            "activation_code": recovered_code,
+            "wallet_address": request.wallet_address,
+            "recovered": true,
+            "message": "Activation code recovered successfully"
+        })));
+    }
+
+    println!("[RECOVERY] No recoverable code for burn TX: {}...", 
+             &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
+    Ok(warp::reply::json(&json!({
+        "success": false,
+        "error": "No activation code found for this burn transaction",
+        "burn_tx_hash": request.burn_tx_hash,
+        "hint": "Code can only be recovered if it was generated after the recovery system was enabled"
+    })))
 }
 
 // PRODUCTION: Macroblock Consensus Handlers
@@ -10644,7 +10888,7 @@ async fn handle_performance_metrics(
     
     let metrics = json!({
         "mempool_size": mempool_size,  // REAL-TIME
-        "mempool_capacity": 5_000_000, // 5M TX mempool
+        "mempool_capacity": 200_000, // 200K TX mempool (v4.1)
         "current_height": current_height,  // REAL-TIME
         "peers_connected": peer_count,  // REAL-TIME
         "tps_current": tps_current,
@@ -10923,10 +11167,8 @@ async fn handle_contract_deploy(
         let part2 = &hash[19..34];
         // Generate SHA-256 checksum for wallet compatibility
         let checksum_input = format!("{}eon{}", part1, part2);
-        use sha2::{Sha256, Digest as Sha2Digest};
-        let mut checksum_hasher = Sha256::new();
-        checksum_hasher.update(checksum_input.as_bytes());
-        let checksum = hex::encode(&checksum_hasher.finalize()[..2]);
+        use sha3::{Sha3_256, Digest};
+        let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..2]);
         format!("{}eon{}{}", part1, part2, checksum)
     };
     
@@ -10999,6 +11241,140 @@ async fn handle_contract_deploy(
     }
 }
 
+/// Verify Dilithium3 signature from mobile client (Android DilithiumModule / Bouncy Castle)
+/// Format: "dilithium_sig_{nodeId}_{base64}" where base64 decodes to:
+///   [signed_msg_len(4 LE)] [signedMessage = sig(3293) + msg(N)] [pk_len(4 LE)] [pk(1952)]
+/// Both Bouncy Castle and pqcrypto use the same NIST FIPS 204 standard
+fn verify_mobile_dilithium_signature(
+    expected_message: &str,
+    formatted_signature: &str,
+    public_key_hex: &str,
+) -> bool {
+    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_traits::sign::*;
+    
+    // Step 1: Extract base64 payload from formatted string
+    // Format: "dilithium_sig_{nodeId_with_underscores}_{base64_no_underscores}"
+    // Base64 standard alphabet doesn't contain '_', so rfind('_') gives us the separator
+    if !formatted_signature.starts_with("dilithium_sig_") {
+        // Not mobile format — try raw hex verification as fallback
+        // Raw hex: signature_hex directly, verify with wallet_address as message
+        let pk_bytes = match hex::decode(public_key_hex) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let sig_bytes = match hex::decode(formatted_signature) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let mut signed_msg = sig_bytes;
+        signed_msg.extend_from_slice(expected_message.as_bytes());
+        let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
+            Ok(pk) => pk,
+            Err(_) => return false,
+        };
+        let signed_message = match dilithium3::SignedMessage::from_bytes(&signed_msg) {
+            Ok(sm) => sm,
+            Err(_) => return false,
+        };
+        return match dilithium3::open(&signed_message, &public_key) {
+            Ok(_) => { println!("[INFO][DILITHIUM] mobile_raw_hex_verified"); true }
+            Err(_) => { println!("[WARN][DILITHIUM] mobile_raw_hex_failed"); false }
+        };
+    }
+    
+    let base64_data = match formatted_signature.rfind('_') {
+        Some(pos) if pos > 14 => &formatted_signature[pos + 1..],
+        _ => {
+            println!("[WARN][DILITHIUM] mobile_sig_invalid reason=no_base64_separator");
+            return false;
+        }
+    };
+    
+    // Step 2: Decode base64
+    let decoded = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_data) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("[WARN][DILITHIUM] mobile_base64_decode_failed err={}", e);
+            return false;
+        }
+    };
+    
+    // Step 3: Parse binary format [signed_msg_len(4 LE)] [signedMessage] [pk_len(4 LE)] [pk]
+    if decoded.len() < 8 {
+        println!("[WARN][DILITHIUM] mobile_payload_too_short bytes={}", decoded.len());
+        return false;
+    }
+    
+    let signed_msg_len = u32::from_le_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]) as usize;
+    if decoded.len() < 4 + signed_msg_len + 4 {
+        println!("[WARN][DILITHIUM] mobile_invalid_signed_msg_len len={} payload={}", signed_msg_len, decoded.len());
+        return false;
+    }
+    
+    let signed_message_bytes = &decoded[4..4 + signed_msg_len];
+    
+    let pk_offset = 4 + signed_msg_len;
+    let pk_len = u32::from_le_bytes([decoded[pk_offset], decoded[pk_offset+1], decoded[pk_offset+2], decoded[pk_offset+3]]) as usize;
+    
+    if decoded.len() < pk_offset + 4 + pk_len {
+        println!("[WARN][DILITHIUM] mobile_invalid_pk_len pk_len={} remaining={}", pk_len, decoded.len() - pk_offset - 4);
+        return false;
+    }
+    
+    let pk_bytes_from_sig = &decoded[pk_offset + 4..pk_offset + 4 + pk_len];
+    
+    // Step 4: Verify public key matches what client sent in quantum_pubkey
+    let pk_bytes_from_request = match hex::decode(public_key_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[WARN][DILITHIUM] mobile_invalid_pubkey_hex err={}", e);
+            return false;
+        }
+    };
+    
+    if pk_bytes_from_sig != pk_bytes_from_request {
+        println!("[WARN][DILITHIUM] mobile_pk_mismatch reason=sig_pk_differs_from_request_pk");
+        return false;
+    }
+    
+    // Step 5: Create pqcrypto PublicKey from raw bytes
+    let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes_from_request) {
+        Ok(pk) => pk,
+        Err(e) => {
+            println!("[WARN][DILITHIUM] mobile_invalid_pk bytes={} err={:?}", pk_bytes_from_request.len(), e);
+            return false;
+        }
+    };
+    
+    // Step 6: Verify using pqcrypto's open() — signedMessage = signature || message
+    // This is the standard NIST FIPS 204 format used by both Bouncy Castle and pqcrypto
+    let signed_message = match dilithium3::SignedMessage::from_bytes(signed_message_bytes) {
+        Ok(sm) => sm,
+        Err(e) => {
+            println!("[WARN][DILITHIUM] mobile_invalid_signed_msg bytes={} err={:?}", signed_message_bytes.len(), e);
+            return false;
+        }
+    };
+    
+    match dilithium3::open(&signed_message, &public_key) {
+        Ok(verified_msg) => {
+            // Step 7: Verify the extracted message matches expected wallet_address
+            if verified_msg == expected_message.as_bytes() {
+                println!("[INFO][DILITHIUM] mobile_sig_verified standard=FIPS204 level=3");
+                true
+            } else {
+                println!("[WARN][DILITHIUM] mobile_msg_mismatch reason=signed_data_differs_from_wallet");
+                false
+            }
+        }
+        Err(_) => {
+            println!("[WARN][DILITHIUM] mobile_sig_verification_failed reason=cryptographic");
+            false
+        }
+    }
+}
+
 /// NIST FIPS 204: Verify Dilithium3 signature for smart contracts
 /// FIXED v2.26.6: Use Dilithium3 consistently across entire codebase (was Dilithium5)
 async fn verify_dilithium_signature_for_contract(
@@ -11013,7 +11389,7 @@ async fn verify_dilithium_signature_for_contract(
     let pk_bytes = match hex::decode(public_key_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("[DILITHIUM3] ❌ Invalid public key hex: {}", e);
+            println!("[WARN][DILITHIUM] Invalid public key hex: {}", e);
             return false;
         }
     };
@@ -11021,7 +11397,7 @@ async fn verify_dilithium_signature_for_contract(
     let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
         Ok(pk) => pk,
         Err(e) => {
-            println!("[DILITHIUM3] ❌ Invalid Dilithium3 public key: {:?}", e);
+            println!("[WARN][DILITHIUM] Invalid Dilithium3 public key: {:?}", e);
             return false;
         }
     };
@@ -11030,7 +11406,7 @@ async fn verify_dilithium_signature_for_contract(
     let sig_bytes = match hex::decode(signature_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("[DILITHIUM3] ❌ Invalid signature hex: {}", e);
+            println!("[WARN][DILITHIUM] Invalid signature hex: {}", e);
             return false;
         }
     };
@@ -11042,7 +11418,7 @@ async fn verify_dilithium_signature_for_contract(
     let signed_message = match dilithium3::SignedMessage::from_bytes(&signed_msg) {
         Ok(sm) => sm,
         Err(e) => {
-            println!("[DILITHIUM3] ❌ Invalid signed message format: {:?}", e);
+            println!("[WARN][DILITHIUM] Invalid signed message format: {:?}", e);
             return false;
         }
     };
@@ -11050,11 +11426,11 @@ async fn verify_dilithium_signature_for_contract(
     // Verify signature
     match dilithium3::open(&signed_message, &public_key) {
         Ok(_) => {
-            println!("[DILITHIUM3] ✅ Signature verified (NIST FIPS 204, Level 3)");
+            println!("[INFO][DILITHIUM] Signature verified (NIST FIPS 204, Level 3)");
             true
         }
         Err(_) => {
-            println!("[DILITHIUM3] ❌ Signature verification failed");
+            println!("[WARN][DILITHIUM] Signature verification failed");
             false
         }
     }
@@ -11959,10 +12335,8 @@ async fn handle_token_deploy(
         let hash = hex::encode(hasher.finalize());
         let part1 = &hash[0..19];
         let part2 = &hash[19..34];
-        use sha2::{Sha256, Digest as Sha2Digest};
-        let mut checksum_hasher = Sha256::new();
-        checksum_hasher.update(format!("{}eon{}", part1, part2).as_bytes());
-        let checksum = hex::encode(&checksum_hasher.finalize()[..2]);
+        use sha3::{Sha3_256, Digest};
+        let checksum = hex::encode(&Sha3_256::digest(format!("{}eon{}", part1, part2).as_bytes())[..2]);
         format!("{}eon{}{}", part1, part2, checksum)
     };
     
@@ -12308,8 +12682,9 @@ async fn run_benchmark_generator(
         0..=10_000 => 2,           // 5K-10K TPS: 2 workers
         10_001..=30_000 => 4,      // 10K-30K TPS: 4 workers
         30_001..=60_000 => 8,      // 30K-60K TPS: 8 workers
-        60_001..=100_000 => 12,    // v2.47: 60K-100K TPS: 12 workers (balanced)
-        _ => 16,                    // v2.47: 100K+ TPS: 16 workers (with delay!)
+        60_001..=100_000 => 12,    // v4.1: 60K-100K TPS: 12 workers
+        100_001..=200_000 => 16,   // v4.1: 100K-200K TPS: 16 workers
+        _ => 20,                    // v4.1: 200K+ TPS: 20 workers
     };
     
     // v2.47: ADAPTIVE batch size based on target TPS
@@ -12318,8 +12693,9 @@ async fn run_benchmark_generator(
         0..=10_000 => 500,          // Low TPS: small batches
         10_001..=30_000 => 1_000,   // Medium TPS: medium batches
         30_001..=60_000 => 2_000,   // High TPS: larger batches
-        60_001..=100_000 => 3_000,  // v2.47: Very high TPS: controlled batches
-        _ => 4_000,                  // v2.47: Extreme TPS: still limited!
+        60_001..=100_000 => 4_000,  // v4.1: Very high TPS: 4K batches
+        100_001..=200_000 => 6_000, // v4.1: 100K-200K TPS: 6K batches
+        _ => 8_000,                  // v4.1: 200K+ TPS: 8K batches
     };
     
     // v2.47: RATE LIMITING delay between batches
@@ -12329,8 +12705,9 @@ async fn run_benchmark_generator(
         0..=10_000 => 50,           // 50ms delay = controlled flow
         10_001..=30_000 => 20,      // 20ms delay
         30_001..=60_000 => 10,      // 10ms delay
-        60_001..=100_000 => 5,      // v2.47: 5ms delay for 100K TPS
-        _ => 2,                      // v2.47: 2ms minimum (NEVER 0!)
+        60_001..=100_000 => 3,      // v4.1: 3ms delay for 100K TPS
+        100_001..=200_000 => 2,     // v4.1: 2ms delay for 200K TPS
+        _ => 1,                      // v4.1: 1ms minimum (NEVER 0!)
     };
     
     println!("[BENCHMARK] 🔧 ADAPTIVE MODE v2.47 - target: {} TPS", target_tps);
@@ -12422,8 +12799,8 @@ async fn run_benchmark_generator(
                 // v2.41.2: EARLY BACKPRESSURE - prevent crash BEFORE it happens!
                 let mempool_size = blockchain_clone.get_mempool_size().await.unwrap_or(0);
                 
-                // Use realistic mempool capacity (100K for genesis, not 1M fantasy)
-                let mempool_capacity = 100_000usize;
+                // v4.1: Increased mempool capacity for higher TPS target
+                let mempool_capacity = 200_000usize;
                 let mempool_fill_ratio = mempool_size as f64 / mempool_capacity as f64;
                 
                 // v2.41.2: EARLY backpressure thresholds (50/70/90, not 90/95!)

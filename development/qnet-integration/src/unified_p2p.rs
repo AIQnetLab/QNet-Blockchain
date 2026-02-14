@@ -780,6 +780,31 @@ static TIMEOUT_CERTIFICATES: Lazy<Arc<DashMap<(u64, u64), TimeoutCertificate>>> 
 static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
 
+// ═══════════════════════════════════════════════════════════════════
+// v4.0: VRF LEADER CLAIMS — Algorand-style secret leader election
+// Key: leadership_round → Vec<VerifiedLeaderClaim>
+// Collected from P2P gossip, verified before storage
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VerifiedLeaderClaim {
+    pub node_id: String,
+    pub round: u64,
+    pub vrf_output: [u8; 32],
+    pub vrf_proof: Vec<u8>,
+    pub reputation: f64,
+    pub verified_at: u64,
+}
+
+/// Global registry of verified VRF leader claims per round
+/// Cleaned up at rotation boundaries (keep last 3 rounds)
+pub static LEADER_CLAIMS: Lazy<DashMap<u64, Vec<VerifiedLeaderClaim>>> =
+    Lazy::new(|| DashMap::new());
+
+/// Track which rounds we've already broadcast our own claim
+static OWN_CLAIM_BROADCAST: Lazy<DashMap<u64, bool>> =
+    Lazy::new(|| DashMap::new());
+
 /// Check if QUIC fallback is allowed for given node (rate limiting)
 /// Returns true if request is allowed, false if rate limited
 pub fn quic_fallback_rate_check(node_id: &str) -> bool {
@@ -1837,13 +1862,13 @@ const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 // v2.43.7: CRITICAL FIX - Increased chunk size to avoid Reed-Solomon TooManyShards error
 // GF(2^8) Reed-Solomon supports max 255 shards (data + parity combined)
 // At 1KB chunks: 14MB block = 14000 chunks → TooManyShards FAILURE
-// At 128KB chunks: 20MB block = 156 chunks × 1.5 = 234 shards → OK!
-// v2.63: Increased to 256KB for 100K+ TPS support (170 × 256KB = 43.5MB max)
-const SHRED_PROTOCOL_CHUNK_SIZE: usize = 256 * 1024;  // 256KB chunks (was 128KB - increased for 100K TPS)
+// At 512KB chunks: 80MB block = 156 chunks × 1.5 = 234 shards → OK! (v4.1)
+// v4.1: Increased to 512KB (2x) for 200K TX/block support (170 × 512KB = 87MB max)
+const SHRED_PROTOCOL_CHUNK_SIZE: usize = 512 * 1024;  // 512KB chunks (v4.1: was 256KB - 2x for 200K TX/block)
 const SHRED_PROTOCOL_REDUNDANCY_FACTOR: f32 = 1.5;    // 50% redundancy for Reed-Solomon  
 const SHRED_PROTOCOL_MAX_CHUNKS: usize = 170;         // Max data chunks (170 + 85 parity = 255 ≤ GF(2^8) limit)
-                                                      // v2.63: 170 × 256KB = 43.5MB max block size
-                                                      // Supports 100K+ TPS with proper Reed-Solomon encoding
+                                                      // v4.1: 170 × 512KB = 87MB max block size
+                                                      // Supports 200K TX/block with proper Reed-Solomon encoding
 const SHRED_CHUNK_TIMEOUT_SECS: u64 = 5;            // Timeout before requesting missing chunks (v2.31: increased from 3s for reliability)
 const SHRED_CHUNK_CACHE_SIZE: usize = 100;          // Cache last N blocks' chunks for retransmit (v2.21.3)
 const SHRED_CHUNK_MAX_RETRIES: u8 = 4;              // Max retransmit attempts per block (v2.31: increased from 2 for reliability)
@@ -4860,7 +4885,7 @@ impl SimplifiedP2P {
         // ═══════════════════════════════════════════════════════════════════════════
         // PRODUCTION v2.63: Block size validation
         // ═══════════════════════════════════════════════════════════════════════════
-        // With Level 1 (40MB block size limit at creation) and Level 2 (43.5MB ShredProtocol max),
+        // With Level 1 (80MB block size limit at creation) and Level 2 (87MB ShredProtocol max),
         // blocks should NEVER exceed the limit. If they do, log error and reject.
         if block_data.len() > max_shred_size {
             println!("[ERR][SHRED] block_rejected h={} size_mb={:.2} max_mb={:.2} reason=exceeds_shred_limit",
@@ -6509,7 +6534,7 @@ impl SimplifiedP2P {
                 // Solution: Send in batches of 10 chunks with 5ms delay between batches
                 // This matches broadcast pacing strategy and prevents UDP burst loss
                 // ═══════════════════════════════════════════════════════════════════════════
-                const REPAIR_BATCH_SIZE: usize = 10;  // 10 chunks × 256KB = 2.56MB per batch (v2.63)
+                const REPAIR_BATCH_SIZE: usize = 10;  // 10 chunks × 512KB = 5.12MB per batch (v4.1)
                 const REPAIR_BATCH_DELAY_MS: u64 = 5; // 5ms between batches for pacing
                 
                 let total_chunks = chunks_to_send.len();
@@ -6903,7 +6928,7 @@ impl SimplifiedP2P {
     /// Used by sync to reliably deliver blocks >1MB that would fail as single QUIC message
     /// 
     /// ARCHITECTURE: Same chunking as broadcast_block_shred_protocol but targeted to one peer
-    /// - Splits block into 256KB chunks with Reed-Solomon parity (v2.63)
+    /// - Splits block into 512KB chunks with Reed-Solomon parity (v4.1)
     /// - Sends chunks sequentially with pacing to prevent congestion
     /// - Receiver uses existing handle_shred_protocol_chunk to reassemble
     pub async fn send_block_via_shred_to_peer(&self, peer_addr: &str, height: u64, block_data: Vec<u8>, is_macroblock: bool) {
@@ -8611,7 +8636,7 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: For Genesis bootstrap, return ALL configured peers WITHOUT TCP checks
         // TCP checks are ONLY for broadcast/failover, NOT for consensus candidate lists
-        // This ensures deterministic consensus: all nodes see SAME candidates for QRDS
+        // This ensures deterministic consensus: all nodes see SAME candidates for VRF election
         if std::env::var("QNET_BOOTSTRAP_ID")
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.trim()))
             .unwrap_or(false) {
@@ -9035,9 +9060,9 @@ impl SimplifiedP2P {
     pub fn get_max_concurrent_chunk_sends(&self) -> usize {
         let peer_count = self.connected_peers_lockfree.len().max(1);
         
-        // v2.43.6: CRITICAL FIX for 100K TPS support
-        // v2.63: With 256KB chunks (was 128KB), broadcast supports larger blocks:
-        // - 43.5MB block = 170 data + 85 parity = 255 chunks
+        // v4.1: CRITICAL for 200K TX/block support
+        // With 512KB chunks, broadcast supports larger blocks:
+        // - 87MB block = 170 data + 85 parity = 255 chunks
         // - 255 chunks × 4 peers = 1,020 sends total
         // - 1,020 / 200 concurrent = 5 batches × 10ms = ~50ms broadcast time
         // Old 1KB chunks: 14MB = 14K chunks = 86K sends = 43+ seconds (TooManyShards!)
@@ -10535,6 +10560,19 @@ pub enum NetworkMessage {
         sender_id: String,
     },
 
+    /// v4.0: VRF Leader Claim — Algorand-style secret leader election
+    /// Each elected node broadcasts its VRF proof at rotation boundary
+    /// All nodes verify and select lowest VRF output as winner
+    VrfLeaderClaim {
+        round: u64,              // Leadership round (= rotation period)
+        node_id: String,         // Claiming node
+        vrf_output: Vec<u8>,     // 32-byte VRF output
+        vrf_proof: Vec<u8>,      // ~3293-byte Dilithium3 detached signature
+        slot_seed: Vec<u8>,      // 32-byte slot seed (for verification)
+        reputation: f64,         // Node's reputation at claim time
+        timestamp: u64,          // Claim timestamp
+    },
+
     /// DEPRECATED v4.0: EmergencyProducerChange replaced by BFT Timeout Protocol
     /// ═══════════════════════════════════════════════════════════════════════════
     /// WHY REMOVED:
@@ -11224,6 +11262,72 @@ impl SimplifiedP2P {
             }
             
             // BFT Timeout Vote - v4.0 deterministic failover
+            // ═══════════════════════════════════════════════════════════════
+            // v4.0: VRF Leader Claim — verify and store
+            // ═══════════════════════════════════════════════════════════════
+            NetworkMessage::VrfLeaderClaim { round, node_id, vrf_output, vrf_proof, slot_seed, reputation, timestamp } => {
+                self.update_peer_last_seen(&node_id);
+                
+                // Validate sizes
+                if vrf_output.len() != 32 || slot_seed.len() != 32 {
+                    if crate::node::is_debug() {
+                        println!("[DBG][VRF] claim_invalid node={} out_len={} seed_len={}",
+                                 node_id, vrf_output.len(), slot_seed.len());
+                    }
+                } else {
+                    // Verify VRF proof against registered public key
+                    let verified = match crate::genesis_constants::get_vrf_public_key(&node_id) {
+                        Some(pk_bytes) => {
+                            let mut out = [0u8; 32];
+                            out.copy_from_slice(&vrf_output);
+                            let vrf_result = crate::crypto::vrf::VrfOutput {
+                                output: out,
+                                proof: vrf_proof.clone(),
+                            };
+                            crate::crypto::vrf::DilithiumVrf::verify_static(
+                                &pk_bytes, &slot_seed, &vrf_result,
+                            ).unwrap_or(false)
+                        }
+                        None => {
+                            if crate::node::is_debug() {
+                                println!("[DBG][VRF] claim_no_pk node={}", node_id);
+                            }
+                            false
+                        }
+                    };
+
+                    if verified {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let mut out = [0u8; 32];
+                        out.copy_from_slice(&vrf_output);
+                        let claim = VerifiedLeaderClaim {
+                            node_id: node_id.clone(),
+                            round,
+                            vrf_output: out,
+                            vrf_proof,
+                            reputation,
+                            verified_at: now,
+                        };
+                        
+                        // Deduplicate: one claim per node per round
+                        let mut claims = LEADER_CLAIMS.entry(round).or_insert_with(Vec::new);
+                        if !claims.iter().any(|c| c.node_id == node_id) {
+                            claims.push(claim);
+                            if crate::node::is_info() {
+                                println!("[INFO][VRF] claim_verified round={} node={} output={}",
+                                         round, node_id, hex::encode(&vrf_output[..8]));
+                            }
+                        }
+                    } else {
+                        println!("[WARN][VRF] claim_rejected round={} node={} reason=invalid_proof",
+                                 round, node_id);
+                    }
+                }
+            }
+
             NetworkMessage::TimeoutVote { height, timeout_round, voter_id, last_block_hash, signature } => {
                 self.update_peer_last_seen(&voter_id);
                 if crate::node::is_debug() { 
@@ -19104,6 +19208,93 @@ impl SimplifiedP2P {
     
     /// Create and broadcast timeout vote for specified height/round
     /// signature: Pre-computed hybrid signature from node's quantum_crypto
+    // ═══════════════════════════════════════════════════════════════════
+    // v4.0: VRF LEADER CLAIM BROADCAST
+    // Gossips our VRF proof to all validators at rotation boundary
+    // ═══════════════════════════════════════════════════════════════════
+    pub fn broadcast_leader_claim(
+        &self,
+        round: u64,
+        vrf_output: [u8; 32],
+        vrf_proof: Vec<u8>,
+        slot_seed: [u8; 32],
+        reputation: f64,
+    ) {
+        // Prevent double broadcast for same round
+        if OWN_CLAIM_BROADCAST.contains_key(&round) {
+            return;
+        }
+        OWN_CLAIM_BROADCAST.insert(round, true);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let msg = NetworkMessage::VrfLeaderClaim {
+            round,
+            node_id: self.node_id.clone(),
+            vrf_output: vrf_output.to_vec(),
+            vrf_proof: vrf_proof.clone(),
+            slot_seed: slot_seed.to_vec(),
+            reputation,
+            timestamp: now,
+        };
+
+        // Also store own claim locally (verified by definition)
+        let own_claim = VerifiedLeaderClaim {
+            node_id: self.node_id.clone(),
+            round,
+            vrf_output,
+            vrf_proof,
+            reputation,
+            verified_at: now,
+        };
+        LEADER_CLAIMS.entry(round).or_insert_with(Vec::new).push(own_claim);
+
+        if crate::node::is_info() {
+            println!("[INFO][VRF] claim_broadcast round={} output={}",
+                     round, hex::encode(&vrf_output[..8]));
+        }
+
+        // Broadcast to all validators via QUIC
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        let peers = self.get_all_validator_addresses();
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+
+        handle.spawn(async move {
+            if quic_enabled {
+                if let Some(ref qt_lock) = quic_transport {
+                    let qt = qt_lock.read().await;
+                    for peer_str in &peers {
+                        if let Ok(peer_addr) = peer_str.parse::<std::net::SocketAddr>() {
+                            let _ = qt.broadcast_to(peer_addr, &msg).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// v4.0: Get verified leader claims for a given round
+    pub fn get_leader_claims(round: u64) -> Vec<VerifiedLeaderClaim> {
+        LEADER_CLAIMS.get(&round)
+            .map(|v| v.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// v4.0: Cleanup old leader claims (keep last 3 rounds)
+    pub fn cleanup_old_claims(current_round: u64) {
+        let min_round = current_round.saturating_sub(3);
+        LEADER_CLAIMS.retain(|round, _| *round >= min_round);
+        OWN_CLAIM_BROADCAST.retain(|round, _| *round >= min_round);
+    }
+
     pub fn broadcast_timeout_vote(&self, height: u64, timeout_round: u64, 
                                    last_block_hash: [u8; 32], signature: Vec<u8>) {
         // Check if we already voted for this height
@@ -19851,13 +20042,13 @@ impl SimplifiedP2P {
         // ═══════════════════════════════════════════════════════════════════════════
         // PROBLEM (before v2.104):
         //   - Only the new emergency producer set the flag
-        //   - Other nodes didn't know about emergency -> continued using QRDS result
-        //   - QRDS returned failed producer -> network deadlock!
+        //   - Other nodes didn't know about emergency → continued using VRF result
+        //   - VRF returned failed producer → network deadlock!
         //
-        // SOLUTION:
-        //   - ALL nodes receiving emergency broadcast set the flag
-        //   - select_microblock_producer checks emergency flag AFTER QRDS
-        //   - If emergency flag is set, use emergency producer instead of QRDS result
+        // SOLUTION (v4.0: BFT Timeout Protocol replaces emergency broadcast):
+        //   - ALL nodes receiving timeout certificate increment timeout_round
+        //   - select_microblock_producer_with_round excludes failed producers
+        //   - Deterministic failover — no broadcast needed
         // ═══════════════════════════════════════════════════════════════════════════
             use crate::node::set_emergency_producer_flag;
             

@@ -160,7 +160,7 @@ impl DilithiumKeyManager {
     }
     
     /// Get keypair (loads from disk or generates new, cached for performance)
-    fn get_keypair(&self) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
+    pub fn get_keypair(&self) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
         // Check cache first
         {
             let cache_guard = match self.cached_keypair.read() { Ok(g) => g, Err(p) => p.into_inner() };

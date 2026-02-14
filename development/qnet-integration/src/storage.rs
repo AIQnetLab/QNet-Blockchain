@@ -155,8 +155,8 @@ pub struct TransactionPool {
 }
 
 /// v3.0: Maximum transaction pool size to prevent memory leak
-/// ~100K transactions × ~1KB average = ~100MB RAM
-const MAX_TRANSACTION_POOL_SIZE: usize = 100_000;
+/// ~200K transactions × ~1KB average = ~200MB RAM (v4.1: 2x)
+const MAX_TRANSACTION_POOL_SIZE: usize = 200_000;
 
 impl TransactionPool {
     /// Create new transaction pool with default TTL of 24 hours
@@ -4749,6 +4749,56 @@ impl Storage {
         
         self.persistent.db.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes())?;
         Ok(())
+    }
+    
+    /// v4.0: Save VRF public key for node (persists across restarts)
+    pub fn save_vrf_public_key(&self, node_id: &str, pk_hex: &str) -> IntegrationResult<()> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry CF not found".to_string()))?;
+        let key = format!("vrf_pk_{}", node_id);
+        self.persistent.db.put_cf(&registry_cf, key.as_bytes(), pk_hex.as_bytes())?;
+        println!("[INFO][STORAGE] vrf_pk_saved node={}", node_id);
+        Ok(())
+    }
+    
+    /// v4.0: Load VRF public key for node
+    pub fn load_vrf_public_key(&self, node_id: &str) -> IntegrationResult<Option<Vec<u8>>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry CF not found".to_string()))?;
+        let key = format!("vrf_pk_{}", node_id);
+        match self.persistent.db.get_cf(&registry_cf, key.as_bytes())? {
+            Some(data) => {
+                let hex_str = std::str::from_utf8(&data)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                let pk_bytes = hex::decode(hex_str)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                Ok(Some(pk_bytes))
+            }
+            None => Ok(None),
+        }
+    }
+    
+    /// v4.0: Load ALL stored VRF public keys (for startup restoration)
+    pub fn load_all_vrf_public_keys(&self) -> IntegrationResult<Vec<(String, Vec<u8>)>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry CF not found".to_string()))?;
+        let prefix = b"vrf_pk_";
+        let mut result = Vec::new();
+        let iter = self.persistent.db.prefix_iterator_cf(&registry_cf, prefix);
+        for item in iter {
+            if let Ok((key, value)) = item {
+                let key_str = std::str::from_utf8(&key).unwrap_or("");
+                if !key_str.starts_with("vrf_pk_") { break; }
+                let node_id = &key_str[7..]; // Skip "vrf_pk_" prefix
+                if let Ok(hex_str) = std::str::from_utf8(&value) {
+                    if let Ok(pk_bytes) = hex::decode(hex_str) {
+                        result.push((node_id.to_string(), pk_bytes));
+                    }
+                }
+            }
+        }
+        println!("[INFO][STORAGE] vrf_pk_loaded count={}", result.len());
+        Ok(result)
     }
     
     /// Load node registration

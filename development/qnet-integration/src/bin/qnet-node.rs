@@ -2538,10 +2538,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Display configuration
     display_node_config(&config, &node_type, &region);
-    
+
+    // ═══════════════════════════════════════════════════════════════════
+    // v4.0: Wallet Seed → WalletIdentity + VRF
+    // ═══════════════════════════════════════════════════════════════════
+    if let Ok(seed) = std::env::var("QNET_WALLET_SEED") {
+        let wallet_addr = qnet_integration::crypto::vrf::WalletIdentity::derive_wallet_address(&seed);
+        println!("[INFO][STARTUP] wallet_seed=present derived_addr={}", wallet_addr);
+        println!("[INFO][STARTUP] vrf=dilithium3 mode=secret_leader_election");
+    } else if let Ok(genesis_seed) = std::env::var("QNET_GENESIS_SEED") {
+        let wallet_addr = qnet_integration::crypto::vrf::WalletIdentity::derive_wallet_address(&genesis_seed);
+        println!("[INFO][STARTUP] genesis_seed=present derived_addr={}", wallet_addr);
+    } else {
+        println!("[WARN][STARTUP] wallet_seed=absent vrf=disabled — set QNET_WALLET_SEED or QNET_GENESIS_SEED");
+    }
+
     // Display activation status
     let activation_code = std::env::var("QNET_ACTIVATION_CODE").unwrap_or_default();
-    println!("\n🔐 === Activation Status ===");
+    println!("\n[INFO][STARTUP] === Activation Status ===");
     
     if activation_code.is_empty() {
         return Err("No activation code provided".into());
@@ -2986,8 +3000,8 @@ fn configure_production_mode() {
     
     std::env::set_var("QNET_HIGH_FREQUENCY", "1");
     std::env::set_var("QNET_MAX_TPS", "12800000");
-    std::env::set_var("QNET_MEMPOOL_SIZE", "10000000");
-    std::env::set_var("QNET_BATCH_SIZE", "100000");
+    std::env::set_var("QNET_MEMPOOL_SIZE", "20000000");
+    std::env::set_var("QNET_BATCH_SIZE", "200000");
     std::env::set_var("QNET_PARALLEL_VALIDATION", "1");
     std::env::set_var("QNET_PARALLEL_THREADS", "16");
     std::env::set_var("QNET_COMPRESSION", "1");
@@ -2998,7 +3012,7 @@ fn configure_production_mode() {
     std::env::set_var("QNET_USE_LOCKFREE", "1"); // DashMap for lock-free operations
     
     println!("⚡ ULTRA HIGH-PERFORMANCE: 12.8M TPS theoretical max (50K × 256 shards)");
-    println!("🚀 Quantum blockchain optimizations: Lock-free + Sharding + Parallel + 2MB blocks");
+    println!("🚀 Quantum blockchain optimizations: Lock-free + Sharding + Parallel + 80MB blocks (v4.1)");
         
     // Default server configuration (user will choose during setup)
     std::env::set_var("QNET_FULL_SYNC", "1");

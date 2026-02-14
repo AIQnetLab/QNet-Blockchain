@@ -116,7 +116,7 @@ pub fn is_valid_system_signature(message: &[u8], signature_hex: &str) -> bool {
     // This is REQUIRED because the system key doesn't exist until first Genesis startup
     // After deployment, replace PLACEHOLDER with real key and this check becomes active
     if SYSTEM_DILITHIUM_PUBLIC_KEY_HEX == "PLACEHOLDER_GENESIS_DEPLOYMENT_WILL_GENERATE_REAL_KEY" {
-        println!("[SECURITY] ⚠️ Genesis deployment mode - system key not yet configured");
+        println!("[INFO][SECURITY] genesis_deployment_mode system_key=not_configured");
         return true;
     }
     
@@ -152,5 +152,52 @@ pub fn is_valid_system_signature(message: &[u8], signature_hex: &str) -> bool {
         Ok(verified_msg) => verified_msg == message,
         Err(_) => false,
     }
+}
+
+// =========================================================================
+// v4.0: VRF Public Key Registry for producer verification
+// Maps node_id → Dilithium3 public key (hex)
+// Populated during node registration, used for VRF proof verification
+// =========================================================================
+
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+lazy_static::lazy_static! {
+    /// Global registry: node_id → dilithium3_pk_hex
+    /// Thread-safe, updated on node registration
+    pub static ref VRF_PK_REGISTRY: RwLock<HashMap<String, Vec<u8>>> =
+        RwLock::new(HashMap::new());
+}
+
+/// Register a node's VRF public key
+pub fn register_vrf_public_key(node_id: &str, pk_bytes: &[u8]) {
+    if pk_bytes.len() != 1952 {
+        println!("[WARN][VRF_REG] invalid pk_size={} node={}", pk_bytes.len(), node_id);
+        return;
+    }
+    if let Ok(mut registry) = VRF_PK_REGISTRY.write() {
+        registry.insert(node_id.to_string(), pk_bytes.to_vec());
+        println!("[INFO][VRF_REG] pk_registered node={} total={}", node_id, registry.len());
+    }
+}
+
+/// Get a node's VRF public key for proof verification
+pub fn get_vrf_public_key(node_id: &str) -> Option<Vec<u8>> {
+    VRF_PK_REGISTRY.read().ok()?.get(node_id).cloned()
+}
+
+/// Check if node has registered VRF key
+pub fn has_vrf_key(node_id: &str) -> bool {
+    VRF_PK_REGISTRY.read().ok()
+        .map(|r| r.contains_key(node_id))
+        .unwrap_or(false)
+}
+
+/// Get all registered VRF public keys (for full election verification)
+pub fn get_all_vrf_keys() -> HashMap<String, Vec<u8>> {
+    VRF_PK_REGISTRY.read().ok()
+        .map(|r| r.clone())
+        .unwrap_or_default()
 }
 

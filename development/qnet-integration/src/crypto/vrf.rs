@@ -1,260 +1,350 @@
-// QNet Verifiable Random Function (VRF) Implementation
-// Based on Ed25519 without OpenSSL dependencies
-// Provides cryptographically secure, verifiable randomness for producer selection
+// QNet Dilithium3-VRF: Post-Quantum Verifiable Random Function
+// NIST FIPS 204 (ML-DSA-65) + SHA3-256
+//
+// Construction:
+//   evaluate(sk, input) -> (output, proof)
+//   verify(pk, input, output, proof) -> bool
+//
+// SHA3-256 for domain separation + output derivation
+// Dilithium3 detached_sign for proof generation (deterministic in PQClean)
 
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
-use sha3::{Sha3_512, Digest};
-use std::convert::TryFrom;
+use pqcrypto_dilithium::dilithium3;
+use pqcrypto_traits::sign::{
+    PublicKey as PkTrait,
+    SecretKey as SkTrait,
+    DetachedSignature as SigTrait,
+};
+use sha3::{Sha3_256, Digest};
 
-/// VRF output with proof for verification
+// Domain separation constants
+const DOMAIN_EVAL: &[u8] = b"QNet_Dilithium3_VRF_Eval_v3";
+const DOMAIN_OUTPUT: &[u8] = b"QNet_Dilithium3_VRF_Output_v3";
+const DOMAIN_SLOT: &[u8] = b"QNet_VRF_SlotSeed_v3";
+
+/// Dilithium3 sizes
+pub const D3_PK_BYTES: usize = 1952;
+pub const D3_SK_BYTES: usize = 4032;
+pub const D3_SIG_BYTES: usize = 3293;
+
+/// VRF evaluation result
 #[derive(Debug, Clone)]
 pub struct VrfOutput {
-    /// The random output value (32 bytes)
+    /// Pseudorandom output (32 bytes)
     pub output: [u8; 32],
-    /// The VRF proof (signature)
+    /// Dilithium3 detached signature proof
     pub proof: Vec<u8>,
 }
 
-/// VRF implementation using Ed25519
-pub struct QNetVrf {
-    signing_key: Option<SigningKey>,
-    verifying_key: Option<VerifyingKey>,
+impl VrfOutput {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(36 + self.proof.len());
+        buf.extend_from_slice(&self.output);
+        buf.extend_from_slice(&(self.proof.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.proof);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 36 {
+            return Err(format!("[ERR][VRF] data_too_short len={}", data.len()));
+        }
+        let mut output = [0u8; 32];
+        output.copy_from_slice(&data[..32]);
+        let plen = u32::from_le_bytes([data[32], data[33], data[34], data[35]]) as usize;
+        if data.len() < 36 + plen {
+            return Err(format!("[ERR][VRF] proof_truncated need={} have={}", 36 + plen, data.len()));
+        }
+        Ok(Self { output, proof: data[36..36 + plen].to_vec() })
+    }
+
+    pub fn output_as_u128(&self) -> u128 {
+        u128::from_le_bytes([
+            self.output[0], self.output[1], self.output[2], self.output[3],
+            self.output[4], self.output[5], self.output[6], self.output[7],
+            self.output[8], self.output[9], self.output[10], self.output[11],
+            self.output[12], self.output[13], self.output[14], self.output[15],
+        ])
+    }
 }
 
-impl QNetVrf {
-    /// Create new VRF instance
-    pub fn new() -> Self {
-        Self { 
-            signing_key: None,
-            verifying_key: None,
-        }
+// =========================================================================
+// DilithiumVrf — core VRF engine
+// =========================================================================
+
+pub struct DilithiumVrf {
+    sk: Option<Vec<u8>>,
+    pk: Option<Vec<u8>>,
+    node_id: String,
+}
+
+/// Backward compatibility alias
+pub type QNetVrf = DilithiumVrf;
+
+impl DilithiumVrf {
+    pub fn new(node_id: String) -> Self {
+        Self { sk: None, pk: None, node_id }
     }
-    
-    /// Initialize with node's private key
-    /// In production, this would load from secure storage or HSM
-    pub fn initialize(&mut self, node_id: &str) -> Result<(), String> {
-        // Derive key from node ID and environment variable
-        // In production, use proper key management
-        let secret_seed = Self::derive_secret_seed(node_id)?;
-        
-        // Create Ed25519 signing key from seed
-        let signing_key = SigningKey::from_bytes(&secret_seed);
-        let verifying_key = signing_key.verifying_key();
-        
-        self.signing_key = Some(signing_key);
-        self.verifying_key = Some(verifying_key);
+
+    /// Initialize from raw key bytes
+    pub fn initialize_from_keys(&mut self, pk: &[u8], sk: &[u8]) -> Result<(), String> {
+        if pk.len() != D3_PK_BYTES {
+            return Err(format!("[ERR][VRF] pk_size={} expected={}", pk.len(), D3_PK_BYTES));
+        }
+        if sk.len() != D3_SK_BYTES {
+            return Err(format!("[ERR][VRF] sk_size={} expected={}", sk.len(), D3_SK_BYTES));
+        }
+        self.pk = Some(pk.to_vec());
+        self.sk = Some(sk.to_vec());
+        println!("[INFO][VRF] initialized node={} pk_hash={}",
+                 self.node_id, &hex::encode(Sha3_256::digest(pk))[..16]);
         Ok(())
     }
-    
-    /// Generate VRF output with proof for given input
-    /// This is the main VRF evaluation function
-    pub fn evaluate(&self, input: &[u8]) -> Result<VrfOutput, String> {
-        let signing_key = self.signing_key.as_ref()
-            .ok_or_else(|| "VRF not initialized".to_string())?;
-        
-        // Step 1: Hash input to curve point (hash-to-point)
-        // We use SHA3-512 for quantum resistance
-        let mut hasher = Sha3_512::new();
-        hasher.update(b"QNet_VRF_Hash_To_Point_v1");
-        hasher.update(input);
-        let hash_to_point = hasher.finalize();
-        
-        // Step 2: Sign the hash with Ed25519 (this is our VRF proof)
-        // The signature serves as cryptographic proof of the VRF computation
-        let signature = signing_key.sign(&hash_to_point);
-        
-        // Step 3: Hash signature to get VRF output
-        // This ensures the output is uniformly distributed
-        let mut output_hasher = Sha3_512::new();
-        output_hasher.update(b"QNet_VRF_Output_v1");
-        output_hasher.update(signature.to_bytes());
-        let output_hash = output_hasher.finalize();
-        
-        // Take first 32 bytes as output
-        let mut output = [0u8; 32];
-        output.copy_from_slice(&output_hash[..32]);
-        
-        Ok(VrfOutput {
-            output,
-            proof: signature.to_bytes().to_vec(),
-        })
+
+    /// Initialize from existing DilithiumKeyManager
+    pub fn initialize_from_key_manager(
+        &mut self,
+        km: &crate::crypto::key_manager::DilithiumKeyManager,
+    ) -> Result<(), String> {
+        let (pk, sk) = km.get_keypair()
+            .map_err(|e| format!("[ERR][VRF] keypair_load err={}", e))?;
+        self.initialize_from_keys(PkTrait::as_bytes(&pk), SkTrait::as_bytes(&sk))
     }
-    
-    /// Verify VRF proof for given input and output
-    /// Anyone can verify with just the public key
-    pub fn verify(
-        public_key_bytes: &[u8],
-        input: &[u8],
-        vrf_output: &VrfOutput,
-    ) -> Result<bool, String> {
-        // Parse verifying key
-        if public_key_bytes.len() != 32 {
-            return Err("Invalid public key length".to_string());
-        }
-        let mut key_array = [0u8; 32];
-        key_array.copy_from_slice(public_key_bytes);
-        let verifying_key = VerifyingKey::from_bytes(&key_array)
-            .map_err(|e| format!("Invalid verifying key: {}", e))?;
-        
-        // Parse signature proof
-        if vrf_output.proof.len() != 64 {
-            return Err("Invalid signature proof length".to_string());
-        }
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes.copy_from_slice(&vrf_output.proof);
-        let signature = Signature::from_bytes(&sig_bytes);
-        
-        // Step 1: Recreate hash-to-point
-        let mut hasher = Sha3_512::new();
-        hasher.update(b"QNet_VRF_Hash_To_Point_v1");
-        hasher.update(input);
-        let hash_to_point = hasher.finalize();
-        
-        // Step 2: Verify signature
-        verifying_key.verify(&hash_to_point, &signature)
-            .map_err(|e| format!("Signature verification failed: {}", e))?;
-        
-        // Step 3: Recreate output from signature
-        let mut output_hasher = Sha3_512::new();
-        output_hasher.update(b"QNet_VRF_Output_v1");
-        output_hasher.update(signature.to_bytes());
-        let output_hash = output_hasher.finalize();
-        
-        // Verify output matches
-        let mut expected_output = [0u8; 32];
-        expected_output.copy_from_slice(&output_hash[..32]);
-        
-        Ok(expected_output == vrf_output.output)
-    }
-    
-    /// Get public key for this VRF instance
+
     pub fn get_public_key(&self) -> Option<Vec<u8>> {
-        self.verifying_key.as_ref().map(|vk| vk.to_bytes().to_vec())
+        self.pk.clone()
     }
-    
-    /// Derive secret seed from node ID and environment
-    /// In production, use secure key management
-    fn derive_secret_seed(node_id: &str) -> Result<[u8; 32], String> {
-        // Try to get from environment variable first
-        let env_key = std::env::var("QNET_NODE_PRIVATE_KEY")
-            .unwrap_or_else(|_| format!("NODE_KEY_{}", node_id));
-        
-        // Derive 32-byte seed using SHA3-512
-        let mut hasher = Sha3_512::new();
-        hasher.update(b"QNet_VRF_Seed_Derivation_v1");
-        hasher.update(env_key.as_bytes());
-        hasher.update(node_id.as_bytes());
-        
-        let hash = hasher.finalize();
+
+    pub fn get_public_key_hex(&self) -> Option<String> {
+        self.pk.as_ref().map(|pk| hex::encode(pk))
+    }
+
+    /// Get secret key bytes (for block signing)
+    /// SECURITY: Only call from trusted signing code paths
+    pub fn get_secret_key_bytes(&self) -> Option<Vec<u8>> {
+        self.sk.clone()
+    }
+
+    // ── Core VRF ─────────────────────────────────────────────────────────
+
+    /// Evaluate VRF (deterministic: same sk+input → same output)
+    pub fn evaluate(&self, input: &[u8]) -> Result<VrfOutput, String> {
+        let sk_bytes = self.sk.as_ref()
+            .ok_or("[ERR][VRF] not initialized")?;
+        let msg = Self::hash_input(input);
+        let sk = dilithium3::SecretKey::from_bytes(sk_bytes)
+            .map_err(|e| format!("[ERR][VRF] sk_parse err={:?}", e))?;
+        let sig = dilithium3::detached_sign(&msg, &sk);
+        let proof = SigTrait::as_bytes(&sig).to_vec();
+        let output = Self::derive_output(&proof);
+        Ok(VrfOutput { output, proof })
+    }
+
+    /// Verify VRF proof (stateless, no secret key needed)
+    pub fn verify_static(pk_bytes: &[u8], input: &[u8], vrf: &VrfOutput) -> Result<bool, String> {
+        if pk_bytes.len() != D3_PK_BYTES {
+            return Err(format!("[ERR][VRF] verify pk_size={}", pk_bytes.len()));
+        }
+        let msg = Self::hash_input(input);
+        let pk = dilithium3::PublicKey::from_bytes(pk_bytes)
+            .map_err(|e| format!("[ERR][VRF] pk_parse err={:?}", e))?;
+        let sig = dilithium3::DetachedSignature::from_bytes(&vrf.proof)
+            .map_err(|e| format!("[ERR][VRF] sig_parse err={:?}", e))?;
+        if dilithium3::verify_detached_signature(&sig, &msg, &pk).is_err() {
+            return Ok(false);
+        }
+        Ok(Self::derive_output(&vrf.proof) == vrf.output)
+    }
+
+    // ── Secret Leader Election ───────────────────────────────────────────
+
+    /// Compute slot seed from macroblock hash + round
+    pub fn compute_slot_seed(mb_hash: &[u8; 32], round: u64) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(DOMAIN_SLOT);
+        h.update(mb_hash);
+        h.update(&round.to_le_bytes());
+        let r = h.finalize();
         let mut seed = [0u8; 32];
-        seed.copy_from_slice(&hash[..32]);
-        
-        Ok(seed)
+        seed.copy_from_slice(&r);
+        seed
+    }
+
+    /// Am I elected for this slot?
+    pub fn evaluate_election(
+        &self, slot_seed: &[u8; 32], my_rep: f64, total_rep: f64,
+    ) -> Result<Option<VrfOutput>, String> {
+        let vrf = self.evaluate(slot_seed)?;
+        let threshold = Self::calculate_threshold(my_rep, total_rep);
+        if vrf.output_as_u128() < threshold {
+            println!("[INFO][VRF] elected node={} rep={:.1}/{:.1}", self.node_id, my_rep, total_rep);
+            Ok(Some(vrf))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Verify another node's election claim
+    pub fn verify_election(
+        pk: &[u8], slot_seed: &[u8; 32], vrf: &VrfOutput, rep: f64, total_rep: f64,
+    ) -> Result<bool, String> {
+        if !Self::verify_static(pk, slot_seed, vrf)? {
+            return Ok(false);
+        }
+        Ok(vrf.output_as_u128() < Self::calculate_threshold(rep, total_rep))
+    }
+
+    /// Election threshold: P(elected) = rep / total_rep
+    pub fn calculate_threshold(rep: f64, total_rep: f64) -> u128 {
+        if total_rep <= 0.0 || rep <= 0.0 { return 0; }
+        let p = (rep / total_rep).min(1.0);
+        (u128::MAX as f64 * p).min(u128::MAX as f64) as u128
+    }
+
+    /// Pick winner: lowest VRF output (deterministic tiebreaker)
+    pub fn select_winner(candidates: &[(String, VrfOutput)]) -> Option<(String, VrfOutput)> {
+        candidates.iter()
+            .min_by_key(|(_, v)| v.output)
+            .map(|(id, v)| (id.clone(), v.clone()))
+    }
+
+    // ── Internal helpers ─────────────────────────────────────────────────
+
+    fn hash_input(input: &[u8]) -> Vec<u8> {
+        let mut h = Sha3_256::new();
+        h.update(DOMAIN_EVAL);
+        h.update(input);
+        h.finalize().to_vec()
+    }
+
+    fn derive_output(proof: &[u8]) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(DOMAIN_OUTPUT);
+        h.update(proof);
+        let r = h.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&r);
+        out
     }
 }
 
-/// DEPRECATED: Use deterministic SHA3-512 selection in node.rs instead!
-/// This function causes FORKS - each node has different keys = different outputs.
-#[allow(dead_code)]
-pub async fn select_producer_with_vrf(
-    round: u64,
-    candidates: &[(String, f64)],
-    node_id: &str,
-    entropy: &[u8],
-) -> Result<(String, VrfOutput), String> {
-    if candidates.is_empty() {
-        return Err("No candidates available".to_string());
-    }
-    
-    // Initialize VRF for this node
-    let mut vrf = QNetVrf::new();
-    vrf.initialize(node_id)?;
-    
-    // Create VRF input from round, entropy, and candidates
-    let mut vrf_input = Vec::new();
-    vrf_input.extend_from_slice(b"QNet_Producer_Selection_v1");
-    vrf_input.extend_from_slice(&round.to_le_bytes());
-    vrf_input.extend_from_slice(entropy);
-    
-    // Include all candidates to ensure consistency
-    // CRITICAL: Use ONLY node_id, NOT reputation!
-    // Reputation changes dynamically → different entropy → different producer → FORK!
-    for (candidate_id, _reputation) in candidates {
-        vrf_input.extend_from_slice(candidate_id.as_bytes());
-        // DO NOT use reputation in entropy - it changes during runtime!
-    }
-    
-    // Generate VRF output
-    let vrf_output = vrf.evaluate(&vrf_input)?;
-    
-    // Convert VRF output to selection index
-    let selection_number = u64::from_le_bytes([
-        vrf_output.output[0], vrf_output.output[1], vrf_output.output[2], vrf_output.output[3],
-        vrf_output.output[4], vrf_output.output[5], vrf_output.output[6], vrf_output.output[7],
-    ]);
-    
-    let selection_index = (selection_number as usize) % candidates.len();
-    let selected_producer = candidates[selection_index].0.clone();
-    
-    println!("[VRF] 🎲 Producer selected: {} (index {} of {})", 
-             selected_producer, selection_index, candidates.len());
-    println!("[VRF] 📝 Proof: {}", hex::encode(&vrf_output.proof[..32])); // Show first 32 bytes
-    
-    Ok((selected_producer, vrf_output))
+// =========================================================================
+// WalletIdentity — seed → wallet address + Dilithium3 keypair
+// =========================================================================
+
+pub struct WalletIdentity {
+    pub wallet_address: String,
+    pub dilithium_pk: Vec<u8>,
+    dilithium_sk: Vec<u8>,
+    pub seed_fingerprint: [u8; 32],
 }
+
+impl WalletIdentity {
+    /// Create from seed phrase + persistent keypair bytes
+    pub fn from_seed_and_keys(seed: &str, pk: Vec<u8>, sk: Vec<u8>) -> Result<Self, String> {
+        let wallet_address = Self::derive_wallet_address(seed);
+        let mut fp = [0u8; 32];
+        let h = Sha3_256::digest(format!("QNet_Seed_FP_v1{}", seed).as_bytes());
+        fp.copy_from_slice(&h);
+
+        if pk.len() != D3_PK_BYTES {
+            return Err(format!("[ERR][WALLET] pk_size={}", pk.len()));
+        }
+        if sk.len() != D3_SK_BYTES {
+            return Err(format!("[ERR][WALLET] sk_size={}", sk.len()));
+        }
+        println!("[INFO][WALLET] created addr={} pk_hash={}",
+                 wallet_address, &hex::encode(Sha3_256::digest(&pk))[..16]);
+        Ok(Self { wallet_address, dilithium_pk: pk, dilithium_sk: sk, seed_fingerprint: fp })
+    }
+
+    /// Derive EON wallet address from seed
+    /// Format: {19hex}eon{15hex}{4hex checksum} = 41 chars
+    pub fn derive_wallet_address(seed: &str) -> String {
+        let hash = Sha3_256::digest(format!("QNet_Wallet_v1{}", seed).as_bytes());
+        let hex_str = hex::encode(&hash);
+        let p1 = &hex_str[..19];
+        let p2 = &hex_str[19..34];
+        let body = format!("{}eon{}", p1, p2);
+        let ck = hex::encode(&Sha3_256::digest(body.as_bytes())[..2]);
+        format!("{}eon{}{}", p1, p2, ck)
+    }
+
+    /// Sign data with Dilithium3 (detached)
+    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let sk = dilithium3::SecretKey::from_bytes(&self.dilithium_sk)
+            .map_err(|e| format!("[ERR][WALLET] sk_parse err={:?}", e))?;
+        Ok(SigTrait::as_bytes(&dilithium3::detached_sign(data, &sk)).to_vec())
+    }
+
+    /// Create VRF instance from this identity
+    pub fn create_vrf(&self, node_id: &str) -> Result<DilithiumVrf, String> {
+        let mut vrf = DilithiumVrf::new(node_id.to_string());
+        vrf.initialize_from_keys(&self.dilithium_pk, &self.dilithium_sk)?;
+        Ok(vrf)
+    }
+
+    /// Verify signature from any public key
+    pub fn verify_signature(pk: &[u8], data: &[u8], sig_bytes: &[u8]) -> Result<bool, String> {
+        let pk = dilithium3::PublicKey::from_bytes(pk)
+            .map_err(|e| format!("[ERR][WALLET] pk err={:?}", e))?;
+        let sig = dilithium3::DetachedSignature::from_bytes(sig_bytes)
+            .map_err(|e| format!("[ERR][WALLET] sig err={:?}", e))?;
+        Ok(dilithium3::verify_detached_signature(&sig, data, &pk).is_ok())
+    }
+
+    pub fn pk_hex(&self) -> String { hex::encode(&self.dilithium_pk) }
+}
+
+impl Drop for WalletIdentity {
+    fn drop(&mut self) {
+        for b in self.dilithium_sk.iter_mut() { *b = 0; }
+    }
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_vrf_deterministic() {
-        let mut vrf = QNetVrf::new();
-        vrf.initialize("test_node_001").unwrap();
-        
-        let input = b"test_input";
-        let output1 = vrf.evaluate(input).unwrap();
-        let output2 = vrf.evaluate(input).unwrap();
-        
-        // Same input should produce same output
-        assert_eq!(output1.output, output2.output);
-        assert_eq!(output1.proof, output2.proof);
+        let (pk, sk) = dilithium3::keypair();
+        let mut vrf = DilithiumVrf::new("t1".into());
+        vrf.initialize_from_keys(PkTrait::as_bytes(&pk), SkTrait::as_bytes(&sk)).unwrap();
+        let a = vrf.evaluate(b"input").unwrap();
+        let b = vrf.evaluate(b"input").unwrap();
+        assert_eq!(a.output, b.output);
+        assert_eq!(a.proof, b.proof);
     }
-    
+
     #[test]
-    fn test_vrf_verification() {
-        let mut vrf = QNetVrf::new();
-        vrf.initialize("test_node_001").unwrap();
-        
-        let input = b"test_input";
-        let output = vrf.evaluate(input).unwrap();
-        let public_key = vrf.get_public_key().unwrap();
-        
-        // Verification should succeed
-        let verified = QNetVrf::verify(&public_key, input, &output).unwrap();
-        assert!(verified);
-        
-        // Wrong input should fail
-        let wrong_input = b"wrong_input";
-        let verified = QNetVrf::verify(&public_key, wrong_input, &output);
-        // Should either return false or error - both are valid
-        assert!(verified.is_err() || !verified.unwrap());
+    fn test_vrf_verify() {
+        let (pk, sk) = dilithium3::keypair();
+        let pk_b = PkTrait::as_bytes(&pk).to_vec();
+        let mut vrf = DilithiumVrf::new("t2".into());
+        vrf.initialize_from_keys(&pk_b, SkTrait::as_bytes(&sk)).unwrap();
+        let out = vrf.evaluate(b"msg").unwrap();
+        assert!(DilithiumVrf::verify_static(&pk_b, b"msg", &out).unwrap());
+        assert!(!DilithiumVrf::verify_static(&pk_b, b"wrong", &out).unwrap());
     }
-    
+
     #[test]
-    fn test_vrf_different_nodes() {
-        let mut vrf1 = QNetVrf::new();
-        vrf1.initialize("node_001").unwrap();
-        
-        let mut vrf2 = QNetVrf::new();
-        vrf2.initialize("node_002").unwrap();
-        
-        let input = b"same_input";
-        let output1 = vrf1.evaluate(input).unwrap();
-        let output2 = vrf2.evaluate(input).unwrap();
-        
-        // Different nodes should produce different outputs
-        assert_ne!(output1.output, output2.output);
-        assert_ne!(output1.proof, output2.proof);
+    fn test_wallet_address_deterministic() {
+        let a = WalletIdentity::derive_wallet_address("test seed");
+        let b = WalletIdentity::derive_wallet_address("test seed");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 41);
+        assert!(a.contains("eon"));
+    }
+
+    #[test]
+    fn test_vrf_serialization() {
+        let v = VrfOutput { output: [42u8; 32], proof: vec![1, 2, 3] };
+        let r = VrfOutput::from_bytes(&v.to_bytes()).unwrap();
+        assert_eq!(r.output, v.output);
+        assert_eq!(r.proof, v.proof);
     }
 }

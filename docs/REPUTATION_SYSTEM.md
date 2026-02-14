@@ -9,7 +9,9 @@ All nodes compute identical reputation scores from on-chain data.
 
 **NEW in v2.40:** Block-based consensus phases eliminate cascade jailing!
 
-**NEW in v2.27:** Epoch-based validator sets + QRDS (Quantum-Resistant Deterministic Selection) eliminate gossip race conditions!
+**NEW in v4.0:** Dilithium3-VRF Secret Leader Election replaces deterministic selection — unpredictable, verifiable, post-quantum!
+
+**NEW in v2.27:** Epoch-based validator sets eliminate gossip race conditions!
 
 **NEW in v2.24:** Reputation snapshots ensure 100% synchronization across all nodes!
 

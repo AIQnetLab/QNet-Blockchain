@@ -16,8 +16,8 @@ class MainApplication : Application(), ReactApplication {
       object : DefaultReactNativeHost(this) {
         override fun getPackages(): List<ReactPackage> =
             PackageList(this).packages.apply {
-              // Packages that cannot be autolinked yet can be added manually here, for example:
-              // add(MyReactNativePackage())
+              // CRYSTALS-Dilithium3 (ML-DSA-65) post-quantum signature module
+              add(DilithiumPackage())
             }
 
         override fun getJSMainModuleName(): String = "index"

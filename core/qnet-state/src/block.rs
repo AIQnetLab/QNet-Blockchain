@@ -46,22 +46,18 @@ pub struct MicroBlock {
     pub poh_count: u64,
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // QUANTUM RANDOMNESS BEACON (QRB) v3.0
-    // Each producer contributes signed randomness for epoch accumulation
-    // Provides "true randomness" for gambling, NFT mints, fair auctions
+    // v4.0: DILITHIUM3-VRF OUTPUT + PROOF (dual purpose)
+    // 1. Secret Leader Election: VRF(wallet_sk, slot_seed) → election proof
+    // 2. Quantum Randomness Beacon (QRB): accumulated for epoch randomness
     // ═══════════════════════════════════════════════════════════════════════════
     
-    /// QRB randomness output from producer (32 bytes)
-    /// Generated using Hybrid signature (Dilithium3 + Ed25519)
-    /// Input: SHA3(prev_block_hash || height || producer_id)
-    /// Note: Field named vrf_output for serialization compatibility
+    /// VRF output: SHA3-256(Dilithium3_detached_sign(sk, slot_seed)) = 32 bytes
+    /// Used for: leader election verification + QRB randomness accumulation
     #[serde(default)]
     pub vrf_output: Option<[u8; 32]>,
     
-    /// Serialized QRB proof for verification
-    /// Contains: HybridSignature (Dilithium certificate + Ed25519 ephemeral signature)
-    /// Any node can verify the randomness contribution is authentic
-    /// Note: Field named vrf_proof for serialization compatibility
+    /// VRF proof: Dilithium3 detached signature (~3293 bytes)
+    /// Verifiable by any node with producer's registered public key
     #[serde(default)]
     pub vrf_proof: Option<Vec<u8>>,
     

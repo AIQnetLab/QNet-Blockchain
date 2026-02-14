@@ -51,8 +51,8 @@ pub mod quantum_crypto;
 /// Time-based consensus with quantum-resistant hashing
 pub mod quantum_poh;
 
-/// Legacy VRF (DEPRECATED for producer selection)
-/// Keep for reference only - production uses SHA3-512 deterministic selection
+/// Dilithium3-VRF: Post-quantum VRF for secret leader election
+/// Uses NIST FIPS 204 (ML-DSA-65) + SHA3-256
 pub mod vrf;
 
 /// Hybrid VRF for QRB (Quantum Randomness Beacon)
@@ -98,10 +98,12 @@ pub use quantum_poh::{
     PoHEntry,
 };
 
-// VRF types
+// VRF types (Dilithium3-VRF)
 pub use vrf::{
+    DilithiumVrf,
     QNetVrf,
     VrfOutput,
+    WalletIdentity,
 };
 
 // Hybrid VRF types

@@ -379,6 +379,7 @@ sudo iptables -A INPUT -p udp --dport 10876 -j ACCEPT
 
 # On server with IP matching QNET_BOOTSTRAP_ID (001-005)
 docker run -d --name qnet-genesis-001 --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=001 \
   -e DOCKER_ENV=1 \

@@ -9,8 +9,8 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"     # Smaller files for faster log rotation
-        max-file: "2"       # Only 2 files max (20MB total)
+        max-size: "200m"    # 200MB per file
+        max-file: "50"      # 50 files = 10GB total max, oldest auto-deleted
         compress: "true"    # Compress old logs to save space
     environment:
       - RUST_LOG=info,qnet=debug
@@ -64,8 +64,8 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"     # Smaller files for faster log rotation
-        max-file: "2"       # Only 2 files max (20MB total)
+        max-size: "200m"    # 200MB per file
+        max-file: "50"      # 50 files = 10GB total max, oldest auto-deleted
         compress: "true"    # Compress old logs to save space
     environment:
       - RUST_LOG=info,qnet=debug
@@ -118,8 +118,8 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"     # Smaller files for faster log rotation
-        max-file: "2"       # Only 2 files max (20MB total)
+        max-size: "200m"    # 200MB per file
+        max-file: "50"      # 50 files = 10GB total max, oldest auto-deleted
         compress: "true"    # Compress old logs to save space
     environment:
       - RUST_LOG=info,qnet=debug

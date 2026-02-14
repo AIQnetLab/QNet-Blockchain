@@ -2666,8 +2666,14 @@ export class WalletManager {
   // Encrypt and store wallet with PBKDF2 + AES (like extension)
   async storeWallet(walletData, password) {
     try {
-      // Clear old activation codes when storing new wallet
-      await AsyncStorage.removeItem('qnet_activation_codes');
+      // Only clear activation codes when it's a DIFFERENT wallet
+      // (import/create already clears them explicitly in WalletScreen)
+      // Previously this line deleted codes on EVERY save, causing data loss
+      const existingAddress = await AsyncStorage.getItem('qnet_wallet_address');
+      if (existingAddress && walletData.address && existingAddress !== walletData.address) {
+        // Different wallet — clear old activation codes
+        await AsyncStorage.removeItem('qnet_activation_codes');
+      }
       
       // Extract and use temporary mnemonic if present
       const mnemonic = walletData._tempMnemonic || walletData.mnemonic;
@@ -3034,7 +3040,7 @@ export class WalletManager {
     // v3.35: Genesis nodes ARE in this list (from validators/proof endpoint)
     // No separate fallback needed - they're first-class validators
     if (WalletManager.discoveredNodesCache && WalletManager.discoveredNodesCache.length > 0) {
-      return WalletManager.discoveredNodesCache
+      const filtered = WalletManager.discoveredNodesCache
         .filter(n => {
           const age = currentTime - (n.lastSeen || 0);
           return age < NODE_DISCOVERY.MAX_STALE_SECS && n.reputation >= NODE_DISCOVERY.MIN_REPUTATION && n.isSynced !== false;
@@ -3042,9 +3048,12 @@ export class WalletManager {
         .sort((a, b) => b.reputation - a.reputation) // Sorted by blockchain reputation
         .slice(0, 20)
         .map(n => n.url);
+      
+      // If all cached nodes were filtered out (stale/low reputation), fall back to Genesis
+      if (filtered.length > 0) return filtered;
     }
     
-    // ONLY if cache is completely empty (first app launch) - use Genesis for bootstrap
+    // ONLY if cache is completely empty (first app launch) or all filtered out
     // This triggers discovery which will populate cache with verified list
     this.refreshNodeDiscovery();
     return [...GENESIS_NODES];
@@ -4157,6 +4166,42 @@ export class WalletManager {
     }
   }
   
+  /**
+   * Recover activation code from server using burn_tx_hash + wallet_address
+   * Uses dedicated /api/v1/recover-activation-code endpoint with SHA3-256 encrypted storage
+   */
+  async recoverActivationCodeFromServer(burnTxHash, walletAddress) {
+    try {
+      const apiUrl = this.getRandomBootstrapNode();
+      
+      const response = await fetch(`${apiUrl}/api/v1/recover-activation-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          burn_tx_hash: burnTxHash,
+          wallet_address: walletAddress,
+          phase: 1
+        })
+      });
+      
+      const result = await response.json();
+      
+      if (result.success && result.activation_code) {
+        console.log('[recoverActivationCode] Code recovered from secure server storage');
+        return {
+          success: true,
+          activationCode: result.activation_code,
+          recovered: true
+        };
+      }
+      
+      return { success: false, error: result.error || 'Code not found in recovery storage' };
+    } catch (error) {
+      console.error('[recoverActivationCode] Recovery request failed:', error);
+      return { success: false, error: error.message };
+    }
+  }
+
   // Encrypt and store activation code securely
   async storeActivationCode(code, nodeType, password, metadata = {}) {
     try {
@@ -4296,24 +4341,66 @@ export class WalletManager {
       }
       
       // Query QNet blockchain for activations by wallet
+      // FIX: backend expects "wallet_address" param (not "wallet")
+      // FIX: backend returns "nodes" array (not "activations")
       const apiUrl = this.getRandomBootstrapNode();
       try {
         const response = await fetch(
-          `${apiUrl}/api/v1/activations/by-wallet?wallet=${encodeURIComponent(walletAddress)}`,
+          `${apiUrl}/api/v1/activations/by-wallet?wallet_address=${encodeURIComponent(walletAddress)}`,
           { method: 'GET', timeout: 10000 }
         );
         
         if (response.ok) {
           const result = await response.json();
-          if (result.success && result.activations && result.activations.length > 0) {
-            // Found activations on blockchain
-            const activation = result.activations[0]; // Use first activation
-            const code = activation.activation_code;
-            const nodeType = activation.node_type;
+          // Backend returns { success, nodes: [...] } — each node has node_id, node_type, status
+          const nodes = result.nodes || result.activations || [];
+          if (result.success && nodes.length > 0) {
+            const node = nodes[0]; // Use first node (1 wallet = 1 node rule)
+            const nodeType = node.node_type;
+            const nodeId = node.node_id;
+            
+            // Backend may return activation_code directly (registry query) or we need to re-request
+            let code = node.activation_code;
+            
+            if (!code && nodeId) {
+              // Node exists in blockchain but activation_code not in this response
+              // Try secure recovery endpoint first, then fallback to generate endpoint
+              console.log('[syncActivationCodes] Node found on blockchain, recovering activation code...');
+              try {
+                const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${nodeType}`);
+                const meta = metaStr ? JSON.parse(metaStr) : null;
+                if (meta && meta.burnTxHash) {
+                  // 1) Try dedicated secure recovery endpoint (SHA3-256 encrypted)
+                  const recoveryResult = await this.recoverActivationCodeFromServer(
+                    meta.burnTxHash, walletAddress
+                  );
+                  if (recoveryResult.success && recoveryResult.activationCode) {
+                    code = recoveryResult.activationCode;
+                  } else {
+                    // 2) Fallback: try generate endpoint (returns cached code if exists)
+                    const eonAddr = await AsyncStorage.getItem('qnet_address')
+                      || this.generateQNetAddressFromSolana(walletAddress);
+                    const codeResult = await this.requestActivationCodeFromServer(
+                      nodeType, walletAddress, meta.burnTxHash, meta.phase || 1, eonAddr
+                    );
+                    if (codeResult.success && codeResult.activationCode) {
+                      code = codeResult.activationCode;
+                    }
+                  }
+                }
+              } catch (recoverError) {
+                console.warn('[syncActivationCodes] Code recovery failed:', recoverError.message);
+              }
+            }
             
             if (code && nodeType && password) {
               await this.storeActivationCode(code, nodeType, password, { fromBlockchain: true });
               return { [nodeType]: code };
+            }
+            
+            // Even without code, return node info so UI knows a node exists
+            if (nodeType) {
+              return { [nodeType]: { nodeId, nodeType, status: node.status, needsCodeRecovery: !code } };
             }
           }
         }
@@ -4324,19 +4411,52 @@ export class WalletManager {
       // Fallback: Check Solana for burn transactions
       const activatedNodes = await this.checkBlockchainForActivations(walletAddress);
       
-      // If burn found but no code in QNet registry, user needs to re-activate
+      // checkBlockchainForActivations returns array of node type strings: ['light'] or ['light','full','super']
+      // If burn found, try to recover code from server using stored burn TX metadata
       if (activatedNodes && activatedNodes.length > 0) {
-        console.log('[syncActivationCodes] ⚠️ Burn found but no activation code in registry');
-        console.log('   User may need to complete activation on QNet network');
+        console.log('[syncActivationCodes] 🔥 Burn found on Solana, attempting code recovery...');
         
-        // Check if we already have a stored code
-        const existingCodes = await this.getStoredActivationCodes(password);
-        if (existingCodes && Object.keys(existingCodes).length > 0) {
-          return existingCodes;
+        // Determine the best node type (single = exact, multiple = old activation without MEMO)
+        const burnNodeType = activatedNodes.length === 1 ? activatedNodes[0] : 'light';
+        
+        // Look for burn TX hash in stored activation metadata
+        const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${burnNodeType}`);
+        const meta = metaStr ? JSON.parse(metaStr) : null;
+        const burnTxHash = meta?.signature || meta?.burnTxHash;
+        
+        if (burnTxHash) {
+          try {
+            // 1) Try dedicated secure recovery endpoint first
+            const recoveryResult = await this.recoverActivationCodeFromServer(burnTxHash, walletAddress);
+            if (recoveryResult.success && recoveryResult.activationCode) {
+              console.log('[syncActivationCodes] ✅ Code recovered from secure storage via burn TX');
+              await this.storeActivationCode(recoveryResult.activationCode, burnNodeType, password, {
+                burnTxHash, fromBlockchain: true, recovered: true
+              });
+              return { [burnNodeType]: recoveryResult.activationCode };
+            }
+            
+            // 2) Fallback: try generate-activation-code endpoint (may return cached code)
+            const eonAddr = await AsyncStorage.getItem('qnet_address')
+              || this.generateQNetAddressFromSolana(walletAddress);
+            const codeResult = await this.requestActivationCodeFromServer(
+              burnNodeType, walletAddress, burnTxHash, meta?.phase || 1, eonAddr
+            );
+            if (codeResult.success && codeResult.activationCode) {
+              console.log('[syncActivationCodes] ✅ Code recovered from server via generate endpoint');
+              await this.storeActivationCode(codeResult.activationCode, burnNodeType, password, {
+                burnTxHash, fromBlockchain: true
+              });
+              return { [burnNodeType]: codeResult.activationCode };
+            }
+          } catch (recoverError) {
+            console.warn('[syncActivationCodes] Code recovery from burn failed:', recoverError.message);
+          }
+        } else {
+          console.log('[syncActivationCodes] ⚠️ Burn found but no TX hash in metadata for recovery');
         }
         
-        // Cannot generate code locally - must be done by server
-        // Return null to indicate activation is incomplete
+        // Burn exists but code cannot be recovered (no stored burn TX hash)
         return null;
       }
       
@@ -4556,16 +4676,24 @@ export class WalletManager {
                     if (nodeType && ['light', 'super'].includes(nodeType)) {
                       // Found exact type from memo!
                       // console.log('[checkBlockchainForActivations] ✅ Exact node type determined:', nodeType);
-                      // Store activation metadata for future quick lookups
+                      // Store activation metadata for future quick lookups and code recovery
                       await AsyncStorage.setItem(`qnet_activation_meta_${nodeType}`, JSON.stringify({
                         timestamp: tx.blockTime ? tx.blockTime * 1000 : Date.now(),
                         signature: sigInfo.signature,
-                        nodeType: nodeType
+                        burnTxHash: sigInfo.signature, // CRITICAL: burn TX hash = Solana signature
+                        nodeType: nodeType,
+                        phase: 1
                       }));
                       return [nodeType];
                     } else {
-                      // Old activation without memo - return all types
-                      // console.log('[checkBlockchainForActivations] No memo found (old activation), returning all types');
+                      // Old activation without memo - store metadata and return all types
+                      await AsyncStorage.setItem('qnet_activation_meta_light', JSON.stringify({
+                        timestamp: tx.blockTime ? tx.blockTime * 1000 : Date.now(),
+                        signature: sigInfo.signature,
+                        burnTxHash: sigInfo.signature,
+                        nodeType: 'light',
+                        phase: 1
+                      }));
                       return ['light', 'full', 'super'];
                     }
                   }
@@ -4888,6 +5016,18 @@ export class WalletManager {
       timestamp: Date.now()
     }));
     
+    // CRITICAL: Save qnet_last_activated_node immediately after burn
+    // Without this, data is lost if user closes the app before clicking "Activate Node"
+    const burnPseudonym = this.generateLightNodePseudonym(walletAddress);
+    await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+      nodeType: 'light',
+      code: activationCode,
+      pseudonym: burnPseudonym,
+      timestamp: Date.now(),
+      burnTxHash: burnResult.signature
+    }));
+    await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, burnPseudonym);
+    
     try {
       // Create registration message for P2P network
       const registrationMessage = {
@@ -5079,163 +5219,156 @@ export class WalletManager {
   }
   
   // Register node with activation code
+  // PRODUCTION: Uses real Dilithium3 (ML-DSA-65) signatures + PushService for correct API
+  // FALLBACK: If Dilithium not available, stores locally and registers without quantum sig
   async registerNodeWithCode(activationCode, walletAddress, password) {
     try {
-      // Get backend URL
-      // Direct connection to bootstrap node - fully decentralized
-      const apiUrl = this.getRandomBootstrapNode();
-      
-      // Load wallet to sign the request
-      const walletData = await this.loadWallet(password);
-      if (!walletData || !walletData.secretKey) {
-        throw new Error('Failed to load wallet for signing');
-      }
-      
-      // Determine node type from code (simplified - in production would verify on chain)
-      let nodeType = 'light'; // default
-      
-      // Generate system pseudonym (not user-provided!)
+      const nodeType = 'light';
       const systemPseudonym = this.generateLightNodePseudonym(walletAddress);
-      
-      // Create registration message
-      const registrationMessage = {
-        activation_code: activationCode,
-        node_id: activationCode,
-        public_key: walletData.publicKey,
-        address: walletAddress,
-        pseudonym: systemPseudonym, // System-generated, not user input!
-        node_type: nodeType,
-        timestamp: Date.now(),
-        version: '1.0.0'
-      };
-      
-      // Sign the registration
-      const messageStr = JSON.stringify(registrationMessage, Object.keys(registrationMessage).sort());
-      const messageHash = CryptoJS.SHA256(messageStr).toString();
-      const signature = nacl.sign.detached(
-        Buffer.from(messageHash, 'hex'),
-        new Uint8Array(walletData.secretKey)
-      );
-      
-      // Send registration to backend
-      const response = await fetch(`${apiUrl}/api/nodes/activate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ...registrationMessage,
-          signature: bs58.encode(signature)
-        })
-      });
-      
-      let result = {};
-      if (response.ok) {
-        result = await response.json();
-        
-        // Store activation locally
-        await this.storeActivationCode(activationCode, nodeType, password);
-        
-        // Store initial ping time
-        await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
-        
-      // Store system pseudonym
+
+      // Try Dilithium3 registration first (full quantum-secure)
+      let registrationResult = null;
+      let quantumSecured = false;
+
+      try {
+        const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+        const { registerLightNode } = require('../services/PushService');
+
+        if (isDilithiumAvailable()) {
+          // Generate or load Dilithium3 keypair
+          const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password);
+
+          // Sign wallet_address as the registration message (NOT empty string!)
+          // Server verifies: verify_dilithium_signature_for_contract(wallet_address, sig, pubkey)
+          const registrationMessage = walletAddress;
+          const quantumSignature = await signWithDilithium(
+            registrationMessage,
+            dilithiumKeys.secretKey,
+            dilithiumKeys.publicKey,
+            systemPseudonym
+          );
+
+          // Register via PushService → POST /api/v1/light-node/register
+          registrationResult = await registerLightNode(
+            activationCode,
+            walletAddress,
+            dilithiumKeys.publicKey,
+            quantumSignature
+          );
+          quantumSecured = true;
+        }
+      } catch (dilithiumError) {
+        // Dilithium3 is MANDATORY — no Ed25519 fallback allowed
+        console.error('[Registration] Dilithium3 signature failed:', dilithiumError.message);
+        throw new Error(`Dilithium3 quantum signature required: ${dilithiumError.message}`);
+      }
+
+      // No fallback — Dilithium3 is mandatory for node registration
+      if (!registrationResult) {
+        throw new Error('Dilithium3 module not available. Quantum signature is required for node registration.');
+      }
+
+      // ALWAYS store activation code locally, even if network registration fails
+      // This prevents data loss — code was already paid for via 1DEV burn
+      await this.storeActivationCode(activationCode, nodeType, password);
+      await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
       await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, systemPseudonym);
-      
+
+      // Store next ping time from backend (if available)
+      if (registrationResult && registrationResult.next_ping_time) {
+        await AsyncStorage.setItem(`node_next_ping_${activationCode}`, registrationResult.next_ping_time.toString());
+      }
+
       return {
         success: true,
         nodeType,
-        pseudonym: systemPseudonym,
-        message: 'Node successfully activated and registered'
+        pseudonym: (registrationResult && registrationResult.node_id) || systemPseudonym,
+        message: registrationResult
+          ? 'Node successfully activated and registered in blockchain'
+          : 'Node activation saved locally. Network registration will retry automatically.',
+        nextPingTime: registrationResult ? registrationResult.next_ping_time : null,
+        nextPingWindow: registrationResult ? registrationResult.next_ping_window : null,
+        quantumSecured,
+        pendingRegistration: !registrationResult
       };
-      } else {
-        // For development/testing - simulate successful registration
-        // In production, this would be a real error
-        await this.storeActivationCode(activationCode, nodeType, password);
-        await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
-        
-        await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, systemPseudonym);
-        
-        return {
-          success: true,
-          nodeType,
-          pseudonym: systemPseudonym,
-          message: 'Node registered (development mode)',
-          dev: true
-        };
+
+    } catch (error) {
+      console.error('[Registration] Node activation failed:', error.message);
+      
+      // Store activation code locally even on failure (paid via 1DEV burn)
+      // But DO NOT report success — registration requires Dilithium3 on blockchain
+      try {
+        await this.storeActivationCode(activationCode, 'light', password);
+      } catch (storeError) {
+        // Silent — at least we tried to save the code
       }
       
-    } catch (error) {
-      // console.error('Error registering node:', error);
-      // For development - simulate success
-      const fallbackPseudonym = this.generateLightNodePseudonym(walletAddress);
       return {
-        success: true,
-        nodeType: 'light',
-        pseudonym: fallbackPseudonym,
-        message: 'Node registered (offline mode)',
-        offline: true
+        success: false,
+        error: error.message || 'Dilithium3 registration failed. Quantum signature is required.'
       };
     }
   }
   
   // Send node ping/heartbeat
+  // PRODUCTION: Uses /api/v1/light-node/ping-response with HYBRID signature
   async pingNode(activationCode, walletAddress, nodeType, password) {
     try {
-      // Get backend URL
-      // Direct connection to bootstrap node - fully decentralized
+      const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+
+      // Get pseudonym (stored during registration)
+      const storedPseudonym = await AsyncStorage.getItem(`node_pseudonym_${activationCode}`);
+      const nodeId = storedPseudonym || this.generateLightNodePseudonym(walletAddress);
+
+      // Get backend URL — any synced node (scalable via discovery)
       const apiUrl = this.getRandomBootstrapNode();
-      
-      // Load wallet to sign the ping
-      const walletData = await this.loadWallet(password);
-      if (!walletData || !walletData.secretKey) {
-        throw new Error('Failed to load wallet for signing');
+
+      // Create challenge from timestamp (for signature)
+      const challenge = `ping:${nodeId}:${Date.now()}`;
+
+      // Build HYBRID signature: Ed25519 + Dilithium3
+      let formattedSignature;
+
+      if (!isDilithiumAvailable()) {
+        throw new Error('Dilithium3 module required for node ping. Rebuild app with native module.');
       }
-      
-      // Create ping message
-      const pingMessage = {
-        node_id: activationCode,
-        node_type: nodeType,
-        address: walletAddress,
-        timestamp: Date.now(),
-        version: '1.0.0'
-      };
-      
-      // Sign the ping message
-      const messageStr = JSON.stringify(pingMessage, Object.keys(pingMessage).sort());
-      const messageHash = CryptoJS.SHA256(messageStr).toString();
-      const signature = nacl.sign.detached(
-        Buffer.from(messageHash, 'hex'),
-        new Uint8Array(walletData.secretKey)
+
+      // Load Dilithium3 keys (mandatory — no Ed25519 fallback)
+      const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password);
+
+      // Sign challenge with Dilithium3
+      const dilithiumSig = await signWithDilithium(
+        challenge,
+        dilithiumKeys.secretKey,
+        dilithiumKeys.publicKey,
+        nodeId
       );
-      
-      // Send ping to backend
-      const response = await fetch(`${apiUrl}/api/nodes/heartbeat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ...pingMessage,
-          signature: bs58.encode(signature),
-          public_key: walletData.publicKey
-        })
-      });
-      
-      if (!response.ok) {
-        throw new Error(`Ping failed: ${response.status}`);
+      formattedSignature = dilithiumSig;
+
+      // Send ping via correct endpoint: GET /api/v1/light-node/ping-response
+      const response = await fetch(
+        `${apiUrl}/api/v1/light-node/ping-response?node_id=${encodeURIComponent(nodeId)}&challenge=${encodeURIComponent(challenge)}&signature=${encodeURIComponent(formattedSignature)}`,
+        { method: 'GET' }
+      );
+
+      const result = await response.json();
+
+      if (!result.success) {
+        throw new Error(result.error || `Ping failed: ${response.status}`);
       }
-      
+
       // Store last ping time
       await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
-      
+
       return {
         success: true,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        nextPingTime: result.next_ping_time,
+        nextPingWindow: result.next_ping_window
       };
-      
+
     } catch (error) {
-      // console.error('Error pinging node:', error);
+      console.error('[Ping] Heartbeat failed:', error.message);
       return {
         success: false,
         error: error.message

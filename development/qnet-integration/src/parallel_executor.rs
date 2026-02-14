@@ -10,8 +10,8 @@ use sha3::{Sha3_256, Digest};
 use rayon::prelude::*;
 use hex;
 
-/// Maximum transactions to process in parallel
-const MAX_PARALLEL_TX: usize = 10000;
+/// Maximum transactions to process in parallel (v4.1: increased for 200K TX/block)
+const MAX_PARALLEL_TX: usize = 200000;
 
 /// Number of pipeline stages (including Dilithium signature stage)
 const PIPELINE_STAGES: usize = 5;

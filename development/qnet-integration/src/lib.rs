@@ -144,7 +144,7 @@ impl QNetBlockchain {
             max_size: std::env::var("QNET_MEMPOOL_SIZE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(500_000), // Production default: 500k
+                .unwrap_or(200_000), // Production default: 200k (v4.1)
             min_gas_price: 1,
         };
         
@@ -375,7 +375,7 @@ pub mod feature_flags {
                 enable_sharding: true,
                 enable_parallel_validation: true,
                 shard_count: 100,
-                batch_size: 1000,
+                batch_size: 200000, // v4.1: 200K TX/block
                 microblock_interval: std::time::Duration::from_secs(1),
             }
         }

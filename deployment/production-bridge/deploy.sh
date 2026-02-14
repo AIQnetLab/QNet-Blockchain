@@ -81,8 +81,8 @@ deploy_container() {
         --memory="1g" \
         --cpus="2" \
         --log-driver json-file \
-        --log-opt max-size=10m \
-        --log-opt max-file=3 \
+        --log-opt max-size=200m \
+        --log-opt max-file=50 \
         $IMAGE_NAME:latest
     
     log_info "✅ Container deployed successfully"

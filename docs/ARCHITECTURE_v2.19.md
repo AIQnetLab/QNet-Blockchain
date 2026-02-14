@@ -100,7 +100,7 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 
 ### Problem Solved
 
-Previous gossip-based producer selection caused **network forks** when different nodes had different views of active peers at the moment of QRDS (Quantum-Resistant Deterministic Selection).
+Previous gossip-based producer selection caused **network forks** when different nodes had different views of active peers. Now replaced by **Dilithium3-VRF Secret Leader Election** (NIST FIPS 204).
 
 ### Solution: MacroBlock Snapshots
 
@@ -135,10 +135,10 @@ pub struct EligibleProducer {
 │  └── Source: MacroBlock N-2.eligible_producers (blockchain)            │
 │  └── WHY N-2? N-1 may not be finalized yet! N-2 has 90+ blocks buffer │
 │                                                                         │
-│  PRODUCER SELECTION (QRDS - Quantum-Resistant Deterministic Selection):│
+│  PRODUCER SELECTION (Dilithium3-VRF Secret Leader Election v4.0):     │
 │  └── calculate_qualified_candidates() → read snapshot from blockchain  │
-│  └── SHA3-512 deterministic selection from snapshot                    │
-│  └── All nodes use SAME snapshot → DETERMINISM!                        │
+│  └── VRF evaluate(sk, slot_seed) → lowest output wins                 │
+│  └── All nodes use SAME snapshot + verify VRF proofs → DETERMINISM!   │
 │                                                                         │
 │  EMERGENCY SELECTION:                                                   │
 │  └── Same snapshot, excluding failed producer                          │
@@ -2154,27 +2154,37 @@ Per **NIST SP 800-208** and **Cisco Post-Quantum Recommendations**:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Post-Quantum Cryptography
-- **Algorithm**: CRYSTALS-Dilithium (NIST FIPS 204 / ML-DSA)
-- **Security Level**: Dilithium3 (Level 3)
+#### Post-Quantum Cryptography (v4.0)
+- **Algorithm**: CRYSTALS-Dilithium3 (NIST FIPS 204 / ML-DSA-65)
+- **Security Level**: Dilithium3 (Level 3, 128-bit post-quantum)
 - **Key Size**: 1952 bytes (public), 4000 bytes (private)
-- **Signature Size**: ~2420 bytes
+- **Signature Size**: 3293 bytes (detached)
 - **Security**: Resistant to Shor's algorithm (quantum attacks)
-- **Usage**: Signs BOTH ephemeral key binding AND message hash
+- **Usage**: VRF leader election, block signing, node registration proof
+- **VRF Construction**: `evaluate(sk, input) → (output, proof)`, `verify(pk, input, output, proof) → bool`
 
 #### Classical Cryptography  
 - **Algorithm**: Ed25519 (Curve25519)
 - **Security Level**: 128-bit security
 - **Key Size**: 32 bytes (public), 64 bytes (private)
 - **Signature Size**: 64 bytes
-- **Purpose**: Fast verification, EPHEMERAL keys per message
-- **CRITICAL**: Ed25519 keys are NOT reused between messages!
+- **Purpose**: Fast verification, EPHEMERAL keys for heartbeat transactions only
+- **CRITICAL**: Ed25519 is NOT used for consensus-critical paths (VRF, block signing)
 
 #### Hashing
 - **Algorithm**: SHA3-256 (NIST FIPS 202) - quantum-resistant
 - **Output**: 256 bits (32 bytes)
-- **Usage**: Block hashes, message digests, signature preparation
+- **Usage**: Block hashes, message digests, VRF domain separation, wallet address derivation
 - **Alternative**: Blake3 (for non-cryptographic identifiers only)
+
+#### Key Management & Storage
+- **Mnemonic Seed**: 12 or 24 BIP39 words, passed via `QNET_WALLET_SEED` / `QNET_GENESIS_SEED` env var
+- **Wallet Address**: Deterministically derived from seed via `SHA3-256("QNet_Wallet_v1" + seed)`
+- **Dilithium3 Keypair**: Generated randomly on first launch, encrypted with **AES-256-GCM**, stored in Docker volume
+- **Key File Permissions**: `chmod 600` (owner read/write only) on Unix systems
+- **VRF Public Keys**: Persisted in RocksDB, restored on node restart
+- **Migration**: Key files **must be copied** when moving node to another server (seed alone is insufficient)
+- **Zeroization**: Secret keys wiped from memory on `Drop` via explicit zeroing
 
 ### Attack Resistance
 
@@ -2504,9 +2514,43 @@ Software:
   Node.js: 18+ LTS
   
 Environment:
-  QNET_BOOTSTRAP_ID: "001" (for Genesis Super nodes)
+  QNET_BOOTSTRAP_ID: "001"            # Genesis nodes only (001-005)
+  QNET_GENESIS_SEED: "12 or 24 words" # Genesis node mnemonic seed phrase
+  QNET_WALLET_SEED: "12 or 24 words"  # Super node mnemonic seed phrase
+  QNET_ACTIVATION_CODE: "QNET-..."    # Super node activation code (from 1DEV burn)
   QNET_NODE_TYPE: "super"
   RUST_LOG: "info"
+
+Docker:
+  # Genesis node (--name is local Docker label, node_id = genesis_node_001)
+  docker run -d --name qnet-genesis-001 --restart=always \
+    --log-opt max-size=200m --log-opt max-file=50 \
+    -e QNET_PRODUCTION=1 -e DOCKER_ENV=1 \
+    -e QNET_BOOTSTRAP_ID=001 \
+    -e QNET_GENESIS_SEED="your twelve or twenty four word mnemonic here" \
+    -e QNET_AGGRESSIVE_PRUNING=0 -e QNET_MAX_STORAGE_GB=2000 \
+    -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+    -v $(pwd)/genesis_001_data:/app/data \
+    qnet-production
+
+  # Super node (--name is local Docker label, node_id = super_{activation_code})
+  docker run -d --name my-qnet-node --restart=always \
+    --log-opt max-size=200m --log-opt max-file=50 \
+    -e QNET_PRODUCTION=1 -e DOCKER_ENV=1 \
+    -e QNET_ACTIVATION_CODE="QNET-XXXX-XXXX-XXXX-XXXX" \
+    -e QNET_WALLET_SEED="your twelve or twenty four word mnemonic here" \
+    -e QNET_AGGRESSIVE_PRUNING=0 -e QNET_MAX_STORAGE_GB=2000 \
+    -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+    -v $(pwd)/super_node_data:/app/data \
+    qnet-production
+
+Node Migration (MUST copy Dilithium3 keys — seed alone is not enough):
+  # Backup keys from old server
+  docker cp my-qnet-node:/app/data/keys ./keys_backup
+  # Restore keys on new server before starting
+  mkdir -p $(pwd)/super_node_data/keys
+  cp -r ./keys_backup/* $(pwd)/super_node_data/keys/
+  # Start node with SAME mnemonic, SAME activation code, and restored keys
 ```
 
 ### Monitoring

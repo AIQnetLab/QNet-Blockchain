@@ -17,9 +17,39 @@ export const PushType = {
 };
 
 /**
- * Get random bootstrap node URL
- * v3.35: Use centralized config
+ * Get random synced node URL (scalable)
+ * v3.36: Uses node discovery cache first, falls back to genesis nodes
+ * When 100+ server nodes exist, this will select from all synced nodes
  */
+async function getRandomBootstrapNodeAsync() {
+  try {
+    const cachedNodesStr = await AsyncStorage.getItem('qnet_discovered_nodes');
+    if (cachedNodesStr) {
+      const cachedNodes = JSON.parse(cachedNodesStr);
+      const currentTime = Math.floor(Date.now() / 1000);
+      const eligible = cachedNodes.filter(n => {
+        const age = currentTime - (n.lastSeen || 0);
+        return age < 300 && n.reputation >= 0.7 && n.isSynced !== false;
+      });
+      if (eligible.length > 0) {
+        // Weighted random by reputation
+        const totalRep = eligible.reduce((sum, n) => sum + (n.reputation || 0.7), 0);
+        let random = Math.random() * totalRep;
+        for (const node of eligible) {
+          random -= (node.reputation || 0.7);
+          if (random <= 0) return node.url;
+        }
+        return eligible[0].url;
+      }
+    }
+  } catch (e) {
+    // Ignore cache errors
+  }
+  // Fallback to genesis (first launch or stale cache)
+  return getRandomGenesisNode();
+}
+
+// Synchronous version for backward compatibility (returns genesis as fallback)
 function getRandomBootstrapNode() {
   return getRandomGenesisNode();
 }
@@ -62,7 +92,7 @@ export async function detectPushProvider() {
  */
 export async function registerLightNode(nodeId, walletAddress, quantumPubkey, quantumSignature) {
   const pushProvider = await detectPushProvider();
-  const apiUrl = getRandomBootstrapNode();
+  const apiUrl = await getRandomBootstrapNodeAsync();
 
   const registrationData = {
     node_id: nodeId,
@@ -271,21 +301,11 @@ export async function getNextPingTime() {
 
 /**
  * Respond to ping challenge (sign and send)
- * ARCHITECTURE v2.78: Light nodes use HYBRID signature (Ed25519 + Dilithium)
- * TEMPORARY: Using Ed25519 fallback until Dilithium3 library is integrated
- * Server ready to accept compact_bin format when available
+ * MANDATORY: Dilithium3 (ML-DSA-65) quantum signature — no Ed25519 fallback
  */
 export async function respondToChallenge(nodeId, challenge) {
   try {
-    const nacl = require('tweetnacl');
     const CryptoJS = require('crypto-js');
-
-    // Load wallet
-    const walletDataStr = await AsyncStorage.getItem('qnet_wallet_encrypted');
-    if (!walletDataStr) {
-      console.error('[Push] No wallet found');
-      return false;
-    }
 
     const passwordHash = await AsyncStorage.getItem('qnet_password_hash');
     if (!passwordHash) {
@@ -293,19 +313,22 @@ export async function respondToChallenge(nodeId, challenge) {
       return false;
     }
 
-    // Decrypt wallet
-    const decrypted = CryptoJS.AES.decrypt(walletDataStr, passwordHash);
-    const walletData = JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
+    // MANDATORY: Dilithium3 signature for ping response
+    const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+    if (!isDilithiumAvailable()) {
+      console.error('[Push] Dilithium3 module required for ping');
+      return false;
+    }
 
-    // TEMPORARY: Ed25519-only signature until Dilithium3 library is available
-    // Server accepts this as fallback but expects compact_bin format
-    const challengeBytes = new TextEncoder().encode(challenge);
-    const signature = nacl.sign.detached(challengeBytes, new Uint8Array(walletData.secretKey));
-    const signatureHex = Buffer.from(signature).toString('hex');
-    
-    // Format: "light_hybrid_pending:<hex>" - temporary fallback mode
-    // Target format: "compact_bin:<base64_bincode>" when Dilithium3 available
-    const formattedSignature = `light_hybrid_pending:${signatureHex}`;
+    const activationState = await AsyncStorage.getItem('qnet_last_activated_node');
+    const activationCode = activationState ? JSON.parse(activationState).code : null;
+    if (!activationCode) {
+      console.error('[Push] No activation code found for ping');
+      return false;
+    }
+
+    const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, passwordHash);
+    const formattedSignature = await signWithDilithium(challenge, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
 
     // Send response
     const apiUrl = getRandomBootstrapNode();
@@ -442,15 +465,24 @@ export async function reactivateNode() {
     const decrypted = CryptoJS.AES.decrypt(walletDataStr, passwordHash);
     const walletData = JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
 
-    // Create reactivation signature
+    // Create reactivation signature with Dilithium3 (ML-DSA-65)
     const timestamp = Math.floor(Date.now() / 1000);
     const message = `reactivate:${nodeInfo.nodeId}:${timestamp}`;
-    const messageBytes = new TextEncoder().encode(message);
-    
-    // Note: For production, this should use Dilithium signature
-    // For now using Ed25519 as placeholder
-    const signature = nacl.sign.detached(messageBytes, new Uint8Array(walletData.secretKey));
-    const signatureHex = Buffer.from(signature).toString('hex');
+
+    // MANDATORY: Dilithium3 signature — no Ed25519 fallback
+    const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+    if (!isDilithiumAvailable()) {
+      return { success: false, error: 'Dilithium3 module required for node reactivation' };
+    }
+
+    const activationState = await AsyncStorage.getItem('qnet_last_activated_node');
+    const activationCode = activationState ? JSON.parse(activationState).code : null;
+    if (!activationCode) {
+      return { success: false, error: 'No activation code found for reactivation' };
+    }
+
+    const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, passwordHash);
+    const signatureStr = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeInfo.nodeId);
 
     const apiUrl = getRandomBootstrapNode();
     const response = await fetch(`${apiUrl}/api/v1/light-node/reactivate`, {
@@ -459,7 +491,7 @@ export async function reactivateNode() {
       body: JSON.stringify({
         node_id: nodeInfo.nodeId,
         wallet_address: nodeInfo.walletAddress,
-        signature: signatureHex,
+        signature: signatureStr,
         timestamp: timestamp,
       }),
     });

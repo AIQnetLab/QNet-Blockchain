@@ -1432,9 +1432,11 @@ const WalletScreen = () => {
       }
       
       // Register node with backend (system generates pseudonym automatically)
+      // MUST use QNet EON address (not Solana publicKey!) for blockchain registration
+      const walletAddress = wallet.qnetAddress || wallet.address;
       const result = await walletManager.registerNodeWithCode(
         activationInputCode.trim(),
-        wallet.publicKey,
+        walletAddress,
         password
       );
       
@@ -2727,6 +2729,11 @@ const WalletScreen = () => {
     
     // Get nodes from discovery system (not hardcoded!)
     const httpNodes = walletManager.getAvailableNodes();
+    if (!httpNodes || httpNodes.length === 0) {
+      // No nodes available yet — retry in 5s
+      setTimeout(connectWebSocket, 5000);
+      return;
+    }
     const myAddress = wallet?.qnetAddress || '';
     
     // v3.35: Correct WS URL format: /ws/subscribe?channels=blocks,account:ADDRESS
@@ -2740,6 +2747,11 @@ const WalletScreen = () => {
       return `${wsBase}/ws/subscribe?channels=${encodeURIComponent(channels)}`;
     });
     const wsUrl = wsNodes[Math.floor(Math.random() * wsNodes.length)];
+    
+    if (!wsUrl) {
+      setTimeout(connectWebSocket, 5000);
+      return;
+    }
     
     try {
       wsRef.current = new WebSocket(wsUrl);
@@ -4634,6 +4646,17 @@ const WalletScreen = () => {
                             setActivationCode(code);
                             setNodeStatus(null);
                             
+                            // Persist activation state for restore on re-login
+                            const burnPseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
+                            AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                              nodeType: nodeStatus,
+                              code: code,
+                              pseudonym: burnPseudonym,
+                              timestamp: Date.now(),
+                              burnTxHash: result.signature
+                            })).catch(() => {});
+                            AsyncStorage.setItem(`node_pseudonym_${code}`, burnPseudonym).catch(() => {});
+                            
                             // Create detailed activation message
                             const nodeTypeName = nodeStatus.charAt(0).toUpperCase() + nodeStatus.slice(1) + ' Node';
                             const contract = BURN_CONTRACT_PROGRAM_ID;
@@ -4751,6 +4774,101 @@ const WalletScreen = () => {
                   : 'Get Activation Code'}
               </Text>
             </TouchableOpacity>
+
+            {/* Recover Code button — for users who already burned 1DEV but lost their code */}
+            {!activatedNodeType && !activatingNode && (
+              <TouchableOpacity
+                style={[styles.button, styles.secondaryButton, { marginTop: 12 }]}
+                onPress={async () => {
+                  if (!wallet || !password) {
+                    showAlert('Error', 'Please unlock your wallet first');
+                    return;
+                  }
+                  
+                  setActivatingNode(true);
+                  try {
+                    // Step 1: Check local storage first
+                    const localCodes = await walletManager.getStoredActivationCodes(password);
+                    if (localCodes && Object.keys(localCodes).length > 0) {
+                      const firstType = Object.keys(localCodes)[0];
+                      const firstCode = localCodes[firstType];
+                      setActivatedNodeType(firstType);
+                      setActivationCode(typeof firstCode === 'string' ? firstCode : firstCode?.code || '');
+                      showAlert('Code Found', `Your ${firstType} node activation code was found in local storage.`);
+                      return;
+                    }
+
+                    // Step 2: Check Solana for burn TX and try secure recovery endpoint
+                    const activatedNodes = await walletManager.checkBlockchainForActivations(wallet.publicKey);
+                    if (activatedNodes && activatedNodes.length > 0) {
+                      // Burn TX found on Solana — try to get burn TX hash from metadata
+                      const metaStr = await AsyncStorage.getItem('qnet_activation_meta_light');
+                      const meta = metaStr ? JSON.parse(metaStr) : null;
+                      
+                      if (meta && meta.burnTxHash) {
+                        // Try dedicated secure recovery endpoint
+                        const recoveryResult = await walletManager.recoverActivationCodeFromServer(
+                          meta.burnTxHash, wallet.publicKey
+                        );
+                        if (recoveryResult.success && recoveryResult.activationCode) {
+                          const nodeType = 'light';
+                          const code = recoveryResult.activationCode;
+                          setActivatedNodeType(nodeType);
+                          setActivationCode(code);
+                          
+                          // Persist locally
+                          await walletManager.storeActivationCode(code, nodeType, password, { recovered: true });
+                          const pseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
+                          AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                            nodeType, code, pseudonym, timestamp: Date.now()
+                          })).catch(() => {});
+                          
+                          showAlert('Code Recovered', `Your ${nodeType} node activation code has been recovered securely.`);
+                          return;
+                        }
+                      }
+                    }
+
+                    // Step 3: Try full sync (queries QNet registry + Solana + server)
+                    const syncResult = await walletManager.syncActivationCodes(wallet.publicKey, null, password);
+                    if (syncResult && Object.keys(syncResult).length > 0) {
+                      const firstType = Object.keys(syncResult)[0];
+                      const value = syncResult[firstType];
+                      const code = typeof value === 'string' ? value : value?.code || '';
+                      
+                      if (code && !value?.needsCodeRecovery) {
+                        setActivatedNodeType(firstType);
+                        setActivationCode(code);
+                        
+                        const pseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
+                        AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                          nodeType: firstType, code, pseudonym, timestamp: Date.now()
+                        })).catch(() => {});
+                        
+                        showAlert('Code Recovered', `Your ${firstType} node activation code has been recovered.`);
+                        return;
+                      }
+                    }
+
+                    // Step 4: Nothing found
+                    showAlert(
+                      'No Activation Found',
+                      'No 1DEV burn transaction or activation code was found for this wallet address.\n\nIf you recently burned tokens, please wait a few minutes and try again.',
+                      [{ text: 'OK' }]
+                    );
+                  } catch (error) {
+                    console.error('Code recovery error:', error);
+                    showAlert('Recovery Failed', error.message || 'Failed to recover activation code. Please try again.');
+                  } finally {
+                    setActivatingNode(false);
+                  }
+                }}
+              >
+                <Text style={[styles.buttonText, styles.secondaryButtonText]}>
+                  Recover My Code
+                </Text>
+              </TouchableOpacity>
+            )}
           </ScrollView>
         );
 
