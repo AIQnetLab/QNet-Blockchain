@@ -193,10 +193,18 @@ impl DilithiumVrf {
         Ok(vrf.output_as_u128() < Self::calculate_threshold(rep, total_rep))
     }
 
-    /// Election threshold: P(elected) = rep / total_rep
+    /// Expected winners per round — controls claim density in P2P gossip.
+    /// 5 nodes  -> all 5 broadcast  (P = min(1.0, 20/5*rep_fraction) = 1.0)
+    /// 50 nodes -> ~20 broadcast     (~80 KB gossip)
+    /// 1000 nodes -> ~20 broadcast   (~80 KB gossip, same bandwidth)
+    pub const EXPECTED_WINNERS: f64 = 20.0;
+
+    /// Election threshold: P(elected) = EXPECTED_WINNERS * (rep / total_rep)
+    /// Guarantees ~EXPECTED_WINNERS claims per round regardless of network size.
+    /// P(0 winners) ~ e^(-EXPECTED_WINNERS) ~ 2e-9 — practically impossible.
     pub fn calculate_threshold(rep: f64, total_rep: f64) -> u128 {
         if total_rep <= 0.0 || rep <= 0.0 { return 0; }
-        let p = (rep / total_rep).min(1.0);
+        let p = (Self::EXPECTED_WINNERS * rep / total_rep).min(1.0);
         (u128::MAX as f64 * p).min(u128::MAX as f64) as u128
     }
 
@@ -205,6 +213,24 @@ impl DilithiumVrf {
         candidates.iter()
             .min_by_key(|(_, v)| v.output)
             .map(|(id, v)| (id.clone(), v.clone()))
+    }
+
+    /// Deterministic secondary leader — fallback when VRF produces 0 claims.
+    /// SHA3-256(domain ++ slot_seed ++ height ++ round) -> candidate index.
+    /// Predictable but guaranteed — ensures liveness under any conditions.
+    pub fn deterministic_fallback(
+        slot_seed: &[u8; 32], height: u64, round: u64, num_candidates: usize,
+    ) -> usize {
+        if num_candidates == 0 { return 0; }
+        let mut h = Sha3_256::new();
+        h.update(b"QNET_SECONDARY_V1");
+        h.update(slot_seed);
+        h.update(&height.to_le_bytes());
+        h.update(&round.to_le_bytes());
+        let result = h.finalize();
+        let idx_bytes: [u8; 8] = result[..8].try_into().unwrap_or([0u8; 8]);
+        let idx = u64::from_le_bytes(idx_bytes);
+        (idx % num_candidates as u64) as usize
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
@@ -346,5 +372,42 @@ mod tests {
         let r = VrfOutput::from_bytes(&v.to_bytes()).unwrap();
         assert_eq!(r.output, v.output);
         assert_eq!(r.proof, v.proof);
+    }
+
+    #[test]
+    fn test_threshold_expected_winners() {
+        // 5 nodes, equal rep -> P(elected) = min(1.0, 20 * 1/5) = 1.0 -> all elected
+        let t5 = DilithiumVrf::calculate_threshold(90.0, 450.0);
+        assert_eq!(t5, u128::MAX); // saturates at 1.0
+
+        // 1000 nodes, equal rep -> P(elected) = 20/1000 = 0.02
+        let t1000 = DilithiumVrf::calculate_threshold(1.0, 1000.0);
+        let expected = (u128::MAX as f64 * 0.02) as u128;
+        assert!(t1000 > 0);
+        assert!((t1000 as f64 - expected as f64).abs() / (expected as f64) < 0.01);
+
+        // Zero rep -> 0
+        assert_eq!(DilithiumVrf::calculate_threshold(0.0, 100.0), 0);
+        assert_eq!(DilithiumVrf::calculate_threshold(10.0, 0.0), 0);
+    }
+
+    #[test]
+    fn test_deterministic_fallback() {
+        let seed = [1u8; 32];
+        // Same inputs -> same result
+        let a = DilithiumVrf::deterministic_fallback(&seed, 100, 5, 10);
+        let b = DilithiumVrf::deterministic_fallback(&seed, 100, 5, 10);
+        assert_eq!(a, b);
+        assert!(a < 10);
+
+        // Different height -> different result (with high probability)
+        let c = DilithiumVrf::deterministic_fallback(&seed, 101, 5, 10);
+        // Not guaranteed to differ, but extremely likely with 10 slots
+        // Just verify it's in range
+        assert!(c < 10);
+
+        // Different round -> different result
+        let d = DilithiumVrf::deterministic_fallback(&seed, 100, 6, 10);
+        assert!(d < 10);
     }
 }

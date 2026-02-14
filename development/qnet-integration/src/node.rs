@@ -15779,23 +15779,31 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             };
             
             // ═══════════════════════════════════════════════════════════════════════════
-            // PRODUCTION v4.0: DILITHIUM3-VRF SECRET LEADER ELECTION
+            // PRODUCTION v4.2: DILITHIUM3-VRF SECRET LEADER ELECTION (Hybrid)
             // ═══════════════════════════════════════════════════════════════════════════
             // 
-            // PROTOCOL:
-            //   1. slot_seed = SHA3-256(macroblock_N-2_hash || leadership_round)
-            //   2. Each node: VRF_eval(wallet_sk, slot_seed) → (output, proof)
-            //   3. If output < threshold(rep/total_rep) → broadcast VrfLeaderClaim
-            //   4. All nodes collect claims (~1.5s window at rotation boundary)
-            //   5. Winner = lowest VRF output among verified claims
-            //   6. Block header: vrf_output + vrf_proof (verifiable by all)
+            // TWO-TIER PROTOCOL:
+            //   PRIMARY (VRF — unpredictable):
+            //     1. slot_seed = SHA3-256(macroblock_N-2_hash || leadership_round)
+            //     2. Each node: VRF_eval(wallet_sk, slot_seed) -> (output, proof)
+            //     3. threshold = EXPECTED_WINNERS(20) * (rep/total_rep) * u128::MAX
+            //     4. If output < threshold -> broadcast VrfLeaderClaim
+            //     5. All nodes collect claims (~1.5s window at rotation boundary)
+            //     6. Winner = lowest VRF output among verified claims
             //
-            // NO FALLBACK: VRF is the ONLY selection method.
-            // If no claims → BFT Timeout Protocol handles liveness.
+            //   SECONDARY (deterministic — guaranteed liveness):
+            //     7. If 0 claims after collection -> SHA3(seed++height++round) % N
+            //     8. Predictable but instant; ensures chain NEVER stalls
+            //
+            // SCALABILITY:
+            //   5 nodes   -> all 5 broadcast claims (threshold saturates at 1.0)
+            //   50 nodes  -> ~20 broadcast (~80 KB gossip)
+            //   1000 nodes -> ~20 broadcast (~80 KB gossip, constant bandwidth)
+            //   P(secondary needed) ~ e^(-20) ~ 2e-9 — practically never
             //
             // SECURITY:
             //   - Unpredictable: VRF output = f(secret_key, slot_seed)
-            //   - Verifiable: verify(pk, slot_seed, proof) → output
+            //   - Verifiable: verify(pk, slot_seed, proof) -> output
             //   - Bias-resistant: Dilithium3 signing is deterministic
             //   - Post-quantum: NIST FIPS 204, ML-DSA-65 (Level 3)
             // ═══════════════════════════════════════════════════════════════════════════
@@ -15869,7 +15877,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // ─── Step 3: Select winner from verified claims ────────────────
                 let claims = SimplifiedP2P::get_leader_claims(leadership_round);
                 
-                let winner = if !claims.is_empty() {
+                let mut winner = if !claims.is_empty() {
                     // Filter claims to only include current candidates
                     let candidate_ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
                     let valid_claims: Vec<_> = claims.iter()
@@ -15890,45 +15898,35 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         }
                         winner_claim.node_id.clone()
                     } else {
-                        // Claims exist but none from current candidates
-                        // This can happen during topology changes — use BFT timeout
+                        // Claims exist but none from current candidates (topology change)
+                        // Fall through to secondary deterministic fallback
                         if is_warn() {
                             println!("[WARN][VRF] no_valid_claims round={} total_claims={} candidates={}",
                                      leadership_round, claims.len(), candidates.len());
                         }
-                        String::new() // Empty = trigger BFT timeout
-                    }
-                } else {
-                    // ─── No claims received ────────────────────────────────────
-                    // This happens when:
-                    // a) Network just started (no VRF keys registered yet)
-                    // b) All nodes' VRF outputs exceeded threshold (unlikely)
-                    // c) Network partition (claims didn't arrive)
-                    //
-                    // BFT TIMEOUT PROTOCOL handles liveness:
-                    // - After ~5s without block, nodes vote for timeout
-                    // - When 2/3+ vote, next candidate is tried
-                    // - This ensures liveness via BFT timeout protocol
-                    //
-                    // GENESIS BOOTSTRAP: First 180 blocks use genesis candidates
-                    // Genesis nodes always have seeds → always produce claims
-                    if current_height <= 180 {
-                        // Genesis bootstrap: first genesis candidate produces
-                        // All genesis nodes have VRF keys → at least one claim will arrive
-                        // If still no claims (very first blocks), use first genesis
-                        if is_info() {
-                            println!("[INFO][VRF] genesis_bootstrap h={} round={}", current_height, leadership_round);
-                        }
-                        candidates[0].0.clone() // First genesis candidate (sorted)
-                    } else {
-                        // Post-bootstrap: empty = BFT timeout will handle
-                        if is_warn() {
-                            println!("[WARN][VRF] no_claims round={} candidates={} — waiting for BFT timeout",
-                                     leadership_round, candidates.len());
-                        }
                         String::new()
                     }
+                } else {
+                    // ─── No claims received — SECONDARY FALLBACK ─────────────
+                    // With EXPECTED_WINNERS=20 this is practically impossible
+                    // (P ~ e^(-20) ~ 2e-9), but we guarantee liveness anyway.
+                    String::new()
                 };
+
+                // ─── SECONDARY: Deterministic fallback (guaranteed liveness) ──
+                // If VRF primary produced no winner, use hash-based selection.
+                // Predictable but instant — chain NEVER stalls.
+                if winner.is_empty() {
+                    let fallback_idx = DilithiumVrf::deterministic_fallback(
+                        &slot_input, current_height, leadership_round, candidates.len(),
+                    );
+                    let secondary = &candidates[fallback_idx].0;
+                    if is_info() {
+                        println!("[INFO][VRF] secondary_fallback h={} round={} idx={} producer={}",
+                                 current_height, leadership_round, fallback_idx, secondary);
+                    }
+                    winner = secondary.clone();
+                }
 
                 // ─── Step 4: Timeout round exclusion (BFT failover) ────────────
                 // If timeout_round > 0, the original winner failed to produce
@@ -15969,12 +15967,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         }
                         next_winner.node_id.clone()
                 } else {
-                        // All claimants exhausted — BFT timeout continues
-                        if is_warn() {
-                            println!("[WARN][VRF] all_claimants_exhausted round={} timeout={}",
-                                     leadership_round, timeout_round);
+                        // All VRF claimants exhausted — use secondary with timeout as extra entropy
+                        let fallback_idx = DilithiumVrf::deterministic_fallback(
+                            &slot_input, current_height, leadership_round + timeout_round, candidates.len(),
+                        );
+                        let timeout_secondary = &candidates[fallback_idx].0;
+                        if is_info() {
+                            println!("[INFO][VRF] timeout_secondary h={} round={} timeout={} producer={}",
+                                     current_height, leadership_round, timeout_round, timeout_secondary);
                         }
-                        String::new()
+                        timeout_secondary.clone()
                     }
                 } else {
                 winner
