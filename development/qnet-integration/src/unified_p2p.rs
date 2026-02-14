@@ -19308,7 +19308,10 @@ impl SimplifiedP2P {
                 if let Some(ref qt_lock) = quic_transport {
                     let qt = qt_lock.read().await;
                     for peer_str in &peers {
-                        if let Ok(peer_addr) = peer_str.parse::<std::net::SocketAddr>() {
+                        // CRITICAL: Remap to QUIC port 10876 (peer addr may be TCP :9876)
+                        let ip = peer_str.split(':').next().unwrap_or(peer_str);
+                        let quic_addr_str = format!("{}:10876", ip);
+                        if let Ok(peer_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
                             let _ = qt.broadcast_to(peer_addr, &msg).await;
                         }
                     }
