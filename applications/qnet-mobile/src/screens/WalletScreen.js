@@ -935,6 +935,28 @@ const WalletScreen = () => {
           // (cached data was already restored from AsyncStorage on mount)
           promises.push(loadServerNodeStatus());
         }
+        
+        // On-chain verification: confirm activation still exists on current blockchain
+        const qnetAddr = wallet.qnetAddress || wallet.address;
+        promises.push(
+          walletManager.verifyActivationOnChain(qnetAddr).then(async (result) => {
+            if (!result.verified && !result.networkError) {
+              // Double-check with Solana address
+              const solanaCheck = await walletManager.verifyActivationOnChain(wallet.publicKey);
+              if (!solanaCheck.verified && !solanaCheck.networkError) {
+                console.log('[NODE TAB] Activation not verified on-chain — clearing stale state');
+                setActivatedNodeType(null);
+                setActivationCode(null);
+                setNodePseudonym('');
+                setLightNodeStatus(null);
+                setServerNodeStatus(null);
+                await AsyncStorage.removeItem('qnet_last_activated_node');
+                await AsyncStorage.removeItem('qnet_cached_server_status');
+                await AsyncStorage.removeItem('qnet_activation_codes');
+              }
+            }
+          }).catch(() => { /* Network error — keep current state */ })
+        );
       }
       
       // Ensure nodeInitializing is cleared even if no nodes found
@@ -2515,6 +2537,7 @@ const WalletScreen = () => {
       loadBalance(loadedWallet.publicKey);
       
       // Restore activation state + cached server status from AsyncStorage immediately
+      // Then verify on-chain in background — clear stale cache if not found
       Promise.all([
         AsyncStorage.getItem('qnet_last_activated_node'),
         AsyncStorage.getItem('qnet_cached_server_status'),
@@ -2523,12 +2546,12 @@ const WalletScreen = () => {
           try {
             const state = JSON.parse(savedState);
             if (state.nodeType && state.code) {
+              // Show cached state immediately for UX (will be verified below)
               setActivatedNodeType(state.nodeType);
               setActivationCode(state.code);
               if (state.pseudonym) {
                 setNodePseudonym(state.pseudonym);
               } else {
-                // Try to load pseudonym from separate storage
                 const savedPseudonym = await AsyncStorage.getItem(`node_pseudonym_${state.code}`);
                 if (savedPseudonym) {
                   setNodePseudonym(savedPseudonym);
@@ -2539,7 +2562,6 @@ const WalletScreen = () => {
               if (cachedStatus && state.nodeType !== 'light') {
                 try {
                   const cached = JSON.parse(cachedStatus);
-                  // Use cache if less than 10 minutes old
                   if (cached.success && cached.cachedAt && (Date.now() - cached.cachedAt < 600000)) {
                     setServerNodeStatus(cached);
                   }
@@ -2547,6 +2569,30 @@ const WalletScreen = () => {
                   // Silent fail
                 }
               }
+              
+              // CRITICAL: Background on-chain verification
+              // If node is not found on current blockchain, clear stale cache
+              const qnetAddr = loadedWallet.qnetAddress || loadedWallet.address;
+              walletManager.verifyActivationOnChain(qnetAddr).then(async (result) => {
+                if (!result.verified && !result.networkError) {
+                  // Double-check with Solana address (Phase 1 activations use Solana addr)
+                  const solanaCheck = await walletManager.verifyActivationOnChain(loadedWallet.publicKey);
+                  if (!solanaCheck.verified && !solanaCheck.networkError) {
+                    console.log('[VERIFY] Activation not found on current blockchain — clearing stale cache');
+                    setActivatedNodeType(null);
+                    setActivationCode(null);
+                    setNodePseudonym('');
+                    setServerNodeStatus(null);
+                    await AsyncStorage.removeItem('qnet_last_activated_node');
+                    await AsyncStorage.removeItem('qnet_cached_server_status');
+                    await AsyncStorage.removeItem('qnet_activation_codes');
+                    await AsyncStorage.removeItem('qnet_activation_meta_light');
+                    await AsyncStorage.removeItem('qnet_activation_meta_super');
+                  }
+                }
+              }).catch(() => {
+                // Network error — keep cached state, will retry next time
+              });
             }
           } catch (e) {
             // Silent fail
@@ -4787,15 +4833,37 @@ const WalletScreen = () => {
                   
                   setActivatingNode(true);
                   try {
-                    // Step 1: Check local storage first
+                    // Step 0: On-chain verification — ensure activation exists on CURRENT blockchain
+                    // Prevents stale cache from showing phantom activations after network restart
+                    const qnetAddr = wallet.qnetAddress || wallet.address;
+                    const onChainCheck = await walletManager.verifyActivationOnChain(qnetAddr);
+                    
+                    // Also try Solana address if different (Phase 1 activations)
+                    let onChainVerified = onChainCheck.verified;
+                    if (!onChainVerified && wallet.publicKey && wallet.publicKey !== qnetAddr) {
+                      const solanaCheck = await walletManager.verifyActivationOnChain(wallet.publicKey);
+                      onChainVerified = solanaCheck.verified;
+                    }
+
+                    // Step 1: Check local storage — but ONLY if on-chain verification passed
                     const localCodes = await walletManager.getStoredActivationCodes(password);
                     if (localCodes && Object.keys(localCodes).length > 0) {
-                      const firstType = Object.keys(localCodes)[0];
-                      const firstCode = localCodes[firstType];
-                      setActivatedNodeType(firstType);
-                      setActivationCode(typeof firstCode === 'string' ? firstCode : firstCode?.code || '');
-                      showAlert('Code Found', `Your ${firstType} node activation code was found in local storage.`);
-                      return;
+                      if (onChainVerified) {
+                        const firstType = Object.keys(localCodes)[0];
+                        const firstCode = localCodes[firstType];
+                        setActivatedNodeType(firstType);
+                        setActivationCode(typeof firstCode === 'string' ? firstCode : firstCode?.code || '');
+                        showAlert('Code Found', `Your ${firstType} node activation code was found in local storage.`);
+                        return;
+                      } else if (!onChainCheck.networkError) {
+                        // On-chain says no activation — clear stale local cache
+                        console.log('[Recovery] Clearing stale local activation cache (not found on-chain)');
+                        await AsyncStorage.removeItem('qnet_activation_codes');
+                        await AsyncStorage.removeItem('qnet_last_activated_node');
+                        await AsyncStorage.removeItem('qnet_activation_meta_light');
+                        await AsyncStorage.removeItem('qnet_activation_meta_super');
+                        // Fall through to check Solana burn
+                      }
                     }
 
                     // Step 2: Check Solana for burn TX and try secure recovery endpoint

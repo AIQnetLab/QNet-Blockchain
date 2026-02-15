@@ -1701,6 +1701,15 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_recover_activation_code);
 
+    // On-chain activation verification endpoint (for mobile wallet)
+    let verify_activation = api_v1
+        .and(warp::path("verify-activation"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_verify_activation_onchain);
+
     // Graceful shutdown endpoint for node replacement
     let graceful_shutdown = api_v1
         .and(warp::path("shutdown"))
@@ -2171,6 +2180,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(activations_by_wallet)
         .or(generate_activation_code)
         .or(recover_activation_code)
+        .or(verify_activation)
         .or(node_secure_info);
 
     let consensus_routes = consensus_commit
@@ -9463,6 +9473,83 @@ async fn handle_generate_activation_code(
             Ok(warp::reply::json(&error_response))
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ON-CHAIN ACTIVATION VERIFICATION
+// Mobile wallets MUST verify activation exists in current blockchain
+// before showing node as active (prevents stale cache issues)
+// ═══════════════════════════════════════════════════════════════
+
+async fn handle_verify_activation_onchain(
+    params: HashMap<String, String>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let wallet_address = match params.get("wallet_address") {
+        Some(addr) if !addr.is_empty() => addr.clone(),
+        _ => {
+            return Ok(warp::reply::json(&json!({
+                "verified": false,
+                "error": "Missing wallet_address parameter"
+            })));
+        }
+    };
+
+    // Level 1: O(1) reverse index lookup in RocksDB (wallet → node_id)
+    // Populated automatically when NodeRegistration and NodeActivation TXs are processed in blocks.
+    // Survives restarts. This is the primary and fastest check.
+    let storage = blockchain.get_storage();
+    if let Ok(Some((node_id, node_type))) = storage.get_node_by_wallet(&wallet_address) {
+        return Ok(warp::reply::json(&json!({
+            "verified": true,
+            "source": "storage_index",
+            "node_id": node_id,
+            "node_type": node_type,
+            "wallet_address": wallet_address
+        })));
+    }
+
+    // Level 2: Genesis wallet constants (hardcoded, O(1))
+    use crate::genesis_constants::GENESIS_WALLETS;
+    for (bootstrap_id, genesis_wallet) in GENESIS_WALLETS.iter() {
+        if wallet_address == *genesis_wallet {
+            return Ok(warp::reply::json(&json!({
+                "verified": true,
+                "source": "genesis_constants",
+                "node_id": format!("genesis_node_{}", bootstrap_id),
+                "node_type": "super",
+                "wallet_address": wallet_address
+            })));
+        }
+    }
+
+    // Level 3: RewardManager (runtime HashMap, O(1))
+    let reward_manager_arc = blockchain.get_reward_manager();
+    let reward_manager = reward_manager_arc.read().await;
+    let rm_nodes = reward_manager.get_nodes_by_wallet(&wallet_address);
+    if !rm_nodes.is_empty() {
+        let node = &rm_nodes[0];
+        let type_str = match node.1 {
+            qnet_consensus::lazy_rewards::NodeType::Light => "light",
+            qnet_consensus::lazy_rewards::NodeType::Super => "super",
+        };
+        return Ok(warp::reply::json(&json!({
+            "verified": true,
+            "source": "reward_manager",
+            "node_id": node.0,
+            "node_type": type_str,
+            "wallet_address": wallet_address
+        })));
+    }
+
+    // Not found — wallet has no activation or registration on current blockchain
+    let current_height = blockchain.get_height().await;
+    Ok(warp::reply::json(&json!({
+        "verified": false,
+        "wallet_address": wallet_address,
+        "current_height": current_height,
+        "message": "No activation or registration found for this wallet"
+    })))
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -2096,10 +2096,11 @@ export class WalletManager {
       const part1 = fullHash.substring(0, 19).toLowerCase();
       const part2 = fullHash.substring(19, 34).toLowerCase();
       
-      // Generate SHA-256 checksum (MUST match server!)
+      // Generate SHA3-256 checksum (MUST match server! v4.0 migrated from SHA2 to SHA3)
+      const { sha3_256 } = require('js-sha3');
       const addressWithoutChecksum = part1 + 'eon' + part2;
-      const checksumHash = CryptoJS.SHA256(addressWithoutChecksum);
-      const checksum = checksumHash.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();
+      const checksumHex = sha3_256(addressWithoutChecksum);
+      const checksum = checksumHex.substring(0, 4).toLowerCase();
       
       return `${part1}eon${part2}${checksum}`;
     } catch (error) {
@@ -2272,10 +2273,11 @@ export class WalletManager {
       const part1 = fullHash.substring(0, 19).toLowerCase();
       const part2 = fullHash.substring(19, 34).toLowerCase();
       
-      // Generate SHA-256 checksum (MUST match server!)
+      // Generate SHA3-256 checksum (MUST match server! v4.0 migrated from SHA2 to SHA3)
+      const { sha3_256 } = require('js-sha3');
       const addressWithoutChecksum = part1 + 'eon' + part2;
-      const checksumData = CryptoJS.SHA256(addressWithoutChecksum);
-      const checksum = checksumData.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();
+      const checksumHex = sha3_256(addressWithoutChecksum);
+      const checksum = checksumHex.substring(0, 4).toLowerCase();
       
       const address = `${part1}eon${part2}${checksum}`;
       
@@ -4202,6 +4204,36 @@ export class WalletManager {
     }
   }
 
+  /**
+   * Verify that a node activation exists on the CURRENT QNet blockchain.
+   * Prevents stale local cache from showing phantom activations after network restart.
+   * Checks: RocksDB storage, genesis constants, reward manager, and blockchain scan.
+   * @param {string} walletAddress - QNet EON or Solana wallet address
+   * @returns {{ verified: boolean, node_type?: string, node_id?: string, source?: string }}
+   */
+  async verifyActivationOnChain(walletAddress) {
+    try {
+      const apiUrl = this.getRandomBootstrapNode();
+      const response = await fetch(
+        `${apiUrl}/api/v1/verify-activation?wallet_address=${encodeURIComponent(walletAddress)}`,
+        { method: 'GET', headers: { 'Content-Type': 'application/json' } }
+      );
+
+      if (!response.ok) {
+        console.warn('[verifyOnChain] Server returned', response.status);
+        return { verified: false, error: `HTTP ${response.status}` };
+      }
+
+      const result = await response.json();
+      console.log('[verifyOnChain] Result:', JSON.stringify(result));
+      return result;
+    } catch (error) {
+      console.warn('[verifyOnChain] Verification request failed:', error.message);
+      // Network error — do NOT invalidate cache (could be temporary connectivity issue)
+      return { verified: false, error: error.message, networkError: true };
+    }
+  }
+
   // Encrypt and store activation code securely
   async storeActivationCode(code, nodeType, password, metadata = {}) {
     try {
@@ -4302,9 +4334,20 @@ export class WalletManager {
       const existingCodes = await this.getStoredActivationCodes(password);
       
       if (existingCodes && Object.keys(existingCodes).length > 0) {
-        // Already have codes locally - no need to check blockchain
-        // This saves battery and RPC calls
-        return existingCodes;
+        // Verify on-chain before trusting local cache
+        // Prevents stale codes from surviving network restarts
+        try {
+          const onChainResult = await this.verifyActivationOnChain(walletAddress);
+          if (!onChainResult.verified && !onChainResult.networkError) {
+            console.log('[syncActivationCodes] Local codes exist but NOT verified on-chain — ignoring cache');
+            // Don't return cached codes — fall through to re-check server/blockchain
+          } else {
+            return existingCodes;
+          }
+        } catch (e) {
+          // Network error — trust local cache as fallback
+          return existingCodes;
+        }
       }
       
       // First check if we have stored activation metadata
@@ -5795,8 +5838,22 @@ export class WalletManager {
         // Check for stored QNet address first
         let qnetAddress = await AsyncStorage.getItem('qnet_address');
         
-        // If no QNet address or it's old format, generate/migrate
-        if (!qnetAddress || qnetAddress.length < 40) {
+        // If no QNet address or it's old format or SHA2→SHA3 checksum migration needed
+        let needsRegen = !qnetAddress || qnetAddress.length < 40;
+        if (!needsRegen && qnetAddress && qnetAddress.length === 41) {
+          // v4.0 migration: verify SHA3-256 checksum (server migrated from SHA2 to SHA3)
+          try {
+            const { sha3_256 } = require('js-sha3');
+            const addrBody = qnetAddress.substring(0, 37);
+            const oldChecksum = qnetAddress.substring(37, 41);
+            const correctChecksum = sha3_256(addrBody).substring(0, 4).toLowerCase();
+            if (oldChecksum !== correctChecksum) {
+              console.log('[WALLET] SHA2→SHA3 checksum migration needed');
+              needsRegen = true;
+            }
+          } catch (e) { needsRegen = true; }
+        }
+        if (needsRegen) {
           qnetAddress = this.generateQNetAddressFromSolana(solanaAddress);
           // Store the new address for future use
           if (qnetAddress) {

@@ -2037,7 +2037,7 @@ impl SimplifiedP2P {
                                 let genesis_id = format!("genesis_node_{:03}", i);
                                 reputation_sys.set_reputation(&genesis_id, INITIAL_REPUTATION);
                             }
-                            println!("[P2P] 🛡️ Genesis node {} initialized - all Genesis nodes set to {:.0}% reputation", bootstrap_id, INITIAL_REPUTATION);
+                            println!("[INFO][P2P] Genesis node {} initialized - all Genesis nodes set to {:.0}% reputation", bootstrap_id, INITIAL_REPUTATION);
                         }
                         _ => {}
                     }
@@ -2054,7 +2054,7 @@ impl SimplifiedP2P {
                     } else {
                         get_privacy_id_for_addr(&node_id)
                     };
-                    println!("[P2P] 🛡️ Legacy Genesis node {} detected - reputation will be initialized by consensus system", display_id);
+                    println!("[INFO][P2P] Legacy Genesis node {} detected - reputation will be initialized by consensus system", display_id);
                 } else {
                     // Check activation code for Genesis codes
                     if let Ok(activation_code) = std::env::var("QNET_ACTIVATION_CODE") {
@@ -2063,7 +2063,7 @@ impl SimplifiedP2P {
                         for genesis_code in GENESIS_BOOTSTRAP_CODES {
                             if activation_code == *genesis_code {
                                 // PRIVACY: Don't show node_id even in local logs
-                                println!("[P2P] 🛡️ Genesis activation code {} detected - reputation will be initialized by consensus system", genesis_code);
+                                println!("[INFO][P2P] Genesis activation code {} detected - reputation will be initialized by consensus system", genesis_code);
                                 break;
                             }
                         }
@@ -2124,7 +2124,7 @@ impl SimplifiedP2P {
     /// PRODUCTION: Set consensus message channel for real integration
     pub fn set_consensus_channel(&mut self, consensus_tx: tokio::sync::mpsc::UnboundedSender<ConsensusMessage>) {
         self.consensus_tx = Some(consensus_tx);
-        println!("[P2P] 🏛️ Consensus integration channel established");
+        println!("[INFO][P2P] Consensus integration channel established");
     }
     
     /// PRODUCTION: Set block processing channel for storage integration
@@ -2134,7 +2134,7 @@ impl SimplifiedP2P {
             Err(p) => p.into_inner()
         };
         *guard = Some(block_tx);
-        println!("[P2P] ✅ Block processing channel established");
+        println!("[INFO][P2P] Block processing channel established");
     }
     
     /// PRODUCTION: Set macroblock processing channel for storage integration (v2.19.12)
@@ -2144,7 +2144,7 @@ impl SimplifiedP2P {
             Err(p) => p.into_inner()
         };
         *guard = Some(macroblock_tx);
-        println!("[P2P] ✅ Macroblock processing channel established");
+        println!("[INFO][P2P] Macroblock processing channel established");
     }
     
     /// PRODUCTION v2.19.25: Set transaction processing channel for mempool integration
@@ -2155,7 +2155,7 @@ impl SimplifiedP2P {
             Err(p) => p.into_inner()
         };
         *guard = Some(tx_channel);
-        println!("[P2P] ✅ Transaction processing channel established");
+        println!("[INFO][P2P] Transaction processing channel established");
     }
     
     /// GULF STREAM v2.25: Set current block producer for TX forwarding
@@ -2193,7 +2193,7 @@ impl SimplifiedP2P {
     /// PRODUCTION: Set macroblock sync request channel (v2.19.12)
     pub fn set_macroblock_sync_channel(&mut self, sync_tx: tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>) {
         self.macroblock_sync_request_tx = Some(sync_tx);
-        println!("[P2P] ✅ Macroblock sync request channel established");
+        println!("[INFO][P2P] Macroblock sync request channel established");
     }
     
     /// Set sync request channel for handling block requests
@@ -2479,7 +2479,7 @@ impl SimplifiedP2P {
     
     /// Start simplified P2P network with load balancing
     pub fn start(&self) {
-        println!("[P2P] Starting P2P network with intelligent load balancing");
+        println!("[INFO][P2P] Starting P2P network with intelligent load balancing");
         
         // CRITICAL: Load jail statuses from persistent storage FIRST
         // This ensures banned nodes stay banned across restarts
@@ -2513,7 +2513,7 @@ impl SimplifiedP2P {
         match self.is_running.lock() {
             Ok(mut running) => *running = true,
             Err(poisoned) => {
-                println!("[P2P] ⚠️ Mutex poisoned, recovering...");
+                println!("[WARN][P2P] Mutex poisoned, recovering...");
                 *poisoned.into_inner() = true;
             }
         }
@@ -2535,12 +2535,12 @@ impl SimplifiedP2P {
             match self.node_type {
                 NodeType::Light => {
                     // Light nodes don't need aggressive peer exchange
-                    println!("[P2P] 📱 Light node: Minimal peer exchange (bandwidth optimization)");
+                    println!("[INFO][P2P] Light node: Minimal peer exchange (bandwidth optimization)");
                 }
                 _ => {
                     self.start_peer_exchange_protocol(initial_peers);
                     // v3.18: Full nodes removed
-                    println!("[P2P] 🔄 Started peer exchange protocol for Super node");
+                    println!("[INFO][P2P] Started peer exchange protocol for Super node");
                 }
             }
         }
@@ -2551,13 +2551,13 @@ impl SimplifiedP2P {
             || std::path::Path::new("/.dockerenv").exists();
         
         if is_docker {
-            println!("[P2P] 🐳 Docker detected - skipping UPnP (ports forwarded via -p)");
+            println!("[INFO][P2P] Docker detected - skipping UPnP (ports forwarded via -p)");
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let port = self.port;
             let _node_id = self.node_id.clone();
             handle.spawn(async move {
                 if let Err(e) = Self::setup_upnp_port_forwarding(port).await {
-                    println!("[P2P] ⚠️ UPnP setup failed: {}", e);
+                    println!("[WARN][P2P] UPnP setup failed: {}", e);
                 }
             });
         }
@@ -2565,7 +2565,7 @@ impl SimplifiedP2P {
         // QUANTUM OPTIMIZATION: Start performance monitor
         self.start_performance_optimizer();
         
-        println!("[P2P] ✅ P2P network with load balancing started");
+        println!("[INFO][P2P] P2P network with load balancing started");
     }
     
     /// QUANTUM OPTIMIZATION: Monitor and adapt to network growth
@@ -2599,7 +2599,7 @@ impl SimplifiedP2P {
     async fn setup_upnp_port_forwarding(port: u16) -> Result<(), String> {
         use std::process::Command;
         
-        println!("[P2P] 🔌 Attempting UPnP port forwarding for port {}", port);
+        println!("[INFO][P2P] Attempting UPnP port forwarding for port {}", port);
         
         // Check if upnpc is available (miniupnpc package)
         if let Ok(output) = Command::new("which").arg("upnpc").output() {
@@ -2614,7 +2614,7 @@ impl SimplifiedP2P {
                     
                 if let Ok(output) = result {
                     if output.status.success() {
-                        println!("[P2P] ✅ UPnP port forwarding successful for port {}", port);
+                        println!("[INFO][P2P] UPnP port forwarding successful for port {}", port);
                         return Ok(());
                     }
                 }
@@ -2631,14 +2631,14 @@ impl SimplifiedP2P {
                        "connectaddress=127.0.0.1"])
                 .output() {
                 if output.status.success() {
-                    println!("[P2P] ✅ Windows port forwarding configured");
+                    println!("[INFO][P2P] Windows port forwarding configured");
                     return Ok(());
                 }
             }
         }
         
-        println!("[P2P] ⚠️ UPnP not available, manual port forwarding may be required");
-        println!("[P2P] 💡 For Docker: Use -p {}:{} or DOCKER_HOST_IP env var", port, port);
+        println!("[WARN][P2P] UPnP not available, manual port forwarding may be required");
+        println!("[INFO][P2P] For Docker: Use -p {}:{} or DOCKER_HOST_IP env var", port, port);
         Err("UPnP not available".to_string())
     }
     
@@ -2922,7 +2922,7 @@ impl SimplifiedP2P {
             
             if let Some(addr) = oldest_addr {
                 self.connected_peers_lockfree.remove(&addr);
-                println!("[P2P] 🔄 LRU eviction: removed oldest peer to add new one");
+                println!("[INFO][P2P] LRU eviction: removed oldest peer to add new one");
             }
         }
         
@@ -2975,7 +2975,7 @@ impl SimplifiedP2P {
         
         // Add peer using existing safe method
         if self.add_peer_safe(peer_info) {
-            println!("[P2P] ✅ AUTO-ADDED peer {} ({}) - received message proves connectivity", 
+            println!("[INFO][P2P] AUTO-ADDED peer {} ({}) - received message proves connectivity", 
                      peer_id, peer_addr);
             
             // Invalidate cache to include new peer
@@ -3080,7 +3080,7 @@ impl SimplifiedP2P {
         };
         
         if peer_info.id == self.node_id || is_self_by_ip {
-            println!("[P2P] 🚫 add_peer_lockfree: Rejecting self-connection {}", 
+            println!("[INFO][P2P] add_peer_lockfree: Rejecting self-connection {}", 
                      get_privacy_id_for_addr(&peer_info.addr));
             return false;
         }
@@ -3111,7 +3111,7 @@ impl SimplifiedP2P {
                 if peer_info.combined_reputation() > *worst_rep {
                     // Remove worst peer to make room
                     self.remove_peer_lockfree(worst_addr);
-                    println!("[P2P] 🔄 K-bucket {}: Replaced {} (rep: {:.2}) with {} (rep: {:.2})",
+                    println!("[INFO][P2P] K-bucket {}: Replaced {} (rep: {:.2}) with {} (rep: {:.2})",
                             peer_info.bucket_index, worst_addr, *worst_rep, 
                             peer_info.id, peer_info.combined_reputation());
                 } else {
@@ -3147,7 +3147,7 @@ impl SimplifiedP2P {
     /// Connect to bootstrap peers OR use internet-wide peer discovery
     pub fn connect_to_bootstrap_peers(&self, peers: &[String]) {
         if peers.is_empty() {
-            println!("[P2P] No bootstrap peers provided - using internet-wide peer discovery");
+            println!("[INFO][P2P] No bootstrap peers provided - using internet-wide peer discovery");
             self.start_internet_peer_discovery();
             return;
         }
@@ -3158,7 +3158,7 @@ impl SimplifiedP2P {
             Err(poisoned) => poisoned.into_inner().clone(),
         };
         
-        println!("[P2P] Connecting to {} bootstrap peers (filtering self: {:?})", peers.len(), our_ip);
+        println!("[INFO][P2P] Connecting to {} bootstrap peers (filtering self: {:?})", peers.len(), our_ip);
         
         let mut successful_parses = 0;
         let mut skipped_self = 0;
@@ -3167,7 +3167,7 @@ impl SimplifiedP2P {
             let peer_ip = peer_addr.split(':').next().unwrap_or("");
             if let Some(ref own_ip) = our_ip {
                 if peer_ip == own_ip {
-                    println!("[P2P] 🚫 Skipping self-address: {}", get_privacy_id_for_addr(peer_addr));
+                    println!("[INFO][P2P] Skipping self-address: {}", get_privacy_id_for_addr(peer_addr));
                     skipped_self += 1;
                     continue;
                 }
@@ -3177,23 +3177,23 @@ impl SimplifiedP2P {
                 Ok(peer_info) => {
                     // Also check by node_id
                     if peer_info.id == self.node_id {
-                        println!("[P2P] 🚫 Skipping self by node_id: {}", peer_info.id);
+                        println!("[INFO][P2P] Skipping self by node_id: {}", peer_info.id);
                         skipped_self += 1;
                         continue;
                     }
                     // PRIVACY: Use pseudonym in logs
-                    println!("[P2P] ✅ Successfully parsed peer: {} ({})", get_privacy_id_for_addr(peer_addr), region_string(&peer_info.region));
+                    println!("[INFO][P2P] Successfully parsed peer: {} ({})", get_privacy_id_for_addr(peer_addr), region_string(&peer_info.region));
                     self.add_peer_to_region(peer_info);
                     successful_parses += 1;
                 }
                 Err(e) => {
                     // PRIVACY: Use pseudonym in logs
-                    println!("[P2P] ❌ Failed to parse peer {}: {}", get_privacy_id_for_addr(peer_addr), e);
+                    println!("[WARN][P2P] Failed to parse peer {}: {}", get_privacy_id_for_addr(peer_addr), e);
                 }
             }
         }
         
-        println!("[P2P] 📊 Successfully parsed {}/{} bootstrap peers (skipped {} self)", 
+        println!("[INFO][P2P] Successfully parsed {}/{} bootstrap peers (skipped {} self)", 
                  successful_parses, peers.len(), skipped_self);
         
         // STARTUP FIX: Establish connections asynchronously to prevent blocking startup
@@ -3215,7 +3215,7 @@ impl SimplifiedP2P {
             if ip.starts_with("172.17.") || ip.starts_with("172.18.") 
                 || ip.starts_with("10.") || ip.starts_with("192.168.") 
                 || ip.starts_with("127.") || ip == "localhost" {
-                println!("[P2P] 🚫 Skipping private/internal IP: {}", get_privacy_id_for_addr(peer_addr));
+                println!("[INFO][P2P] Skipping private/internal IP: {}", get_privacy_id_for_addr(peer_addr));
                 continue;
             }
             
@@ -3248,24 +3248,11 @@ impl SimplifiedP2P {
                     // 3. Fake peers cannot produce valid blocks
                     // 4. ensure_peer_connected() will update status when messages arrive
                     let should_add = if is_genesis_peer && (is_bootstrap_node || is_small_network) {
-                        // GENESIS STARTUP FIX: Try connectivity check first
-                        let is_reachable = Self::test_peer_connectivity_static(&peer_info.addr);
-                        if is_reachable {
-                            println!("[P2P] 🌟 Genesis peer: adding {} with bootstrap trust (verified reachable)", get_privacy_id_for_addr(&peer_info.addr));
-                            true
-                        } else {
-                            // CRITICAL FIX v2.19.15: Add Genesis peer anyway during bootstrap!
-                            // This fixes the race condition where all Genesis nodes start simultaneously
-                            // and none can connect because the others' APIs aren't ready yet.
-                            // 
-                            // SAFETY: This is safe because:
-                            // - Genesis IPs are hardcoded (cannot be spoofed)
-                            // - All blocks require valid Dilithium signatures
-                            // - Fake peers cannot produce valid signatures
-                            // - ensure_peer_connected() will confirm when they respond
-                            println!("[P2P] 🌟 Genesis peer: adding {} with BOOTSTRAP TRUST (API not ready yet, will verify on message)", get_privacy_id_for_addr(&peer_info.addr));
-                            true // ADD ANYWAY - this is the key fix!
-                        }
+                        // v4.2: Genesis peers added unconditionally (no blocking TCP check).
+                        // Previous version blocked tokio workers for 2s per peer with no effect
+                        // (both branches returned true). Safety guaranteed by Dilithium signatures.
+                        println!("[INFO][P2P] Genesis peer: adding {} with bootstrap trust", get_privacy_id_for_addr(&peer_info.addr));
+                        true
                     } else {
                         self.is_peer_actually_connected(&peer_info.addr)
                     };
@@ -3289,7 +3276,7 @@ impl SimplifiedP2P {
                                 // CACHE FIX: Invalidate peer cache when topology changes
                                 self.invalidate_peer_cache();
                             } else {
-                                println!("[P2P] ⚠️ Peer {} already connected, skipping duplicate", get_privacy_id_for_addr(&peer_info.addr));
+                                println!("[INFO][P2P] Peer {} already connected, skipping duplicate", get_privacy_id_for_addr(&peer_info.addr));
                     }
                     
                             // ARCHITECTURE FIX: Peer discovery is P2P task, NOT blockchain task!
@@ -3298,10 +3285,10 @@ impl SimplifiedP2P {
                             // Blocks are empty (consensus only, no TX processing in Phase 1)
                             
                             let peer_type = if is_genesis_peer { "GENESIS" } else { "QUANTUM" };
-                            println!("[P2P] ✅ {}: Added verified peer: {}", peer_type, get_privacy_id_for_addr(&peer_info.addr));
+                            println!("[INFO][P2P] {}: Added verified peer: {}", peer_type, get_privacy_id_for_addr(&peer_info.addr));
                         }
                     } else {
-                        println!("[P2P] ❌ Peer {} is not reachable, skipping", get_privacy_id_for_addr(&peer_info.addr));
+                        println!("[INFO][P2P] Peer {} is not reachable, skipping", get_privacy_id_for_addr(&peer_info.addr));
                     }
                 }
             }
@@ -3314,7 +3301,7 @@ impl SimplifiedP2P {
         }
         
         if new_connections > 0 {
-            println!("[P2P] 🚀 Successfully added {} new peers to P2P network", new_connections);
+            println!("[INFO][P2P] Successfully added {} new peers to P2P network", new_connections);
             // CACHE FIX: Invalidate peer cache after adding discovered peers
             self.invalidate_peer_cache();
             
@@ -3341,7 +3328,7 @@ impl SimplifiedP2P {
                             if existing_peer.addr != peer_info.addr { // Don't broadcast to self
                                 self.send_network_message(&existing_peer.addr, peer_discovery_msg.clone());
                                 // PRIVACY: Use pseudonym in logs, not raw IP
-                                println!("[P2P] 📢 REAL-TIME: Announced new peer {} to {}", 
+                                println!("[INFO][P2P] REAL-TIME: Announced new peer {} to {}", 
                                          get_privacy_id_for_addr(&peer_info.addr), 
                                          get_privacy_id_for_addr(&existing_peer.addr));
                             }
@@ -3349,7 +3336,7 @@ impl SimplifiedP2P {
                     } else {
                         // PRIVACY: Non-Genesis peers are NOT announced via PeerDiscovery
                         // They are discovered via DHT/Kademlia without exposing IPs
-                        println!("[P2P] 🔒 PRIVACY: Peer {} added locally only (no broadcast)", 
+                        println!("[INFO][P2P] PRIVACY: Peer {} added locally only (no broadcast)", 
                                  get_privacy_id_for_addr(&peer_info.addr));
                     }
                 }
@@ -3365,7 +3352,7 @@ impl SimplifiedP2P {
     
     /// Start internet-wide peer discovery using external IP and peer registry
     fn start_internet_peer_discovery(&self) {
-        println!("[P2P] 🔍 Starting internet-wide peer discovery...");
+        println!("[INFO][P2P] Starting internet-wide peer discovery...");
         
         // Announce our node to the internet
         self.announce_node_to_internet();
@@ -3388,7 +3375,7 @@ impl SimplifiedP2P {
         // Start regional peer clustering
         self.start_regional_clustering();
         
-        println!("[P2P] ✅ Internet-wide peer discovery started");
+        println!("[INFO][P2P] Internet-wide peer discovery started");
     }
     
     /// Announce our node to the internet for peer discovery
@@ -3397,7 +3384,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ No Tokio runtime - node announcement deferred");
+                println!("[WARN][P2P] No Tokio runtime - node announcement deferred");
                 return;
             }
         };
@@ -3409,7 +3396,7 @@ impl SimplifiedP2P {
         let external_ip_store = self.external_ip.clone();
         
         handle.spawn(async move {
-            println!("[P2P] 🌐 Announcing node to internet...");
+            println!("[INFO][P2P] Announcing node to internet...");
             
             // Get our external IP address
             let external_ip = match Self::get_our_ip_address().await {
@@ -3423,14 +3410,14 @@ impl SimplifiedP2P {
                     ip
                 },
                 Err(e) => {
-                    println!("[P2P] ⚠️ Could not get external IP: {}", e);
+                    println!("[WARN][P2P] Could not get external IP: {}", e);
                     return;
                 }
             };
             
             // PRIVACY: Use pseudonym for own IP in logs
-            println!("[P2P] 🌐 External IP: {}", get_privacy_id_for_addr(&external_ip));
-            println!("[P2P] 🌐 Node announcement: {} in {:?}", get_privacy_id_for_addr(&external_ip), region);
+            println!("[INFO][P2P] External IP: {}", get_privacy_id_for_addr(&external_ip));
+            println!("[INFO][P2P] Node announcement: {} in {:?}", get_privacy_id_for_addr(&external_ip), region);
             
             // PRIVACY: Use display name for public P2P announcement (preserves consensus ID)
             let public_display_name = {
@@ -3475,10 +3462,10 @@ impl SimplifiedP2P {
                 "version": "1.0.0"
             });
             
-            println!("[P2P] 📢 Node announced: {}", announcement);
+            println!("[INFO][P2P] Node announced: {}", announcement);
             
             // PRODUCTION: Save to distributed registry via HTTP API calls
-            println!("[P2P] ✅ Node announcement completed for distributed registry");
+            println!("[INFO][P2P] Node announcement completed for distributed registry");
         });
     }
     
@@ -3488,7 +3475,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ No Tokio runtime - peer search deferred");
+                println!("[WARN][P2P] No Tokio runtime - peer search deferred");
                 return;
             }
         };
@@ -3502,7 +3489,7 @@ impl SimplifiedP2P {
         let reputation_system = self.reputation_system.clone();  // Clone for async block
         
         handle.spawn(async move {
-            println!("[P2P] 🌐 Searching for QNet peers with cryptographic verification...");
+            println!("[INFO][P2P] Searching for QNet peers with cryptographic verification...");
             
             let mut discovered_peers = Vec::new();
             
@@ -3524,7 +3511,7 @@ impl SimplifiedP2P {
                  let region_name = get_genesis_region_by_ip(&ip)
                      .unwrap_or("Unknown");
                  // PRIVACY: Genesis IPs are public, but use pseudonym for consistency
-                 println!("[P2P] 🌟 Working Genesis bootstrap node: {} ({})", get_privacy_id_for_addr(&ip), region_name);
+                 println!("[INFO][P2P] Working Genesis bootstrap node: {} ({})", get_privacy_id_for_addr(&ip), region_name);
              }
              
              // PRIORITY 2: Add environment variable peers (additional nodes)
@@ -3534,12 +3521,12 @@ impl SimplifiedP2P {
                      if !ip.is_empty() && !known_node_ips.contains(&ip.to_string()) {
                          known_node_ips.push(ip.to_string());
                          // PRIVACY: Use pseudonym in logs
-                         println!("[P2P] 🔧 Additional peer IP: {}", get_privacy_id_for_addr(ip));
+                         println!("[INFO][P2P] Additional peer IP: {}", get_privacy_id_for_addr(ip));
                      }
                  }
              }
              
-             println!("[P2P] ✅ Quantum network bootstrap: {} total nodes configured", known_node_ips.len());
+             println!("[INFO][P2P] Quantum network bootstrap: {} total nodes configured", known_node_ips.len());
             
             // EXISTING: Use existing Genesis constants to avoid code duplication
             let our_external_ip = if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
@@ -3554,31 +3541,31 @@ impl SimplifiedP2P {
             };
             
             // PRIVACY: Show privacy ID instead of raw IP
-            println!("[P2P] 🔍 DEBUG: Our external node: {}", get_privacy_id_for_addr(&our_external_ip));
+            println!("[DBG][P2P] Our external node: {}", get_privacy_id_for_addr(&our_external_ip));
             // PRIVACY: Don't print raw IPs, just count
-            println!("[P2P] 🔍 DEBUG: Known node IPs count: {}", known_node_ips.len());
+            println!("[DBG][P2P] Known node IPs count: {}", known_node_ips.len());
             
             // Search on known server IPs with proper regional ports
             for ip in known_node_ips {
                 // PRIVACY: Use pseudonym in logs
-                println!("[P2P] 🔍 DEBUG: Processing peer: {}", get_privacy_id_for_addr(&ip));
+                println!("[DBG][P2P] Processing peer: {}", get_privacy_id_for_addr(&ip));
                 
                 // CRITICAL: Skip our own IP to prevent self-connection
                 if ip == our_external_ip {
                     // PRIVACY: Don't show raw IP  
-                    println!("[P2P] 🚫 Skipping self-connection to own node: {}", get_privacy_id_for_addr(&ip));
+                    println!("[INFO][P2P] Skipping self-connection to own node: {}", get_privacy_id_for_addr(&ip));
                     continue;
                 }
                 
                 // ADDITIONAL CHECK: Skip if IP matches any of our listening addresses
                 if ip == "127.0.0.1" || ip == "0.0.0.0" || ip == "localhost" {
                     // PRIVACY: Even local addresses shouldn't be shown
-                    println!("[P2P] 🚫 Skipping local address: {}", get_privacy_id_for_addr(&ip));
+                    println!("[INFO][P2P] Skipping local address: {}", get_privacy_id_for_addr(&ip));
                     continue;
                 }
                 
                 // PRIVACY: Show privacy ID for peer connections
-                println!("[P2P] 🌐 Attempting to connect to peer: {}", get_privacy_id_for_addr(&ip));
+                println!("[INFO][P2P] Attempting to connect to peer: {}", get_privacy_id_for_addr(&ip));
                 // GENESIS PERIOD FIX: All nodes use unified API on port 8001
                 // Simplified connection strategy - all Genesis nodes listen on 8001
                 let target_ports = vec![8001];  // All nodes connect via unified API port only
@@ -3586,13 +3573,13 @@ impl SimplifiedP2P {
                 for target_port in target_ports {
                     let target_addr = format!("{}:{}", ip, target_port);
                     
-                    println!("[P2P] 🔍 DEBUG: Attempting peer verification for {}", target_addr);
+                    println!("[DBG][P2P] Attempting peer verification for {}", target_addr);
                     
                     // Try to connect with timeout
                     // PRODUCTION: Use cryptographic peer verification instead of simple TCP test
                     match Self::verify_peer_authenticity(&target_addr).await {
                         Ok(peer_pubkey) => {
-                            println!("🌟 [P2P] Quantum-secured peer verified: {} | 🔐 Dilithium signature validated | Key: {}...", 
+                            println!("[INFO][P2P] Quantum-secured peer verified: {} | Dilithium signature validated | Key: {}...", 
                                    target_addr, &peer_pubkey[..peer_pubkey.len().min(16)]);
                             
                             // EXISTING: Use get_genesis_region_by_ip() to get correct Genesis peer region
@@ -3648,8 +3635,8 @@ impl SimplifiedP2P {
                         }
                         Err(e) => {
                             // PRIVACY: Use pseudonym in logs
-                            println!("[P2P] ❌ Peer verification failed for {}: {}", get_privacy_id_for_addr(&target_addr), e);
-                            println!("[P2P] 🔍 Debug: Trying next port for peer {}", get_privacy_id_for_addr(&ip));
+                            println!("[INFO][P2P] Peer verification failed for {}: {}", get_privacy_id_for_addr(&target_addr), e);
+                            println!("[DBG][P2P] Trying next port for peer {}", get_privacy_id_for_addr(&ip));
                         }
                     }
                 }
@@ -3658,7 +3645,7 @@ impl SimplifiedP2P {
             // If no direct connections found, load cached peers from previous sessions
             if discovered_peers.is_empty() {
                 // QUANTUM DECENTRALIZED: No file cache loading - use real-time DHT discovery only
-                println!("[P2P] 🔗 QUANTUM: No direct connections found - using cryptographic DHT discovery");
+                println!("[INFO][P2P] QUANTUM: No direct connections found - using cryptographic DHT discovery");
                 
                 // QUANTUM DECENTRALIZED: File caching disabled for quantum security and decentralization
                 // Peers are discovered exclusively through real-time cryptographic DHT network protocols
@@ -3690,8 +3677,13 @@ impl SimplifiedP2P {
             }
             
             // v2.51: Add validated peers using lock-free DashMap
+            // v4.2: Use spawn_blocking to avoid starving tokio worker threads
             for peer in validated_peers.iter() {
-                if Self::test_peer_connectivity_static(&peer.addr) {
+                let addr_clone = peer.addr.clone();
+                let is_reachable = tokio::task::spawn_blocking(move || {
+                    Self::test_peer_connectivity_static(&addr_clone)
+                }).await.unwrap_or(false);
+                if is_reachable {
                     if !connected_peers.contains_key(&peer.addr) {
                         connected_peers.insert(peer.addr.clone(), peer.clone());
                     }
@@ -3703,7 +3695,7 @@ impl SimplifiedP2P {
             }
 
             if connected_peers.is_empty() {
-                println!("[P2P] 🌐 Running in genesis mode - accepting new peer connections");
+                println!("[INFO][P2P] Running in genesis mode - accepting new peer connections");
             }
         });
     }
@@ -3802,7 +3794,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ No Tokio runtime - peer cleanup task deferred");
+                println!("[WARN][P2P] No Tokio runtime - peer cleanup task deferred");
                 return;
             }
         };
@@ -3815,7 +3807,7 @@ impl SimplifiedP2P {
         let quic_transport = self.quic_transport.clone();
         
         handle.spawn(async move {
-            println!("[P2P] 🧹 Starting periodic peer cleanup task (every 5 minutes)...");
+            println!("[INFO][P2P] Starting periodic peer cleanup task (every 5 minutes)...");
             
             // Initial delay to let network stabilize
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -4564,7 +4556,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ No Tokio runtime - multicast discovery deferred");
+                println!("[WARN][P2P] No Tokio runtime - multicast discovery deferred");
                 return;
             }
         };
@@ -4575,7 +4567,7 @@ impl SimplifiedP2P {
         let port = self.port;
         
         handle.spawn(async move {
-            println!("[P2P] 🔍 Starting multicast discovery...");
+            println!("[INFO][P2P] Starting multicast discovery...");
             
             // Announce our presence via multicast
             for _ in 0..5 {
@@ -4583,12 +4575,12 @@ impl SimplifiedP2P {
                 
                 // PRODUCTION: Use HTTP-based peer discovery instead of UDP multicast  
                 // for better NAT traversal and firewall compatibility
-                println!("[P2P] 📢 HTTP-based peer discovery: {}", announcement);
+                println!("[INFO][P2P] HTTP-based peer discovery: {}", announcement);
                 
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             
-            println!("[P2P] ✅ Multicast discovery completed");
+            println!("[INFO][P2P] Multicast discovery completed");
         });
     }
     
@@ -4613,7 +4605,7 @@ impl SimplifiedP2P {
         
         if validated_peers.is_empty() {
             if height % 10 == 0 {
-                println!("[P2P] ⚠️ No validated peers available - block #{} not broadcasted", height);
+                println!("[WARN][P2P] No validated peers available - block #{} not broadcasted", height);
             }
             return Ok(());
         }
@@ -4780,7 +4772,7 @@ impl SimplifiedP2P {
         let validated_peers = self.get_validated_active_peers();
         
         if validated_peers.is_empty() {
-            println!("[P2P] ⚠️ No validated peers available - Genesis block not broadcasted");
+            println!("[WARN][P2P] No validated peers available - Genesis block not broadcasted");
             return Ok(());
         }
         
@@ -5762,7 +5754,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ WARN: No Tokio runtime - operation skipped");
+                println!("[WARN][P2P] No Tokio runtime - operation skipped");
                 return;
             }
         };
@@ -6414,7 +6406,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ WARN: No Tokio runtime - operation skipped");
+                println!("[WARN][P2P] No Tokio runtime - operation skipped");
                 return;
             }
         };
@@ -6500,7 +6492,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ WARN: No Tokio runtime - operation skipped");
+                println!("[WARN][P2P] No Tokio runtime - operation skipped");
                 return;
             }
         };
@@ -7441,7 +7433,7 @@ impl SimplifiedP2P {
                 .send()
         ).await {
             Ok(Ok(response)) => {
-                println!("[P2P] 🔍 DEBUG: HTTP response status: {}", response.status());
+                println!("[DBG][P2P] HTTP response status: {}", response.status());
                 if response.status().is_success() {
                     match response.json::<serde_json::Value>().await {
                         Ok(auth_response) => {
@@ -7455,7 +7447,7 @@ impl SimplifiedP2P {
                             let challenge_bytes = hex::decode(&challenge)
                                 .map_err(|e| format!("Failed to decode challenge hex: {}", e))?;
                             if Self::verify_dilithium_signature(&challenge_bytes, signature, pubkey).await? {
-                                println!("[P2P] ✅ Peer {} authenticated with post-quantum signature", get_privacy_id_for_addr(&peer_addr));
+                                println!("[INFO][P2P] Peer {} authenticated with post-quantum signature", get_privacy_id_for_addr(&peer_addr));
                                 Ok(pubkey.to_string())
                             } else {
                                 Err("Invalid signature verification".to_string())
@@ -7468,11 +7460,11 @@ impl SimplifiedP2P {
                 }
             },
             Ok(Err(e)) => {
-                println!("[P2P] 🔍 DEBUG: Connection error details: {}", e);
+                println!("[DBG][P2P] Connection error details: {}", e);
                 Err(format!("Connection error: {}", e))
             },
             Err(_) => {
-                println!("[P2P] 🔍 DEBUG: Timeout during peer authentication (5 seconds)");
+                println!("[DBG][P2P] Timeout during peer authentication (5 seconds)");
                 Err("Timeout during peer authentication".to_string())
             },
         }
@@ -7567,37 +7559,35 @@ impl SimplifiedP2P {
     }
     
     /// Static version for use in async contexts
+    /// v4.2 CRITICAL FIX: Non-blocking connectivity check
+    /// Previous version used blocking std::net::TcpStream in async runtime,
+    /// causing cascading API deadlocks when peers went offline.
+    /// Now uses spawn_blocking + parallel probes with strict timeout budget.
     pub fn filter_working_genesis_nodes_static(nodes: Vec<String>) -> Vec<String> {
         use std::net::{TcpStream, SocketAddr};
         use std::time::Duration;
         use std::sync::{Arc, Mutex};
         use std::collections::HashMap;
         
-        // PERFORMANCE FIX: Cache connectivity results to prevent 20+ second delays every microblock
-        // Genesis topology is stable - no need to test every few seconds
+        // Cache connectivity results to prevent repeated probes
         static CACHED_GENESIS_CONNECTIVITY: std::sync::OnceLock<Mutex<HashMap<String, (Vec<String>, std::time::SystemTime)>>> = std::sync::OnceLock::new();
         
         let connectivity_cache = CACHED_GENESIS_CONNECTIVITY.get_or_init(|| Mutex::new(HashMap::new()));
         
-        // Create cache key from sorted node list for consistent results
         let mut cache_key_nodes = nodes.clone();
         cache_key_nodes.sort();
         let cache_key = cache_key_nodes.join("|");
         
         let current_time = std::time::SystemTime::now();
         
-        // Check cache first (dynamic refresh based on network phase)
+        // Check cache first
         if let Ok(cache) = connectivity_cache.lock() {
             if let Some((cached_working_nodes, cached_time)) = cache.get(&cache_key) {
                 if let Ok(cache_age) = current_time.duration_since(*cached_time) {
-                    // ARCHITECTURE: Use static cache time for deterministic behavior
-                    // All nodes must have same view of connectivity at same time
                     let cache_ttl = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
-                        // Genesis nodes: shorter cache for faster convergence
-                        // But not too short to avoid network spam
-                        20 // 20 seconds for Genesis nodes
+                        30 // Genesis nodes: 30 seconds
                     } else {
-                        30 // Regular nodes: 30 seconds
+                        45 // Regular nodes: 45 seconds
                     };
                     
                     if cache_age.as_secs() < cache_ttl {
@@ -7611,103 +7601,99 @@ impl SimplifiedP2P {
             }
         }
         
-        // Cache miss or expired - perform connectivity tests
-        let mut working_nodes = Vec::new();
-        let mut test_results = Vec::new();
-        
         if crate::node::is_info() {
-            println!("[INFO][CONNECTIVITY] refresh_start peers={} strategy=tcp_probe", nodes.len());
+            println!("[INFO][CONNECTIVITY] refresh_start peers={} strategy=nonblocking_probe", nodes.len());
         }
         
-        for ip in &nodes {
-            let addr = format!("{}:8001", ip);
-            if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
-                // PRODUCTION: Enhanced connectivity test with multiple attempts
-                let mut connection_success = false;
-                let mut response_time_ms = 0u64;
-                
-                // PRODUCTION: Attempt connection 3 times with proper timeouts for global network
-                for attempt in 1..=3 {
-                    // EXISTING: Increased timeouts for intercontinental connections (5s, 10s, 15s)
-                    let timeout = Duration::from_secs(5 * attempt as u64); // Quantum-resistant verification needs time
-                    let start_time = std::time::Instant::now();
-                    
-                    match TcpStream::connect_timeout(&socket_addr, timeout) {
+        // v4.2: PARALLEL non-blocking probes using std threads (not tokio)
+        // Each probe runs in its own OS thread with a strict 2-second timeout.
+        // Total wall-clock time = ~2 seconds regardless of peer count.
+        let handles: Vec<_> = nodes.iter().map(|ip| {
+            let ip_clone = ip.clone();
+            std::thread::spawn(move || {
+                let addr = format!("{}:8001", ip_clone);
+                if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+                    let start = std::time::Instant::now();
+                    // Single attempt, 2-second timeout. No retries.
+                    // If a peer can't respond in 2s, it's effectively offline for this round.
+                    match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2)) {
                         Ok(_) => {
-                            response_time_ms = start_time.elapsed().as_millis() as u64;
-                            connection_success = true;
-                            break;
+                            let rtt = start.elapsed().as_millis() as u64;
+                            (ip_clone, true, rtt)
                         }
-                        Err(_) => {
-                            if attempt < 3 {
-                                // PRODUCTION: Exponential backoff for retry (1s, 2s)
-                                std::thread::sleep(Duration::from_secs(attempt as u64)); // Avoid network spam
-                            }
-                        }
-                    }
-                }
-                
-                if connection_success {
-                    working_nodes.push(ip.clone());
-                    test_results.push((ip.clone(), response_time_ms, "online"));
-                    if crate::node::is_debug() {
-                        println!("[DBG][CONNECTIVITY] peer={} status=online rtt={}ms", get_privacy_id_for_addr(ip), response_time_ms);
+                        Err(_) => (ip_clone, false, 0)
                     }
                 } else {
-                    test_results.push((ip.clone(), 0, "offline"));
-                    if crate::node::is_warn() {
-                        println!("[WARN][CONNECTIVITY] peer={} status=offline attempts=3", get_privacy_id_for_addr(ip));
-                    }
+                    (ip_clone, false, 0)
                 }
-            } else {
-                test_results.push((ip.clone(), 0, "invalid"));
-                if crate::node::is_warn() {
-                    println!("[WARN][CONNECTIVITY] peer={} status=invalid_addr", get_privacy_id_for_addr(ip));
+            })
+        }).collect();
+        
+        let mut working_nodes = Vec::new();
+        let mut online_count = 0u32;
+        let mut offline_count = 0u32;
+        
+        // Join all threads (max wait = 3 seconds to account for thread overhead)
+        let join_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        for handle in handles {
+            let remaining = join_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                // Budget exhausted, skip remaining
+                offline_count += 1;
+                continue;
+            }
+            match handle.join() {
+                Ok((ip, true, rtt)) => {
+                    if crate::node::is_debug() {
+                        println!("[DBG][CONNECTIVITY] peer={} status=online rtt={}ms", get_privacy_id_for_addr(&ip), rtt);
+                    }
+                    working_nodes.push(ip);
+                    online_count += 1;
+                }
+                Ok((ip, false, _)) => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][CONNECTIVITY] peer={} status=offline", get_privacy_id_for_addr(&ip));
+                    }
+                    offline_count += 1;
+                }
+                Err(_) => {
+                    offline_count += 1;
                 }
             }
         }
         
-        // Log connectivity report
         if crate::node::is_info() {
-            let online = test_results.iter().filter(|(_, _, s)| *s == "online").count();
-            let offline = test_results.iter().filter(|(_, _, s)| *s != "online").count();
-            println!("[INFO][CONNECTIVITY] refresh_done online={} offline={} total={}", online, offline, test_results.len());
+            println!("[INFO][CONNECTIVITY] refresh_done online={} offline={} total={}", 
+                     online_count, offline_count, online_count + offline_count);
         }
         
-        // SECURITY: Require minimum number of working Genesis nodes
-        let min_required_nodes = 2; // Minimum for network security
-        
+        // Minimum peer requirement
+        let min_required_nodes = 2;
         if working_nodes.len() < min_required_nodes {
             println!("[WARN][CONNECTIVITY] low_peers reachable={} min_required={}", 
                      working_nodes.len(), min_required_nodes);
             
             if working_nodes.is_empty() {
                 println!("[WARN][CONNECTIVITY] no_peers_reachable fallback=all_configured");
-                
-                // Cache the fallback result (all nodes) for short period to prevent repeated failures
                 if let Ok(mut cache) = connectivity_cache.lock() {
                     cache.insert(cache_key, (nodes.clone(), current_time));
                 }
-                
-                return nodes; // Last resort - use all nodes
+                return nodes;
             }
         }
         
-        // PERFORMANCE FIX: Cache the successful connectivity results
+        // Cache results
         if let Ok(mut cache) = connectivity_cache.lock() {
             cache.insert(cache_key, (working_nodes.clone(), current_time));
             
-            // PRODUCTION: Cleanup old cache entries to prevent memory leak (keep last 5)
             if cache.len() > 5 {
                 let mut keys_to_remove = Vec::new();
-                let cutoff_time = current_time - std::time::Duration::from_secs(300); // Remove entries older than 5 minutes
-                
+                let cutoff_time = current_time - Duration::from_secs(300);
                 for (key, (_, cached_time)) in cache.iter() {
                     if *cached_time < cutoff_time {
                         keys_to_remove.push(key.clone());
                     }
                 }
-                
                 for key in keys_to_remove {
                     cache.remove(&key);
                 }
@@ -8174,7 +8160,11 @@ impl SimplifiedP2P {
             } else {
                 // FALLBACK: TCP test only if not in any list
                 // This handles the case where peer just started and hasn't sent messages yet
-                let is_reachable = Self::test_peer_connectivity_static(&peer_addr);
+                // v4.2: spawn_blocking to avoid starving tokio workers during VRF claim collection
+                let peer_addr_clone = peer_addr.clone();
+                let is_reachable = tokio::task::spawn_blocking(move || {
+                    Self::test_peer_connectivity_static(&peer_addr_clone)
+                }).await.unwrap_or(false);
                 if is_reachable {
                     connected_count += 1;
                     println!("[P2P] ✅ Genesis {} reachable via TCP (not yet in peers list)", node_id);
@@ -8268,7 +8258,7 @@ impl SimplifiedP2P {
                             None => {
                                 // PRODUCTION: Peer not in P2P state = not really connected
                                 // Log but don't add phantom peer with fake data
-                                println!("[P2P] ⚠️ Genesis peer {} not in P2P state - skipping (no fake data)", node_id);
+                                println!("[WARN][P2P] Genesis peer {} not in P2P state - skipping (no fake data)", node_id);
                             }
                         }
                     }
@@ -8276,7 +8266,7 @@ impl SimplifiedP2P {
             }
             
             // PRODUCTION: Only return REAL connected peers with REAL reputation
-            println!("[P2P] 🌱 Genesis mode: returning {} REAL connected peers (no phantoms, no fake reputation)", 
+            println!("[INFO][P2P] Genesis mode: returning {} REAL connected peers (no phantoms, no fake reputation)", 
                      genesis_peers.len());
             genesis_peers
         } else {
@@ -8299,7 +8289,7 @@ impl SimplifiedP2P {
         // Clear actor cache
         if let Ok(mut peers_cache) = CACHE_ACTOR.peers_cache.write() {
             *peers_cache = None;
-            println!("[P2P] 🔄 Peer cache invalidated (epoch: {})", new_epoch);
+            println!("[INFO][P2P] Peer cache invalidated (epoch: {})", new_epoch);
         }
         
         // Legacy cache for backward compatibility
@@ -8357,7 +8347,7 @@ impl SimplifiedP2P {
             
             // Send certificate announcement (async in production)
             // PRIVACY: Use pseudonym for peer address
-            println!("[P2P] 📤 Sending certificate {} to peer {}", cert_serial, get_privacy_id_for_addr(&peer_addr));
+            println!("[INFO][P2P] Sending certificate {} to peer {}", cert_serial, get_privacy_id_for_addr(&peer_addr));
             broadcast_count += 1;
             
             // PRODUCTION v2.19.22: Send certificate via QUIC (binary, fast)
@@ -8388,7 +8378,7 @@ impl SimplifiedP2P {
             });
         }
         
-        println!("[P2P] 📜 Certificate {} broadcast to {} peers", cert_serial, broadcast_count);
+        println!("[INFO][P2P] Certificate {} broadcast to {} peers", cert_serial, broadcast_count);
         Ok(())
     }
     
@@ -8409,10 +8399,10 @@ impl SimplifiedP2P {
         // Find peer address for target node
         if let Some(addr) = self.peer_id_to_addr.get(target_node_id) {
             self.send_network_message(&addr, message);
-            println!("[P2P] 📤 Sent certificate request for {} to {}", cert_serial, target_node_id);
+            println!("[INFO][P2P] Sent certificate request for {} to {}", cert_serial, target_node_id);
         } else {
             // Broadcast request to all peers if we don't know the target
-            println!("[P2P] ⚠️ Target node {} not found, broadcasting certificate request", target_node_id);
+            println!("[WARN][P2P] Target node {} not found, broadcasting certificate request", target_node_id);
             let peers: Vec<_> = self.connected_peers_lockfree
                 .iter()
                 .map(|r| r.value().clone())
@@ -8447,14 +8437,14 @@ impl SimplifiedP2P {
         let peers = self.get_validated_active_peers();
         
         if peers.is_empty() {
-            println!("[P2P] ⚠️ No peers available for tracked certificate broadcast");
+            println!("[WARN][P2P] No peers available for tracked certificate broadcast");
             return Ok(()); // No peers is OK (single node network)
         }
         
         let total_peers = peers.len();
         let byzantine_threshold = (total_peers * 2 + 2) / 3; // Ceiling of 2/3
         
-        println!("[P2P] 📜 TRACKED broadcast of certificate {} to {} peers (need {}/{})", 
+        println!("[INFO][P2P] TRACKED broadcast of certificate {} to {} peers (need {}/{})", 
                  cert_serial, total_peers, byzantine_threshold, total_peers);
         
         // Prepare message once
@@ -8561,7 +8551,7 @@ impl SimplifiedP2P {
         
         // Log skipped peers if any
         if skipped_peers > 0 {
-            println!("[P2P] ⏭️ Skipped {} peers in cooldown", skipped_peers);
+            println!("[INFO][P2P] Skipped {} peers in cooldown", skipped_peers);
         }
         
         // CRITICAL: Recalculate effective peers and threshold after cooldown filtering
@@ -8593,14 +8583,14 @@ impl SimplifiedP2P {
                 let delivery_time = broadcast_start.elapsed();
                 let successful = success_count.load(Ordering::SeqCst);
                 
-                println!("[P2P] 📊 Certificate {} delivery: {}/{} effective peers ({:.1}%) in {:?}", 
+                println!("[INFO][P2P] Certificate {} delivery: {}/{} effective peers ({:.1}%) in {:?}", 
                          cert_serial, successful, effective_peers, 
                          if effective_peers > 0 { (successful as f64 / effective_peers as f64) * 100.0 } else { 0.0 },
                          delivery_time);
                 
                 // Check Byzantine threshold (based on effective peers, not total)
                 if successful >= effective_threshold {
-                    println!("[P2P] ✅ Byzantine threshold reached: {}/{} ≥ 2/3 (effective)", 
+                    println!("[INFO][P2P] Byzantine threshold reached: {}/{} ≥ 2/3 (effective)", 
                              successful, effective_peers);
                     Ok(())
                 } else {
@@ -8608,7 +8598,7 @@ impl SimplifiedP2P {
                         "Byzantine threshold NOT reached: {}/{} < 2/3 (need {}, {} in cooldown)",
                         successful, effective_peers, effective_threshold, skipped_peers
                     );
-                    println!("[P2P] ❌ {}", err);
+                    println!("[WARN][P2P] {}", err);
                     Err(err)
                 }
             }
@@ -8628,7 +8618,7 @@ impl SimplifiedP2P {
         // Only Full and Super nodes need validated peers for consensus/emergency producer selection
         match self.node_type {
             NodeType::Light => {
-                println!("[P2P] 📱 Light node: no consensus participation, returning empty peer list");
+                println!("[INFO][P2P] Light node: no consensus participation, returning empty peer list");
                 return Vec::new(); // Light nodes don't participate in consensus
             },
             _ => {} // Continue with Full/Super node logic
@@ -8749,7 +8739,7 @@ impl SimplifiedP2P {
                 // Check topology hash for cache validity  
                 let topology_hash = CacheActor::get_topology_hash(&peer_addrs);
                 if age < validation_interval && cached_data.topology_hash == topology_hash {
-                    println!("[P2P] 📋 Using actor cached peer list ({} peers, epoch: {}, age: {}s)", 
+                    println!("[INFO][P2P] Using actor cached peer list ({} peers, epoch: {}, age: {}s)", 
                              cached_data.data.len(), cached_data.epoch, age.as_secs());
                     return cached_data.data.clone();
                 }
@@ -8760,7 +8750,7 @@ impl SimplifiedP2P {
                 let now = Instant::now();
                 
             if now.duration_since(cached.1) < validation_interval && cached.2 == cache_key {
-                    println!("[P2P] 📋 Using legacy cached peer list ({} peers, age: {}s)", 
+                    println!("[INFO][P2P] Using legacy cached peer list ({} peers, age: {}s)", 
                          cached.0.len(), now.duration_since(cached.1).as_secs());
                 return cached.0.clone();
                 }
@@ -8775,7 +8765,7 @@ impl SimplifiedP2P {
             if let Ok(cached) = CACHED_PEERS.lock() {
                 let now = Instant::now();
                 if now.duration_since(cached.1) < validation_interval && cached.2 == cache_key {
-                    println!("[P2P] 📋 Cache refreshed by another thread ({} peers)", cached.0.len());
+                    println!("[INFO][P2P] Cache refreshed by another thread ({} peers)", cached.0.len());
                     return cached.0.clone();
                 }
             }
@@ -8801,7 +8791,7 @@ impl SimplifiedP2P {
             *cached = (fresh_peers.clone(), now, cache_key);
                 }
                 
-                println!("[P2P] 🔄 Refreshed both peer caches ({} peers, epoch: {})", fresh_peers.len(), epoch);
+                println!("[INFO][P2P] Refreshed both peer caches ({} peers, epoch: {})", fresh_peers.len(), epoch);
             }
             
             return fresh_peers;
@@ -8925,7 +8915,7 @@ impl SimplifiedP2P {
     pub fn force_peer_cache_refresh(&self) {
         if let Ok(mut cached) = CACHED_PEERS.lock() {
             *cached = (Vec::new(), Instant::now(), String::new());
-            println!("[P2P] 🔄 FORCED: Peer cache cleared for fresh validation");
+            println!("[INFO][P2P] FORCED: Peer cache cleared for fresh validation");
         }
     }
     
@@ -9087,11 +9077,11 @@ impl SimplifiedP2P {
         match self.is_running.lock() {
             Ok(mut running) => *running = false,
             Err(poisoned) => {
-                println!("[P2P] ⚠️ Mutex poisoned during shutdown, forcing stop...");
+                println!("[WARN][P2P] Mutex poisoned during shutdown, forcing stop...");
                 *poisoned.into_inner() = false;
             }
         }
-        println!("[P2P] ✅ Simplified P2P network stopped");
+        println!("[INFO][P2P] Simplified P2P network stopped");
     }
     
     // === PRIVATE METHODS ===
@@ -9129,7 +9119,7 @@ impl SimplifiedP2P {
         // This allows network growth and peer exchange to work properly
         let discovery_peers = self.get_discovery_peers();
         
-        println!("[P2P] 📡 Providing {} peers for DHT/API discovery", discovery_peers.len());
+        println!("[INFO][P2P] Providing {} peers for DHT/API discovery", discovery_peers.len());
         discovery_peers
     }
     
@@ -9140,7 +9130,7 @@ impl SimplifiedP2P {
             // Might be a pseudonym - try to resolve
             // CRITICAL FIX: Skip pseudonym resolution in sync context to avoid runtime panic
             // PRIVACY: Don't log raw address
-            println!("[P2P] ⚠️ Pseudonym resolution not available in sync context");
+            println!("[WARN][P2P] Pseudonym resolution not available in sync context");
             return Err("Cannot resolve pseudonym in sync context".to_string());
         }
         
@@ -9237,7 +9227,7 @@ impl SimplifiedP2P {
         let mut regional_peers = match self.regional_peers.lock() {
             Ok(peers) => peers,
             Err(poisoned) => {
-                println!("[P2P] ⚠️ Regional peers mutex poisoned during peer addition");
+                println!("[WARN][P2P] Regional peers mutex poisoned during peer addition");
                 poisoned.into_inner()
             }
         };
@@ -9253,7 +9243,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ No Tokio runtime - regional connection deferred");
+                println!("[WARN][P2P] No Tokio runtime - regional connection deferred");
                 return;
             }
         };
@@ -9267,12 +9257,12 @@ impl SimplifiedP2P {
         
         // EXISTING PATTERN: Use handle.spawn for non-blocking startup
         handle.spawn(async move {
-            println!("[P2P] 🔧 Starting regional connection establishment (background)...");
+            println!("[INFO][P2P] Starting regional connection establishment (background)...");
             
             let regional_peers_data = match regional_peers.lock() {
                 Ok(peers) => peers.clone(), // Clone the data to avoid lifetime issues
                 Err(poisoned) => {
-                    println!("[P2P] ⚠️ Regional peers mutex poisoned during connection establishment");
+                    println!("[WARN][P2P] Regional peers mutex poisoned during connection establishment");
                     poisoned.into_inner().clone()
                 }
             };
@@ -9286,12 +9276,18 @@ impl SimplifiedP2P {
                 let use_all_peers = is_bootstrap_node || is_small_network;
                 let peer_limit = if use_all_peers { peers.len() } else { 5 };
                 
+                // v4.2: spawn_blocking for all connectivity checks to avoid tokio starvation
                 for peer in peers.iter().take(peer_limit) {
                     if peer.id == node_id || peer.addr.contains(&port.to_string()) {
                         continue;
                     }
                     
-                    if Self::is_peer_actually_connected_static(&peer.addr, active_peers) {
+                    let addr_clone = peer.addr.clone();
+                    let ap = active_peers;
+                    let is_connected = tokio::task::spawn_blocking(move || {
+                        Self::is_peer_actually_connected_static(&addr_clone, ap)
+                    }).await.unwrap_or(false);
+                    if is_connected {
                         connected_peers.insert(peer.addr.clone(), peer.clone());
                         if crate::node::is_debug() {
                             println!("[DBG][P2P] regional_added peer={}", peer.id);
@@ -9313,7 +9309,12 @@ impl SimplifiedP2P {
                         }
                         let ip = peer.addr.split(':').next().unwrap_or("");
                         if is_genesis_node_ip(ip) && !connected_peers.contains_key(&peer.addr) {
-                            if Self::is_peer_actually_connected_static(&peer.addr, active_peers) {
+                            let addr_clone = peer.addr.clone();
+                            let ap = active_peers;
+                            let is_connected = tokio::task::spawn_blocking(move || {
+                                Self::is_peer_actually_connected_static(&addr_clone, ap)
+                            }).await.unwrap_or(false);
+                            if is_connected {
                                 connected_peers.insert(peer.addr.clone(), peer.clone());
                             }
                         }
@@ -9329,7 +9330,12 @@ impl SimplifiedP2P {
                         for peer in peers.iter().take(5) {
                             if connected_peers.len() >= 5 { break; }
                             if !connected_peers.contains_key(&peer.addr) {
-                                if Self::is_peer_actually_connected_static(&peer.addr, current_peers) {
+                                let addr_clone = peer.addr.clone();
+                                let cp = current_peers;
+                                let is_connected = tokio::task::spawn_blocking(move || {
+                                    Self::is_peer_actually_connected_static(&addr_clone, cp)
+                                }).await.unwrap_or(false);
+                                if is_connected {
                                     connected_peers.insert(peer.addr.clone(), peer.clone());
                                 }
                             }
@@ -9344,11 +9350,11 @@ impl SimplifiedP2P {
             
             // v2.51: No need to copy back - already using DashMap directly
             {
-                println!("[P2P] ⚠️ Failed to update connected_peers after establishment");
+                println!("[WARN][P2P] Failed to update connected_peers after establishment");
             }
         });
         
-        println!("[P2P] ⚡ Regional connection establishment started (non-blocking startup)");
+        println!("[INFO][P2P] Regional connection establishment started (non-blocking startup)");
     }
     
     /// STATIC VERSION: Check if peer is actually connected (async-safe)
@@ -9372,14 +9378,14 @@ impl SimplifiedP2P {
             
             if is_connected {
                 // PRIVACY: Use pseudonym for peer address
-                println!("[P2P] ✅ Genesis peer {} - FAST TCP connection verified", get_privacy_id_for_addr(peer_addr));
+                println!("[INFO][P2P] Genesis peer {} - FAST TCP connection verified", get_privacy_id_for_addr(peer_addr));
                 true
             } else {
                 if use_relaxed_validation {
-                    println!("[P2P] ⏳ Genesis peer {} - using relaxed validation for network formation", get_privacy_id_for_addr(peer_addr));
+                    println!("[INFO][P2P] Genesis peer {} - using relaxed validation for network formation", get_privacy_id_for_addr(peer_addr));
                     true // Allow for bootstrap/small networks
                 } else {
-                    println!("[P2P] ❌ Genesis peer {} - TCP connection failed, excluding from consensus", get_privacy_id_for_addr(peer_addr));
+                    println!("[WARN][P2P] Genesis peer {} - TCP connection failed, excluding from consensus", get_privacy_id_for_addr(peer_addr));
                     false
                 }
             }
@@ -9410,10 +9416,10 @@ impl SimplifiedP2P {
         let quic_port = p2p_port.saturating_add(crate::quic_transport::QUIC_PORT_OFFSET);
         let quic_addr = format!("{}:{}", ip, quic_port);
         
-        // Quick TCP connect test to QUIC port (3 second timeout)
+        // v4.2: Reduced to 2s to prevent tokio thread starvation
         TcpStream::connect_timeout(
             &quic_addr.parse().unwrap_or_else(|_| std::net::SocketAddr::from(([0,0,0,0], 0))),
-            Duration::from_secs(3)
+            Duration::from_secs(2)
         ).is_ok()
     }
     
@@ -9474,7 +9480,7 @@ impl SimplifiedP2P {
             }
         }
         
-        println!("[P2P] 🎯 Selected {} optimal peers using load balancing", selected_peers.len());
+        println!("[INFO][P2P] Selected {} optimal peers using load balancing", selected_peers.len());
         selected_peers
     }
     
@@ -9547,7 +9553,7 @@ impl SimplifiedP2P {
         *last_rebalance = now;
         drop(last_rebalance);
         
-        println!("[P2P] 🔄 Starting connection rebalancing");
+        println!("[INFO][P2P] Starting connection rebalancing");
         
         // Get current load metrics
         let metrics = match self.regional_metrics.lock() {
@@ -9563,7 +9569,7 @@ impl SimplifiedP2P {
             .collect();
         
         if overloaded_regions.is_empty() {
-            println!("[P2P] ✅ All regions operating within thresholds");
+            println!("[INFO][P2P] All regions operating within thresholds");
             return false;
         }
         
@@ -9590,7 +9596,7 @@ impl SimplifiedP2P {
                 self.connected_peers_lockfree.insert(peer.addr.clone(), peer);
             }
             
-            println!("[P2P] ✅ Rebalancing complete: dropped {}, reconnected to optimal peers", dropped_count);
+            println!("[INFO][P2P] Rebalancing complete: dropped {}, reconnected to optimal peers", dropped_count);
             true
         } else {
             false
@@ -9672,91 +9678,44 @@ impl SimplifiedP2P {
     }
     
     /// Static method for testing peer connectivity (lifetime-safe for async contexts)
+    /// v4.2 CRITICAL FIX: Reduced timeout from 5s to 2s to prevent tokio thread starvation.
+    /// Single attempt only - no retries. If peer can't respond in 2s, treat as offline.
+    /// Previous version (5s + check_api_readiness_static with 24s worst-case) caused
+    /// cascading API deadlocks across the entire network.
     fn test_peer_connectivity_static(peer_addr: &str) -> bool {
         use std::net::{TcpStream, SocketAddr};
         use std::time::Duration;
         
-        // Extract IP from peer address
         let ip = peer_addr.split(':').next().unwrap_or("");
         let addr = format!("{}:8001", ip);
         
         if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
-            // CRITICAL FIX v2.19.15: Increased TCP timeout for international servers
-            // Previous 2s was too short for intercontinental connections:
-            // - Latency between continents: 200-500ms
-            // - API processing time: 100-500ms
-            // - Network jitter: 100-300ms
-            // - Total: 400-1300ms minimum, plus variance
-            // 5s provides safe margin for international Genesis nodes
-            match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5)) {
-                Ok(_) => {
-                    // EXISTING: All peers require API readiness for production quantum security
-                    let api_ready = Self::check_api_readiness_static(ip);
-                    
-                    if api_ready {
-                        // PRIVACY: Use pseudonym for peer address
-                        println!("[P2P] 🔍 Connectivity & API test PASSED for {}", get_privacy_id_for_addr(peer_addr));
-                        true
-                    } else {
-                        println!("[P2P] 🔍 TCP OK but API not ready for {}", get_privacy_id_for_addr(peer_addr));
-                        false
-                    }
-                }
-                Err(_) => {
-                    println!("[P2P] 🔍 Connectivity test FAILED for {}", get_privacy_id_for_addr(peer_addr));
-                    false
-                }
+            // v4.2: Single attempt, strict 2-second timeout. No retries.
+            // For international servers: 200-500ms latency + 100-300ms jitter = 800ms max.
+            // 2s provides sufficient margin without blocking the runtime.
+            match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2)) {
+                Ok(_) => true,
+                Err(_) => false,
             }
         } else {
-            println!("[P2P] 🔍 Invalid address format: {}", get_privacy_id_for_addr(peer_addr));
             false
         }
     }
     
-    /// Check if API server is ready (lightweight check for race condition prevention)
+    /// Check if API server is ready (lightweight TCP port check)
+    /// v4.2 CRITICAL FIX: Removed all blocking retries and thread::sleep calls.
+    /// Previous version blocked tokio threads for up to 24 seconds per offline Genesis peer,
+    /// causing network-wide API deadlock cascade.
     fn check_api_readiness_static(ip: &str) -> bool {
         use std::time::Duration;
         
-        // CRITICAL FIX v2.21.8: Check API port 8001 (TCP) - this is what we actually use!
-        // Previous bug: checked 10876 (UDP port!) and 9876 (unused) - always failed!
-        // Port 8001 is the REST API port and is TCP, which we can test with TcpStream
-        
-        // Primary check: API port 8001
         let api_port_check = format!("{}:{}", ip, 8001);
         if let Ok(addr) = api_port_check.parse::<std::net::SocketAddr>() {
-            if std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok() {
-                return true;
-            }
+            // v4.2: Single attempt, 2-second timeout. No retries, no thread::sleep.
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
+        } else {
+            false
         }
-        
-        // CRITICAL FIX v2.21.8: Genesis peers get extended retry on API port
-        // During Genesis SYNC, all nodes have signal_listener on 8001 → TCP connect works
-        let is_genesis_peer = is_genesis_node_ip(ip);
-        if is_genesis_peer {
-            // Retry with longer timeout for Genesis peers (network startup timing)
-            println!("[P2P] 🔧 Genesis peer {} not ready, retrying with extended timeout...", get_privacy_id_for_addr(ip));
-            
-            // Extended retry for Genesis: 3 attempts with 2s delay
-            for attempt in 1..=3 {
-                std::thread::sleep(Duration::from_secs(2));
-                
-                // Check API port again
-                if let Ok(addr) = api_port_check.parse::<std::net::SocketAddr>() {
-                    if std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)).is_ok() {
-                        println!("[P2P] ✅ Genesis peer {} ready after {} attempts (API)", get_privacy_id_for_addr(ip), attempt);
-                        return true;
-                    }
-                }
-                
-                println!("[P2P] ⏳ Genesis peer {} attempt {}/3 failed, retrying...", get_privacy_id_for_addr(ip), attempt);
-            }
-            
-            // CRITICAL: Do NOT add peer if unreachable after retries
-            println!("[P2P] ❌ Genesis peer {} unreachable after 3 attempts - NOT adding", get_privacy_id_for_addr(ip));
-            return false;
-        }
-        
-        false
     }
     
     /// Query peer metrics - now returns placeholder as metrics come from QUIC stats
@@ -9783,7 +9742,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ No Tokio runtime - regional clustering deferred");
+                println!("[WARN][P2P] No Tokio runtime - regional clustering deferred");
                 return;
             }
         };
@@ -9795,7 +9754,7 @@ impl SimplifiedP2P {
         let is_running = self.is_running.clone();
         
         handle.spawn(async move {
-            println!("[P2P] 🌍 Starting regional clustering for region: {:?}", region);
+            println!("[INFO][P2P] Starting regional clustering for region: {:?}", region);
             
             // Regional clustering logic
             while *match is_running.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
@@ -9812,24 +9771,24 @@ impl SimplifiedP2P {
                 // Ensure we have peers in our region
                 let our_region_count = regional_counts.get(&region).unwrap_or(&0);
                 if *our_region_count < 2 {
-                    println!("[P2P] 🔍 Looking for more peers in region: {:?}", region);
+                    println!("[INFO][P2P] Looking for more peers in region: {:?}", region);
                     
                     // Get dynamic IP for regional peer discovery
                     let external_ip = match Self::get_our_ip_address().await {
                         Ok(ip) => ip,
                         Err(e) => {
-                            println!("[P2P] ⚠️ Failed to get external IP for regional clustering: {}", e);
+                            println!("[WARN][P2P] Failed to get external IP for regional clustering: {}", e);
                             continue;
                         }
                     };
                     
                     // PRODUCTION: Regional clustering uses only real discovered peers
-                    println!("[P2P] 🔍 Region {} needs more peers - expanding discovery range", region_string(&region));
-                    println!("[P2P] 🌐 Initiating wider peer discovery for better regional coverage");
+                    println!("[INFO][P2P] Region {} needs more peers - expanding discovery range", region_string(&region));
+                    println!("[INFO][P2P] Initiating wider peer discovery for better regional coverage");
                 }
                 
                 // Report regional distribution
-                println!("[P2P] 📊 Regional distribution: {:?}", regional_counts);
+                println!("[INFO][P2P] Regional distribution: {:?}", regional_counts);
             }
         });
     }
@@ -9865,19 +9824,19 @@ impl SimplifiedP2P {
                                    peer.id.starts_with("node_");
             
             let is_valid = if is_blacklisted {
-                println!("[P2P] ❌ Peer {} rejected: blacklisted", peer.id);
+                println!("[ERR][P2P] Peer {} rejected: blacklisted", peer.id);
                 false
             } else if is_genesis {
                 // Genesis/bootstrap nodes are always valid
-                println!("[P2P] ✅ Peer {} validated: Genesis bootstrap node", peer.id);
+                println!("[INFO][P2P] Peer {} validated: Genesis bootstrap node", peer.id);
                 true
             } else if has_valid_format {
                 // Regular nodes with valid format
-                println!("[P2P] ✅ Peer {} validated: valid node format", peer.id);
+                println!("[INFO][P2P] Peer {} validated: valid node format", peer.id);
                 true
             } else {
                 // Unknown format - log but allow for flexibility
-                println!("[P2P] ⚠️ Peer {} has unknown format, allowing", peer.id);
+                println!("[WARN][P2P] Peer {} has unknown format, allowing", peer.id);
                 true
             };
             
@@ -9898,23 +9857,23 @@ impl SimplifiedP2P {
         
         // IMPROVED: Check if we're in Docker and need special handling
         if std::path::Path::new("/.dockerenv").exists() {
-            println!("[P2P] 🐳 Docker environment detected, using enhanced NAT traversal");
+            println!("[INFO][P2P] Docker environment detected, using enhanced NAT traversal");
             
             // CRITICAL: Try environment variables first (user can set QNET_EXTERNAL_IP)
             if let Ok(external_ip) = std::env::var("QNET_EXTERNAL_IP") {
-                println!("[P2P] 🐳 Using configured external IP: {}", get_privacy_id_for_addr(&external_ip));
+                println!("[INFO][P2P] Using configured external IP: {}", get_privacy_id_for_addr(&external_ip));
                 return Ok(external_ip);
             }
             
             // Try Docker host IP from environment
             if let Ok(docker_host) = std::env::var("DOCKER_HOST_IP") {
-                println!("[P2P] 🐳 Using Docker host IP: {}", get_privacy_id_for_addr(&docker_host));
+                println!("[INFO][P2P] Using Docker host IP: {}", get_privacy_id_for_addr(&docker_host));
                 return Ok(docker_host);
             }
             
             // CRITICAL: Force STUN for Docker to get real external IP
             // Docker containers always have 172.17.x.x internally, must use STUN
-            println!("[P2P] 🐳 Docker detected: forcing STUN NAT traversal for external IP");
+            println!("[INFO][P2P] Docker detected: forcing STUN NAT traversal for external IP");
         }
         
         // IMPROVED: Try STUN server for NAT traversal (Google's public STUN)
@@ -9955,7 +9914,7 @@ impl SimplifiedP2P {
                                             buf[i+8] ^ 0x21, buf[i+9] ^ 0x12,
                                             buf[i+10] ^ 0xA4, buf[i+11] ^ 0x42);
                                         // PRIVACY: Show privacy ID in logs, but return real IP for internal use
-                                        println!("[P2P] 🌐 STUN resolved external IP: {} (port: {})", 
+                                        println!("[INFO][P2P] STUN resolved external IP: {} (port: {})", 
                                                 get_privacy_id_for_addr(&ip), port);
                                         return Ok(ip);
                                     }
@@ -10560,10 +10519,11 @@ pub enum NetworkMessage {
         sender_id: String,
     },
 
-    /// v4.2: VRF Leader Claim — secret leader election with inline public key
+    /// v4.3: VRF Leader Claim — secret leader election with gossip relay
     /// Each elected node broadcasts its VRF proof at rotation boundary
-    /// All nodes verify and select lowest VRF output as winner
+    /// All nodes verify, store, and RELAY to peers (TTL-limited gossip)
     /// vrf_public_key included so claims are self-verifiable without prior key exchange
+    /// gossip_ttl: decremented on each relay hop; 0 = do not relay further
     VrfLeaderClaim {
         round: u64,              // Leadership round (= rotation period)
         node_id: String,         // Claiming node
@@ -10573,6 +10533,7 @@ pub enum NetworkMessage {
         reputation: f64,         // Node's reputation at claim time
         timestamp: u64,          // Claim timestamp
         vrf_public_key: Vec<u8>, // 1952-byte Dilithium3 public key (self-verifiable claims)
+        gossip_ttl: u8,          // Gossip relay hops remaining (0 = no further relay)
     },
 
     /// DEPRECATED v4.0: EmergencyProducerChange replaced by BFT Timeout Protocol
@@ -10973,7 +10934,7 @@ impl SimplifiedP2P {
                 
                 // Log only every 10th block
                 if height % 10 == 0 {
-                println!("[P2P] ← Received {} block #{} from {} ({} bytes)", 
+                println!("[INFO][P2P] Received {} block #{} from {} ({} bytes)", 
                          block_type, height, from_peer, data.len());
                 }
                 
@@ -11044,7 +11005,7 @@ impl SimplifiedP2P {
                     
                     match block_tx.send(received_block.clone()) {
                         Ok(_) => {
-                            println!("[P2P] ✅ {} block #{} queued for processing", block_type, height);
+                            println!("[INFO][P2P] {} block #{} queued for processing", block_type, height);
                             
                             // GOSSIP RE-BROADCAST v2.19.18: Forward received blocks to other peers
                             // This improves block propagation reliability across the network
@@ -11070,13 +11031,13 @@ impl SimplifiedP2P {
                         Err(e) => {
                             // v3.0: Clear pending on error so block can be retried
                             clear_block_pending_sync(height);
-                            println!("[P2P] ❌ Failed to queue {} block #{}: {}", block_type, height, e);
+                            println!("[ERR][P2P] Failed to queue {} block #{}: {}", block_type, height, e);
                         }
                     }
                 } else {
                     // v3.0: Clear pending - channel not available
                     clear_block_pending_sync(height);
-                    println!("[P2P] ⚠️ Block processing channel not available - block #{} discarded", height);
+                    println!("[WARN][P2P] Block processing channel not available - block #{} discarded", height);
                     println!("[DIAGNOSTIC] 💥 CRITICAL: Block channel was LOST after setup!");
                 }
                 drop(block_tx_guard); // Explicitly drop the lock
@@ -11120,15 +11081,15 @@ impl SimplifiedP2P {
                     // Send to node for validation and mempool addition
                     match tx_sender.send(received_tx) {
                         Ok(_) => {
-                            println!("[P2P] ← Transaction {} from {} queued for processing", 
+                            println!("[INFO][P2P] Transaction {} from {} queued for processing", 
                                      &tx_hash[..tx_hash.len().min(16)], from_peer);
                         }
                         Err(e) => {
-                            println!("[P2P] ❌ Failed to queue transaction: {}", e);
+                            println!("[ERR][P2P] Failed to queue transaction: {}", e);
                         }
                     }
                 } else {
-                    println!("[P2P] ⚠️ Transaction channel not available - tx from {} discarded", from_peer);
+                    println!("[WARN][P2P] Transaction channel not available - tx from {} discarded", from_peer);
                 }
                 drop(tx_guard);
                 
@@ -11184,7 +11145,7 @@ impl SimplifiedP2P {
                     }
                     
                     if processed > 0 {
-                        println!("[P2P] ← Transaction batch: {}/{} new TXs from {} queued", 
+                        println!("[INFO][P2P] Transaction batch: {}/{} new TXs from {} queued", 
                                  processed, new_txs.len(), from_peer);
                     }
                 }
@@ -11204,7 +11165,7 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::PeerDiscovery { requesting_node } => {
-                println!("[P2P] ← Peer discovery from {} in {:?}", 
+                println!("[INFO][P2P] Peer discovery from {} in {:?}", 
                          requesting_node.id, requesting_node.region);
                 self.add_peer_to_region(requesting_node);
             }
@@ -11267,7 +11228,7 @@ impl SimplifiedP2P {
             // ═══════════════════════════════════════════════════════════════
             // v4.0: VRF Leader Claim — verify and store
             // ═══════════════════════════════════════════════════════════════
-            NetworkMessage::VrfLeaderClaim { round, node_id, vrf_output, vrf_proof, slot_seed, reputation, timestamp, vrf_public_key } => {
+            NetworkMessage::VrfLeaderClaim { round, node_id, vrf_output, vrf_proof, slot_seed, reputation, timestamp, vrf_public_key, gossip_ttl } => {
                 self.update_peer_last_seen(&node_id);
                 
                 // Validate sizes
@@ -11339,18 +11300,61 @@ impl SimplifiedP2P {
                             node_id: node_id.clone(),
                             round,
                             vrf_output: out,
-                            vrf_proof,
+                            vrf_proof: vrf_proof.clone(),
                             reputation,
                             verified_at: now,
                         };
                         
                         // Deduplicate: one claim per node per round
-                        let mut claims = LEADER_CLAIMS.entry(round).or_insert_with(Vec::new);
-                        if !claims.iter().any(|c| c.node_id == node_id) {
-                            claims.push(claim);
-                            if crate::node::is_info() {
-                                println!("[INFO][VRF] claim_verified round={} node={} output={}",
-                                         round, node_id, hex::encode(&vrf_output[..8]));
+                        let mut is_new_claim = false;
+                        {
+                            let mut claims = LEADER_CLAIMS.entry(round).or_insert_with(Vec::new);
+                            if !claims.iter().any(|c| c.node_id == node_id) {
+                                claims.push(claim);
+                                is_new_claim = true;
+                                if crate::node::is_info() {
+                                    println!("[INFO][VRF] claim_verified round={} node={} output={} ttl={}",
+                                             round, node_id, hex::encode(&vrf_output[..8]), gossip_ttl);
+                                }
+                            }
+                        }
+                        
+                        // ═══════════════════════════════════════════════════════════════
+                        // v4.3: GOSSIP RELAY — forward verified claim to peers
+                        // TTL prevents infinite propagation loops.
+                        // Only relay NEW claims (dedup above ensures no re-relay).
+                        // Fanout: √(connected_peers) — balances speed vs bandwidth.
+                        //
+                        // SCALABILITY:
+                        //   TTL=3: covers 1000^3 = 1B nodes (3 hops × 1000 peers/hop)
+                        //   TTL=4: covers 1000^4 = 1T nodes (theoretical max)
+                        //   Claim size: ~5.3 KB (pk=1952 + proof=3293 + overhead)
+                        //   Bandwidth per relay: 5.3 KB × √1000 ≈ 167 KB (acceptable)
+                        //   Total network: 20 claims × 167 KB × 3 hops = ~10 MB/round
+                        // ═══════════════════════════════════════════════════════════════
+                        if is_new_claim && gossip_ttl > 0 {
+                            let relay_msg = NetworkMessage::VrfLeaderClaim {
+                                round,
+                                node_id: node_id.clone(),
+                                vrf_output: vrf_output.clone(),
+                                vrf_proof: vrf_proof.clone(),
+                                slot_seed: slot_seed.clone(),
+                                reputation,
+                                timestamp,
+                                vrf_public_key: vrf_public_key.clone(),
+                                gossip_ttl: gossip_ttl - 1,
+                            };
+                            
+                            // Fanout: √(connected_peers), min 2, max 20
+                            let peer_count = self.connected_peers_lockfree.len();
+                            let fanout = ((peer_count as f64).sqrt().ceil() as usize).clamp(2, 20);
+                            
+                            // Relay to random peers (excluding sender)
+                            self.gossip_to_random_peers_excluding(relay_msg, fanout, from_peer);
+                            
+                            if crate::node::is_debug() {
+                                println!("[DBG][VRF] claim_relayed round={} node={} ttl={} fanout={}",
+                                         round, node_id, gossip_ttl - 1, fanout);
                             }
                         }
                     } else {
@@ -11633,7 +11637,7 @@ impl SimplifiedP2P {
                 let handle = match tokio::runtime::Handle::try_current() {
                     Ok(h) => h,
                     Err(_) => {
-                        println!("[P2P] ⚠️ No Tokio runtime - certificate verification skipped");
+                        println!("[WARN][P2P] No Tokio runtime - certificate verification skipped");
                         return;
                     }
                 };
@@ -11642,11 +11646,11 @@ impl SimplifiedP2P {
                 
                 // SCALABILITY: Light nodes don't participate in consensus, skip certificate processing
                 if matches!(self.node_type, NodeType::Light) {
-                    println!("[P2P] 📱 Light node: Ignoring certificate announcement (consensus not required)");
+                    println!("[INFO][P2P] Light node: Ignoring certificate announcement (consensus not required)");
                     return;
                 }
                 
-                println!("[P2P] 📜 Certificate announcement from {} (serial: {})", node_id, cert_serial);
+                println!("[INFO][P2P] Certificate announcement from {} (serial: {})", node_id, cert_serial);
                 
                 // SECURITY: Rate limiting to prevent certificate flooding attacks
                 // Maximum 10 certificate announcements per minute per peer (40 for Genesis nodes)
@@ -11669,7 +11673,7 @@ impl SimplifiedP2P {
                     
                     // Check if currently blocked
                     if rate_limit.blocked_until > now {
-                        println!("[P2P] ⛔ Rate limit: {} blocked from sending certificates for {} more seconds", 
+                        println!("[ERR][P2P] Rate limit: {} blocked from sending certificates for {} more seconds", 
                                  node_id, rate_limit.blocked_until - now);
                         true
                     } else {
@@ -12107,21 +12111,21 @@ impl SimplifiedP2P {
                             }
                         });
                     } else {
-                        println!("[P2P] ⚠️ Cannot find address for requester {}", requester_id);
+                        println!("[WARN][P2P] Cannot find address for requester {}", requester_id);
                     }
                 } else {
-                    println!("[P2P] ❌ Certificate {} not found in cache", cert_serial);
+                    println!("[ERR][P2P] Certificate {} not found in cache", cert_serial);
                 }
             }
             
             NetworkMessage::CertificateResponse { node_id, cert_serial, certificate, timestamp } => {
                 self.update_peer_last_seen(&node_id);
-                println!("[P2P] 📥 Certificate response from {} (serial: {})", node_id, cert_serial);
+                println!("[INFO][P2P] Certificate response from {} (serial: {})", node_id, cert_serial);
                 
                 // Store received certificate
                 let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
                 cert_manager.store_remote_certificate(cert_serial.clone(), certificate);
-                println!("[P2P] ✅ Received certificate {} cached", cert_serial);
+                println!("[INFO][P2P] Received certificate {} cached", cert_serial);
                 
                 // FIX v2.28: Signal retry loop that new certificate is available
                 crate::node::NEW_CERTIFICATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12771,6 +12775,35 @@ impl SimplifiedP2P {
         // v2.51: lock-free
         let peers: Vec<_> = self.connected_peers_lockfree
             .iter()
+            .map(|r| r.value().clone())
+            .collect();
+        
+        if peers.is_empty() {
+            return;
+        }
+        
+        let mut rng = rand::thread_rng();
+        let selected: Vec<_> = peers.choose_multiple(&mut rng, count.min(peers.len())).collect();
+        
+        for peer in selected {
+            self.send_network_message(&peer.addr, message.clone());
+        }
+    }
+    
+    /// v4.3: Gossip to random peers EXCLUDING the sender (prevents echo loops)
+    /// Used by VRF claim relay to avoid sending claim back to the node that sent it
+    pub fn gossip_to_random_peers_excluding(&self, message: NetworkMessage, count: usize, exclude_peer: &str) {
+        use rand::seq::SliceRandom;
+        
+        let peers: Vec<_> = self.connected_peers_lockfree
+            .iter()
+            .filter(|r| {
+                // Exclude the sender by addr prefix (IP match)
+                let peer_addr = r.value().addr.as_str();
+                let exclude_ip = exclude_peer.split(':').next().unwrap_or(exclude_peer);
+                let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
+                peer_ip != exclude_ip
+            })
             .map(|r| r.value().clone())
             .collect();
         
@@ -16197,7 +16230,12 @@ impl SimplifiedP2P {
             }
             
             // Check if peer is reachable
-            if !Self::test_peer_connectivity_static(&peer.addr) {
+            // v4.2: spawn_blocking to avoid starving tokio workers
+            let peer_addr_clone = peer.addr.clone();
+            let is_reachable = tokio::task::spawn_blocking(move || {
+                Self::test_peer_connectivity_static(&peer_addr_clone)
+            }).await.unwrap_or(false);
+            if !is_reachable {
                 if crate::node::is_warn() {
                     println!("[WARN][MB-SYNC] peer_unreachable id={} retry=next", peer.id);
                 }
@@ -19243,9 +19281,25 @@ impl SimplifiedP2P {
     /// Create and broadcast timeout vote for specified height/round
     /// signature: Pre-computed hybrid signature from node's quantum_crypto
     // ═══════════════════════════════════════════════════════════════════
-    // v4.0: VRF LEADER CLAIM BROADCAST
-    // Gossips our VRF proof to all validators at rotation boundary
     // ═══════════════════════════════════════════════════════════════════
+    // v4.3: VRF LEADER CLAIM BROADCAST WITH GOSSIP TTL
+    // Sends our VRF proof to all direct peers with TTL for relay.
+    //
+    // GOSSIP_TTL determines how many hops a claim can travel:
+    //   TTL=3: 1000^3 = 1B node reach (3 hops × 1000 peers/hop)
+    //   TTL=4: covers any practical network size
+    //
+    // At each hop, fanout = √(connected_peers), ensuring:
+    //   5 nodes:    fanout=2 → all reached in 1 hop (direct)
+    //   1000 nodes: fanout=32 → all reached in 1 hop (direct, <1000 peers)
+    //   10K nodes:  fanout=32 → 32×32=1024 reached in 2 hops
+    //   100K nodes: fanout=32 → 32^3=32K reached in 3 hops (+ direct 1000)
+    //
+    // BANDWIDTH: ~20 claims × 5.3 KB × 3 hops × 32 fanout ≈ 10 MB/round
+    // ═══════════════════════════════════════════════════════════════════
+    /// Initial TTL for VRF claim gossip (number of relay hops)
+    const VRF_CLAIM_GOSSIP_TTL: u8 = 4;
+    
     pub fn broadcast_leader_claim(
         &self,
         round: u64,
@@ -19275,6 +19329,7 @@ impl SimplifiedP2P {
             reputation,
             timestamp: now,
             vrf_public_key: vrf_public_key.clone(),
+            gossip_ttl: Self::VRF_CLAIM_GOSSIP_TTL,
         };
 
         // Also store own claim locally (verified by definition)
@@ -19289,8 +19344,8 @@ impl SimplifiedP2P {
         LEADER_CLAIMS.entry(round).or_insert_with(Vec::new).push(own_claim);
 
         if crate::node::is_info() {
-            println!("[INFO][VRF] claim_broadcast round={} output={}",
-                     round, hex::encode(&vrf_output[..8]));
+            println!("[INFO][VRF] claim_broadcast round={} output={} ttl={}",
+                     round, hex::encode(&vrf_output[..8]), Self::VRF_CLAIM_GOSSIP_TTL);
         }
 
         // Broadcast to all validators via QUIC

@@ -4735,10 +4735,17 @@ impl Storage {
     
     /// Save node registration information (for local cache only)
     /// NOTE: api_endpoint is now stored ON-CHAIN in NodeRegistration TX!
+    /// Stores BOTH forward index (node_id → data) AND reverse index (wallet → node_id)
+    /// for O(1) lookups in both directions.
     pub fn save_node_registration(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64) -> IntegrationResult<()> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
         
+        // ATOMIC: WriteBatch ensures both forward and reverse indexes are written together
+        // Prevents inconsistency if crash occurs between writes
+        let mut batch = rocksdb::WriteBatch::default();
+        
+        // Forward index: node_id → data
         let key = format!("node_{}", node_id);
         let data = json!({
             "node_type": node_type,
@@ -4746,9 +4753,44 @@ impl Storage {
             "reputation": reputation,
             "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
         });
+        batch.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes());
         
-        self.persistent.db.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes())?;
+        // Reverse index: wallet → node_id (O(1) lookup by wallet)
+        let wallet_key = format!("wallet_{}", wallet);
+        let wallet_data = json!({
+            "node_id": node_id,
+            "node_type": node_type,
+        });
+        batch.put_cf(&registry_cf, wallet_key.as_bytes(), wallet_data.to_string().as_bytes());
+        
+        self.persistent.db.write(batch)?;
+        
         Ok(())
+    }
+    
+    /// O(1) lookup: get node by wallet address using reverse index
+    /// Returns (node_id, node_type) if found
+    pub fn get_node_by_wallet(&self, wallet_address: &str) -> IntegrationResult<Option<(String, String)>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        
+        let wallet_key = format!("wallet_{}", wallet_address);
+        match self.persistent.db.get_cf(&registry_cf, wallet_key.as_bytes())? {
+            Some(value) => {
+                let json_str = std::str::from_utf8(&value)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                let parsed: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                let node_id = parsed["node_id"].as_str().unwrap_or("").to_string();
+                let node_type = parsed["node_type"].as_str().unwrap_or("").to_string();
+                if node_id.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some((node_id, node_type)))
+                }
+            }
+            None => Ok(None),
+        }
     }
     
     /// v4.0: Save VRF public key for node (persists across restarts)
@@ -4885,6 +4927,66 @@ impl Storage {
         }
         
         Ok(result)
+    }
+    
+    /// v4.1: Backfill reverse index (wallet → node_id) from existing forward entries.
+    /// Called once on startup to migrate data created before reverse index was added.
+    /// Idempotent — safe to call multiple times. Skips entries that already have reverse index.
+    pub fn backfill_wallet_reverse_index(&self) -> IntegrationResult<u32> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        
+        let prefix = b"node_";
+        let iter = self.persistent.db.prefix_iterator_cf(&registry_cf, prefix);
+        let mut backfilled = 0u32;
+        let mut batch = rocksdb::WriteBatch::default();
+        
+        for item in iter {
+            if let Ok((key, value)) = item {
+                let key_str = match std::str::from_utf8(&key) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                
+                if !key_str.starts_with("node_") { continue; }
+                let node_id = &key_str[5..];
+                
+                let json_str = match std::str::from_utf8(&value) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                
+                let wallet = match parsed["wallet"].as_str() {
+                    Some(w) if !w.is_empty() => w,
+                    _ => continue,
+                };
+                let node_type = parsed["node_type"].as_str().unwrap_or("unknown");
+                
+                // Check if reverse index already exists
+                let wallet_key = format!("wallet_{}", wallet);
+                if self.persistent.db.get_cf(&registry_cf, wallet_key.as_bytes())?.is_some() {
+                    continue; // Already has reverse index
+                }
+                
+                let wallet_data = json!({
+                    "node_id": node_id,
+                    "node_type": node_type,
+                });
+                batch.put_cf(&registry_cf, wallet_key.as_bytes(), wallet_data.to_string().as_bytes());
+                backfilled += 1;
+            }
+        }
+        
+        if backfilled > 0 {
+            self.persistent.db.write(batch)?;
+            println!("[INFO][STORAGE] backfill_wallet_index entries={}", backfilled);
+        }
+        
+        Ok(backfilled)
     }
     
     // ============================================

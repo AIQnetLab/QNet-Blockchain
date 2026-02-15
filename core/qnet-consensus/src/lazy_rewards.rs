@@ -702,11 +702,15 @@ impl PhaseAwareRewardManager {
     
     /// Get all nodes owned by a specific wallet address
     /// Returns Vec of (node_id, node_type, pending_reward)
-    /// Used by mobile apps to find user's nodes by wallet
+    /// Uses wallet_nodes_index for O(1) lookup instead of O(n) scan
     pub fn get_nodes_by_wallet(&self, wallet_address: &str) -> Vec<(String, NodeType, u64)> {
-        self.node_ownership.iter()
-            .filter(|(_, wallet)| *wallet == wallet_address)
-            .filter_map(|(node_id, _)| {
+        let node_ids = match self.wallet_nodes_index.get(wallet_address) {
+            Some(ids) => ids.clone(),
+            None => return Vec::new(),
+        };
+        
+        node_ids.iter()
+            .filter_map(|node_id| {
                 self.ping_histories.get(node_id).map(|history| {
                     let pending = self.pending_rewards.get(node_id)
                         .map(|r| r.total_reward)

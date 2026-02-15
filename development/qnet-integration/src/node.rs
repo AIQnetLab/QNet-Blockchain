@@ -2055,26 +2055,49 @@ impl BlockchainNode {
         use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         
         for tx in transactions {
-            if let qnet_state::TransactionType::NodeRegistration { 
-                node_id, node_type, wallet_address, api_endpoint, .. 
-            } = &tx.tx_type {
-                // v3.18: Full node type removed
-                let type_str = match node_type {
-                    qnet_state::NodeType::Super => "super",
-                    qnet_state::NodeType::Light => "light",
-                };
-                // Level 1: DashMap in-memory cache
-                cache.insert(
-                    node_id.clone(),
-                    (node_type.clone(), wallet_address.clone(), api_endpoint.clone())
-                );
-                // Level 2: RocksDB persistent cache
-                if let Err(e) = storage.save_node_registration(node_id, type_str, wallet_address, INITIAL_REPUTATION) {
-                    eprintln!("[WARN][REG] cache_from_block_fail node={} err={}", node_id, e);
-                } else if is_info() {
-                    println!("[INFO][REG] cached_from_produced_block node={} wallet={}...", 
-                             node_id, &wallet_address[..wallet_address.len().min(16)]);
+            match &tx.tx_type {
+                qnet_state::TransactionType::NodeRegistration { 
+                    node_id, node_type, wallet_address, api_endpoint, .. 
+                } => {
+                    let type_str = match node_type {
+                        qnet_state::NodeType::Super => "super",
+                        qnet_state::NodeType::Light => "light",
+                    };
+                    // Level 1: DashMap in-memory cache
+                    cache.insert(
+                        node_id.clone(),
+                        (node_type.clone(), wallet_address.clone(), api_endpoint.clone())
+                    );
+                    // Level 2: RocksDB persistent cache (forward + reverse index)
+                    if let Err(e) = storage.save_node_registration(node_id, type_str, wallet_address, INITIAL_REPUTATION) {
+                        eprintln!("[WARN][REG] cache_from_block_fail node={} err={}", node_id, e);
+                    } else if is_info() {
+                        println!("[INFO][REG] cached_from_produced_block node={} wallet={}...", 
+                                 node_id, &wallet_address[..wallet_address.len().min(16)]);
+                    }
                 }
+                qnet_state::TransactionType::NodeActivation { node_type, phase, .. } => {
+                    // Index NodeActivation TX: wallet → activation record in RocksDB
+                    let wallet_address = &tx.from;
+                    let type_str = match node_type {
+                        qnet_state::account::NodeType::Super => "super",
+                        qnet_state::account::NodeType::Light => "light",
+                    };
+                    let phase_num = match phase {
+                        qnet_state::account::ActivationPhase::Phase1 => 1u8,
+                        qnet_state::account::ActivationPhase::Phase2 => 2u8,
+                    };
+                    // Use tx hash as node_id placeholder for activation-only records
+                    let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
+                    if let Err(e) = storage.save_node_registration(&activation_id, type_str, wallet_address, INITIAL_REPUTATION) {
+                        eprintln!("[WARN][ACT] cache_activation_fail wallet={} err={}", 
+                                 &wallet_address[..wallet_address.len().min(16)], e);
+                    } else if is_info() {
+                        println!("[INFO][ACT] indexed_activation wallet={}... type={} phase={}", 
+                                 &wallet_address[..wallet_address.len().min(16)], type_str, phase_num);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -5562,6 +5585,14 @@ impl BlockchainNode {
             }
         }
         
+        // v4.1: Backfill wallet reverse index (migration for pre-v4.1 data)
+        // Ensures O(1) verify-activation lookups work for nodes registered before reverse index existed
+        match blockchain.storage.backfill_wallet_reverse_index() {
+            Ok(count) if count > 0 => println!("[INFO][NODE] wallet_reverse_index_migrated entries={}", count),
+            Ok(_) => {} // No migration needed
+            Err(e) => println!("[WARN][NODE] wallet_index_backfill err={}", e),
+        }
+        
         // CRITICAL: Link deterministic reputation to P2P for unified access
         // This allows deterministic producer selection to use blockchain-based reputation
         if let Some(ref p2p) = blockchain.unified_p2p {
@@ -6455,7 +6486,10 @@ impl BlockchainNode {
         let last_fork_attempt = Arc::new(tokio::sync::RwLock::new(
             std::time::Instant::now() - std::time::Duration::from_secs(120)
         ));
-        const FORK_ATTEMPT_COOLDOWN_SECS: u64 = 60; // Max 1 fork attempt per 60 seconds
+        // v4.2: Reduced from 60s to 10s. Previous 60s cooldown prevented fork resolution
+        // when the first attempt failed, locking nodes on wrong chain indefinitely.
+        // 10s still prevents reorg DoS while allowing recovery within 2-3 attempts.
+        const FORK_ATTEMPT_COOLDOWN_SECS: u64 = 10;
         
         loop {
             // Check both channels - prioritize retries
@@ -7222,7 +7256,6 @@ impl BlockchainNode {
                                             node_id, node_type, wallet_address, .. 
                                         } => {
                                             // Cache in RocksDB for fast access (blockchain is source of truth)
-                                            // v3.18: Full node type removed
                                             let type_str = match node_type {
                                                 qnet_state::NodeType::Super => "super",
                                                 qnet_state::NodeType::Light => "light",
@@ -7234,7 +7267,23 @@ impl BlockchainNode {
                                                          received_block.height); 
                                             }
                                         }
-                                        _ => {} // Other transaction types don't contribute to Pool 3
+                                        // v4.1: Index NodeActivation TX on block receive (same as NodeRegistration)
+                                        // Without this, verify-activation O(1) lookup fails for synced blocks
+                                        qnet_state::TransactionType::NodeActivation { node_type, .. } => {
+                                            let wallet_addr = &tx.from;
+                                            let type_str = match node_type {
+                                                qnet_state::account::NodeType::Super => "super",
+                                                qnet_state::account::NodeType::Light => "light",
+                                            };
+                                            let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
+                                            let _ = storage.save_node_registration(&activation_id, type_str, wallet_addr, 1.0);
+                                            if is_debug() {
+                                                println!("[DBG][ACT] cached_from_block wallet={}... h={}",
+                                                         &wallet_addr[..16.min(wallet_addr.len())],
+                                                         received_block.height);
+                                            }
+                                        }
+                                        _ => {} // Other transaction types
                                     }
                                 }
                             }
@@ -12058,18 +12107,16 @@ impl BlockchainNode {
                         let local_height = storage.get_chain_height().unwrap_or(0);
                         let sync_lag = network_height.saturating_sub(local_height);
                         
-                        if sync_lag > 100 {
-                            // v3.9: Self-exclude - just DON'T PRODUCE, no broadcast needed!
-                            // timeout_round will handle failover DETERMINISTICALLY
-                            println!("[WARN][PROD] self_exclude local={} network={} lag={} (timeout_round will handle)", 
-                                     local_height, network_height, sync_lag);
-                            
-                            // Simply skip this iteration - don't produce the block
-                            // All other nodes will see slot_delay > 5 and select next producer
+                        // v4.3: Producer MUST be fully synced (lag=0) to prevent forks
+                        // If lag >= 1, a block at our next height may already exist on the network.
+                        // Producing a duplicate with different prev_hash = guaranteed fork.
+                        // BFT Timeout Protocol will select next producer after 5s deterministically.
+                        if sync_lag > 0 {
+                            if is_warn() {
+                                println!("[WARN][PROD] self_exclude h={} local={} network={} lag={} (must be fully synced to produce)",
+                                         next_block_height, local_height, network_height, sync_lag);
+                            }
                             is_my_turn_to_produce = false;
-                            // Don't set current_producer - leave it as is, we're not producing
-                        } else if sync_lag > 10 && is_warn() {
-                            println!("[WARN][PROD] sync_lag={} h={} (producing)", sync_lag, next_block_height);
                         }
                     }
                 }
@@ -15880,9 +15927,54 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     ((current_height - 1) % 30 == 0 || current_height == 1);
                 
                 if is_rotation_boundary {
-                    // Brief collection window — claims are gossiped in parallel
-                    // 1.5s is enough for VRF eval (~5ms) + QUIC gossip (~50ms) + network
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                    // ═══════════════════════════════════════════════════════════════
+                    // v4.3: ADAPTIVE VRF COLLECTION WINDOW
+                    // Scales with network size and latency, same approach as BFT wait.
+                    //
+                    // Budget: VRF eval (~5ms) + QUIC direct (~50ms) + gossip hops
+                    //   Genesis (≤50):   1 hop direct → 1.5s (plenty of margin)
+                    //   Small (≤200):    1 hop direct → 1.5s
+                    //   Medium (≤1000):  1 hop direct → 2.0s (WAN margin)
+                    //   Large (>1000):   gossip relay  → 2.5-3.5s (multi-hop)
+                    //
+                    // CONSTRAINT: Must stay < Grace Period (5s) minus block creation
+                    // Max safe VRF window = 4s (leaves 1s for block + broadcast)
+                    // ═══════════════════════════════════════════════════════════════
+                    let candidate_count = candidates.len();
+                    let avg_latency = if let Some(ref p2p) = unified_p2p {
+                        p2p.get_average_peer_latency()
+                    } else {
+                        100 // Default: assume WAN
+                    };
+                    
+                    let vrf_collection_ms: u64 = match (candidate_count, avg_latency) {
+                        // GENESIS (≤50 candidates): Direct QUIC, no gossip hops needed
+                        (0..=50, 0..=50)   => 1500,  // LAN: 1.5s
+                        (0..=50, _)        => 2000,  // WAN: 2.0s
+                        
+                        // SMALL (51-200 candidates): Direct QUIC, single hop sufficient
+                        (51..=200, 0..=50) => 1500,  // LAN: 1.5s
+                        (51..=200, _)      => 2000,  // WAN: 2.0s
+                        
+                        // MEDIUM (201-1000 candidates): Direct + 1 gossip hop possible
+                        (201..=1000, 0..=50)  => 2000,  // LAN: 2.0s
+                        (201..=1000, 51..=150) => 2500,  // Regional: 2.5s
+                        (201..=1000, _)       => 3000,  // Global WAN: 3.0s
+                        
+                        // LARGE (>1000 candidates): Multi-hop gossip relay required
+                        // ~2-3 gossip hops × latency + VRF eval + margin
+                        (1001.., 0..=50)  => 2500,  // LAN: 2.5s
+                        (1001.., 51..=150) => 3000,  // Regional: 3.0s
+                        (1001.., 151..=250) => 3500,  // Continental: 3.5s
+                        (1001.., _)        => 4000,  // Global WAN: 4.0s (MAX SAFE)
+                    };
+                    
+                    if is_info() {
+                        println!("[INFO][VRF] collection_window={}ms candidates={} avg_latency={}ms",
+                                 vrf_collection_ms, candidate_count, avg_latency);
+                    }
+                    
+                    tokio::time::sleep(tokio::time::Duration::from_millis(vrf_collection_ms)).await;
                     
                     // Cleanup old rounds
                     SimplifiedP2P::cleanup_old_claims(leadership_round);
