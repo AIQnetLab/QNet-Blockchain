@@ -14687,6 +14687,42 @@ impl SimplifiedP2P {
         println!("[GOSSIP] 📡 Light node registration gossiped to network");
     }
     
+    /// v4.3: Restore light node registry from blockchain storage (RocksDB) on startup.
+    /// Populates the in-memory P2P registry from persisted NodeRegistration data.
+    /// Called once during node initialization so registry survives restarts.
+    /// Without this, all in-memory registries would be empty after restart,
+    /// and light nodes would be invisible until they re-register or gossip arrives.
+    /// This is the GUARANTEED path — gossip sync is supplementary.
+    pub fn restore_light_nodes_from_storage(&self, nodes: Vec<(String, String, String, u64)>) -> usize {
+        let mut added = 0;
+        let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        
+        for (node_id, wallet_address, _node_type, registered_at) in nodes {
+            if !registry.contains_key(&node_id) {
+                registry.insert(node_id.clone(), LightNodeRegistrationData {
+                    node_id,
+                    wallet_address,
+                    device_token_hash: String::new(), // Not persisted in blockchain — populated on re-registration
+                    quantum_pubkey: String::new(),    // Re-sent by mobile app on re-registration
+                    registered_at,
+                    signature: String::new(),          // Not needed for restored entries
+                    push_type: PushType::Polling,      // Default for restored — updated on re-registration
+                    unified_push_endpoint: None,
+                    last_seen: registered_at,          // Conservative: last seen = registration time
+                    consecutive_failures: 0,           // Assume healthy until proven otherwise
+                    is_active: true,
+                });
+                added += 1;
+            }
+        }
+        
+        if added > 0 {
+            println!("[INFO][P2P] restored_from_storage light_nodes={} total_registry={}", added, registry.len());
+        }
+        
+        added
+    }
+    
     /// Request Light Node registry sync from peers
     pub fn request_light_node_registry_sync(&self) {
         let now = std::time::SystemTime::now()
