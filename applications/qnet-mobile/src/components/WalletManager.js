@@ -3855,7 +3855,7 @@ export class WalletManager {
     }
     
     // All nodes failed - throw error, NOT fake data
-    console.error('[PRICING] ❌ Could not reach any bootstrap nodes');
+    console.warn('[PRICING] Could not reach any bootstrap nodes');
     throw new Error('Network size unavailable - all bootstrap nodes unreachable');
   }
 
@@ -4163,7 +4163,7 @@ export class WalletManager {
         burnTxHash: burnTxHash
       };
     } catch (error) {
-      console.error('Error requesting activation code:', error);
+      console.warn('[WalletManager] Activation code request failed:', error.message || error);
       throw error;
     }
   }
@@ -4199,7 +4199,7 @@ export class WalletManager {
       
       return { success: false, error: result.error || 'Code not found in recovery storage' };
     } catch (error) {
-      console.error('[recoverActivationCode] Recovery request failed:', error);
+      console.warn('[recoverActivationCode] Recovery request failed:', error.message || error);
       return { success: false, error: error.message };
     }
   }
@@ -4396,7 +4396,13 @@ export class WalletManager {
         if (response.ok) {
           const result = await response.json();
           // Backend returns { success, nodes: [...] } — each node has node_id, node_type, status
-          const nodes = result.nodes || result.activations || [];
+          const allNodes = result.nodes || result.activations || [];
+          // CRITICAL: Filter out pending_activation and HASH-only entries
+          // These are NOT real activated nodes — just code generation records
+          const nodes = allNodes.filter(n => 
+            n.status !== 'pending_activation' && 
+            !(n.activation_code && typeof n.activation_code === 'string' && n.activation_code.startsWith('HASH:'))
+          );
           if (result.success && nodes.length > 0) {
             const node = nodes[0]; // Use first node (1 wallet = 1 node rule)
             const nodeType = node.node_type;
@@ -4506,7 +4512,7 @@ export class WalletManager {
       // No activations found
       return null;
     } catch (error) {
-      console.error('Error syncing activation codes:', error);
+      console.warn('[syncActivationCodes] Error:', error.message || error);
       return null;
     }
   }
@@ -5041,7 +5047,7 @@ export class WalletManager {
       
       activationCode = codeResult.activationCode;
     } catch (codeError) {
-      console.error('Failed to get activation code from server:', codeError);
+      console.warn('[burnTokensForNode] Failed to get activation code from server:', codeError.message || codeError);
       throw new Error('Burn successful but failed to get activation code. Please contact support.');
     }
     
@@ -5302,7 +5308,7 @@ export class WalletManager {
         }
       } catch (dilithiumError) {
         // Dilithium3 is MANDATORY — no Ed25519 fallback allowed
-        console.error('[Registration] Dilithium3 signature failed:', dilithiumError.message);
+        console.warn('[Registration] Dilithium3 signature failed:', dilithiumError.message);
         throw new Error(`Dilithium3 quantum signature required: ${dilithiumError.message}`);
       }
 
@@ -5336,7 +5342,7 @@ export class WalletManager {
       };
 
     } catch (error) {
-      console.error('[Registration] Node activation failed:', error.message);
+      console.warn('[Registration] Node activation failed:', error.message);
       
       // Store activation code locally even on failure (paid via 1DEV burn)
       // But DO NOT report success — registration requires Dilithium3 on blockchain
@@ -5411,7 +5417,7 @@ export class WalletManager {
       };
 
     } catch (error) {
-      console.error('[Ping] Heartbeat failed:', error.message);
+      console.warn('[Ping] Heartbeat failed:', error.message);
       return {
         success: false,
         error: error.message
@@ -5736,7 +5742,7 @@ export class WalletManager {
         const errorMsg = result.details 
           ? `${result.error}: ${result.details}`
           : (result.error || 'Failed to send transaction');
-        console.error('[WalletManager] Transaction rejected:', result);
+        console.warn('[WalletManager] Transaction rejected:', result);
         throw new Error(errorMsg);
       }
       
@@ -5749,7 +5755,7 @@ export class WalletManager {
         timestamp: Date.now()
       };
     } catch (error) {
-      console.error('[WalletManager] Send QNC error:', error);
+      console.warn('[WalletManager] Send QNC error:', error.message || error);
       throw error;
     }
   }

@@ -880,14 +880,26 @@ const WalletScreen = () => {
           
           if (syncedCodes && Object.keys(syncedCodes).length > 0) {
             const nodeType = Object.keys(syncedCodes)[0];
-            const code = syncedCodes[nodeType];
-            setActivatedNodeType(nodeType);
-            setActivationCode(code.code || code);
+            const codeData = syncedCodes[nodeType];
+            const codeStr = typeof codeData === 'string' ? codeData : (codeData?.code || codeData?.nodeId || '');
             
-            // Stop syncing once we found activation
+            // CRITICAL: Don't show activation for:
+            // 1. Hash-only codes (HASH:xxx) — not a real activation code
+            // 2. Nodes with pending_activation status — not yet activated
+            // 3. Nodes that needsCodeRecovery — code not available
+            const isHashOnly = typeof codeStr === 'string' && codeStr.startsWith('HASH:');
+            const isPending = codeData?.status === 'pending_activation';
+            const needsRecovery = codeData?.needsCodeRecovery;
+            
+            if (!isHashOnly && !isPending && !needsRecovery && codeStr) {
+            setActivatedNodeType(nodeType);
+              setActivationCode(codeStr);
+            
+              // Stop syncing once we found valid activation
             if (syncInterval) {
               clearInterval(syncInterval);
               syncInterval = null;
+              }
             }
           }
         } catch (error) {
@@ -936,27 +948,58 @@ const WalletScreen = () => {
           promises.push(loadServerNodeStatus());
         }
         
-        // On-chain verification: confirm activation still exists on current blockchain
-        const qnetAddr = wallet.qnetAddress || wallet.address;
-        promises.push(
-          walletManager.verifyActivationOnChain(qnetAddr).then(async (result) => {
-            if (!result.verified && !result.networkError) {
-              // Double-check with Solana address
-              const solanaCheck = await walletManager.verifyActivationOnChain(wallet.publicKey);
-              if (!solanaCheck.verified && !solanaCheck.networkError) {
-                console.log('[NODE TAB] Activation not verified on-chain — clearing stale state');
-                setActivatedNodeType(null);
-                setActivationCode(null);
-                setNodePseudonym('');
-                setLightNodeStatus(null);
-                setServerNodeStatus(null);
-                await AsyncStorage.removeItem('qnet_last_activated_node');
-                await AsyncStorage.removeItem('qnet_cached_server_status');
-                await AsyncStorage.removeItem('qnet_activation_codes');
+        // On-chain verification: only clear if NO burn evidence exists
+        // "Has activation code" (from Solana burn) != "Node activated on QNet chain"
+        // User may have burned tokens and received code but not yet activated the node
+        AsyncStorage.getItem('qnet_last_activated_node').then(savedStr => {
+          const saved = savedStr ? JSON.parse(savedStr) : {};
+          const currentAddr = wallet.qnetAddress || wallet.address;
+          
+          // CRITICAL: If saved state has no wallet tag or belongs to a different wallet, clear UI
+          if (!saved.walletAddress || saved.walletAddress !== currentAddr) {
+            console.log('[NODE TAB] Saved activation has no wallet tag or belongs to different wallet — clearing UI');
+            setActivatedNodeType(null);
+            setActivationCode(null);
+            setNodePseudonym('');
+            setLightNodeStatus(null);
+            setServerNodeStatus(null);
+            return;
+          }
+          
+          if (!saved.burnTxHash) {
+            // No burn evidence — check if this is truly stale from a previous chain
+            const qnetAddr = wallet.qnetAddress || wallet.address;
+            walletManager.verifyActivationOnChain(qnetAddr).then(async (result) => {
+              if (!result.verified && !result.networkError) {
+                const solanaCheck = await walletManager.verifyActivationOnChain(wallet.publicKey);
+                if (!solanaCheck.verified && !solanaCheck.networkError) {
+                  // Last check: see if Solana has a burn TX
+                  try {
+                    const burnCheck = await walletManager.checkBlockchainForActivations(wallet.publicKey);
+                    if (burnCheck && burnCheck.length > 0) {
+                      console.log('[NODE TAB] No on-chain activation but Solana burn found — keeping code');
+                      return;
+                    }
+                  } catch (e) {
+                    console.log('[NODE TAB] Solana check failed — keeping state');
+                    return;
+                  }
+                  console.log('[NODE TAB] No activation on-chain AND no burn — clearing stale state');
+                  setActivatedNodeType(null);
+                  setActivationCode(null);
+                  setNodePseudonym('');
+                  setLightNodeStatus(null);
+                  setServerNodeStatus(null);
+                  await AsyncStorage.removeItem('qnet_last_activated_node');
+                  await AsyncStorage.removeItem('qnet_cached_server_status');
+                  await AsyncStorage.removeItem('qnet_activation_codes');
+                }
               }
-            }
-          }).catch(() => { /* Network error — keep current state */ })
-        );
+            }).catch(() => { /* Network error — keep current state */ });
+          } else {
+            console.log('[NODE TAB] Burn evidence present — code is valid (node not yet activated on-chain is OK)');
+          }
+        }).catch(() => {});
       }
       
       // Ensure nodeInitializing is cleared even if no nodes found
@@ -1061,10 +1104,16 @@ const WalletScreen = () => {
       const result = await getAllNodesByWallet(walletAddress);
       
       if (result.success) {
-        setAllUserNodes(result.nodes || []);
+        // CRITICAL: Filter out pending_activation nodes — they are NOT real activated nodes
+        // Also filter HASH: codes — these are hash references, not activation codes
+        const realNodes = (result.nodes || []).filter(n => 
+          n.status !== 'pending_activation' && 
+          !(n.activation_code && typeof n.activation_code === 'string' && n.activation_code.startsWith('HASH:'))
+        );
+        setAllUserNodes(realNodes);
         
         // AUTO-LINK: If we found server nodes that aren't activated locally, link them automatically
-        const serverNodes = (result.nodes || []).filter(n => n.node_type !== 'light' && n.status === 'active');
+        const serverNodes = realNodes.filter(n => n.node_type !== 'light' && n.status === 'active');
         
         if (serverNodes.length > 0 && !activatedNodeType) {
           // Priority 1: Check for Genesis nodes first (bootstrap nodes)
@@ -1091,7 +1140,8 @@ const WalletScreen = () => {
               pseudonym: genesisNode.node_id,
               isGenesis: true,
               bootstrapId: bootstrapId,
-              timestamp: Date.now()
+              timestamp: Date.now(),
+              walletAddress: walletAddress
             })).catch(() => {});
             
             // Fetch server status inline (avoids separate render cycle)
@@ -1132,7 +1182,8 @@ const WalletScreen = () => {
               nodeType: serverNode.node_type,
               code: nodeActivationCode,
               pseudonym: serverNode.node_id || serverNode.pseudonym,
-              timestamp: Date.now()
+              timestamp: Date.now(),
+              walletAddress: walletAddress
             })).catch(() => {});
             
             // Fetch server status inline
@@ -1224,7 +1275,8 @@ const WalletScreen = () => {
                     pseudonym: genesisNodeId,
                     isGenesis: true,
                     bootstrapId: bootstrapId,
-                    timestamp: Date.now()
+                    timestamp: Date.now(),
+                    walletAddress: wallet.qnetAddress || wallet.address
                   })).catch(() => {});
                   AsyncStorage.setItem('qnet_cached_server_status', JSON.stringify({
                     ...status,
@@ -1425,7 +1477,8 @@ const WalletScreen = () => {
           pseudonym: `genesis_node_${bootstrapId}`,
           isGenesis: true,
           bootstrapId: bootstrapId,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          walletAddress: wallet.qnetAddress || wallet.address
         }));
         
         // Load server status immediately
@@ -1478,7 +1531,8 @@ const WalletScreen = () => {
           nodeType: nodeType,
           code: code,
           pseudonym: result.pseudonym,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          walletAddress: wallet.qnetAddress || wallet.address
         }));
         
         // Start automatic ping interval (every 4 hours)
@@ -1497,7 +1551,52 @@ const WalletScreen = () => {
         throw new Error(result.error || 'Failed to activate node');
       }
     } catch (error) {
-      showAlert('Activation Failed', error.message || 'Unable to activate node. Please check your code and try again.');
+      const msg = (error.message || '').toLowerCase();
+      
+      // User-friendly error messages for known activation failures
+      // PRIORITY: "wrong wallet" checks FIRST — catches all variations including wrapped Dilithium3 errors
+      if (msg.includes('belongs to different wallet') || 
+          msg.includes('invalid activation code') ||
+          msg.includes('code belongs') ||
+          msg.includes('not found or does not match')) {
+        showAlert(
+          'Code Mismatch',
+          'This activation code does not belong to this wallet.\n\n' +
+          'Each activation code is cryptographically bound to the wallet that burned 1DEV tokens. ' +
+          'You can only activate a node using the same wallet that received the code.\n\n' +
+          'If you lost access to the original wallet, you will need to burn tokens again from this wallet to get a new code.'
+        );
+      } else if (msg.includes('invalid') && msg.includes('format')) {
+        showAlert(
+          'Invalid Code Format',
+          'The activation code format is incorrect.\n\nExpected format: QNET-XXXXXX-XXXXXX-XXXXXX\n\nPlease check your code and try again.'
+        );
+      } else if (msg.includes('already registered') || msg.includes('already activated') || msg.includes('already exists')) {
+        showAlert(
+          'Already Activated',
+          'This activation code has already been used to register a node.\n\nEach code can only be used once.'
+        );
+      } else if (msg.includes('expired') || msg.includes('expir')) {
+        showAlert(
+          'Code Expired',
+          'This activation code has expired.\n\nPlease burn tokens again to obtain a new activation code.'
+        );
+      } else if (msg.includes('network') || msg.includes('timeout') || msg.includes('fetch') || msg.includes('econnrefused')) {
+        showAlert(
+          'Network Error',
+          'Could not connect to the QNet network.\n\nPlease check your internet connection and try again.'
+        );
+      } else if (msg.includes('dilithium') || msg.includes('quantum signature') || msg.includes('signature')) {
+        showAlert(
+          'Signature Error',
+          'Failed to create quantum-secure signature for node registration.\n\nPlease try again. If the problem persists, restart the app.'
+        );
+      } else {
+        showAlert(
+          'Activation Failed',
+          error.message || 'Unable to activate node. Please check your code and try again.'
+        );
+      }
     } finally {
       setNodeActivating(false);
     }
@@ -2081,60 +2180,53 @@ const WalletScreen = () => {
     const checkActivationStatus = async () => {
       if (wallet && wallet.address && password) {
         try {
+          // Priority 1: Check qnet_last_activated_node (includes burn evidence)
+          // CRITICAL: Must verify the saved state belongs to THIS wallet, not a different one
+          const currentAddr = wallet.qnetAddress || wallet.address;
+          const savedState = await AsyncStorage.getItem('qnet_last_activated_node');
+          if (savedState) {
+            const state = JSON.parse(savedState);
+            if (state.nodeType && state.code) {
+              // Verify wallet ownership — saved data must belong to current wallet
+              // If walletAddress is missing (old data) or doesn't match — don't trust it
+              if (!state.walletAddress || state.walletAddress !== currentAddr) {
+                console.log('[checkActivationStatus] Saved activation has no wallet tag or belongs to different wallet, ignoring');
+                // Don't load — user can recover via "Recover My Code"
+              } else {
+                setActivatedNodeType(state.nodeType);
+                setActivationCode(state.code);
+                if (state.pseudonym) setNodePseudonym(state.pseudonym);
+                return; // Trust saved state — it includes burnTxHash evidence
+              }
+            }
+          }
+          
+          // Priority 2: Check encrypted stored codes
           const storedCodes = await walletManager.getStoredActivationCodes(password);
           if (storedCodes && Object.keys(storedCodes).length > 0) {
-            // Verify the code belongs to current wallet
-            // Generate the expected code for this wallet to verify
             const nodeType = Object.keys(storedCodes)[0];
             const code = storedCodes[nodeType];
+            const codeStr = code?.code || (typeof code === 'string' ? code : '');
             
-            // Verify code is for current wallet by checking if it's the expected format
-            // and was generated from current wallet's seed
-            // Verify code asynchronously
-            if (password) {
-              walletManager.getEncryptedMnemonic(password).then(mnemonic => {
-                if (mnemonic) {
-                  const expectedCode = walletManager.generateActivationCode(nodeType, wallet.address, mnemonic);
-                  if (code && code.code && code.code === expectedCode) {
+            if (codeStr) {
                     setActivatedNodeType(nodeType);
-                    setActivationCode(code.code);
-                    // Save to AsyncStorage for quick restore
-                    AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-                      nodeType: nodeType,
-                      code: code.code,
-                      timestamp: Date.now()
-                    }));
-                    // Start ping interval for active node
-                    // No automatic ping interval
-                  } else {
-                    // Code doesn't match current wallet, clear it
-                    setActivatedNodeType(null);
-                    setActivationCode(null);
-                  }
-                }
-              });
-            } else {
-              // If we can't verify, show the code (backward compatibility)
-              setActivatedNodeType(nodeType);
-              setActivationCode(code.code || code);
-              // Start ping interval for active node
-              // No automatic ping interval
+              setActivationCode(codeStr);
+              // Re-persist to qnet_last_activated_node for consistency
+              await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                nodeType, code: codeStr, timestamp: Date.now(),
+                burnTxHash: code?.burnTxHash || 'stored',
+                walletAddress: currentAddr
+              }));
+              return;
             }
-          } else {
-            // No codes found, ensure state is cleared
-            setActivatedNodeType(null);
-            setActivationCode(null);
           }
+          
+          // No activation data found — state stays as-is (don't forcefully clear)
+          // Other mechanisms (wallet unlock verify) will handle truly stale data
         } catch (error) {
-          // console.error('Error checking activation status:', error);
-          // On error, clear activation status
-          setActivatedNodeType(null);
-          setActivationCode(null);
+          // On error, don't clear — keep current state to avoid data loss
+          console.log('[checkActivationStatus] Error, keeping current state:', error.message);
         }
-      } else {
-        // No wallet or password, clear activation status
-        setActivatedNodeType(null);
-        setActivationCode(null);
       }
     };
     
@@ -2160,9 +2252,15 @@ const WalletScreen = () => {
           
           if (syncedCodes && Object.keys(syncedCodes).length > 0) {
             const nodeType = Object.keys(syncedCodes)[0];
-            const code = syncedCodes[nodeType];
+            const codeData = syncedCodes[nodeType];
+            const codeStr = typeof codeData === 'string' ? codeData : (codeData?.code || '');
+            const isHashOnly = typeof codeStr === 'string' && codeStr.startsWith('HASH:');
+            const isPending = codeData?.status === 'pending_activation';
+            
+            if (!isHashOnly && !isPending && codeStr) {
             setActivatedNodeType(nodeType);
-            setActivationCode(code.code || code);
+              setActivationCode(codeStr);
+            }
           }
         } catch (error) {
           // Silent fail - don't interrupt user
@@ -2401,24 +2499,31 @@ const WalletScreen = () => {
             );
             if (syncedCodes && Object.keys(syncedCodes).length > 0) {
               const nodeType = Object.keys(syncedCodes)[0];
-              const code = syncedCodes[nodeType];
+              const codeData = syncedCodes[nodeType];
+              const codeStr = typeof codeData === 'string' ? codeData : (codeData?.code || '');
+              const isHashOnly = typeof codeStr === 'string' && codeStr.startsWith('HASH:');
+              const isPending = codeData?.status === 'pending_activation';
+              
+              if (!isHashOnly && !isPending && codeStr) {
               setActivatedNodeType(nodeType);
-              setActivationCode(code.code || code);
+              setActivationCode(codeStr);
               
               // Regenerate pseudonym for imported wallet (deterministic based on wallet address)
               const regeneratedPseudonym = await walletManager.generateLightNodePseudonym(imported.address);
               setNodePseudonym(regeneratedPseudonym);
               
               // Save regenerated pseudonym to AsyncStorage
-              await AsyncStorage.setItem(`node_pseudonym_${code.code || code}`, regeneratedPseudonym);
+              await AsyncStorage.setItem(`node_pseudonym_${codeStr}`, regeneratedPseudonym);
               
               // Save to AsyncStorage for persistence across app restarts
               await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
                 nodeType: nodeType,
-                code: code.code || code,
+                code: codeStr,
                 pseudonym: regeneratedPseudonym,
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                walletAddress: imported.qnetAddress || imported.address
               }));
+              } // end if (!isHashOnly && !isPending)
             }
           }
         } catch (error) {
@@ -2545,7 +2650,14 @@ const WalletScreen = () => {
         if (savedState) {
           try {
             const state = JSON.parse(savedState);
-            if (state.nodeType && state.code) {
+            const currentWalletAddr = loadedWallet.qnetAddress || loadedWallet.address;
+            
+            // CRITICAL: Verify saved state belongs to THIS wallet
+            // If walletAddress is missing (old data) or doesn't match — don't trust it
+            if (!state.walletAddress || state.walletAddress !== currentWalletAddr) {
+              console.log('[UNLOCK] Saved activation has no wallet tag or belongs to different wallet, skipping');
+              // Don't load stale data — user can recover via "Recover My Code"
+            } else if (state.nodeType && state.code) {
               // Show cached state immediately for UX (will be verified below)
               setActivatedNodeType(state.nodeType);
               setActivationCode(state.code);
@@ -2570,29 +2682,49 @@ const WalletScreen = () => {
                 }
               }
               
-              // CRITICAL: Background on-chain verification
-              // If node is not found on current blockchain, clear stale cache
-              const qnetAddr = loadedWallet.qnetAddress || loadedWallet.address;
-              walletManager.verifyActivationOnChain(qnetAddr).then(async (result) => {
-                if (!result.verified && !result.networkError) {
-                  // Double-check with Solana address (Phase 1 activations use Solana addr)
-                  const solanaCheck = await walletManager.verifyActivationOnChain(loadedWallet.publicKey);
-                  if (!solanaCheck.verified && !solanaCheck.networkError) {
-                    console.log('[VERIFY] Activation not found on current blockchain — clearing stale cache');
-                    setActivatedNodeType(null);
-                    setActivationCode(null);
-                    setNodePseudonym('');
-                    setServerNodeStatus(null);
-                    await AsyncStorage.removeItem('qnet_last_activated_node');
-                    await AsyncStorage.removeItem('qnet_cached_server_status');
-                    await AsyncStorage.removeItem('qnet_activation_codes');
-                    await AsyncStorage.removeItem('qnet_activation_meta_light');
-                    await AsyncStorage.removeItem('qnet_activation_meta_super');
+              // Background on-chain verification
+              // Only clear stale cache if there's NO burn evidence (burnTxHash).
+              // If user burned tokens but hasn't activated node yet, keep the code!
+              // "Has code" != "Node activated on-chain" — these are separate states.
+              const hasBurnEvidence = !!state.burnTxHash;
+              
+              if (!hasBurnEvidence) {
+                // No burn TX hash saved — this might be truly stale from a previous chain
+                const qnetAddr = loadedWallet.qnetAddress || loadedWallet.address;
+                walletManager.verifyActivationOnChain(qnetAddr).then(async (result) => {
+                  if (!result.verified && !result.networkError) {
+                    const solanaCheck = await walletManager.verifyActivationOnChain(loadedWallet.publicKey);
+                    if (!solanaCheck.verified && !solanaCheck.networkError) {
+                      // Last resort: check Solana for any burn TX before clearing
+                      try {
+                        const burnCheck = await walletManager.checkBlockchainForActivations(loadedWallet.publicKey);
+                        if (burnCheck && burnCheck.length > 0) {
+                          console.log('[VERIFY] No on-chain activation but Solana burn found — keeping code');
+                          return; // Keep the code, user burned but hasn't activated yet
+                        }
+                      } catch (e) {
+                        // If Solana check fails, keep state to be safe
+                        console.log('[VERIFY] Solana check failed — keeping cached state');
+                        return;
+                      }
+                      console.log('[VERIFY] No activation on-chain AND no Solana burn — clearing stale cache');
+                      setActivatedNodeType(null);
+                      setActivationCode(null);
+                      setNodePseudonym('');
+                      setServerNodeStatus(null);
+                      await AsyncStorage.removeItem('qnet_last_activated_node');
+                      await AsyncStorage.removeItem('qnet_cached_server_status');
+                      await AsyncStorage.removeItem('qnet_activation_codes');
+                      await AsyncStorage.removeItem('qnet_activation_meta_light');
+                      await AsyncStorage.removeItem('qnet_activation_meta_super');
+                    }
                   }
-                }
-              }).catch(() => {
-                // Network error — keep cached state, will retry next time
-              });
+                }).catch(() => {
+                  // Network error — keep cached state, will retry next time
+                });
+              } else {
+                console.log('[VERIFY] Burn TX evidence found — keeping activation code (not yet activated on-chain is OK)');
+              }
             }
           } catch (e) {
             // Silent fail
@@ -2612,22 +2744,34 @@ const WalletScreen = () => {
         ).then(async syncedCodes => {
           if (syncedCodes && Object.keys(syncedCodes).length > 0) {
             const nodeType = Object.keys(syncedCodes)[0];
-            const code = syncedCodes[nodeType];
+            const codeData = syncedCodes[nodeType];
+            const codeStr = typeof codeData === 'string' ? codeData : (codeData?.code || '');
+            const isHashOnly = typeof codeStr === 'string' && codeStr.startsWith('HASH:');
+            const isPending = codeData?.status === 'pending_activation';
+            
+            if (isHashOnly || isPending || !codeStr) {
+              console.log('[SYNC] Skipping hash-only or pending activation code');
+              return;
+            }
+            
+            const code = codeData;
             setActivatedNodeType(nodeType);
-            setActivationCode(code.code || code);
+            setActivationCode(codeStr);
             
             // Try to load pseudonym
-            const savedPseudonym = await AsyncStorage.getItem(`node_pseudonym_${code.code || code}`);
+            const savedPseudonym = await AsyncStorage.getItem(`node_pseudonym_${codeStr}`);
             if (savedPseudonym) {
               setNodePseudonym(savedPseudonym);
             }
             
-            // Save to AsyncStorage for quick restore
+            // Save to AsyncStorage for quick restore (include burnTxHash to prevent clearing)
             await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
               nodeType: nodeType,
-              code: code.code || code,
+              code: codeStr,
               pseudonym: savedPseudonym || undefined,
-              timestamp: Date.now()
+              timestamp: Date.now(),
+              burnTxHash: codeData?.burnTxHash || 'synced',
+              walletAddress: loadedWallet.qnetAddress || loadedWallet.address
             }));
           }
         }).catch(() => {
@@ -4699,7 +4843,8 @@ const WalletScreen = () => {
                               code: code,
                               pseudonym: burnPseudonym,
                               timestamp: Date.now(),
-                              burnTxHash: result.signature
+                              burnTxHash: result.signature,
+                              walletAddress: wallet.qnetAddress || wallet.address
                             })).catch(() => {});
                             AsyncStorage.setItem(`node_pseudonym_${code}`, burnPseudonym).catch(() => {});
                             
@@ -4833,36 +4978,28 @@ const WalletScreen = () => {
                   
                   setActivatingNode(true);
                   try {
-                    // Step 0: On-chain verification — ensure activation exists on CURRENT blockchain
-                    // Prevents stale cache from showing phantom activations after network restart
-                    const qnetAddr = wallet.qnetAddress || wallet.address;
-                    const onChainCheck = await walletManager.verifyActivationOnChain(qnetAddr);
-                    
-                    // Also try Solana address if different (Phase 1 activations)
-                    let onChainVerified = onChainCheck.verified;
-                    if (!onChainVerified && wallet.publicKey && wallet.publicKey !== qnetAddr) {
-                      const solanaCheck = await walletManager.verifyActivationOnChain(wallet.publicKey);
-                      onChainVerified = solanaCheck.verified;
-                    }
-
-                    // Step 1: Check local storage — but ONLY if on-chain verification passed
+                    // Step 1: Check local storage first (fastest path)
+                    // Don't gate on on-chain verification — user may have a code from burn
+                    // but hasn't activated the node on QNet chain yet
                     const localCodes = await walletManager.getStoredActivationCodes(password);
                     if (localCodes && Object.keys(localCodes).length > 0) {
-                      if (onChainVerified) {
-                        const firstType = Object.keys(localCodes)[0];
-                        const firstCode = localCodes[firstType];
+                      const firstType = Object.keys(localCodes)[0];
+                      const firstCode = localCodes[firstType];
+                      const codeStr = typeof firstCode === 'string' ? firstCode : firstCode?.code || '';
+                      if (codeStr) {
                         setActivatedNodeType(firstType);
-                        setActivationCode(typeof firstCode === 'string' ? firstCode : firstCode?.code || '');
+                        setActivationCode(codeStr);
+                        
+                        // Re-persist to ensure qnet_last_activated_node is set
+                        const pseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
+                        await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                          nodeType: firstType, code: codeStr, pseudonym, timestamp: Date.now(),
+                          burnTxHash: firstCode?.burnTxHash || 'recovered',
+                          walletAddress: wallet.qnetAddress || wallet.address
+                        }));
+                        
                         showAlert('Code Found', `Your ${firstType} node activation code was found in local storage.`);
                         return;
-                      } else if (!onChainCheck.networkError) {
-                        // On-chain says no activation — clear stale local cache
-                        console.log('[Recovery] Clearing stale local activation cache (not found on-chain)');
-                        await AsyncStorage.removeItem('qnet_activation_codes');
-                        await AsyncStorage.removeItem('qnet_last_activated_node');
-                        await AsyncStorage.removeItem('qnet_activation_meta_light');
-                        await AsyncStorage.removeItem('qnet_activation_meta_super');
-                        // Fall through to check Solana burn
                       }
                     }
 
@@ -4884,11 +5021,13 @@ const WalletScreen = () => {
                           setActivatedNodeType(nodeType);
                           setActivationCode(code);
                           
-                          // Persist locally
-                          await walletManager.storeActivationCode(code, nodeType, password, { recovered: true });
+                          // Persist locally with burnTxHash to prevent background clearing
+                          await walletManager.storeActivationCode(code, nodeType, password, { recovered: true, burnTxHash: meta.burnTxHash });
                           const pseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
                           AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-                            nodeType, code, pseudonym, timestamp: Date.now()
+                            nodeType, code, pseudonym, timestamp: Date.now(),
+                            burnTxHash: meta.burnTxHash,
+                            walletAddress: wallet.qnetAddress || wallet.address
                           })).catch(() => {});
                           
                           showAlert('Code Recovered', `Your ${nodeType} node activation code has been recovered securely.`);
@@ -4904,13 +5043,17 @@ const WalletScreen = () => {
                       const value = syncResult[firstType];
                       const code = typeof value === 'string' ? value : value?.code || '';
                       
-                      if (code && !value?.needsCodeRecovery) {
+                      const isHash = typeof code === 'string' && code.startsWith('HASH:');
+                      const isPend = value?.status === 'pending_activation';
+                      if (code && !value?.needsCodeRecovery && !isHash && !isPend) {
                         setActivatedNodeType(firstType);
                         setActivationCode(code);
                         
                         const pseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
                         AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-                          nodeType: firstType, code, pseudonym, timestamp: Date.now()
+                          nodeType: firstType, code, pseudonym, timestamp: Date.now(),
+                          burnTxHash: value?.burnTxHash || 'synced',
+                          walletAddress: wallet.qnetAddress || wallet.address
                         })).catch(() => {});
                         
                         showAlert('Code Recovered', `Your ${firstType} node activation code has been recovered.`);

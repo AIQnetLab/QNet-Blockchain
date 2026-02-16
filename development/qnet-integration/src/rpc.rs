@@ -9092,33 +9092,17 @@ async fn handle_activations_by_wallet(
         }
         
         if nodes.is_empty() {
-            // No nodes in reward manager - check activation registry for pending activations
-            let registry = &*GLOBAL_ACTIVATION_REGISTRY;
-            match registry.check_wallet_has_any_node(&wallet_address).await {
-                Ok(Some((existing_type, code_or_id))) => {
-                    let response = json!({
-                        "success": true,
-                        "wallet_address": wallet_address,
-                        "nodes": [{
-                            "node_type": existing_type,
-                            "activation_code": code_or_id,
-                            "node_id": null,
-                            "pending_rewards": 0,
-                            "status": "pending_activation"
-                        }]
-                    });
-                    return Ok(warp::reply::json(&response));
-                }
-                _ => {
-                    let response = json!({
-                        "success": true,
-                        "wallet_address": wallet_address,
-                        "nodes": [],
-                        "message": "No nodes found for this wallet"
-                    });
-                    return Ok(warp::reply::json(&response));
-                }
-            }
+            // v4.2: DO NOT return pending_activation records as nodes!
+            // pending_activation means code was generated but node NOT yet activated.
+            // Returning this caused mobile app to show "Activated" for non-existent nodes.
+            // Only return truly registered/active nodes from blockchain storage + reward manager.
+            let response = json!({
+                "success": true,
+                "wallet_address": wallet_address,
+                "nodes": [],
+                "message": "No active nodes found for this wallet"
+            });
+            return Ok(warp::reply::json(&response));
         }
         
         // v3.1: Get active nodes to determine REAL online status

@@ -140,7 +140,7 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
       throw new Error(result.error || 'Registration failed');
     }
   } catch (error) {
-    console.error('[Push] ❌ Registration failed:', error);
+    console.warn('[Push] Registration failed:', error.message || error);
     throw error;
   }
 }
@@ -221,7 +221,7 @@ async function setupPollingService(nodeId, nextPingTime) {
 
     console.log('[Polling] ✅ Scheduled precise wake-up for ping');
   } catch (error) {
-    console.error('[Polling] ❌ Failed to setup background fetch:', error);
+    console.warn('[Polling] Failed to setup background fetch:', error.message || error);
   }
 }
 
@@ -260,7 +260,7 @@ export async function checkPendingChallenge() {
 
     return null;
   } catch (error) {
-    console.error('[Polling] ❌ Check failed:', error);
+    console.warn('[Polling] Check failed:', error.message || error);
     return null;
   }
 }
@@ -294,7 +294,7 @@ export async function getNextPingTime() {
 
     return null;
   } catch (error) {
-    console.error('[Push] ❌ Failed to get next ping time:', error);
+    console.warn('[Push] Failed to get next ping time:', error.message || error);
     return null;
   }
 }
@@ -309,21 +309,21 @@ export async function respondToChallenge(nodeId, challenge) {
 
     const passwordHash = await AsyncStorage.getItem('qnet_password_hash');
     if (!passwordHash) {
-      console.error('[Push] No password hash');
+      console.warn('[Push] No password hash');
       return false;
     }
 
     // MANDATORY: Dilithium3 signature for ping response
     const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
     if (!isDilithiumAvailable()) {
-      console.error('[Push] Dilithium3 module required for ping');
+      console.warn('[Push] Dilithium3 module required for ping');
       return false;
     }
 
     const activationState = await AsyncStorage.getItem('qnet_last_activated_node');
     const activationCode = activationState ? JSON.parse(activationState).code : null;
     if (!activationCode) {
-      console.error('[Push] No activation code found for ping');
+      console.warn('[Push] No activation code found for ping');
       return false;
     }
 
@@ -347,11 +347,11 @@ export async function respondToChallenge(nodeId, challenge) {
       
       return true;
     } else {
-      console.error('[Push] ❌ Ping response failed:', result.error);
+      console.warn('[Push] Ping response failed:', result.error);
       return false;
     }
   } catch (error) {
-    console.error('[Push] ❌ Error responding to challenge:', error);
+    console.warn('[Push] Error responding to challenge:', error.message || error);
     return false;
   }
 }
@@ -428,7 +428,7 @@ export async function checkNodeStatus() {
 
     return { registered: false, error: result.error };
   } catch (error) {
-    console.error('[Push] ❌ Status check failed:', error);
+    console.warn('[Push] Status check failed:', error.message || error);
     return { registered: false, error: error.message };
   }
 }
@@ -444,7 +444,7 @@ export async function reactivateNode() {
 
     const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
     if (!nodeInfoStr) {
-      console.error('[Push] No node to reactivate');
+      console.warn('[Push] No node to reactivate');
       return { success: false, error: 'Node not registered' };
     }
 
@@ -524,7 +524,7 @@ export async function reactivateNode() {
 
     return { success: false, error: result.error };
   } catch (error) {
-    console.error('[Push] ❌ Reactivation failed:', error);
+    console.warn('[Push] Reactivation failed:', error.message || error);
     return { success: false, error: error.message };
   }
 }
@@ -682,11 +682,17 @@ export async function getAllNodesByWallet(walletAddress) {
     const result = await response.json();
     
     if (result.success && result.nodes) {
-      console.log(`[Nodes] Found ${result.nodes.length} nodes for wallet`);
+      // CRITICAL: Filter out pending_activation and HASH-only entries
+      // These are NOT real activated nodes — just code generation records
+      const realNodes = result.nodes.filter(n => 
+        n.status !== 'pending_activation' && 
+        !(n.activation_code && typeof n.activation_code === 'string' && n.activation_code.startsWith('HASH:'))
+      );
+      console.log(`[Nodes] Found ${realNodes.length} real nodes for wallet (${result.nodes.length} total incl pending)`);
       return {
         success: true,
-        nodes: result.nodes,
-        totalNodes: result.total_nodes || result.nodes.length
+        nodes: realNodes,
+        totalNodes: realNodes.length
       };
     }
     
