@@ -1950,18 +1950,24 @@ impl BlockchainActivationRegistry {
                 Ok(tx_bytes) => {
                     // v2.26: Direct access - SimpleMempool is already thread-safe
                     // Use transaction.hash which was calculated via canonical_bytes()
-                    if mempool_arc.add_binary_transaction(tx_bytes, transaction.hash.clone(), transaction.gas_price) {
-                        println!("[REGISTRY] ✅ Activation transaction added to mempool: {}", &transaction.hash[..16.min(transaction.hash.len())]);
+                    if mempool_arc.add_binary_transaction(tx_bytes.clone(), transaction.hash.clone(), transaction.gas_price) {
+                        println!("[INFO][REGISTRY] activation_tx_added hash={}", &transaction.hash[..16.min(transaction.hash.len())]);
+                        // v4.3: Broadcast to ALL peers so ANY producer can include in next block
+                        // Without this, TX stays only in local mempool until this node produces a block
+                        if let Some(p2p) = crate::node::try_get_p2p() {
+                            let _ = p2p.broadcast_transaction(tx_bytes);
+                            println!("[INFO][REGISTRY] activation_tx_broadcast hash={}", &transaction.hash[..16.min(transaction.hash.len())]);
+                        }
                     } else {
-                        println!("[REGISTRY] ⚠️ Failed to add activation transaction to mempool (may be full or duplicate)");
+                        println!("[WARN][REGISTRY] activation_tx_skip hash={} reason=duplicate_or_full", &transaction.hash[..16.min(transaction.hash.len())]);
                     }
                 }
                 Err(e) => {
-                    println!("[REGISTRY] ❌ Failed to serialize activation transaction: {}", e);
+                    println!("[WARN][REGISTRY] activation_tx_serialize_err err={}", e);
                 }
             }
         } else {
-            println!("[REGISTRY] ⚠️ Global mempool not initialized yet");
+            println!("[WARN][REGISTRY] activation_tx_no_mempool reason=not_initialized");
         }
         
         // Also store in transaction_pool for backward compatibility and quick lookup

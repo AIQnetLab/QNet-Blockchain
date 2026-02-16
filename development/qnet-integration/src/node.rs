@@ -837,6 +837,26 @@ pub fn try_get_mempool() -> Option<&'static Arc<qnet_mempool::SimpleMempool>> {
     GLOBAL_MEMPOOL_INSTANCE.get()
 }
 
+/// v4.3: Global P2P instance — for broadcasting TX from activation_validation.rs
+/// Without this, NodeActivation TX stays in local mempool and is only included
+/// when this specific node becomes block producer.
+pub static GLOBAL_P2P_INSTANCE: OnceCell<Arc<crate::unified_p2p::SimplifiedP2P>> = OnceCell::const_new();
+
+/// Initialize global P2P (call once during node startup, after P2P is ready)
+pub fn init_global_p2p(p2p: Arc<crate::unified_p2p::SimplifiedP2P>) {
+    if GLOBAL_P2P_INSTANCE.set(p2p).is_err() {
+        if is_warn() { println!("[WARN][P2P] global_p2p_already_initialized"); }
+    } else {
+        if is_info() { println!("[INFO][P2P] global_p2p_init_complete"); }
+    }
+}
+
+/// Try to get reference to global P2P (returns None if not initialized)
+#[inline]
+pub fn try_get_p2p() -> Option<&'static Arc<crate::unified_p2p::SimplifiedP2P>> {
+    GLOBAL_P2P_INSTANCE.get()
+}
+
 // CRITICAL: Track certificate requests to prevent DDoS (request flooding)
 // Maps certificate_serial -> last_request_timestamp
 // v2.96: Using DashMap for lock-free operations
@@ -5549,6 +5569,11 @@ impl BlockchainNode {
             vrf_instance: None,
         };
         
+        // v4.3: Initialize global P2P instance for TX broadcast from activation_validation.rs
+        if let Some(ref p2p) = blockchain.unified_p2p {
+            init_global_p2p(p2p.clone());
+        }
+        
         // PRODUCTION v4.0: Initialize WalletIdentity from QNET_WALLET_SEED
         if let Ok(wallet_seed) = std::env::var("QNET_WALLET_SEED") {
             match blockchain.initialize_wallet_identity(&wallet_seed) {
@@ -5591,6 +5616,21 @@ impl BlockchainNode {
             Ok(count) if count > 0 => println!("[INFO][NODE] wallet_reverse_index_migrated entries={}", count),
             Ok(_) => {} // No migration needed
             Err(e) => println!("[WARN][NODE] wallet_index_backfill err={}", e),
+        }
+        
+        // v4.3: Restore P2P light node registry from blockchain storage (RocksDB)
+        // CRITICAL: Without this, all in-memory registries are empty after restart.
+        // Light nodes would be invisible for pinging until they re-register via mobile app.
+        // This ensures data consistency: blockchain state = source of truth for "node exists".
+        if let Some(ref p2p) = blockchain.unified_p2p {
+            match blockchain.storage.load_all_node_registrations() {
+                Ok(nodes) if !nodes.is_empty() => {
+                    let restored = p2p.restore_light_nodes_from_storage(nodes);
+                    println!("[INFO][NODE] p2p_registry_restored from_storage={}", restored);
+                }
+                Ok(_) => println!("[INFO][NODE] p2p_registry_restore no_nodes_in_storage"),
+                Err(e) => println!("[WARN][NODE] p2p_registry_restore err={}", e),
+            }
         }
         
         // CRITICAL: Link deterministic reputation to P2P for unified access

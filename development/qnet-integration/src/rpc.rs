@@ -5435,6 +5435,13 @@ struct PendingChallenge {
 }
 
 lazy_static::lazy_static! {
+    /// LOCAL OPERATIONAL CACHE — NOT source of truth for "node exists" queries!
+    /// Source of truth = RocksDB (blockchain state from NodeRegistration TX).
+    /// This cache stores device-specific data (device_token, push settings) for API-registered
+    /// light nodes. It is populated on direct API calls only, NOT from gossip/blockchain.
+    /// The P2P registry (unified_p2p::light_node_registry) is the authoritative in-memory
+    /// registry for light node liveness/connectivity, synchronized via gossip + restored from
+    /// RocksDB on startup (v4.3). This Mutex cache manages per-device state only.
     static ref LIGHT_NODE_REGISTRY: Mutex<HashMap<String, LightNodeInfo>> = Mutex::new(HashMap::new());
     
     /// Pending challenges for polling-based Light nodes
@@ -5442,8 +5449,12 @@ lazy_static::lazy_static! {
     /// Cleaned up automatically when challenge expires or is answered
     static ref PENDING_CHALLENGES: Mutex<HashMap<String, PendingChallenge>> = Mutex::new(HashMap::new());
     
-    // OPTIMIZATION: Global registry singleton to avoid creating new instance on every P2P message
-    // This reduces latency from 600-2000ms to <10ms for IP->pseudonym lookups
+    /// TEMPORARY IN-MEMORY CACHE for activation codes (wallet → code mapping).
+    /// NOT persisted across restarts. NOT replicated between nodes.
+    /// Used only during the window between code generation and node registration.
+    /// Code ownership verification (verify_code_ownership) works by decrypting the code
+    /// itself (XOR-encrypted wallet address) — does NOT depend on this registry.
+    /// v4.2: No longer returned by /activations/by-wallet — only blockchain state is returned.
     static ref GLOBAL_ACTIVATION_REGISTRY: Arc<crate::activation_validation::BlockchainActivationRegistry> = 
         Arc::new(crate::activation_validation::BlockchainActivationRegistry::new(None));
     
@@ -5713,7 +5724,8 @@ async fn handle_light_node_register(
         p2p.register_light_node(registration);
         println!("[INFO][GOSSIP] light_node_gossiped pseudonym={} push={}", light_node_pseudonym, push_type_str);
         
-        // v2.71: Create ON-CHAIN NodeRegistration TX for Light nodes (only for NEW nodes)
+        // v4.3: Create ON-CHAIN NodeRegistration TX for Light nodes (only for NEW nodes)
+        // + broadcast to all peers for faster inclusion in next block
         if registration_result == "node_created" {
             let device_sig_hash = blake3::hash(register_request.device_id.as_bytes()).to_hex().to_string();
             let registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
@@ -5727,11 +5739,15 @@ async fn handle_light_node_register(
             let mempool = blockchain.get_mempool();
             let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
             let tx_hash = registration_tx.hash.clone();
-            if mempool.add_binary_transaction(tx_bytes, tx_hash.clone(), 0) {
+            if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
                 println!("[INFO][REG] light_onchain_tx node={} wallet={}... hash={}...", 
                          light_node_pseudonym, 
                          &register_request.wallet_address[..16.min(register_request.wallet_address.len())],
                          &tx_hash[..16.min(tx_hash.len())]);
+                // Broadcast to ALL peers so ANY producer includes it in next block
+                if let Some(ref p2p_ref) = blockchain.get_unified_p2p() {
+                    let _ = p2p_ref.broadcast_transaction(tx_bytes);
+                }
             } else {
                 eprintln!("[WARN][REG] light_onchain_tx_failed node={}", light_node_pseudonym);
             }
@@ -6081,16 +6097,35 @@ async fn handle_light_node_ping_response(
         let reward_manager_arc = blockchain.get_reward_manager();
         let mut reward_manager = reward_manager_arc.write().await;
         
-        // Get wallet address from registry
+        // v4.3: Get wallet address — try P2P registry first (authoritative, gossip-synced),
+        // fall back to local LIGHT_NODE_REGISTRY (device cache), then RocksDB (blockchain state)
         let wallet_address = {
-            let registry = match LIGHT_NODE_REGISTRY.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some(light_node) = registry.get(&node_id) {
-                light_node.devices.first().map(|d| d.wallet_address.clone())
+            // Level 1: P2P registry (gossip-synced + restored from RocksDB on startup)
+            let from_p2p = blockchain.get_unified_p2p()
+                .and_then(|p2p| {
+                    let registry = p2p.get_light_node_registry();
+                    registry.get(&node_id).map(|r| r.wallet_address.clone())
+                });
+            
+            if let Some(addr) = from_p2p {
+                Some(addr)
             } else {
-                None
+                // Level 2: Local device cache (populated on direct API calls only)
+                let from_local = {
+                    let registry = match LIGHT_NODE_REGISTRY.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    registry.get(&node_id)
+                        .and_then(|n| n.devices.first().map(|d| d.wallet_address.clone()))
+                };
+                
+                if from_local.is_some() {
+                    from_local
+                } else {
+                    // Level 3: RocksDB reverse index (blockchain state — ultimate source of truth)
+                    None // Handled by fallback below (generate EON address)
+                }
             }
         };
         
@@ -8706,8 +8741,21 @@ async fn handle_register_node(
                 })));
             }
             Err(e) => {
-                // Genesis/bootstrap codes may not be in registry — allow
-                println!("[INFO][REGISTER] code_check_skip reason={}", e);
+                // v4.3 SECURITY: Only allow skip for Genesis bootstrap codes
+                // After restart, GLOBAL_ACTIVATION_REGISTRY is empty — Err is expected for any code.
+                // Without this check, ANYONE could register with ANY code after a restart.
+                let is_genesis_code = activation_code.starts_with("QNET-BOOT-") 
+                    && activation_code.ends_with("-STRAP");
+                if is_genesis_code {
+                    println!("[INFO][REGISTER] genesis_code_bypass code={}...", &activation_code[..16.min(activation_code.len())]);
+                } else {
+                    println!("[WARN][REGISTER] code_verify_err wallet={} err={}", wallet_address, e);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Activation code verification failed. Registry may be restarting — retry in 30s.",
+                        "details": e.to_string()
+                    })));
+                }
             }
         }
     }
@@ -8801,6 +8849,36 @@ async fn handle_register_node(
             // Trigger active node announcement (ASYNC - proper Dilithium signature)
             p2p.register_as_active_node_async().await;
             println!("[INFO][REGISTER] p2p_announce type={}", node_type);
+        }
+    }
+    
+    // v4.3 CRITICAL: Create ON-CHAIN NodeRegistration TX to propagate to ALL nodes.
+    // Previously this endpoint only saved to local RocksDB + RewardManager,
+    // meaning other genesis nodes never received the registration data.
+    // The TX goes through mempool → block production → replicated to all nodes.
+    // Additionally, broadcast TX to all peers' mempools for faster inclusion.
+    {
+        let registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
+            &node_id,
+            if node_type == "super" { qnet_state::NodeType::Super } else { qnet_state::NodeType::Light },
+            wallet_address,
+            &format!("activation_{}", &activation_code[..16.min(activation_code.len())]),
+        );
+        
+        let mempool = blockchain.get_mempool();
+        let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
+        let tx_hash = registration_tx.hash.clone();
+        if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
+            println!("[INFO][REG] onchain_tx type={} node={} wallet={}... hash={}...", 
+                     node_type, node_id,
+                     &wallet_address[..16.min(wallet_address.len())],
+                     &tx_hash[..16.min(tx_hash.len())]);
+            // Broadcast to all peers so ANY producer can include it in next block
+            if let Some(p2p) = blockchain.get_unified_p2p() {
+                let _ = p2p.broadcast_transaction(tx_bytes);
+            }
+        } else {
+            eprintln!("[WARN][REG] onchain_tx_failed type={} node={}", node_type, node_id);
         }
     }
     

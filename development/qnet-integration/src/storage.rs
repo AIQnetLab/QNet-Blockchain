@@ -4876,57 +4876,48 @@ impl Storage {
         }
     }
     
-    /// v3.1: Get all nodes registered with a specific wallet address
+    /// v4.3: Get all nodes registered with a specific wallet address — O(1) via reverse index
     /// CRITICAL for mobile app: Returns nodes even when the node itself is offline!
-    /// Data is read from blockchain storage, not from the node's memory
+    /// Data is read from blockchain storage (RocksDB), not from the node's memory.
+    /// Uses wallet_{address} reverse index for constant-time lookup.
+    /// Architecture: 1 wallet = 1 node (strictly enforced), so result is always 0 or 1 entry.
+    /// Previous version (v3.1) used O(N) prefix scan over ALL nodes — not scalable for 100K+ nodes.
     pub fn get_nodes_by_wallet(&self, wallet_address: &str) -> IntegrationResult<Vec<(String, String, f64)>> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
         
-        let mut result = Vec::new();
-        let prefix = b"node_";
-        
-        // Iterate through all nodes in registry
-        let iter = self.persistent.db.prefix_iterator_cf(&registry_cf, prefix);
-        
-        for item in iter {
-            if let Ok((key, value)) = item {
-                // Extract node_id from key (format: "node_{node_id}")
-                let key_str = match std::str::from_utf8(&key) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
+        // O(1) lookup via reverse index: wallet_{address} → {node_id, node_type}
+        let wallet_key = format!("wallet_{}", wallet_address);
+        match self.persistent.db.get_cf(&registry_cf, wallet_key.as_bytes())? {
+            Some(value) => {
+                let json_str = std::str::from_utf8(&value)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                let parsed: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
                 
-                let node_id = if key_str.starts_with("node_") {
-                    &key_str[5..] // Skip "node_" prefix
-                } else {
-                    continue;
-                };
+                let node_id = parsed["node_id"].as_str().unwrap_or("").to_string();
+                let node_type = parsed["node_type"].as_str().unwrap_or("").to_string();
                 
-                // Parse value JSON
-                let json_str = match std::str::from_utf8(&value) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                
-                let parsed: serde_json::Value = match serde_json::from_str(json_str) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                
-                // Check if wallet matches
-                let node_wallet = parsed["wallet"].as_str().unwrap_or("");
-                if node_wallet == wallet_address {
-                    let node_type = parsed["node_type"].as_str().unwrap_or("unknown").to_string();
-                    let reputation = parsed["reputation"].as_f64()
-                        .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
-                    
-                    result.push((node_id.to_string(), node_type, reputation));
+                if node_id.is_empty() {
+                    return Ok(Vec::new());
                 }
+                
+                // Get reputation from forward index: node_{node_id} → full data
+                let node_key = format!("node_{}", node_id);
+                let reputation = match self.persistent.db.get_cf(&registry_cf, node_key.as_bytes())? {
+                    Some(node_data) => {
+                        let node_json = std::str::from_utf8(&node_data).unwrap_or("{}");
+                        let node_parsed: serde_json::Value = serde_json::from_str(node_json).unwrap_or_default();
+                        node_parsed["reputation"].as_f64()
+                            .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION)
+                    }
+                    None => qnet_consensus::deterministic_reputation::INITIAL_REPUTATION,
+                };
+                
+                Ok(vec![(node_id, node_type, reputation)])
             }
+            None => Ok(Vec::new()),
         }
-        
-        Ok(result)
     }
     
     /// v4.1: Backfill reverse index (wallet → node_id) from existing forward entries.
@@ -4987,6 +4978,52 @@ impl Storage {
         }
         
         Ok(backfilled)
+    }
+    
+    /// v4.3: Load ALL node registrations from RocksDB for P2P registry restore on startup.
+    /// Returns Vec of (node_id, wallet_address, node_type, registered_at) tuples.
+    /// Called once during node initialization to populate in-memory P2P registry from
+    /// blockchain state, ensuring the registry survives node restarts.
+    /// This is a one-time startup operation — O(N) is acceptable here.
+    pub fn load_all_node_registrations(&self) -> IntegrationResult<Vec<(String, String, String, u64)>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        
+        let prefix = b"node_";
+        let iter = self.persistent.db.prefix_iterator_cf(&registry_cf, prefix);
+        let mut result = Vec::new();
+        
+        for item in iter {
+            if let Ok((key, value)) = item {
+                let key_str = match std::str::from_utf8(&key) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                
+                if !key_str.starts_with("node_") { continue; }
+                let node_id = &key_str[5..];
+                
+                let json_str = match std::str::from_utf8(&value) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                
+                let node_type = parsed["node_type"].as_str().unwrap_or("unknown").to_string();
+                let wallet = parsed["wallet"].as_str().unwrap_or("").to_string();
+                let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
+                
+                if !wallet.is_empty() {
+                    result.push((node_id.to_string(), wallet, node_type, timestamp));
+                }
+            }
+        }
+        
+        println!("[INFO][STORAGE] load_all_node_registrations count={}", result.len());
+        Ok(result)
     }
     
     // ============================================
