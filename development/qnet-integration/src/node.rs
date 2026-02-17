@@ -24379,76 +24379,138 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 Some(qnet_rpc.clone())
             );
             
-            // FIXED: Check code ownership for REGULAR codes (1 wallet = 1 code, but reusable on devices)
-            match registry.verify_code_ownership(code, &self.get_wallet_address()).await {
-                Ok(true) => {
-                    println!("✅ Activation code verified - belongs to this wallet");
+            // v4.5: STATELESS verification — use env vars for burn_tx + burn_amount
+            // Docker: -e QNET_BURN_TX_HASH=... -e QNET_BURN_AMOUNT=...
+            // Code = XOR(wallet, SHA3(burn_tx:type:amount)) — self-contained, no node state needed
+            let env_burn_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
+            let env_burn_amount: u64 = std::env::var("QNET_BURN_AMOUNT")
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(0);
+            
+            if !env_burn_tx.is_empty() && env_burn_amount > 0 {
+                // v4.7: CRITICAL — derive Solana address from mnemonic and compare with XOR-decrypted wallet
+                // This proves the mnemonic entered on the server belongs to the wallet that burned tokens.
+                // Without this check, an attacker with stolen code+burn_tx could use ANY mnemonic.
+                let wallet_seed = std::env::var("QNET_WALLET_SEED")
+                    .or_else(|_| std::env::var("QNET_GENESIS_SEED"))
+                    .unwrap_or_default();
+                
+                if wallet_seed.is_empty() {
+                    return Err(QNetError::ValidationError(
+                        "QNET_WALLET_SEED is required for super node activation".to_string()
+                    ));
                 }
-                Ok(false) => {
-                    return Err(QNetError::ValidationError("Activation code does not belong to this wallet".to_string()));
+                
+                // Derive Solana address from mnemonic (same BIP44/SLIP-10 path as mobile app)
+                let solana_from_mnemonic = crate::crypto::solana_derivation::derive_solana_address_from_mnemonic(&wallet_seed)
+                    .map_err(|e| QNetError::ValidationError(
+                        format!("Failed to derive Solana address from mnemonic: {}", e)
+                    ))?;
+                
+                println!("[INFO][ACTIVATION] solana_from_mnemonic={}...", 
+                    &solana_from_mnemonic[..16.min(solana_from_mnemonic.len())]);
+                
+                // STATELESS XOR verification — compare code's embedded wallet with mnemonic's Solana address
+                // This is THE critical check: proves mnemonic owner == code owner
+                match registry.verify_code_ownership_stateless(code, &solana_from_mnemonic, &env_burn_tx, env_burn_amount) {
+                    Ok(true) => {
+                        println!("[INFO][ACTIVATION] code_verified method=mnemonic_xor_match solana={}...",
+                            &solana_from_mnemonic[..16.min(solana_from_mnemonic.len())]);
+                    }
+                    Ok(false) => {
+                        println!("[ERROR][ACTIVATION] mnemonic_mismatch solana_from_seed={}... code_wallet=different",
+                            &solana_from_mnemonic[..16.min(solana_from_mnemonic.len())]);
+                        return Err(QNetError::ValidationError(
+                            "Activation code does not belong to this mnemonic. \
+                             The code was generated for a different wallet. \
+                             Use the same seed phrase that was used in the mobile app when burning tokens.".to_string()
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(QNetError::ValidationError(
+                            format!("Activation code verification failed: {}. Check QNET_BURN_TX_HASH and QNET_BURN_AMOUNT.", e)
+                        ));
+                    }
                 }
-                Err(e) => {
-                    println!("⚠️  Warning: Code ownership verification failed: {}", e);
-                    // Continue with local validation only - graceful degradation
-                }
+            } else {
+                // No env burn data — REQUIRED for non-genesis nodes
+                println!("[ERROR][ACTIVATION] missing_burn_env_vars QNET_BURN_TX_HASH and QNET_BURN_AMOUNT required for super node activation");
+                return Err(QNetError::ValidationError(
+                    "QNET_BURN_TX_HASH and QNET_BURN_AMOUNT environment variables are required for super node activation. \
+                     Get these from your mobile app: Settings > Export Activation Codes.".to_string()
+                ));
             }
         }
         
-        // FIXED: Extract FULL payload from activation code - NO FALLBACKS for security
-        // This gives us wallet_address, burn_tx, node_type, and phase all at once
-        let activation_payload = match self.decrypt_activation_code_full(code).await {
-            Ok(payload) => payload,
-            Err(e) => {
-                println!("❌ CRITICAL: Cannot decrypt activation code: {}", e);
-                println!("   Code: {}...", &code[..8.min(code.len())]);
-                println!("   Node activation FAILED - security requires valid activation code");
-                return Err(QNetError::ValidationError(format!("Activation code decryption failed: {}", e)));
-            }
-        };
-        
-        let wallet_address = activation_payload.wallet.clone();
-        let burn_tx_hash = activation_payload.burn_tx.clone();
-        
-        // Determine phase from activation payload (default to 1 for legacy codes)
-        // Phase 1: 1DEV burn on Solana, Phase 2: QNC transfer to Pool 3
-        let phase = if burn_tx_hash.starts_with("genesis_") || burn_tx_hash.starts_with("QNET-BOOT") {
-            1 // Genesis nodes are always Phase 1
-        } else if burn_tx_hash.starts_with("pool3_transfer_") || burn_tx_hash.starts_with("qnet_") {
-            // Phase 2: Pool 3 transfer transactions (start with "pool3_transfer_" or "qnet_")
-            2 // Phase 2 - QNC transfer to Pool 3
-        } else if burn_tx_hash.len() == 88 || burn_tx_hash.len() == 87 {
-            // Solana transaction signatures are 87-88 base58 chars
-            1 // Phase 1 - Solana burn
-        } else if burn_tx_hash.len() == 64 {
-            // Could be QNet tx hash (64 hex chars) - assume Phase 2
-            2 // Phase 2 - QNet transfer
-        } else {
-            1 // Default to Phase 1 for unknown formats
-        };
-        
-        // Get burn_amount from registry (was stored when code was generated)
-        // CRITICAL: Must match the amount used in key_material for XOR encryption!
-        let burn_amount = {
-            let registry_temp = crate::activation_validation::BlockchainActivationRegistry::new(
-                Some(qnet_rpc.clone())
-            );
-            let code_hash_temp = registry_temp.hash_activation_code_for_blockchain(code)
-                .unwrap_or_else(|_| {
-                    use sha3::{Sha3_256, Digest};
-                    format!("{:x}", Sha3_256::digest(code.as_bytes()))
-                });
+        // v4.5: Get wallet and burn data — PREFER env vars (stateless), fallback to decrypt
+        let (wallet_address, burn_tx_hash, phase, burn_amount) = {
+            let env_burn_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
+            let env_burn_amount: u64 = std::env::var("QNET_BURN_AMOUNT")
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(0);
             
-            match registry_temp.get_activation_record_by_hash(&code_hash_temp).await {
-                Ok(Some(record)) => {
-                    println!("   Burn Amount: {} (from registry)", record.activation_amount);
-                    record.activation_amount
-                }
-                _ => {
-                    // Fallback for Genesis nodes or codes without registry entry
-                    let default_amount = if phase == 1 { 1500u64 } else { 5000u64 };
-                    println!("   Burn Amount: {} (default for Phase {})", default_amount, phase);
-                    default_amount
-                }
+            if !env_burn_tx.is_empty() && env_burn_amount > 0 {
+                // Stateless path: wallet derived from code via XOR decryption
+                let wallet = self.get_wallet_address();
+                let phase = if env_burn_tx.len() == 88 || env_burn_tx.len() == 87 { 1 } else { 1 };
+                println!("[INFO][ACTIVATION] using_env_burn_data tx={}... amount={} phase={}",
+                    &env_burn_tx[..16.min(env_burn_tx.len())], env_burn_amount, phase);
+                (wallet, env_burn_tx, phase, env_burn_amount)
+            } else {
+                // Legacy path: decrypt code to get wallet + burn_tx
+                let activation_payload = match self.decrypt_activation_code_full(code).await {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        println!("[ERROR][ACTIVATION] decrypt_failed={}", e);
+                        println!("[ERROR][ACTIVATION] Set QNET_BURN_TX_HASH and QNET_BURN_AMOUNT env vars for stateless activation");
+                        return Err(QNetError::ValidationError(format!(
+                            "Activation code decryption failed: {}. Set QNET_BURN_TX_HASH and QNET_BURN_AMOUNT.", e
+                        )));
+                    }
+                };
+                
+                let wallet = activation_payload.wallet.clone();
+                let btx = activation_payload.burn_tx.clone();
+                
+                let phase = if btx.starts_with("genesis_") || btx.starts_with("QNET-BOOT") {
+                    1
+                } else if btx.starts_with("pool3_transfer_") || btx.starts_with("qnet_") {
+                    2
+                } else if btx.len() == 88 || btx.len() == 87 {
+                    1
+                } else if btx.len() == 64 {
+                    2
+                } else {
+                    1
+                };
+                
+                // Get burn_amount from registry (stored when code was generated)
+                let burn_amount = {
+                    let registry_temp = crate::activation_validation::BlockchainActivationRegistry::new(
+                        Some(qnet_rpc.clone())
+                    );
+                    let code_hash_temp = registry_temp.hash_activation_code_for_blockchain(code)
+                        .unwrap_or_else(|_| {
+                            use sha3::{Sha3_256, Digest};
+                            format!("{:x}", Sha3_256::digest(code.as_bytes()))
+                        });
+                    
+                    match registry_temp.get_activation_record_by_hash(&code_hash_temp).await {
+                        Ok(Some(record)) => {
+                            println!("   Burn Amount: {} (from registry)", record.activation_amount);
+                            record.activation_amount
+                        }
+                        _ => {
+                            let default_amount = if phase == 1 { 1500u64 } else { 5000u64 };
+                            println!("   Burn Amount: {} (default for Phase {})", default_amount, phase);
+                            default_amount
+                        }
+                    }
+                };
+                
+                (wallet, btx, phase, burn_amount)
             }
         };
         
@@ -24586,6 +24648,54 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             } else {
                 eprintln!("[WARN][REG] onchain_tx_failed node={}", self.node_id);
             }
+        }
+        
+        // v4.9: USER SUPER NODE MIGRATION TRACKING
+        // Register device_id on a genesis node's RocksDB via lightweight REST API.
+        // Flow: Super node starts → POST /api/v1/register-device → genesis stores device_id.
+        // If the same activation code is used on a NEW server, genesis updates device_id.
+        // Old server polls GET /api/v1/node-device every 30s → sees different device_id → graceful shutdown.
+        // NOTE: Genesis nodes are EXCLUDED (they use IP-based auth, not activation codes).
+        if !is_genesis_code {
+            let device_sig = self.get_device_signature();
+            let genesis_url = std::env::var("QNET_RPC_URL")
+                .or_else(|_| std::env::var("QNET_GENESIS_NODES")
+                    .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+                .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+            
+            let node_id_for_log = self.node_id.clone();
+            let node_id_for_body = self.node_id.clone();
+            let device_sig_clone = device_sig.clone();
+            
+            // Non-blocking: POST device_id to genesis node's RocksDB storage
+            tokio::spawn(async move {
+                let client = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build() {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let url = format!("{}/api/v1/register-device", genesis_url);
+                let body = serde_json::json!({
+                    "node_id": node_id_for_body,
+                    "device_id": device_sig_clone,
+                });
+                match client.post(&url).json(&body).send().await {
+                    Ok(resp) => {
+                        if let Ok(json) = resp.json::<serde_json::Value>().await {
+                            if json["success"].as_bool() == Some(true) {
+                                println!("[INFO][ACTIVATION] device_registered_on_genesis node={}", node_id_for_log);
+                            } else {
+                                println!("[WARN][ACTIVATION] device_register_rejected node={} err={}",
+                                    node_id_for_log, json["error"].as_str().unwrap_or("unknown"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("[WARN][ACTIVATION] device_register_failed node={} err={}", node_id_for_log, e);
+                    }
+                }
+            });
         }
         
         println!("✅ Activation code saved with blockchain registry and cryptographic binding");
@@ -24773,49 +24883,60 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Check if this device has been deactivated due to migration
+    /// v4.9: Uses HTTP query to genesis node's /api/v1/node-device endpoint
+    /// instead of in-memory registry (which is empty after genesis restart)
     pub async fn check_device_deactivation(&self) -> Result<bool, QNetError> {
         // Skip device deactivation check for Genesis/bootstrap nodes - they don't use activation codes
         if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
             return Ok(false);
         }
         
-        let activation_code = match self.load_activation_code().await? {
-            Some((code, _)) => code,
-            None => return Ok(false), // No activation code - not deactivated
-        };
+        let my_device = self.get_device_signature();
+        if my_device.is_empty() {
+            return Ok(false);
+        }
         
-        // FIXED: Check global registry for current device using real QNet nodes
-        let qnet_rpc = std::env::var("QNET_RPC_URL")
+        // Build the genesis node API URL
+        let genesis_api = std::env::var("QNET_RPC_URL")
             .or_else(|_| std::env::var("QNET_GENESIS_NODES")
                 .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-            
-        let registry = crate::activation_validation::BlockchainActivationRegistry::new(
-            Some(qnet_rpc)
-        );
         
-        match registry.get_current_device_for_code(&activation_code).await {
-            Ok(Some(current_device)) => {
-                let my_device = self.get_device_signature();
-                
-                if current_device != my_device {
-                    println!("🚨 DEVICE DEACTIVATED: Activation migrated to new device");
-                    println!("   My device: {}...", &my_device[..8.min(my_device.len())]);
-                    println!("   Current device: {}...", &current_device[..8.min(current_device.len())]);
-                    println!("   This node will shut down gracefully");
-                    return Ok(true);
-                } else {
-                    // Still the active device
-                    return Ok(false);
+        // Query genesis node's RocksDB via REST API for the current device_id of our node
+        // node_id format: "super_QNET-XXXXXX-XXXXXX-XXXXXX" — no special URL chars needed
+        let url = format!("{}/api/v1/node-device?node_id={}", genesis_api, &self.node_id);
+        
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| QNetError::NetworkError(format!("HTTP client error: {}", e)))?;
+        
+        match client.get(&url).send().await {
+            Ok(response) => {
+                match response.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if json["success"].as_bool() == Some(true) {
+                            if let Some(current_device) = json["device_id"].as_str() {
+                                if current_device != my_device {
+                                    println!("[WARN][MIGRATION] device_changed my={} current={} action=shutdown",
+                                        &my_device[..8.min(my_device.len())],
+                                        &current_device[..8.min(current_device.len())]);
+                                    return Ok(true);
+                                }
+                                // Same device — still active
+                                return Ok(false);
+                            }
+                            // device_id is null — not registered yet, continue
+                            return Ok(false);
+                        }
+                        // API error — don't deactivate on transient failures
+                        return Ok(false);
+                    }
+                    Err(_) => return Ok(false), // Parse error — don't deactivate
                 }
             }
-            Ok(None) => {
-                // Code not found - might be network issue, don't deactivate
-                println!("⚠️  Warning: Could not verify device status - continuing operation");
-                return Ok(false);
-            }
-            Err(e) => {
-                println!("⚠️  Warning: Device status check failed: {} - continuing operation", e);
+            Err(_) => {
+                // Network error — genesis node might be down, don't deactivate
                 return Ok(false);
             }
         }

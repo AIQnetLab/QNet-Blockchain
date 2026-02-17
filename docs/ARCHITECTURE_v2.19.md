@@ -1375,7 +1375,7 @@ MaliciousBehavior:  Permanent (until reputation ≥ 70%)
 ### Peer Selection for Sync
 
 **Priority Order** (descending):
-1. **Node Type**: Super > Full (Light nodes excluded)
+1. **Node Type**: Super (Light nodes excluded, Full removed in v3.18)
 2. **Blacklist**: Not blacklisted
 3. **Consensus Score**: ≥ 70% (Byzantine threshold)
 4. **Network Score**: Higher = better latency
@@ -2517,8 +2517,9 @@ Environment:
   QNET_BOOTSTRAP_ID: "001"            # Genesis nodes only (001-005)
   QNET_GENESIS_SEED: "12 or 24 words" # Genesis node mnemonic seed phrase
   QNET_WALLET_SEED: "12 or 24 words"  # Super node mnemonic seed phrase
-  QNET_ACTIVATION_CODE: "QNET-..."    # Super node activation code (from 1DEV burn)
-  QNET_NODE_TYPE: "super"
+  QNET_ACTIVATION_CODE: "QNET-SXXXXX-YYYYYY-ZZZZZZ"   # Super node activation code (from 1DEV burn)
+  QNET_BURN_TX_HASH: "solana_tx_signature_here"         # Solana burn TX hash
+  QNET_BURN_AMOUNT: "1500"                              # Amount of 1DEV burned
   RUST_LOG: "info"
 
 Docker:
@@ -2537,8 +2538,10 @@ Docker:
   docker run -d --name my-qnet-node --restart=always \
     --log-opt max-size=200m --log-opt max-file=50 \
     -e QNET_PRODUCTION=1 -e DOCKER_ENV=1 \
-    -e QNET_ACTIVATION_CODE="QNET-XXXX-XXXX-XXXX-XXXX" \
+    -e QNET_ACTIVATION_CODE="QNET-SXXXXX-YYYYYY-ZZZZZZ" \
     -e QNET_WALLET_SEED="your twelve or twenty four word mnemonic here" \
+    -e QNET_BURN_TX_HASH="your_solana_burn_tx_signature" \
+    -e QNET_BURN_AMOUNT=1500 \
     -e QNET_AGGRESSIVE_PRUNING=0 -e QNET_MAX_STORAGE_GB=2000 \
     -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
     -v $(pwd)/super_node_data:/app/data \

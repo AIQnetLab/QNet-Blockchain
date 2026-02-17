@@ -61,7 +61,7 @@
 - ✅ **Transaction-level PQ verification** fully operational
 - ✅ **Account-based PQ public keys** integrated
 - 🔄 **EVM opcode implementations** (80% complete - targeting Q4 2025)
-- 🔄 **CRYSTALS-Kyber encryption** (scheduled for smart contract phase)
+- ✅ **CRYSTALS-Kyber key exchange** (ML-KEM-768 active in QUIC TLS 1.3 via X25519Kyber768 hybrid)
 
 **Security Audit:**
 - ✅ **Cryptographic primitives** validated
@@ -208,7 +208,7 @@
 - ✅ Reward system distributes real QNC tokens
 - ✅ **Lazy rewards system fully implemented (v2.19.4)**
 - ✅ **Sharded ping architecture (256 shards) for Light nodes**
-- ✅ **Heartbeat system for Full/Super nodes**
+- ✅ **Heartbeat system for Super nodes**
 - ✅ **FCM V1 API integration for push notifications**
 - ✅ **All TODO/placeholder comments removed**
 
@@ -242,7 +242,7 @@
 ### **Node Infrastructure**
 - ✅ **Rust-based core** with Python bindings
 - ✅ **Kademlia DHT** for decentralized discovery
-- ✅ **Multi-tier architecture** (Light/Full/Super nodes)
+- ✅ **Multi-tier architecture** (Light/Super nodes — Full removed in v3.18)
 - ✅ **Cross-platform support** (Windows/Linux/macOS)
 - 🔄 **Load balancing** optimizations in progress
 
@@ -327,7 +327,7 @@
 
 1. **Complete reward system** with lazy accumulation
 2. **Sharded ping architecture** (256 shards, 25.6M Light nodes capacity)
-3. **Heartbeat system** for Full/Super nodes (10 per 4-hour window)
+3. **Heartbeat system** for Super nodes (10 per 4-hour window)
 4. **FCM V1 API** with OAuth2 authentication
 5. **P2P gossip sync** for Light node registrations
 6. **RocksDB persistence** for attestations, heartbeats, rewards

@@ -90,7 +90,7 @@ export async function detectPushProvider() {
 /**
  * Register Light node with detected push provider
  */
-export async function registerLightNode(nodeId, walletAddress, quantumPubkey, quantumSignature) {
+export async function registerLightNode(nodeId, walletAddress, quantumPubkey, quantumSignature, burnTxHash = null, burnAmount = null, burnWallet = null, ed25519Signature = null, signatureTimestamp = null) {
   const pushProvider = await detectPushProvider();
   const apiUrl = await getRandomBootstrapNodeAsync();
 
@@ -102,6 +102,19 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
     quantum_signature: quantumSignature,
     push_type: pushProvider.type,
   };
+
+  // v4.3: Include burn TX data for STATELESS code ownership verification
+  // Node can verify code belongs to wallet WITHOUT any in-memory state:
+  // XOR key = SHA3(burn_tx:type:amount) → decrypt wallet prefix from code → compare
+  if (burnTxHash) registrationData.burn_tx_hash = burnTxHash;
+  if (burnAmount != null) registrationData.burn_amount = burnAmount;
+  // v4.6: burn_wallet = Solana address used during code generation (Phase 1)
+  // wallet_address = EON (for rewards), burn_wallet = Solana (for XOR verification)
+  if (burnWallet) registrationData.burn_wallet = burnWallet;
+  // v4.7: Ed25519 signature proving ownership of burn_wallet (Solana key)
+  // Prevents stolen code reuse — attacker cannot sign without Solana private key
+  if (ed25519Signature) registrationData.ed25519_signature = ed25519Signature;
+  if (signatureTimestamp != null) registrationData.signature_timestamp = signatureTimestamp;
 
   // Add provider-specific data
   if (pushProvider.type === PushType.FCM) {

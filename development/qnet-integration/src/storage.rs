@@ -4793,6 +4793,40 @@ impl Storage {
         }
     }
     
+    /// v4.9: Save device signature for node (used for migration detection)
+    /// Key: device_{node_id} → device_id string
+    /// When a super node migrates to a new server, the old server detects the change
+    /// by comparing its own device_id with the stored one on genesis nodes.
+    pub fn save_node_device_id(&self, node_id: &str, device_id: &str) -> IntegrationResult<()> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry CF not found".to_string()))?;
+        let key = format!("device_{}", node_id);
+        let data = json!({
+            "device_id": device_id,
+            "updated_at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        });
+        self.persistent.db.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes())?;
+        Ok(())
+    }
+    
+    /// v4.9: Get current device signature for node (O(1) lookup)
+    /// Returns None if node not found or never had a device_id stored
+    pub fn get_node_device_id(&self, node_id: &str) -> IntegrationResult<Option<String>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry CF not found".to_string()))?;
+        let key = format!("device_{}", node_id);
+        match self.persistent.db.get_cf(&registry_cf, key.as_bytes())? {
+            Some(value) => {
+                let json_str = std::str::from_utf8(&value)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                let parsed: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                Ok(parsed["device_id"].as_str().map(|s| s.to_string()))
+            }
+            None => Ok(None),
+        }
+    }
+    
     /// v4.0: Save VRF public key for node (persists across restarts)
     pub fn save_vrf_public_key(&self, node_id: &str, pk_hex: &str) -> IntegrationResult<()> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")

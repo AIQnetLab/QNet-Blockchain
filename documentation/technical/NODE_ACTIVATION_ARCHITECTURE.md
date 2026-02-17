@@ -5,19 +5,20 @@ QNet uses a two-phase activation system transitioning from 1DEV burn on Solana t
 
 ## **CRITICAL DEVICE RESTRICTIONS (STRICTLY ENFORCED)**
 
-### Server Deployment (Interactive Menu ONLY)
-- **Super Nodes**: ✅ Can be activated on servers via interactive menu
-- **Light Nodes**: ❌ **ABSOLUTELY BLOCKED** - Cannot be activated on servers (enforced at code level)
+### Server Deployment (Docker Only)
+- **Genesis Nodes**: Hardcoded bootstrap nodes with `QNET_BOOTSTRAP_ID` — auto-generated activation
+- **Super Nodes**: Activated via Docker environment variables (`QNET_ACTIVATION_CODE` + `QNET_BURN_TX_HASH` + `QNET_BURN_AMOUNT` + `QNET_WALLET_SEED`)
+- **Light Nodes**: **ABSOLUTELY BLOCKED** — Cannot be activated on servers (enforced at code level with `std::process::exit(1)`)
 
 ### Mobile Device Deployment
-- **Light Nodes**: ✅ Can ONLY be activated on mobile devices
-- **Super Nodes**: ❌ Cannot be activated on mobile devices
+- **Light Nodes**: Can ONLY be activated on mobile devices via QNet mobile app
+- **Super Nodes**: Cannot be activated on mobile devices (mobile only obtains the activation code)
 
 ### **ENFORCEMENT MECHANISMS - FULLY IMPLEMENTED**
-- **Code-Level Blocking**: Light node codes cause immediate `std::process::exit(1)` on servers ✅ ACTIVE
-- **Dual Validation**: Both `validate_server_node_type()` and `decode_activation_code()` block Light nodes ✅ ACTIVE  
-- **No Bypass**: Impossible to circumvent restrictions through configuration or parameters ✅ VERIFIED
-- **Production Deployment**: Enforcement tested and verified in production environment ✅ CONFIRMED
+- **Code-Level Blocking**: Light node codes (prefix `QNET-L`) cause immediate `std::process::exit(1)` on servers
+- **Dual Validation**: Both `validate_server_node_type()` and `decode_activation_code()` block Light nodes
+- **No Bypass**: Impossible to circumvent restrictions through configuration or parameters
+- **Production Deployment**: Enforcement tested and verified in production environment
 
 ### **BLOCKCHAIN CONSENSUS INTEGRATION - PRODUCTION READY**
 
@@ -46,28 +47,29 @@ QNet uses a two-phase activation system transitioning from 1DEV burn on Solana t
 - **Overhead**: 72 bytes per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
 - **Monitoring**: Prometheus metrics for hash rate, drift detection, and checkpoint count
 
-## **QUANTUM-SECURE ACTIVATION ARCHITECTURE**
+## **ACTIVATION CODE ARCHITECTURE (v4.7)**
 
-### **Post-Quantum Cryptography Integration**
-QNet uses quantum-resistant algorithms for all activation code generation and validation:
+### **Cryptography Stack**
+- **Activation Code Encryption**: XOR with SHA3-256 derived key from `burn_tx_hash:node_type:burn_amount`
+- **Node Registration Signatures**: CRYSTALS-Dilithium3 (NIST FIPS 204, ML-DSA-65) — quantum-resistant
+- **Wallet Ownership Proof (Light Nodes)**: Ed25519 signature from Solana private key
+- **Wallet Ownership Proof (Super Nodes)**: BIP39 mnemonic → SLIP-10 → Solana Ed25519 address derivation, compared with XOR-decrypted prefix
+- **Burn Transaction Verification**: Solana RPC `getTransaction` with `feePayer` (signer) check
+- **Hash Functions**: SHA3-256 (NIST FIPS 202) for all key material derivation
+- **On-Chain Registration**: `NodeRegistration` + `NodeActivation` transaction types with Dilithium3 signatures
 
-- **Encryption Algorithm**: CRYSTALS-Kyber 1024 (quantum-resistant)
-- **Digital Signatures**: CRYSTALS-Dilithium 5 (quantum-resistant)  
-- **Hash Functions**: SHA3-256 + SHA-512 (quantum-resistant)
-- **Hardware Entropy**: `crypto.randomBytes(32)` for non-deterministic generation
-
-### **Activation Code Security Features**
+### **Activation Code Format**
 
 **Format**: `QNET-XXXXXX-XXXXXX-XXXXXX` (25 characters total)
 
 ```
-Segment 1 (6 chars): NodeType marker (L/F/S) + Timestamp (5 hex chars)
-Segment 2 (6 chars): XOR-encrypted wallet address part 1
-Segment 3 (6 chars): XOR-encrypted wallet address part 2 + entropy
+Segment 1 (6 chars): NodeType marker (L/S) + Timestamp (5 hex chars)
+Segment 2 (6 chars): XOR-encrypted Solana wallet address part 1
+Segment 3 (6 chars): XOR-encrypted Solana wallet address part 2 + entropy
 ```
 
 ```python
-# XOR-encryption based code generation (bridge-server.py / rpc.rs)
+# XOR-encryption based code generation (rpc.rs / bridge-server)
 def generate_activation_code(burn_tx_hash: str, wallet_address: str, 
                               node_type: str, burn_amount: int) -> str:
     # Step 1: Create encryption key from burn transaction
@@ -76,7 +78,8 @@ def generate_activation_code(burn_tx_hash: str, wallet_address: str,
     key_material = f"{burn_tx_hash}:{node_type}:{burn_amount}"
     encryption_key = sha3_256(key_material.encode()).hexdigest()[:32]
     
-    # Step 2: XOR encrypt wallet address (first 5 bytes → 10 hex chars)
+    # Step 2: XOR encrypt Solana wallet address (first 5 bytes -> 10 hex chars)
+    # NOTE: wallet_address is the SOLANA address (base58), NOT the QNet EON address
     encrypted_wallet = xor_encrypt(wallet_address[:5], encryption_key)
     encrypted_wallet_hex = encrypted_wallet.hex().upper()  # 10 chars
     
@@ -96,44 +99,104 @@ def generate_activation_code(burn_tx_hash: str, wallet_address: str,
     return f"QNET-{segment1}-{segment2}-{segment3}"
 ```
 
-**Decryption Process** (quantum_crypto.rs):
+### **Stateless Decryption Process** (quantum_crypto.rs / rpc.rs):
 1. Parse segments from activation code
-2. Retrieve `burn_tx_hash` and `burn_amount` from `ActivationRecord` in blockchain registry
-3. Reconstruct `key_material` and derive encryption key
-4. XOR-decrypt wallet prefix from segments 2+3
-5. Verify decrypted prefix matches first 5 chars of registered wallet address
-```
+2. Reconstruct `key_material = "{burn_tx_hash}:{node_type}:{burn_amount}"`
+3. Derive encryption key via SHA3-256
+4. XOR-decrypt Solana wallet prefix from segments 2+3
+5. Verify decrypted prefix matches the Solana address of the registering wallet
+6. **No in-memory registry needed** — verification is fully stateless
 
-### **Cryptographic Wallet Binding**
-- **Node Ownership Verification**: PDA (Program Derived Address) validation on Solana
-- **Deterministic Key Derivation**: `Pubkey::create_with_seed()` for node key generation
-- **Anti-Theft Protection**: Activation codes cryptographically bound to wallet signatures
-- **Server Migration Security**: Wallet-controlled authorization required for device transfers
+### **Multi-Layer Wallet Ownership Verification (v4.7)**
+
+```
+Layer 1: XOR Verification (stateless)
+  Code = XOR(solana_wallet_prefix, SHA3(burn_tx:type:amount))
+  → Only the holder of burn_tx_hash + burn_amount can reconstruct the key
+  → Decrypted prefix MUST match the provided Solana address
+
+Layer 2: Solana feePayer Check
+  → verify_burn_transaction_exists() fetches the burn TX from Solana RPC
+  → Extracts accountKeys[0] (feePayer/signer) from the transaction
+  → Compares with the provided burn_wallet (Solana address)
+  → Rejects if feePayer != burn_wallet
+
+Layer 3a: Ed25519 Signature (Light Nodes — mobile registration)
+  → Mobile app signs message: "qnet_register:{nodeId}:{timestamp}"
+  → Signed with Solana Ed25519 private key (derived from mnemonic via BIP44)
+  → Server verifies signature against burn_wallet public key
+
+Layer 3b: Mnemonic-to-Solana Derivation (Super Nodes — server registration)
+  → Server derives Solana address from QNET_WALLET_SEED via BIP39+SLIP-10+Ed25519
+  → Compares derived address with XOR-decrypted prefix from activation code
+  → Ensures the mnemonic entered in Docker matches the wallet that burned tokens
+
+Layer 4: Dynamic Pricing Check
+  → Burned amount >= current required price (dynamic based on % burned)
+  → Prevents underpaying for activation
+
+Layer 5: 1 Wallet = 1 Node (RocksDB persistent check)
+  → check_wallet_registered_in_blocks() scans blockchain for existing NodeRegistration
+  → Prevents duplicate registrations from same wallet (ANY node type)
+  → Persistent across node restarts (not in-memory)
+```
 
 ## **SECURITY ENHANCEMENTS**
 
-### **1. Atomic Balance Verification**
-Prevents race conditions and front-running attacks:
+### **1. Burn Transaction feePayer Verification (v4.7)**
+Prevents using someone else's burn transaction:
 
 ```rust
-// Solana contract - atomic balance checks
-pub fn burn_1dev_for_node_activation(ctx: Context<BurnForActivation>) -> Result<()> {
-    // ATOMIC: Calculate required amount first
-    let required_amount = node_type.get_1dev_burn_amount(burn_tracker.burn_percentage);
-    
-    // ATOMIC: Check balance immediately before burn
-    let user_token_balance = ctx.accounts.user_token_account.amount;
-    require!(user_token_balance >= required_amount, BurnError::InsufficientBalance);
-    
-    // ATOMIC: Verify no pending balance-reducing transactions
-    let account_lamports_before = ctx.accounts.user_token_account.to_account_info().lamports();
-    
-    // Proceed with burn only if all checks pass
-    burn_tokens_atomically(ctx, required_amount)
+// rpc.rs — verify_burn_transaction_exists()
+// CRITICAL: Extract feePayer (signer) from Solana transaction
+if let Some(fee_payer) = result_value["transaction"]["message"]["accountKeys"][0].as_str() {
+    if fee_payer != wallet_address {
+        println!("[SECURITY] Transaction feePayer ({}) does not match wallet_address ({})",
+            fee_payer, wallet_address);
+        return Ok(false);
+    }
+    println!("[INFO] Transaction feePayer verified: {}", fee_payer);
+} else {
+    println!("[ERROR] Could not determine transaction feePayer");
+    return Ok(false);
 }
 ```
 
-### **2. Automatic Node Replacement** 
+### **2. Solana Address Derivation on Server (v4.7)**
+For super node mnemonic ownership verification:
+
+```rust
+// crypto/solana_derivation.rs — derive_solana_address_from_mnemonic()
+// BIP39 mnemonic -> BIP44 seed -> SLIP-10 derivation -> Ed25519 keypair -> base58 address
+// Derivation path: m/44'/501'/0'/0' (standard Solana path, matches Phantom/Solflare)
+pub fn derive_solana_address_from_mnemonic(mnemonic_phrase: &str) -> Result<String, String> {
+    let mnemonic = Mnemonic::from_phrase(mnemonic_phrase, Language::English)?;
+    let seed = mnemonic.to_seed("");
+    // SLIP-10 hardened derivation for Ed25519
+    let derived_key = slip10_derive_ed25519(&seed, &[44, 501, 0, 0])?;
+    let public_key = PublicKey::from(&SecretKey::from_bytes(&derived_key)?);
+    Ok(bs58::encode(public_key.as_bytes()).into_string())
+}
+```
+
+### **3. Ed25519 Wallet Ownership Proof (v4.7)**
+For light node registration from mobile:
+
+```rust
+// rpc.rs — handle_light_node_register()
+// Verify Ed25519 signature proving ownership of burn_wallet (Solana key)
+if let Some(sig_hex) = &request.ed25519_signature {
+    let message = format!("qnet_register:{}:{}", request.node_id, timestamp);
+    let sig_bytes = hex::decode(sig_hex)?;
+    let pubkey_bytes = bs58::decode(&request.burn_wallet)?.into_vec();
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes)?;
+    let public_key = ed25519_dalek::PublicKey::from_bytes(&pubkey_bytes)?;
+    public_key.verify(message.as_bytes(), &signature)?;
+    // Signature valid — burn_wallet ownership confirmed
+}
+```
+
+### **4. Automatic Node Replacement** 
 Seamless server migration with quantum security:
 
 ```rust
@@ -159,38 +222,6 @@ pub async fn register_activation_on_blockchain(
 }
 ```
 
-### **3. Non-Deterministic Code Generation**
-Eliminates predictability and guessing attacks:
-
-- **Hardware Entropy**: True randomness from `crypto.randomBytes()`
-- **Timestamp Precision**: Microsecond-level timestamps prevent replay
-- **Dynamic Salting**: Per-generation unique salts
-- **Combined Deterministic+Random**: Burn transaction data + hardware entropy
-
-### **4. Node Ownership Verification**
-Prevents unauthorized node activations:
-
-```rust
-// Solana contract - ownership verification  
-fn verify_node_ownership(user_key: &Pubkey, node_pubkey: &Pubkey) -> bool {
-    // Method 1: Deterministic derivation verification
-    if let Ok(derived_key) = Pubkey::create_with_seed(
-        user_key, "QNET_NODE", &system_program::ID
-    ) {
-        if derived_key == *node_pubkey { return true; }
-    }
-    
-    // Method 2: PDA ownership record verification  
-    let (expected_pda, _) = Pubkey::find_program_address(
-        &[b"node_ownership", user_key.as_ref(), node_pubkey.as_ref()],
-        &crate::ID
-    );
-    
-    // Verify PDA exists with valid ownership record
-    verify_pda_ownership_record(&expected_pda)
-}
-```
-
 ## Two-Phase Activation System
 
 ### Phase 1: 1DEV Token Burn on Solana (Years 0-5)
@@ -200,44 +231,41 @@ fn verify_node_ownership(user_key: &Pubkey, node_pubkey: &Pubkey) -> bool {
 - 1DEV Mint: `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ`
 
 **How Phase 1 Works:**
-1. User burns 1DEV tokens on Solana blockchain
-2. Solana contract creates PDA (Program Derived Address) activation record
-3. **NEW**: Cryptographic ownership verification prevents unauthorized activations
-4. **NEW**: Atomic balance verification prevents race conditions
-5. QNet monitors Solana for burn transactions
-6. User receives quantum-secure activation code from wallet/mobile app
-7. Interactive activation on servers OR mobile activation for Light nodes
+1. User burns 1DEV tokens on Solana blockchain (via mobile app or wallet extension)
+2. Mobile app requests activation code from QNet genesis node, passing `burn_tx_hash`, `wallet_address` (Solana), `node_type`, `burn_amount`
+3. Genesis node verifies burn via Solana RPC (`getTransaction`), checks `feePayer` matches wallet
+4. Genesis node generates XOR-encrypted activation code bound to Solana wallet
+5. User receives code + burn_tx_hash + burn_amount in mobile app
+6. **For Light Nodes**: Mobile app registers directly via `/api/v1/light-node/register` with Ed25519 signature
+7. **For Super Nodes**: User enters code + burn data + mnemonic into Docker container on server
 
 **Universal Pricing (All Node Types):**
-- Base: 1,500 1DEV → 300 1DEV minimum (decreases as tokens burned, min at 80-90%)
+- Base: 1,500 1DEV -> 300 1DEV minimum (decreases as tokens burned, min at 80-90%)
 - Every 10% burned reduces cost by 150 1DEV
-- Same price for Light/Full/Super nodes
+- Same price for Light and Super nodes
 - At 90% burned: Transition to Phase 2 (QNC activation)
 
-**Phase 1 Solana Integration:**
+**Phase 1 Solana Verification (Actual Implementation):**
 ```rust
-// Enhanced Solana burn verification with security
-pub async fn verify_solana_burn(
-    burn_tx: &str,
-    node_pubkey: &PublicKey,
-) -> Result<BurnRecord, SolanaError> {
-    // Verify burn transaction on Solana
-    let burn_record = fetch_burn_record_from_solana(burn_tx).await?;
+// rpc.rs — verify_burn_transaction_exists()
+pub async fn verify_burn_transaction_exists(
+    burn_tx_hash: &str,
+    wallet_address: &str,  // Solana address (burn_wallet)
+    min_amount: u64,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    // 1. Fetch transaction from Solana RPC (getTransaction)
+    let result = solana_rpc_request("getTransaction", burn_tx_hash).await?;
     
-    // NEW: Validate node ownership before proceeding
-    require!(
-        verify_node_ownership(&burn_record.user, node_pubkey),
-        SolanaError::NodeOwnershipMismatch
-    );
+    // 2. CRITICAL: Verify feePayer matches provided wallet
+    let fee_payer = result["transaction"]["message"]["accountKeys"][0].as_str();
+    if fee_payer != wallet_address { return Ok(false); }
     
-    // Validate PDA account
-    let pda_seeds = &[NODE_ACTIVATION_SEED, node_pubkey.as_ref()];
-    let (pda, _bump) = Pubkey::find_program_address(pda_seeds, &PROGRAM_ID);
+    // 3. Verify burn amount >= minimum required
+    let burn_amount = extract_burn_amount(&result)?;
+    if burn_amount < min_amount { return Ok(false); }
     
-    // Verify activation record
-    let activation_record = fetch_activation_record(&pda).await?;
-    
-    Ok(burn_record)
+    // 4. Verify transaction was successful
+    if result["meta"]["err"].is_null() { Ok(true) } else { Ok(false) }
 }
 ```
 
@@ -251,14 +279,12 @@ pub async fn verify_solana_burn(
 **How Phase 2 Works:**
 1. User TRANSFERS QNC tokens to Pool 3 (not burned!)
 2. Native QNet smart contract processes activation
-3. **NEW**: Quantum-secure activation code generation with hardware entropy
-4. **NEW**: Rate-limited migrations with 3-per-day limit
-5. All transferred QNC redistributed equally to active nodes
-6. Direct activation through QNet blockchain
+3. All transferred QNC redistributed equally to active nodes
+4. Direct activation through QNet blockchain
 
 **Dynamic Pricing by Node Type:**
-- **Light**: 5,000-30,000 QNC (base: 10,000 × network multiplier)
-- **Super**: 3,750-22,500 QNC (base: 7,500 × network multiplier)
+- **Light**: 5,000-30,000 QNC (base: 10,000 x network multiplier)
+- **Super**: 3,750-22,500 QNC (base: 7,500 x network multiplier)
 NOTE: Full Node type removed in v3.18
 
 **Network Size Multipliers:**
@@ -269,137 +295,236 @@ NOTE: Full Node type removed in v3.18
 
 ## Activation Flow Architecture
 
-### Interactive Server Activation (Super Nodes - v3.18: Full removed)
-```bash
-# Server activation process with enhanced security
-cd development/qnet-integration
-./target/release/qnet-node
+### Super Node — Docker Deployment (Production)
 
-# Interactive prompts:
-# 1. Economic phase detection (1 or 2)
-# 2. Activation code input: QNET-XXXXXX-XXXXXX-XXXXXX (quantum-secure, 26 chars)
-# 3. Node type validation (Super only - Light nodes BLOCKED, v3.18: Full removed)
-# 4. Cryptographic ownership verification
-# 5. Region auto-detection
-# 6. Port configuration  
-# 7. Blockchain sync initiation
-# 8. API server launch (Super only - v3.18: Full removed)
+**Step 1: Obtain activation code via mobile app**
+1. Install QNet mobile app, create/import wallet (12/24-word BIP39 mnemonic)
+2. Purchase and burn 1DEV tokens (dynamic price based on burn %)
+3. App automatically requests activation code from genesis node
+4. App saves: activation code, burn TX hash, burn amount
+
+**Step 2: Deploy Docker container on server**
+```bash
+# Build production image
+git clone https://github.com/AIQnetLab/QNet-Blockchain.git
+cd QNet-Blockchain && git checkout testnet
+docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
+
+# Configure firewall
+sudo ufw allow 9876,9877,8001/tcp
+sudo ufw allow 10876/udp
+sudo ufw reload
+
+# Launch super node (detached mode)
+docker run -d --name qnet-super --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
+  -e QNET_PRODUCTION=1 \
+  -e DOCKER_ENV=1 \
+  -e QNET_WALLET_SEED="<SAME 12-WORD MNEMONIC AS IN MOBILE APP>" \
+  -e QNET_ACTIVATION_CODE="QNET-SXXXXX-YYYYYY-ZZZZZZ" \
+  -e QNET_BURN_TX_HASH="<SOLANA TX SIGNATURE FROM MOBILE APP>" \
+  -e QNET_BURN_AMOUNT="1500" \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+  -v $(pwd)/super_node_data:/app/data \
+  qnet-production
 ```
 
-### Mobile Activation (Light Nodes Only)
-```javascript
-// Mobile app activation with security enhancements
-const activationResult = await QNetMobile.activateNode({
-    nodeType: 'Light',
-    phase: currentPhase,
-    activationCode: 'QNET-LXXXXX-XXXXXX-XXXXXX', // Quantum-secure generated (26 chars)
-    deviceSignature: getDeviceSignature(),
-    walletAddress: wallet.address,
-    migrationCount: 0 // Migration tracking
-});
+**Environment variables explained:**
 
-// Result: Light node activated with no API server
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `QNET_PRODUCTION` | Yes | Enable production security checks |
+| `DOCKER_ENV` | Yes | Confirms running inside Docker |
+| `QNET_WALLET_SEED` | Yes | BIP39 mnemonic (12 or 24 words) — MUST match mobile app wallet |
+| `QNET_ACTIVATION_CODE` | Yes | Code from mobile app (format: `QNET-SXXXXX-YYYYYY-ZZZZZZ`) |
+| `QNET_BURN_TX_HASH` | Yes | Solana burn transaction signature (from mobile app) |
+| `QNET_BURN_AMOUNT` | Yes | Amount of 1DEV burned (must match exactly) |
+| `QNET_AGGRESSIVE_PRUNING` | No | `0` = keep full history (default for super nodes) |
+| `QNET_MAX_STORAGE_GB` | No | Maximum storage limit in GB |
+
+**Startup verification flow (qnet-node.rs):**
+```
+1. QNET_BOOTSTRAP_ID set? → NO (not genesis)
+2. QNET_ACTIVATION_CODE set? → YES
+3. Read QNET_BURN_TX_HASH and QNET_BURN_AMOUNT from env
+4. Return (NodeType::Super, code) to main()
+
+5. save_activation_code():
+   a) Derive Solana address from QNET_WALLET_SEED via BIP39+SLIP-10
+   b) XOR-decrypt wallet prefix from code using SHA3(burn_tx:super:amount)
+   c) Compare decrypted prefix with derived Solana address
+   d) MATCH → activation proceeds
+   e) MISMATCH → REJECT: "Code does not belong to this mnemonic"
+
+6. verify_burn_transaction_exists():
+   a) Fetch burn TX from Solana RPC
+   b) Check feePayer == derived Solana address
+   c) Check burn_amount >= dynamic price
+   d) Any failure → REJECT registration
+
+7. check_wallet_registered_in_blocks():
+   a) Scan blockchain for existing NodeRegistration from this wallet
+   b) If found → REJECT: "Wallet already has a registered node"
+
+8. Register on-chain via NodeRegistration + NodeActivation TX with Dilithium3 signature
+```
+
+### Genesis Node — Docker Deployment (Bootstrap Only)
+
+```bash
+# Genesis Node (hardcoded bootstrap — no activation code needed)
+docker run -d --name qnet-genesis-001 --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=001 \
+  -e QNET_WALLET_SEED="<12-word mnemonic for this genesis node>" \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+  -v $(pwd)/genesis_001_data:/app/data \
+  qnet-production
+```
+
+**Genesis-specific variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `QNET_BOOTSTRAP_ID` | Genesis node ID (`001`-`005`) — triggers auto-activation |
+| `QNET_BENCHMARK_MODE` | Optional: enable benchmarking |
+| `QNET_API_KEY_EXPLORER` | Optional: API key for explorer access (Node 005) |
+| `QNET_API_KEY_ADMIN` | Optional: Admin API key (Node 005) |
+| `QNET_WHITELIST_IPS` | Optional: IP whitelist for API access (Node 005) |
+
+### Light Node — Mobile Activation Only
+
+```
+1. User opens QNet mobile app
+2. Creates/imports wallet (BIP39 mnemonic)
+3. Burns 1DEV tokens on Solana (dynamic price)
+4. App requests activation code from genesis node
+5. App saves code + burn_tx_hash + burn_amount
+6. User taps "Activate Light Node"
+
+7. Mobile app sends POST /api/v1/light-node/register:
+   {
+     node_id: "light_QNET-LXXXXX-...",
+     wallet_address: "a3f8b2...eon...",     // EON address for rewards
+     burn_wallet: "7Qx9vN3...",             // Solana address for verification
+     burn_tx_hash: "7Ab9zKj3x...",          // Solana TX signature
+     burn_amount: 1500,                     // Must match exactly
+     ed25519_signature: "a1b2c3d4...",      // Signed with Solana private key
+     signature_timestamp: 1739721600,       // Replay protection
+     quantum_pubkey: "...",                 // Dilithium3 public key
+     quantum_signature: "..."              // Dilithium3 registration signature
+   }
+
+8. Server verifies:
+   a) XOR decrypt code → Solana wallet prefix matches burn_wallet
+   b) Solana RPC: feePayer of burn_tx == burn_wallet
+   c) Ed25519 signature valid for burn_wallet public key
+   d) burn_amount >= current dynamic price
+   e) No existing node for this wallet (RocksDB scan)
+   f) Dilithium3 signature valid
+
+9. Server creates NodeRegistration + NodeActivation on-chain TX
+10. Light node registered, begins receiving rewards
 ```
 
 ## Data Storage Architecture
 
 ### Phase 1 Storage
-- **Solana PDA**: Activation records on Solana blockchain with ownership verification
-- **QNet Blockchain**: Mirrored activation transactions with quantum-resistant signatures
-- **DHT Network**: Distributed node registry with migration history
-- **NEW**: Migration rate limiting database
+- **RocksDB**: Persistent node registration data (`node_registrations` column family)
+- **QNet Blockchain**: On-chain `NodeRegistration` and `NodeActivation` transactions
+- **DashMap Cache**: In-memory `node_registration_cache` for O(1) lookups
+- **P2P Registry**: In-memory `light_node_registry` synchronized via gossip
 
 ### Phase 2 Storage  
 - **QNet Smart Contract**: Native activation records with cryptographic binding
 - **Pool 3 Contract**: QNC redistribution tracking
 - **Node Registry**: Real-time active node list with security metadata
-- **NEW**: Quantum-resistant activation code database
 
 ## Implementation Files
 
-### Phase 1 (1DEV Burn) - Enhanced Security
-- `development/qnet-contracts/1dev-burn-contract/` - **UPDATED**: Solana burn contract with atomic checks
-- `applications/qnet-wallet/src/integration/SolanaIntegration.js` - Browser wallet  
-- `applications/qnet-mobile/src/screens/ActivationScreen.jsx` - Mobile activation
-- `infrastructure/qnet-node/src/economics/onedev_phase_handler.py` - QNet handler
-- `applications/qnet-explorer/frontend/src/app/api/node/activate/route.ts` - **UPDATED**: Quantum-secure API
+### Phase 1 (1DEV Burn) - v4.7
+- `development/qnet-integration/src/rpc.rs` — API endpoints: `handle_light_node_register`, `handle_register_node`, `verify_burn_transaction_exists`, `handle_generate_activation_code`
+- `development/qnet-integration/src/node.rs` — `save_activation_code` (super node mnemonic verification)
+- `development/qnet-integration/src/bin/qnet-node.rs` — `get_activation_with_auto_genesis` (startup flow, env var reading)
+- `development/qnet-integration/src/crypto/solana_derivation.rs` — BIP39/SLIP-10/Ed25519 Solana address derivation
+- `development/qnet-integration/src/crypto/quantum_crypto.rs` — XOR encryption/decryption, stateless verification
+- `development/qnet-integration/src/activation_validation.rs` — Dynamic pricing, validation rules
+- `development/qnet-integration/src/storage.rs` — RocksDB persistence for node registrations
+- `applications/qnet-mobile/src/components/WalletManager.js` — Mobile activation, Ed25519 signing
+- `applications/qnet-mobile/src/services/PushService.js` — `registerLightNode` API call
 
-### Phase 2 (QNC Pool 3) 
-- `development/qnet-contracts/qnet-native/node_activation_qnc.py` - QNC contract
-- `core/qnet-state/src/transaction.rs` - Pool 3 transactions
-- `core/qnet-consensus/src/reward_integration.rs` - Pool 3 redistribution
-
-### Activation Validation - Enhanced
-- `development/qnet-integration/src/activation_validation.rs` - **UPDATED**: Automatic node replacement system
-- `development/qnet-integration/src/bin/qnet-node.rs` - **UPDATED**: Interactive setup with Light node blocking
-- `development/qnet-integration/src/quantum_crypto.rs` - **UPDATED**: Quantum-secure replacement coordination
-- `development/qnet-integration/src/rpc.rs` - **UPDATED**: Graceful shutdown API endpoint
-- `applications/qnet-mobile/src/services/BridgeService.js` - Mobile bridge
+### Phase 2 (QNC Pool 3)
+- `development/qnet-contracts/qnet-native/node_activation_qnc.py` — QNC contract
+- `core/qnet-state/src/transaction.rs` — Pool 3 transactions
+- `core/qnet-consensus/src/reward_integration.rs` — Pool 3 redistribution
 
 ## Node Type API Capabilities
 
 ### Super Nodes (Server Only)
-- ✅ Full blockchain validation
-- ✅ Complete REST API endpoints
-- ✅ Enhanced validation with cryptographic binding
-- ✅ Maximum reward distribution
-- ✅ Priority transaction processing
-- ✅ Advanced monitoring
-- ✅ **NEW**: Enhanced security features
+- Full blockchain validation
+- Complete REST API endpoints
+- Consensus participation (microblock production + macroblock voting)
+- Maximum reward distribution
+- Priority transaction processing
+- Advanced monitoring
 
 ### Light Nodes (Mobile Only)
-- ✅ Basic blockchain sync
-- ✅ Wallet functionality
-- ✅ Transaction submission
-- ✅ Direct node connections via getRandomBootstrapNode()
-- ✅ PhaseAwareRewardManager integration for rewards
-- ✅ LightNodeDevice registration with quantum_pubkey
-- ❌ NO API server
-- ❌ NO public endpoints  
-- ❌ NO metrics endpoints
-- ❌ **STRICTLY BLOCKED on servers** - Code-level enforcement
+- Basic blockchain sync
+- Wallet functionality
+- Transaction submission
+- Direct node connections via `getRandomBootstrapNode()`
+- `PhaseAwareRewardManager` integration for rewards
+- `LightNodeDevice` registration with `quantum_pubkey`
+- NO API server
+- NO public endpoints  
+- NO metrics endpoints
+- **STRICTLY BLOCKED on servers** — Code-level enforcement
 
 ## Security Architecture
 
-### **Enhanced Security Features**
+### **Multi-Layer Security (v4.7)**
 
 #### **Quantum Resistance**
-- **Algorithms**: CRYSTALS-Kyber 1024 + CRYSTALS-Dilithium 5
-- **Hash Functions**: SHA3-256 + SHA-512 for double protection
-- **Key Generation**: Hardware entropy + deterministic components
-- **Future-Proof**: Resistant to quantum computer attacks
+- **Consensus Signatures**: CRYSTALS-Dilithium3 (NIST FIPS 204, ML-DSA-65) — 2420-byte signatures
+- **Hybrid P2P**: Ed25519 (ephemeral) + Dilithium3 (certificate binding)
+- **Hash Functions**: SHA3-256 (NIST FIPS 202) for all derivations
+- **Key Storage**: AES-256-GCM encrypted Dilithium3 keypairs
+- **P2P Key Exchange**: ML-KEM-768 (Kyber) active in QUIC TLS 1.3 hybrid handshake (v4.8)
 
 #### **Anti-Fraud Mechanisms**
-- **Code Uniqueness**: Each activation code usable only once globally
-- **Wallet Binding**: Cryptographically impossible to use codes from other wallets
-- **Migration Limits**: Maximum 3 device transfers per day
-- **Race Condition Prevention**: Atomic balance verification
+- **1 Wallet = 1 Node**: Enforced via persistent RocksDB scan (any node type)
+- **Wallet Binding**: XOR encryption + feePayer check + Ed25519/mnemonic verification
+- **Code Theft Prevention**: Stolen code useless without matching Solana private key
+- **XOR Brute-Force Prevention**: Dynamic burn amount is part of key material
+- **Race Condition Prevention**: Solana RPC verification is mandatory (no bypass on error)
 
 #### **Attack Surface Minimization**
-- **Non-Deterministic Generation**: Hardware entropy prevents guessing
 - **Device Restrictions**: Light nodes physically cannot run on servers
-- **Ownership Verification**: PDA-based proof of node ownership
+- **Stateless Verification**: No in-memory registry needed for code validation
+- **Solana RPC Mandatory**: Registration rejected if Solana RPC unavailable
 - **Temporal Validation**: Timestamp-based replay attack prevention
 
 ### Phase 1 Security
-- **Enhanced Solana Burn Verification**: Real-time transaction validation with ownership checks
-- **Quantum-Secure PDA Validation**: Cryptographic proof of burn with hardware entropy
-- **One-Time Use Enforcement**: Each burn transaction used only once with global registry
-- **Device Limits**: Maximum 3 Light nodes per wallet with migration tracking
-- **NEW**: Atomic balance verification prevents front-running
-- **NEW**: Rate-limited migrations prevent abuse
+- **feePayer Verification**: Burn TX signer must match registering wallet
+- **Ed25519 Ownership Proof**: Light node registration requires Solana key signature
+- **Mnemonic Derivation Proof**: Super node registration derives Solana address from seed
+- **Dynamic Pricing Enforcement**: Burned amount must meet current price requirement
+- **1 Wallet = 1 Node**: Persistent blockchain scan prevents duplicates
+- **Solana RPC Error = Rejection**: No fallback if Solana verification fails
 
 ### Phase 2 Security  
 - **QNC Pool 3 Verification**: Smart contract validation with quantum signatures
-- **Node Type Enforcement**: Activation codes tied to node types with cryptographic binding
+- **Node Type Enforcement**: Activation codes tied to node types via prefix (L/S)
 - **Network Size Validation**: Dynamic pricing enforcement 
 - **Redistribution Auditing**: Transparent Pool 3 distribution
-- **NEW**: Hardware entropy for code generation
-- **NEW**: Migration history tracking
 
 ## Automatic Node Replacement System
 
-### **Quantum-Secure Node Transfer**
+### **Node Transfer**
 QNet implements automatic node replacement when activating on a new server:
 
 ```rust
@@ -414,7 +539,7 @@ pub async fn check_and_replace_existing_node(
         if existing_node.wallet_address == new_node_info.wallet_address 
             && existing_node.node_type == new_node_info.node_type {
             
-            // Send quantum-secure shutdown signal to previous node
+            // Send shutdown signal to previous node
             self.send_blockchain_shutdown_signal(existing_node).await?;
             
             // Mark as replaced in blockchain immediately
@@ -428,55 +553,57 @@ pub async fn check_and_replace_existing_node(
 }
 ```
 
+### **Super Node Server Migration (v4.9)**
+
+User super nodes support **seamless server migration** — same activation code on a new server, old server shuts down automatically.
+
+**Migration Flow:**
+1. User starts Docker container on **new server** with same `QNET_ACTIVATION_CODE`, `QNET_BURN_TX_HASH`, `QNET_BURN_AMOUNT`, `QNET_WALLET_SEED`
+2. New server calls `save_activation_code` → XOR + mnemonic verification passes (same wallet)
+3. New server POSTs `device_id` to genesis node via `POST /api/v1/register-device`
+4. Genesis node stores new `device_id` in RocksDB (`device_{node_id}` key)
+5. `handle_register_node` on genesis detects existing node_id → `is_migration = true`
+6. **No duplicate on-chain TX** — existing `NodeRegistration` preserved, reputation preserved
+7. Old server polls `GET /api/v1/node-device?node_id=...` every 30 seconds
+8. Old server sees `device_id ≠ my_device_id` → **graceful shutdown** (QUIC stop, clear activation, `exit(0)`)
+
+**Rate Limiting:** Max 1 migration per 24 hours per wallet (`SUPER_NODE_MIGRATION_TIMESTAMPS` DashMap)
+
+**Genesis Nodes Excluded:** Genesis nodes use `QNET_BOOTSTRAP_ID` + IP-based authentication. Migration system does **not** apply to genesis nodes.
+
+### **Light Node Device Management**
+- Up to **3 mobile devices** per Light node (round-robin attestation)
+- Managed via `handle_light_node_register` with `LightNodeDevice` slots
+- No server migration concept — Light nodes are mobile-only
+
 ### **Automatic Replacement Features**
-- **1 Wallet = 1 Active Node**: Only one node per type per wallet
-- **Blockchain-Based**: Uses quantum blockchain for coordination
-- **Graceful Shutdown**: Previous node receives shutdown signal
-- **Zero Manual Migration**: Automatic on new activation
-- **Scalable**: Optimized for millions of nodes
+- **1 Wallet = 1 Active Node**: Only one node (any type) per wallet — enforced via RocksDB reverse index
+- **Persistent Device Tracking**: `device_id` stored in RocksDB on genesis nodes (survives restarts)
+- **Graceful Shutdown**: Old server detects migration via HTTP polling → stops QUIC → clears activation → exits
+- **Zero Manual Migration**: Start same Docker command on new server → old shuts down automatically
+- **Scalable**: O(1) device_id lookup via RocksDB key
 
 ### **Node Replacement Scenarios**
-1. **Server Migration**: Activate same node type on new server → old automatically shuts down
-2. **Hardware Upgrade**: New server activation → seamless replacement
-3. **Node Type Upgrade**: N/A (v3.18: Only Super nodes for servers)
-4. **Recovery**: Lost server access → reactivate on new hardware
+1. **Server Migration**: Start same Docker on new server → old automatically shuts down within 30 seconds
+2. **Hardware Upgrade**: New server activation → seamless replacement with reputation preserved
+3. **Recovery**: Lost server access → reactivate on new hardware with same mnemonic + activation code
 
 ### **Security & Limitations**
 - **Wallet Binding**: Node activations permanently bound to wallet addresses
 - **No Wallet Transfer**: Prevents activation code trading
-- **Quantum-Secure**: All replacement signals use CRYSTALS-Dilithium signatures
+- **Dilithium3 Signatures**: All blockchain transactions use CRYSTALS-Dilithium3
 - **Blockchain Authority**: Blockchain records are source of truth for active nodes
+- **Rate Limiting**: 1 migration per 24 hours prevents abuse
 
-## Alternative Activation Methods
+## Activation Methods Summary
 
-### CLI Activation (Servers) - **DEPRECATED**
-```bash
-# DEPRECATED: Direct server activation (removed for security)
-# qnet-node --activation-code QNET-XXXX-XXXX-XXXX --node-type full
-# 
-# REPLACEMENT: Interactive menu only (prevents Light node bypass)
-./target/release/qnet-node  # Interactive menu enforced
-```
+| Method | Node Type | Environment Variables |
+|--------|-----------|----------------------|
+| **Genesis (auto)** | Super | `QNET_BOOTSTRAP_ID` + `QNET_WALLET_SEED` |
+| **Docker detached** | Super | `QNET_ACTIVATION_CODE` + `QNET_BURN_TX_HASH` + `QNET_BURN_AMOUNT` + `QNET_WALLET_SEED` |
+| **Mobile app** | Light | Via API call with Ed25519 signature |
 
-### Environment Variables (Production) - **ENHANCED**
-```bash  
-# Production deployment with security
-export QNET_ACTIVATION_CODE=QNET-XXXXXX-XXXXXX-XXXXXX  # Quantum-secure code (26 chars)
-export QNET_NODE_TYPE=super                       # Super only (v3.18: Full removed)
-export QNET_PRODUCTION=1                          # Enable all security checks
-./target/release/qnet-node
-```
-
-### Mobile App (Light Nodes) - **SECURED**
-```javascript
-// Mobile-only activation with rate limiting
-const result = await QNetMobile.activateNode({
-    nodeType: 'Light',                    // Only Light allowed on mobile
-    phase: getCurrentPhase(),
-    activationCode: userCode,             // Quantum-secure generated
-    migrationHistory: getMigrationCount() // Rate limiting check
-});
-```
+**NOTE**: Node type is determined from activation code prefix (`QNET-S` = Super, `QNET-L` = Light). No separate `QNET_NODE_TYPE` variable needed.
 
 ## Benefits of Two-Phase Architecture
 
@@ -485,16 +612,13 @@ const result = await QNetMobile.activateNode({
 - **Universal Pricing**: Same cost for all node types  
 - **Proven Technology**: Solana blockchain reliability
 - **External Funding**: No QNet token required
-- **NEW**: Quantum-secure activation with hardware entropy
-- **NEW**: Cryptographic ownership verification
+- **Stateless Verification**: XOR-based, no in-memory state needed
 
 ### Phase 2 Benefits
 - **Native Integration**: QNet blockchain control
 - **Fair Redistribution**: Pool 3 rewards all nodes
 - **Dynamic Pricing**: Node type differentiation
 - **Network Growth**: Existing nodes benefit from new activations
-- **NEW**: Rate-limited migrations prevent abuse
-- **NEW**: Enhanced security features
 
 ## Monitoring and Statistics
 
@@ -503,40 +627,41 @@ const result = await QNetMobile.activateNode({
 - **Network Size**: Active nodes by type and region
 - **Pool 3 Balance**: QNC available for redistribution
 - **Activation Rate**: New nodes per day
-- **NEW**: Node replacement statistics and blockchain coordination metrics
-- **NEW**: Security event monitoring (failed activations, blocked attempts)
+- **Node replacement statistics and blockchain coordination metrics**
+- **Security event monitoring (failed activations, blocked attempts)**
 
 ### Security Monitoring
 - **Failed Activations**: Track attempted Light node server activations
-- **Replacement Events**: Monitor automatic node shutdowns and replacements
-- **Code Reuse Attempts**: Track attempts to reuse activation codes  
-- **Ownership Violations**: Monitor unauthorized node activation attempts
+- **feePayer Mismatches**: Monitor Solana wallet verification failures
+- **Ed25519 Signature Failures**: Track wallet ownership proof failures
+- **Mnemonic Derivation Mismatches**: Track super node mnemonic verification failures
+- **Duplicate Wallet Attempts**: Track 1-wallet-1-node enforcement
 
 ### Phase Transition Monitoring
 - **Burn Threshold**: Monitor 90% burn progress
 - **Time Threshold**: Track 5-year countdown
 - **Transition Readiness**: QNC contract deployment status
-- **Replacement Stats**: Automatic node replacements and server migrations
-- **NEW**: Quantum-secure replacement deployment tracking
 
 ## **SECURITY COMPLIANCE**
 
 ### **Quantum Readiness**  
-- ✅ Post-quantum cryptography implemented
-- ✅ Hardware entropy integration
-- ✅ Quantum-resistant hash functions
-- ✅ Future-proof algorithm selection
+- CRYSTALS-Dilithium3 (NIST FIPS 204) for all on-chain signatures
+- SHA3-256 (NIST FIPS 202) for all hash operations
+- AES-256-GCM (NIST FIPS 197) for key storage encryption
+- Hybrid Ed25519 + Dilithium3 for P2P message authentication
+- ML-KEM-768 (Kyber) active for P2P key exchange via QUIC TLS 1.3
 
 ### **Anti-Fraud Measures**
-- ✅ Activation code uniqueness enforced globally
-- ✅ Wallet ownership cryptographically verified  
-- ✅ Device migration rate limited (3/day)
-- ✅ Light node server blocking (code-level)
+- Wallet ownership cryptographically verified (Ed25519 + mnemonic derivation)
+- feePayer verification prevents stolen burn TX usage
+- 1 wallet = 1 node enforced via persistent blockchain scan
+- Light node server blocking (code-level `std::process::exit(1)`)
+- Dynamic pricing verified at registration time
 
 ### **Production Security**
-- ✅ Atomic transaction verification
-- ✅ Race condition prevention
-- ✅ Front-running attack mitigation
-- ✅ Comprehensive audit trails
+- Stateless activation code verification (no in-memory registries)
+- Solana RPC errors cause registration rejection (no bypass)
+- Dilithium3 signatures on all blockchain transactions
+- Comprehensive audit trails via structured logging
 
-**⚠️ PRODUCTION-READY WITH ENHANCED SECURITY ⚠️** 
+**PRODUCTION-READY WITH v4.7 SECURITY ARCHITECTURE**

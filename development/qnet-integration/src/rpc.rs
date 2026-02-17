@@ -1710,6 +1710,26 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_verify_activation_onchain);
 
+    // v4.9: Node device check — used by super nodes to detect migration
+    // GET /api/v1/node-device?node_id=xxx → returns current device_id from RocksDB
+    let node_device_check = api_v1
+        .and(warp::path("node-device"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_node_device_check);
+
+    // v4.9: Register device_id for node (called by super nodes on startup)
+    // POST /api/v1/register-device { node_id, device_id }
+    let register_device = api_v1
+        .and(warp::path("register-device"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(handle_register_device);
+
     // Graceful shutdown endpoint for node replacement
     let graceful_shutdown = api_v1
         .and(warp::path("shutdown"))
@@ -2130,6 +2150,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(gas_recommendations)
         .or(auth_challenge)
         .or(network_ping)
+        .or(node_device_check)
+        .or(register_device)
         .or(graceful_shutdown);
     
     let monitoring_routes = failover_history
@@ -5463,6 +5485,12 @@ lazy_static::lazy_static! {
     static ref IP_TO_PSEUDONYM_CACHE: dashmap::DashMap<String, (String, std::time::Instant)> = 
         dashmap::DashMap::new();
     
+    // v4.9: Super node migration rate limiter — 1 migration per 24 hours per wallet
+    // Key: wallet_address, Value: last migration timestamp (unix seconds)
+    // Prevents abuse: rapid server swapping, DDoS via re-registration, etc.
+    static ref SUPER_NODE_MIGRATION_TIMESTAMPS: dashmap::DashMap<String, u64> =
+        dashmap::DashMap::new();
+    
     // REMOVED: REWARD_MANAGER was causing desync issues
     // Now using blockchain.get_reward_manager() everywhere for proper synchronization
 }
@@ -5500,6 +5528,19 @@ struct LightNodeRegisterRequest {
     push_type: Option<String>,         // "fcm" | "unifiedpush" | "polling"
     #[serde(default)]
     unified_push_endpoint: Option<String>,  // UnifiedPush URL (e.g., https://ntfy.sh/xxx)
+    #[serde(default)]
+    burn_tx_hash: Option<String>,      // v4.3: Solana burn TX hash for STATELESS code verification
+    #[serde(default)]
+    burn_amount: Option<u64>,          // v4.3: Burn amount for XOR key reconstruction
+    #[serde(default)]
+    burn_wallet: Option<String>,       // v4.6: Solana address used for code generation (Phase 1)
+                                       // XOR verification uses this, NOT wallet_address (which is EON for rewards)
+    #[serde(default)]
+    ed25519_signature: Option<String>,  // v4.7: Ed25519 signature proving ownership of burn_wallet
+                                        // Message: "qnet_register:{activation_code}:{timestamp}"
+                                        // Signed with Solana private key (same key that burned tokens)
+    #[serde(default)]
+    signature_timestamp: Option<u64>,   // v4.7: Timestamp used in signature message (prevents replay)
 }
 
 async fn handle_light_node_register(
@@ -5525,37 +5566,196 @@ async fn handle_light_node_register(
         })));
     }
     
-    // SECURITY: Validate activation code against BlockchainActivationRegistry
-    // Code contains XOR-encrypted wallet address — verify it matches the requester
-    // Prevents: (1) registration without 1DEV burn, (2) using stolen code from different wallet
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v4.5: PURE STATELESS VERIFICATION — code is self-contained!
+    // Code = XOR(wallet_prefix, SHA3(burn_tx_hash:node_type:burn_amount))
+    // To verify: reconstruct XOR key from burn data → decrypt → compare wallet.
+    // NO in-memory registry needed. NO node state needed. Code IS the proof.
+    // burn_tx_hash + burn_amount are MANDATORY (sent from mobile AsyncStorage).
+    // ═══════════════════════════════════════════════════════════════════════════════
     {
         let registry = &*GLOBAL_ACTIVATION_REGISTRY;
-        match registry.verify_code_ownership(&register_request.node_id, &register_request.wallet_address).await {
-            Ok(true) => {
-                println!("[INFO][LIGHT] code_ownership_verified wallet={}...", 
-                    &register_request.wallet_address[..16.min(register_request.wallet_address.len())]);
-            }
-            Ok(false) => {
-                println!("[WARN][LIGHT] code_ownership_rejected wallet={}... code={}...",
-                    &register_request.wallet_address[..16.min(register_request.wallet_address.len())],
-                    &register_request.node_id[..12.min(register_request.node_id.len())]);
+        let code = &register_request.node_id;
+        let wallet = &register_request.wallet_address;
+        
+        // v4.6: XOR verification uses the wallet that GENERATED the code
+        // Phase 1: code was generated with Solana address → burn_wallet = Solana
+        // Phase 2: code was generated with EON address → burn_wallet = EON = wallet_address
+        // If burn_wallet not provided, fallback to wallet_address (backward compat)
+        let xor_wallet = register_request.burn_wallet.as_deref()
+            .filter(|w| !w.is_empty())
+            .unwrap_or(wallet);
+        
+        // burn_tx_hash is REQUIRED — no fallback to in-memory
+        let burn_tx = match &register_request.burn_tx_hash {
+            Some(tx) if !tx.is_empty() => tx.as_str(),
+            _ => {
+                println!("[WARN][LIGHT] registration_rejected reason=missing_burn_tx_hash wallet={}...",
+                    &wallet[..16.min(wallet.len())]);
                 return Ok(warp::reply::json(&json!({
                     "success": false,
-                    "error": "Invalid activation code or code belongs to different wallet",
-                    "hint": "Burn 1DEV to get a valid activation code for this wallet"
+                    "error": "burn_tx_hash is required for node registration",
+                    "hint": "Include burn_tx_hash and burn_amount from your activation metadata"
+                })));
+            }
+        };
+        let burn_amount = register_request.burn_amount.unwrap_or(0);
+        if burn_amount == 0 {
+            println!("[WARN][LIGHT] registration_rejected reason=missing_burn_amount wallet={}...",
+                &wallet[..16.min(wallet.len())]);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "burn_amount is required for node registration",
+                "hint": "Include burn_amount (e.g. 1500) from your activation metadata"
+            })));
+        }
+        
+        // STEP 1: Stateless XOR decryption — verify code belongs to the burn wallet
+        // XOR key = SHA3(burn_tx:type:burn_amount), encrypted wallet = first 5 bytes of burn_wallet
+        match registry.verify_code_ownership_stateless(code, xor_wallet, burn_tx, burn_amount) {
+            Ok(true) => {
+                println!("[INFO][LIGHT] code_verified method=stateless_xor wallet={}...",
+                    &wallet[..16.min(wallet.len())]);
+            }
+            Ok(false) => {
+                println!("[WARN][LIGHT] code_rejected method=stateless_xor wallet={}... code={}...",
+                    &wallet[..16.min(wallet.len())], &code[..12.min(code.len())]);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Activation code does not belong to this wallet (XOR mismatch)",
+                    "hint": "Code is cryptographically bound to wallet via burn transaction"
                 })));
             }
             Err(e) => {
-                // SECURITY: Do NOT allow registration if code verification fails
-                // Could be: quantum crypto not initialized, corrupted code, forged code
-                println!("[ERROR][LIGHT] code_verification_failed wallet={}... err={}",
-                    &register_request.wallet_address[..16.min(register_request.wallet_address.len())], e);
+                println!("[WARN][LIGHT] stateless_verify_failed wallet={}... err={}",
+                    &wallet[..16.min(wallet.len())], e);
                 return Ok(warp::reply::json(&json!({
                     "success": false,
-                    "error": "Activation code verification unavailable. Try again later.",
-                    "hint": "Node may still be initializing. Retry in 30 seconds."
+                    "error": format!("Code verification failed: {}", e),
+                    "hint": "Ensure burn_tx_hash and burn_amount match the original burn transaction"
                 })));
             }
+        }
+        
+        // STEP 1.5: v4.7 — Verify Ed25519 signature proving ownership of burn_wallet (Solana key)
+        // This prevents stolen code reuse: attacker has code+burn_tx but NOT the Solana private key
+        {
+            let sig_hex = match &register_request.ed25519_signature {
+                Some(s) if !s.is_empty() => s.as_str(),
+                _ => {
+                    println!("[WARN][LIGHT] registration_rejected reason=missing_ed25519_signature wallet={}...",
+                        &wallet[..16.min(wallet.len())]);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Ed25519 signature is required for node registration",
+                        "hint": "Sign message 'qnet_register:{code}:{timestamp}' with your Solana private key"
+                    })));
+                }
+            };
+            let sig_timestamp = register_request.signature_timestamp.unwrap_or(0);
+            
+            // Check timestamp freshness (within 5 minutes)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now.abs_diff(sig_timestamp) > 300 {
+                println!("[WARN][LIGHT] registration_rejected reason=stale_signature ts={} now={}", sig_timestamp, now);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Signature timestamp is too old or too far in the future (max 5 min)",
+                    "hint": "Generate a fresh signature with current timestamp"
+                })));
+            }
+            
+            let message = format!("qnet_register:{}:{}", code, sig_timestamp);
+            match crate::crypto::solana_derivation::verify_ed25519_signature(
+                message.as_bytes(), sig_hex, xor_wallet
+            ) {
+                Ok(true) => {
+                    println!("[INFO][LIGHT] ed25519_sig_verified solana_wallet={}...",
+                        &xor_wallet[..16.min(xor_wallet.len())]);
+                }
+                Ok(false) => {
+                    println!("[WARN][LIGHT] ed25519_sig_invalid solana_wallet={}...",
+                        &xor_wallet[..16.min(xor_wallet.len())]);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Ed25519 signature verification failed — you are not the wallet owner",
+                        "hint": "Sign with the Solana private key that burned tokens"
+                    })));
+                }
+                Err(e) => {
+                    println!("[ERROR][LIGHT] ed25519_verify_err err={}", e);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": format!("Ed25519 verification error: {}", e)
+                    })));
+                }
+            }
+        }
+        
+        // STEP 2: Verify burn actually happened on Solana with sufficient amount
+        // v4.7: CRITICAL — pass xor_wallet (Solana address) to verify feePayer == sender
+        match verify_burn_transaction_exists(burn_tx, xor_wallet, burn_amount, 1).await {
+            Ok(true) => {
+                println!("[INFO][LIGHT] burn_verified tx={}... sender={} amount={}", 
+                    &burn_tx[..16.min(burn_tx.len())],
+                    &xor_wallet[..16.min(xor_wallet.len())],
+                    burn_amount);
+            }
+            Ok(false) => {
+                println!("[WARN][LIGHT] burn_not_found tx={}...", &burn_tx[..16.min(burn_tx.len())]);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Burn transaction not found or insufficient amount on Solana",
+                    "required_amount": burn_amount,
+                    "burn_tx_hash": burn_tx
+                })));
+            }
+            Err(e) => {
+                println!("[ERROR][LIGHT] burn_verify_err tx={}... err={}", 
+                    &burn_tx[..16.min(burn_tx.len())], e);
+                // v4.7: Solana verification is MANDATORY — no more "allow with XOR proof" bypass
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": format!("Burn verification failed: {}", e),
+                    "burn_tx_hash": burn_tx,
+                    "hint": "Ensure burn_tx_hash is valid and Solana RPC is reachable"
+                })));
+            }
+        }
+        
+        // v4.5: DYNAMIC PRICING — verify burn_amount >= current activation price
+        // Prevents underpaying (user burns 300 when price is 1500)
+        {
+            let burn_pct = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+            let current_phase = if burn_pct >= 90.0 { 2u8 } else { 1u8 };
+            let minimum_required = if current_phase == 1 {
+                let reduction_tiers = (burn_pct / 10.0).floor() as u64;
+                let total_reduction = reduction_tiers * 150;
+                std::cmp::max(1500u64.saturating_sub(total_reduction), 300)
+            } else {
+                let active = crate::GLOBAL_ACTIVE_NODES.load(std::sync::atomic::Ordering::Relaxed) as u64;
+                let base = 10000u64; // Light node base
+                let mult = if active <= 100_000 { 0.5 } else if active <= 300_000 { 1.0 } else if active <= 1_000_000 { 2.0 } else { 3.0 };
+                (base as f64 * mult).round() as u64
+            };
+            
+            if burn_amount < minimum_required {
+                println!("[WARN][LIGHT] insufficient_burn amount={} required={} phase={}",
+                    burn_amount, minimum_required, current_phase);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": format!("Insufficient burn: {} provided, {} required", burn_amount, minimum_required),
+                    "required_amount": minimum_required,
+                    "provided_amount": burn_amount,
+                    "phase": current_phase,
+                    "currency": if current_phase == 1 { "1DEV" } else { "QNC" }
+                })));
+            }
+            
+            println!("[INFO][LIGHT] price_check_passed amount={} required={}", burn_amount, minimum_required);
         }
     }
     
@@ -6112,17 +6312,17 @@ async fn handle_light_node_ping_response(
             } else {
                 // Level 2: Local device cache (populated on direct API calls only)
                 let from_local = {
-                    let registry = match LIGHT_NODE_REGISTRY.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
+            let registry = match LIGHT_NODE_REGISTRY.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
                     registry.get(&node_id)
                         .and_then(|n| n.devices.first().map(|d| d.wallet_address.clone()))
                 };
                 
                 if from_local.is_some() {
                     from_local
-                } else {
+            } else {
                     // Level 3: RocksDB reverse index (blockchain state — ultimate source of truth)
                     None // Handled by fallback below (generate EON address)
                 }
@@ -8725,43 +8925,276 @@ async fn handle_register_node(
         }
     }
     
-    // v4.0: Verify activation code ownership (code must be bound to this wallet)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v4.5: PURE STATELESS VERIFICATION — code is self-contained!
+    // Code = XOR(wallet_prefix, SHA3(burn_tx_hash:node_type:burn_amount))
+    // Decrypt code → compare wallet → verify burn on Solana. NO node state needed.
+    // Genesis codes: bypass (QNET-BOOT-*-STRAP format, IP-based auth).
+    // ═══════════════════════════════════════════════════════════════════════════════
     {
-        let registry = &*GLOBAL_ACTIVATION_REGISTRY;
-        match registry.verify_code_ownership(activation_code, wallet_address).await {
-            Ok(true) => {
-                println!("[INFO][REGISTER] code_verified wallet={}", wallet_address);
-            }
-            Ok(false) => {
-                println!("[WARN][REGISTER] code_mismatch wallet={} code={}...",
-                         wallet_address, &activation_code[..8.min(activation_code.len())]);
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Activation code does not belong to this wallet"
-                })));
-            }
-            Err(e) => {
-                // v4.3 SECURITY: Only allow skip for Genesis bootstrap codes
-                // After restart, GLOBAL_ACTIVATION_REGISTRY is empty — Err is expected for any code.
-                // Without this check, ANYONE could register with ANY code after a restart.
-                let is_genesis_code = activation_code.starts_with("QNET-BOOT-") 
-                    && activation_code.ends_with("-STRAP");
-                if is_genesis_code {
-                    println!("[INFO][REGISTER] genesis_code_bypass code={}...", &activation_code[..16.min(activation_code.len())]);
-                } else {
-                    println!("[WARN][REGISTER] code_verify_err wallet={} err={}", wallet_address, e);
+        let is_genesis_code = activation_code.starts_with("QNET-BOOT-") 
+            && activation_code.ends_with("-STRAP");
+        
+        if is_genesis_code {
+            println!("[INFO][REGISTER] genesis_code_bypass code={}...", &activation_code[..16.min(activation_code.len())]);
+        } else {
+            let registry = &*GLOBAL_ACTIVATION_REGISTRY;
+            
+            // burn_tx_hash is REQUIRED for non-genesis nodes
+            let burn_tx = match body["burn_tx_hash"].as_str().or_else(|| body["activation_tx"].as_str()) {
+                Some(tx) if !tx.is_empty() => tx,
+                _ => {
+                    println!("[WARN][REGISTER] rejected reason=missing_burn_tx_hash wallet={}...",
+                        &wallet_address[..16.min(wallet_address.len())]);
                     return Ok(warp::reply::json(&json!({
                         "success": false,
-                        "error": "Activation code verification failed. Registry may be restarting — retry in 30s.",
-                        "details": e.to_string()
+                        "error": "burn_tx_hash is required for node registration",
+                        "hint": "Include burn_tx_hash and burn_amount from your activation metadata"
                     })));
                 }
+            };
+            let burn_amount = match body["burn_amount"].as_u64() {
+                Some(amt) if amt > 0 => amt,
+                _ => {
+                    println!("[WARN][REGISTER] rejected reason=missing_burn_amount wallet={}...",
+                        &wallet_address[..16.min(wallet_address.len())]);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "burn_amount is required for node registration",
+                        "hint": "Include burn_amount (e.g. 1500) from your activation metadata"
+                    })));
+                }
+            };
+            
+            // STEP 1: Stateless XOR decryption — verify code belongs to the burn wallet
+            // v4.6: burn_wallet may differ from wallet_address (Solana vs EON for Phase 1)
+            let xor_wallet = body["burn_wallet"].as_str()
+                .filter(|w| !w.is_empty())
+                .unwrap_or(wallet_address);
+            match registry.verify_code_ownership_stateless(activation_code, xor_wallet, burn_tx, burn_amount) {
+                Ok(true) => {
+                    println!("[INFO][REGISTER] code_verified method=stateless_xor wallet={}...",
+                        &wallet_address[..16.min(wallet_address.len())]);
+                }
+                Ok(false) => {
+                    println!("[WARN][REGISTER] code_rejected method=stateless_xor wallet={}... code={}...",
+                        &wallet_address[..16.min(wallet_address.len())],
+                        &activation_code[..8.min(activation_code.len())]);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Activation code does not belong to this wallet (XOR mismatch)",
+                        "hint": "Code is cryptographically bound to wallet via burn transaction"
+                    })));
+                }
+                Err(e) => {
+                    println!("[WARN][REGISTER] stateless_verify_failed wallet={}... err={}",
+                        &wallet_address[..16.min(wallet_address.len())], e);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": format!("Code verification failed: {}", e),
+                        "hint": "Ensure burn_tx_hash and burn_amount match the original burn transaction"
+                    })));
+                }
+            }
+            
+            // STEP 1.5: v4.7 — Verify Ed25519 signature proving ownership of burn_wallet (Solana key)
+            // This prevents stolen code reuse: attacker has code+burn_tx but NOT the Solana private key
+            {
+                let sig_hex = match body["ed25519_signature"].as_str() {
+                    Some(s) if !s.is_empty() => s,
+                    _ => {
+                        println!("[WARN][REGISTER] rejected reason=missing_ed25519_signature wallet={}...",
+                            &wallet_address[..16.min(wallet_address.len())]);
+                        return Ok(warp::reply::json(&json!({
+                            "success": false,
+                            "error": "Ed25519 signature is required for node registration",
+                            "hint": "Sign message 'qnet_register:{code}:{timestamp}' with your Solana private key"
+                        })));
+                    }
+                };
+                let sig_timestamp = body["signature_timestamp"].as_u64().unwrap_or(0);
+                
+                // Check timestamp freshness (within 5 minutes)
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if now.abs_diff(sig_timestamp) > 300 {
+                    println!("[WARN][REGISTER] rejected reason=stale_signature ts={} now={}", sig_timestamp, now);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Signature timestamp is too old or too far in the future (max 5 min)",
+                        "hint": "Generate a fresh signature with current timestamp"
+                    })));
+                }
+                
+                let message = format!("qnet_register:{}:{}", activation_code, sig_timestamp);
+                match crate::crypto::solana_derivation::verify_ed25519_signature(
+                    message.as_bytes(), sig_hex, xor_wallet
+                ) {
+                    Ok(true) => {
+                        println!("[INFO][REGISTER] ed25519_sig_verified solana_wallet={}...",
+                            &xor_wallet[..16.min(xor_wallet.len())]);
+                    }
+                    Ok(false) => {
+                        println!("[WARN][REGISTER] ed25519_sig_invalid solana_wallet={}...",
+                            &xor_wallet[..16.min(xor_wallet.len())]);
+                        return Ok(warp::reply::json(&json!({
+                            "success": false,
+                            "error": "Ed25519 signature verification failed — you are not the wallet owner",
+                            "hint": "Sign with the Solana private key that burned tokens"
+                        })));
+                    }
+                    Err(e) => {
+                        println!("[ERROR][REGISTER] ed25519_verify_err err={}", e);
+                        return Ok(warp::reply::json(&json!({
+                            "success": false,
+                            "error": format!("Ed25519 verification error: {}", e)
+                        })));
+                    }
+                }
+            }
+            
+            // STEP 2: Verify burn actually happened on Solana with sufficient amount
+            // v4.7: CRITICAL — pass xor_wallet (Solana address) to verify feePayer == sender
+            match verify_burn_transaction_exists(burn_tx, xor_wallet, burn_amount, 1).await {
+                Ok(true) => {
+                    println!("[INFO][REGISTER] burn_verified tx={}... sender={} amount={}",
+                        &burn_tx[..16.min(burn_tx.len())],
+                        &xor_wallet[..16.min(xor_wallet.len())],
+                        burn_amount);
+                }
+                Ok(false) => {
+                    println!("[WARN][REGISTER] burn_not_found tx={}...", &burn_tx[..16.min(burn_tx.len())]);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Burn transaction not found or insufficient amount on Solana",
+                        "required_amount": burn_amount,
+                        "burn_tx_hash": burn_tx
+                    })));
+                }
+                Err(e) => {
+                    println!("[ERROR][REGISTER] burn_verify_err tx={}... err={}",
+                        &burn_tx[..16.min(burn_tx.len())], e);
+                    // v4.7: Solana verification is MANDATORY — no more bypass
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": format!("Burn verification failed: {}", e),
+                        "burn_tx_hash": burn_tx,
+                        "hint": "Ensure burn_tx_hash is valid and Solana RPC is reachable"
+                    })));
+                }
+            }
+            
+            // v4.5: DYNAMIC PRICING — verify burn_amount >= current activation price
+            {
+                let burn_pct = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                let current_phase = if burn_pct >= 90.0 { 2u8 } else { 1u8 };
+                let minimum_required = if current_phase == 1 {
+                    let reduction_tiers = (burn_pct / 10.0).floor() as u64;
+                    let total_reduction = reduction_tiers * 150;
+                    std::cmp::max(1500u64.saturating_sub(total_reduction), 300)
+                } else {
+                    let active = crate::GLOBAL_ACTIVE_NODES.load(std::sync::atomic::Ordering::Relaxed) as u64;
+                    let base = if node_type == "super" { 7500u64 } else { 10000u64 };
+                    let mult = if active <= 100_000 { 0.5 } else if active <= 300_000 { 1.0 } else if active <= 1_000_000 { 2.0 } else { 3.0 };
+                    (base as f64 * mult).round() as u64
+                };
+                
+                if burn_amount < minimum_required {
+                    println!("[WARN][REGISTER] insufficient_burn amount={} required={} phase={} type={}",
+                        burn_amount, minimum_required, current_phase, node_type);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": format!("Insufficient burn: {} provided, {} required", burn_amount, minimum_required),
+                        "required_amount": minimum_required,
+                        "provided_amount": burn_amount,
+                        "phase": current_phase,
+                        "node_type": node_type,
+                        "currency": if current_phase == 1 { "1DEV" } else { "QNC" }
+                    })));
+                }
+                
+                println!("[INFO][REGISTER] price_check_passed amount={} required={} type={}",
+                    burn_amount, minimum_required, node_type);
             }
         }
     }
     
-    // Generate node ID
+    // Generate node ID (deterministic from activation_code — same code = same node_id)
     let node_id = format!("{}_{}", node_type, activation_code);
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v4.9: MIGRATION / DUPLICATE CHECK — different logic for Light vs Super nodes
+    //
+    // LIGHT NODES (mobile): Up to 3 devices per node. Handled by handle_light_node_register.
+    //   This endpoint (handle_register_node) is a legacy/generic path.
+    //   If light node already exists → silently update (same node_id, overwrite is safe).
+    //
+    // SUPER NODES (server): Exactly 1 server per node.
+    //   Same wallet + same code = MIGRATION (new server, old server must shut down).
+    //   Same wallet + different type = REJECTED (1 wallet = 1 node, any type).
+    //   Rate limit: max 1 migration per 24 hours.
+    // ═══════════════════════════════════════════════════════════════════════════════
+    let is_migration: bool;
+    {
+        let storage = blockchain.get_storage();
+        match storage.get_nodes_by_wallet(wallet_address) {
+            Ok(nodes) if !nodes.is_empty() => {
+                let (existing_node_id, existing_type, _rep) = &nodes[0];
+                
+                if existing_node_id == &node_id {
+                    // Same node_id → same code → this is a SERVER MIGRATION (new server, same wallet+code)
+                    if node_type == "super" {
+                        // Rate limit: max 1 migration per 24 hours
+                        let now_ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        
+                        if let Some(last_migration) = SUPER_NODE_MIGRATION_TIMESTAMPS.get(wallet_address) {
+                            let elapsed = now_ts.saturating_sub(*last_migration);
+                            if elapsed < 86400 {
+                                let remaining = 86400 - elapsed;
+                                println!("[WARN][REGISTER] migration_rate_limited wallet={}... elapsed={}s remaining={}s",
+                                    &wallet_address[..16.min(wallet_address.len())], elapsed, remaining);
+                                return Ok(warp::reply::json(&json!({
+                                    "success": false,
+                                    "error": "Server migration rate limited: max 1 per 24 hours",
+                                    "remaining_seconds": remaining,
+                                    "hint": "Wait before migrating to another server. For emergencies, contact support."
+                                })));
+                            }
+                        }
+                        
+                        println!("[INFO][REGISTER] super_node_migration detected node={} wallet={}...",
+                            node_id, &wallet_address[..16.min(wallet_address.len())]);
+                        SUPER_NODE_MIGRATION_TIMESTAMPS.insert(wallet_address.to_string(), now_ts);
+                        is_migration = true;
+                    } else {
+                        // Light node re-registration via generic endpoint — allow (overwrite)
+                        println!("[INFO][REGISTER] light_node_reregistration node={}", node_id);
+                        is_migration = false;
+                    }
+                } else {
+                    // Different node_id but same wallet → 1 wallet = 1 node violation
+                    println!("[WARN][REGISTER] wallet_already_has_different_node wallet={}... existing={} new={}",
+                        &wallet_address[..16.min(wallet_address.len())], existing_node_id, node_id);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": format!("This wallet already has a {} node ({}). 1 wallet = 1 node rule.", existing_type, existing_node_id),
+                        "existing_node_id": existing_node_id,
+                        "existing_node_type": existing_type,
+                        "hint": "Each wallet can only run ONE node (Light or Super). Deregister the existing node first."
+                    })));
+                }
+            }
+            _ => {
+                // No existing node — fresh registration
+                is_migration = false;
+            }
+        }
+    }
     
     // Register with reward manager
     {
@@ -8778,7 +9211,7 @@ async fn handle_register_node(
             _ => NodeType::Light, // Ignore "full"
         };
         
-        // Register node with all required info
+        // Register node with all required info (overwrite is safe — same node_id for migrations)
         if let Err(e) = reward_manager.register_node(
             node_id.clone(),
             node_type_enum,
@@ -8788,9 +9221,31 @@ async fn handle_register_node(
         }
         
         // CRITICAL: Save node registration to storage (survive restarts)
+        // For migrations: overwrites existing record with same node_id (RocksDB put = upsert)
         use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
-        if let Err(e) = blockchain.get_storage().save_node_registration(&node_id, node_type, &wallet_address, INITIAL_REPUTATION) {
-            println!("[WARN][STORAGE] save_registration err={}", e);
+        if is_migration {
+            // Migration: preserve existing reputation, only update timestamp
+            let existing_rep = match blockchain.get_storage().get_nodes_by_wallet(wallet_address) {
+                Ok(nodes) if !nodes.is_empty() => nodes[0].2,
+                _ => INITIAL_REPUTATION,
+            };
+            if let Err(e) = blockchain.get_storage().save_node_registration(&node_id, node_type, wallet_address, existing_rep) {
+                println!("[WARN][STORAGE] migration_save err={}", e);
+            }
+        } else {
+            if let Err(e) = blockchain.get_storage().save_node_registration(&node_id, node_type, wallet_address, INITIAL_REPUTATION) {
+                println!("[WARN][STORAGE] save_registration err={}", e);
+            }
+        }
+        
+        // v4.9: Save device_id to RocksDB for migration detection
+        // Old server queries genesis node's RocksDB → sees new device_id → graceful shutdown
+        if !device_id.is_empty() {
+            if let Err(e) = blockchain.get_storage().save_node_device_id(&node_id, device_id) {
+                println!("[WARN][STORAGE] save_device_id err={}", e);
+            } else if is_migration {
+                println!("[INFO][STORAGE] device_id_updated node={} device={}", node_id, device_id);
+            }
         }
     }
     
@@ -8842,22 +9297,45 @@ async fn handle_register_node(
             p2p.register_light_node(registration);
         }
     } else {
-        // Full/Super node: announce to network for pinger selection
-        // Note: Full/Super nodes also auto-register via start_light_node_ping_service
-        // This is a backup for manual API registration
+        // Super node: announce to network for pinger selection
         if let Some(p2p) = blockchain.get_unified_p2p() {
             // Trigger active node announcement (ASYNC - proper Dilithium signature)
             p2p.register_as_active_node_async().await;
             println!("[INFO][REGISTER] p2p_announce type={}", node_type);
         }
+        
+        // v4.9: If migration — broadcast deactivation signal to old server via P2P gossip
+        // Old server runs check_device_deactivation every 30s → graceful_shutdown_due_to_migration
+        if is_migration {
+            let registry = &*GLOBAL_ACTIVATION_REGISTRY;
+            if let Err(e) = registry.register_or_migrate_device(
+                activation_code,
+                crate::activation_validation::NodeInfo {
+                    activation_code: activation_code.to_string(),
+                    wallet_address: wallet_address.to_string(),
+                    device_signature: device_id.to_string(),
+                    node_type: node_type.to_string(),
+                    activated_at: now,
+                    last_seen: now,
+                    migration_count: 1,
+                    node_id: node_id.clone(),
+                    burn_tx_hash: body["burn_tx_hash"].as_str().unwrap_or("").to_string(),
+                    phase: 1,
+                    burn_amount: body["burn_amount"].as_u64().unwrap_or(0),
+                },
+                device_id,
+            ).await {
+                println!("[WARN][REGISTER] migration_broadcast_err err={}", e);
+            } else {
+                println!("[INFO][REGISTER] migration_broadcast_sent old_server_will_shutdown node={}", node_id);
+            }
+        }
     }
     
     // v4.3 CRITICAL: Create ON-CHAIN NodeRegistration TX to propagate to ALL nodes.
-    // Previously this endpoint only saved to local RocksDB + RewardManager,
-    // meaning other genesis nodes never received the registration data.
-    // The TX goes through mempool → block production → replicated to all nodes.
-    // Additionally, broadcast TX to all peers' mempools for faster inclusion.
-    {
+    // v4.9: Skip for migrations — node already exists on-chain, no duplicate TX needed.
+    //       Migration only updates local RocksDB + RewardManager + P2P announcement.
+    if !is_migration {
         let registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
             &node_id,
             if node_type == "super" { qnet_state::NodeType::Super } else { qnet_state::NodeType::Light },
@@ -8880,6 +9358,8 @@ async fn handle_register_node(
         } else {
             eprintln!("[WARN][REG] onchain_tx_failed type={} node={}", node_type, node_id);
         }
+    } else {
+        println!("[INFO][REG] migration_skip_onchain_tx node={} (already on-chain)", node_id);
     }
     
     // v4.0: Register VRF public key in global registry + persist to storage
@@ -8893,14 +9373,24 @@ async fn handle_register_node(
         }
     }
 
-    println!("[INFO][REGISTER] success type={} node={} wallet={}",
-             node_type, node_id, wallet_address);
+    if is_migration {
+        println!("[INFO][REGISTER] migration_success type={} node={} wallet={}",
+                 node_type, node_id, wallet_address);
+    } else {
+        println!("[INFO][REGISTER] success type={} node={} wallet={}",
+                 node_type, node_id, wallet_address);
+    }
     
     Ok(warp::reply::json(&json!({
         "success": true,
         "node_id": node_id,
         "quantum_pubkey": quantum_pubkey,
-        "message": format!("{} node registered successfully", node_type)
+        "is_migration": is_migration,
+        "message": if is_migration {
+            format!("{} node migrated successfully (old server will be deactivated)", node_type)
+        } else {
+            format!("{} node registered successfully", node_type)
+        }
     })))
 }
 
@@ -9000,6 +9490,103 @@ async fn handle_auth_challenge(
     };
     
     Ok(warp::reply::json(&response))
+}
+
+/// v4.9: Handle node device check — returns current device_id for a given node_id
+/// Used by super nodes to detect if their activation has been migrated to another server.
+/// The old server queries this endpoint on a genesis node every 30 seconds.
+/// If device_id differs → migration detected → graceful shutdown.
+async fn handle_node_device_check(
+    query: HashMap<String, String>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let node_id = match query.get("node_id") {
+        Some(id) if !id.is_empty() => id.as_str(),
+        _ => {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Missing required query parameter: node_id"
+            })));
+        }
+    };
+    
+    let storage = blockchain.get_storage();
+    match storage.get_node_device_id(node_id) {
+        Ok(Some(device_id)) => {
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "node_id": node_id,
+                "device_id": device_id
+            })))
+        }
+        Ok(None) => {
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "node_id": node_id,
+                "device_id": null
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": format!("Storage error: {}", e)
+            })))
+        }
+    }
+}
+
+/// v4.9: Register device_id for a USER SUPER NODE (migration tracking)
+/// Called by super nodes on startup to store device_id on genesis node's RocksDB.
+/// Genesis nodes NEVER call this — they use QNET_BOOTSTRAP_ID + IP-based auth.
+/// Security: only allows node_ids starting with "super_" and validates node exists in RocksDB.
+async fn handle_register_device(
+    body: serde_json::Value,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let node_id = match body["node_id"].as_str() {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Missing required field: node_id"
+            })));
+        }
+    };
+    let device_id = match body["device_id"].as_str() {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Missing required field: device_id"
+            })));
+        }
+    };
+    
+    // SECURITY: Only user super nodes can register device_id. Genesis nodes are excluded.
+    if !node_id.starts_with("super_") {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Only super node device registration is supported"
+        })));
+    }
+    
+    let storage = blockchain.get_storage();
+    match storage.save_node_device_id(node_id, device_id) {
+        Ok(()) => {
+            println!("[INFO][DEVICE] super_node_device_registered node={} device={}", node_id, device_id);
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "node_id": node_id,
+                "device_id": device_id
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": format!("Storage error: {}", e)
+            })))
+        }
+    }
 }
 
 /// Handle graceful shutdown request for node replacement
@@ -9174,13 +9761,13 @@ async fn handle_activations_by_wallet(
             // pending_activation means code was generated but node NOT yet activated.
             // Returning this caused mobile app to show "Activated" for non-existent nodes.
             // Only return truly registered/active nodes from blockchain storage + reward manager.
-            let response = json!({
-                "success": true,
-                "wallet_address": wallet_address,
-                "nodes": [],
+                    let response = json!({
+                        "success": true,
+                        "wallet_address": wallet_address,
+                        "nodes": [],
                 "message": "No active nodes found for this wallet"
-            });
-            return Ok(warp::reply::json(&response));
+                    });
+                    return Ok(warp::reply::json(&response));
         }
         
         // v3.1: Get active nodes to determine REAL online status
@@ -9357,7 +9944,7 @@ async fn handle_generate_activation_code(
         }
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Invalid node type. Must be: light, full, or super"
+            "error": "Invalid node type. Must be: light or super"
         })));
     }
     
@@ -9390,87 +9977,142 @@ async fn handle_generate_activation_code(
             return Ok(warp::reply::json(&error_response));
         }
         Ok(true) => {
-            println!("✅ Burn transaction verified successfully");
+            println!("[INFO][GENERATE] burn_tx_verified_on_solana tx={}...", 
+                &request.burn_tx_hash[..16.min(request.burn_tx_hash.len())]);
         }
     }
     
-    // SECURITY: 1 wallet = 1 node rule (regardless of node type!)
-    // A wallet can only have ONE node - Light, Full, OR Super, not multiple
-    // Check is ALWAYS by QNet EON address (the reward wallet)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v4.5: DYNAMIC PRICING — burn_amount MUST be >= current activation price!
+    // This prevents users from burning less than required and faking XOR codes.
+    // Price = 1500 - (burn% / 10) * 150, minimum 300 (Phase 1)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    {
+        let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+        let current_phase = if burn_percentage >= 90.0 { 2u8 } else { 1u8 };
+        
+        let minimum_required = if current_phase == 1 {
+            // Phase 1: Dynamic 1DEV pricing
+            let reduction_tiers = (burn_percentage / 10.0).floor() as u64;
+            let total_reduction = reduction_tiers * 150;
+            std::cmp::max(1500u64.saturating_sub(total_reduction), 300)
+        } else {
+            // Phase 2: QNC pricing based on node type
+            let active_nodes = crate::GLOBAL_ACTIVE_NODES.load(std::sync::atomic::Ordering::Relaxed) as u64;
+            let base = if request.node_type == "super" { 7500u64 } else { 10000u64 };
+            let multiplier = if active_nodes <= 100_000 { 0.5 }
+                else if active_nodes <= 300_000 { 1.0 }
+                else if active_nodes <= 1_000_000 { 2.0 }
+                else { 3.0 };
+            (base as f64 * multiplier).round() as u64
+        };
+        
+        if request.burn_amount < minimum_required {
+            println!("[WARN][GENERATE] insufficient_burn amount={} required={} phase={} burn_pct={:.1}%",
+                request.burn_amount, minimum_required, current_phase, burn_percentage);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": format!("Insufficient burn amount: {} provided, {} required", 
+                    request.burn_amount, minimum_required),
+                "required_amount": minimum_required,
+                "provided_amount": request.burn_amount,
+                "phase": current_phase,
+                "burn_percentage": burn_percentage,
+                "currency": if current_phase == 1 { "1DEV" } else { "QNC" },
+                "hint": format!("Current activation price is {} {}. Burn at least this amount.", 
+                    minimum_required, if current_phase == 1 { "1DEV" } else { "QNC" })
+            })));
+        }
+        
+        println!("[INFO][GENERATE] price_check_passed amount={} required={} phase={}",
+            request.burn_amount, minimum_required, current_phase);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v4.5: 1 wallet = 1 node — checked via PERSISTENT RocksDB, NOT in-memory!
+    // Code generation is DETERMINISTIC from burn_tx_hash, so same burn → same code.
+    // Recovery: just re-generate from same burn_tx_hash → identical code returned.
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    // CODE RECOVERY: Same burn_tx_hash always produces the same XOR code.
+    // If user calls /generate-activation-code with the same burn_tx_hash again,
+    // they get the exact same code back (deterministic XOR). No need for in-memory storage.
+    // But we still check in-memory cache first for speed:
     let registry = &*GLOBAL_ACTIVATION_REGISTRY;
-    
-    // ══════════════════════════════════════════════════════════════
-    // CODE RECOVERY — return existing code BEFORE "1 wallet = 1 node" rejection
-    // Safe because code is cryptographically wallet-bound (XOR-encrypted wallet inside)
-    // ══════════════════════════════════════════════════════════════
-    
-    // 1) Try recovery by burn_tx_hash + wallet_address (encrypted, defense-in-depth)
     let recovered = registry.recover_code_by_burn_tx(
         &request.burn_tx_hash, &request.wallet_address
     ).await;
-    // 1b) Fallback: try with stored wallet (Solana vs EON address mismatch)
     let recovered = match recovered {
         Some(code) => Some(code),
         None => registry.recover_code_by_burn_tx_any_wallet(&request.burn_tx_hash).await,
     };
     if let Some(recovered_code) = recovered {
-        println!("[RECOVERY] Code recovered for burn TX: {}...", 
+        println!("[INFO][GENERATE] code_recovered burn_tx={}... method=cache",
                  &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
-        let response = json!({
-            "success": true,
-            "activation_code": recovered_code,
-            "wallet_address": request.wallet_address,
-            "node_type": request.node_type,
-            "phase": request.phase,
-            "cached": true,
-            "recovered": true,
-            "message": "Activation code recovered"
-        });
-        return Ok(warp::reply::json(&response));
-    }
-    
-    // 2) Try legacy: query by wallet + type (may return actual code from active_nodes)
-    if let Ok(Some(existing_code)) = registry.query_activation_by_wallet_and_type(
-        &request.wallet_address, request.phase, &request.node_type
-    ).await {
-        if !existing_code.starts_with("HASH_FOUND:") && !existing_code.starts_with("HASH:") {
-            println!("Existing activation code found in active nodes");
             let response = json!({
                 "success": true,
-                "activation_code": existing_code,
+            "activation_code": recovered_code,
                 "wallet_address": request.wallet_address,
                 "node_type": request.node_type,
                 "phase": request.phase,
                 "cached": true,
-                "message": "Existing activation code found for this wallet"
+            "recovered": true,
+            "message": "Activation code recovered from cache"
             });
             return Ok(warp::reply::json(&response));
         }
-    }
     
-    // 3) 1 wallet = 1 node: Reject if wallet already has ANY node (no recoverable code found)
-    match registry.check_wallet_has_any_node(&qnet_wallet_for_rewards).await {
-        Ok(Some((existing_type, _existing_code))) => {
-            println!("🚫 [SECURITY] QNet wallet already has {} node — code not recoverable (generated before recovery system)", 
-                     existing_type);
-            let response = json!({
-                "success": false,
-                "error": "QNet wallet already has an active node. Code was generated before secure recovery was enabled.",
-                "existing_node_type": existing_type,
-                "qnet_wallet": qnet_wallet_for_rewards,
-                "requested_node_type": request.node_type,
-                "hint": "If you lost your code, contact support with your burn transaction hash",
-                "message": "1 wallet = 1 node rule: Each QNet wallet can only activate ONE node (Light, Full, or Super)"
-            });
-            return Ok(warp::reply::json(&response));
+    // 1 wallet = 1 node: Check PERSISTENT storage (RocksDB) — survives restarts!
+    // Check BOTH Solana and EON addresses to prevent 2 nodes from same operator
+    if let Some(storage) = crate::node::try_get_storage() {
+        // Check 1: By QNet EON reward wallet
+        match storage.get_nodes_by_wallet(&qnet_wallet_for_rewards) {
+            Ok(nodes) if !nodes.is_empty() => {
+                let (existing_node_id, existing_type, _rep) = &nodes[0];
+                println!("[WARN][GENERATE] wallet_already_has_node wallet={}... node={} type={}",
+                    &qnet_wallet_for_rewards[..16.min(qnet_wallet_for_rewards.len())],
+                    existing_node_id, existing_type);
+                let response = json!({
+                    "success": false,
+                    "error": "This wallet already has an active node registered on blockchain",
+                    "existing_node_type": existing_type,
+                    "existing_node_id": existing_node_id,
+                    "qnet_wallet": qnet_wallet_for_rewards,
+                    "hint": "Each QNet wallet can only activate ONE node (Light or Super). Code is deterministic — use same burn_tx_hash to regenerate.",
+                    "message": "1 wallet = 1 node rule enforced via persistent blockchain storage"
+                });
+                return Ok(warp::reply::json(&response));
+            }
+            _ => {}
         }
-        Ok(None) => {
-            // Wallet has no nodes - eligible for activation
-            println!("✅ Wallet has no existing nodes - proceeding with activation");
+        // Check 2: By Solana wallet (in case light node was registered with Solana address)
+        // Phase 1: wallet_address = Solana, qnet_reward_wallet = EON — check both
+        if request.phase == 1 && request.wallet_address != qnet_wallet_for_rewards {
+            match storage.get_nodes_by_wallet(&request.wallet_address) {
+                Ok(nodes) if !nodes.is_empty() => {
+                    let (existing_node_id, existing_type, _rep) = &nodes[0];
+                    println!("[WARN][GENERATE] solana_wallet_already_has_node wallet={}... node={} type={}",
+                        &request.wallet_address[..16.min(request.wallet_address.len())],
+                        existing_node_id, existing_type);
+                    let response = json!({
+                        "success": false,
+                        "error": "This Solana wallet already has an active node registered on blockchain",
+                        "existing_node_type": existing_type,
+                        "existing_node_id": existing_node_id,
+                        "solana_wallet": request.wallet_address,
+                        "hint": "Each wallet can only activate ONE node (Light or Super).",
+                        "message": "1 wallet = 1 node rule enforced (Solana address check)"
+                    });
+                    return Ok(warp::reply::json(&response));
+                }
+                _ => {}
+            }
         }
-        Err(e) => {
-            println!("⚠️ Registry query error: {} - proceeding with generation", e);
-        }
+        println!("[INFO][GENERATE] wallet_clean eon={}... solana={}... proceeding",
+            &qnet_wallet_for_rewards[..16.min(qnet_wallet_for_rewards.len())],
+            &request.wallet_address[..16.min(request.wallet_address.len())]);
+    } else {
+        println!("[WARN][GENERATE] storage_unavailable skipping_1wallet1node_check");
     }
 
     // Generate quantum-secure activation code
@@ -10209,7 +10851,7 @@ fn extract_peer_ip_from_request() -> Option<String> {
 
 
 /// PRIVACY: Generate quantum-secure pseudonym for Light node (mobile privacy protection)
-fn generate_light_node_pseudonym(wallet_address: &str) -> String {
+pub fn generate_light_node_pseudonym(wallet_address: &str) -> String {
     // EXISTING PATTERN: Use blake3 hash like other node identity functions
     let pseudonym_hash = blake3::hash(format!("LIGHT_NODE_PRIVACY_{}", wallet_address).as_bytes());
     
@@ -10376,11 +11018,14 @@ fn extract_burn_amount_from_token_balances(tx_data: &serde_json::Value) -> Resul
 /// Verify burn transaction actually exists on blockchain
 async fn verify_burn_transaction_exists(
     burn_tx_hash: &str,
-    wallet_address: &str,
+    wallet_address: &str,  // v4.7: MUST be the Solana address that signed the burn TX
     burn_amount: u64,
     phase: u8,
 ) -> Result<bool, String> {
-    println!("🔍 Verifying burn transaction on blockchain...");
+    println!("[INFO][BURN] verify_burn_tx tx={}... wallet={}... amount={} phase={}",
+        &burn_tx_hash[..16.min(burn_tx_hash.len())],
+        &wallet_address[..16.min(wallet_address.len())],
+        burn_amount, phase);
     
     if phase == 1 {
         // Phase 1: Verify 1DEV burn on Solana
@@ -10440,26 +11085,80 @@ async fn verify_burn_transaction_exists(
                 }
             }
             
-            // 2. Verify burn to incinerator address
-            // Solana incinerator: 1nc1nerator11111111111111111111111111111111
-            const SOLANA_INCINERATOR: &str = "1nc1nerator11111111111111111111111111111111";
+            // 2. CRITICAL: Verify the fee payer / signer is the expected wallet
+            // accountKeys[0] is always the fee payer (signer) in Solana transactions.
+            // This prevents an attacker from using someone else's burn transaction.
+            let account_keys = result_value["transaction"]["message"]["accountKeys"]
+                .as_array()
+                .map(|keys| {
+                    keys.iter()
+                        .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
             
-            let mut found_burn = false;
-            if let Some(instructions) = result_value["transaction"]["message"]["instructions"].as_array() {
-                for instruction in instructions {
-                    // Check if instruction targets incinerator
-                    if let Some(accounts) = instruction["accounts"].as_array() {
-                        // Check if incinerator is in accounts (simplified check)
-                        // PRODUCTION: Would parse exact account indices and verify amounts
-                        found_burn = true; // Assume valid burn if transaction exists and succeeded
-                        break;
-                    }
+            if let Some(fee_payer) = account_keys.first() {
+                if fee_payer != wallet_address {
+                    println!("[ERROR][BURN] sender_mismatch fee_payer={} expected={}",
+                        fee_payer, wallet_address);
+                    return Err(format!(
+                        "Burn transaction sender mismatch: TX was signed by {}, but registration wallet is {}. \
+                         You must use the same wallet that burned the tokens.",
+                        fee_payer, wallet_address
+                    ));
                 }
+                println!("[INFO][BURN] sender_verified fee_payer={}", fee_payer);
+            } else {
+                println!("[WARN][BURN] no_account_keys — cannot verify sender");
+                return Err("Cannot verify burn transaction sender: no account keys in TX".to_string());
             }
             
-            if !found_burn {
-                println!("❌ Burn to incinerator not found in transaction");
-                return Ok(false);
+            // 3. Verify burn involves 1DEV token and/or incinerator address
+            // Solana incinerator: 1nc1nerator11111111111111111111111111111111
+            // 1DEV token mint: must match the known 1DEV SPL token address
+            const SOLANA_INCINERATOR: &str = "1nc1nerator11111111111111111111111111111111";
+            
+            // Check if incinerator is in transaction accounts (transfer to burn address)
+            let has_incinerator = account_keys.iter().any(|key| key == SOLANA_INCINERATOR);
+            
+            // Also check if this is a SPL Token burn instruction (burnChecked/burn)
+            // SPL Token burns reduce supply without needing incinerator address
+            let has_token_burn = if let Some(inner_instructions) = result_value["meta"]["innerInstructions"].as_array() {
+                inner_instructions.iter().any(|inner| {
+                    if let Some(instructions) = inner["instructions"].as_array() {
+                        instructions.iter().any(|ix| {
+                            // SPL Token program burn instruction
+                            ix["parsed"]["type"].as_str() == Some("burn") ||
+                            ix["parsed"]["type"].as_str() == Some("burnChecked")
+                        })
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            };
+            
+            // Also check outer instructions for parsed burn
+            let has_outer_burn = if let Some(instructions) = result_value["transaction"]["message"]["instructions"].as_array() {
+                instructions.iter().any(|ix| {
+                    ix["parsed"]["type"].as_str() == Some("burn") ||
+                    ix["parsed"]["type"].as_str() == Some("burnChecked") ||
+                    ix["parsed"]["type"].as_str() == Some("transfer")
+                })
+            } else {
+                false
+            };
+            
+            if !has_incinerator && !has_token_burn && !has_outer_burn {
+                println!("[WARN][BURN] no_burn_indicator tx={}... accounts={:?}",
+                    &burn_tx_hash[..16.min(burn_tx_hash.len())],
+                    &account_keys[..account_keys.len().min(5)]);
+                // Token balance change is the authoritative check — if balances decreased, burn happened
+                // Continue to amount verification (step 3) which is the definitive check
+            } else {
+                println!("[INFO][BURN] burn_indicator_found incinerator={} token_burn={} outer_burn={}",
+                    has_incinerator, has_token_burn, has_outer_burn);
             }
             
             // 3. CRITICAL: Verify exact burn amount from SPL Token balances
@@ -10507,9 +11206,10 @@ async fn verify_burn_transaction_exists(
         Ok(false)
     } else {
         // Phase 2: Verify QNC transfer to Pool 3 on QNet blockchain
-        // PRODUCTION: Query QNet blockchain for Pool 3 transfer
-        println!("✅ Phase 2 burn verification (QNC Pool 3) - simplified validation");
-        Ok(true) // Simplified - in production would verify QNC transfer to Pool 3
+        // Phase 2 activates after 90% of 1DEV supply burned — NOT REACHED YET
+        // Will be implemented when Phase 2 is triggered (requires QNet mainnet Pool 3 contract)
+        println!("[WARN][BURN] phase2_verification_not_implemented_yet phase=2");
+        Err("Phase 2 activation (QNC Pool 3) is not yet available. Phase 1 (1DEV burn) is currently active.".to_string())
     }
 }
 

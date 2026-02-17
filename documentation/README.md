@@ -149,7 +149,7 @@ curl http://localhost:8545/api/v1/metrics
 - **Sub-second finality** for small transactions
 - **Adaptive batch processing** up to 50k transactions
 - **Regional P2P clustering** for optimal routing
-- **Post-quantum cryptography** (Dilithium + Kyber)
+- **Post-quantum cryptography** (Dilithium3 + Ed25519 hybrid)
 
 ### Node Types & Capabilities
 
@@ -178,8 +178,8 @@ curl http://localhost:8545/api/v1/metrics
 // Signature scheme
 Dilithium3 (NIST standard)
 
-// Key encapsulation  
-Kyber1024 (high security)
+// Key storage encryption  
+AES-256-GCM (NIST FIPS 197)
 
 // Hash function
 SHA3-256 (quantum-resistant)

@@ -68,7 +68,7 @@
 1DEV tokens serve as activation credits for QNET blockchain nodes:
 
 - **Current Activation Cost:** 1,500 1DEV (for all node types)
-- **Node Types:** Light Node, Full Node, Super Node
+- **Node Types:** Light Node, Super Node (Full Node removed in v3.18)
 - **Burn Process:** Tokens are permanently removed from circulation when used for activation
 
 ### Dynamic Pricing Model

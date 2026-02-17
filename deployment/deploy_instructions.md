@@ -12,19 +12,24 @@ git pull origin testnet
 # 2. Build Docker image
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
-# 3. Run interactive setup (ONLY activation method)
-docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/node_data:/app/node_data \
+# 3. Run Super Node (env vars — same architecture as Genesis nodes)
+docker run -d --name qnet-super --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
+  -e QNET_PRODUCTION=1 \
+  -e DOCKER_ENV=1 \
+  -e QNET_WALLET_SEED="your twelve word mnemonic phrase here" \
+  -e QNET_ACTIVATION_CODE="QNET-SXXXXX-YYYYYY-ZZZZZZ" \
+  -e QNET_BURN_TX_HASH="your_solana_burn_tx_signature" \
+  -e QNET_BURN_AMOUNT="1500" \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+  -v $(pwd)/node_data:/app/data \
   qnet-production
 ```
 
-**The interactive menu handles all activation automatically:**
-- Region detection
-- Node type selection (Full/Super)
-- Activation code input
-- Network configuration
-- Daemon mode startup
+**Single deployment method: Docker detached mode with environment variables.**
+No interactive menu — all configuration via `-e` flags (identical to Genesis node architecture).
+
+Get activation data from QNet Mobile App: **Settings > Export Activation Codes**
 
 ---
 
@@ -72,23 +77,39 @@ git pull origin testnet
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 ```
 
-## Step 4: Run Interactive Setup (ONLY Method)
+## Step 4: Run Super Node
 
 ```bash
-docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/node_data:/app/node_data \
+docker run -d --name qnet-super --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
+  -e QNET_PRODUCTION=1 \
+  -e DOCKER_ENV=1 \
+  -e QNET_WALLET_SEED="your twelve word mnemonic phrase here" \
+  -e QNET_ACTIVATION_CODE="QNET-SXXXXX-YYYYYY-ZZZZZZ" \
+  -e QNET_BURN_TX_HASH="your_solana_burn_tx_signature" \
+  -e QNET_BURN_AMOUNT="1500" \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+  -v $(pwd)/node_data:/app/data \
   qnet-production
 ```
 
-**The interactive setup will:**
-1. **Auto-detect region** based on your IP
-2. **Choose node type** (Full Node or Super Node for servers)
-3. **Enter activation code** (QNET-XXXXXX-XXXXXX-XXXXXX format, 26 characters)
-4. **Generate quantum-resistant keys**
-5. **Configure P2P network**
-6. **Start daemon mode** automatically
-7. **Begin consensus participation**
+**Required environment variables:**
+| Variable | Description |
+|----------|-------------|
+| `QNET_WALLET_SEED` | 12-word BIP39 mnemonic (same as mobile app) |
+| `QNET_ACTIVATION_CODE` | `QNET-SXXXXX-YYYYYY-ZZZZZZ` (25 chars, from mobile app) |
+| `QNET_BURN_TX_HASH` | Solana burn transaction signature |
+| `QNET_BURN_AMOUNT` | Exact 1DEV amount burned (e.g. `1500`) |
+| `QNET_PRODUCTION` | Set to `1` |
+| `DOCKER_ENV` | Set to `1` |
+
+**On startup the node will:**
+1. Derive Solana address from mnemonic (BIP39 → SLIP-10 → Ed25519)
+2. XOR-verify activation code belongs to this mnemonic
+3. Verify burn TX on Solana (amount + feePayer check)
+4. Generate quantum-resistant Dilithium3 keys
+5. Register on-chain via NodeRegistration TX
+6. Begin consensus participation
 
 ## Node Management
 
@@ -132,10 +153,11 @@ curl http://localhost:9877/api/v1/height
 ## Activation Requirements
 
 **Valid activation codes required:**
-- **Format:** QNET-XXXXXX-XXXXXX-XXXXXX (26 characters)
-- **Phase 1:** 1DEV burn on Solana (1,500 → 300 1DEV minimum pricing)
+- **Format:** QNET-XXXXXX-XXXXXX-XXXXXX (25 characters)
+- **Phase 1:** 1DEV burn on Solana (1,500 -> 300 1DEV dynamic pricing)
 - **Phase 2:** QNC transfer to Pool 3 (5k-30k QNC pricing)
-- **Node Types:** Full/Super for servers, Light for mobile only
+- **Node Types:** Super for servers only, Light for mobile only (Full removed in v3.18)
+- **Required env vars:** `QNET_ACTIVATION_CODE`, `QNET_BURN_TX_HASH`, `QNET_BURN_AMOUNT`, `QNET_WALLET_SEED`
 
 **Get activation codes:**
 - QNet Browser Extension
@@ -151,6 +173,38 @@ sudo ufw allow 9877  # RPC endpoint
 sudo ufw allow 8001  # REST API
 sudo ufw --force enable
 ```
+
+## Super Node Server Migration
+
+**To migrate your Super Node to a new server**, simply run the same Docker command on the new server with the same environment variables:
+
+```bash
+docker run -d --name qnet-super --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
+  -e QNET_PRODUCTION=1 \
+  -e DOCKER_ENV=1 \
+  -e QNET_WALLET_SEED="your twelve word mnemonic phrase here" \
+  -e QNET_ACTIVATION_CODE="QNET-SXXXXX-YYYYYY-ZZZZZZ" \
+  -e QNET_BURN_TX_HASH="your_solana_burn_tx_signature" \
+  -e QNET_BURN_AMOUNT="1500" \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+  -v $(pwd)/node_data:/app/data \
+  qnet-production
+```
+
+**What happens automatically:**
+1. New server registers its `device_id` with genesis nodes
+2. Old server detects the change within ~30 seconds
+3. Old server performs graceful shutdown (stops QUIC, clears activation, exits)
+4. Node reputation is **preserved** — no penalty for migration
+5. No duplicate on-chain transactions created
+
+**Limitations:**
+- Max **1 migration per 24 hours** per wallet (rate limited)
+- Same activation code + mnemonic required
+- Genesis nodes are **not affected** — they use IP-based authentication
+
+**NOTE:** You do NOT need to stop the old server manually. It will shut down automatically after detecting the migration.
 
 ## Troubleshooting
 
@@ -174,13 +228,18 @@ curl http://localhost:8001/api/v1/node/health
 **Container issues:**
 ```bash
 # Remove old container
-docker stop qnet-node || true
-docker rm qnet-node || true
+docker stop qnet-super || true
+docker rm qnet-super || true
 
-# Run fresh container
-docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/node_data:/app/node_data \
+# Run fresh container with env vars
+docker run -d --name qnet-super --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
+  -e QNET_PRODUCTION=1 -e DOCKER_ENV=1 \
+  -e QNET_WALLET_SEED="your mnemonic" \
+  -e QNET_ACTIVATION_CODE="QNET-SXXXXX-YYYYYY-ZZZZZZ" \
+  -e QNET_BURN_TX_HASH="solana_tx" -e QNET_BURN_AMOUNT="1500" \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
+  -v $(pwd)/node_data:/app/data \
   qnet-production
 ```
 

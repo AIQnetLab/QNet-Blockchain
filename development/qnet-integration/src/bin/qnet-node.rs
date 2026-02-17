@@ -5,10 +5,10 @@
 
 //! QNet Production Node - 100k+ TPS Ready
 //! 
-//! PRODUCTION DEPLOYMENT: Interactive Setup Only
-//! - No command-line arguments for activation
-//! - Use built-in interactive menu for node configuration
-//! - Activation code required (format: QNET-XXXXXX-XXXXXX-XXXXXX)
+//! PRODUCTION DEPLOYMENT: Docker Environment Variables Only
+//! - Genesis: QNET_BOOTSTRAP_ID + QNET_WALLET_SEED
+//! - Super:   QNET_ACTIVATION_CODE + QNET_BURN_TX_HASH + QNET_BURN_AMOUNT + QNET_WALLET_SEED
+//! - No interactive menu — env vars only (same architecture as genesis nodes)
 //! 
 //! Features:
 //! - Microblocks as default mode for 100k+ TPS
@@ -54,6 +54,7 @@ async fn get_current_phase_simple() -> Result<u8, String> {
 }
 
 // Quantum-secure activation code decryption with Light node blocking
+#[allow(dead_code)]
 async fn decode_activation_code_quantum_secure(
     code: &str, 
     selected_node_type: NodeType
@@ -119,7 +120,7 @@ async fn decode_activation_code_quantum_secure(
     let purchase_phase = if payload.burn_tx.starts_with("burn_tx_") { 1 } else { 2 };
 
     println!("✅ Quantum-secure activation code validation successful");
-    println!("   🔐 Quantum encryption: CRYSTALS-Kyber compatible");
+    println!("   🔐 Quantum encryption: CRYSTALS-Dilithium3 (NIST FIPS 204)");
     println!("   📝 Digital signature: Dilithium verified"); 
     println!("   🛡️  Wallet binding: Cryptographically secured");
     println!("   ♾️  Permanent: Code never expires");
@@ -134,6 +135,7 @@ async fn decode_activation_code_quantum_secure(
 }
 
 // Validate activation code matches expected node type and payment
+#[allow(dead_code)]
 fn validate_activation_code_node_type(code: &str, expected_type: NodeType, current_phase: u8, current_pricing: &PricingInfo) -> Result<(), String> {
     println!("\n🔍 === Activation Code Validation ===");
     
@@ -173,6 +175,7 @@ fn validate_activation_code_node_type(code: &str, expected_type: NodeType, curre
 // Phase 2: Base * multiplier (0.5x to 3.0x based on network size)
 
 // Device type validation functions
+#[allow(dead_code)]
 fn validate_server_node_type(node_type: NodeType) -> Result<(), String> {
     match node_type {
         NodeType::Light => {
@@ -193,6 +196,7 @@ fn validate_server_node_type(node_type: NodeType) -> Result<(), String> {
     }
 }
 
+#[allow(dead_code)]
 async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &PricingInfo, activation_code: &str) -> Result<(), String> {
     let price = calculate_node_price(phase, node_type, pricing);
     let price_str = format_price(phase, price);
@@ -242,7 +246,7 @@ async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &Pr
     Ok(())
 }
 
-// Check for existing activation or run interactive setup
+// Check for existing activation from env vars or RocksDB
 async fn check_existing_activation_or_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
     // Use the new activation function with auto-genesis detection
     get_activation_with_auto_genesis().await
@@ -441,6 +445,7 @@ fn get_existing_bootstrap_nodes() -> Vec<String> {
 }
 
 // Comprehensive activation code validation (ALL checks before acceptance)
+#[allow(dead_code)]
 async fn validate_activation_code_comprehensive(
     code: &str, 
     node_type: NodeType, 
@@ -549,7 +554,9 @@ async fn verify_activation_burn(code: &str, node_type: &NodeType) -> Result<(), 
     }
 }
 
-// Interactive node setup functions
+// Legacy interactive setup — no longer called in production.
+// Kept as dead code for potential future dev/testing use.
+#[allow(dead_code)]
 async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
     println!("🚀 QNet Node Setup");
     
@@ -649,7 +656,7 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
     println!("🔮 QNET QUANTUM BLOCKCHAIN NODE INITIALIZED");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("🚀 Node Type: {:?} | 🔐 Post-Quantum Security: ACTIVE", node_type);
-    println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium + CRYSTALS-Kyber");
+    println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium3 + ML-KEM-768 + Ed25519 Hybrid");
     println!("⚡ Performance Target: 100,000+ TPS | ⏱️  Block Time: 1s microblocks");
     println!("🌐 Network: Production Ready | 💎 Consensus: Byzantine-BFT");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -1038,6 +1045,7 @@ fn calculate_network_multiplier(network_size: u64) -> f64 {
     }
 }
 
+#[allow(dead_code)]
 fn display_phase_info(phase: u8, pricing: &PricingInfo) {
     match phase {
         1 => println!("🔥 Phase 1: {} active nodes, {:.1}% burned", pricing.network_size, pricing.burn_percentage),
@@ -1046,6 +1054,7 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
     }
 }
 
+#[allow(dead_code)]
 fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dyn std::error::Error>> {
     // SECURITY: Check if this is a Genesis node - if so, auto-select Super Node type
     if is_genesis_bootstrap_node() {
@@ -1093,6 +1102,7 @@ fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dy
     }
 }
 
+#[allow(dead_code)]
 fn calculate_node_price(phase: u8, node_type: NodeType, pricing: &PricingInfo) -> f64 {
     match phase {
         1 => {
@@ -1126,6 +1136,7 @@ fn calculate_node_price(phase: u8, node_type: NodeType, pricing: &PricingInfo) -
     }
 }
 
+#[allow(dead_code)]
 fn format_price(phase: u8, price: f64) -> String {
     match phase {
         1 => format!("{:.0} 1DEV", price),
@@ -1134,6 +1145,7 @@ fn format_price(phase: u8, price: f64) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn format_node_type(node_type: NodeType) -> &'static str {
     match node_type {
         NodeType::Light => "Light Node ",
@@ -1141,10 +1153,12 @@ fn format_node_type(node_type: NodeType) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn display_activation_cost(phase: u8, node_type: NodeType, price: f64) {
     println!("\n💳 Cost: {}", format_price(phase, price));
 }
 
+#[allow(dead_code)]
 fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Error>> {
     if is_genesis_bootstrap_node() {
         print!("🚀 Genesis node (press ENTER): ");
@@ -2514,7 +2528,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Auto-configure everything
     let config = AutoConfig::new().await?;
     
-    // PRODUCTION: Check for existing activation or run interactive setup
+    // PRODUCTION: Check for existing activation from env vars or RocksDB
     let (node_type, activation_code) = check_existing_activation_or_setup().await?;
     
     // Configure production mode (microblocks by default)
@@ -2628,7 +2642,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         println!("✅ Quantum activation recorded in QNet blockchain successfully");
         println!("   📝 Node: {}...", &node_pubkey[..12]);
-        println!("   🔐 Quantum-secure: CRYSTALS-Kyber + Dilithium");
+        println!("   🔐 Quantum-secure: CRYSTALS-Dilithium3 (NIST FIPS 204)");
         println!("   🚫 Database: Not used - blockchain is source of truth");
 
         // PRODUCTION: Auto-shutdown previous nodes of same type for this wallet
@@ -3515,6 +3529,7 @@ async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: f
     Ok(false)
 }
 
+#[allow(dead_code)]
 async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_hash: &str, required_amount: u64) -> Result<bool, String> {
     println!("📡 PRODUCTION: Verifying 1DEV burn on Solana for node activation...");
     
@@ -4552,19 +4567,58 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
         
         return Ok((NodeType::Super, genesis_code));
     } else {
-        println!("[DEBUG] ❌ NOT a genesis node - checking storage...");
+        println!("[DEBUG] ❌ NOT a genesis node - checking env/storage...");
     }
     
-    // Try to initialize storage first
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v4.5: PRIORITY 1 — Read activation code from environment variable
+    // This is the PRIMARY method for Docker detached mode (-d):
+    //   docker run -d -e QNET_ACTIVATION_CODE=QNET-SXXXXX-YYYYYY-ZZZZZZ \
+    //              -e QNET_BURN_TX_HASH=<solana_tx_signature> \
+    //              -e QNET_BURN_AMOUNT=1500 ...
+    // Code is SELF-CONTAINED: XOR(wallet_prefix, SHA3(burn_tx:type:amount))
+    // Verification is STATELESS — no node state needed.
+    // ═══════════════════════════════════════════════════════════════════════════════
+    if let Ok(env_code) = std::env::var("QNET_ACTIVATION_CODE") {
+        let env_code = env_code.trim().to_string();
+        if !env_code.is_empty() && env_code.starts_with("QNET-") {
+            println!("[INFO][STARTUP] activation_source=env_var code={}...", &env_code[..12.min(env_code.len())]);
+            
+            // Read burn data from env for stateless verification
+            let burn_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
+            let burn_amount: u64 = std::env::var("QNET_BURN_AMOUNT")
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(0);
+            
+            if !burn_tx.is_empty() && burn_amount > 0 {
+                // Store burn data in env for later use by save_activation_code
+                std::env::set_var("QNET_BURN_TX_HASH", &burn_tx);
+                std::env::set_var("QNET_BURN_AMOUNT", burn_amount.to_string());
+                println!("[INFO][STARTUP] burn_data=present tx={}... amount={}",
+                    &burn_tx[..16.min(burn_tx.len())], burn_amount);
+            } else {
+                println!("[WARN][STARTUP] burn_data=missing — set QNET_BURN_TX_HASH and QNET_BURN_AMOUNT for full verification");
+                println!("[WARN][STARTUP] Code will still be validated via comprehensive checks at startup");
+            }
+            
+            // Server nodes are always Super (Light → exit(1) enforced later)
+            return Ok((NodeType::Super, env_code));
+        }
+    }
+    
+    // PRIORITY 2: Check persistent RocksDB storage (previous activation)
     let temp_storage = match Storage::new("./temp_activation_check") {
         Ok(storage) => storage,
         Err(e) => {
-            println!("[WARNING] Storage not available: {}, running interactive setup", e);
-            return interactive_node_setup().await;
+            println!("[WARNING] Storage not available: {} — skipping RocksDB check", e);
+            // Fall through to error message below (no interactive fallback)
+            eprintln!("❌ No QNET_ACTIVATION_CODE env var and storage unavailable.");
+            eprintln!("   Set QNET_ACTIVATION_CODE, QNET_BURN_TX_HASH, QNET_BURN_AMOUNT, QNET_WALLET_SEED");
+            std::process::exit(1);
         }
     };
     
-    // Check for existing activation code
     println!("[DEBUG] Loading activation code from storage...");
     match temp_storage.load_activation_code() {
         Ok(Some((code, node_type_id, timestamp))) => {
@@ -4576,27 +4630,48 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
                 _ => NodeType::Super,
             };
             
-            // Check if activation is still valid (codes never expire - tied to blockchain burns)
-            println!("[SUCCESS] Found valid activation code with cryptographic binding");
-            println!("   [CODE] Code: {}", mask_code(&code));
+            println!("[INFO][STARTUP] activation_source=rocksdb code={}", mask_code(&code));
             println!("   [TYPE] Node Type: {:?}", node_type);
             let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             println!("   [TIME] Activated: {} days ago", (current_time - timestamp) / (24 * 60 * 60));
-            println!("   [UNIVERSAL] Works on VPS, VDS, PC, laptop, server");
             println!("   [RESUMING] Resuming node with existing activation...\n");
             return Ok((node_type, code));
         }
         Ok(None) => {
-            println!("[DEBUG] No existing activation found");
+            println!("[DEBUG] No existing activation found in storage");
         }
         Err(e) => {
             println!("[WARNING] Error checking activation: {}", e);
         }
     }
     
-    // For non-genesis nodes, run interactive setup
-    println!("[DEBUG] Regular node detected - starting interactive setup");
-    interactive_node_setup().await
+    // NO INTERACTIVE MENU — super nodes use env vars ONLY (same as genesis nodes)
+    // If we get here: no QNET_BOOTSTRAP_ID, no QNET_ACTIVATION_CODE, no saved activation
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("❌ ACTIVATION REQUIRED — no activation data found");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("");
+    eprintln!("Super Node requires these environment variables:");
+    eprintln!("  -e QNET_ACTIVATION_CODE=\"QNET-SXXXXX-YYYYYY-ZZZZZZ\"");
+    eprintln!("  -e QNET_BURN_TX_HASH=\"your_solana_burn_tx_signature\"");
+    eprintln!("  -e QNET_BURN_AMOUNT=\"1500\"");
+    eprintln!("  -e QNET_WALLET_SEED=\"your twelve word mnemonic phrase here\"");
+    eprintln!("");
+    eprintln!("Example:");
+    eprintln!("  docker run -d --name qnet-super --restart=always \\");
+    eprintln!("    -e QNET_PRODUCTION=1 \\");
+    eprintln!("    -e DOCKER_ENV=1 \\");
+    eprintln!("    -e QNET_WALLET_SEED=\"your mnemonic here\" \\");
+    eprintln!("    -e QNET_ACTIVATION_CODE=\"QNET-SXXXXX-YYYYYY-ZZZZZZ\" \\");
+    eprintln!("    -e QNET_BURN_TX_HASH=\"solana_tx_signature\" \\");
+    eprintln!("    -e QNET_BURN_AMOUNT=\"1500\" \\");
+    eprintln!("    -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \\");
+    eprintln!("    -v $(pwd)/node_data:/app/data \\");
+    eprintln!("    qnet-production");
+    eprintln!("");
+    eprintln!("Get activation data from QNet Mobile App: Settings > Export Activation Codes");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    std::process::exit(1);
 }
 
 

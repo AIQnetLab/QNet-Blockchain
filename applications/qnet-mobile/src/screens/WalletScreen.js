@@ -1507,7 +1507,8 @@ const WalletScreen = () => {
       }
       
       // Register node with backend (system generates pseudonym automatically)
-      // MUST use QNet EON address (not Solana publicKey!) for blockchain registration
+      // wallet_address = EON (for rewards), burn_wallet = Solana (for XOR verification)
+      // Phase 1 codes are XOR-encrypted with SOLANA address, but rewards go to EON
       const walletAddress = wallet.qnetAddress || wallet.address;
       const result = await walletManager.registerNodeWithCode(
         activationInputCode.trim(),
@@ -3302,28 +3303,60 @@ const WalletScreen = () => {
       const storedCodes = await walletManager.getStoredActivationCodes(exportPassword);
       
       if (storedCodes && Object.keys(storedCodes).length > 0) {
-        // Show existing codes
-        const codesList = Object.entries(storedCodes)
-          .map(([type, data]) => `${type.toUpperCase()} Node:\n${data.code || data}\n`)
-          .join('\n');
+        // v4.5: Show codes WITH burn_tx_hash + burn_amount (needed for Docker -e)
+        // Code is self-contained: XOR(wallet, SHA3(burn_tx:type:amount))
+        // User needs all 3 values to activate server node
+        const codeEntries = [];
+        for (const [type, data] of Object.entries(storedCodes)) {
+          const code = data.code || data;
+          let entry = `${type.toUpperCase()} Node:\n${code}`;
+          
+          // Get burn metadata from AsyncStorage
+          try {
+            const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${type}`);
+            if (metaStr) {
+              const meta = JSON.parse(metaStr);
+              if (meta.burnTxHash) {
+                entry += `\nBurn TX: ${meta.burnTxHash}`;
+              }
+              if (meta.burnAmount) {
+                entry += `\nBurn Amount: ${meta.burnAmount}`;
+              }
+            }
+          } catch (_) { /* best effort */ }
+          
+          codeEntries.push(entry);
+        }
+        const codesList = codeEntries.join('\n\n');
       
       setShowExportActivation(false);
       setExportPassword('');
       
       showAlert(
-          'Activation Codes',
-          codesList,
+          'Activation Data',
+          codesList + '\n\nFor server node Docker:\n-e QNET_ACTIVATION_CODE=<code>\n-e QNET_BURN_TX_HASH=<tx>\n-e QNET_BURN_AMOUNT=<amount>',
           [
-            { text: 'Copy All', onPress: () => {
-              const plainCodes = Object.entries(storedCodes)
-                .map(([type, data]) => data.code || data)
-                .join('\n');
-              Clipboard.setString(plainCodes);
-              showAlert('Copied', 'Activation codes copied to clipboard');
-              // Clear sensitive data from clipboard after 10 seconds
+            { text: 'Copy All', onPress: async () => {
+              // Build full copy data with burn info
+              const copyParts = [];
+              for (const [type, data] of Object.entries(storedCodes)) {
+                const code = data.code || data;
+                let part = code;
+                try {
+                  const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${type}`);
+                  if (metaStr) {
+                    const meta = JSON.parse(metaStr);
+                    if (meta.burnTxHash) part += `\nBURN_TX=${meta.burnTxHash}`;
+                    if (meta.burnAmount) part += `\nBURN_AMOUNT=${meta.burnAmount}`;
+                  }
+                } catch (_) {}
+                copyParts.push(part);
+              }
+              Clipboard.setString(copyParts.join('\n\n'));
+              showAlert('Copied', 'Activation data copied to clipboard (auto-clears in 30s)');
               setTimeout(() => {
                 Clipboard.setString('');
-              }, 10000);
+              }, 30000);
             }},
             { text: 'OK' }
           ]
@@ -4799,7 +4832,9 @@ const WalletScreen = () => {
                             result = await walletManager.activateLightNode(wallet.publicKey, password);
                             code = result.activationCode;
                           } else {
-                            // Super nodes - also require burn BEFORE generating code
+                            // Super nodes: burn 1DEV → get code from SERVER (XOR-encrypted)
+                            // Code contains wallet prefix encrypted with SHA3(burn_tx:type:amount)
+                            // This enables STATELESS verification on any node without in-memory state
                             const burnResult = await walletManager.burnTokensForNode(
                               nodeStatus, 
                               requiredAmount, 
@@ -4811,16 +4846,35 @@ const WalletScreen = () => {
                               throw new Error('Failed to burn tokens for activation');
                             }
                             
-                            // Only generate code AFTER successful burn
-                            // Get mnemonic securely from encrypted storage
-                            const mnemonic = await walletManager.getEncryptedMnemonic(password);
-                            if (!mnemonic) {
-                              throw new Error('Failed to retrieve seed phrase for code generation');
-                            }
-                            code = walletManager.generateActivationCode(nodeStatus, wallet.publicKey, mnemonic);
+                            // CRITICAL: Request code from SERVER after burn (NOT local generation!)
+                            // Server verifies burn TX on Solana and creates XOR-encrypted code
+                            // Phase 1: wallet_address MUST be Solana (for burn verification)
+                            // qnet_reward_wallet = EON address (for rewards on QNet blockchain)
+                            const solanaAddress = wallet.publicKey || wallet.address;
+                            const eonAddress = wallet.qnetAddress || walletManager.generateQNetAddressFromSolana(solanaAddress);
+                            const codeResult = await walletManager.requestActivationCodeFromServer(
+                              nodeStatus,
+                              solanaAddress,         // Solana address (burn was on Solana!)
+                              burnResult.signature,
+                              1,                     // Phase 1
+                              eonAddress,            // QNet EON address for rewards
+                              requiredAmount         // CRITICAL: exact burned amount for XOR key
+                            );
                             
-                            // Store the code
-                          await walletManager.storeActivationCode(code, nodeStatus, password);
+                            if (!codeResult.success || !codeResult.activationCode) {
+                              throw new Error('Burn successful but failed to get activation code from server');
+                            }
+                            
+                            code = codeResult.activationCode;
+                            
+                            // Store the code with ALL burn metadata (burnAmount included for stateless XOR)
+                            // storeActivationCode now saves burnAmount — no duplicate write needed
+                            await walletManager.storeActivationCode(code, nodeStatus, password, {
+                              burnTxHash: burnResult.signature,
+                              burnAmount: requiredAmount,
+                              phase: 1,
+                              walletAddress: walletAddress
+                            });
                           
                             // Create result with REAL transaction signature
                             result = {

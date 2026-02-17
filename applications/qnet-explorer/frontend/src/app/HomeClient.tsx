@@ -150,7 +150,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Post-Quantum Cryptography</h3>
             <p>
-              Kyber-1024 KEM & Dilithium-5 signatures. 31/31 crypto tests passed (100% perfect). 
+              CRYSTALS-Dilithium3 (NIST FIPS 204) + Ed25519 hybrid signatures. 31/31 crypto tests passed (100% perfect). 
               NIST-approved algorithms protecting against quantum computing threats.
             </p>
           </div>

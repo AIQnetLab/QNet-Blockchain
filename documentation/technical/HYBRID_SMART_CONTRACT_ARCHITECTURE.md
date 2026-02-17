@@ -19,7 +19,7 @@ QNet implements a unique **hybrid smart contract architecture** combining:
 
 **Key Features**:
 - ✅ **Mobile Optimization**: <2MB memory footprint, <0.01% battery usage
-- ✅ **Post-Quantum Security**: Dilithium + Kyber quantum-resistant crypto
+- ✅ **Post-Quantum Security**: Dilithium3 + ML-KEM-768 (Kyber) quantum-resistant crypto
 - ✅ **High Performance**: 50,000+ TPS per node
 - ✅ **Microblock Integration**: Sub-second finality
 
@@ -42,15 +42,15 @@ class QNCNodeActivationContract:
 **New Opcodes**:
 - `PQ_SIGN` (0xF0) - Dilithium signatures
 - `PQ_VERIFY` (0xF1) - Signature verification
-- `PQ_ENCRYPT` (0xF2) - Kyber encryption
-- `PQ_DECRYPT` (0xF3) - Kyber decryption
+- `PQ_ENCRYPT` (0xF2) - ML-KEM-768 (Kyber) encryption
+- `PQ_DECRYPT` (0xF3) - ML-KEM-768 (Kyber) decryption
 
 **Gas Metering**:
 ```rust
 PQ_SIGN_COST: 15000,    // Dilithium signing
 PQ_VERIFY_COST: 8000,   // Signature verification
-PQ_ENCRYPT_COST: 12000, // Kyber encryption
-PQ_DECRYPT_COST: 10000  // Kyber decryption
+PQ_ENCRYPT_COST: 12000, // ML-KEM-768 encryption
+PQ_DECRYPT_COST: 10000  // ML-KEM-768 decryption
 ```
 
 ### **3. Cross-System Integration**
@@ -105,7 +105,7 @@ qnet deploy-hybrid ./native.wasm ./evm.sol --bridge-enabled
 
 ### **Quantum Protection**:
 - **Dilithium-5**: Digital signatures (3293-byte signatures)
-- **Kyber-1024**: Key encapsulation (1568-byte public keys)
+- **ML-KEM-768 (Kyber)**: Key encapsulation (1184-byte public keys)
 - **SHA3-256**: Quantum-resistant hashing
 
 ### **Cross-System Security**:
@@ -177,7 +177,7 @@ qnet compile-pq-evm ./contract.sol --quantum-opcodes
 - ✅ **PQ-EVM Implementation**: Production ready  
 - ✅ **Cross-system bridge**: Production ready
 - ✅ **Mobile optimization**: <0.01% battery usage achieved
-- ✅ **Quantum security**: Full Dilithium + Kyber implementation
+- ✅ **Quantum security**: Full Dilithium3 + ML-KEM-768 (Kyber) implementation
 - ✅ **Developer tools**: Complete SDK available
 
 **Launch Ready**: July 2025 🎯 

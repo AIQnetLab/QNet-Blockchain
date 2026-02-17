@@ -4115,16 +4115,31 @@ export class WalletManager {
   // Request activation code from server after burn verification
   // Phase 1: burnTxHash = Solana 1DEV burn transaction, qnetRewardWallet = EON address for rewards
   // Phase 2: burnTxHash = QNet QNC transfer to Pool 3 transaction
-  async requestActivationCodeFromServer(nodeType, walletAddress, burnTxHash, phase = 1, qnetRewardWallet = null) {
+  // CRITICAL: actualBurnAmount MUST be the exact amount burned on Solana — NOT the current price!
+  //   XOR key = SHA3(burn_tx:type:amount) — if amount is wrong, code can NEVER be verified.
+  //   Caller must pass the same amount used in burnTokensForNode / burnTokens.
+  async requestActivationCodeFromServer(nodeType, walletAddress, burnTxHash, phase = 1, qnetRewardWallet = null, actualBurnAmount = null) {
     try {
       const apiUrl = this.getRandomBootstrapNode();
       
-      // Get dynamic pricing info for Phase 2
-      let burnAmount = 0;
-      if (phase === 2) {
-        const pricingResponse = await fetch(`${apiUrl}/api/v1/pricing/${nodeType}`);
-        const pricing = await pricingResponse.json();
-        burnAmount = pricing.current_price || 0;
+      // Use ACTUAL burned amount (from caller) — NOT current price!
+      // XOR key = SHA3(burn_tx:type:amount) — amount MUST match exactly what was burned
+      let burnAmount = actualBurnAmount;
+      if (!burnAmount || burnAmount <= 0) {
+        // Fallback: fetch current price ONLY if caller didn't provide amount
+        // This should NOT happen in normal flow — callers must always pass actualBurnAmount
+        console.warn('[WalletManager] actualBurnAmount not provided — fetching current price (may mismatch!)');
+        try {
+          const pricingResponse = await fetch(`${apiUrl}/api/v1/pricing/${nodeType}`);
+          const pricing = await pricingResponse.json();
+          burnAmount = pricing.current_price || 0;
+        } catch (pricingErr) {
+          console.warn('[WalletManager] Pricing fetch failed, using default:', pricingErr.message);
+        }
+        // Fallback: Phase 1 default is 1500 1DEV if pricing endpoint unavailable
+        if (burnAmount === 0 && phase === 1) {
+          burnAmount = 1500;
+        }
       }
       
       // Build request body
@@ -4241,13 +4256,15 @@ export class WalletManager {
       const existingCodesStr = await AsyncStorage.getItem('qnet_activation_codes');
       let encryptedCodes = existingCodesStr ? JSON.parse(existingCodesStr) : {};
       
-      // Store activation metadata (timestamp, tx signature, phase, wallet address)
+      // Store activation metadata (timestamp, tx signature, phase, wallet address, burn amount)
       // CRITICAL: phase determines which wallet address to use for claims
       // Phase 1: Solana address, Phase 2: QNet address
+      // burnAmount is REQUIRED for stateless XOR verification on server nodes
       await AsyncStorage.setItem(`qnet_activation_meta_${nodeType}`, JSON.stringify({
         timestamp: metadata.timestamp || Date.now(),
         signature: metadata.signature || null,
         burnTxHash: metadata.burnTxHash || null,
+        burnAmount: metadata.burnAmount || null,
         nodeType: nodeType,
         phase: metadata.phase || 1,  // Default to Phase 1
         walletAddress: metadata.walletAddress || null  // The address used for activation
@@ -4370,7 +4387,8 @@ export class WalletManager {
                 walletAddress, 
                 meta.burnTxHash,
                 meta.phase || 1,
-                eonAddr
+                eonAddr,
+                meta.burnAmount || null // Pass stored burn amount for XOR key
               );
               if (result.success && result.activationCode) {
                 await this.storeActivationCode(result.activationCode, nodeType, password);
@@ -4430,7 +4448,7 @@ export class WalletManager {
                     const eonAddr = await AsyncStorage.getItem('qnet_address')
                       || this.generateQNetAddressFromSolana(walletAddress);
                     const codeResult = await this.requestActivationCodeFromServer(
-                      nodeType, walletAddress, meta.burnTxHash, meta.phase || 1, eonAddr
+                      nodeType, walletAddress, meta.burnTxHash, meta.phase || 1, eonAddr, meta.burnAmount || null
                     );
                     if (codeResult.success && codeResult.activationCode) {
                       code = codeResult.activationCode;
@@ -4489,7 +4507,7 @@ export class WalletManager {
             const eonAddr = await AsyncStorage.getItem('qnet_address')
               || this.generateQNetAddressFromSolana(walletAddress);
             const codeResult = await this.requestActivationCodeFromServer(
-              burnNodeType, walletAddress, burnTxHash, meta?.phase || 1, eonAddr
+              burnNodeType, walletAddress, burnTxHash, meta?.phase || 1, eonAddr, meta?.burnAmount || null
             );
             if (codeResult.success && codeResult.activationCode) {
               console.log('[syncActivationCodes] ✅ Code recovered from server via generate endpoint');
@@ -5038,7 +5056,8 @@ export class WalletManager {
         walletAddress,
         burnResult.signature,
         1, // Phase 1: 1DEV burn
-        qnetAddress // QNet EON address for rewards
+        qnetAddress, // QNet EON address for rewards
+        pricing.cost // CRITICAL: exact burned amount for XOR key
       );
       
       if (!codeResult.success || !codeResult.activationCode) {
@@ -5051,19 +5070,14 @@ export class WalletManager {
       throw new Error('Burn successful but failed to get activation code. Please contact support.');
     }
     
-    // Store the activation code with transaction signature
+    // Store the activation code with ALL metadata (burnAmount included for stateless XOR)
+    // storeActivationCode now saves burnAmount in qnet_activation_meta_light — no duplicate write needed
     await this.storeActivationCode(activationCode, 'light', password, {
       burnTxHash: burnResult.signature,
+      burnAmount: pricing.cost,
       phase: 1,
       walletAddress: walletAddress
     });
-    
-    // Store activation metadata for wallet restore
-    await AsyncStorage.setItem(`qnet_activation_meta_light`, JSON.stringify({
-      burnTxHash: burnResult.signature,
-      phase: 1,
-      timestamp: Date.now()
-    }));
     
     // CRITICAL: Save qnet_last_activated_node immediately after burn
     // Without this, data is lost if user closes the app before clicking "Activate Node"
@@ -5079,6 +5093,14 @@ export class WalletManager {
     
     try {
       // Create registration message for P2P network
+      // v4.3: Include burn_tx_hash + burn_amount for STATELESS code ownership verification
+      // v4.7: Include Ed25519 signature + burn_wallet for wallet ownership proof
+      const sigTimestamp = Math.floor(Date.now() / 1000);
+      const ed25519Message = `qnet_register:${activationCode}:${sigTimestamp}`;
+      const ed25519MsgBytes = new TextEncoder().encode(ed25519Message);
+      const ed25519Sig = nacl.sign.detached(ed25519MsgBytes, new Uint8Array(walletData.secretKey));
+      const ed25519SigHex = Array.from(ed25519Sig).map(b => b.toString(16).padStart(2, '0')).join('');
+      
       const registrationMessage = {
         node_id: activationCode,
         public_key: walletData.publicKey,
@@ -5086,7 +5108,13 @@ export class WalletManager {
         port: 0, // Mobile nodes don't listen on ports
         node_type: 'light',
         activation_tx: burnResult.signature,
+        burn_tx_hash: burnResult.signature,
+        burn_amount: pricing.cost,
+        activation_code: activationCode,
         wallet_address: walletAddress,
+        burn_wallet: walletData.publicKey, // v4.7: Solana address for XOR + sender verification
+        ed25519_signature: ed25519SigHex, // v4.7: Proves ownership of burn_wallet
+        signature_timestamp: sigTimestamp, // v4.7: Replay protection
         timestamp: Date.now()
       };
       
@@ -5297,12 +5325,76 @@ export class WalletManager {
             systemPseudonym
           );
 
+          // v4.3: Get burn TX data for STATELESS code ownership verification
+          // Node needs burn_tx_hash + burn_amount to reconstruct XOR key and verify
+          // that the activation code truly belongs to this wallet — no server state needed
+          let burnTxHash = null;
+          let burnAmount = null;
+          let burnWallet = null; // v4.6: Solana address used for code generation (Phase 1)
+          try {
+            const metaStr = await AsyncStorage.getItem('qnet_activation_meta_light');
+            if (metaStr) {
+              const meta = JSON.parse(metaStr);
+              burnTxHash = meta.burnTxHash || null;
+              burnAmount = meta.burnAmount || null;
+              burnWallet = meta.walletAddress || null; // Solana address used during code gen
+            }
+            if (!burnTxHash) {
+              const lastNode = await AsyncStorage.getItem('qnet_last_activated_node');
+              if (lastNode) {
+                const ln = JSON.parse(lastNode);
+                burnTxHash = ln.burnTxHash || null;
+              }
+            }
+            // Fallback: try to get Solana address from wallet data
+            if (!burnWallet) {
+              const walletDataStr = await AsyncStorage.getItem('qnet_wallet');
+              if (walletDataStr) {
+                const wd = JSON.parse(walletDataStr);
+                burnWallet = wd.publicKey || null; // Solana publicKey
+              }
+            }
+          } catch (_) { /* best effort */ }
+
+          // v4.7: Sign with Solana Ed25519 key to prove wallet ownership
+          // Prevents stolen code reuse — attacker cannot sign without private key
+          let ed25519Signature = null;
+          let signatureTimestamp = null;
+          try {
+            const walletDataStr = await AsyncStorage.getItem('qnet_wallet');
+            if (walletDataStr) {
+              const wd = JSON.parse(walletDataStr);
+              if (wd.secretKey) {
+                signatureTimestamp = Math.floor(Date.now() / 1000);
+                const message = `qnet_register:${activationCode}:${signatureTimestamp}`;
+                const messageBytes = new TextEncoder().encode(message);
+                const secretKeyBytes = new Uint8Array(wd.secretKey);
+                const sig = nacl.sign.detached(messageBytes, secretKeyBytes);
+                ed25519Signature = Array.from(sig).map(b => b.toString(16).padStart(2, '0')).join('');
+                console.log('[Registration] Ed25519 wallet ownership signature created');
+              }
+            }
+          } catch (sigErr) {
+            console.warn('[Registration] Ed25519 signature failed:', sigErr.message);
+            throw new Error(`Wallet ownership proof (Ed25519 signature) required: ${sigErr.message}`);
+          }
+          
+          if (!ed25519Signature) {
+            throw new Error('Ed25519 wallet ownership signature is required. Ensure wallet has Solana private key.');
+          }
+
           // Register via PushService → POST /api/v1/light-node/register
+          // wallet_address = EON (for rewards), burn_wallet = Solana (for XOR)
           registrationResult = await registerLightNode(
             activationCode,
             walletAddress,
             dilithiumKeys.publicKey,
-            quantumSignature
+            quantumSignature,
+            burnTxHash,
+            burnAmount,
+            burnWallet, // v4.6: Solana address for XOR verification
+            ed25519Signature, // v4.7: Ed25519 signature proving wallet ownership
+            signatureTimestamp // v4.7: Timestamp for replay protection
           );
           quantumSecured = true;
         }

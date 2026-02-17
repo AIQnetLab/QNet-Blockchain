@@ -449,7 +449,7 @@ MicroBlock {
    - NIST FIPS 197 standard
    - Key storage encryption
    - 128-bit post-quantum security (Grover's algorithm)
-   - Note: Kyber reserved for future key exchange
+   - CRYSTALS-Kyber ML-KEM-768 (FIPS 203): Active for P2P key exchange via QUIC TLS 1.3 hybrid (X25519 + Kyber768)
 
 3. **SHA3-256** (hashing):
    - Quantum-resistant to Grover's algorithm  

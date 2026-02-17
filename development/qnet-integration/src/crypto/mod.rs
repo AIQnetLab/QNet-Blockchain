@@ -64,6 +64,10 @@ pub mod vrf_hybrid;
 /// Dilithium key generation, storage, rotation
 pub mod key_manager;
 
+/// Solana address derivation from mnemonic (BIP39 + SLIP-10)
+/// Used to verify mnemonic ownership during server node activation
+pub mod solana_derivation;
+
 // NOTE: crypto_integration.rs is deprecated (uses non-existent qnet_core::crypto)
 // The hybrid_crypto and quantum_crypto modules handle all production crypto needs
 // pub mod crypto_integration;

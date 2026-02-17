@@ -388,30 +388,196 @@ impl BlockchainActivationRegistry {
         }
     }
 
-    /// FIXED: Verify activation code belongs to specific wallet (1 wallet = 1 code)
+    /// v4.3 FIXED: Verify activation code belongs to specific wallet
+    /// 
+    /// DESIGN: The activation code embeds XOR-encrypted wallet prefix.
+    /// XOR key = SHA3(burn_tx_hash:node_type:burn_amount)[0..32]
+    /// All inputs are PUBLIC (Solana blockchain + code itself) → STATELESS verification.
+    /// Nodes don't need to store anything — they can always verify from the code + burn data.
+    ///
+    /// Strategy (ordered by reliability):
+    ///   1. STATELESS XOR: burn_tx_hash provided by client → reconstruct key → decrypt → compare
+    ///   2. IN-MEMORY: quantum_crypto cache has burn_tx data (same session as generate)
+    ///   3. ROCKSDB: wallet already registered → reverse index confirms ownership
     pub async fn verify_code_ownership(&self, code: &str, wallet_address: &str) -> Result<bool, IntegrationError> {
-        println!("🔍 Verifying code ownership for wallet: {}...", safe_preview(wallet_address, 8));
+        println!("[INFO][VERIFY] code_ownership_check wallet={}... code={}...", 
+            &wallet_address[..16.min(wallet_address.len())],
+            &code[..12.min(code.len())]);
         
-        // Extract wallet address from activation code
-        let code_wallet = match self.extract_wallet_from_activation_code(code).await {
-            Ok(wallet) => wallet,
-            Err(e) => {
-                println!("❌ Failed to extract wallet from code: {}", e);
+        // Strategy 1: In-memory quantum XOR decryption (works if registry has burn_tx data)
+        match self.extract_wallet_from_activation_code(code).await {
+            Ok(ref code_wallet) if code_wallet == wallet_address => {
+                println!("[INFO][VERIFY] ownership_confirmed method=quantum_decrypt wallet={}...", 
+                    &wallet_address[..16.min(wallet_address.len())]);
+                return Ok(true);
+            }
+            Ok(ref code_wallet) if !code_wallet.is_empty() && code_wallet.len() > 10 => {
+                // XOR decryption returned a plausible full wallet — but it doesn't match
+                println!("[WARN][VERIFY] ownership_rejected method=quantum_decrypt expected={}... got={}...",
+                    &wallet_address[..16.min(wallet_address.len())],
+                    &code_wallet[..16.min(code_wallet.len())]);
                 return Ok(false);
             }
-        };
-        
-        // Check if code belongs to this wallet
-        let belongs_to_wallet = code_wallet == wallet_address;
-        
-        if belongs_to_wallet {
-            println!("✅ Code ownership verified - code belongs to wallet");
-        } else {
-            println!("❌ Code ownership failed - code belongs to different wallet: {}...", 
-                safe_preview(&code_wallet, 8));
+            _ => {
+                // XOR decryption failed (no burn_tx in registry) — need stateless path
+                println!("[INFO][VERIFY] quantum_decrypt_unavailable fallback=stateless_or_rocksdb");
+            }
         }
         
-        Ok(belongs_to_wallet)
+        // Strategy 2: RocksDB reverse index (wallet already registered before)
+        if let Some(storage) = crate::node::try_get_storage() {
+            match storage.get_nodes_by_wallet(wallet_address) {
+                Ok(nodes) if !nodes.is_empty() => {
+                    let expected_super = format!("super_{}", code);
+                    let expected_light = format!("light_{}", code);
+                    let light_pseudonym = crate::rpc::generate_light_node_pseudonym(wallet_address);
+                    
+                    for (node_id, _node_type, _rep) in &nodes {
+                        if node_id == &expected_super 
+                            || node_id == &expected_light 
+                            || node_id == &light_pseudonym
+                            || node_id == code {
+                            println!("[INFO][VERIFY] ownership_confirmed method=rocksdb node={} wallet={}...",
+                                node_id, &wallet_address[..16.min(wallet_address.len())]);
+                            return Ok(true);
+                        }
+                    }
+                    println!("[WARN][VERIFY] wallet_has_different_node wallet={}... nodes={:?}",
+                        &wallet_address[..16.min(wallet_address.len())],
+                        nodes.iter().map(|(id,_,_)| id.clone()).collect::<Vec<_>>());
+                    return Ok(false);
+                }
+                _ => {} // No nodes in RocksDB — continue to stateless
+            }
+        }
+        
+        // Strategy 3: No data available — return Err so caller can use stateless XOR with burn_tx
+        Err(IntegrationError::CryptoError(
+            "Code ownership verification needs burn_tx_hash for stateless check".to_string()
+        ))
+    }
+    
+    /// v4.3: STATELESS code ownership verification using burn_tx_hash from client.
+    /// This is the PRIMARY verification method — works after any restart, on any node.
+    /// XOR key = SHA3(burn_tx:type:amount) → decrypt wallet prefix from code → compare.
+    pub fn verify_code_ownership_stateless(
+        &self,
+        code: &str,
+        wallet_address: &str,
+        burn_tx_hash: &str,
+        burn_amount: u64,
+    ) -> Result<bool, IntegrationError> {
+        use sha3::{Sha3_256, Digest};
+        
+        // Parse code: QNET-{TYPE+TS}-{ENC_WALLET[0:6]}-{ENC_WALLET[6:10]+ENTROPY}
+        if !code.starts_with("QNET-") || code.len() != 25 {
+            return Err(IntegrationError::ValidationError("Invalid code format".to_string()));
+        }
+        let parts: Vec<&str> = code.split('-').collect();
+        if parts.len() != 4 {
+            return Err(IntegrationError::ValidationError("Invalid code structure".to_string()));
+        }
+        
+        // Extract node type from segment1[0]: L=light, S=super
+        let node_type = match parts[1].chars().next() {
+            Some('L') | Some('l') => "light",
+            Some('S') | Some('s') => "super",
+            _ => "light",
+        };
+        
+        // Extract encrypted wallet hex from segments 2+3
+        let segment2 = parts[2]; // 6 hex chars
+        let wallet_part2 = &parts[3][..4.min(parts[3].len())]; // first 4 hex chars
+        let encrypted_wallet_hex = format!("{}{}", segment2, wallet_part2); // 10 hex chars = 5 bytes
+        
+        // Reconstruct XOR key: SHA3(burn_tx:type:amount)[0..32]
+        let key_material = format!("{}:{}:{}", burn_tx_hash, node_type, burn_amount);
+        let mut hasher = Sha3_256::new();
+        hasher.update(key_material.as_bytes());
+        let key_full = hex::encode(hasher.finalize());
+        let encryption_key = &key_full[..32];
+        
+        // XOR decrypt wallet prefix
+        let encrypted_bytes = match hex::decode(&encrypted_wallet_hex) {
+            Ok(b) => b,
+            Err(_) => return Err(IntegrationError::ValidationError("Invalid hex in code".to_string())),
+        };
+        let key_bytes = encryption_key.as_bytes();
+        let mut decrypted = Vec::with_capacity(encrypted_bytes.len());
+        for (i, &enc_byte) in encrypted_bytes.iter().enumerate() {
+            decrypted.push(enc_byte ^ key_bytes[i % key_bytes.len()]);
+        }
+        let decrypted_prefix = String::from_utf8_lossy(&decrypted).to_string();
+        
+        // Compare decrypted prefix with wallet address prefix
+        let wallet_prefix = &wallet_address[..decrypted_prefix.len().min(wallet_address.len())];
+        let matches = decrypted_prefix == wallet_prefix;
+        
+        if matches {
+            println!("[INFO][VERIFY] ownership_confirmed method=stateless_xor wallet={}... prefix_match={}",
+                &wallet_address[..16.min(wallet_address.len())], decrypted_prefix.len());
+        } else {
+            println!("[WARN][VERIFY] ownership_rejected method=stateless_xor expected={}... got={}...",
+                &wallet_prefix[..8.min(wallet_prefix.len())],
+                &decrypted_prefix[..8.min(decrypted_prefix.len())]);
+        }
+        
+        Ok(matches)
+    }
+    
+    /// Extract wallet prefix from activation code using stateless XOR decryption
+    /// Returns the first 5 bytes of the original wallet address that was encrypted in the code
+    /// Used by save_activation_code to get the wallet that generated this code (NOT the server's wallet)
+    pub fn extract_wallet_prefix_stateless(
+        &self,
+        code: &str,
+        burn_tx_hash: &str,
+        burn_amount: u64,
+    ) -> Result<String, IntegrationError> {
+        use sha3::{Sha3_256, Digest};
+        
+        if !code.starts_with("QNET-") || code.len() != 25 {
+            return Err(IntegrationError::ValidationError("Invalid code format".to_string()));
+        }
+        let parts: Vec<&str> = code.split('-').collect();
+        if parts.len() != 4 {
+            return Err(IntegrationError::ValidationError("Invalid code structure".to_string()));
+        }
+        
+        let node_type = match parts[1].chars().next() {
+            Some('L') | Some('l') => "light",
+            Some('S') | Some('s') => "super",
+            _ => "light",
+        };
+        
+        let segment2 = parts[2];
+        let wallet_part2 = &parts[3][..4.min(parts[3].len())];
+        let encrypted_wallet_hex = format!("{}{}", segment2, wallet_part2);
+        
+        let key_material = format!("{}:{}:{}", burn_tx_hash, node_type, burn_amount);
+        let mut hasher = Sha3_256::new();
+        hasher.update(key_material.as_bytes());
+        let key_full = hex::encode(hasher.finalize());
+        let encryption_key = &key_full[..32];
+        
+        let encrypted_bytes = hex::decode(&encrypted_wallet_hex)
+            .map_err(|_| IntegrationError::ValidationError("Invalid hex in code".to_string()))?;
+        let key_bytes = encryption_key.as_bytes();
+        let mut decrypted = Vec::with_capacity(encrypted_bytes.len());
+        for (i, &enc_byte) in encrypted_bytes.iter().enumerate() {
+            decrypted.push(enc_byte ^ key_bytes[i % key_bytes.len()]);
+        }
+        let prefix = String::from_utf8_lossy(&decrypted).to_string();
+        
+        // Sanity check: prefix should contain only printable ASCII (valid wallet chars)
+        if prefix.chars().all(|c| c.is_ascii_alphanumeric()) {
+            println!("[INFO][EXTRACT] wallet_prefix_stateless prefix={}...", &prefix[..prefix.len().min(5)]);
+            Ok(prefix)
+        } else {
+            Err(IntegrationError::CryptoError(
+                "Decrypted wallet prefix contains invalid characters — wrong burn_tx_hash or burn_amount".to_string()
+            ))
+        }
     }
     
     /// Extract wallet address from activation code using quantum decryption

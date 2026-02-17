@@ -1525,15 +1525,15 @@ fn get_encryption_key(&self) -> Result<[u8; 32]> {
 #### Why Not Fully Post-Quantum Encryption?
 
 **Current**: AES-256-GCM (quantum-resistant for 30+ years)
-**Alternative**: Kyber-1024 (fully post-quantum, but 10x slower)
+**Active (v4.8)**: CRYSTALS-Kyber ML-KEM-768 (FIPS 203) — hybrid X25519Kyber768 key exchange in QUIC TLS 1.3
 
 **Rationale:**
 - ⚠️ Low-frequency encryption (~1/hour per node) = not a bottleneck
 - ✅ 30+ years safety buffer exceeds quantum threat timeline
-- ✅ AES-256 hardware acceleration (AES-NI) = 10x faster than Kyber
-- ✅ Kyber can be added when quantum computers scale (10-15 years)
+- ✅ AES-256 hardware acceleration (AES-NI) for symmetric encryption
+- ✅ ML-KEM-768 (Kyber) ACTIVE for key exchange via QUIC TLS 1.3 hybrid handshake (v4.8)
 
-**Migration path**: Replace AES-256-GCM → Kyber-1024 when quantum threat imminent
+**Status (v4.8)**: ML-KEM-768 active for P2P key exchange. AES-256-GCM for symmetric encryption. Full post-quantum stack.
 
 ---
 

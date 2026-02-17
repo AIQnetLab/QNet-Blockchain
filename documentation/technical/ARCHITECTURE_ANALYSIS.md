@@ -17,7 +17,7 @@
 
 2. **Post-Quantum Ready**
    - Dilithium3 signatures
-   - Kyber1024 encryption
+   - ML-KEM-768 (Kyber) key exchange via QUIC TLS 1.3
    - Future-proof security
 
 3. **Modular Design**

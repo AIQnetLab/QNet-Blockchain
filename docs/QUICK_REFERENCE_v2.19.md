@@ -28,11 +28,10 @@
 
 > **v2.23 Update**: RAW bytes format via `serde_bytes` (88% reduction from 22KB)
 
-### Node Types
+### Node Types (v3.18: Two-Tier Architecture)
 | Type | Consensus | Storage | Bandwidth | Target | Reputation | VTS |
 |------|-----------|---------|-----------|--------|------------|-----|
 | **Light** | ❌ No | Minimal | Low | Mobile, IoT | Fixed 70 | ❌ No |
-| **Full** | ⚠️ Partial | Full chain | Medium | Validators | Variable | ✅ Yes |
 | **Super** | ✅ Always | Full + history | High | Producers | Variable | ✅ Yes |
 
 ### Verifiable Time Sequence (VTS)
@@ -44,7 +43,7 @@
 | **Hashes per Slot** | 500,000 | 1-second microblock alignment |
 | **Checkpoint Interval** | 10M hashes | ~20 seconds |
 | **Max Drift** | 5% | Auto-warning on clock drift |
-| **Node Types** | Full/Super only | Light nodes excluded (battery saving) |
+| **Node Types** | Super only | Light nodes excluded (battery saving) |
 | **Storage** | Separate CF | O(1) validation without block loading |
 | **Max Regression** | 15M hashes | ~30 seconds tolerance |
 
@@ -141,7 +140,7 @@ Consensus Layer (consensus_crypto.rs)
 ## 🔄 Block Buffering (v2.19.20)
 
 ### Adaptive Memory Protection
-- **Max Pending (Full/Super)**: 500 blocks (~50 MB)
+- **Max Pending (Super)**: 500 blocks (~50 MB)
 - **Light Nodes**: Do NOT sync blocks (thin client architecture)
 - **Retry**: Pseudo-infinite
 - **Backoff (0-9 retries)**: 10 seconds (aggressive)
@@ -152,7 +151,7 @@ Consensus Layer (consensus_crypto.rs)
 ### Purpose
 Handles out-of-order block arrival in gossip P2P network while preventing memory exhaustion attacks. Blocks are NEVER discarded - pseudo-infinite retries with exponential backoff ensure all blocks are eventually received.
 
-**Note**: Light nodes (mobile apps) are thin clients - they get all data via RPC from Full/Super nodes and do not participate in block sync.
+**Note**: Light nodes (mobile apps) are thin clients - they get all data via RPC from Super nodes and do not participate in block sync.
 
 ## 🎯 Reputation System
 
@@ -415,9 +414,9 @@ const MAX_VALIDATORS_PER_ROUND: usize = 1000;  // Consensus limit
 const CERTIFICATE_LIFETIME_SECS: u64 = 270;    // 4.5 minutes
 const MAX_CACHE_SIZE: usize = 100000;          // Certificate cache
 
-// Block buffering (v2.19.20) - Full/Super nodes only
+// Block buffering (v2.19.20) - Super nodes only
 // Light nodes: thin client (no block sync)
-// Full/Super nodes: 500 blocks (~50 MB)
+// Super nodes: 500 blocks (~50 MB)
 const NETWORK_STABILIZATION_SECS: u64 = 30;    // Genesis startup wait
 const EMERGENCY_WAIT_SECS: u64 = 10;           // Emergency producer wait
 
@@ -433,7 +432,7 @@ const EMISSION_INTERVAL_BLOCKS: u64 = 14400;   // 4 hours (1 block/sec)
 const INITIAL_POOL1_EMISSION: u64 = 251_432;   // QNC per 4-hour window
 const PING_SHARDS: u8 = 256;                   // Light node shards
 const MAX_LIGHT_NODES_PER_SHARD: usize = 100_000;
-const HEARTBEATS_PER_WINDOW: u8 = 10;          // Full/Super heartbeats
+const HEARTBEATS_PER_WINDOW: u8 = 10;          // Super heartbeats
 const GRACE_PERIOD_SECS: u64 = 180;            // 3 minutes
 
 // v2.61 Sync constants

@@ -167,7 +167,7 @@ export default function WalletPage() {
           <div className="tool-card-large">
             <h4>Hybrid Post-Quantum Security</h4>
             <p>
-              Dilithium2 + Ed25519 dual-signature system. CRYSTALS-Kyber 1024 key exchange. 
+              Dilithium3 + Ed25519 dual-signature system. CRYSTALS-Kyber ML-KEM-768 key exchange (active via QUIC TLS 1.3). 
               Hardware-backed storage with biometric authentication. Future-proof against quantum computers.
             </p>
           </div>

@@ -1,5 +1,5 @@
 //! QNet Quantum-Resistant Cryptography Module for Server
-//! Production implementation using CRYSTALS-Kyber and Dilithium algorithms
+//! Production implementation using CRYSTALS-Dilithium3 and XOR-based activation code encryption
 //! Server-side activation code decryption and validation
 
 use sha3::{Sha3_256, Digest};
@@ -524,7 +524,7 @@ impl QNetQuantumCrypto {
             initialized: self.initialized,
             algorithms: QuantumAlgorithms {
                 signature: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204
-                encryption: "AES-256-GCM".to_string(),         // NIST FIPS 197 (Kyber removed)
+                encryption: "AES-256-GCM + ML-KEM-768".to_string(), // NIST FIPS 197 + FIPS 203 (Kyber via QUIC TLS 1.3)
                 hash: "SHA3-256".to_string(),                  // NIST FIPS 202
             },
             performance: PerformanceMetrics {

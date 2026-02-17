@@ -130,7 +130,7 @@ SOLANA_RPC_URL=https://api.devnet.solana.com
    - Verify token balance
 
 3. **Activate Node**
-   - Choose node type (Light/Full/Super)
+   - Choose node type (Light/Super)
    - Confirm transaction
    - Verify activation status
 

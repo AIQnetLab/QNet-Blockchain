@@ -121,7 +121,7 @@ Explorer → Node RPC (RocksDB)
 - **On-Chain Recording**: Heartbeats stored in MacroBlock (not gossip)
 - **Emission MacroBlocks**: Heartbeats only in every 160th MacroBlock (4 hours)
 - **Strict Validation**: Unknown node_id formats REJECTED (no defaults)
-- **Full/Super**: 10 heartbeats per 4h (80%/90% threshold)
+- **Super**: 10 heartbeats per 4h (90% threshold)
 - **Light Nodes**: Separate ping system (MIN_PING_SAMPLES = 10,000)
 
 **🎯 Block-Based Consensus Phases v2.40:**
@@ -172,7 +172,7 @@ Explorer → Node RPC (RocksDB)
 - Connection multiplexing: 100+ streams per connection
 - 0-RTT handshake for repeat connections
 - Binary protocol (bincode): ~50% bandwidth reduction vs JSON
-- **HTTP Fallback Removed**: Pure QUIC for Full/Super node P2P
+- **HTTP Fallback Removed**: Pure QUIC for Super node P2P
 - **Port Requirement**: UDP 10876 must be open (`sudo ufw allow 10876/udp`)
 - **Docker Update**: Add `-p 10876:10876/udp` to run commands
 
@@ -182,7 +182,7 @@ Explorer → Node RPC (RocksDB)
 - **Emergency Timeout 10s**: Increased from 2s to allow original producer delivery
 - **Pseudo-Infinite Retries**: Blocks are NEVER discarded
 - **Exponential Backoff**: 10s (retries 0-9) → 30s → 60s → 120s → 240s → 300s max
-- **Adaptive Buffer Size**: Full/Super nodes: 500 blocks (~50MB), Light nodes: 100 blocks (~10MB)
+- **Adaptive Buffer Size**: Super nodes: 500 blocks (~50MB)
 - **Background Re-request**: Missing blocks automatically re-requested every 30s with backoff
 
 ### 🛡️ **Latest Update (v2.27.0 - December 11, 2025)**
@@ -227,7 +227,7 @@ Explorer → Node RPC (RocksDB)
 ### 🛡️ **Previous Updates (v2.19.12 - November 27, 2025)**
 - **Full Macroblock Sync**: Complete P2P synchronization for macroblocks (RequestMacroblocks, MacroblocksBatch)
 - **Snapshot API**: New endpoints `/api/v1/snapshot/latest` and `/api/v1/snapshot/{height}` for fast sync
-- **Light Node Architecture (v3.0)**: Thin clients - do NOT sync blocks (all data via RPC from Full/Super nodes)
+- **Light Node Architecture (v3.0)**: Thin clients - do NOT sync blocks (all data via RPC from Super nodes)
 - **Async Runtime Fixes**: Isolated `block_on` calls prevent "nested runtime" panics
 - **Balance Restoration**: Balances restored from snapshots or block replay during synchronization
 
@@ -460,7 +460,7 @@ Explorer → Node RPC (RocksDB)
 - **Anti-DDoS Protection**: Rate limiting and network flooding detection
 
 ### 🖥️ **DEVICE RESTRICTIONS**
-- **Full/Super Nodes**: ONLY servers, VPS, desktops with interactive setup
+- **Super Nodes**: ONLY servers, VPS, desktops via Docker env vars
 - **Light Nodes**: ONLY mobile devices & tablets through mobile app
 
 ### 🚀 **Current Status: Production Testnet Ready (v2.12.0)**
@@ -479,7 +479,7 @@ Explorer → Node RPC (RocksDB)
 - ✅ **Production Rust Nodes**: Server deployment with real blockchain nodes
 - ✅ **Browser Extension Wallet**: Production-ready with full-screen interface
 - ✅ **Mobile Applications**: iOS/Android apps for Light nodes only
-- ✅ **Interactive Setup**: Server nodes require interactive activation menu
+- ✅ **Docker Env Activation**: Server nodes activated via environment variables (same as Genesis)
 - ✅ **IPFS Integration**: Optional P2P snapshot distribution
 - ✅ **1DEV Burn Contract**: [D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7](https://explorer.solana.com/address/D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7?cluster=devnet) on Solana Devnet
 
@@ -502,8 +502,8 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **🔗 Cross-Chain Compatibility**: Solana integration for Phase 1
 - **🏛️ Decentralized Governance**: Community-driven decision making
 - **📱 Mobile-First Design**: Light nodes on phones & tablets
-- **🖥️ Server Architecture**: Full/Super nodes on dedicated servers
-- **🔧 Interactive Setup**: User-friendly activation process
+- **🖥️ Server Architecture**: Super nodes on dedicated servers
+- **🔧 Docker Env Setup**: Activation via environment variables (identical to Genesis nodes)
 - **🛡️ Deadlock Prevention**: Guard patterns & health monitors for stability
 - **🛡️ MEV Protection**: Private bundles for front-running protection (80%+ reputation, 0-20% allocation)
 - **📊 Priority Mempool**: Gas-price-based ordering for spam resistance
@@ -611,7 +611,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
     - 500 TPS: ~1.1 TB/year (Super), ~90 GB (Full 30d)
     - 1000 TPS: ~2.2 TB/year (Super), ~180 GB (Full 30d)
   - Note: Sharding is for parallel TX processing, NOT storage partitioning
-- **Distributed Archival**: Full/Super nodes archive 3-8 chunks each as network obligation
+- **Distributed Archival**: Super nodes archive 3-8 chunks each as network obligation
 - **Triple Replication**: Every data chunk replicated across 3+ nodes minimum
 - **Automatic Compliance**: Network enforces archival obligations for fault tolerance
 - **Backward Compatible**: Seamless migration from legacy storage format
@@ -623,9 +623,9 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │                    QNet Blockchain                         │
 ├─────────────────────────────────────────────────────────────┤
 │  Post-Quantum Crypto Layer                                 │
-│  ├── CRYSTALS-Dilithium (Signatures)                       │
-│  ├── CRYSTALS-Kyber (Key Exchange)                         │
-│  └── SPHINCS+ (Hash-based Signatures)                      │
+│  ├── CRYSTALS-Dilithium3 (NIST FIPS 204 Signatures)       │
+│  ├── Hybrid Ed25519 + Dilithium3 (P2P Messages)           │
+│  └── SHA3-256 (NIST FIPS 202 Hashing)                     │
 ├─────────────────────────────────────────────────────────────┤
 │  Consensus Layer with Deterministic Selection              │
 │  ├── Microblock Production (1s intervals)                  │
@@ -634,10 +634,10 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  │   ├── 30-block rotation with SHA3-512 entropy           │
 │  │   ├── Race-free at boundaries (no delays)               │
 │  │   ├── Producer rewards: +1 reputation per block         │
-│  │   └── Full/Super nodes only (reputation >= 70%)        │
+│  │   └── Super nodes only (reputation >= 70%)        │
 │  ├── Macroblock Consensus (90s intervals)                  │
 │  │   ├── Byzantine consensus with 1000 validators          │
-│  │   ├── Active listener on all Full/Super nodes (1s poll) │
+│  │   ├── Active listener on all Super nodes (1s poll) │
 │  │   ├── Consensus window: blocks 61-90 (early start)      │
 │  │   ├── Leader: +10 reputation, Participants: +5 each     │
 │  │   ├── Deterministic initiator selection                 │
@@ -720,7 +720,7 @@ QNet implements advanced chain reorganization and synchronization mechanisms for
 - **Block Time Synchronization**: Sub-second precision across distributed network
 - **Historical Proof**: Cryptographic evidence of event ordering and timing
 - **Fork Prevention**: VTS creates immutable timeline making forks computationally expensive
-- **Node Type Optimization**: VTS runs ONLY on Full/Super nodes (Light nodes excluded to save mobile battery/CPU)
+- **Node Type Optimization**: VTS runs ONLY on Super nodes (Light nodes excluded to save mobile battery/CPU)
 - **Network Synchronization**: Local VTS syncs with network consensus on block receipt
 - **Checkpointing**: Automatic checkpoints every 1M hashes for fast node restart
 - **Drift Detection**: Automatic clock drift monitoring with 5% tolerance threshold
@@ -932,17 +932,7 @@ SYNC_WORKERS=4
 | **Network** | 10 Mbps |
 | **OS** | Linux, macOS, Windows |
 
-### Recommended Requirements (Full Node)
-
-| Component | Specification |
-|-----------|---------------|
-| **CPU** | 4 cores, 3.0 GHz |
-| **RAM** | 16 GB |
-| **Storage** | 500 GB NVMe SSD |
-| **Network** | 100 Mbps |
-| **OS** | Ubuntu 20.04+ / CentOS 8+ |
-
-### High-Performance Requirements (Super Node)
+### Recommended Requirements (Super Node)
 
 | Component | Specification |
 |-----------|---------------|
@@ -961,7 +951,7 @@ SYNC_WORKERS=4
 | Node Type | Allowed Execution Method | Prohibited |
 |-----------|-------------------------|------------|
 | **Genesis Nodes** | ✅ Docker containers only | ❌ Direct binary execution |
-| **Full/Super Nodes** | ✅ Docker containers only | ❌ Direct binary execution |
+| **Super Nodes** | ✅ Docker containers only | ❌ Direct binary execution |
 | **Light Nodes** | ✅ Official mobile apps only | ❌ Server execution |
 
 **IMPORTANT:**
@@ -1020,7 +1010,7 @@ git pull origin testnet
 
 ⚠️ **Fully Automatic Configuration**: Everything is auto-configured including Solana contracts, ports, region, and performance settings.
 
-⚠️ **Interactive Activation Only**: Node requires activation code input through interactive menu.
+⚠️ **Docker Environment Variables Only**: Node requires `QNET_ACTIVATION_CODE`, `QNET_BURN_TX_HASH`, `QNET_BURN_AMOUNT`, `QNET_WALLET_SEED` via `-e` flags.
 
 ### Complete Production Setup
 
@@ -1045,19 +1035,6 @@ sudo iptables -A INPUT -p tcp --dport 9876 -j ACCEPT
 sudo iptables -A INPUT -p tcp --dport 9877 -j ACCEPT
 sudo iptables -A INPUT -p tcp --dport 8001 -j ACCEPT
 sudo iptables -A INPUT -p udp --dport 10876 -j ACCEPT
-
-# Run interactive production node (ONLY command needed)
-docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
-  -v $(pwd)/node_data:/app/node_data \
-  qnet-production
-
-# During interactive setup:
-# 1. Select network (testnet/mainnet) 
-# 2. Enter activation code from wallet extension
-# 3. Node activates automatically
-
-# Get activation codes via QNet wallet extension or mobile app (P2P decentralized system)
 ```
 
 **Note**: All Solana contract configuration is embedded in the Docker image. No manual configuration required.
@@ -1108,7 +1085,7 @@ docker run -d --name qnet-genesis-001 --restart=always \
   --log-opt max-size=200m --log-opt max-file=50 \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=001 \
-  -e QNET_GENESIS_SEED="your twelve or twenty four word mnemonic phrase here" \
+  -e QNET_WALLET_SEED="your twelve or twenty four word mnemonic phrase here" \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
@@ -1121,12 +1098,14 @@ docker run -d --name qnet-genesis-001 --restart=always \
 
 ```bash
 # Super Node — --name is Docker container name (any name you like, for docker management only)
-# Network node_id is auto-generated from your activation code: super_QNET-XXXX-XXXX-XXXX-XXXX
+# Network node_id is auto-generated from your activation code: super_QNET-SXXXX-XXXX-XXXX
 docker run -d --name my-qnet-node --restart=always \
   --log-opt max-size=200m --log-opt max-file=50 \
   -e QNET_PRODUCTION=1 \
-  -e QNET_ACTIVATION_CODE="QNET-XXXX-XXXX-XXXX-XXXX" \
   -e QNET_WALLET_SEED="your twelve or twenty four word mnemonic phrase here" \
+  -e QNET_ACTIVATION_CODE="QNET-SXXXXX-YYYYYY-ZZZZZZ" \
+  -e QNET_BURN_TX_HASH="your_solana_burn_transaction_signature_here" \
+  -e QNET_BURN_AMOUNT="1500" \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
@@ -1137,11 +1116,18 @@ docker run -d --name my-qnet-node --restart=always \
 
 > **💡 Container name (`--name`)**: This is your local Docker label — pick any name you want (e.g. `my-qnet-node`, `qnet-super-eu`, `validator-1`). It is NOT your network identity.
 >
-> **🔗 Network node_id**: Auto-generated from your activation code as `super_{activation_code}` (e.g. `super_QNET-AB12-CD34-EF56-GH78`). Genesis nodes use `genesis_node_001` format. You don't set this manually.
+> **🔗 Network node_id**: Auto-generated from your activation code as `super_{activation_code}` (e.g. `super_QNET-SAB12-CD34EF-GH5678`). Genesis nodes use `genesis_node_001` format. You don't set this manually.
 >
 > **⚠️ Mnemonic Seed Phrase**: Both 12-word (128-bit) and 24-word (256-bit) BIP39 mnemonics are supported.
-> The seed phrase derives your wallet address and stays **only in process memory** (not saved to disk).
+> The seed phrase **MUST match** the wallet used in the mobile app to burn 1DEV tokens and obtain the activation code.
+> The server derives the Solana address from this mnemonic and verifies it against the XOR-encrypted address in the activation code.
 > Dilithium3 keypair is generated on first launch, encrypted with **AES-256-GCM**, and stored in the Docker volume with `chmod 600`.
+>
+> **🔥 QNET_BURN_TX_HASH**: Solana transaction signature from the 1DEV burn. Obtained in the mobile app along with the activation code.
+>
+> **💰 QNET_BURN_AMOUNT**: Exact amount of 1DEV burned. Must match exactly for XOR decryption to succeed.
+>
+> **📱 How to get these values**: Open QNet mobile app → Settings → Export Activation Data → copy Code, Burn TX Hash, and Burn Amount.
 
 #### 🔐 Key Storage & Security
 
@@ -1169,7 +1155,7 @@ cp -r ./keys_backup/* $(pwd)/super_node_data/keys/
 docker run -d --name my-qnet-node --restart=always \
   --log-opt max-size=200m --log-opt max-file=50 \
   -e QNET_PRODUCTION=1 \
-  -e QNET_ACTIVATION_CODE="QNET-XXXX-XXXX-XXXX-XXXX" \
+  -e QNET_ACTIVATION_CODE="QNET-SXXXXX-YYYYYY-ZZZZZZ" \
   -e QNET_WALLET_SEED="your twelve or twenty four word mnemonic phrase here" \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
@@ -1256,11 +1242,11 @@ rm -rf ~/QNet-Blockchain/node_data
 
 QNet nodes run natively for maximum performance. Choose your node type based on available resources.
 
-### 💡 Node Setup (Interactive Menu)
+### 💡 Node Setup
 
 QNet nodes use device-specific deployment methods:
 
-**Server Nodes (Full/Super)**: Interactive setup menu on dedicated servers
+**Server Nodes (Super)**: Docker with environment variables (same architecture as Genesis nodes)
 **Mobile Nodes (Light)**: Mobile app activation on phones & tablets
 
 ### Node Types & Platform Support
@@ -1268,15 +1254,14 @@ QNet nodes use device-specific deployment methods:
 | Node Type | Platform | Activation Method | API Server | Features |
 |-----------|----------|-------------------|------------|----------|
 | **Light** | 📱 Mobile phones & tablets | Mobile app only | ❌ No | Basic sync, wallet |
-| **Full** | 🖥️ Servers, VPS, desktops | Interactive setup | ✅ Yes | Full validation, API |
-| **Super** | 🖥️ Servers, VPS, desktops | Interactive setup | ✅ Yes | Enhanced features, API |
+| **Super** | 🖥️ Servers, VPS, desktops | Docker env vars | ✅ Yes | Full validation, consensus, API |
 
 ### Device Restrictions
 
 **⚠️ CRITICAL LIMITATIONS:**
 - **Light Nodes**: Cannot be activated on servers/desktops
-- **Full/Super Nodes**: Cannot be activated on mobile devices
-- **API Access**: Only Full/Super nodes provide REST endpoints
+- **Super Nodes**: Cannot be activated on mobile devices
+- **API Access**: Only Super nodes provide REST endpoints
 
 #### Automatic Node Setup
 
@@ -1323,7 +1308,7 @@ Welcome to QNet Blockchain Network!
    📉 Dynamic Reduction: Lower prices as more tokens burned
 
 🖥️  === Server Node Type Selection ===
-⚠️  SERVERS ONLY SUPPORT FULL/SUPER NODES
+⚠️  SERVERS ONLY SUPPORT SUPER NODES
 📱 Light nodes are restricted to mobile devices only
 
 Choose your server node type:
@@ -1444,9 +1429,15 @@ docker rm qnet-node
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
 # Run updated container
-docker run -it --name qnet-node --restart=always \
+docker run -d --name qnet-super --restart=always \
+  --log-opt max-size=200m --log-opt max-file=50 \
+  -e QNET_PRODUCTION=1 -e DOCKER_ENV=1 \
+  -e QNET_WALLET_SEED="your twelve word mnemonic" \
+  -e QNET_ACTIVATION_CODE="QNET-SXXXXX-YYYYYY-ZZZZZZ" \
+  -e QNET_BURN_TX_HASH="solana_burn_tx_signature" \
+  -e QNET_BURN_AMOUNT="1500" \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
-  -v $(pwd)/node_data:/app/node_data \
+  -v $(pwd)/node_data:/app/data \
   qnet-production
 ```
 
@@ -1467,17 +1458,20 @@ docker run -it --name qnet-node --restart=always \
 - **Blockchain Authority**: Blockchain records are the source of truth
 
 #### Migration Scenarios
-1. **Server Migration**: Move Full/Super node to new hardware
+1. **Server Migration**: Move Super node to new hardware
 2. **Hardware Upgrade**: Seamless transition to more powerful server
 3. **Node Type Upgrade**: Full → Super activation replaces Full node
 4. **Disaster Recovery**: Reactivate on new server after hardware failure
 
 #### Example: Server Migration
 ```bash
-# On NEW server - activate with same activation code
-docker run -it --name qnet-node --restart=always \
-  -e QNET_PRODUCTION=1 \
-  -e QNET_BOOTSTRAP_ID=YOUR_ID \
+# On NEW server - activate with same activation code + burn data
+docker run -d --name qnet-super --restart=always \
+  -e QNET_PRODUCTION=1 -e DOCKER_ENV=1 \
+  -e QNET_WALLET_SEED="same mnemonic as mobile app" \
+  -e QNET_ACTIVATION_CODE="same code" \
+  -e QNET_BURN_TX_HASH="same burn tx" \
+  -e QNET_BURN_AMOUNT="same amount" \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
@@ -1514,11 +1508,11 @@ sudo chown -R qnet:qnet ~/QNet-Blockchain/node_data
 
 ### Test Network (Testnet)
 
-Current deployment runs on testnet automatically. Network selection is handled during the interactive setup - no manual configuration required.
+Current deployment runs on testnet automatically. Network selection is auto-detected from server IP — no manual configuration required.
 
 ### Regional Configuration
 
-Regional selection is handled automatically during the interactive setup based on your server's IP location. The system auto-detects your optimal region for best performance:
+Regional selection is handled automatically at startup based on your server's IP location. The system auto-detects your optimal region for best performance:
 
 - **North America**: US, Canada, Mexico
 - **Europe**: EU countries, UK, Norway, Switzerland
@@ -1649,7 +1643,7 @@ docker run -d --name qnet-genesis-005 --restart=always \
 - ✅ Batch size: 10,000 transactions
 - ✅ Mempool: 2M transactions capacity
 - ✅ High frequency mode: enabled
-- ✅ VTS: 500K hashes/sec (Full/Super nodes only)
+- ✅ VTS: 500K hashes/sec (Super nodes only)
 
 **Genesis Node Requirements:**
 - Set `QNET_BOOTSTRAP_ID` to 001-005 for genesis nodes
@@ -1866,7 +1860,7 @@ cargo test --test performance --release
 
 ### Multi-Node REST API Architecture
 
-**🌐 Every Full/Super node provides complete API functionality:**
+**🌐 Every Super node provides complete API functionality:**
 
 ```bash
 # Node 1 API endpoints
@@ -1951,13 +1945,13 @@ async function qnetApiCall(endpoint, data = null) {
 - ✅ **Redundancy**: Built-in failover capabilities
 
 **📝 Node Requirements:**
-- Full/Super nodes provide REST API endpoints
+- Super nodes provide REST API endpoints
 - Light nodes focus on mobile functionality
 - Each node offers identical API interface
 
 ### WebSocket API (Per Node)
 
-Each Full/Super node also provides WebSocket endpoints for real-time updates:
+Each Super node also provides WebSocket endpoints for real-time updates:
 
 ```javascript
 // Connect to specific node WebSocket
@@ -2077,10 +2071,9 @@ docker run ... -e QNET_MAX_THREADS=8 ...
 | Node Type | Storage Size | Data Retention | Sync Time |
 |-----------|-------------|----------------|-----------|
 | **Light** | ~10 MB (app only) | None (thin client via RPC) | N/A |
-| **Full** | 50-100 GB | Sliding window (~18-74 days) | ~5 minutes |
 | **Super** | 500 GB - 1 TB | Complete history forever | ~15 minutes |
 
-> **Light Node Architecture (v3.0)**: Light nodes are mobile apps (thin clients). They do NOT sync or store any blockchain data. All data (balance, TX history) is fetched via RPC from Full/Super nodes.
+> **Light Node Architecture (v3.0)**: Light nodes are mobile apps (thin clients). They do NOT sync or store any blockchain data. All data (balance, TX history) is fetched via RPC from Super nodes.
 
 - **Smart Defaults**: Automatically detects node type via `QNET_NODE_TYPE` environment variable
 - **Adaptive Sliding Window**: Full nodes auto-scale storage window with network growth (100K × active_shards)
@@ -2211,7 +2204,7 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 - Minimum 3 replicas per archive chunk across different nodes
 - Automatic rebalancing when nodes disconnect or migrate
 - Background compliance monitoring every 4 hours
-- Mandatory archival participation for Full/Super nodes
+- Mandatory archival participation for Super nodes
 
 #### 🚫 **Advanced Reputation & Penalty System:**
 
@@ -2229,16 +2222,16 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 **Reputation Consequences:**
 - **<70% Reputation**: Excluded from consensus participation AND new rewards
 - **<10% Reputation**: Automatically banned from network (can still claim old rewards)
-- **Hourly Decay**: -1% automatic reputation decay for inactive Full/Super nodes
+- **Hourly Decay**: -1% automatic reputation decay for inactive Super nodes
 - **Light Nodes**: Fixed 70% reputation (immutable, always eligible for rewards)
 
 **Universal Node Security (Full Decentralization):**
-- **Starting Reputation**: 70% for Full/Super nodes (consensus threshold)
+- **Starting Reputation**: 70% for Super nodes (consensus threshold)
 - **Light Node Reputation**: Fixed at 70% (immutable by design)
 - **No Special Protection**: Genesis nodes = Regular nodes
-- **Full Penalties Apply**: Any Full/Super node can be reduced to 0% and banned
-- **Merit-Based System**: Full/Super nodes must maintain good behavior
-- **Consensus Participation**: ≥70% required for Full/Super nodes
+- **Full Penalties Apply**: Any FSuper node can be reduced to 0% and banned
+- **Merit-Based System**: Super nodes must maintain good behavior
+- **Consensus Participation**: ≥70% required for Super nodes
 - **Light Nodes**: Never participate in consensus (rewards only)
 
 #### 🔧 **Node Migration Support:**
@@ -2452,7 +2445,7 @@ Prevents repeat attacks: attackers can't instantly rejoin after penalty
 This release introduces critical improvements for quantum-resistant consensus:
 - **Deterministic Producer Selection** with Dilithium + Ed25519 hybrid cryptography and finality window entropy
 - **Race-Free Rotation**: No delays at block boundaries (31, 61, 91)
-- **Active Macroblock Consensus**: All Full/Super nodes run 1-second polling listener
+- **Active Macroblock Consensus**: All Super nodes run 1-second polling listener
 - **Deterministic Validator Selection**: 1000 validators per macroblock round
 - **Improved Failover**: Consensus state cleanup prevents stuck states
 - **Reputation Rewards** incentivize active network participation
