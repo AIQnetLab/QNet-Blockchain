@@ -13715,8 +13715,8 @@ async fn run_benchmark_generator(
                 BENCHMARK_MANAGER.record_latency(lat).await;
                     }
             
-            println!("[BENCHMARK] Worker {} finished: {} TX sent, {} confirmed", 
-                     worker_id, local_sent, local_confirmed);
+            println!("[BENCHMARK] Worker {} finished: {} TX sent, {} confirmed, {} errors", 
+                     worker_id, local_sent, local_confirmed, local_errors);
             
             (worker_id, local_sent, local_confirmed)
         });
@@ -13773,6 +13773,7 @@ async fn run_benchmark_generator(
     
     // Stop progress reporter
     progress_handle.abort();
+    println!("[BENCHMARK] ✅ All workers done, total_by_workers={}", total_by_workers);
     
     // Final stats update
     let final_sent = global_sent.load(Ordering::SeqCst);

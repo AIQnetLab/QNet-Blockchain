@@ -1,5 +1,5 @@
 # PRODUCTION QNet Node Dockerfile - Latest Rust and dependencies
-FROM rust:1.86-slim AS builder
+FROM rust:1.88-slim AS builder
 
 LABEL maintainer="QNet Development Team"
 LABEL description="Production QNet Blockchain Node"

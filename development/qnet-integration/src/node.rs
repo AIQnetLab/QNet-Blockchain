@@ -6063,8 +6063,8 @@ impl BlockchainNode {
                         }
                     }
                     
-                    if added > 0 {
-                        if is_info() { println!("[INFO][TX-SYNC] batch_added count={} mode=batch_verify", added); }
+                    if added > 0 || rejected_sig > 0 || rejected_val > 0 {
+                        if is_info() { println!("[INFO][TX-SYNC] batch_added count={} rejected_sig={} rejected_val={} mode=batch_verify", added, rejected_sig, rejected_val); }
                     }
                     
                     last_batch_time = std::time::Instant::now();

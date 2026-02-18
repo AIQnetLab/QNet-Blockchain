@@ -1,5 +1,5 @@
 # Multi-stage build for QNet Production Node
-FROM rust:1.82-bookworm as builder
+FROM rust:1.88-bookworm as builder
 
 # Install build dependencies including libclang for bindgen
 RUN apt-get update && apt-get install -y \

@@ -17058,6 +17058,7 @@ impl SimplifiedP2P {
                         
                         println!("[P2P] 🔥 PEER EXCHANGE: {} new peers added to connected_peers", added_count);
                         
+                        let _ = validated_count; // tracked but not aggregated further
                         // CACHE FIX: Invalidate cache after adding peers through exchange
                         if added_count > 0 {
                             // Can't call self.invalidate_peer_cache() from static context
@@ -17970,8 +17971,8 @@ impl SimplifiedP2P {
             broadcasted += 1;
         }
         
-        println!("[SECURITY] 📢 Alert sent to {} Super nodes + {} sampled peers", 
-                 super_nodes.len(), sampled_peers.len());
+        println!("[SECURITY] 📢 Alert sent to {} Super nodes + {} sampled peers (total broadcasted: {})", 
+                 super_nodes.len(), sampled_peers.len(), broadcasted);
     }
     
     /// Log security incident with cryptographic chain for tamper-proof audit trail
