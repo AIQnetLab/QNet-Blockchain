@@ -7,11 +7,12 @@ import { derivePath } from 'ed25519-hd-key';
 import * as bip39 from 'bip39';
 import nacl from 'tweetnacl'; // Ed25519 signing for node operations
 // v3.35: Centralized node configuration (no duplication!)
-import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode } from '../config/nodes';
+// v4.10: Added getSolanaRpcUrl for centralized Solana RPC management
+import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl } from '../config/nodes';
 
 export class WalletManager {
   constructor() {
-    this.connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+    this.connection = new Connection(getSolanaRpcUrl(true), 'confirmed');
     this.keyCache = null; // Cache derived key for faster unlock
     this.keyCachePassword = null; // Track which password the key is for
     
@@ -3219,9 +3220,7 @@ export class WalletManager {
     try {
       // Use correct RPC based on network (don't use cached connection)
       // FIXED: Previously inverted - now isTestnet=true means devnet
-      const rpcUrl = isTestnet 
-        ? 'https://api.devnet.solana.com'  // Testnet
-        : 'https://api.mainnet-beta.solana.com';  // Mainnet
+      const rpcUrl = getSolanaRpcUrl(isTestnet);
         
       const response = await fetch(rpcUrl, {
         method: 'POST',
@@ -3252,10 +3251,8 @@ export class WalletManager {
   // Get SPL token balance (for 1DEV and other tokens)
   async getTokenBalance(walletAddress, mintAddress, isTestnet = true) {
     try {
-      // Use correct RPC based on network - TESTNET when isTestnet=true
-      const rpcUrl = isTestnet 
-        ? 'https://api.devnet.solana.com'  // TESTNET when isTestnet=true
-        : 'https://api.mainnet-beta.solana.com';  // MAINNET when isTestnet=false
+      // v4.10: Centralized RPC URL
+      const rpcUrl = getSolanaRpcUrl(isTestnet);
       
       // Get token accounts for the wallet
       const response = await fetch(rpcUrl, {
@@ -3862,10 +3859,8 @@ export class WalletManager {
   // Get real burn progress from blockchain
   async getBurnProgress(isTestnet = true) {
     try {
-      // Ensure correct RPC endpoint usage
-      const rpcUrl = isTestnet 
-        ? 'https://api.devnet.solana.com'  // TESTNET when isTestnet=true
-        : 'https://api.mainnet-beta.solana.com';  // MAINNET when isTestnet=false
+      // v4.10: Centralized RPC URL
+      const rpcUrl = getSolanaRpcUrl(isTestnet);
       
       // 1DEV token mint addresses - ensure correct assignment
       const oneDevMint = isTestnet 
@@ -3940,10 +3935,7 @@ export class WalletManager {
         amount = pricing.cost;
       }
       
-      const connection = new Connection(
-        isTestnet ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com',
-        'confirmed'
-      );
+      const connection = new Connection(getSolanaRpcUrl(isTestnet), 'confirmed');
       
       // Load and decrypt wallet properly
       if (!password) {
@@ -4124,21 +4116,20 @@ export class WalletManager {
       
       // Use ACTUAL burned amount (from caller) — NOT current price!
       // XOR key = SHA3(burn_tx:type:amount) — amount MUST match exactly what was burned
+      // Dynamic pricing: amount varies based on network burn percentage — NO hardcoded defaults
       let burnAmount = actualBurnAmount;
       if (!burnAmount || burnAmount <= 0) {
-        // Fallback: fetch current price ONLY if caller didn't provide amount
-        // This should NOT happen in normal flow — callers must always pass actualBurnAmount
-        console.warn('[WalletManager] actualBurnAmount not provided — fetching current price (may mismatch!)');
+        // Fallback: fetch current price from server — caller SHOULD always pass actualBurnAmount
+        console.warn('[WalletManager] actualBurnAmount not provided — fetching current price from server');
         try {
           const pricingResponse = await fetch(`${apiUrl}/api/v1/pricing/${nodeType}`);
           const pricing = await pricingResponse.json();
           burnAmount = pricing.current_price || 0;
         } catch (pricingErr) {
-          console.warn('[WalletManager] Pricing fetch failed, using default:', pricingErr.message);
+          console.warn('[WalletManager] Pricing fetch failed:', pricingErr.message);
         }
-        // Fallback: Phase 1 default is 1500 1DEV if pricing endpoint unavailable
-        if (burnAmount === 0 && phase === 1) {
-          burnAmount = 1500;
+        if (!burnAmount || burnAmount <= 0) {
+          throw new Error('Cannot determine burn amount — dynamic pricing requires server or caller to provide actual amount');
         }
       }
       
@@ -4369,7 +4360,7 @@ export class WalletManager {
       
       // First check if we have stored activation metadata
       // This is the most reliable way to know if node was activated
-      const metaKeys = ['light', 'full', 'super'];
+      const metaKeys = ['light', 'super']; // v4.10: Removed 'full' — Full Node type was removed in v3.18
       for (const nodeType of metaKeys) {
         const metaData = await AsyncStorage.getItem(`qnet_activation_meta_${nodeType}`);
         if (metaData) {
@@ -4622,9 +4613,101 @@ export class WalletManager {
     }
   }
   
+  /**
+   * v4.10: Find burn transaction directly on Solana blockchain
+   * Returns { burnTxHash, nodeType, burnAmount } or null
+   * Used when local metadata was cleared (pm clear / reinstall)
+   */
+  async findBurnTransactionOnSolana(walletAddress) {
+    try {
+      const testnetSetting = await AsyncStorage.getItem('qnet_testnet');
+      const isTestnet = testnetSetting === null ? true : testnetSetting === 'true';
+      const rpcUrl = getSolanaRpcUrl(isTestnet);
+      
+      // Step 1: Get signatures with memo
+      const sigResponse = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1,
+          method: 'getSignaturesForAddress',
+          params: [walletAddress, { limit: 10 }]
+        })
+      });
+      
+      if (!sigResponse.ok) return null;
+      const sigData = await sigResponse.json();
+      if (!sigData.result || sigData.result.length === 0) return null;
+      
+      // Step 2: Fast-path — find burn TX from memo
+      for (const sig of sigData.result) {
+        if (sig.memo && sig.memo.includes('QNET_NODE_TYPE:') && !sig.err) {
+          const match = sig.memo.match(/QNET_NODE_TYPE:(\w+)/);
+          if (match) {
+            const nodeType = match[1].toLowerCase();
+            console.log(`[findBurnTx] Found burn TX: ${sig.signature.substring(0, 16)}... type=${nodeType}`);
+            
+            // Step 3: Get parsed transaction to extract burn amount
+            await new Promise(r => setTimeout(r, 500)); // Rate limit protection
+            try {
+              const txResponse = await fetch(rpcUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  jsonrpc: '2.0', id: 1,
+                  method: 'getTransaction',
+                  params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
+                })
+              });
+              
+              if (txResponse.ok) {
+                const txData = await txResponse.json();
+                if (txData.result) {
+                  // Extract burn amount from instructions
+                  let burnAmount = 0;
+                  const instructions = txData.result?.transaction?.message?.instructions || [];
+                  for (const inst of instructions) {
+                    if (inst.parsed && inst.parsed.type === 'burn' && inst.parsed.info) {
+                      const rawAmount = parseInt(inst.parsed.info.amount || '0');
+                      const decimals = inst.parsed.info.decimals || 6;
+                      burnAmount = rawAmount / Math.pow(10, decimals);
+                      break;
+                    }
+                  }
+                  
+                  return {
+                    burnTxHash: sig.signature,
+                    nodeType: nodeType,
+                    burnAmount: burnAmount > 0 ? burnAmount : null, // Must be real — no defaults
+                    blockTime: sig.blockTime
+                  };
+                }
+              }
+            } catch (txErr) {
+              // Can't get amount — return TX hash but no amount (caller must handle)
+              return {
+                burnTxHash: sig.signature,
+                nodeType: nodeType,
+                burnAmount: null,
+                blockTime: sig.blockTime
+              };
+            }
+          }
+        }
+      }
+      
+      return null;
+    } catch (error) {
+      console.warn('[findBurnTx] Error:', error.message);
+      return null;
+    }
+  }
+
   // Check blockchain for burn transactions to find activated nodes
+  // v4.10: Added rate-limit protection — initial delay + retry with backoff
   async checkBlockchainForActivations(walletAddress) {
     try {
+      console.warn('[QNET_DEBUG] checkBlockchainForActivations called for:', walletAddress);
       const activatedNodes = [];
       
       // Get network setting
@@ -4638,27 +4721,54 @@ export class WalletManager {
         // Import Solana web3
         const { Connection, PublicKey } = require('@solana/web3.js');
         
-        // Create connection with timeout
-        const connection = new Connection(
-          isTestnet ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com',
-          {
-            commitment: 'confirmed',
-            confirmTransactionInitialTimeout: 10000 // 10 second timeout
-          }
-        );
+        // v4.10: Centralized RPC URL with timeout + fetch middleware for 429 retry
+        const connection = new Connection(getSolanaRpcUrl(isTestnet), {
+          commitment: 'confirmed',
+          confirmTransactionInitialTimeout: 15000,
+        });
+        
+        // v4.10: Initial delay to stagger with other parallel Solana RPC calls
+        // (loadBalance, getBurnProgress run first — we wait to avoid 429)
+        await new Promise(r => setTimeout(r, 2000));
         
         // Smart transaction fetching strategy
         // 1. First check recent transactions (fast)
         let signatures = await connection.getSignaturesForAddress(
           new PublicKey(walletAddress),
-          { limit: 10 } // Quick check of recent transactions
+          { limit: 5 } // v4.10: Reduced from 10→5 to reduce RPC calls
         );
         
+        // v4.10: Helper to avoid Solana 429 rate limits
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        
+        // v4.10: FAST PATH — check memo field from signatures (no extra RPC calls needed)
+        // Solana returns memo in getSignaturesForAddress response, e.g. "[20] QNET_NODE_TYPE:LIGHT"
+        const detectedTypes = new Set();
+        for (const sig of signatures) {
+          if (sig.memo && sig.memo.includes('QNET_NODE_TYPE:') && !sig.err) {
+            const memoText = sig.memo;
+            const nodeTypeMatch = memoText.match(/QNET_NODE_TYPE:(\w+)/);
+            if (nodeTypeMatch) {
+              const detectedType = nodeTypeMatch[1].toLowerCase();
+              console.log(`[checkBlockchainForActivations] Fast-path: found ${detectedType} burn via memo`);
+              detectedTypes.add(detectedType);
+            }
+          }
+        }
+        if (detectedTypes.size > 0) {
+          // Return exact detected types (light, super, or both if multiple burns)
+          return Array.from(detectedTypes);
+        }
+        
+        console.log('[checkBlockchainForActivations] No memo fast-path hit, checking transaction details...');
+        
         // Function to check transactions in batches
+        // v4.10: Reduced batch size from 5→2 and added 500ms delay between batches
+        // to avoid Solana public RPC 429 rate limiting
         const checkTransactionBatch = async (sigs) => {
           const txPromises = [];
           const txSignatures = []; // Store signatures for later use
-          const maxBatchSize = 5;
+          const maxBatchSize = 2; // v4.10: Reduced from 5 to avoid 429
           
           for (let i = 0; i < sigs.length; i++) {
             const sigInfo = sigs[i];
@@ -4674,6 +4784,8 @@ export class WalletManager {
             // Process in batches
             if (txPromises.length === maxBatchSize || i === sigs.length - 1) {
               const txBatch = await Promise.all(txPromises);
+              // v4.10: Delay between batches to respect Solana RPC rate limits
+              if (i < sigs.length - 1) await sleep(500);
               
               for (const result of txBatch) {
                 if (!result) continue;
@@ -4689,8 +4801,7 @@ export class WalletManager {
                   // Found burn transaction but can't determine type in Phase 1
                   // All nodes have DYNAMIC pricing (1500-300 1DEV based on burn %)
                   // Return all types and let sync logic determine which one
-                  // console.log('[checkBlockchainForActivations] Found burn transaction');
-                  return ['light', 'full', 'super'];
+                  return ['light', 'super']; // v4.10: Removed 'full'
                 }
                 
                 // Also check for SPL token burns
@@ -4761,7 +4872,7 @@ export class WalletManager {
                         nodeType: 'light',
                         phase: 1
                       }));
-                      return ['light', 'full', 'super'];
+                      return ['light', 'super']; // v4.10: Removed 'full'
                     }
                   }
                 }
@@ -4927,13 +5038,13 @@ export class WalletManager {
   
   // Calculate dynamic activation cost based on burn percentage
   // Calculate activation cost (Light and Super nodes only)
+  // Dynamic pricing: 1500 base at 0% burned → 300 minimum at 80%+ burned
   async calculateActivationCost(nodeType = 'super') {
+    // Phase 1 Economic Model — declared outside try for catch access
+    const PHASE_1_BASE_PRICE = 1500; // Base cost in 1DEV at 0% burned
+    const PRICE_REDUCTION_PER_10_PERCENT = 150; // 150 1DEV reduction per 10% burned
     try {
       const burnPercent = parseFloat(await this.getBurnProgress(false));
-      
-      // Phase 1 Economic Model
-      const PHASE_1_BASE_PRICE = 1500; // Base cost in 1DEV
-      const PRICE_REDUCTION_PER_10_PERCENT = 150; // 150 1DEV reduction per 10% burned
       const MINIMUM_PRICE = 300; // Minimum price at 80-90% burned
       
       // Check if Phase 2 (90% burned or 5 years passed)
@@ -4993,14 +5104,18 @@ export class WalletManager {
         description: `Burn ${currentPrice} 1DEV for activation (${burnPercent.toFixed(1)}% already burned)`
       };
     } catch (error) {
-      // console.error('Error calculating activation cost:', error);
-      // Fallback to base price
+      console.warn('[PRICING] Error calculating activation cost:', error.message);
+      // Fallback: use BASE price (max cost) — safe because user never underpays
+      // Base = 1500 at 0% burned, actual price may be lower if tokens have been burned
       return {
-        cost: 1500,
+        cost: PHASE_1_BASE_PRICE || 1500,
         currency: '1DEV',
         phase: 1,
         mechanism: 'burn',
-        description: 'Burn 1500 1DEV for activation'
+        burnPercent: 0,
+        baseCost: PHASE_1_BASE_PRICE || 1500,
+        description: 'Burn 1DEV for activation (price may be lower — check network status)',
+        isEstimate: true
       };
     }
   }

@@ -11172,8 +11172,8 @@ async fn verify_burn_transaction_exists(
             }
             
             // Convert burn_amount from request (1DEV units) to SPL token units (with decimals)
-            // 1DEV token has 9 decimals, so 1 1DEV = 1_000_000_000 smallest units
-            const ONEDEV_DECIMALS: u64 = 1_000_000_000; // 10^9
+            // 1DEV token has 6 decimals, so 1 1DEV = 1_000_000 smallest units
+            const ONEDEV_DECIMALS: u64 = 1_000_000; // 10^6
             let expected_exact_burn = burn_amount * ONEDEV_DECIMALS; // EXACT amount required
             
             // CRITICAL: NO TOLERANCE! Application burns EXACT amount as specified

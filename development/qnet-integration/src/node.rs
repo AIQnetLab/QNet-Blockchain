@@ -11144,6 +11144,8 @@ impl BlockchainNode {
                         if can_sync {
                             println!("[SYNC] ⚡ State machine height {} → {} (all blocks in RocksDB)", 
                                     microblock_height, canonical_height);
+                            
+                            let old_height = microblock_height;
                             microblock_height = canonical_height;
                             
                             // CRITICAL FIX v2.26.8: Also update last_macroblock_trigger when syncing!
@@ -11156,6 +11158,59 @@ impl BlockchainNode {
                                 if is_debug() { println!("[DBG][SYNC] mb_trigger {} -> {} (synced)", 
                                         last_macroblock_trigger, new_trigger); }
                                 last_macroblock_trigger = new_trigger;
+                            }
+                            
+                            // ═══════════════════════════════════════════════════════════════
+                            // FIX v2.48: PFP ACTIVATION IN SYNC MODE
+                            // ═══════════════════════════════════════════════════════════════
+                            // Root cause of incident: node 002 was elected mb=509 INITIATOR
+                            // but was in catch-up sync mode at h=45810. The PFP trigger only
+                            // fires inside the production loop (check_height % 90 == 0).
+                            // A syncing node never runs the production loop → PFP never fires
+                            // → mb=509 was never initiated → network stall → fork.
+                            //
+                            // FIX: After sync advances past an epoch boundary, check if the
+                            // macroblock for that epoch is MISSING. If so, activate PFP from
+                            // this sync-path, independent of the production loop.
+                            // ═══════════════════════════════════════════════════════════════
+                            if canonical_height > 180 && canonical_height > old_height {
+                                // Check every epoch boundary we just crossed during this sync
+                                let first_epoch_boundary = ((old_height / 90) + 1) * 90;
+                                let mut check_boundary = first_epoch_boundary;
+                                while check_boundary <= canonical_height {
+                                    let expected_mb = check_boundary / 90;
+                                    // Only check if macroblock is actually missing
+                                    let mb_missing = storage
+                                        .get_macroblock_by_height(expected_mb)
+                                        .map(|r| r.is_none())
+                                        .unwrap_or(true);
+                                    
+                                    if mb_missing && expected_mb > 0 {
+                                        let blocks_since = canonical_height.saturating_sub(check_boundary);
+                                        println!("[WARN][SYNC] epoch_boundary_crossed h={} mb={} MISSING blocks_without={} → activating PFP from sync path",
+                                                 canonical_height, expected_mb, blocks_since);
+                                        
+                                        // Spawn PFP so it doesn't block the sync loop
+                                        let storage_pfp = storage.clone();
+                                        let consensus_pfp = consensus.clone();
+                                        let p2p_pfp = unified_p2p.clone();
+                                        let pfp_height = canonical_height;
+                                        let pfp_blocks = blocks_since.max(1);
+                                        tokio::spawn(async move {
+                                            // Small delay so state fully settles after sync
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                            println!("[INFO][SYNC-PFP] activating PFP for missing mb={} h={}", expected_mb, pfp_height);
+                                            Self::activate_progressive_finalization_with_level(
+                                                storage_pfp,
+                                                consensus_pfp,
+                                                pfp_height,
+                                                p2p_pfp,
+                                                pfp_blocks,
+                                            ).await;
+                                        });
+                                    }
+                                    check_boundary += 90;
+                                }
                             }
                         }
                     }
@@ -11359,6 +11414,68 @@ impl BlockchainNode {
                                     if is_info() {
                                         println!("[INFO][FAILOVER] h={} certified_round={} producer={}", 
                                                  next_height, certified_timeout_round, current_producer);
+                                    }
+                                }
+                            }
+                            
+                            // ═══════════════════════════════════════════════════════════════════
+                            // FIX v2.48: CHRONIC STALL RECOVERY
+                            // ═══════════════════════════════════════════════════════════════════
+                            // Root cause of incident: All 4 non-forked nodes stuck at h=45900.
+                            // Byzantine median height == local height → gap=0 → rollback never fires.
+                            // certified_round stays 0 because nobody can get 2/3 consensus.
+                            //
+                            // NEW: If stall > CHRONIC_STALL_THRESHOLD (300s) AND certified_round=0:
+                            //   1. The macroblock for current epoch is MISSING
+                            //   2. Force PFP activation — this node may be the unaware initiator
+                            //   3. Trigger full resync from all peers to get any missed blocks
+                            // ═══════════════════════════════════════════════════════════════════
+                            static CHRONIC_STALL_LAST_PFP: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let chronic_stall_threshold = 300u64; // 5 minutes
+                            let pfp_cooldown = 120u64;            // re-trigger PFP at most every 2 min
+                            
+                            if local_delay > chronic_stall_threshold && certified_timeout_round == 0 {
+                                let now_u64 = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let last_pfp = CHRONIC_STALL_LAST_PFP.load(std::sync::atomic::Ordering::Relaxed);
+                                
+                                if now_u64.saturating_sub(last_pfp) > pfp_cooldown {
+                                    CHRONIC_STALL_LAST_PFP.store(now_u64, std::sync::atomic::Ordering::Relaxed);
+                                    
+                                    let missing_mb = next_height / 90;
+                                    println!("[WARN][STALL] chronic_stall h={} delay={}s mb={} certified_round=0 → forcing PFP + resync",
+                                             next_height, local_delay, missing_mb);
+                                    
+                                    // 1. Force macroblock sync from all peers
+                                    if let Some(p2p) = &unified_p2p {
+                                        let _ = p2p.sync_macroblocks(
+                                            missing_mb.saturating_sub(1), missing_mb
+                                        ).await;
+                                        
+                                        // 2. Force block resync for last 90 blocks to recover gap
+                                        let resync_from = next_height.saturating_sub(90);
+                                        let _ = p2p.sync_blocks(resync_from, next_height).await;
+                                        
+                                        // 3. Activate PFP — will elect correct leader deterministically
+                                        //    Same logic as the production loop but triggered from stall path
+                                        let blocks_without = local_delay.min(270) as u64;
+                                        let storage_clone = storage.clone();
+                                        let consensus_clone = consensus.clone();
+                                        let p2p_clone = p2p.clone();
+                                        let p2p_opt = Some(p2p_clone);
+                                        tokio::spawn(async move {
+                                            println!("[INFO][STALL] spawning PFP h={} blocks_without={}", next_height, blocks_without);
+                                            Self::activate_progressive_finalization_with_level(
+                                                storage_clone,
+                                                consensus_clone,
+                                                next_height,
+                                                p2p_opt,
+                                                blocks_without,
+                                            ).await;
+                                        });
                                     }
                                 }
                             }
@@ -15123,36 +15240,39 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             _ => {}
                                         }
                                         
-                                        // CRITICAL FIX v2.61: NEVER do emergency if network HAS block
-                                        // Previous logic: 1 retry → fallback to emergency → FORK!
-                                        // New logic: 3 retries with wait → if all fail → SKIP emergency (prevent fork)
-                                        // Reasoning: If 2/3+ network has block, emergency production would create duplicate → FORK
+                                        // CRITICAL FIX v2.62: Network HAS block — AGGRESSIVE SYNC, never skip
+                                        // Root cause of incident mb=509: 3 retries were not enough when the
+                                        // producer was still propagating the block to other peers. We now retry
+                                        // up to 8 times with extended backoff (total ≤ 33s) so that by attempt
+                                        // 4-5 the block has fully propagated to all 4 available peers.
+                                        //
+                                        // REMOVED: "skipping_block" fallback — skipping a block that 2/3+ of
+                                        // the network has places this node on a diverged chain. It is NEVER
+                                        // safe to skip a block that exists on the network.
                                         let mut sync_success = false;
-                                        let max_sync_attempts = 3;  // Increased from 1
+                                        // Backoff schedule (ms): 500, 1000, 2000, 3000, 5000, 5000, 5000, 5000
+                                        let backoff_schedule: &[u64] = &[500, 1000, 2000, 3000, 5000, 5000, 5000, 5000];
+                                        let max_sync_attempts = backoff_schedule.len();
                                         
                                         for sync_attempt in 1..=max_sync_attempts {
                                             match p2p_check.sync_blocks(expected_height_timeout, expected_height_timeout).await {
                                                 Ok(_) => {
-                                                    // CRITICAL FIX: Wait for block to arrive (sync_blocks is fire-and-forget!)
-                                                    // sync_blocks() returns Ok immediately after sending request
-                                                    // Block arrives asynchronously via gossip/response
-                                                    // Wait up to 2 seconds for block to appear in storage
+                                                    // sync_blocks() is fire-and-forget — wait for block in storage
+                                                    // Wait up to 3 seconds per attempt (30 * 100ms)
                                                     let mut block_arrived = false;
-                                                    let max_wait_attempts = 20;  // 20 * 100ms = 2s
+                                                    let max_wait_attempts = 30;  // 30 * 100ms = 3s
                                                     
                                                     for wait_attempt in 0..max_wait_attempts {
                                                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                                         
                                                         match storage_check.load_microblock(expected_height_timeout) {
                                                             Ok(Some(_)) => {
-                                                                println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} wait={}ms result=success action=exit", 
+                                                                println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} wait={}ms result=success", 
                                                                          expected_height_timeout, sync_attempt, max_sync_attempts, wait_attempt * 100);
                                                                 block_arrived = true;
                                                                 break;
                                                             },
-                                                            _ => {
-                                                                // Block not in storage yet, keep waiting
-                                                            }
+                                                            _ => {}
                                                         }
                                                     }
                                                     
@@ -15160,7 +15280,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                         sync_success = true;
                                                         break;
                                                     } else {
-                                                        println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} result=timeout wait=2s", 
+                                                        println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} result=wait_timeout will_retry", 
                                                                  expected_height_timeout, sync_attempt, max_sync_attempts);
                                                     }
                                                 },
@@ -15170,31 +15290,31 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 }
                                             }
                                             
-                                            // Backoff between retries (exponential: 1s, 2s)
                                             if sync_attempt < max_sync_attempts && !sync_success {
-                                                let backoff_ms = 1000 * sync_attempt;  // 1s, 2s
+                                                let backoff_ms = backoff_schedule[sync_attempt - 1];
+                                                println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} backoff={}ms", 
+                                                         expected_height_timeout, sync_attempt, max_sync_attempts, backoff_ms);
                                                 tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                                             }
                                         }
                                         
                                         if sync_success {
-                                            // Sync succeeded - no emergency needed
                                             println!("[EMERGENCY][FAILOVER] h={} sync_result=success action=clearing_failover", 
                                                      expected_height_timeout);
                                             FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);
-                                            return; // Exit - sync resolved the issue
+                                            return;
                                         } else {
-                                            // CRITICAL v2.61: Network HAS block but ALL sync attempts failed!
-                                            // DO NOT produce emergency block - this would cause FORK!
-                                            // Possible reasons: severe network partition, all peers down, storage corruption
-                                            // SAFER: Skip this block height and let network continue
-                                            // Block will be recovered via background gap sync when network stabilizes
-                                            println!("[EMERGENCY][FAILOVER] h={} sync_result=all_failed network_has_block=true action=skip_emergency reason=prevent_fork", 
+                                            // All 8 attempts exhausted. Network HAS the block but we can't get it.
+                                            // This indicates a severe local network issue (not a block missing).
+                                            // DO NOT produce emergency block (would cause fork).
+                                            // Trigger a parallel full-range resync to recover the gap.
+                                            println!("[EMERGENCY][FAILOVER] h={} sync_result=all_failed network_has_block=true action=trigger_parallel_resync", 
                                                      expected_height_timeout);
-                                            println!("[EMERGENCY][FAILOVER] h={} analysis=network_2/3+_has_block emergency_would_cause_fork skipping_block", 
-                                                     expected_height_timeout);
+                                            // Request a broader sync range to recover (±5 blocks) in background
+                                            let resync_from = expected_height_timeout.saturating_sub(5);
+                                            let _ = p2p_check.sync_blocks(resync_from, expected_height_timeout).await;
                                             FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);
-                                            return; // EXIT without emergency - prevent fork!
+                                            return;
                                         }
                                     }
                                     
@@ -15632,32 +15752,28 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 })
                 .collect();
             
-            // PRODUCTION v2.30: Handle empty candidate list
+            // PRODUCTION v2.30 (RESTORED v2.48): Handle empty candidate list
             // Empty list means:
             // - Genesis epoch (height 1-180): Normal, use Genesis static list
-            // - Epoch 3+ (height 181+): ERROR - macroblock missing, cannot produce!
+            // - Epoch 3+ (height 181+): ERROR - macroblock missing, CANNOT produce!
+            //
+            // CRITICAL: v2.46 introduced fallback=genesis_deterministic here — REMOVED!
+            //   That fallback caused nodes to independently produce macroblocks using
+            //   potentially DIFFERENT genesis candidate lists → CONFIRMED FORK at h=45901.
+            //   "OLD (BROKEN)" behavior was re-introduced — this patch restores v2.30 fix.
             let mut candidates = if valid_candidates.is_empty() {
                 // Genesis epoch (height 1-180): Use Genesis static list
                 // WHY 180? N-2 logic - MacroBlock #1 ready only at ~block 120
                 if current_height <= 180 {
                     println!("[INFO][MB] genesis_epoch h={}", current_height);
-                    // REFACTORED v2.32: Use unified helper function
                     let genesis_candidates = Self::get_genesis_candidates_with_real_reputation(p2p);
                     println!("[INFO][MB] genesis_producers={}", genesis_candidates.len());
                     genesis_candidates
                 } else {
-                    // v2.46: Use Genesis fallback instead of empty to prevent deadlock
-                    let required_epoch = (current_height - 1) / 90;
-                    if is_warn() { 
-                        println!("[WARN][MB] mb={} h={} fallback=genesis_deterministic", required_epoch, current_height); 
-                    }
-                    
-                    // Use Genesis fallback - DETERMINISTIC for ALL nodes!
-                    let genesis_candidates = Self::get_genesis_candidates_with_real_reputation(p2p);
-                    if is_info() { 
-                        println!("[INFO][MB] fallback=genesis producers={}", genesis_candidates.len()); 
-                    }
-                    genesis_candidates
+                    // CORRECT v2.30: Empty candidates = node is DESYNCHRONIZED.
+                    // DO NOT fall back to genesis list — different nodes may have different
+                    // genesis lists or reputation values → NON-DETERMINISTIC → FORK!
+                    Vec::new()
                 }
             } else {
                 valid_candidates
@@ -15666,22 +15782,24 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // CRITICAL v2.30: NO FALLBACK FOR EMPTY CANDIDATES!
             // Empty candidates means node is DESYNCHRONIZED - it CANNOT participate!
             // 
-            // OLD (BROKEN): fallback to genesis_node_001 → DIFFERENT lists → FORK!
-            // NEW (CORRECT): return empty string → node excluded from production
+            // OLD (BROKEN, re-introduced by v2.46): fallback to genesis candidates
+            //   → DIFFERENT lists across nodes → FORK! (confirmed incident at mb=509)
+            // CORRECT (v2.30, restored v2.48): return empty string → node excluded
             //
             // The SYNCHRONIZED nodes will continue producing blocks.
             // This node will sync via background task and rejoin later.
             if candidates.is_empty() && current_height > 180 {
-                eprintln!("[ERR][MB] desync h={} no_candidates", current_height);
+                let required_epoch = (current_height - 1) / 90;
+                eprintln!("[ERR][MB] desync mb={} h={} no_candidates action=excluded_from_production", required_epoch, current_height);
                 
-                // STATE MACHINE: Error state
+                // STATE MACHINE: Error state — recoverable via background sync
                 set_node_state(NodeState::Error {
-                    reason: format!("Desynchronized at height {} - no candidates (macroblock missing)", current_height),
+                    reason: format!("Desynchronized at height {} - mb={} missing, excluded from production", current_height, required_epoch),
                     recoverable: true,
                 });
                 
                 // Return empty string = this node is EXCLUDED from producer selection
-                // Network continues with synchronized nodes
+                // Network continues with synchronized nodes.
                 return String::new();
             }
             
