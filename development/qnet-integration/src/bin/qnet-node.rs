@@ -2906,7 +2906,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // ═══════════════════════════════════════════════════════════════════════════
     // PRODUCTION FIX v2.30: Graceful shutdown with certificate persistence
-    // Handles Ctrl+C and SIGTERM to save certificate_history before exit
+    // Handles Ctrl+C and SIGTERM to save certificates before exit
+    // v3.50: certificate_history no longer persisted (Dilithium-only verification)
     // ═══════════════════════════════════════════════════════════════════════════
     
     tokio::select! {

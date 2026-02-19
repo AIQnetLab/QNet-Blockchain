@@ -1691,16 +1691,6 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_generate_activation_code);
 
-    // Secure activation code recovery endpoint
-    let recover_activation_code = api_v1
-        .and(warp::path("recover-activation-code"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(warp::body::json())
-        .and(warp::addr::remote())
-        .and(blockchain_filter.clone())
-        .and_then(handle_recover_activation_code);
-
     // On-chain activation verification endpoint (for mobile wallet)
     let verify_activation = api_v1
         .and(warp::path("verify-activation"))
@@ -2201,7 +2191,6 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(register_node)
         .or(activations_by_wallet)
         .or(generate_activation_code)
-        .or(recover_activation_code)
         .or(verify_activation)
         .or(node_secure_info);
 
@@ -9375,7 +9364,7 @@ async fn handle_register_node(
 
     if is_migration {
         println!("[INFO][REGISTER] migration_success type={} node={} wallet={}",
-                 node_type, node_id, wallet_address);
+             node_type, node_id, wallet_address);
     } else {
         println!("[INFO][REGISTER] success type={} node={} wallet={}",
                  node_type, node_id, wallet_address);
@@ -10034,34 +10023,6 @@ async fn handle_generate_activation_code(
     // Recovery: just re-generate from same burn_tx_hash → identical code returned.
     // ═══════════════════════════════════════════════════════════════════════════════
     
-    // CODE RECOVERY: Same burn_tx_hash always produces the same XOR code.
-    // If user calls /generate-activation-code with the same burn_tx_hash again,
-    // they get the exact same code back (deterministic XOR). No need for in-memory storage.
-    // But we still check in-memory cache first for speed:
-    let registry = &*GLOBAL_ACTIVATION_REGISTRY;
-    let recovered = registry.recover_code_by_burn_tx(
-        &request.burn_tx_hash, &request.wallet_address
-    ).await;
-    let recovered = match recovered {
-        Some(code) => Some(code),
-        None => registry.recover_code_by_burn_tx_any_wallet(&request.burn_tx_hash).await,
-    };
-    if let Some(recovered_code) = recovered {
-        println!("[INFO][GENERATE] code_recovered burn_tx={}... method=cache",
-                 &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
-            let response = json!({
-                "success": true,
-            "activation_code": recovered_code,
-                "wallet_address": request.wallet_address,
-                "node_type": request.node_type,
-                "phase": request.phase,
-                "cached": true,
-            "recovered": true,
-            "message": "Activation code recovered from cache"
-            });
-            return Ok(warp::reply::json(&response));
-        }
-    
     // 1 wallet = 1 node: Check PERSISTENT storage (RocksDB) — survives restarts!
     // Check BOTH Solana and EON addresses to prevent 2 nodes from same operator
     if let Some(storage) = crate::node::try_get_storage() {
@@ -10142,14 +10103,6 @@ async fn handle_generate_activation_code(
             if let Err(e) = registry.register_activation_on_blockchain(&activation_code, node_info).await {
                 println!("⚠️ Blockchain registration warning: {}", e);
                 // Continue anyway - user can still use the code
-            }
-
-            // SECURE RECOVERY: Also store recovery mapping for Solana address
-            // (register_activation_on_blockchain stores for QNet EON address)
-            if qnet_wallet_for_rewards != request.wallet_address {
-                registry.store_code_for_recovery(
-                    &activation_code, &request.burn_tx_hash, &request.wallet_address
-                ).await;
             }
 
             let response = json!({
@@ -10257,90 +10210,6 @@ async fn handle_verify_activation_onchain(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SECURE ACTIVATION CODE RECOVERY
-// ═══════════════════════════════════════════════════════════════
-
-#[derive(Deserialize)]
-struct RecoverActivationCodeRequest {
-    burn_tx_hash: String,
-    wallet_address: String,
-    #[serde(default = "default_recovery_phase")]
-    phase: u8,
-    #[serde(default)]
-    node_type: Option<String>,
-}
-
-fn default_recovery_phase() -> u8 { 1 }
-
-async fn handle_recover_activation_code(
-    request: RecoverActivationCodeRequest,
-    remote_addr: Option<std::net::SocketAddr>,
-    _blockchain: Arc<BlockchainNode>,
-) -> Result<impl Reply, Rejection> {
-    // Rate limiting
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "recovery") {
-        return Ok(rate_limit_response);
-    }
-
-    println!("[RECOVERY] 🔐 Secure code recovery request");
-    println!("   Burn TX: {}...", &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
-    println!("   Wallet: {}...", &request.wallet_address[..8.min(request.wallet_address.len())]);
-
-    // Validate inputs
-    if request.burn_tx_hash.len() < 32 || request.burn_tx_hash.len() > 128 {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Invalid burn transaction hash format"
-        })));
-    }
-    if request.wallet_address.len() < 20 || request.wallet_address.len() > 64 {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Invalid wallet address format"
-        })));
-    }
-
-    let registry = &*GLOBAL_ACTIVATION_REGISTRY;
-
-    // Try decryption with provided wallet_address
-    if let Some(recovered_code) = registry.recover_code_by_burn_tx(
-        &request.burn_tx_hash, &request.wallet_address
-    ).await {
-        println!("[RECOVERY] Code recovered for burn TX: {}...", 
-                 &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
-        return Ok(warp::reply::json(&json!({
-            "success": true,
-            "activation_code": recovered_code,
-            "wallet_address": request.wallet_address,
-            "recovered": true,
-            "message": "Activation code recovered successfully"
-        })));
-    }
-
-    // Fallback: try with the wallet stored in the record (Solana vs EON mismatch)
-    if let Some(recovered_code) = registry.recover_code_by_burn_tx_any_wallet(
-        &request.burn_tx_hash
-    ).await {
-        println!("[RECOVERY] Code recovered via stored wallet fallback");
-        return Ok(warp::reply::json(&json!({
-            "success": true,
-            "activation_code": recovered_code,
-            "wallet_address": request.wallet_address,
-            "recovered": true,
-            "message": "Activation code recovered successfully"
-        })));
-    }
-
-    println!("[RECOVERY] No recoverable code for burn TX: {}...", 
-             &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
-    Ok(warp::reply::json(&json!({
-        "success": false,
-        "error": "No activation code found for this burn transaction",
-        "burn_tx_hash": request.burn_tx_hash,
-        "hint": "Code can only be recovered if it was generated after the recovery system was enabled"
-    })))
-}
-
 // PRODUCTION: Macroblock Consensus Handlers
 
 #[derive(Deserialize)]
@@ -11826,11 +11695,13 @@ async fn generate_quantum_activation_code(
     // Convert to hex
     let encrypted_wallet_hex = hex::encode(&encrypted_wallet).to_uppercase();
     
-    // Step 3: Generate entropy from transaction data
+    // Step 3: Generate DETERMINISTIC entropy from burn transaction data
+    // CRITICAL: Must NOT use current time — same inputs MUST always produce the same code
+    // (regeneration/recovery must produce identical code to the one initially issued)
     let mut entropy_hasher = Sha3_256::new();
-    entropy_hasher.update(format!("{}:{}:{}", 
+    entropy_hasher.update(format!("entropy:{}:{}:{}", 
         request.wallet_address, 
-        chrono::Utc::now().timestamp(),
+        request.burn_tx_hash,   // deterministic — always the same burn tx
         request.node_type
     ).as_bytes());
     let entropy_hash = hex::encode(entropy_hasher.finalize());
@@ -11845,10 +11716,13 @@ async fn generate_quantum_activation_code(
         _ => "U",
     };
     
-    // Step 5: Timestamp (last 5 hex chars)
-    let timestamp = chrono::Utc::now().timestamp() as u64;
-    let timestamp_hex = format!("{:X}", timestamp);
-    let timestamp_part = &timestamp_hex[timestamp_hex.len().saturating_sub(5)..];
+    // Step 5: DETERMINISTIC "timestamp" segment — derived from burn_tx_hash, NOT from wall-clock
+    // CRITICAL: chrono::Utc::now() was here before → different code every call → recovery mismatch!
+    // Fix: hash(burn_tx_hash + node_type) gives a stable 5-char hex segment
+    let mut ts_hasher = Sha3_256::new();
+    ts_hasher.update(format!("ts:{}:{}", request.burn_tx_hash, request.node_type).as_bytes());
+    let ts_hash = hex::encode(ts_hasher.finalize());
+    let timestamp_part = &ts_hash[..5].to_uppercase();
     
     // Step 6: Build segments (MUST match bridge-server.py format)
     // segment1: NodeType + Timestamp (6 chars)

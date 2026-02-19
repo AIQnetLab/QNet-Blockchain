@@ -3328,13 +3328,19 @@ const WalletScreen = () => {
           codeEntries.push(entry);
         }
         const codesList = codeEntries.join('\n\n');
+
+        // Only show Docker instructions if there's a Super node (Light nodes don't need Docker)
+        const hasSuper = Object.keys(storedCodes).some(t => t.toLowerCase() === 'super');
+        const dockerHint = hasSuper
+          ? '\n\nFor server node Docker:\n-e QNET_ACTIVATION_CODE=<code>\n-e QNET_BURN_TX_HASH=<tx>\n-e QNET_BURN_AMOUNT=<amount>'
+          : '';
       
       setShowExportActivation(false);
       setExportPassword('');
       
       showAlert(
           'Activation Data',
-          codesList + '\n\nFor server node Docker:\n-e QNET_ACTIVATION_CODE=<code>\n-e QNET_BURN_TX_HASH=<tx>\n-e QNET_BURN_AMOUNT=<amount>',
+          codesList + dockerHint,
           [
             { text: 'Copy All', onPress: async () => {
               // Build full copy data with burn info
@@ -3353,7 +3359,6 @@ const WalletScreen = () => {
                 copyParts.push(part);
               }
               Clipboard.setString(copyParts.join('\n\n'));
-              showAlert('Copied', 'Activation data copied to clipboard (auto-clears in 30s)');
               setTimeout(() => {
                 Clipboard.setString('');
               }, 30000);
@@ -5049,10 +5054,9 @@ const WalletScreen = () => {
                         setActivatedNodeType(firstType);
                         setActivationCode(codeStr);
                         
-                        // Re-persist to ensure qnet_last_activated_node is set
-                        const pseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
+                        // Re-persist to ensure qnet_last_activated_node is set (no pseudonym — not yet registered on network)
                         await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-                          nodeType: firstType, code: codeStr, pseudonym, timestamp: Date.now(),
+                          nodeType: firstType, code: codeStr, timestamp: Date.now(),
                           burnTxHash: firstCode?.burnTxHash || 'recovered',
                           walletAddress: wallet.qnetAddress || wallet.address
                         }));
@@ -5062,37 +5066,7 @@ const WalletScreen = () => {
                       }
                     }
 
-                    // Step 2a: Try local activation metadata (saved from previous burns)
-                    for (const tryType of ['light', 'super']) {
-                      const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${tryType}`);
-                      const meta = metaStr ? JSON.parse(metaStr) : null;
-                      
-                      if (meta && meta.burnTxHash) {
-                        try {
-                          const recoveryResult = await walletManager.recoverActivationCodeFromServer(
-                            meta.burnTxHash, wallet.publicKey
-                          );
-                          if (recoveryResult.success && recoveryResult.activationCode) {
-                            const code = recoveryResult.activationCode;
-                            setActivatedNodeType(tryType);
-                            setActivationCode(code);
-                            
-                            await walletManager.storeActivationCode(code, tryType, password, { recovered: true, burnTxHash: meta.burnTxHash });
-                            const pseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
-                            AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-                              nodeType: tryType, code, pseudonym, timestamp: Date.now(),
-                              burnTxHash: meta.burnTxHash,
-                              walletAddress: wallet.qnetAddress || wallet.address
-                            })).catch(() => {});
-                            
-                            showAlert('Code Recovered', `Your ${tryType} node activation code has been recovered securely.`);
-                            return;
-                          }
-                        } catch (e) { console.log('[RECOVER] Server recovery failed for', tryType, e.message); }
-                      }
-                    }
-
-                    // Step 2b: Fetch burn TX directly from Solana via raw RPC (most reliable)
+                    // Step 2: Fetch burn TX directly from Solana via raw RPC (most reliable)
                     // This is independent of checkBlockchainForActivations — uses raw fetch, not @solana/web3.js
                     console.log('[RECOVER] Fetching burn TX directly from Solana RPC...');
                     try {
@@ -5104,30 +5078,7 @@ const WalletScreen = () => {
                         // Ensure we have QNet EON address (41 chars) for Phase 1 — NOT Solana address (44 chars)
                         const qnetEonAddress = wallet.qnetAddress || walletManager.generateQNetAddressFromSolana(wallet.publicKey);
                         
-                        // Try server recovery with the burn TX hash from Solana
-                        try {
-                          const recoveryResult = await walletManager.recoverActivationCodeFromServer(
-                            burnInfo.burnTxHash, wallet.publicKey
-                          );
-                          if (recoveryResult.success && recoveryResult.activationCode) {
-                            const code = recoveryResult.activationCode;
-                            setActivatedNodeType(nodeType);
-                            setActivationCode(code);
-                            
-                            await walletManager.storeActivationCode(code, nodeType, password, { recovered: true, burnTxHash: burnInfo.burnTxHash, burnAmount: burnInfo.burnAmount });
-                            const pseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
-                            AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-                              nodeType, code, pseudonym, timestamp: Date.now(),
-                              burnTxHash: burnInfo.burnTxHash,
-                              walletAddress: qnetEonAddress
-                            })).catch(() => {});
-                            
-                            showAlert('Code Recovered', `Your ${nodeType} node activation code has been recovered from blockchain data.`);
-                            return;
-                          }
-                        } catch (recErr) { console.log('[RECOVER] Server recovery with Solana TX failed:', recErr.message); }
-                        
-                        // Server recovery failed — try re-generating the code with QNet EON address
+                        // Regenerate code deterministically from burn TX data (stateless XOR)
                         try {
                           const codeResult = await walletManager.requestActivationCodeFromServer(
                             nodeType, wallet.publicKey, burnInfo.burnTxHash, 1,
@@ -5140,9 +5091,9 @@ const WalletScreen = () => {
                             setActivationCode(code);
                             
                             await walletManager.storeActivationCode(code, nodeType, password, { recovered: true, burnTxHash: burnInfo.burnTxHash, burnAmount: burnInfo.burnAmount });
-                            const pseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
+                            // No pseudonym — node is not registered on network yet, only code recovered
                             AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-                              nodeType, code, pseudonym, timestamp: Date.now(),
+                              nodeType, code, timestamp: Date.now(),
                               burnTxHash: burnInfo.burnTxHash,
                               walletAddress: qnetEonAddress
                             })).catch(() => {});
@@ -5175,9 +5126,9 @@ const WalletScreen = () => {
                         setActivatedNodeType(firstType);
                         setActivationCode(code);
                         
-                        const pseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
+                        // No pseudonym — node may not be registered on network yet
                         AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-                          nodeType: firstType, code, pseudonym, timestamp: Date.now(),
+                          nodeType: firstType, code, timestamp: Date.now(),
                           burnTxHash: value?.burnTxHash || 'synced',
                           walletAddress: wallet.qnetAddress || wallet.address
                         })).catch(() => {});
@@ -5437,26 +5388,38 @@ const WalletScreen = () => {
                       )}
                     </View>
                     <View style={[
-                      styles.statusBadge, 
-                      nodePseudonym 
-                        ? ((activatedNodeType === 'light' && lightNodeStatus?.needsReactivation) ||
-                           (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)
-                            ? styles.statusBadgeInactive  // Red for inactive node
-                            : styles.statusBadgeActivated)  // Green for active
-                        : styles.statusBadgeActive  // Yellow for code received
+                      styles.statusBadge,
+                      activatedNodeType === 'light'
+                        ? (!nodePseudonym
+                            ? styles.statusBadgeActive                                         // Yellow — CODE RECEIVED
+                            : !lightNodeStatus
+                              ? styles.statusBadgeActive                                       // Yellow — CHECKING...
+                              : lightNodeStatus.needsReactivation
+                                ? styles.statusBadgeInactive                                   // Red   — OFFLINE
+                                : styles.statusBadgeActivated)                                 // Green — ONLINE
+                        : (!nodePseudonym || !serverNodeStatus?.success
+                            ? styles.statusBadgeActive                                         // Yellow — CODE RECEIVED
+                            : serverNodeStatus.isOnline
+                              ? styles.statusBadgeActivated                                    // Green — ONLINE
+                              : styles.statusBadgeInactive)                                    // Red   — OFFLINE
                     ]}>
                       <Text style={[
-                        styles.statusBadgeText, 
-                        !nodePseudonym && styles.statusBadgeTextActive,
+                        styles.statusBadgeText,
+                        (activatedNodeType === 'light'
+                          ? (!nodePseudonym || !lightNodeStatus)
+                          : (!nodePseudonym || !serverNodeStatus?.success)) && styles.statusBadgeTextActive,
                         ((activatedNodeType === 'light' && lightNodeStatus?.needsReactivation) ||
                          (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)) && {color: '#ff3b30'}
                       ]}>
-                        {!nodePseudonym 
-                          ? 'CODE RECEIVED' 
-                          : ((activatedNodeType === 'light' && lightNodeStatus?.needsReactivation) ||
-                             (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline))
-                              ? 'OFFLINE' 
-                              : 'ONLINE'}
+                        {activatedNodeType === 'light'
+                          ? (!nodePseudonym
+                              ? 'CODE RECEIVED'
+                              : !lightNodeStatus
+                                ? 'CHECKING...'
+                                : lightNodeStatus.needsReactivation ? 'OFFLINE' : 'ONLINE')
+                          : (!nodePseudonym || !serverNodeStatus?.success
+                              ? 'CODE RECEIVED'
+                              : serverNodeStatus.isOnline ? 'ONLINE' : 'OFFLINE')}
                       </Text>
                     </View>
                   </View>

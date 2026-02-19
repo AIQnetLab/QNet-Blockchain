@@ -4175,42 +4175,6 @@ export class WalletManager {
   }
   
   /**
-   * Recover activation code from server using burn_tx_hash + wallet_address
-   * Uses dedicated /api/v1/recover-activation-code endpoint with SHA3-256 encrypted storage
-   */
-  async recoverActivationCodeFromServer(burnTxHash, walletAddress) {
-    try {
-      const apiUrl = this.getRandomBootstrapNode();
-      
-      const response = await fetch(`${apiUrl}/api/v1/recover-activation-code`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          burn_tx_hash: burnTxHash,
-          wallet_address: walletAddress,
-          phase: 1
-        })
-      });
-      
-      const result = await response.json();
-      
-      if (result.success && result.activation_code) {
-        console.log('[recoverActivationCode] Code recovered from secure server storage');
-        return {
-          success: true,
-          activationCode: result.activation_code,
-          recovered: true
-        };
-      }
-      
-      return { success: false, error: result.error || 'Code not found in recovery storage' };
-    } catch (error) {
-      console.warn('[recoverActivationCode] Recovery request failed:', error.message || error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  /**
    * Verify that a node activation exists on the CURRENT QNet blockchain.
    * Prevents stale local cache from showing phantom activations after network restart.
    * Checks: RocksDB storage, genesis constants, reward manager, and blockchain scan.
@@ -4422,32 +4386,23 @@ export class WalletManager {
             
             if (!code && nodeId) {
               // Node exists in blockchain but activation_code not in this response
-              // Try secure recovery endpoint first, then fallback to generate endpoint
-              console.log('[syncActivationCodes] Node found on blockchain, recovering activation code...');
+              // Regenerate deterministically via XOR from burn TX data
+              console.log('[syncActivationCodes] Node found on blockchain, regenerating activation code...');
               try {
                 const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${nodeType}`);
                 const meta = metaStr ? JSON.parse(metaStr) : null;
                 if (meta && meta.burnTxHash) {
-                  // 1) Try dedicated secure recovery endpoint (SHA3-256 encrypted)
-                  const recoveryResult = await this.recoverActivationCodeFromServer(
-                    meta.burnTxHash, walletAddress
+                  const eonAddr = await AsyncStorage.getItem('qnet_address')
+                    || this.generateQNetAddressFromSolana(walletAddress);
+                  const codeResult = await this.requestActivationCodeFromServer(
+                    nodeType, walletAddress, meta.burnTxHash, meta.phase || 1, eonAddr, meta.burnAmount || null
                   );
-                  if (recoveryResult.success && recoveryResult.activationCode) {
-                    code = recoveryResult.activationCode;
-                  } else {
-                    // 2) Fallback: try generate endpoint (returns cached code if exists)
-                    const eonAddr = await AsyncStorage.getItem('qnet_address')
-                      || this.generateQNetAddressFromSolana(walletAddress);
-                    const codeResult = await this.requestActivationCodeFromServer(
-                      nodeType, walletAddress, meta.burnTxHash, meta.phase || 1, eonAddr, meta.burnAmount || null
-                    );
-                    if (codeResult.success && codeResult.activationCode) {
-                      code = codeResult.activationCode;
-                    }
+                  if (codeResult.success && codeResult.activationCode) {
+                    code = codeResult.activationCode;
                   }
                 }
               } catch (recoverError) {
-                console.warn('[syncActivationCodes] Code recovery failed:', recoverError.message);
+                console.warn('[syncActivationCodes] Code regeneration failed:', recoverError.message);
               }
             }
             
@@ -4484,31 +4439,21 @@ export class WalletManager {
         
         if (burnTxHash) {
           try {
-            // 1) Try dedicated secure recovery endpoint first
-            const recoveryResult = await this.recoverActivationCodeFromServer(burnTxHash, walletAddress);
-            if (recoveryResult.success && recoveryResult.activationCode) {
-              console.log('[syncActivationCodes] ✅ Code recovered from secure storage via burn TX');
-              await this.storeActivationCode(recoveryResult.activationCode, burnNodeType, password, {
-                burnTxHash, fromBlockchain: true, recovered: true
-              });
-              return { [burnNodeType]: recoveryResult.activationCode };
-            }
-            
-            // 2) Fallback: try generate-activation-code endpoint (may return cached code)
+            // Regenerate code deterministically via XOR from burn TX data
             const eonAddr = await AsyncStorage.getItem('qnet_address')
               || this.generateQNetAddressFromSolana(walletAddress);
             const codeResult = await this.requestActivationCodeFromServer(
               burnNodeType, walletAddress, burnTxHash, meta?.phase || 1, eonAddr, meta?.burnAmount || null
             );
             if (codeResult.success && codeResult.activationCode) {
-              console.log('[syncActivationCodes] ✅ Code recovered from server via generate endpoint');
+              console.log('[syncActivationCodes] ✅ Code regenerated from burn TX (deterministic XOR)');
               await this.storeActivationCode(codeResult.activationCode, burnNodeType, password, {
                 burnTxHash, fromBlockchain: true
               });
               return { [burnNodeType]: codeResult.activationCode };
             }
           } catch (recoverError) {
-            console.warn('[syncActivationCodes] Code recovery from burn failed:', recoverError.message);
+            console.warn('[syncActivationCodes] Code regeneration from burn failed:', recoverError.message);
           }
         } else {
           console.log('[syncActivationCodes] ⚠️ Burn found but no TX hash in metadata for recovery');
@@ -5461,33 +5406,31 @@ export class WalletManager {
                 burnTxHash = ln.burnTxHash || null;
               }
             }
-            // Fallback: try to get Solana address from wallet data
+            // Fallback: try to get Solana address from wallet address storage
             if (!burnWallet) {
-              const walletDataStr = await AsyncStorage.getItem('qnet_wallet');
-              if (walletDataStr) {
-                const wd = JSON.parse(walletDataStr);
-                burnWallet = wd.publicKey || null; // Solana publicKey
+              // qnet_wallet_address stores the Solana publicKey directly (unencrypted)
+              const storedAddr = await AsyncStorage.getItem('qnet_wallet_address');
+              if (storedAddr) {
+                burnWallet = storedAddr;
               }
             }
           } catch (_) { /* best effort */ }
 
           // v4.7: Sign with Solana Ed25519 key to prove wallet ownership
           // Prevents stolen code reuse — attacker cannot sign without private key
+          // FIX: qnet_wallet stores ENCRYPTED vault — must use loadWallet(password) to decrypt
           let ed25519Signature = null;
           let signatureTimestamp = null;
           try {
-            const walletDataStr = await AsyncStorage.getItem('qnet_wallet');
-            if (walletDataStr) {
-              const wd = JSON.parse(walletDataStr);
-              if (wd.secretKey) {
-                signatureTimestamp = Math.floor(Date.now() / 1000);
-                const message = `qnet_register:${activationCode}:${signatureTimestamp}`;
-                const messageBytes = new TextEncoder().encode(message);
-                const secretKeyBytes = new Uint8Array(wd.secretKey);
-                const sig = nacl.sign.detached(messageBytes, secretKeyBytes);
-                ed25519Signature = Array.from(sig).map(b => b.toString(16).padStart(2, '0')).join('');
-                console.log('[Registration] Ed25519 wallet ownership signature created');
-              }
+            const wd = await this.loadWallet(password);
+            if (wd && wd.secretKey) {
+              signatureTimestamp = Math.floor(Date.now() / 1000);
+              const message = `qnet_register:${activationCode}:${signatureTimestamp}`;
+              const messageBytes = new TextEncoder().encode(message);
+              const secretKeyBytes = new Uint8Array(wd.secretKey);
+              const sig = nacl.sign.detached(messageBytes, secretKeyBytes);
+              ed25519Signature = Array.from(sig).map(b => b.toString(16).padStart(2, '0')).join('');
+              console.log('[Registration] Ed25519 wallet ownership signature created');
             }
           } catch (sigErr) {
             console.warn('[Registration] Ed25519 signature failed:', sigErr.message);

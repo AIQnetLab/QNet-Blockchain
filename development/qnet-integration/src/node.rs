@@ -8047,10 +8047,11 @@ impl BlockchainNode {
                 }
                 
                 // v3.10 BUG 1 FIX: Check for consensus blocks awaiting data
-                // If consensus passed but block not received within 5 seconds, request it
-                // WHY 5 SECONDS: Grace period = 5 sec, failover starts at 5+ sec
-                // We request IMMEDIATELY when grace expires, BEFORE failover selects new producer
-                let blocks_to_request = get_blocks_needing_request(5);
+                // If consensus passed but block not received within 8 seconds, request it
+                // FIX v2.49: Increased from 5→8 seconds to reduce false-positive retries
+                // 5s was too aggressive for cross-region P2P delivery (EU↔NA latency ~100-200ms + jitter)
+                // 8s gives producers adequate time while keeping recovery fast
+                let blocks_to_request = get_blocks_needing_request(8);
                 if !blocks_to_request.is_empty() {
                     if let Some(p2p) = &unified_p2p {
                         for (block_height, producer) in blocks_to_request {
@@ -10800,18 +10801,17 @@ impl BlockchainNode {
                 genesis_reconnect_counter += 1;
                 
                 // ═══════════════════════════════════════════════════════════════════
-                // PRODUCTION v2.44: Periodic certificate rotation (every 3 minutes)
+                // v3.50: Periodic certificate rotation + immediate broadcast
                 // ═══════════════════════════════════════════════════════════════════
-                // CRITICAL FIX: Certificates expire after 4.5 minutes (270s)
-                // Without periodic rotation, stalled nodes have expired certs
-                // → Sync fails with "Certificate expired" → DEADLOCK!
+                // Certificates expire after 4.5 minutes (270s), rotate at 80% (216s)
+                // v3.50: Broadcast IMMEDIATELY after rotation to ensure all peers
+                // receive every new cert. Dilithium-only verification — no chain needed.
                 // ═══════════════════════════════════════════════════════════════════
                 if certificate_rotation_counter >= 180 && node_type != NodeType::Light {
                     certificate_rotation_counter = 0;
                     
-                    // PRODUCTION v2.45: Periodic certificate rotation using GLOBAL_HYBRID_INSTANCES
-                    // Force certificate rotation even if not signing to prevent "Certificate expired" errors
                     let node_id_for_rotation = node_id.clone();
+                    let p2p_for_rotation = unified_p2p.clone();
                     match tokio::runtime::Handle::try_current() {
                         Ok(handle) => {
                             handle.spawn(async move {
@@ -10838,7 +10838,19 @@ impl BlockchainNode {
                                         if let Err(e) = hybrid.rotate_certificate().await {
                                             println!("[WARN][CERT] Periodic rotation failed: {}", e);
                                         } else {
-                                            println!("[INFO][CERT] Periodic rotation completed");
+                                            // v3.50: Broadcast immediately after rotation
+                                            // Ensures peers always have our latest cert
+                                            if let Some(cert) = hybrid.get_current_certificate() {
+                                                if let Ok(cert_bytes) = bincode::serialize(&cert) {
+                                                    if let Some(ref p2p) = p2p_for_rotation {
+                                                        if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
+                                                            println!("[WARN][CERT] post_rotation_broadcast_failed err={}", e);
+                                                        } else {
+                                                            println!("[INFO][CERT] rotated_and_broadcasted serial={}", cert.serial_number);
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -11054,16 +11066,16 @@ impl BlockchainNode {
                     }
                 }
                 
-                // ADAPTIVE CERTIFICATE BROADCAST: Aggressive → Moderate → Conservative
-                // ARCHITECTURE: Aligned with certificate lifetime (270s = 4.5 minutes)
-                // Ensures certificates propagate before expiration (54s grace period)
+                // v3.50: PERIODIC CERTIFICATE BROADCAST (maintenance for new peers)
+                // Primary delivery: immediate broadcast after rotation (see rotation block above)
+                // This periodic broadcast only serves new peers who missed the rotation broadcast
                 let uptime_secs = node_start_time.elapsed().as_secs();
                 let broadcast_interval = if uptime_secs < 120 {
-                    10  // First 2 minutes: every 10 seconds (AGGRESSIVE - critical initial propagation)
+                    10  // First 2 minutes: every 10 seconds (initial propagation to bootstrap peers)
                 } else if uptime_secs < 300 {
-                    30  // 2-5 minutes: every 30 seconds (MODERATE - covers 1+ cert lifetime)
+                    60  // 2-5 minutes: every 60 seconds (moderate)
                 } else {
-                    120  // After 5 minutes: every 2 minutes (CONSERVATIVE - maintenance, ~50% of lifetime)
+                    180  // After 5 minutes: every 3 minutes (maintenance only — rotation broadcast is primary)
                 };
                 
                 if certificate_broadcast_counter >= broadcast_interval && node_type != NodeType::Light {
@@ -11190,15 +11202,34 @@ impl BlockchainNode {
                                         println!("[WARN][SYNC] epoch_boundary_crossed h={} mb={} MISSING blocks_without={} → activating PFP from sync path",
                                                  canonical_height, expected_mb, blocks_since);
                                         
-                                        // Spawn PFP so it doesn't block the sync loop
+                                        // FIX v2.49: Fast direct macroblock request BEFORE full PFP
+                                        // The macroblock leader already produced and broadcast it.
+                                        // First try a quick direct sync (no wait) - if the MB is already
+                                        // on the network, this is immediate. Only fall back to full PFP if
+                                        // the quick request fails, eliminating the unnecessary 2-sec delay.
                                         let storage_pfp = storage.clone();
                                         let consensus_pfp = consensus.clone();
                                         let p2p_pfp = unified_p2p.clone();
                                         let pfp_height = canonical_height;
                                         let pfp_blocks = blocks_since.max(1);
                                         tokio::spawn(async move {
-                                            // Small delay so state fully settles after sync
-                                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                            // v2.49: Quick direct fetch (no initial delay)
+                                            // Leader broadcast the MB when it was created - it should be available now
+                                            if let Some(ref p2p) = p2p_pfp {
+                                                let _ = p2p.sync_macroblocks(expected_mb, expected_mb).await;
+                                                // Give it 500ms to propagate
+                                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                            }
+                                            // Check if quick fetch was enough
+                                            let already_synced = storage_pfp
+                                                .get_macroblock_by_height(expected_mb)
+                                                .map(|r| r.is_some())
+                                                .unwrap_or(false);
+                                            if already_synced {
+                                                if is_info() { println!("[INFO][SYNC-PFP] mb={} fast_fetched skipping_pfp", expected_mb); }
+                                                return;
+                                            }
+                                            // Quick fetch failed - activate full PFP
                                             println!("[INFO][SYNC-PFP] activating PFP for missing mb={} h={}", expected_mb, pfp_height);
                                             Self::activate_progressive_finalization_with_level(
                                                 storage_pfp,
@@ -18148,181 +18179,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                              mb_idx, round, cons_time); 
                                                 }
                                                 
-                                                // v2.98: CRITICAL - Save state snapshot for blockchain persistence
-                                                // This allows nodes to restore state after restart and sync with network
-                                                // SCALABILITY: Only save every 160 MBs (emission blocks) to reduce storage
-                                                const EMISSION_MACROBLOCK_INTERVAL: u64 = 160;
-                                                let is_emission_macroblock = mb_idx > 0 && mb_idx % EMISSION_MACROBLOCK_INTERVAL == 0;
-                                                
-                                                if is_emission_macroblock {
-                                                    // Get state_root and serialize accounts
-                                                    let state = state_manager_cons.read().await;
-                                                    
-                                                    // Calculate state_root for verification
-                                                    let state_root = match (*state).calculate_state_root() {
-                                                        Ok(root) => root,
-                                                        Err(e) => {
-                                                            eprintln!("[ERR][SNAPSHOT] state_root_calc_fail mb={} err={}", mb_idx, e);
-                                                            [0u8; 32]
-                                                        }
-                                                    };
-                                                    
-                                                    // Serialize all accounts (for large networks, this could be optimized with delta compression)
-                                                    let state_data = match bincode::serialize(&(*state).get_all_accounts()) {
-                                                        Ok(data) => data,
-                                                        Err(e) => {
-                                                            eprintln!("[ERR][SNAPSHOT] serialize_fail mb={} err={}", mb_idx, e);
-                                                            Vec::new()
-                                                        }
-                                                    };
-                                                    
-                                                    drop(state);
-                                                    
-                                                    if !state_data.is_empty() {
-                                                        // Save snapshot to RocksDB
-                                                        let snapshot_height = mb_idx * 90; // Convert MB index to block height
-                                                        if let Err(e) = storage_cons.save_state_snapshot(snapshot_height, state_root, state_data.clone()).await {
-                                                            eprintln!("[ERR][SNAPSHOT] save_fail mb={} h={} err={}", mb_idx, snapshot_height, e);
-                                                        } else {
-                                                            if is_info() {
-                                                                println!("[INFO][SNAPSHOT] saved mb={} h={} size={}KB", 
-                                                                         mb_idx, snapshot_height, state_data.len() / 1024);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                
-                                                // v2.95: FIXED - PARTICIPANTS only process rewards via MacroBlock listener
-                                                // INITIATOR processes rewards SYNCHRONOUSLY in emission blocks
-                                                // Simple role check prevents duplication without slow lock
-                                                // 
-                                                // CRITICAL: This prevents the deadlock/lag issue where read() lock
-                                                // on reward_manager slowed down MacroBlock processing
-                                                
-                                                if !should_initiate {
-                                                    if let Ok(Some(macroblock_bytes)) = storage_cons.get_macroblock_by_height(mb_idx) {
-                                                        // Deserialize MacroBlock from storage
-                                                        if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_bytes) {
-                                                            // Process rewards for emission MacroBlocks (every 160 MBs = 4 hours)
-                                                            const EMISSION_MACROBLOCK_INTERVAL: u64 = 160;
-                                                            let is_emission_macroblock = mb_idx > 0 && mb_idx % EMISSION_MACROBLOCK_INTERVAL == 0;
-                                                            
-                                                            if is_emission_macroblock {
-                                                                // v2.99: ALL nodes process rewards from MacroBlock (deterministic!)
-                                                                // MacroBlock contains reward_heartbeats → ALL nodes use SAME data → SAME result
-                                                                if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
-                                                                    if !heartbeats_data.is_empty() {
-                                                                        if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
-                                                                            let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = heartbeat_summaries.iter()
-                                                                                .map(|s| qnet_consensus::HeartbeatSummaryData {
-                                                                                    node_id: s.node_id.clone(),
-                                                                                    node_type: s.node_type,
-                                                                                    heartbeat_count: s.heartbeat_count,
-                                                                                    first_heartbeat: s.first_heartbeat,
-                                                                                    last_heartbeat: s.last_heartbeat,
-                                                                                    is_eligible: s.is_eligible,
-                                                                                })
-                                                                                .collect();
-                                                                            
-                                                                            let mut reward_mgr = reward_manager_cons.write().await;
-                                                                            let pool2_total = macroblock.consensus_data.pool2_total_fees;
-                                                                            let pool3_total = macroblock.consensus_data.pool3_total_activations;
-                                                                            
-                                                                            match reward_mgr.process_macroblock_heartbeats_deterministic(
-                                                                                mb_idx,
-                                                                                &summary_data,
-                                                                                pool2_total,
-                                                                                pool3_total,
-                                                                            ) {
-                                                                                Ok(was_processed) => {
-                                                                                    if was_processed {
-                                                                                        let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
-                                                                                        if is_info() {
-                                                                                            println!("[INFO][REWARDS] PARTICIPANT rewards_calculated mb={} nodes={} eligible={}", 
-                                                                                                     mb_idx, heartbeat_summaries.len(), eligible);
-                                                                                        }
-                                                                                        
-                                                                                        // Update total_supply
-                                                                                        let total_emission = reward_mgr.get_last_epoch_emission();
-                                                                                        drop(reward_mgr);
-                                                                                        
-                                                                                        if total_emission > 0 {
-                                                                                            let state = state_manager_cons.read().await;
-                                                                                            if let Err(e) = (*state).emit_rewards(total_emission) {
-                                                                                                eprintln!("[ERR][REWARDS] supply_update_fail err={}", e);
-                                                                                            } else {
-                                                                                                let new_supply = (*state).get_total_supply();
-                                                                                                if is_info() {
-                                                                                                    println!("[INFO][REWARDS] PARTICIPANT supply_updated emission={} total={} QNC", 
-                                                                                                             total_emission / 1_000_000_000, new_supply / 1_000_000_000);
-                                                                                                }
-                                                                                            }
-                                                                                            drop(state);
-                                                                                        }
-                                                                                        
-                                                                                        // Update pending_rewards
-                                                                                        let mut reward_mgr = reward_manager_cons.write().await;
-                                                                                        let pending = reward_mgr.get_all_pending_rewards();
-                                                                                        drop(reward_mgr);
-                                                                                        
-                                                                                        let state = state_manager_cons.read().await;
-                                                                                        let mut updated_count = 0;
-                                                                                        for (node_id, amount) in &pending {
-                                                                                            if let Ok(Some((_, wallet_addr, _))) = storage_cons.load_node_registration(node_id) {
-                                                                                                if let Err(e) = (*state).update_pending_rewards(&wallet_addr, *amount) {
-                                                                                                    eprintln!("[WARN][REWARDS] pending_update_fail node={} err={}", node_id, e);
-                                                                                                } else {
-                                                                                                    updated_count += 1;
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                        drop(state);
-                                                                                        
-                                                                                        if is_info() && updated_count > 0 {
-                                                                                            println!("[INFO][REWARDS] PARTICIPANT pending_updated count={}", updated_count);
-                                                                                        }
-                                                                                        
-                                                                                        // Save state snapshot for persistence across restarts
-                                                                                        let state = state_manager_cons.read().await;
-                                                                                        let state_root = (*state).calculate_state_root().unwrap_or([0u8; 32]);
-                                                                                        let state_data = bincode::serialize(&(*state).get_all_accounts()).unwrap_or_default();
-                                                                                        drop(state);
-                                                                                        
-                                                                                        if !state_data.is_empty() {
-                                                                                            if let Err(e) = storage_cons.save_state_snapshot(mb_idx, state_root, state_data).await {
-                                                                                                eprintln!("[ERR][REWARDS] snapshot_save_fail mb={} err={}", mb_idx, e);
-                                                                                            } else if is_info() {
-                                                                                                println!("[INFO][REWARDS] PARTICIPANT snapshot_saved mb={}", mb_idx);
-                                                                                            }
-                                                                                        }
-                                                                                        
-                                                                                        // Mark as processed
-                                                                                        let mut reward_mgr = reward_manager_cons.write().await;
-                                                                                        let mut processed_set = reward_mgr.get_processed_emission_macroblocks().clone();
-                                                                                        processed_set.insert(mb_idx);
-                                                                                        reward_mgr.set_processed_emission_macroblocks(processed_set.clone());
-                                                                                        drop(reward_mgr);
-                                                                                        
-                                                                                        if let Err(e) = storage_cons.save_processed_emission_macroblocks(&processed_set) {
-                                                                                            eprintln!("[WARN][REWARDS] processed_save_fail mb={} err={}", mb_idx, e);
-                                                                                        }
-                                                                                    } else {
-                                                                                        if is_warn() {
-                                                                                            println!("[WARN][REWARDS] PARTICIPANT already_processed mb={}", mb_idx);
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                                Err(e) => {
-                                                                                    eprintln!("[ERR][REWARDS] PARTICIPANT process_fail mb={} err={}", mb_idx, e);
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                                // v3.00: PARTICIPANT emission processing REMOVED
+                                                // Rewards are processed ONCE via the SYNC path (sync_macroblock)
+                                                // which handles ALL non-initiator nodes deterministically.
+                                                // Previous PARTICIPANT path caused:
+                                                //   1. Duplicate bincode::serialize(all_accounts) — CPU blocking async runtime
+                                                //   2. Duplicate save_state_snapshot() — unnecessary RocksDB I/O
+                                                //   3. reward_manager.write() lock contention with SYNC path
+                                                //   4. Pre-reward snapshot saved with wrong key (mb_idx*90 vs mb_idx)
+                                                // Total overhead: ~6 seconds per emission macroblock (every 4 hours)
                                             } else {
                                                 // MB not saved - DO NOT update round, will retry!
                                                 if is_warn() { 
@@ -21910,20 +21775,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 println!("[REPUTATION] 🏆 Consensus leader {} - reward via macroblock", consensus_data.leader_id);
                 println!("[REPUTATION] ✅ {} participants - rewards via macroblock", consensus_data.participants.len());
                 
-                // v2.99: CRITICAL - INITIATOR processes emission rewards AFTER MacroBlock creation
-                // This ensures MacroBlock exists BEFORE rewards are calculated
-                // Snapshot is saved BEFORE broadcast so PARTICIPANTS can load it
+                // v3.00: INITIATOR processes emission rewards AFTER MacroBlock creation
+                // Snapshot is saved AFTER broadcast in background task (non-blocking)
                 const EMISSION_MB_INTERVAL: u64 = 160;
                 let is_emission_mb = macroblock.height > 0 && macroblock.height % EMISSION_MB_INTERVAL == 0;
+                let mut emission_snapshot_data: Option<(u64, [u8; 32], Arc<dashmap::DashMap<String, qnet_state::Account>>)> = None;
                 
                 if is_emission_mb {
                     if is_info() {
                         println!("[INFO][EMISSION] processing_rewards mb={} epoch={}", 
                                  macroblock.height, macroblock.height / EMISSION_MB_INTERVAL);
                     }
-                    
-                    // Calculate emission height (last microblock of this MacroBlock)
-                    let emission_height = macroblock.height * 90;
                     
                     // Extract reward_heartbeats from MacroBlock
                     if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
@@ -22003,24 +21865,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             // NOT here in trigger_macroblock_consensus (would be in block 14401)
                             // This ensures TX is in the EMISSION BLOCK, not the next block
                                             
-                            // Save state snapshot for PARTICIPANTS
-                            // CRITICAL: Use MacroBlock index as key, not emission_height!
+                            // v3.00: Arc clone — O(1) ref bump, NO data copy
+                            // SCALABILITY: DashMap iteration + serialize in spawn_blocking
+                            // At 1M+ accounts, clone+serialize takes seconds — must NOT block Tokio
                             let state = state_manager.read().await;
                             let state_root = (*state).calculate_state_root().unwrap_or([0u8; 32]);
-                            let state_data = bincode::serialize(&(*state).get_all_accounts()).unwrap_or_default();
+                            let accounts_arc = (*state).accounts.clone(); // Arc bump — O(1)
                             drop(state);
                             
-                            if !state_data.is_empty() {
-                                // v2.99: Save by MacroBlock index (160), not emission height (14400)
-                                // This ensures PARTICIPANTS can load using same key
-                                if let Err(e) = storage.save_state_snapshot(macroblock.height, state_root, state_data.clone()).await {
-                                    eprintln!("[ERR][EMISSION] snapshot_save_fail mb={} err={}", macroblock.height, e);
-                                } else {
-                                    if is_info() {
-                                        println!("[INFO][EMISSION] snapshot_saved mb={} size={}KB", 
-                                                 macroblock.height, state_data.len() / 1024);
-                                    }
-                                }
+                            if accounts_arc.len() > 0 {
+                                emission_snapshot_data = Some((macroblock.height, state_root, accounts_arc));
                             }
                                             
                                             // Mark as processed
@@ -22086,6 +21940,40 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             println!("[WARN][MB] MacroBlock #{} broadcast failed: {} (consensus participants already have it)", macroblock_index, e);
                         }
                     }
+                }
+                
+                // v3.00: Fully async snapshot — DashMap iterate + serialize in spawn_blocking
+                // SCALABILITY: At 1M+ accounts, iterate+clone+serialize takes seconds
+                // Tokio reactor blocked for 0ms — only Arc clone + state_root on async path
+                if let Some((mb_height, state_root, accounts_arc)) = emission_snapshot_data {
+                    let storage_bg = storage.clone();
+                    tokio::spawn(async move {
+                        // CPU-bound: DashMap iterate + clone entries + serialize — all on blocking pool
+                        let state_data = match tokio::task::spawn_blocking(move || {
+                            let accounts: Vec<(String, qnet_state::Account)> = accounts_arc.iter()
+                                .map(|e| (e.key().clone(), e.value().clone()))
+                                .collect();
+                            bincode::serialize(&accounts)
+                        }).await {
+                            Ok(Ok(data)) => data,
+                            Ok(Err(e)) => {
+                                eprintln!("[ERR][EMISSION] bg_serialize_fail mb={} err={}", mb_height, e);
+                                return;
+                            }
+                            Err(e) => {
+                                eprintln!("[ERR][EMISSION] bg_spawn_fail mb={} err={}", mb_height, e);
+                                return;
+                            }
+                        };
+                        
+                        if !state_data.is_empty() {
+                            if let Err(e) = storage_bg.save_state_snapshot(mb_height, state_root, state_data.clone()).await {
+                                eprintln!("[ERR][EMISSION] bg_snapshot_fail mb={} err={}", mb_height, e);
+                            } else {
+                                println!("[INFO][EMISSION] bg_snapshot_saved mb={} size={}KB", mb_height, state_data.len() / 1024);
+                            }
+                        }
+                    });
                 }
                 
                 Ok(())
@@ -23936,62 +23824,69 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             )));
         }
         
-        // Check if we already have this macroblock
-        if let Ok(Some(_)) = self.storage.get_macroblock_by_height(index) {
-            println!("[MACROBLOCK-SYNC] ℹ️ Macroblock #{} already exists, skipping", index);
-            // v3.1: Clear from pending tracker even if already exists
-            crate::unified_p2p::clear_macroblock_pending_sync(index);
-            return Ok(());
-        }
+        // v3.00: Check if macroblock already saved (e.g., by BFT participant during consensus)
+        // CRITICAL: Do NOT return early — emission rewards still need processing!
+        // process_macroblock_heartbeats_deterministic has built-in dedup via processed_set
+        let already_saved = self.storage.get_macroblock_by_height(index)
+            .map(|mb| mb.is_some())
+            .unwrap_or(false);
         
-        // Validate microblock hashes exist (if we have the microblocks)
-        let expected_start = if index == 1 { 1 } else { (index - 1) * 90 + 1 };
-        let expected_end = index * 90;
-        
-        let mut missing_microblocks = Vec::new();
-        for height in expected_start..=expected_end {
-            if self.storage.load_microblock(height)?.is_none() {
-                missing_microblocks.push(height);
+        if already_saved {
+            // BFT participants save macroblock during consensus, broadcast arrives later
+            // Skip save + validation, but continue to emission reward processing below
+            if is_info() {
+                println!("[INFO][MB-SYNC] already_saved mb={} skip_save process_rewards", index);
             }
-        }
-        
-        if !missing_microblocks.is_empty() {
-            println!("[MACROBLOCK-SYNC] ⚠️ Macroblock #{} references {} missing microblocks (first: {})", 
-                     index, missing_microblocks.len(), missing_microblocks[0]);
-            // Don't reject - we might be syncing macroblocks before microblocks
-            // The macroblock will be useful for Light nodes that only need headers
-        }
-        
-        // Save macroblock to storage
-        self.storage.save_macroblock(index, &macroblock).await?;
-        
-        // v3.1: Clear from pending sync tracker after successful save
-        crate::unified_p2p::clear_macroblock_pending_sync(index);
-        
-        // v2.48 FIX: Update global finalized round after successful save
-        let round = index * 90;
-        let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
-        if round > prev_round {
-            LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
-            println!("[INFO][MB-SYNC] finalized_round_updated mb={} round={}", index, round);
-        }
-        
-        // v2.24: Apply reputation snapshot from macroblock
-        // This ensures ALL nodes have IDENTICAL reputation after syncing
-        if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
-            if !snapshot_data.is_empty() {
-                if let Some(ref p2p) = self.unified_p2p {
-                    if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                        let mut rep_state = rep_arc.write();
-                        match rep_state.apply_snapshot(snapshot_data) {
-                            Ok(count) => {
-                                if is_info() {
-                                    println!("[INFO][MB-SYNC] snapshot_applied nodes={}", count);
+            crate::unified_p2p::clear_macroblock_pending_sync(index);
+        } else {
+            // New macroblock — validate, save, apply reputation
+            
+            // Validate microblock hashes exist (if we have the microblocks)
+            let expected_start = if index == 1 { 1 } else { (index - 1) * 90 + 1 };
+            let expected_end = index * 90;
+            
+            let mut missing_microblocks = Vec::new();
+            for height in expected_start..=expected_end {
+                if self.storage.load_microblock(height)?.is_none() {
+                    missing_microblocks.push(height);
+                }
+            }
+            
+            if !missing_microblocks.is_empty() {
+                println!("[WARN][MB-SYNC] Macroblock #{} references {} missing microblocks (first: {})", 
+                         index, missing_microblocks.len(), missing_microblocks[0]);
+            }
+            
+            // Save macroblock to storage
+            self.storage.save_macroblock(index, &macroblock).await?;
+            
+            // v3.1: Clear from pending sync tracker after successful save
+            crate::unified_p2p::clear_macroblock_pending_sync(index);
+            
+            // v2.48 FIX: Update global finalized round after successful save
+            let round = index * 90;
+            let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
+            if round > prev_round {
+                LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
+                println!("[INFO][MB-SYNC] finalized_round_updated mb={} round={}", index, round);
+            }
+            
+            // v2.24: Apply reputation snapshot from macroblock
+            if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
+                if !snapshot_data.is_empty() {
+                    if let Some(ref p2p) = self.unified_p2p {
+                        if let Some(rep_arc) = p2p.get_deterministic_reputation() {
+                            let mut rep_state = rep_arc.write();
+                            match rep_state.apply_snapshot(snapshot_data) {
+                                Ok(count) => {
+                                    if is_info() {
+                                        println!("[INFO][MB-SYNC] snapshot_applied nodes={}", count);
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                if is_warn() {
-                                    println!("[WARN][MB-SYNC] snapshot_failed err={}", e);
+                                Err(e) => {
+                                    if is_warn() {
+                                        println!("[WARN][MB-SYNC] snapshot_failed err={}", e);
+                                    }
                                 }
                             }
                         }
@@ -24109,18 +24004,42 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         println!("[INFO][REWARDS] SYNC pending_updated count={}", updated_count);
                                     }
                                     
-                                    // Save state snapshot for persistence across restarts
+                                    // v3.00: Fully async snapshot — DashMap iterate + serialize in spawn_blocking
+                                    // SCALABILITY: At 1M+ accounts — Tokio blocked for 0ms
                                     let state = self.state.read().await;
                                     let state_root = (*state).calculate_state_root().unwrap_or([0u8; 32]);
-                                    let state_data = bincode::serialize(&(*state).get_all_accounts()).unwrap_or_default();
+                                    let accounts_arc = (*state).accounts.clone(); // Arc bump — O(1)
                                     drop(state);
                                     
-                                    if !state_data.is_empty() {
-                                        if let Err(e) = self.storage.save_state_snapshot(index, state_root, state_data).await {
-                                            eprintln!("[ERR][REWARDS] snapshot_save_fail mb={} err={}", index, e);
-                                        } else if is_info() {
-                                            println!("[INFO][REWARDS] SYNC snapshot_saved mb={}", index);
-                                        }
+                                    if accounts_arc.len() > 0 {
+                                        let storage_bg = self.storage.clone();
+                                        let snap_index = index;
+                                        tokio::spawn(async move {
+                                            let state_data = match tokio::task::spawn_blocking(move || {
+                                                let accounts: Vec<(String, qnet_state::Account)> = accounts_arc.iter()
+                                                    .map(|e| (e.key().clone(), e.value().clone()))
+                                                    .collect();
+                                                bincode::serialize(&accounts)
+                                            }).await {
+                                                Ok(Ok(data)) => data,
+                                                Ok(Err(e)) => {
+                                                    eprintln!("[ERR][REWARDS] bg_serialize_fail mb={} err={}", snap_index, e);
+                                                    return;
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[ERR][REWARDS] bg_spawn_fail mb={} err={}", snap_index, e);
+                                                    return;
+                                                }
+                                            };
+                                            
+                                            if !state_data.is_empty() {
+                                                if let Err(e) = storage_bg.save_state_snapshot(snap_index, state_root, state_data.clone()).await {
+                                                    eprintln!("[ERR][REWARDS] bg_snapshot_fail mb={} err={}", snap_index, e);
+                                                } else {
+                                                    println!("[INFO][REWARDS] SYNC bg_snapshot_saved mb={} size={}KB", snap_index, state_data.len() / 1024);
+                                                }
+                                            }
+                                        });
                                     }
                                     
                                     // Mark as processed
@@ -24149,7 +24068,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         }
         
-        if is_info() { 
+        if is_info() && !already_saved { 
             println!("[INFO][MB-SYNC] saved mb={} microblocks={}", index, macroblock.micro_blocks.len()); 
         }
         

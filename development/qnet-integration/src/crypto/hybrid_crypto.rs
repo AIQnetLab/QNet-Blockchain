@@ -18,10 +18,11 @@
 //! - **Legacy**: `to_json()` / `from_json()` - for backwards compatibility only
 //!
 //! ### Certificate Management
-//! - **Lifetime**: 4.5 minutes (270 seconds) - frequent rotation for security
+//! - **Lifetime**: 4.5 minutes (270 seconds) - frequent rotation for ephemeral key freshness
 //! - **Rotation**: Automatic at 80% lifetime (216 sec), grace period 54 sec
 //! - **Storage**: LRU cache (100K certificates)
-//! - **Distribution**: P2P broadcast on rotation
+//! - **Distribution**: P2P broadcast immediately after rotation + periodic maintenance
+//! - **Verification**: Dilithium-only (v3.50) — Ed25519 rotation chain removed
 //!
 //! ## Signature Formats (v2.24)
 //!
@@ -201,10 +202,9 @@ pub struct HybridCertificate {
     /// Certificate serial number for revocation
     pub serial_number: String,
     
-    /// PRODUCTION: Ed25519 signature from previous key (for rotation chain verification)
-    /// This proves that the owner of the old key authorized the new key
-    /// Format: base64-encoded Ed25519 signature (64 bytes) of new_ed25519_public_key
-    /// None for first certificate (no previous key)
+    /// DEPRECATED v3.50: Ed25519 rotation chain removed — Dilithium-only verification
+    /// Field kept as Option for backwards compatibility (deserializing old certificates)
+    /// New certificates always set this to None — Dilithium signature is sufficient
     #[serde(default)]
     pub rotation_signature: Option<String>,
 }
@@ -466,7 +466,7 @@ impl HybridCrypto {
             issued_at: now,
             expires_at,
             serial_number,
-            rotation_signature: None, // Will be set during rotation if needed
+            rotation_signature: None, // v3.50: Always None — Dilithium is sole authenticator
         })
     }
     
@@ -493,6 +493,9 @@ impl HybridCrypto {
     }
     
     /// Rotate certificate (generate new Ed25519 key)
+    /// v3.50: rotation_signature removed — Dilithium is the sole authenticator
+    /// Each cert is independently verified by its Dilithium signature over
+    /// (ed25519_pubkey || node_id || timestamp). No Ed25519 chain needed.
     pub async fn rotate_certificate(&mut self) -> Result<()> {
         println!("🔄 Rotating hybrid certificate...");
         
@@ -501,21 +504,10 @@ impl HybridCrypto {
         let new_signing_key = SigningKey::generate(&mut csprng);
         let new_verifying_key = new_signing_key.verifying_key();
         
-        // Create new certificate
-        let mut new_certificate = self.create_certificate(&new_verifying_key).await?;
-        
-        // PRODUCTION: Sign new certificate with OLD Ed25519 key for rotation chain verification
-        // This proves that the owner of the old key authorized the new key
-        if let Some(old_signing_key) = &self.ed25519_signing_key {
-            // Sign the new Ed25519 public key with the old signing key
-            let signature = old_signing_key.sign(new_verifying_key.as_bytes());
-            let signature_base64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
-            new_certificate.rotation_signature = Some(signature_base64);
-            println!("🔐 Certificate rotation signed with previous key for chain verification");
-        } else {
-            // First certificate (no previous key)
-            println!("🆕 First certificate - no rotation signature needed");
-        }
+        // Create new certificate (Dilithium signs: ed25519_pubkey || node_id || timestamp)
+        let new_certificate = self.create_certificate(&new_verifying_key).await?;
+        // NOTE: rotation_signature is None — Dilithium signature is sufficient
+        // See v3.50 rationale: Ed25519 chain adds zero security over Dilithium
         
         // Atomic replacement
         self.ed25519_signing_key = Some(new_signing_key);
@@ -524,10 +516,6 @@ impl HybridCrypto {
         self.last_rotation = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         
         println!("✅ Certificate rotated: {}", new_certificate.serial_number);
-        
-        // PRODUCTION: Broadcast new certificate to peers for compact signature verification
-        // This is handled by the P2P layer when the node initializes or rotates certificates
-        // The node.rs will call p2p.broadcast_certificate_announce() after rotation
         
         Ok(())
     }

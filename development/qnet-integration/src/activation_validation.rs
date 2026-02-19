@@ -52,10 +52,6 @@ pub struct BlockchainActivationRegistry {
     /// CRITICAL: Shared storage instance to avoid RocksDB lock conflicts
     /// RocksDB does NOT support multiple connections to same database
     storage: Option<std::sync::Arc<crate::storage::Storage>>,
-    /// SECURE CODE RECOVERY: burn_tx_hash → encrypted activation code
-    /// Encrypted with SHA3-256(burn_tx || wallet || RECOVERY_SALT)
-    /// Survives in-memory while node is running; persisted via ActivationRecord.encrypted_original_code
-    code_recovery_cache: RwLock<HashMap<String, String>>,
 }
 
 /// Bloom filter for fast negative lookups
@@ -331,11 +327,6 @@ pub struct ActivationRecord {
     pub blockchain_height: u64,
     pub is_active: bool,
     pub device_migrations: Vec<DeviceMigration>,
-    /// Encrypted original code for recovery (defense-in-depth):
-    /// Layer 1 — code itself is wallet-bound (XOR-encrypted wallet inside)
-    /// Layer 2 — stored encrypted with SHA3-256(burn_tx + wallet + salt)
-    #[serde(default)]
-    pub encrypted_original_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,7 +375,6 @@ impl BlockchainActivationRegistry {
             cache_ttl: 300, // 5 minutes
             rpc_load_balancer: RpcLoadBalancer::new(rpc_endpoints),
             storage, // CRITICAL: Store shared storage reference
-            code_recovery_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -796,30 +786,21 @@ impl BlockchainActivationRegistry {
         // Create activation record with secure hash storage
         let code_hash = self.hash_activation_code_for_blockchain(code)?;
         
-        // Encrypt original code for recovery (defense-in-depth)
-        let encrypted_code = Self::encrypt_code_for_recovery(
-            code, &node_info.burn_tx_hash, &node_info.wallet_address
-        );
-        
         let record = ActivationRecord {
             code_hash: code_hash.clone(),
             wallet_address: node_info.wallet_address.clone(),
-            tx_hash: node_info.burn_tx_hash.clone(), // CRITICAL: Store burn_tx for XOR decryption
+            tx_hash: node_info.burn_tx_hash.clone(),
             activated_at: node_info.activated_at,
             node_type: node_info.node_type.clone(),
-            phase: node_info.phase, // Use phase from NodeInfo
-            activation_amount: node_info.burn_amount, // CRITICAL: Store exact amount for XOR key derivation
+            phase: node_info.phase,
+            activation_amount: node_info.burn_amount,
             blockchain_height: self.get_current_blockchain_height().await?,
             is_active: true,
             device_migrations: vec![],
-            encrypted_original_code: Some(encrypted_code),
         };
 
         // Submit to blockchain
         self.submit_activation_to_blockchain(record.clone()).await?;
-
-        // Store encrypted code in recovery cache for future lookups
-        self.store_code_for_recovery(code, &node_info.burn_tx_hash, &node_info.wallet_address).await;
 
         // Update local cache with code hash instead of plaintext code
         {
@@ -1129,146 +1110,6 @@ impl BlockchainActivationRegistry {
         println!("[REGISTRY] 🚀 Genesis bootstrap: ALL {} nodes populated (deterministic)", active_nodes.len());
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // SECURE CODE RECOVERY (defense-in-depth)
-    // Layer 1: Code is cryptographically wallet-bound (XOR-encrypted wallet inside)
-    //          — only the original wallet can USE the code for activation
-    // Layer 2: Stored encrypted with SHA3-256(burn_tx + wallet + salt)
-    //          — even if storage is compromised, codes are not readable
-    //          — recovery requires knowing both burn_tx_hash AND wallet_address
-    // ═══════════════════════════════════════════════════════════════════
-
-    /// Derive encryption key from burn_tx_hash + wallet_address
-    fn derive_recovery_key(burn_tx_hash: &str, wallet_address: &str) -> Vec<u8> {
-        use sha3::{Sha3_256, Digest};
-        let mut hasher = Sha3_256::new();
-        hasher.update(format!("{}:{}:QNET_RECOVERY_v1", burn_tx_hash, wallet_address).as_bytes());
-        hasher.finalize().to_vec() // 32 bytes
-    }
-
-    /// XOR encrypt/decrypt with derived key
-    fn xor_with_key(data: &[u8], key: &[u8]) -> Vec<u8> {
-        data.iter().enumerate().map(|(i, &b)| b ^ key[i % key.len()]).collect()
-    }
-
-    /// Encrypt activation code for storage
-    pub fn encrypt_code_for_recovery(code: &str, burn_tx_hash: &str, wallet_address: &str) -> String {
-        let key = Self::derive_recovery_key(burn_tx_hash, wallet_address);
-        hex::encode(Self::xor_with_key(code.as_bytes(), &key))
-    }
-
-    /// Decrypt stored activation code
-    pub fn decrypt_code_for_recovery(encrypted_hex: &str, burn_tx_hash: &str, wallet_address: &str) -> Option<String> {
-        let encrypted = hex::decode(encrypted_hex).ok()?;
-        let key = Self::derive_recovery_key(burn_tx_hash, wallet_address);
-        String::from_utf8(Self::xor_with_key(&encrypted, &key)).ok()
-    }
-
-    /// Store encrypted activation code for future recovery
-    pub async fn store_code_for_recovery(&self, code: &str, burn_tx_hash: &str, wallet_address: &str) {
-        let encrypted = Self::encrypt_code_for_recovery(code, burn_tx_hash, wallet_address);
-        
-        // In-memory cache: burn_tx_hash → encrypted code
-        {
-            let mut cache = self.code_recovery_cache.write().await;
-            cache.insert(burn_tx_hash.to_string(), encrypted.clone());
-        }
-        
-        // Update ActivationRecord if exists
-        {
-            let mut records = self.activation_records.write().await;
-            for record in records.values_mut() {
-                if record.tx_hash == burn_tx_hash {
-                    record.encrypted_original_code = Some(encrypted.clone());
-                    break;
-                }
-            }
-        }
-
-        println!("[RECOVERY] Stored encrypted code for burn TX: {}...", 
-                 &burn_tx_hash[..8.min(burn_tx_hash.len())]);
-    }
-
-    /// Recover activation code by burn_tx_hash + wallet_address
-    /// Requires both values to decrypt — defense-in-depth on top of wallet-bound code
-    pub async fn recover_code_by_burn_tx(&self, burn_tx_hash: &str, wallet_address: &str) -> Option<String> {
-        // Try in-memory cache
-        {
-            let cache = self.code_recovery_cache.read().await;
-            if let Some(encrypted) = cache.get(burn_tx_hash) {
-                if let Some(code) = Self::decrypt_code_for_recovery(encrypted, burn_tx_hash, wallet_address) {
-                    if code.starts_with("QNET-") {
-                        println!("[RECOVERY] Code decrypted from in-memory cache");
-                        return Some(code);
-                    }
-                }
-            }
-        }
-
-        // Fallback: search activation records
-        {
-            let mut found_encrypted: Option<String> = None;
-            let mut found_code: Option<String> = None;
-            {
-                let records = self.activation_records.read().await;
-                for record in records.values() {
-                    if record.tx_hash == burn_tx_hash {
-                        if let Some(ref encrypted) = record.encrypted_original_code {
-                            // Try with provided wallet
-                            if let Some(code) = Self::decrypt_code_for_recovery(encrypted, burn_tx_hash, wallet_address) {
-                                if code.starts_with("QNET-") {
-                                    println!("[RECOVERY] Code decrypted from activation record");
-                                    found_encrypted = Some(encrypted.clone());
-                                    found_code = Some(code);
-                                    break;
-                                }
-                            }
-                            // Try with record's stored wallet (Solana vs EON mismatch)
-                            if record.wallet_address != wallet_address {
-                                if let Some(code) = Self::decrypt_code_for_recovery(encrypted, burn_tx_hash, &record.wallet_address) {
-                                    if code.starts_with("QNET-") {
-                                        println!("[RECOVERY] Code decrypted using stored wallet address");
-                                        found_encrypted = Some(encrypted.clone());
-                                        found_code = Some(code);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            } // records lock released here
-            if let (Some(encrypted), Some(code)) = (found_encrypted, found_code) {
-                let mut cache = self.code_recovery_cache.write().await;
-                cache.insert(burn_tx_hash.to_string(), encrypted);
-                return Some(code);
-            }
-        }
-
-        println!("[RECOVERY] No recoverable code for burn TX: {}...", 
-                 &burn_tx_hash[..8.min(burn_tx_hash.len())]);
-        None
-    }
-
-    /// Recover code trying all known wallet addresses for this burn TX
-    pub async fn recover_code_by_burn_tx_any_wallet(&self, burn_tx_hash: &str) -> Option<String> {
-        let records = self.activation_records.read().await;
-        for record in records.values() {
-            if record.tx_hash == burn_tx_hash {
-                if let Some(ref encrypted) = record.encrypted_original_code {
-                    if let Some(code) = Self::decrypt_code_for_recovery(encrypted, burn_tx_hash, &record.wallet_address) {
-                        if code.starts_with("QNET-") {
-                            println!("[RECOVERY] Code decrypted via stored wallet fallback");
-                            return Some(code);
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        None
-    }
 }
 
 /// PRODUCTION: Blockchain migration record for device migrations
@@ -1893,8 +1734,7 @@ impl BlockchainActivationRegistry {
                                             activation_amount, // CRITICAL: Must match XOR key derivation amount
                                             blockchain_height: block_height,
                                             is_active: true, // Always true if in blockchain
-                                            device_migrations: vec![], // Not stored in blockchain
-                                            encrypted_original_code: None, // Not stored in blockchain
+                                            device_migrations: vec![],
                                         };
                                         activations.push(record);
                                     }
@@ -1947,7 +1787,6 @@ impl BlockchainActivationRegistry {
                 blockchain_height: self.get_blockchain_height().await?,
                 is_active: true,
                 device_migrations: vec![],
-                encrypted_original_code: None,
             };
             activations.push(activation);
         }

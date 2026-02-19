@@ -1364,9 +1364,8 @@ pub struct CertificateManager {
     /// SECURITY: Track usage count for prioritization during eviction
     usage_count: HashMap<String, u32>,  // cert_serial -> usage count
     
-    /// COMPATIBILITY: Track certificate history per node to validate rotations
-    /// node_id -> list of (cert_serial, ed25519_pubkey) for compatibility check
-    certificate_history: HashMap<String, Vec<(String, [u8; 32])>>,  // Max 5 per node
+    // v3.50: certificate_history removed — Dilithium-only verification
+    // Ed25519 rotation chain provided zero additional security over Dilithium
 }
 
 impl CertificateManager {
@@ -1398,7 +1397,6 @@ impl CertificateManager {
             max_cache_size,
             recently_used: HashSet::new(),
             usage_count: HashMap::new(),
-            certificate_history: HashMap::new(),
         }
     }
     
@@ -1682,41 +1680,8 @@ impl CertificateManager {
         
         println!("[CERTIFICATE] 💾 Persisted {} critical certificates to disk", saved_count);
         
-        // ═══════════════════════════════════════════════════════════════════════════
-        // PRODUCTION FIX: Persist certificate_history for rotation validation
-        // Without this, nodes reject valid rotated certificates after restart!
-        // ═══════════════════════════════════════════════════════════════════════════
-        let history_file = cert_dir.join("certificate_history.bin");
-        if !self.certificate_history.is_empty() {
-            // Serialize: node_id -> Vec<(cert_serial, ed25519_pubkey)>
-            // Format: [node_count][node_id_len][node_id][entry_count][serial_len][serial][pubkey:32]...
-            let mut history_data = Vec::new();
-            let history_count = self.certificate_history.len() as u32;
-            history_data.extend_from_slice(&history_count.to_le_bytes());
-            
-            for (node_id, entries) in &self.certificate_history {
-                // Node ID
-                let node_id_bytes = node_id.as_bytes();
-                history_data.extend_from_slice(&(node_id_bytes.len() as u16).to_le_bytes());
-                history_data.extend_from_slice(node_id_bytes);
-                
-                // Entries count
-                history_data.extend_from_slice(&(entries.len() as u8).to_le_bytes());
-                
-                for (cert_serial, ed25519_pubkey) in entries {
-                    // Certificate serial
-                    let serial_bytes = cert_serial.as_bytes();
-                    history_data.extend_from_slice(&(serial_bytes.len() as u16).to_le_bytes());
-                    history_data.extend_from_slice(serial_bytes);
-                    
-                    // Ed25519 public key (always 32 bytes)
-                    history_data.extend_from_slice(ed25519_pubkey);
-                }
-            }
-            
-            fs::write(&history_file, &history_data)?;
-            println!("[CERTIFICATE] 💾 Persisted {} node certificate histories", history_count);
-        }
+        // v3.50: certificate_history persistence removed — Dilithium-only verification
+        // Legacy certificate_history.bin file will be ignored on next restart
         
         Ok(())
     }
@@ -1778,76 +1743,7 @@ impl CertificateManager {
         
         println!("[CERTIFICATE] 📂 Loaded {} certificates from disk ({} expired)", loaded_count, expired_count);
         
-        // ═══════════════════════════════════════════════════════════════════════════
-        // PRODUCTION FIX: Load certificate_history for rotation validation
-        // Without this, nodes reject valid rotated certificates after restart!
-        // ═══════════════════════════════════════════════════════════════════════════
-        let history_file = cert_dir.join("certificate_history.bin");
-        if history_file.exists() {
-            match fs::read(&history_file) {
-                Ok(data) => {
-                    let mut offset = 0;
-                    
-                    // Read node count
-                    if data.len() < 4 {
-                        println!("[CERTIFICATE] ⚠️ History file too short");
-                        return Ok(());
-                    }
-                    let node_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                    offset += 4;
-                    
-                    let mut loaded_histories = 0;
-                    
-                    for _ in 0..node_count {
-                        if offset + 2 > data.len() { break; }
-                        
-                        // Read node_id length and value
-                        let node_id_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-                        offset += 2;
-                        
-                        if offset + node_id_len > data.len() { break; }
-                        let node_id = String::from_utf8_lossy(&data[offset..offset + node_id_len]).to_string();
-                        offset += node_id_len;
-                        
-                        if offset + 1 > data.len() { break; }
-                        let entry_count = data[offset] as usize;
-                        offset += 1;
-                        
-                        let mut entries = Vec::with_capacity(entry_count);
-                        
-                        for _ in 0..entry_count {
-                            if offset + 2 > data.len() { break; }
-                            
-                            // Read cert serial
-                            let serial_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-                            offset += 2;
-                            
-                            if offset + serial_len > data.len() { break; }
-                            let cert_serial = String::from_utf8_lossy(&data[offset..offset + serial_len]).to_string();
-                            offset += serial_len;
-                            
-                            // Read ed25519 pubkey (32 bytes)
-                            if offset + 32 > data.len() { break; }
-                            let mut ed25519_pubkey = [0u8; 32];
-                            ed25519_pubkey.copy_from_slice(&data[offset..offset + 32]);
-                            offset += 32;
-                            
-                            entries.push((cert_serial, ed25519_pubkey));
-                        }
-                        
-                        if !entries.is_empty() {
-                            self.certificate_history.insert(node_id, entries);
-                            loaded_histories += 1;
-                        }
-                    }
-                    
-                    println!("[CERTIFICATE] 📂 Loaded {} certificate histories from disk", loaded_histories);
-                }
-                Err(e) => {
-                    println!("[CERTIFICATE] ⚠️ Failed to load certificate history: {}", e);
-                }
-            }
-        }
+        // v3.50: certificate_history loading removed — Dilithium-only verification
         
         Ok(())
     }
@@ -11847,169 +11743,36 @@ impl SimplifiedP2P {
                         Ok(true) => {
                             println!("[INFO][CERT] verified serial={} node={}", cert_serial_clone, cert.node_id);
                             
-                            // COMPATIBILITY: Check certificate history to ensure smooth rotation
-                            let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
-                            
-                            // Check if we have history for this node
-                            let is_compatible = if let Some(history) = cert_manager.certificate_history.get(&cert.node_id) {
-                                // This node has rotated certificates before
-                                if !history.is_empty() {
-                                    // FIX v3.41: Check if this is a DUPLICATE certificate (same serial already in history)
-                                    // This happens when nodes broadcast the same certificate multiple times
-                                    // Duplicate != Rotation - no need for rotation_signature
-                                    let is_duplicate = history.iter().any(|(serial, _)| serial == &cert_serial_clone);
-                                    
-                                    if is_duplicate {
-                                        // Same certificate received again - just accept it
-                                        println!("[DBG][CERT] duplicate_accepted serial={} node={}", cert_serial_clone, cert.node_id);
-                                        true
-                                    } else {
-                                    // This is ACTUAL rotation - different certificate serial
-                                    let prev_count = history.len();
-                                    
-                                    // SOFT VALIDATION: Check if history is STALE (node was offline for extended period)
-                                    // Serial format: "CERT-{node_id}-{timestamp}" - extract timestamp to check age
-                                    let (prev_serial, prev_ed25519_key) = &history[history.len() - 1];
-                                    let history_stale = if let Some(ts_str) = prev_serial.rsplit('-').next() {
-                                        if let Ok(ts) = ts_str.parse::<u64>() {
-                                            let now = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs();
-                                            let age_secs = now.saturating_sub(ts);
-                                            age_secs > 3600 // History older than 1 hour = stale
-                                        } else { false }
-                                    } else { false };
-                                    
-                                    println!("[INFO][CERT] rotation_detected node={} history_count={} history_stale={}", cert.node_id, prev_count, history_stale);
-                                    
-                                    // PRODUCTION: Verify rotation signature with previous key
-                                    // MANDATORY: All certificate rotations MUST be signed by the previous key
-                                    // This creates an unbreakable chain of trust from the first certificate
-                                    if let Some(rotation_sig_b64) = &cert.rotation_signature {
-                                        // Get previous Ed25519 public key from history (already extracted above)
-                                        
-                                        // Decode rotation signature
-                                        match base64::engine::general_purpose::STANDARD.decode(rotation_sig_b64) {
-                                            Ok(sig_bytes) if sig_bytes.len() == 64 => {
-                                                // Create Ed25519 signature and verifying key
-                                                use ed25519_dalek::{Signature, VerifyingKey, Verifier};
-                                                
-                                                match Signature::from_slice(&sig_bytes) {
-                                                    Ok(signature) => {
-                                                        match VerifyingKey::from_bytes(prev_ed25519_key) {
-                                                            Ok(prev_verifying_key) => {
-                                                                // Verify that new key is signed by old key
-                                                                match prev_verifying_key.verify(&cert.ed25519_public_key, &signature) {
-                                                                    Ok(_) => {
-                                                                        println!("[INFO][CERT] rotation_verified node={} chain_of_trust=ok", cert.node_id);
-                                                                        true
-                                                                    }
-                                                                    Err(_) => {
-                                                                        // SOFT VALIDATION: Accept if history is short OR stale (node was offline)
-                                                                        // Dilithium signature is already verified - certificate is authentic
-                                                                        if prev_count < 3 || history_stale {
-                                                                            println!("[INFO][CERT] soft_accept node={} reason=incomplete_or_stale_history history_len={} stale={} dilithium=verified", cert.node_id, prev_count, history_stale);
-                                                                            true
-                                                                        } else {
-                                                                            println!("[WARN][CERT] rotation_invalid node={} reason=signature_mismatch history_len={}", cert.node_id, prev_count);
-                                                                            println!("[WARN][SECURITY] unauthorized_rotation_attempt node={}", cert.node_id);
-                                                                            false
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(_) => {
-                                                                // SOFT VALIDATION: Accept if history is short OR stale
-                                                                if prev_count < 3 || history_stale {
-                                                                    println!("[INFO][CERT] soft_accept node={} reason=invalid_prev_key history_len={} stale={} dilithium=verified", cert.node_id, prev_count, history_stale);
-                                                                    true
-                                                                } else {
-                                                                    println!("[WARN][CERT] rotation_failed node={} reason=invalid_prev_key history_len={}", cert.node_id, prev_count);
-                                                                    false
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(_) => {
-                                                        // SOFT VALIDATION: Accept if history is short OR stale
-                                                        if prev_count < 3 || history_stale {
-                                                            println!("[INFO][CERT] soft_accept node={} reason=invalid_signature_format history_len={} stale={} dilithium=verified", cert.node_id, prev_count, history_stale);
-                                                            true
-                                                        } else {
-                                                            println!("[WARN][CERT] rotation_failed node={} reason=invalid_signature_format history_len={}", cert.node_id, prev_count);
-                                                            false
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            _ => {
-                                                // SOFT VALIDATION: Accept if history is short OR stale
-                                                if prev_count < 3 || history_stale {
-                                                    println!("[INFO][CERT] soft_accept node={} reason=invalid_sig_bytes history_len={} stale={} dilithium=verified", cert.node_id, prev_count, history_stale);
-                                                    true
-                                                } else {
-                                                    println!("[WARN][CERT] rotation_failed node={} reason=invalid_sig_bytes history_len={}", cert.node_id, prev_count);
-                                                    false
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        // No rotation signature provided
-                                        // SOFT VALIDATION: Accept if history is short OR stale (node was offline)
-                                        // The certificate is already Dilithium-verified - it's authentic
-                                        if prev_count < 3 || history_stale {
-                                            println!("[INFO][CERT] soft_accept node={} reason=missing_rotation_sig history_len={} stale={} dilithium=verified", cert.node_id, prev_count, history_stale);
-                                            true
-                                        } else {
-                                            // Long fresh history but no rotation signature - suspicious
-                                            println!("[WARN][CERT] rotation_rejected node={} reason=missing_signature history_len={}", cert.node_id, prev_count);
-                                            println!("[WARN][SECURITY] rotation_without_proof node={}", cert.node_id);
-                                            false
-                                        }
-                                    }
-                                    }  // end of is_duplicate else block
-                                } else {
-                                    // Empty history but node exists - should not happen
-                                    println!("[WARN][CERT] empty_history node={} action=accept", cert.node_id);
-                                    true
-                                }
-                            } else {
-                                // First certificate from this node
-                                println!("[INFO][CERT] first_certificate node={}", cert.node_id);
-                                
-                                // First certificate should NOT have rotation signature
-                                if cert.rotation_signature.is_some() {
-                                    println!("[WARN][CERT] first_cert_has_rotation_sig node={} action=accept", cert.node_id);
-                                }
-                                true
-                            };
-                            
-                            if is_compatible {
-                                // Update certificate history
-                                let history = cert_manager.certificate_history
-                                    .entry(cert.node_id.clone())
-                                    .or_insert_with(Vec::new);
-                                
-                                // Keep only last 5 certificates for history
-                                if history.len() >= 5 {
-                                    history.remove(0);
-                                }
-                                history.push((cert_serial_clone.clone(), cert.ed25519_public_key));
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v3.50: DILITHIUM-ONLY CERTIFICATE ACCEPTANCE
+                            // 
+                            // RATIONALE: The Ed25519 rotation chain check was removed because:
+                            // 1. Dilithium signature ALREADY proves cert authenticity (NIST Level 3)
+                            // 2. rotation_signature (Ed25519) adds ZERO security over Dilithium
+                            //    - If attacker has Dilithium key → can forge any cert (chain doesn't help)
+                            //    - If attacker lacks Dilithium key → can't forge cert (chain unnecessary)
+                            // 3. Ed25519 is WEAKER than Dilithium against quantum attacks
+                            // 4. Chain caused operational issues: missed broadcasts → rotation_incompatible
+                            //    → rejected valid certs → block verification delays
+                            // 5. Top L1 blockchains (Solana, Ethereum, Aptos, Sui) do NOT use
+                            //    P2P key rotation chains — they rely on primary key verification only
+                            //
+                            // Certificate is valid if and only if:
+                            //   ✅ Dilithium signature is valid for node_id's known Dilithium pubkey
+                            //   ✅ expires_at > now
+                            // ═══════════════════════════════════════════════════════════════════
+                            {
+                                let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                                 
                                 // ATOMIC MOVE: First add to verified, THEN remove from pending
                                 // This prevents race condition where cert is in neither cache
                                 cert_manager.store_remote_certificate(cert_serial_clone.clone(), certificate_clone);
                                 cert_manager.pending_certificates.remove(&cert_serial_clone);
-                                println!("[INFO][CERT] stored serial={} status=verified", cert_serial_clone);
+                                println!("[INFO][CERT] stored serial={} node={} status=dilithium_verified", cert_serial_clone, cert.node_id);
                                 
                                 // FIX v2.28: Signal retry loop that new certificate is available
                                 // This triggers immediate retry of buffered blocks
                                 crate::node::NEW_CERTIFICATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            } else {
-                                println!("[WARN][CERT] rejected serial={} reason=rotation_incompatible", cert_serial_clone);
-                                // Remove from pending without storing
-                                cert_manager.pending_certificates.remove(&cert_serial_clone);
                             }
                         }
                         Ok(false) => {
