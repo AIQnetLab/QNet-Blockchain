@@ -9988,7 +9988,7 @@ async fn handle_generate_activation_code(
         } else {
             // Phase 2: QNC pricing based on node type
             let active_nodes = crate::GLOBAL_ACTIVE_NODES.load(std::sync::atomic::Ordering::Relaxed) as u64;
-            let base = if request.node_type == "super" { 7500u64 } else { 10000u64 };
+            let base = if request.node_type.to_lowercase() == "super" { 7500u64 } else { 10000u64 };
             let multiplier = if active_nodes <= 100_000 { 0.5 }
                 else if active_nodes <= 300_000 { 1.0 }
                 else if active_nodes <= 1_000_000 { 2.0 }
@@ -11697,12 +11697,12 @@ async fn generate_quantum_activation_code(
     
     // Step 3: Generate DETERMINISTIC entropy from burn transaction data
     // CRITICAL: Must NOT use current time — same inputs MUST always produce the same code
-    // (regeneration/recovery must produce identical code to the one initially issued)
+    // CRITICAL: node_type MUST be lowercase — same as XOR key (Step 1) for consistency
     let mut entropy_hasher = Sha3_256::new();
     entropy_hasher.update(format!("entropy:{}:{}:{}", 
         request.wallet_address, 
-        request.burn_tx_hash,   // deterministic — always the same burn tx
-        request.node_type
+        request.burn_tx_hash,
+        request.node_type.to_lowercase()
     ).as_bytes());
     let entropy_hash = hex::encode(entropy_hasher.finalize());
     let entropy_short = &entropy_hash[..4].to_uppercase();
@@ -11718,9 +11718,9 @@ async fn generate_quantum_activation_code(
     
     // Step 5: DETERMINISTIC "timestamp" segment — derived from burn_tx_hash, NOT from wall-clock
     // CRITICAL: chrono::Utc::now() was here before → different code every call → recovery mismatch!
-    // Fix: hash(burn_tx_hash + node_type) gives a stable 5-char hex segment
+    // CRITICAL: node_type MUST be lowercase — same as XOR key (Step 1) for consistency
     let mut ts_hasher = Sha3_256::new();
-    ts_hasher.update(format!("ts:{}:{}", request.burn_tx_hash, request.node_type).as_bytes());
+    ts_hasher.update(format!("ts:{}:{}", request.burn_tx_hash, request.node_type.to_lowercase()).as_bytes());
     let ts_hash = hex::encode(ts_hasher.finalize());
     let timestamp_part = &ts_hash[..5].to_uppercase();
     

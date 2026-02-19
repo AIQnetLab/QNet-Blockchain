@@ -4119,12 +4119,13 @@ export class WalletManager {
       // Dynamic pricing: amount varies based on network burn percentage — NO hardcoded defaults
       let burnAmount = actualBurnAmount;
       if (!burnAmount || burnAmount <= 0) {
-        // Fallback: fetch current price from server — caller SHOULD always pass actualBurnAmount
-        console.warn('[WalletManager] actualBurnAmount not provided — fetching current price from server');
+        // Fallback: fetch DYNAMIC price from server (correct endpoint: /api/v1/activation/price)
+        // This uses GLOBAL_BURN_PERCENTAGE on server — the actual current network price
+        console.warn('[WalletManager] actualBurnAmount not provided — fetching dynamic price from server');
         try {
-          const pricingResponse = await fetch(`${apiUrl}/api/v1/pricing/${nodeType}`);
+          const pricingResponse = await fetch(`${apiUrl}/api/v1/activation/price?type=${nodeType}`);
           const pricing = await pricingResponse.json();
-          burnAmount = pricing.current_price || 0;
+          burnAmount = pricing.cost || 0; // Server returns "cost" field, NOT "current_price"
         } catch (pricingErr) {
           console.warn('[WalletManager] Pricing fetch failed:', pricingErr.message);
         }
@@ -4569,14 +4570,14 @@ export class WalletManager {
       const isTestnet = testnetSetting === null ? true : testnetSetting === 'true';
       const rpcUrl = getSolanaRpcUrl(isTestnet);
       
-      // Step 1: Get signatures with memo
+      // Step 1: Get signatures — fetch enough to find the FIRST (oldest) burn TX
       const sigResponse = await fetch(rpcUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           jsonrpc: '2.0', id: 1,
           method: 'getSignaturesForAddress',
-          params: [walletAddress, { limit: 10 }]
+          params: [walletAddress, { limit: 50 }]
         })
       });
       
@@ -4584,50 +4585,57 @@ export class WalletManager {
       const sigData = await sigResponse.json();
       if (!sigData.result || sigData.result.length === 0) return null;
       
-      // Step 2: Fast-path — find burn TX from memo
-      for (const sig of sigData.result) {
-        if (sig.memo && sig.memo.includes('QNET_NODE_TYPE:') && !sig.err) {
-          const match = sig.memo.match(/QNET_NODE_TYPE:(\w+)/);
-          if (match) {
-            const nodeType = match[1].toLowerCase();
-            console.log(`[findBurnTx] Found burn TX: ${sig.signature.substring(0, 16)}... type=${nodeType}`);
+      // Step 2: Find ALL burn TXs with QNET_NODE_TYPE memo, then pick the OLDEST one.
+      // Solana returns signatures newest-first, so we reverse to get oldest-first.
+      // There should only ever be ONE valid burn TX per wallet (1 wallet = 1 node),
+      // but if multiple exist for any reason, we always use the FIRST (original) burn.
+      const burnSigs = sigData.result
+        .filter(sig => sig.memo && sig.memo.includes('QNET_NODE_TYPE:') && !sig.err);
+      if (burnSigs.length === 0) return null;
+      // Oldest = last in the newest-first array
+      const sig = burnSigs[burnSigs.length - 1];
+      const match = sig.memo.match(/QNET_NODE_TYPE:(\w+)/);
+      if (match) {
+          const nodeType = match[1].toLowerCase();
+          console.log(`[findBurnTx] Found burn TX (oldest): ${sig.signature.substring(0, 16)}... type=${nodeType} (${burnSigs.length} burn TX total)`);
             
-            // Step 3: Get parsed transaction to extract burn amount
-            await new Promise(r => setTimeout(r, 500)); // Rate limit protection
-            try {
-              const txResponse = await fetch(rpcUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  jsonrpc: '2.0', id: 1,
-                  method: 'getTransaction',
-                  params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
-                })
-              });
-              
-              if (txResponse.ok) {
-                const txData = await txResponse.json();
-                if (txData.result) {
-                  // Extract burn amount from instructions
-                  let burnAmount = 0;
-                  const instructions = txData.result?.transaction?.message?.instructions || [];
-                  for (const inst of instructions) {
-                    if (inst.parsed && inst.parsed.type === 'burn' && inst.parsed.info) {
-                      const rawAmount = parseInt(inst.parsed.info.amount || '0');
-                      const decimals = inst.parsed.info.decimals || 6;
-                      burnAmount = rawAmount / Math.pow(10, decimals);
-                      break;
-                    }
+          // Step 3: Get parsed transaction to extract burn amount
+          await new Promise(r => setTimeout(r, 500)); // Rate limit protection
+          try {
+            const txResponse = await fetch(rpcUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0', id: 1,
+                method: 'getTransaction',
+                params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
+              })
+            });
+            
+            if (txResponse.ok) {
+              const txData = await txResponse.json();
+              if (txData.result) {
+                // Extract burn amount from instructions — MUST be integer (no floats for XOR key)
+                let burnAmount = 0;
+                const instructions = txData.result?.transaction?.message?.instructions || [];
+                for (const inst of instructions) {
+                  if (inst.parsed && inst.parsed.type === 'burn' && inst.parsed.info) {
+                    const rawAmount = parseInt(inst.parsed.info.amount || '0');
+                    const decimals = inst.parsed.info.decimals || 6;
+                    // Math.round CRITICAL: avoids floating-point drift (e.g. 1499.9999 vs 1500)
+                    burnAmount = Math.round(rawAmount / Math.pow(10, decimals));
+                    break;
                   }
-                  
-                  return {
-                    burnTxHash: sig.signature,
-                    nodeType: nodeType,
-                    burnAmount: burnAmount > 0 ? burnAmount : null, // Must be real — no defaults
-                    blockTime: sig.blockTime
-                  };
                 }
+                
+                return {
+                  burnTxHash: sig.signature,
+                  nodeType: nodeType,
+                  burnAmount: burnAmount > 0 ? burnAmount : null, // Must be real — no defaults
+                  blockTime: sig.blockTime
+                };
               }
+            }
             } catch (txErr) {
               // Can't get amount — return TX hash but no amount (caller must handle)
               return {
@@ -4638,8 +4646,6 @@ export class WalletManager {
               };
             }
           }
-        }
-      }
       
       return null;
     } catch (error) {
@@ -5050,15 +5056,34 @@ export class WalletManager {
       };
     } catch (error) {
       console.warn('[PRICING] Error calculating activation cost:', error.message);
-      // Fallback: use BASE price (max cost) — safe because user never underpays
-      // Base = 1500 at 0% burned, actual price may be lower if tokens have been burned
+      // Fallback: fetch dynamic price from server pricing endpoint
+      try {
+        const apiUrl = this.getRandomBootstrapNode();
+        const pricingResponse = await fetch(`${apiUrl}/api/v1/activation/price?type=${nodeType}`);
+        const serverPricing = await pricingResponse.json();
+        if (serverPricing.cost > 0) {
+          return {
+            cost: serverPricing.cost,
+            currency: serverPricing.currency || '1DEV',
+            phase: serverPricing.phase || 1,
+            mechanism: serverPricing.mechanism || 'burn',
+            burnPercent: serverPricing.burn_percentage || 0,
+            baseCost: serverPricing.base_cost || serverPricing.cost,
+            description: `Burn ${serverPricing.cost} ${serverPricing.currency || '1DEV'} for activation`,
+            isEstimate: false
+          };
+        }
+      } catch (fallbackErr) {
+        console.warn('[PRICING] Server pricing fallback failed:', fallbackErr.message);
+      }
+      // Last resort: use base price (max cost) — user never underpays
       return {
-        cost: PHASE_1_BASE_PRICE || 1500,
+        cost: PHASE_1_BASE_PRICE,
         currency: '1DEV',
         phase: 1,
         mechanism: 'burn',
         burnPercent: 0,
-        baseCost: PHASE_1_BASE_PRICE || 1500,
+        baseCost: PHASE_1_BASE_PRICE,
         description: 'Burn 1DEV for activation (price may be lower — check network status)',
         isEstimate: true
       };

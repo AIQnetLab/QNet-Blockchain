@@ -1113,19 +1113,49 @@ impl QNetQuantumCrypto {
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string()))
         );
         
+        // CRITICAL: burn_amount is the EXACT amount burned on Solana to generate the activation code.
+        // Required for XOR key: key_material = f"{burn_tx}:{node_type}:{burn_amount}"
+        // Source 1: QNET_BURN_AMOUNT env var (Docker -e QNET_BURN_AMOUNT=...)
+        // Source 2: Dynamic calculation from GLOBAL_BURN_PERCENTAGE (same formula as mobile & server API)
+        let burn_amount = std::env::var("QNET_BURN_AMOUNT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                // Fallback: calculate current dynamic price (identical formula to handle_activation_price)
+                let burn_pct = crate::GLOBAL_BURN_PERCENTAGE
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                if burn_pct < 90.0 {
+                    // Phase 1: 1DEV burn — universal price for all node types
+                    let reduction_tiers = (burn_pct / 10.0).floor() as u64;
+                    let total_reduction = reduction_tiers * 150;
+                    std::cmp::max(1500u64.saturating_sub(total_reduction), 300)
+                } else {
+                    // Phase 2: QNC pricing — base differs by node type
+                    let active = crate::GLOBAL_ACTIVE_NODES
+                        .load(std::sync::atomic::Ordering::Relaxed) as u64;
+                    let base = if payload.node_type.to_lowercase() == "super" { 7500u64 } else { 10000u64 };
+                    let mult = if active <= 100_000 { 0.5 } else if active <= 300_000 { 1.0 }
+                               else if active <= 1_000_000 { 2.0 } else { 3.0 };
+                    (base as f64 * mult).round() as u64
+                }
+            });
+        
+        // Determine phase from burn_tx format (genesis_ = phase 1, pool3_ = phase 2)
+        let phase = if payload.burn_tx.starts_with("pool3_") { 2u8 } else { 1u8 };
+        
         // Create node info for blockchain registry
         let node_info = crate::activation_validation::NodeInfo {
             activation_code: activation_code.to_string(),
             wallet_address: payload.wallet.clone(),
-            device_signature: node_pubkey.to_string(), // Use node pubkey as device signature
+            device_signature: node_pubkey.to_string(),
             node_type: payload.node_type.clone(),
             activated_at: payload.timestamp,
             last_seen: payload.timestamp,
             migration_count: 0,
             node_id: String::new(), // Will be set when node starts
-            burn_tx_hash: payload.burn_tx.clone(), // CRITICAL: Store burn_tx for XOR decryption
-            phase: 1, // Default to Phase 1 (will be determined from activation code)
-            burn_amount: 1500, // Default Phase 1 base price - will be overwritten from registry
+            burn_tx_hash: payload.burn_tx.clone(), // CRITICAL: burn_tx for XOR key
+            phase,
+            burn_amount, // CRITICAL: exact burned amount for XOR key derivation
         };
         
         // Register activation on blockchain using existing infrastructure

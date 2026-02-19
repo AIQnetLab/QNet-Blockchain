@@ -309,7 +309,7 @@ pub struct NodeInfo {
 }
 
 fn default_phase() -> u8 { 1 }
-fn default_burn_amount() -> u64 { 1500 } // Default Phase 1 base price
+fn default_burn_amount() -> u64 { 1500 } // Phase 1 base price — backward compat for old records without this field
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationRecord {
