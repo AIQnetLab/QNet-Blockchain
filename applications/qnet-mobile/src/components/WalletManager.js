@@ -5191,7 +5191,8 @@ export class WalletManager {
       code: activationCode,
       pseudonym: burnPseudonym,
       timestamp: Date.now(),
-      burnTxHash: burnResult.signature
+      burnTxHash: burnResult.signature,
+      walletAddress: walletAddress
     }));
     await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, burnPseudonym);
     
@@ -5572,6 +5573,7 @@ export class WalletManager {
         success: true,
         nodeType,
         pseudonym: (registrationResult && registrationResult.node_id) || systemPseudonym,
+        burnTxHash: burnTxHash || null,
         message: registrationResult
           ? 'Node successfully activated and registered in blockchain'
           : 'Node activation saved locally. Network registration will retry automatically.',
@@ -5770,8 +5772,7 @@ export class WalletManager {
       const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
       const publicKeyBytes = regeneratedKeypair.publicKey;
       
-      // PRODUCTION: Create Ed25519 signature (clients use ONLY Ed25519)
-      // Post-quantum Dilithium is ONLY for node consensus, NOT for client transactions
+      // Hybrid signature: Ed25519 (ownership) + Dilithium3 (quantum-safe)
       // Format matches validator's create_client_signing_message: "claim_rewards:from:to"
       const message = `claim_rewards:${nodeId}:${walletAddress}`;
       const messageBytes = new TextEncoder().encode(message);
@@ -5786,6 +5787,23 @@ export class WalletManager {
       
       // Get public key for verification (32 bytes hex)
       const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
+
+      // Dilithium3 signature — quantum-safe proof of node ownership (NIST FIPS 204)
+      // Activation code is used as seed so the same keypair is deterministically recovered
+      let dilithiumSignature = null;
+      let dilithiumPublicKey = null;
+      try {
+        const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('./crypto/DilithiumCrypto');
+        if (isDilithiumAvailable()) {
+          const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password);
+          dilithiumSignature = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
+          dilithiumPublicKey = dilithiumKeys.publicKey;
+        }
+      } catch (dilithiumErr) {
+        // Dilithium signing failed — server v5.0+ will reject the claim without it.
+        // The error from the server will surface to the user via the normal error path.
+        console.warn('[claimRewards] Dilithium signing failed (server will reject):', dilithiumErr.message);
+      }
       
       // Submit claim request to official API
       const claimResponse = await fetch(`${apiUrl}/api/v1/rewards/claim`, {
@@ -5796,8 +5814,10 @@ export class WalletManager {
         body: JSON.stringify({
           node_id: nodeId,
           wallet_address: walletAddress,
-          quantum_signature: quantumSignature,  // Ed25519 signature (hex)
-          public_key: publicKeyHex  // PRODUCTION: Required for Ed25519 verification
+          quantum_signature: quantumSignature,   // Ed25519 signature (hex)
+          public_key: publicKeyHex,              // Ed25519 public key (hex)
+          ...(dilithiumSignature && { dilithium_signature: dilithiumSignature }),
+          ...(dilithiumPublicKey && { dilithium_public_key: dilithiumPublicKey }),
         })
       });
       

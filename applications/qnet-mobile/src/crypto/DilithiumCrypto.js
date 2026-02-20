@@ -1,16 +1,16 @@
 /**
  * QNet Dilithium3 (ML-DSA-65) Crypto Module for React Native
- * 
- * Provides post-quantum CRYSTALS-Dilithium3 signatures via native Android module.
- * NIST FIPS 204 compliant.
- * 
+ *
+ * Provides post-quantum CRYSTALS-Dilithium3 signatures via native module.
+ * NIST FIPS 204 compliant. Supported on Android (NDK/JNI) and iOS (ObjC bridge).
+ *
  * Architecture:
  *   - Keypair deterministically derived from activation code
  *   - Signs light node registration and ping messages
  *   - Signature format matches backend's verify_dilithium_signature()
  *   - Ed25519 (nacl) used for wallet TX, Dilithium3 for node identity
  *   - HYBRID: both Ed25519 + Dilithium3 signatures sent for double security
- * 
+ *
  * Backend format expected:
  *   "dilithium_sig_{pseudonym}_{base64([sig_len_LE][signed_msg][pk_len_LE][pk])}"
  */
@@ -34,12 +34,11 @@ const DILITHIUM_SK_KEY = 'qnet_dilithium_secret_key';
  * @returns {Promise<{publicKey: string, secretKey: string}>} hex-encoded keys
  */
 export async function getOrCreateDilithiumKeypair(activationCode, password) {
-  if (Platform.OS !== 'android') {
-    throw new Error('Dilithium3 is only available on Android (native module)');
-  }
-
   if (!DilithiumModule) {
-    throw new Error('DilithiumModule native module not found. Rebuild the Android app.');
+    throw new Error(
+      `DilithiumModule native module not found on ${Platform.OS}. ` +
+      'Rebuild the app with the native Dilithium module included.'
+    );
   }
 
   // Check if we already have keys for this activation code
@@ -50,23 +49,15 @@ export async function getOrCreateDilithiumKeypair(activationCode, password) {
     try {
       const decrypted = CryptoJS.AES.decrypt(storedSkEnc, password);
       const secretKey = decrypted.toString(CryptoJS.enc.Utf8);
-      if (secretKey && secretKey.length > 10) {
-        // Verify stored public key matches what seed produces now
-        // (protects against RNG changes between app versions)
-        const verifyResult = await DilithiumModule.generateKeypairFromSeed(secretKey);
-        if (verifyResult.publicKey === storedPk) {
-          return { publicKey: storedPk, secretKey };
-        }
-        // Mismatch — RNG implementation changed, need to re-store correct keys
-        console.warn('[Dilithium] Stored key mismatch (RNG upgrade), re-storing deterministic keys');
-        await AsyncStorage.setItem(`${DILITHIUM_PK_KEY}_${activationCode}`, verifyResult.publicKey);
-        // Re-encrypt the same seed with the password
-        const reEncryptedSk = CryptoJS.AES.encrypt(secretKey, password).toString();
-        await AsyncStorage.setItem(`${DILITHIUM_SK_KEY}_${activationCode}`, reEncryptedSk);
-        return { publicKey: verifyResult.publicKey, secretKey };
+      // Valid pqclean Dilithium3 SK: exactly 4032 raw bytes = 8064 hex chars
+      const EXPECTED_SK_HEX_LEN = 4032 * 2;
+      if (secretKey && secretKey.length === EXPECTED_SK_HEX_LEN && /^[0-9a-fA-F]+$/.test(secretKey)) {
+        return { publicKey: storedPk, secretKey };
       }
+      // SK format invalid (e.g. from old Bouncy Castle install) — regenerate
+      console.warn('[Dilithium] Stored SK format invalid (length=' + (secretKey ? secretKey.length : 0) + '), regenerating from activation code');
     } catch (e) {
-      // Decryption failed, regenerate
+      // Decryption failed — wrong password or corrupted data
       console.warn('[Dilithium] Stored key decryption failed, regenerating');
     }
   }
@@ -125,10 +116,26 @@ export async function verifyDilithium(message, signatureHex, publicKeyHex) {
 
 /**
  * Check if Dilithium3 native module is available on this device.
+ * Supported: Android (NDK/JNI) and iOS (Objective-C bridge).
  * @returns {boolean}
  */
 export function isDilithiumAvailable() {
-  return Platform.OS === 'android' && !!DilithiumModule;
+  return (Platform.OS === 'android' || Platform.OS === 'ios') && !!DilithiumModule;
+}
+
+/**
+ * Run BC vs pqcrypto compatibility test.
+ * Outputs PK and SIG hex to logcat (DILITHIUM_COMPAT tag).
+ */
+export async function runCompatibilityTest() {
+  if (!DilithiumModule) return;
+  try {
+    const result = await DilithiumModule.compatibilityTest();
+    // result = { result: "OK:PK_LEN=1952:SIG_LEN=3309:SELF=OK", sigSize: 3309, isPqclean: true }
+    console.log('[COMPAT] isPqclean=' + result.isPqclean + ' sigSize=' + result.sigSize + ' status=' + result.result);
+  } catch (e) {
+    console.warn('[COMPAT] test failed:', e.message);
+  }
 }
 
 /**

@@ -42,9 +42,24 @@ android {
         applicationId "com.qnetmobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 8
-        versionName "1.0.7"
+        versionCode 9
+        versionName "1.0.8"
         manifestPlaceholders = [usesCleartextTraffic: "true"]
+
+        // NDK: pqclean Dilithium3 reference C code (same as pqcrypto-dilithium 0.5)
+        externalNativeBuild {
+            cmake {
+                cppFlags ""
+                abiFilters "arm64-v8a", "x86_64"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
     }
     signingConfigs {
         debug {
@@ -85,7 +100,6 @@ android {
         abortOnError false
     }
 
-    // Exclude duplicate META-INF files from Bouncy Castle JARs
     packaging {
         resources {
             excludes += ['META-INF/versions/9/OSGI-INF/MANIFEST.MF']
@@ -103,9 +117,6 @@ dependencies {
         implementation jscFlavor
     }
 
-    // Bouncy Castle for CRYSTALS-Dilithium3 (Round 3, pqcrypto-dilithium 0.5 compatible)
-    // NOTE: BC 1.78+ uses FIPS 204 format incompatible with pqcrypto-dilithium 0.5 on server
-    // BC 1.75 uses Round 3 format compatible with pqcrypto-dilithium 0.5 (Rust server)
-    implementation("org.bouncycastle:bcprov-jdk18on:1.75")
-    implementation("org.bouncycastle:bcpkix-jdk18on:1.75")
+    // Bouncy Castle removed — Dilithium3 now handled by native pqclean C code (NDK)
+    // pqclean dilithium3 is compiled via externalNativeBuild/CMakeLists.txt
 }

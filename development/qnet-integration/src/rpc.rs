@@ -5917,19 +5917,23 @@ async fn handle_light_node_register(
         // + broadcast to all peers for faster inclusion in next block
         if registration_result == "node_created" {
             let device_sig_hash = blake3::hash(register_request.device_id.as_bytes()).to_hex().to_string();
-            let registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
+            let mut registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
                 &light_node_pseudonym,
                 qnet_state::NodeType::Light,
                 &register_request.wallet_address,
                 &device_sig_hash[..32], // First 32 chars of device signature hash as proof
             );
-            
+
+            // v5.0: Sign with hybrid crypto (ephemeral Ed25519 + producer Dilithium3).
+            // Any node type (genesis or super) can process registrations.
+            sign_node_registration_tx(&mut registration_tx, &blockchain.get_node_id()).await;
+
             // Add to mempool for inclusion in next block
             let mempool = blockchain.get_mempool();
             let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
             let tx_hash = registration_tx.hash.clone();
             if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
-                println!("[INFO][REG] light_onchain_tx node={} wallet={}... hash={}...", 
+                println!("[INFO][REG] light_onchain_tx node={} wallet={}... hash={}... signed=hybrid", 
                          light_node_pseudonym, 
                          &register_request.wallet_address[..16.min(register_request.wallet_address.len())],
                          &tx_hash[..16.min(tx_hash.len())]);
@@ -7651,10 +7655,10 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
 struct ClaimRewardsRequest {
     node_id: String,
     wallet_address: String,
-    quantum_signature: String,  // Ed25519 signature (REQUIRED)
-    public_key: String,         // Ed25519 public key (REQUIRED)
-    // v2.70: Optional Dilithium signature for quantum-safe claims
-    // If provided, adds post-quantum protection (NIST FIPS 204)
+    quantum_signature: String,     // Ed25519 signature (REQUIRED — ownership proof)
+    public_key: String,            // Ed25519 public key (REQUIRED)
+    // v5.0: Dilithium3 signature (REQUIRED for ALL nodes — NIST FIPS 204, no exceptions)
+    // Both Android (NDK/JNI) and iOS (ObjC bridge) apps v5.0+ provide these fields.
     #[serde(default)]
     dilithium_signature: Option<String>,
     #[serde(default)]
@@ -7734,31 +7738,38 @@ async fn handle_claim_rewards(
     
     println!("[INFO][CLAIM] ed25519_verified node={}", claim_request.node_id);
     
-    // v2.70: OPTIONAL Dilithium signature verification for quantum-safe claims
-    // If provided, verify post-quantum signature (same message format as Ed25519)
-    let has_dilithium = claim_request.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty());
-    if has_dilithium {
-        let dilithium_sig = claim_request.dilithium_signature.as_ref().unwrap();
-        let dilithium_pubkey = match &claim_request.dilithium_public_key {
-            Some(pk) if !pk.is_empty() => pk.clone(),
-            _ => {
+    // v5.0: MANDATORY Dilithium3 (ML-DSA-65) signature for ALL reward claims — no exceptions.
+    // Android (NDK/JNI) and iOS (ObjC bridge) both support Dilithium since v5.0.
+    {
+        let dilithium_sig = match claim_request.dilithium_signature.as_ref().filter(|s| !s.is_empty()) {
+            Some(s) => s.clone(),
+            None => {
+                println!("[WARN][CLAIM] rejected reason=missing_dilithium node={}", claim_request.node_id);
                 return Ok(warp::reply::json(&json!({
                     "success": false,
-                    "error": "dilithium_public_key required when dilithium_signature is provided"
+                    "error": "Reward claim requires dilithium_signature (NIST FIPS 204). \
+                              Update your QNet app to v5.0+ which includes the Dilithium3 native module."
                 })));
             }
         };
-        
-        // Create Dilithium signature struct for verification
+        let dilithium_pubkey = match claim_request.dilithium_public_key.as_ref().filter(|s| !s.is_empty()) {
+            Some(pk) => pk.clone(),
+            None => {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "dilithium_public_key is required alongside dilithium_signature"
+                })));
+            }
+        };
+
         use crate::quantum_crypto::DilithiumSignature;
         let dilithium_struct = DilithiumSignature {
-            signature: dilithium_sig.clone(),
+            signature: dilithium_sig,
             algorithm: "CRYSTALS-Dilithium3".to_string(),
             timestamp: chrono::Utc::now().timestamp() as u64,
             strength: "quantum-resistant".to_string(),
         };
-        
-        // Verify Dilithium signature on same message
+
         let crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
         match crypto.verify_dilithium_signature(&claim_message, &dilithium_struct, &dilithium_pubkey).await {
             Ok(true) => {
@@ -7768,14 +7779,14 @@ async fn handle_claim_rewards(
                 println!("[WARN][CLAIM] dilithium_invalid node={}", claim_request.node_id);
                 return Ok(warp::reply::json(&json!({
                     "success": false,
-                    "error": "Invalid Dilithium signature for quantum-safe claim"
+                    "error": "Invalid Dilithium3 signature for reward claim"
                 })));
             }
             Err(e) => {
                 println!("[ERR][CLAIM] dilithium_verify_fail node={} err={}", claim_request.node_id, e);
                 return Ok(warp::reply::json(&json!({
                     "success": false,
-                    "error": format!("Dilithium verification failed: {}", e)
+                    "error": format!("Dilithium3 verification error: {}", e)
                 })));
             }
         }
@@ -7859,7 +7870,7 @@ async fn handle_claim_rewards(
         public_key: Some(claim_request.public_key.clone()), // User's Ed25519 public key
         tx_type: qnet_state::TransactionType::RewardDistribution,
         data: Some(format!("reward_claim:{}:{}:{}", claim_request.node_id, reward_amount,
-            if has_dilithium { "quantum" } else { "standard" })), // Track which node claimed + quantum flag
+            "quantum")), // v5.0: Dilithium3 mandatory — always quantum
         // v2.70: Pass through Dilithium signature if provided (quantum-safe claim)
         dilithium_signature: claim_request.dilithium_signature.clone(),
         dilithium_public_key: claim_request.dilithium_public_key.clone(),
@@ -8846,6 +8857,67 @@ async fn handle_get_reward_summary(
 }
 
 // POST /api/v1/nodes - Register a new node
+/// Sign a NodeRegistration TX with hybrid crypto: ephemeral Ed25519 + producer Dilithium3.
+///
+/// Layer 1 — ephemeral Ed25519 (forward secrecy, REQUIRED):
+///   Satisfies validate_transaction() Ed25519 check on every peer so the TX propagates.
+///   Without this the TX has an empty signature and is rejected by all peers (bug v4.x).
+///
+/// Layer 2 — producer node Dilithium3 (provenance proof, best-effort):
+///   Proves that this specific node (genesis or super) created the registration TX.
+///   Works identically to HeartbeatCommitment: create_consensus_signature(node_id, msg).
+///   The signer is identified by tx.dilithium_public_key = node_id, which is what
+///   verify_dilithium_tx_signature_async uses for key lookup (NOT tx.from = user wallet).
+///   If quantum crypto is not yet initialised the TX remains valid via Ed25519 alone.
+///
+/// Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp (pipe format).
+async fn sign_node_registration_tx(tx: &mut qnet_state::Transaction, producer_node_id: &str) {
+    use ed25519_dalek::{SigningKey, Signer};
+    use rand::rngs::OsRng;
+
+    let canonical_msg = format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        tx.from,
+        tx.to.as_deref().unwrap_or(""),
+        tx.amount,
+        tx.nonce,
+        tx.gas_price,
+        tx.gas_limit,
+        tx.timestamp,
+    );
+
+    // --- Layer 1: ephemeral Ed25519 (required for P2P validation) ---
+    let signing_key   = SigningKey::generate(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
+    let ed25519_sig   = signing_key.sign(canonical_msg.as_bytes());
+
+    tx.signature  = Some(hex::encode(ed25519_sig.to_bytes()));
+    tx.public_key = Some(hex::encode(verifying_key.as_bytes()));
+
+    // --- Layer 2: producer node Dilithium3 (provenance proof) ---
+    use crate::node::try_get_quantum_crypto;
+    if let Some(crypto) = try_get_quantum_crypto() {
+        match crypto.create_consensus_signature(producer_node_id, &canonical_msg).await {
+            Ok(dilithium_sig) => {
+                tx.dilithium_signature  = Some(dilithium_sig.signature);
+                tx.dilithium_public_key = Some(producer_node_id.to_string());
+                println!("[INFO][REG] node_registration_tx hybrid_signed \
+                          ed25519=ephemeral dilithium={}", producer_node_id);
+            }
+            Err(e) => {
+                println!("[WARN][REG] node_registration_tx dilithium_skip \
+                          node={} err={}", producer_node_id, e);
+            }
+        }
+    } else {
+        println!("[WARN][REG] node_registration_tx quantum_crypto_not_init \
+                  node={} (Ed25519 only)", producer_node_id);
+    }
+
+    // Hash MUST be recalculated after all signature fields are set.
+    tx.hash = tx.calculate_hash();
+}
+
 async fn handle_register_node(
     body: serde_json::Value,
     blockchain: Arc<BlockchainNode>,
@@ -8886,30 +8958,40 @@ async fn handle_register_node(
         })));
     }
     
-    // ═══════════════════════════════════════════════════════════════════
-    // v4.0: MANDATORY Dilithium3 signature verification for Super nodes
-    // No Ed25519 fallback — Dilithium3 only (NIST FIPS 204)
-    // ═══════════════════════════════════════════════════════════════════
-    if node_type == "super" {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v5.0: MANDATORY Dilithium3 (ML-DSA-65) for ALL node types (light + super)
+    // NIST FIPS 204 — post-quantum authentication required for registration.
+    // Both Android (NDK/JNI) and iOS (ObjC bridge) support Dilithium since v5.0.
+    // ═══════════════════════════════════════════════════════════════════════════
+    {
         if quantum_pubkey.is_empty() || quantum_signature.is_empty() {
-            println!("[WARN][REGISTER] super_node_rejected reason=missing_dilithium wallet={}", wallet_address);
+            println!("[WARN][REGISTER] rejected reason=missing_dilithium node_type={} wallet={}...",
+                node_type, &wallet_address[..16.min(wallet_address.len())]);
             return Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": "Super node registration requires Dilithium3 quantum_pubkey and quantum_signature"
+                "error": format!(
+                    "{} node registration requires Dilithium3 quantum_pubkey and quantum_signature (NIST FIPS 204). \
+                     Both Android and iOS apps v5.0+ include the Dilithium3 native module.",
+                    node_type
+                )
             })));
         }
-        
-        // Verify Dilithium3 signature (proves wallet ownership)
+
+        // Verify Dilithium3 signature: proves the registrant controls the activation code + wallet
         let sig_msg = format!("register:{}:{}:{}", wallet_address, activation_code, node_type);
         let sig_valid = verify_mobile_dilithium_signature(&sig_msg, quantum_signature, quantum_pubkey);
         if sig_valid {
-            println!("[INFO][REGISTER] dilithium_verified wallet={} pk_hash={}",
-                     wallet_address, &quantum_pubkey[..16.min(quantum_pubkey.len())]);
+            println!("[INFO][REGISTER] dilithium_verified node_type={} wallet={}... pk_prefix={}...",
+                node_type,
+                &wallet_address[..16.min(wallet_address.len())],
+                &quantum_pubkey[..16.min(quantum_pubkey.len())]);
         } else {
-            println!("[WARN][REGISTER] dilithium_invalid wallet={}", wallet_address);
+            println!("[WARN][REGISTER] dilithium_invalid node_type={} wallet={}...",
+                node_type, &wallet_address[..16.min(wallet_address.len())]);
             return Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": "Dilithium3 signature verification failed"
+                "error": "Dilithium3 signature verification failed. \
+                          Ensure the signature is created from the same activation code and wallet address."
             })));
         }
     }
@@ -9325,18 +9407,22 @@ async fn handle_register_node(
     // v4.9: Skip for migrations — node already exists on-chain, no duplicate TX needed.
     //       Migration only updates local RocksDB + RewardManager + P2P announcement.
     if !is_migration {
-        let registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
+        let mut registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
             &node_id,
             if node_type == "super" { qnet_state::NodeType::Super } else { qnet_state::NodeType::Light },
             wallet_address,
             &format!("activation_{}", &activation_code[..16.min(activation_code.len())]),
         );
-        
+
+        // v5.0: Sign with hybrid crypto (ephemeral Ed25519 + producer Dilithium3).
+        // Any node type (genesis or super) can process registrations.
+        sign_node_registration_tx(&mut registration_tx, &blockchain.get_node_id()).await;
+
         let mempool = blockchain.get_mempool();
         let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
         let tx_hash = registration_tx.hash.clone();
         if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
-            println!("[INFO][REG] onchain_tx type={} node={} wallet={}... hash={}...", 
+            println!("[INFO][REG] onchain_tx type={} node={} wallet={}... hash={}... signed=hybrid",
                      node_type, node_id,
                      &wallet_address[..16.min(wallet_address.len())],
                      &tx_hash[..16.min(tx_hash.len())]);
@@ -9474,7 +9560,7 @@ async fn handle_auth_challenge(
     let response = AuthChallengeResponse {
         signature: hex::encode(&signature_data),
         public_key: hex::encode(&pubkey_data),
-        node_id: node_id.clone(),
+        node_id: node_id.to_string(),
         timestamp: current_time,
     };
     
@@ -10637,7 +10723,7 @@ async fn handle_p2p_message(
                     let response = NetworkMessage::EntropyResponse {
                         block_height: *block_height,
                         entropy_hash,
-                        responder_id: blockchain.get_node_id(),
+                        responder_id: blockchain.get_node_id().clone(),
                     };
                     
                     // Find requester's address from peer list
@@ -10902,6 +10988,8 @@ async fn verify_burn_transaction_exists(
         let solana_rpc = &network_config.solana.rpc_url;
         
         // Build RPC request to get transaction details
+        // jsonParsed encoding: instructions returned with parsed.type field (burn/burnChecked/transfer)
+        // Required for burn indicator detection; account keys become objects {pubkey, signer, writable}
         let request_body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -10909,7 +10997,7 @@ async fn verify_burn_transaction_exists(
             "params": [
                 burn_tx_hash,
                 {
-                    "encoding": "json",
+                    "encoding": "jsonParsed",
                     "commitment": "confirmed",
                     "maxSupportedTransactionVersion": 0
                 }
@@ -10957,11 +11045,17 @@ async fn verify_burn_transaction_exists(
             // 2. CRITICAL: Verify the fee payer / signer is the expected wallet
             // accountKeys[0] is always the fee payer (signer) in Solana transactions.
             // This prevents an attacker from using someone else's burn transaction.
+            // jsonParsed: accountKeys = [{pubkey: "...", signer: bool, writable: bool}, ...]
+            // json (legacy): accountKeys = ["...", "...", ...]
             let account_keys = result_value["transaction"]["message"]["accountKeys"]
                 .as_array()
                 .map(|keys| {
                     keys.iter()
-                        .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                        .filter_map(|k| {
+                            k.as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| k["pubkey"].as_str().map(|s| s.to_string()))
+                        })
                         .collect::<Vec<String>>()
                 })
                 .unwrap_or_default();
@@ -11020,11 +11114,15 @@ async fn verify_burn_transaction_exists(
             };
             
             if !has_incinerator && !has_token_burn && !has_outer_burn {
-                println!("[WARN][BURN] no_burn_indicator tx={}... accounts={:?}",
+                println!("[ERROR][BURN] no_burn_indicator tx={}... accounts={:?}",
                     &burn_tx_hash[..16.min(burn_tx_hash.len())],
                     &account_keys[..account_keys.len().min(5)]);
-                // Token balance change is the authoritative check — if balances decreased, burn happened
-                // Continue to amount verification (step 3) which is the definitive check
+                return Err(format!(
+                    "Transaction {} does not contain a valid SPL Token burn instruction. \
+                     A genuine token burn (createBurnInstruction / burnChecked) is required for node activation. \
+                     Token transfers to other addresses are not accepted.",
+                    &burn_tx_hash[..16.min(burn_tx_hash.len())]
+                ));
             } else {
                 println!("[INFO][BURN] burn_indicator_found incinerator={} token_burn={} outer_burn={}",
                     has_incinerator, has_token_burn, has_outer_burn);
@@ -11419,7 +11517,7 @@ async fn handle_producer_status(
             &blockchain.get_quantum_poh()
         ).await
     } else {
-        node_id.clone()  // Solo mode
+        node_id.to_string()  // Solo mode
     };
     
     // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover

@@ -848,6 +848,11 @@ const WalletScreen = () => {
     // Load wallet data in parallel
     checkWalletExists();
     loadSettings();
+    // Run Dilithium BC compatibility test once on startup
+    try {
+      const { runCompatibilityTest } = require('../crypto/DilithiumCrypto');
+      runCompatibilityTest();
+    } catch (e) {}
   }, []);
 
   // Load real burn progress when activation tab is selected
@@ -1533,6 +1538,7 @@ const WalletScreen = () => {
           code: code,
           pseudonym: result.pseudonym,
           timestamp: Date.now(),
+          burnTxHash: result.burnTxHash || 'registered',
           walletAddress: wallet.qnetAddress || wallet.address
         }));
         
@@ -4931,9 +4937,9 @@ const WalletScreen = () => {
                                       Clipboard.setString(code);
                                       showAlert('Copied', 'Activation code copied to clipboard');
                                     }}
-                                    style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 8, marginBottom: 12 }}
+                                    style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 10, marginBottom: 12 }}
                                   >
-                                    <Text style={[styles.modalContent, { fontFamily: 'monospace', color: '#00d4ff', fontSize: 12, textAlign: 'center' }]}>
+                                    <Text style={{ fontFamily: 'monospace', color: '#00d4ff', fontSize: 13, textAlign: 'center', lineHeight: 20 }}>
                                       {code}
                                     </Text>
                                     <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
@@ -5093,9 +5099,9 @@ const WalletScreen = () => {
                               </Text>
                               <TouchableOpacity
                                 onPress={() => { Clipboard.setString(nodeType === 'super' ? `${code}\nBurn TX: ${burnInfo.burnTxHash}` : code); }}
-                                style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 8, marginBottom: 12 }}
+                                style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 10, marginBottom: 12 }}
                               >
-                                <Text style={[styles.modalContent, { fontFamily: 'monospace', color: '#00d4ff', fontSize: 12, textAlign: 'center' }]}>
+                                <Text style={{ fontFamily: 'monospace', color: '#00d4ff', fontSize: 13, textAlign: 'center', lineHeight: 20 }}>
                                   {code}
                                 </Text>
                                 <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
@@ -5157,9 +5163,9 @@ const WalletScreen = () => {
                             </Text>
                             <TouchableOpacity
                               onPress={() => { Clipboard.setString(firstType === 'super' ? `${code}\nBurn TX: ${value?.burnTxHash || ''}` : code); }}
-                              style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 8, marginBottom: 12 }}
+                              style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 10, marginBottom: 12 }}
                             >
-                              <Text style={[styles.modalContent, { fontFamily: 'monospace', color: '#00d4ff', fontSize: 12, textAlign: 'center' }]}>
+                              <Text style={{ fontFamily: 'monospace', color: '#00d4ff', fontSize: 13, textAlign: 'center', lineHeight: 20 }}>
                                 {code}
                               </Text>
                               <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>

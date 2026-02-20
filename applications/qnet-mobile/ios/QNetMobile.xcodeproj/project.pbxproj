@@ -12,7 +12,17 @@
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
 		81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */; };
 		AF5ECC0B032181446EB6CD26 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */; };
-/* End PBXBuildFile section */
+		AA000002DILITHIUMMOD0002 /* DilithiumModule.m in Sources */ = {isa = PBXBuildFile; fileRef = AA000001DILITHIUMMOD0001 /* DilithiumModule.m */; };
+		AA000004DILITHIUMRND0004 /* randombytes_ios.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000003DILITHIUMRND0003 /* randombytes_ios.c */; };
+		AA000006DILITHIUMNTT0006 /* ntt.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000005DILITHIUMNTT0005 /* ntt.c */; };
+		AA000008DILITHIUMPACK008 /* packing.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000007DILITHIUMPACK007 /* packing.c */; };
+		AA000010DILITHIUMPOLY010 /* poly.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000009DILITHIUMPOLY009 /* poly.c */; };
+		AA000012DILITHIUMPLYV012 /* polyvec.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000011DILITHIUMPLYV011 /* polyvec.c */; };
+		AA000014DILITHIUMREDU014 /* reduce.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000013DILITHIUMREDU013 /* reduce.c */; };
+		AA000016DILITHIUMROUN016 /* rounding.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000015DILITHIUMROUN015 /* rounding.c */; };
+		AA000018DILITHIUMSIGN018 /* sign.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000017DILITHIUMSIGN017 /* sign.c */; };
+		AA000020DILITHIUMSHAK020 /* symmetric-shake.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000019DILITHIUMSHAK019 /* symmetric-shake.c */; };
+		AA000022DILITHIUMFIPS022 /* fips202.c in Sources */ = {isa = PBXBuildFile; fileRef = AA000021DILITHIUMFIPS021 /* fips202.c */; };/* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		13B07F961A680F5B00A75B9A /* QNetMobile.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = QNetMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -25,7 +35,17 @@
 		761780EC2CA45674006654EE /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = QNetMobile/AppDelegate.swift; sourceTree = "<group>"; };
 		81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = LaunchScreen.storyboard; path = QNetMobile/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
-/* End PBXFileReference section */
+		AA000001DILITHIUMMOD0001 /* DilithiumModule.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; name = DilithiumModule.m; path = QNetMobile/DilithiumModule/DilithiumModule.m; sourceTree = SOURCE_ROOT; };
+		AA000003DILITHIUMRND0003 /* randombytes_ios.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = randombytes_ios.c; path = QNetMobile/DilithiumModule/randombytes_ios.c; sourceTree = SOURCE_ROOT; };
+		AA000005DILITHIUMNTT0005 /* ntt.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = ntt.c; path = ../../android/app/src/main/cpp/dilithium3/ntt.c; sourceTree = SOURCE_ROOT; };
+		AA000007DILITHIUMPACK007 /* packing.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = packing.c; path = ../../android/app/src/main/cpp/dilithium3/packing.c; sourceTree = SOURCE_ROOT; };
+		AA000009DILITHIUMPOLY009 /* poly.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = poly.c; path = ../../android/app/src/main/cpp/dilithium3/poly.c; sourceTree = SOURCE_ROOT; };
+		AA000011DILITHIUMPLYV011 /* polyvec.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = polyvec.c; path = ../../android/app/src/main/cpp/dilithium3/polyvec.c; sourceTree = SOURCE_ROOT; };
+		AA000013DILITHIUMREDU013 /* reduce.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = reduce.c; path = ../../android/app/src/main/cpp/dilithium3/reduce.c; sourceTree = SOURCE_ROOT; };
+		AA000015DILITHIUMROUN015 /* rounding.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = rounding.c; path = ../../android/app/src/main/cpp/dilithium3/rounding.c; sourceTree = SOURCE_ROOT; };
+		AA000017DILITHIUMSIGN017 /* sign.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = sign.c; path = ../../android/app/src/main/cpp/dilithium3/sign.c; sourceTree = SOURCE_ROOT; };
+		AA000019DILITHIUMSHAK019 /* symmetric-shake.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = symmetric-shake.c; path = ../../android/app/src/main/cpp/dilithium3/symmetric-shake.c; sourceTree = SOURCE_ROOT; };
+		AA000021DILITHIUMFIPS021 /* fips202.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = fips202.c; path = ../../android/app/src/main/cpp/common/fips202.c; sourceTree = SOURCE_ROOT; };/* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		13B07F8C1A680F5B00A75B9A /* Frameworks */ = {
@@ -42,6 +62,7 @@
 		13B07FAE1A68108700A75B9A /* QNetMobile */ = {
 			isa = PBXGroup;
 			children = (
+				AA000023DILITHIUMGRP0023 /* DilithiumModule */,
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				761780EC2CA45674006654EE /* AppDelegate.swift */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
@@ -98,7 +119,25 @@
 			path = Pods;
 			sourceTree = "<group>";
 		};
-/* End PBXGroup section */
+		AA000023DILITHIUMGRP0023 /* DilithiumModule */ = {
+			isa = PBXGroup;
+			children = (
+				AA000001DILITHIUMMOD0001 /* DilithiumModule.m */,
+				AA000003DILITHIUMRND0003 /* randombytes_ios.c */,
+				AA000005DILITHIUMNTT0005 /* ntt.c */,
+				AA000007DILITHIUMPACK007 /* packing.c */,
+				AA000009DILITHIUMPOLY009 /* poly.c */,
+				AA000011DILITHIUMPLYV011 /* polyvec.c */,
+				AA000013DILITHIUMREDU013 /* reduce.c */,
+				AA000015DILITHIUMROUN015 /* rounding.c */,
+				AA000017DILITHIUMSIGN017 /* sign.c */,
+				AA000019DILITHIUMSHAK019 /* symmetric-shake.c */,
+				AA000021DILITHIUMFIPS021 /* fips202.c */,
+			);
+			name = DilithiumModule;
+			path = QNetMobile/DilithiumModule;
+			sourceTree = SOURCE_ROOT;
+		};/* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
 		13B07F861A680F5B00A75B9A /* QNetMobile */ = {
@@ -247,6 +286,17 @@
 			buildActionMask = 2147483647;
 			files = (
 				761780ED2CA45674006654EE /* AppDelegate.swift in Sources */,
+				AA000002DILITHIUMMOD0002 /* DilithiumModule.m in Sources */,
+				AA000004DILITHIUMRND0004 /* randombytes_ios.c in Sources */,
+				AA000006DILITHIUMNTT0006 /* ntt.c in Sources */,
+				AA000008DILITHIUMPACK008 /* packing.c in Sources */,
+				AA000010DILITHIUMPOLY010 /* poly.c in Sources */,
+				AA000012DILITHIUMPLYV012 /* polyvec.c in Sources */,
+				AA000014DILITHIUMREDU014 /* reduce.c in Sources */,
+				AA000016DILITHIUMROUN016 /* rounding.c in Sources */,
+				AA000018DILITHIUMSIGN018 /* sign.c in Sources */,
+				AA000020DILITHIUMSHAK020 /* symmetric-shake.c in Sources */,
+				AA000022DILITHIUMFIPS022 /* fips202.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -261,6 +311,13 @@
 				CLANG_ENABLE_MODULES = YES;
 				CURRENT_PROJECT_VERSION = 7;
 				ENABLE_BITCODE = NO;
+								HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SOURCE_ROOT)/QNetMobile/DilithiumModule",
+					"$(SOURCE_ROOT)/../../android/app/src/main/cpp",
+					"$(SOURCE_ROOT)/../../android/app/src/main/cpp/dilithium3",
+					"$(SOURCE_ROOT)/../../android/app/src/main/cpp/common",
+				);
 				INFOPLIST_FILE = QNetMobile/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -288,6 +345,13 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CURRENT_PROJECT_VERSION = 7;
+								HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SOURCE_ROOT)/QNetMobile/DilithiumModule",
+					"$(SOURCE_ROOT)/../../android/app/src/main/cpp",
+					"$(SOURCE_ROOT)/../../android/app/src/main/cpp/dilithium3",
+					"$(SOURCE_ROOT)/../../android/app/src/main/cpp/common",
+				);
 				INFOPLIST_FILE = QNetMobile/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = (

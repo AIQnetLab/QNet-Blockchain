@@ -22893,6 +22893,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 format!("claim_rewards:{}:{}", node_id, to_str)
             }
             
+            // === NODEREGISTRATION (hybrid-signed by producer: ephemeral Ed25519 + Dilithium3) ===
+            // Layer 1: Ed25519 (ephemeral) — satisfies validate_transaction() on every peer.
+            // Layer 2: Dilithium3 (producer's long-term key) — provenance proof, verified via
+            //           tx.dilithium_public_key = producer_node_id.
+            // Canonical message format matches rpc.rs sign_node_registration_tx().
+            qnet_state::TransactionType::NodeRegistration { .. } |
+            qnet_state::TransactionType::NodeActivation { .. } => {
+                format!("{}|{}|{}|{}|{}|{}|{}",
+                    tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp)
+            }
+
             // === NODE-SIGNED SYSTEM TRANSACTIONS (signed with ephemeral Ed25519 + Dilithium) ===
             // HeartbeatCommitment, PingCommitmentWithSampling — use pipe-separated format
             // This matches node.rs:2817/2997 where nodes sign with:
@@ -22912,17 +22923,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             _ => return Ok(true),
         };
         
-        let _dilithium_pubkey = match &tx.dilithium_public_key {
+        // v5.0: Use dilithium_public_key as the identity for key lookup, NOT tx.from.
+        // This supports two valid signing patterns:
+        //   1. User TX: dilithium_public_key = wallet_address = tx.from (standard user hybrid TX)
+        //   2. Server TX (NodeRegistration): dilithium_public_key = producer_node_id != tx.from
+        //      The producer node signs with its own long-term Dilithium key; tx.from is the
+        //      user wallet. Using tx.from here would fail because no user Dilithium key exists
+        //      server-side. Using dilithium_public_key selects the correct key for lookup.
+        let signer_id = match &tx.dilithium_public_key {
             Some(pk) if !pk.is_empty() => pk.clone(),
             _ => return Err(QNetError::ValidationError(
-                "dilithium_public_key required".to_string()
+                "dilithium_public_key required when dilithium_signature is present".to_string()
             )),
         };
         
-        let from = tx.from.clone();
         let timestamp = tx.timestamp;
-        
-        // CRITICAL FIX v3.31: Use type-aware canonical message
         let message = Self::build_canonical_verify_message(tx);
         let sig_struct = DilithiumSignature {
             signature: dilithium_sig,
@@ -22930,7 +22945,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             timestamp,
             strength: "quantum-resistant".to_string(),
         };
-        let from_verify = from.clone();
         
         let handle = crate::unified_p2p::spawn_sigverify(async move {
             let crypto = match try_get_quantum_crypto() {
@@ -22938,7 +22952,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 None => return Err("Quantum crypto not initialized".to_string()),
             };
             
-            match crypto.verify_dilithium_signature(&message, &sig_struct, &from_verify).await {
+            match crypto.verify_dilithium_signature(&message, &sig_struct, &signer_id).await {
                 Ok(valid) => Ok(valid),
                 Err(e) => Err(format!("Dilithium error: {}", e)),
             }
@@ -22960,17 +22974,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             _ => return Ok(true),
         };
         
-        let _dilithium_pubkey = match &tx.dilithium_public_key {
+        // v5.0: Use dilithium_public_key as the signer identity — see async version for rationale.
+        let signer_id = match &tx.dilithium_public_key {
             Some(pk) if !pk.is_empty() => pk.clone(),
             _ => return Err(QNetError::ValidationError(
-                "dilithium_public_key required".to_string()
+                "dilithium_public_key required when dilithium_signature is present".to_string()
             )),
         };
         
-        let from = tx.from.clone();
-        // CRITICAL FIX v3.31: Use type-aware canonical message
         let message = Self::build_canonical_verify_message(tx);
-        
         let sig_struct = DilithiumSignature {
             signature: dilithium_sig,
             algorithm: "CRYSTALS-Dilithium3".to_string(),
@@ -22986,7 +22998,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     None => return Err(QNetError::ValidationError("Quantum crypto not initialized".to_string())),
                 };
                 
-                match crypto.verify_dilithium_signature(&message, &sig_struct, &from).await {
+                match crypto.verify_dilithium_signature(&message, &sig_struct, &signer_id).await {
                     Ok(valid) => Ok(valid),
                     Err(e) => Err(QNetError::ValidationError(format!("Dilithium error: {}", e))),
                 }

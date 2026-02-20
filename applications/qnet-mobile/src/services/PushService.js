@@ -124,6 +124,7 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
   }
 
   try {
+    console.log('[Push] registering light node wallet=...' + (registrationData.wallet_address || '').slice(-8));
     const response = await fetch(`${apiUrl}/api/v1/light-node/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
