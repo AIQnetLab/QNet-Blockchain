@@ -12072,6 +12072,23 @@ fn verify_mobile_dilithium_signature(
     
     // Step 6: Verify using pqcrypto's open() — signedMessage = signature || message
     // This is the standard NIST FIPS 204 format used by both Bouncy Castle and pqcrypto
+    let sig_bytes_expected = dilithium3::signature_bytes();
+    let pk_bytes_expected = dilithium3::public_key_bytes();
+    let msg_len = expected_message.len();
+    let bc_sig_size = if signed_message_bytes.len() >= msg_len { signed_message_bytes.len() - msg_len } else { 0 };
+    println!("[DEBUG][DILITHIUM] sizes: pqcrypto_sig={} pqcrypto_pk={} actual_signed_msg={} actual_pk={} msg_len={} bc_sig_inferred={}",
+        sig_bytes_expected, pk_bytes_expected, signed_message_bytes.len(), pk_bytes_from_request.len(), msg_len, bc_sig_size);
+    println!("[DEBUG][DILITHIUM] expected_msg={:?}", expected_message);
+    if signed_message_bytes.len() >= 8 {
+        println!("[DEBUG][DILITHIUM] sig_prefix: {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            signed_message_bytes[0], signed_message_bytes[1], signed_message_bytes[2], signed_message_bytes[3],
+            signed_message_bytes[4], signed_message_bytes[5], signed_message_bytes[6], signed_message_bytes[7]);
+    }
+    if pk_bytes_from_request.len() >= 8 {
+        println!("[DEBUG][DILITHIUM] pk_prefix: {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            pk_bytes_from_request[0], pk_bytes_from_request[1], pk_bytes_from_request[2], pk_bytes_from_request[3],
+            pk_bytes_from_request[4], pk_bytes_from_request[5], pk_bytes_from_request[6], pk_bytes_from_request[7]);
+    }
     let signed_message = match dilithium3::SignedMessage::from_bytes(signed_message_bytes) {
         Ok(sm) => sm,
         Err(e) => {
@@ -12087,12 +12104,14 @@ fn verify_mobile_dilithium_signature(
                 println!("[INFO][DILITHIUM] mobile_sig_verified standard=FIPS204 level=3");
                 true
             } else {
-                println!("[WARN][DILITHIUM] mobile_msg_mismatch reason=signed_data_differs_from_wallet");
+                println!("[WARN][DILITHIUM] mobile_msg_mismatch reason=signed_data_differs_from_wallet expected={:?} got={:?}",
+                    expected_message, String::from_utf8_lossy(&verified_msg));
                 false
             }
         }
         Err(_) => {
-            println!("[WARN][DILITHIUM] mobile_sig_verification_failed reason=cryptographic");
+            println!("[WARN][DILITHIUM] mobile_sig_verification_failed reason=cryptographic pqcrypto_sig={} bc_sig_inferred={}",
+                sig_bytes_expected, bc_sig_size);
             false
         }
     }
