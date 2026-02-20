@@ -9,6 +9,12 @@ const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
 const path = require('path');
 
 const config = {
+  transformer: {
+    // Disable inline requires so ALL modules go into the main bundle upfront.
+    // Without this, js-sha3 and @solana/web3.js are lazy-loaded as separate
+    // bundle requests that take >60s and cause the device-side timeout.
+    inlineRequires: false,
+  },
   resolver: {
     extraNodeModules: {
       stream: require.resolve('readable-stream'),

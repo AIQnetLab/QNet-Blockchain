@@ -4107,6 +4107,53 @@ export class WalletManager {
   // Request activation code from server after burn verification
   // Phase 1: burnTxHash = Solana 1DEV burn transaction, qnetRewardWallet = EON address for rewards
   // Phase 2: burnTxHash = QNet QNC transfer to Pool 3 transaction
+  // ============================================================================
+  // LOCAL activation code generation — NO server dependency.
+  // Identical algorithm to server-side generate_quantum_activation_code (rpc.rs).
+  // Inputs are all derivable from Solana blockchain → always reproducible.
+  //
+  // Algorithm:
+  //   key      = SHA3_256("burn_tx:type:amount")[0:32]
+  //   seg1     = type_marker + SHA3_256("ts:burn_tx:type")[0:5]    (6 chars)
+  //   seg2     = hex(XOR(wallet_bytes, key))[0:6]                   (6 chars)
+  //   seg3     = (hex(XOR(wallet_bytes, key))[6:10]
+  //              + SHA3_256("entropy:wallet:burn_tx:type")[0:4])[0:6] (6 chars)
+  //   code     = QNET-{seg1}-{seg2}-{seg3}
+  // ============================================================================
+  generateActivationCodeLocally(nodeType, walletAddress, burnTxHash, burnAmount) {
+    const sha3_256 = require('js-sha3').sha3_256;
+    const type = nodeType.toLowerCase();
+
+    // Step 1: XOR encryption key = SHA3("burn_tx:type:amount")[0:32]
+    const keyFull = sha3_256(`${burnTxHash}:${type}:${burnAmount}`); // 64 hex chars
+    const encKey = keyFull.substring(0, 32); // 32 hex chars → used as byte key
+
+    // Step 2: XOR encrypt wallet address bytes (cycling over key)
+    const walletBytes = Array.from(walletAddress).map(c => c.charCodeAt(0));
+    const keyBytes   = Array.from(encKey).map(c => c.charCodeAt(0));
+    const encBytes   = walletBytes.map((b, i) => b ^ keyBytes[i % keyBytes.length]);
+    const encHex     = encBytes.map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+
+    // Step 3: segment1 — type marker + SHA3("ts:burn_tx:type")[0:5]
+    const marker     = type === 'super' ? 'S' : 'L';
+    const tsHash     = sha3_256(`ts:${burnTxHash}:${type}`);
+    const tsPart     = tsHash.substring(0, 5).toUpperCase();
+    const segment1   = `${marker}${tsPart}`;                // 6 chars
+
+    // Step 4: segment2 — first 6 hex chars of encrypted wallet
+    const segment2   = (encHex + '000000').substring(0, 6); // 6 chars
+
+    // Step 5: segment3 — next 4 hex chars + entropy[0:4], take first 6
+    const walletPart2 = (encHex.substring(6, 10) + '0000').substring(0, 4);
+    const entropy     = sha3_256(`entropy:${walletAddress}:${burnTxHash}:${type}`);
+    const entShort    = entropy.substring(0, 4).toUpperCase();
+    const segment3    = (walletPart2 + entShort).substring(0, 6); // 6 chars
+
+    const code = `QNET-${segment1}-${segment2}-${segment3}`;
+    console.log(`[LOCAL_CODE] Generated: ${code.substring(0, 12)}... type=${type} tx=${burnTxHash.substring(0, 8)}...`);
+    return code;
+  }
+
   // CRITICAL: actualBurnAmount MUST be the exact amount burned on Solana — NOT the current price!
   //   XOR key = SHA3(burn_tx:type:amount) — if amount is wrong, code can NEVER be verified.
   //   Caller must pass the same amount used in burnTokensForNode / burnTokens.
@@ -4332,26 +4379,21 @@ export class WalletManager {
           const meta = JSON.parse(metaData);
           console.log(`Found activation metadata for ${nodeType} node`);
           
-          // PRODUCTION: Retrieve code from server using burn_tx_hash
-          if (meta.burnTxHash && password) {
+          // Regenerate code LOCALLY from stored burn metadata
+          if (meta.burnTxHash && meta.burnAmount && password) {
             try {
-              // Get QNet EON address for Phase 1
-              const eonAddr = await AsyncStorage.getItem('qnet_address')
-                || this.generateQNetAddressFromSolana(walletAddress);
-              const result = await this.requestActivationCodeFromServer(
-                nodeType, 
-                walletAddress, 
-                meta.burnTxHash,
-                meta.phase || 1,
-                eonAddr,
-                meta.burnAmount || null // Pass stored burn amount for XOR key
+              const code = this.generateActivationCodeLocally(
+                nodeType, walletAddress, meta.burnTxHash, meta.burnAmount
               );
-              if (result.success && result.activationCode) {
-                await this.storeActivationCode(result.activationCode, nodeType, password);
-                return { [nodeType]: result.activationCode };
-              }
+              await this.storeActivationCode(code, nodeType, password, {
+                burnTxHash: meta.burnTxHash,
+                burnAmount: meta.burnAmount,
+                walletAddress: meta.walletAddress,
+                phase: meta.phase || 1
+              });
+              return { [nodeType]: code };
             } catch (e) {
-              console.warn('Failed to retrieve code from server:', e.message);
+              console.warn('Failed to regenerate code locally:', e.message);
             }
           }
         }
@@ -4387,20 +4429,15 @@ export class WalletManager {
             
             if (!code && nodeId) {
               // Node exists in blockchain but activation_code not in this response
-              // Regenerate deterministically via XOR from burn TX data
-              console.log('[syncActivationCodes] Node found on blockchain, regenerating activation code...');
+              // Regenerate code LOCALLY from stored burn metadata
+              console.log('[syncActivationCodes] Node found on blockchain, regenerating activation code locally...');
               try {
                 const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${nodeType}`);
                 const meta = metaStr ? JSON.parse(metaStr) : null;
-                if (meta && meta.burnTxHash) {
-                  const eonAddr = await AsyncStorage.getItem('qnet_address')
-                    || this.generateQNetAddressFromSolana(walletAddress);
-                  const codeResult = await this.requestActivationCodeFromServer(
-                    nodeType, walletAddress, meta.burnTxHash, meta.phase || 1, eonAddr, meta.burnAmount || null
+                if (meta && meta.burnTxHash && meta.burnAmount) {
+                  code = this.generateActivationCodeLocally(
+                    nodeType, walletAddress, meta.burnTxHash, meta.burnAmount
                   );
-                  if (codeResult.success && codeResult.activationCode) {
-                    code = codeResult.activationCode;
-                  }
                 }
               } catch (recoverError) {
                 console.warn('[syncActivationCodes] Code regeneration failed:', recoverError.message);
@@ -4438,23 +4475,22 @@ export class WalletManager {
         const meta = metaStr ? JSON.parse(metaStr) : null;
         const burnTxHash = meta?.signature || meta?.burnTxHash;
         
-        if (burnTxHash) {
+        if (burnTxHash && meta?.burnAmount) {
           try {
-            // Regenerate code deterministically via XOR from burn TX data
-            const eonAddr = await AsyncStorage.getItem('qnet_address')
-              || this.generateQNetAddressFromSolana(walletAddress);
-            const codeResult = await this.requestActivationCodeFromServer(
-              burnNodeType, walletAddress, burnTxHash, meta?.phase || 1, eonAddr, meta?.burnAmount || null
+            // Regenerate code LOCALLY — no server needed
+            const code = this.generateActivationCodeLocally(
+              burnNodeType, walletAddress, burnTxHash, meta.burnAmount
             );
-            if (codeResult.success && codeResult.activationCode) {
-              console.log('[syncActivationCodes] ✅ Code regenerated from burn TX (deterministic XOR)');
-              await this.storeActivationCode(codeResult.activationCode, burnNodeType, password, {
-                burnTxHash, fromBlockchain: true
-              });
-              return { [burnNodeType]: codeResult.activationCode };
-            }
+            console.log('[syncActivationCodes] ✅ Code regenerated locally from burn TX');
+            await this.storeActivationCode(code, burnNodeType, password, {
+              burnTxHash,
+              burnAmount: meta.burnAmount,
+              walletAddress: meta.walletAddress || walletAddress,
+              phase: meta?.phase || 1
+            });
+            return { [burnNodeType]: code };
           } catch (recoverError) {
-            console.warn('[syncActivationCodes] Code regeneration from burn failed:', recoverError.message);
+            console.warn('[syncActivationCodes] Local code regeneration failed:', recoverError.message);
           }
         } else {
           console.log('[syncActivationCodes] ⚠️ Burn found but no TX hash in metadata for recovery');
@@ -5128,32 +5164,15 @@ export class WalletManager {
         throw new Error('Failed to burn tokens for activation');
       }
       
-    // PRODUCTION: Request activation code from server AFTER successful burn
-    // Server verifies burn transaction and generates code with embedded wallet
-    // Phase 1: need QNet EON address for rewards (separate from Solana address)
-    const qnetAddress = await AsyncStorage.getItem('qnet_address') 
-      || this.generateQNetAddressFromSolana(walletAddress);
-    
-    let activationCode;
-    try {
-      const codeResult = await this.requestActivationCodeFromServer(
-        'light',
-        walletAddress,
-        burnResult.signature,
-        1, // Phase 1: 1DEV burn
-        qnetAddress, // QNet EON address for rewards
-        pricing.cost // CRITICAL: exact burned amount for XOR key
-      );
-      
-      if (!codeResult.success || !codeResult.activationCode) {
-        throw new Error('Server failed to generate activation code');
-      }
-      
-      activationCode = codeResult.activationCode;
-    } catch (codeError) {
-      console.warn('[burnTokensForNode] Failed to get activation code from server:', codeError.message || codeError);
-      throw new Error('Burn successful but failed to get activation code. Please contact support.');
-    }
+    // Generate activation code LOCALLY — deterministic XOR, no server dependency.
+    // Inputs are all from Solana blockchain → always reproducible for recovery.
+    // Validation (burn TX exists, amount OK, 1-wallet-1-node) happens at registration.
+    const activationCode = this.generateActivationCodeLocally(
+      'light',
+      walletAddress,        // Solana address (burn wallet, used for XOR)
+      burnResult.signature, // burn TX hash
+      pricing.cost          // exact burned amount
+    );
     
     // Store the activation code with ALL metadata (burnAmount included for stateless XOR)
     // storeActivationCode now saves burnAmount in qnet_activation_meta_light — no duplicate write needed
@@ -5440,6 +5459,32 @@ export class WalletManager {
               }
             }
           } catch (_) { /* best effort */ }
+          
+          // v4.8: If burnAmount or burnTxHash is missing from local storage,
+          // fall back to finding the burn transaction directly on Solana blockchain.
+          // This handles: fresh install, seed restore, or metadata saved without burnAmount.
+          if ((!burnTxHash || !burnAmount) && burnWallet) {
+            try {
+              console.log('[Registration] Burn metadata incomplete, searching Solana for burn TX...');
+              const burnInfo = await this.findBurnTransactionOnSolana(burnWallet);
+              if (burnInfo) {
+                burnTxHash = burnTxHash || burnInfo.burnTxHash;
+                burnAmount = burnAmount || burnInfo.burnAmount;
+                console.log('[Registration] Found burn TX on Solana:', burnTxHash, 'amount:', burnAmount);
+                // Update local metadata with found data
+                await AsyncStorage.setItem('qnet_activation_meta_light', JSON.stringify({
+                  burnTxHash,
+                  burnAmount,
+                  walletAddress: burnWallet,
+                  nodeType: 'light',
+                  phase: 1,
+                  timestamp: Date.now()
+                }));
+              }
+            } catch (solanaErr) {
+              console.warn('[Registration] Solana burn TX lookup failed:', solanaErr.message);
+            }
+          }
 
           // v4.7: Sign with Solana Ed25519 key to prove wallet ownership
           // Prevents stolen code reuse — attacker cannot sign without private key
@@ -5482,9 +5527,23 @@ export class WalletManager {
           quantumSecured = true;
         }
       } catch (dilithiumError) {
-        // Dilithium3 is MANDATORY — no Ed25519 fallback allowed
-        console.warn('[Registration] Dilithium3 signature failed:', dilithiumError.message);
-        throw new Error(`Dilithium3 quantum signature required: ${dilithiumError.message}`);
+        // Re-throw server/network errors as-is so WalletScreen shows proper error messages.
+        // Only wrap actual Dilithium/Ed25519 crypto errors.
+        const msg = dilithiumError.message || '';
+        const isCryptoError = msg.includes('DilithiumModule') ||
+          msg.includes('Dilithium3') ||
+          msg.includes('dilithium') ||
+          msg.includes('Ed25519 wallet ownership') ||
+          msg.includes('Wallet ownership proof') ||
+          msg.includes('generateKeypair') ||
+          msg.includes('Failed to sign');
+        if (isCryptoError) {
+          console.warn('[Registration] Dilithium3 signature failed:', msg);
+          throw new Error(`Quantum signature failed: ${msg}`);
+        }
+        // Server / network error — pass through directly
+        console.warn('[Registration] Registration rejected by server:', msg);
+        throw dilithiumError;
       }
 
       // No fallback — Dilithium3 is mandatory for node registration
@@ -5494,7 +5553,13 @@ export class WalletManager {
 
       // ALWAYS store activation code locally, even if network registration fails
       // This prevents data loss — code was already paid for via 1DEV burn
-      await this.storeActivationCode(activationCode, nodeType, password);
+      // CRITICAL: pass burnTxHash + burnAmount so metadata is NOT overwritten with null
+      await this.storeActivationCode(activationCode, nodeType, password, {
+        burnTxHash: burnTxHash || null,
+        burnAmount: burnAmount || null,
+        walletAddress: burnWallet || null,
+        phase: 1
+      });
       await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
       await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, systemPseudonym);
 
@@ -5521,8 +5586,14 @@ export class WalletManager {
       
       // Store activation code locally even on failure (paid via 1DEV burn)
       // But DO NOT report success — registration requires Dilithium3 on blockchain
+      // CRITICAL: preserve burnTxHash + burnAmount so future retries can send them to server
       try {
-        await this.storeActivationCode(activationCode, 'light', password);
+        await this.storeActivationCode(activationCode, 'light', password, {
+          burnTxHash: burnTxHash || null,
+          burnAmount: burnAmount || null,
+          walletAddress: burnWallet || null,
+          phase: 1
+        });
       } catch (storeError) {
         // Silent — at least we tried to save the code
       }

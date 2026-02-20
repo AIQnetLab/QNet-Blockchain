@@ -44,6 +44,7 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 8
         versionName "1.0.7"
+        manifestPlaceholders = [usesCleartextTraffic: "true"]
     }
     signingConfigs {
         debug {
@@ -102,7 +103,9 @@ dependencies {
         implementation jscFlavor
     }
 
-    // Bouncy Castle for CRYSTALS-Dilithium3 (NIST FIPS 204) post-quantum signatures
-    implementation("org.bouncycastle:bcprov-jdk18on:1.80")
-    implementation("org.bouncycastle:bcpkix-jdk18on:1.80")
+    // Bouncy Castle for CRYSTALS-Dilithium3 (Round 3, pqcrypto-dilithium 0.5 compatible)
+    // NOTE: BC 1.78+ uses FIPS 204 format incompatible with pqcrypto-dilithium 0.5 on server
+    // BC 1.75 uses Round 3 format compatible with pqcrypto-dilithium 0.5 (Rust server)
+    implementation("org.bouncycastle:bcprov-jdk18on:1.75")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.75")
 }

@@ -75,3 +75,7 @@
 -dontwarn org.bitcoinj.**
 -dontwarn okio.**
 -dontwarn retrofit2.**
+-dontwarn javax.naming.**
+-dontwarn javax.naming.directory.**
+-dontwarn org.bouncycastle.cert.dane.**
+-dontwarn org.bouncycastle.**.JndiDANEFetcherFactory

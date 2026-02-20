@@ -4856,26 +4856,15 @@ const WalletScreen = () => {
                               throw new Error('Failed to burn tokens for activation');
                             }
                             
-                            // CRITICAL: Request code from SERVER after burn (NOT local generation!)
-                            // Server verifies burn TX on Solana and creates XOR-encrypted code
-                            // Phase 1: wallet_address MUST be Solana (for burn verification)
-                            // qnet_reward_wallet = EON address (for rewards on QNet blockchain)
+                            // Generate code LOCALLY — deterministic XOR, no server dependency.
+                            // Validation (burn TX, amount, 1-wallet-1-node) happens at registration.
                             const solanaAddress = wallet.publicKey || wallet.address;
-                            const eonAddress = wallet.qnetAddress || walletManager.generateQNetAddressFromSolana(solanaAddress);
-                            const codeResult = await walletManager.requestActivationCodeFromServer(
+                            code = walletManager.generateActivationCodeLocally(
                               nodeStatus,
-                              solanaAddress,         // Solana address (burn was on Solana!)
-                              burnResult.signature,
-                              1,                     // Phase 1
-                              eonAddress,            // QNet EON address for rewards
-                              requiredAmount         // CRITICAL: exact burned amount for XOR key
+                              solanaAddress,        // Solana address (XOR key uses burn wallet)
+                              burnResult.signature, // burn TX hash
+                              requiredAmount        // exact burned amount
                             );
-                            
-                            if (!codeResult.success || !codeResult.activationCode) {
-                              throw new Error('Burn successful but failed to get activation code from server');
-                            }
-                            
-                            code = codeResult.activationCode;
                             
                             // Store the code with ALL burn metadata (burnAmount included for stateless XOR)
                             // storeActivationCode now saves burnAmount — no duplicate write needed
@@ -5078,35 +5067,63 @@ const WalletScreen = () => {
                         // Ensure we have QNet EON address (41 chars) for Phase 1 — NOT Solana address (44 chars)
                         const qnetEonAddress = wallet.qnetAddress || walletManager.generateQNetAddressFromSolana(wallet.publicKey);
                         
-                        // Regenerate code deterministically from burn TX data (stateless XOR)
-                        try {
-                          const codeResult = await walletManager.requestActivationCodeFromServer(
-                            nodeType, wallet.publicKey, burnInfo.burnTxHash, 1,
-                            qnetEonAddress,
+                        // Regenerate code LOCALLY — no server needed, fully deterministic.
+                        // Same algorithm as burn → guaranteed identical code.
+                        if (burnInfo.burnAmount && burnInfo.burnAmount > 0) {
+                          const code = walletManager.generateActivationCodeLocally(
+                            nodeType,
+                            wallet.publicKey,       // Solana address (burn wallet)
+                            burnInfo.burnTxHash,
                             burnInfo.burnAmount
                           );
-                          if (codeResult.success && codeResult.activationCode) {
-                            const code = codeResult.activationCode;
-                            setActivatedNodeType(nodeType);
-                            setActivationCode(code);
-                            
-                            await walletManager.storeActivationCode(code, nodeType, password, { recovered: true, burnTxHash: burnInfo.burnTxHash, burnAmount: burnInfo.burnAmount });
-                            // No pseudonym — node is not registered on network yet, only code recovered
-                            AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-                              nodeType, code, timestamp: Date.now(),
-                              burnTxHash: burnInfo.burnTxHash,
-                              walletAddress: qnetEonAddress
-                            })).catch(() => {});
-                            
-                            showAlert('Code Generated', `Your ${nodeType} node activation code has been regenerated from your burn transaction.`);
-                            return;
-                          }
-                        } catch (genErr) { console.log('[RECOVER] Code regeneration failed:', genErr.message); }
+                          setActivatedNodeType(nodeType);
+                          setActivationCode(code);
+                          
+                          await walletManager.storeActivationCode(code, nodeType, password, { recovered: true, burnTxHash: burnInfo.burnTxHash, burnAmount: burnInfo.burnAmount });
+                          AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                            nodeType, code, timestamp: Date.now(),
+                            burnTxHash: burnInfo.burnTxHash,
+                            walletAddress: qnetEonAddress
+                          })).catch(() => {});
+                          
+                          const richRecovered2 = (
+                            <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
+                              <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8, fontSize: 13 }]}>
+                                <Text style={{ fontWeight: 'bold' }}>Activation Code:</Text>
+                              </Text>
+                              <TouchableOpacity
+                                onPress={() => { Clipboard.setString(nodeType === 'super' ? `${code}\nBurn TX: ${burnInfo.burnTxHash}` : code); }}
+                                style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 8, marginBottom: 12 }}
+                              >
+                                <Text style={[styles.modalContent, { fontFamily: 'monospace', color: '#00d4ff', fontSize: 12, textAlign: 'center' }]}>
+                                  {code}
+                                </Text>
+                                <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
+                                  Tap to copy
+                                </Text>
+                              </TouchableOpacity>
+                              <Text style={[styles.modalContent, { textAlign: 'left', fontSize: 13 }]}>
+                                <Text style={{ fontWeight: 'bold' }}>Node Type:</Text> {nodeType.toUpperCase()}{'\n'}
+                                {nodeType === 'super' && <><Text style={{ fontWeight: 'bold' }}>Burn TX:</Text> {burnInfo.burnTxHash.substring(0, 20)}...</>}
+                              </Text>
+                            </View>
+                          );
+                          showAlert(
+                            'Code Recovered',
+                            '',
+                            [
+                              { text: 'Copy Code', style: 'default', onPress: () => { Clipboard.setString(nodeType === 'super' ? `${code}\nBurn TX: ${burnInfo.burnTxHash}` : code); } },
+                              { text: 'OK', style: 'default' }
+                            ],
+                            richRecovered2
+                          );
+                          return;
+                        }
                         
-                        // Even if server calls failed, we found the burn — show it to user
+                        // burnAmount not found in TX — show what we have
                         showAlert(
                           'Burn Transaction Found',
-                          `Found burn TX: ${burnInfo.burnTxHash.substring(0, 20)}...\nType: ${nodeType}\nAmount: ${burnInfo.burnAmount || 'unknown'}\n\nThe server could not generate the activation code right now. Please try again in a moment.`,
+                          `Found burn TX: ${burnInfo.burnTxHash.substring(0, 20)}...\nType: ${nodeType}\nAmount: ${burnInfo.burnAmount || 'unknown'}\n\nCould not read burn amount from Solana. Please try again.`,
                           [{ text: 'OK' }]
                         );
                         return;
@@ -5133,7 +5150,37 @@ const WalletScreen = () => {
                           walletAddress: wallet.qnetAddress || wallet.address
                         })).catch(() => {});
                         
-                        showAlert('Code Recovered', `Your ${firstType} node activation code has been recovered.`);
+                        const richRecovered3 = (
+                          <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
+                            <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8, fontSize: 13 }]}>
+                              <Text style={{ fontWeight: 'bold' }}>Activation Code:</Text>
+                            </Text>
+                            <TouchableOpacity
+                              onPress={() => { Clipboard.setString(firstType === 'super' ? `${code}\nBurn TX: ${value?.burnTxHash || ''}` : code); }}
+                              style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 8, marginBottom: 12 }}
+                            >
+                              <Text style={[styles.modalContent, { fontFamily: 'monospace', color: '#00d4ff', fontSize: 12, textAlign: 'center' }]}>
+                                {code}
+                              </Text>
+                              <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
+                                Tap to copy
+                              </Text>
+                            </TouchableOpacity>
+                            <Text style={[styles.modalContent, { textAlign: 'left', fontSize: 13 }]}>
+                              <Text style={{ fontWeight: 'bold' }}>Node Type:</Text> {firstType.toUpperCase()}
+                              {firstType === 'super' && <>{'\n'}<Text style={{ fontWeight: 'bold' }}>Burn TX:</Text> {(value?.burnTxHash || '').substring(0, 20)}...</>}
+                            </Text>
+                          </View>
+                        );
+                        showAlert(
+                          'Code Recovered',
+                          '',
+                          [
+                            { text: 'Copy Code', style: 'default', onPress: () => { Clipboard.setString(firstType === 'super' ? `${code}\nBurn TX: ${value?.burnTxHash || ''}` : code); } },
+                            { text: 'OK', style: 'default' }
+                          ],
+                          richRecovered3
+                        );
                         return;
                       }
                     }
