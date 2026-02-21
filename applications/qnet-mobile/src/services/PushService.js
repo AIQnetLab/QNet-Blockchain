@@ -426,6 +426,16 @@ export async function checkNodeStatus() {
       nodeInfo.nextPingTime = result.next_ping_time;
       await AsyncStorage.setItem('qnet_light_node_info', JSON.stringify(nodeInfo));
 
+      // Also fetch current block height for "Next Rewards" display
+      let currentBlockHeight = 0;
+      try {
+        const heightResp = await fetch(`${apiUrl}/api/v1/status`, { method: 'GET' });
+        if (heightResp.ok) {
+          const heightData = await heightResp.json();
+          currentBlockHeight = heightData.height || heightData.current_height || 0;
+        }
+      } catch (_) {}
+
       return {
         registered: true,
         nodeId: result.node_id,
@@ -437,6 +447,7 @@ export async function checkNodeStatus() {
         nextPingTime: result.next_ping_time,
         nextPingWindow: result.next_ping_window,
         needsReactivation: result.needs_reactivation,
+        currentBlockHeight,
       };
     }
 

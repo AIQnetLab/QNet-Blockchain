@@ -30,6 +30,7 @@ import {
   getAllNodesByWallet
 } from '../services/PushService';
 import logger from '../utils/logger';
+import { getRandomGenesisNode } from '../config/nodes';
 
 // 1DEV Burn Tracker Contract (same as browser extension)
 const BURN_CONTRACT_PROGRAM_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
@@ -711,6 +712,37 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
   }
 };
 
+// Module-level block height cache — shared across all renders, max 1 fetch per 60s.
+// Prevents hammering the node API: no matter how many components re-render,
+// only one actual network request goes out per minute.
+const _blockHeightCache = { height: 0, fetchedAt: 0, inFlight: false };
+
+async function fetchCachedBlockHeight() {
+  const now = Date.now();
+  if (_blockHeightCache.height > 0 && now - _blockHeightCache.fetchedAt < 15_000) {
+    return _blockHeightCache.height; // Cache hit — no network call
+  }
+  if (_blockHeightCache.inFlight) {
+    // Another fetch is in progress — return stale value rather than duplicate request
+    return _blockHeightCache.height;
+  }
+  _blockHeightCache.inFlight = true;
+  try {
+    const apiUrl = getRandomGenesisNode();
+    const resp = await fetch(`${apiUrl}/api/v1/status`, { method: 'GET' });
+    if (resp.ok) {
+      const data = await resp.json();
+      const h = data.height || data.current_height || data.local_height || 0;
+      if (h > 0) {
+        _blockHeightCache.height = h;
+        _blockHeightCache.fetchedAt = Date.now();
+      }
+    }
+  } catch (_) { /* silent — return cached/zero */ }
+  finally { _blockHeightCache.inFlight = false; }
+  return _blockHeightCache.height;
+}
+
 const WalletScreen = () => {
   const [walletManager] = useState(new WalletManager());
   const [hasWallet, setHasWallet] = useState(false);
@@ -782,6 +814,7 @@ const WalletScreen = () => {
   const [burnProgress, setBurnProgress] = useState('0.0'); // Real burn progress from blockchain
   const [activatingNode, setActivatingNode] = useState(false); // For node activation loading state
   const [verificationError, setVerificationError] = useState(''); // Error message for seed verification
+  const [currentBlockHeight, setCurrentBlockHeight] = useState(0); // Cached network block height
   const [activatedNodeType, setActivatedNodeType] = useState(null); // Track which node type is activated
   const [activationCode, setActivationCode] = useState(null); // Store the activation code
   const [nodeRewards, setNodeRewards] = useState(null); // Store validator metrics data
@@ -797,6 +830,8 @@ const WalletScreen = () => {
   const [nodeInitializing, setNodeInitializing] = useState(true); // True until first load cycle completes
   const [reactivatingNode, setReactivatingNode] = useState(false); // Reactivation in progress
   const [nodeActivating, setNodeActivating] = useState(false); // Node activation in progress
+  const [restoringNode, setRestoringNode] = useState(false); // Restore existing node in progress
+  const [restoreNodeError, setRestoreNodeError] = useState(''); // Error message from restore attempt
   const [unlockError, setUnlockError] = useState(''); // Error message for unlock screen
 
   // Throttle helper to prevent too frequent updates
@@ -936,6 +971,15 @@ const WalletScreen = () => {
   // - NEW: Load ALL nodes owned by this wallet for unified display
   useEffect(() => {
     if (activeTab === 'node' && wallet) {
+      // Fetch cached block height for "Next Rewards" display (max 1 req per 60s globally)
+      // Fetch block height immediately, then refresh every 15s while on this tab.
+      // fetchCachedBlockHeight has a module-level 15s TTL so actual network calls
+      // are always at most 1 per 15s regardless of how many times this runs.
+      fetchCachedBlockHeight().then(h => { if (h > 0) setCurrentBlockHeight(h); });
+      const heightInterval = setInterval(() => {
+        fetchCachedBlockHeight().then(h => { if (h > 0) setCurrentBlockHeight(h); });
+      }, 15000);
+
       // Load ALL nodes + specific node data in parallel (not waterfall)
       const promises = [];
       
@@ -1009,6 +1053,8 @@ const WalletScreen = () => {
       
       // Ensure nodeInitializing is cleared even if no nodes found
       Promise.all(promises).finally(() => setNodeInitializing(false));
+
+      return () => clearInterval(heightInterval);
     }
   }, [activeTab, activatedNodeType, activationCode, nodePseudonym, wallet]); // Load when tab opens
   
@@ -1051,6 +1097,14 @@ const WalletScreen = () => {
     try {
       const status = await checkNodeStatus();
       setLightNodeStatus(status);
+      // Update cached block height if checkNodeStatus returned a fresh value
+      if (status?.currentBlockHeight > 0) {
+        setCurrentBlockHeight(status.currentBlockHeight);
+        if (status.currentBlockHeight > _blockHeightCache.height) {
+          _blockHeightCache.height = status.currentBlockHeight;
+          _blockHeightCache.fetchedAt = Date.now();
+        }
+      }
       
       if (status.needsReactivation) {
         console.log('[Node] Light node needs reactivation');
@@ -1303,6 +1357,81 @@ const WalletScreen = () => {
     } finally {
       setLoadingAllNodes(false);
       setNodeInitializing(false);
+    }
+  };
+
+  // Restore an existing node after wallet re-import.
+  // Derives the light node pseudonym from the wallet address and queries the network.
+  const restoreExistingNode = async () => {
+    if (!wallet || restoringNode) return;
+    setRestoringNode(true);
+    setRestoreNodeError('');
+    try {
+      const walletAddress = wallet.qnetAddress || wallet.address;
+      if (!walletAddress) {
+        setRestoreNodeError('No wallet address found.');
+        return;
+      }
+
+      // Derive pseudonym using the same formula as the server
+      const CryptoJS = require('crypto-js');
+      const hash = CryptoJS.SHA256(`LIGHT_NODE_PRIVACY_${walletAddress}`).toString();
+      const pseudonym = `light_mobile_${hash.substring(0, 8)}`;
+
+      // Query any bootstrap node for node status
+      const { getRandomBootstrapNodeAsync } = require('../services/PushService');
+      const apiUrl = await getRandomBootstrapNodeAsync();
+
+      const resp = await fetch(
+        `${apiUrl}/api/v1/light-node/status?node_id=${encodeURIComponent(pseudonym)}`,
+        { method: 'GET' }
+      );
+      const data = await resp.json();
+
+      if (!data.success) {
+        // Not found in P2P registry — double-check on-chain via verify-activation
+        const onChainResp = await fetch(
+          `${apiUrl}/api/v1/verify-activation?wallet_address=${encodeURIComponent(walletAddress)}`,
+          { method: 'GET' }
+        );
+        const onChain = await onChainResp.json();
+        if (!onChain.verified) {
+          setRestoreNodeError('No registered node found for this wallet on the network.');
+          return;
+        }
+        // On-chain found but not in P2P — still restore with on-chain data
+      }
+
+      // Restore local state
+      const restoreCode = `RESTORED_${pseudonym}`;
+      setActivationCode(restoreCode);
+      setActivatedNodeType('light');
+      setNodePseudonym(pseudonym);
+
+      // Persist so next launch restores automatically
+      await AsyncStorage.setItem('qnet_light_node_info', JSON.stringify({
+        nodeId: pseudonym,
+        walletAddress,
+        pushType: data.push_type || 'FCM',
+        nextPingTime: data.next_ping_time || 0,
+        nextPingWindow: data.next_ping_window || 0,
+      }));
+      await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+        nodeType: 'light',
+        code: restoreCode,
+        pseudonym,
+        timestamp: Date.now(),
+        walletAddress,
+        restored: true,
+      }));
+      await AsyncStorage.setItem(`node_pseudonym_${restoreCode}`, pseudonym);
+
+      console.log('[Restore] Light node restored:', pseudonym);
+    } catch (err) {
+      console.warn('[Restore] Failed:', err.message);
+      setRestoreNodeError('Network error. Check your connection and try again.');
+    } finally {
+      setRestoringNode(false);
     }
   };
   
@@ -5425,6 +5554,35 @@ const WalletScreen = () => {
                     </Text>
                   </TouchableOpacity>
                 </View>
+
+                {/* Restore existing node after wallet re-import */}
+                <View style={{marginTop: 16, borderTopWidth: 1, borderTopColor: '#1a1a2e', paddingTop: 14}}>
+                  <Text style={[styles.nodeMonitoringLabel, {fontSize: 12, color: '#888', marginBottom: 10}]}>
+                    Already activated a node with this wallet?
+                  </Text>
+                  <TouchableOpacity
+                    onPress={restoreExistingNode}
+                    disabled={restoringNode}
+                    style={{
+                      backgroundColor: restoringNode ? '#1a1a2e' : '#0a2a3a',
+                      borderWidth: 1,
+                      borderColor: '#00d4ff55',
+                      borderRadius: 8,
+                      paddingVertical: 10,
+                      paddingHorizontal: 14,
+                      alignItems: 'center',
+                    }}
+                  >
+                    <Text style={{color: restoringNode ? '#555' : '#00d4ff', fontSize: 13, fontWeight: '600'}}>
+                      {restoringNode ? 'Searching...' : 'I already have a node'}
+                    </Text>
+                  </TouchableOpacity>
+                  {restoreNodeError ? (
+                    <Text style={{color: '#ff6b6b', fontSize: 12, marginTop: 8, textAlign: 'center'}}>
+                      {restoreNodeError}
+                    </Text>
+                  ) : null}
+                </View>
               </View>
             )}
             
@@ -5502,16 +5660,6 @@ const WalletScreen = () => {
                             </Text>
                             <Text style={styles.serverActivationSubtext}>
                               Your node was offline and needs reactivation
-                            </Text>
-                          </View>
-                        ) : lightNodeStatus?.isActive ? (
-                          <View style={[styles.serverActivationNotice, {backgroundColor: '#34c75920', borderColor: '#34c759'}]}>
-                            <Text style={[styles.serverActivationText, {color: '#34c759'}]}>
-                              Node Active - Responding to pings
-                            </Text>
-                            <Text style={styles.serverActivationSubtext}>
-                              Next ping: {lightNodeStatus.nextPingTime ? 
-                                new Date(lightNodeStatus.nextPingTime * 1000).toLocaleTimeString() : 'Soon'}
                             </Text>
                           </View>
                         ) : null}
@@ -5593,20 +5741,40 @@ const WalletScreen = () => {
                     </Text>
                   </View>
                   
-                  {/* LIGHT NODES: Show local ping/reward tracking */}
+                  {/* LIGHT NODES: Show reward tracking like server nodes */}
                   {activatedNodeType === 'light' && (
                     <>
                       <View style={styles.rewardItem}>
-                        <Text style={styles.rewardLabel}>Ping Responses:</Text>
-                        <Text style={styles.rewardValue}>
-                          {nodeRewards?.totalClaimed || 0} successful
+                        <Text style={styles.rewardLabel}>Next Rewards:</Text>
+                        <Text style={[styles.rewardValue, { color: '#34c759' }]}>
+                          {(() => {
+                            const EMISSION_INTERVAL = 14400;
+                            const h = currentBlockHeight || lightNodeStatus?.currentBlockHeight || 0;
+                            if (h === 0) return 'Loading...';
+                            const blocksUntil = EMISSION_INTERVAL - (h % EMISSION_INTERVAL);
+                            const minutes = Math.floor(blocksUntil / 60);
+                            const hours = Math.floor(minutes / 60);
+                            const mins = minutes % 60;
+                            if (hours > 0) {
+                              return `${blocksUntil.toLocaleString()} blocks (~${hours}h ${mins}m)`;
+                            }
+                            return `${blocksUntil.toLocaleString()} blocks (~${mins}m)`;
+                          })()}
                         </Text>
                       </View>
-                      
+
                       <View style={styles.rewardItem}>
                         <Text style={styles.rewardLabel}>Pending Rewards:</Text>
-                        <Text style={[styles.rewardValue, {color: (nodeRewards?.unclaimed || 0) > 0 ? '#34c759' : '#00d4ff'}]}>
-                          {nodeRewards?.unclaimed || 0} pending
+                        <Text style={[styles.rewardValue, {
+                          color: (nodeRewards?.unclaimed || 0) > 0 ? '#34c759' : '#00d4ff'
+                        }]}>
+                          {(() => {
+                            const raw = nodeRewards?.unclaimed || 0;
+                            if (raw === 0) return '0 QNC';
+                            // If value > 1e6 assume nanoQNC, otherwise treat as QNC
+                            const qnc = raw > 1e6 ? raw / 1e9 : raw;
+                            return `${qnc.toFixed(6).replace(/\.?0+$/, '')} QNC`;
+                          })()}
                         </Text>
                       </View>
                     </>
@@ -5620,9 +5788,9 @@ const WalletScreen = () => {
                         <Text style={[styles.rewardValue, { color: '#34c759' }]}>
                           {(() => {
                             const EMISSION_INTERVAL = 14400; // 4 hours in blocks
-                            const currentHeight = serverNodeStatus.currentBlockHeight || 0;
-                            if (currentHeight === 0) return 'Loading...';
-                            const blocksUntil = EMISSION_INTERVAL - (currentHeight % EMISSION_INTERVAL);
+                            const h = currentBlockHeight || serverNodeStatus.currentBlockHeight || 0;
+                            if (h === 0) return 'Loading...';
+                            const blocksUntil = EMISSION_INTERVAL - (h % EMISSION_INTERVAL);
                             // Convert to time estimate
                             const minutes = Math.floor(blocksUntil / 60);
                             const hours = Math.floor(minutes / 60);

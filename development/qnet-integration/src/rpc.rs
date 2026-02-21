@@ -5525,6 +5525,12 @@ lazy_static::lazy_static! {
     static ref SUPER_NODE_MIGRATION_TIMESTAMPS: dashmap::DashMap<String, u64> =
         dashmap::DashMap::new();
     
+    // Per-wallet registration attempt rate limiter (anti-bruteforce for activation codes).
+    // Key: wallet_address, Value: Vec<unix_timestamp_secs> of recent failed attempts.
+    // Allows max 5 failed registration attempts per wallet per 10 minutes.
+    static ref WALLET_REG_FAIL_TIMESTAMPS: dashmap::DashMap<String, Vec<u64>> =
+        dashmap::DashMap::new();
+
     // REMOVED: REWARD_MANAGER was causing desync issues
     // Now using blockchain.get_reward_manager() everywhere for proper synchronization
 }
@@ -5588,7 +5594,33 @@ async fn handle_light_node_register(
     if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "light_node_register") {
         return Ok(rate_limit_response);
     }
-    
+
+    // SECURITY: Per-wallet failed-attempt rate limit (anti-bruteforce for activation codes).
+    // Max 5 failed attempts per wallet per 10 minutes, regardless of IP.
+    {
+        let wallet = &register_request.wallet_address;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        const WINDOW: u64 = 600; // 10 minutes
+        const MAX_FAILS: usize = 5;
+
+        let mut entry = WALLET_REG_FAIL_TIMESTAMPS
+            .entry(wallet.clone())
+            .or_insert_with(Vec::new);
+        // Remove attempts outside the window
+        entry.retain(|&ts| now_secs.saturating_sub(ts) < WINDOW);
+        if entry.len() >= MAX_FAILS {
+            println!("[WARN][LIGHT] wallet_rate_limited wallet={}...", &wallet[..16.min(wallet.len())]);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Too many failed registration attempts. Please wait 10 minutes before retrying.",
+                "retry_after_seconds": WINDOW
+            })));
+        }
+    }
+
     // SECURITY: Validate QNet EON wallet address format
     // Rewards MUST go to valid EON address - prevents loss of funds!
     if let Err(e) = validate_eon_address_with_error(&register_request.wallet_address) {
@@ -5599,7 +5631,24 @@ async fn handle_light_node_register(
             "hint": "Wallet address must be in EON format: {19 hex}eon{15 hex}{4 checksum} = 41 chars"
         })));
     }
-    
+
+    // Reject if this wallet already has an on-chain registered node.
+    // Deriving the pseudonym first is O(1) and avoids all heavy Solana/crypto work below.
+    {
+        let pseudonym = generate_light_node_pseudonym(&register_request.wallet_address);
+        let state_mgr = blockchain.get_state_manager();
+        let state = state_mgr.read().await;
+        if state.is_node_registered(&pseudonym) {
+            println!("[INFO][LIGHT] registration_rejected reason=already_registered pseudonym={}", pseudonym);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Node already registered on-chain for this wallet",
+                "node_id": pseudonym,
+                "hint": "Each wallet can only register one light node"
+            })));
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════════
     // v4.5: PURE STATELESS VERIFICATION — code is self-contained!
     // Code = XOR(wallet_prefix, SHA3(burn_tx_hash:node_type:burn_amount))
@@ -5654,6 +5703,11 @@ async fn handle_light_node_register(
             Ok(false) => {
                 println!("[WARN][LIGHT] code_rejected method=stateless_xor wallet={}... code={}...",
                     &wallet[..16.min(wallet.len())], &code[..12.min(code.len())]);
+                // Record failed attempt for per-wallet rate limiting
+                if let Some(mut entry) = WALLET_REG_FAIL_TIMESTAMPS.get_mut(wallet) {
+                    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    entry.push(now_secs);
+                }
                 return Ok(warp::reply::json(&json!({
                     "success": false,
                     "error": "Activation code does not belong to this wallet (XOR mismatch)",
@@ -5663,6 +5717,10 @@ async fn handle_light_node_register(
             Err(e) => {
                 println!("[WARN][LIGHT] stateless_verify_failed wallet={}... err={}",
                     &wallet[..16.min(wallet.len())], e);
+                if let Some(mut entry) = WALLET_REG_FAIL_TIMESTAMPS.get_mut(wallet) {
+                    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    entry.push(now_secs);
+                }
                 return Ok(warp::reply::json(&json!({
                     "success": false,
                     "error": format!("Code verification failed: {}", e),
@@ -5923,7 +5981,10 @@ async fn handle_light_node_register(
 
     println!("[INFO][LIGHT] node_registered pseudonym={} push={} quantum_secured=true", 
              light_node_pseudonym, push_type_str);
-    
+
+    // Clear per-wallet failed-attempt counter on successful registration
+    WALLET_REG_FAIL_TIMESTAMPS.remove(&register_request.wallet_address);
+
     // CRITICAL: Gossip Light node registration to P2P network for decentralized sync
     // This ensures ALL Full/Super nodes have the same Light node registry
     if let Some(p2p) = blockchain.get_unified_p2p() {
@@ -11672,13 +11733,42 @@ async fn handle_node_registration_client_submit(
         return Ok(rate_limit_response);
     }
 
-    // Validate EON address
+    // Only light nodes use client-side TX creation.
+    // Super node registration is server-initiated (requires server-side authorization + staking).
+    if req.node_type != "light" {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Only light node self-registration is supported via this endpoint"
+        })));
+    }
+
+    // Validate EON address: from and wallet_address must be identical
+    if req.from != req.wallet_address {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "from and wallet_address must match"
+        })));
+    }
     if let Err(e) = validate_eon_address_with_error(&req.from) {
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "Invalid wallet address",
             "details": e
         })));
+    }
+
+    // Reject stale requests: timestamp must be within 5 minutes
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now.abs_diff(req.timestamp) > 300 {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Request timestamp too old or too far in future (max 5 min)"
+            })));
+        }
     }
 
     // Verify Ed25519 signature
@@ -11704,16 +11794,15 @@ async fn handle_node_registration_client_submit(
     }
 
     // Optionally verify Dilithium3 if present
+    // Uses verify_mobile_dilithium_signature which handles Android "dilithium_sig_{nodeId}_{base64}" format
     if let (Some(ref dil_sig), Some(ref dil_pk)) = (&req.dilithium_signature, &req.dilithium_public_key) {
         if !dil_sig.is_empty() && !dil_pk.is_empty() {
-            match verify_dilithium_client_signature(&message, dil_sig, dil_pk).await {
-                Ok(false) | Err(_) => {
-                    return Ok(warp::reply::json(&json!({
-                        "success": false,
-                        "error": "Dilithium3 signature verification failed"
-                    })));
-                }
-                Ok(true) => {}
+            if !verify_mobile_dilithium_signature(&message, dil_sig, dil_pk) {
+                println!("[WARN][NODE-REG-CLIENT] dilithium_sig_invalid node={}", req.node_id);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Dilithium3 signature verification failed"
+                })));
             }
         }
     }
@@ -11732,31 +11821,21 @@ async fn handle_node_registration_client_submit(
         }
     }
 
-    // Build NodeRegistration TX
-    let node_type = if req.node_type == "super" {
-        qnet_state::NodeType::Super
-    } else {
-        qnet_state::NodeType::Light
-    };
-
-    let api_endpoint = if node_type == qnet_state::NodeType::Light {
-        String::new() // Light nodes never expose endpoint (mobile privacy)
-    } else {
-        req.api_endpoint.unwrap_or_default()
-    };
-
+    // Build NodeRegistration TX — always Light (super is blocked above)
+    // Light nodes never expose an endpoint (mobile privacy)
     let mut reg_tx = crate::node::BlockchainNode::create_node_registration_tx_with_timestamp(
         &req.node_id,
-        node_type,
+        qnet_state::NodeType::Light,
         &req.wallet_address,
         &req.registration_proof,
-        &api_endpoint,
+        "",
         Some(req.timestamp),
     );
 
     // Mark as client-signed so build_canonical_verify_message uses the correct format
-    reg_tx.data = Some(format!("client_node_reg:{}:{}:{}:{}",
-        req.node_id, req.wallet_address, req.registration_proof, api_endpoint));
+    // Light nodes never expose an API endpoint (mobile privacy) — empty string
+    reg_tx.data = Some(format!("client_node_reg:{}:{}:{}:",
+        req.node_id, req.wallet_address, req.registration_proof));
 
     // Store client's Ed25519 signature (not a server ephemeral key)
     reg_tx.signature = Some(req.signature.clone());

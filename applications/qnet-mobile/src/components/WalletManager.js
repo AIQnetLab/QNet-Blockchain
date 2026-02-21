@@ -2761,11 +2761,11 @@ export class WalletManager {
     // Fallback to Genesis bootstrap nodes if no discovered nodes
     // These are the official Genesis nodes from genesis_constants.rs
     const genesisNodes = [
-      { url: 'http://154.38.160.39:8001', region: 'North America' },
-      { url: 'http://62.171.157.44:8001', region: 'Europe' },
-      { url: 'http://161.97.86.81:8001', region: 'Europe' },
-      { url: 'http://5.189.130.160:8001', region: 'Europe' },
-      { url: 'http://162.244.25.114:8001', region: 'Europe' }
+      { url: 'http://154.38.160.39', region: 'North America' },
+      { url: 'http://62.171.157.44', region: 'Europe' },
+      { url: 'http://161.97.86.81', region: 'Europe' },
+      { url: 'http://5.189.130.160', region: 'Europe' },
+      { url: 'http://162.244.25.114', region: 'Europe' }
     ];
     
     // Try to discover new nodes from Genesis nodes
