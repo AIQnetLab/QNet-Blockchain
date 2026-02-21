@@ -22893,12 +22893,26 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 format!("claim_rewards:{}:{}", node_id, to_str)
             }
             
-            // === NODEREGISTRATION (hybrid-signed by producer: ephemeral Ed25519 + Dilithium3) ===
-            // Layer 1: Ed25519 (ephemeral) — satisfies validate_transaction() on every peer.
-            // Layer 2: Dilithium3 (producer's long-term key) — provenance proof, verified via
-            //           tx.dilithium_public_key = producer_node_id.
-            // Canonical message format matches rpc.rs sign_node_registration_tx().
-            qnet_state::TransactionType::NodeRegistration { .. } |
+            // === NODEREGISTRATION ===
+            // Two signing paths:
+            // 1. SERVER-SIGNED (legacy): hybrid Ed25519 (ephemeral) + Dilithium3 (producer key)
+            //    data field does NOT start with "client_node_reg:"
+            //    Canonical: pipe-separated to match sign_node_registration_tx() in rpc.rs
+            // 2. CLIENT-SIGNED (new flow): wallet Ed25519 key
+            //    data field starts with "client_node_reg:" — set by handle_node_registration_client_submit
+            //    Canonical: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
+            qnet_state::TransactionType::NodeRegistration { node_id, wallet_address, registration_proof, .. } => {
+                if tx.data.as_ref().map_or(false, |d| d.starts_with("client_node_reg:")) {
+                    format!("client_node_reg:{}:{}:{}:{}",
+                        node_id, wallet_address, registration_proof, tx.timestamp)
+                } else {
+                    // Legacy server-signed format
+                    format!("{}|{}|{}|{}|{}|{}|{}",
+                        tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp)
+                }
+            }
+            
+            // === NODEACTIVATION (system TX, hybrid-signed by producer) ===
             qnet_state::TransactionType::NodeActivation { .. } => {
                 format!("{}|{}|{}|{}|{}|{}|{}",
                     tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp)
@@ -23123,11 +23137,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // PROTOCOL: Commitment TXs skip standard account nonce (they use epoch-based semantics)
         // Deduplication is enforced at STATE level via committed_epochs (deterministic across all nodes)
+        // NodeRegistration: no nonce semantics (one-time event, uniqueness enforced by
+        // state-level registered_nodes DashMap populated from block history)
         let skip_nonce_check = matches!(tx.tx_type,
             qnet_state::TransactionType::HeartbeatCommitment { .. } |
             qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
             qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
-            qnet_state::TransactionType::RewardDistribution { .. }
+            qnet_state::TransactionType::RewardDistribution { .. } |
+            qnet_state::TransactionType::NodeRegistration { .. } |
+            qnet_state::TransactionType::NodeActivation { .. }
         );
         
         // PROTOCOL: State-level dedup check for commitment TXs (prevents duplicate per node per epoch)
@@ -23144,7 +23162,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
                     state.is_epoch_committed("bitmap", genesis_id, *epoch)
                 }
-                _ => false, // RewardDistribution — no epoch dedup
+                qnet_state::TransactionType::NodeRegistration { node_id, .. } => {
+                    state.is_node_registered(node_id)
+                }
+                _ => false, // RewardDistribution / NodeActivation — no epoch dedup
             };
             if is_duplicate {
                 return Err(QNetError::ValidationError(

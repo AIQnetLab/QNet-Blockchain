@@ -499,6 +499,10 @@ pub struct StateManager {
     /// Key: "commitment_type:sender_id", Value: last committed epoch
     /// Deterministic: populated from block application, identical across all nodes
     committed_epochs: Arc<DashMap<String, u64>>,
+    /// PROTOCOL: Tracks registered node_ids to prevent duplicate NodeRegistration TXs
+    /// Key: node_id, Value: wallet_address
+    /// Deterministic: populated from block application, identical across all nodes
+    registered_nodes: Arc<DashMap<String, String>>,
 }
 
 impl StateManager {
@@ -510,6 +514,7 @@ impl StateManager {
             state_root: Arc::new(parking_lot::RwLock::new([0u8; 32])),
             merkle_tree: Arc::new(parking_lot::RwLock::new(StateMerkleTree::new())),
             committed_epochs: Arc::new(DashMap::new()),
+            registered_nodes: Arc::new(DashMap::new()),
         }
     }
     
@@ -542,6 +547,27 @@ impl StateManager {
         self.committed_epochs.retain(|_, epoch| *epoch >= min_epoch);
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PROTOCOL: Node registration deduplication
+    // Prevents duplicate NodeRegistration TXs for the same node_id
+    // Deterministic: all nodes populate from same block history → same result
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Check if a node_id has already been registered (on-chain, from block application)
+    pub fn is_node_registered(&self, node_id: &str) -> bool {
+        self.registered_nodes.contains_key(node_id)
+    }
+
+    /// Mark a node_id as registered (called after successful NodeRegistration TX application)
+    pub fn mark_node_registered(&self, node_id: &str, wallet_address: &str) {
+        self.registered_nodes.insert(node_id.to_string(), wallet_address.to_string());
+    }
+
+    /// Get the wallet address for a registered node (None if not registered)
+    pub fn get_node_wallet(&self, node_id: &str) -> Option<String> {
+        self.registered_nodes.get(node_id).map(|v| v.clone())
+    }
+
     /// PROTOCOL: Check if this TX is a duplicate commitment (already applied in a previous block)
     /// Returns Err if duplicate → TX will be rejected during block application
     /// This is deterministic: all nodes have same committed_epochs from same block history
@@ -571,6 +597,15 @@ impl StateManager {
                     )));
                 }
             }
+            TransactionType::NodeRegistration { node_id, .. } => {
+                if self.is_node_registered(node_id) {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "duplicate NodeRegistration: node_id={} already registered to wallet={}",
+                        node_id,
+                        self.get_node_wallet(node_id).unwrap_or_default()
+                    )));
+                }
+            }
             _ => {} // Non-commitment TXs — no dedup check needed
         }
         Ok(())
@@ -590,6 +625,9 @@ impl StateManager {
             }
             TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
                 self.mark_epoch_committed("bitmap", genesis_id, *epoch);
+            }
+            TransactionType::NodeRegistration { node_id, wallet_address, .. } => {
+                self.mark_node_registered(node_id, wallet_address);
             }
             _ => {} // Non-commitment TXs — nothing to mark
         }

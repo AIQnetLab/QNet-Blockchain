@@ -2878,6 +2878,73 @@ export class WalletManager {
     return getRandomGenesisNode();
   }
   
+  // v6.0: Get current block producer's HTTP endpoint for direct TX routing.
+  // Submitting TX directly to the producer cuts confirmation latency from
+  // up to 30 sec (random node + wait for its producer turn) down to ~1 sec.
+  // Falls back to random node if producer endpoint is unavailable.
+  async getProducerEndpoint() {
+    try {
+      const baseUrl = this.getRandomBootstrapNode();
+      const resp = await fetch(`${baseUrl}/api/v1/producer/status`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (!resp.ok) return null;
+      const data = await resp.json();
+      // producer_endpoint is a full HTTP URL (e.g. "http://162.244.25.114:8001/api/v1/")
+      // We need just the base URL (without /api/v1/) for our fetch calls
+      const endpoint = data.producer_endpoint || '';
+      if (!endpoint) return null;
+      // Strip trailing /api/v1/ if present
+      const base = endpoint.replace(/\/api\/v1\/?$/, '');
+      return base || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // v6.0: Submit a signed transaction to the current producer first, with fallback.
+  // Ensures TX is in the right place at the right time — producer includes it in the
+  // very next microblock instead of waiting up to one full rotation (30 blocks).
+  async submitTransactionToProducer(txPayload) {
+    // Try current producer first
+    let producerUrl = null;
+    try {
+      producerUrl = await this.getProducerEndpoint();
+    } catch (_) { /* fallback below */ }
+
+    const urls = [];
+    if (producerUrl) urls.push(producerUrl);
+    // Always add a random bootstrap node as fallback
+    urls.push(this.getRandomBootstrapNode());
+    // Deduplicate
+    const tried = new Set();
+
+    for (const baseUrl of urls) {
+      if (tried.has(baseUrl)) continue;
+      tried.add(baseUrl);
+      try {
+        const resp = await fetch(`${baseUrl}/api/v1/transaction`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(txPayload),
+        });
+        const result = await resp.json();
+        if (result.success || result.tx_hash) {
+          if (producerUrl && baseUrl === producerUrl) {
+            console.log('[Producer] TX submitted directly to producer:', baseUrl);
+          }
+          return result;
+        }
+        // Server returned an application-level error — propagate immediately
+        if (!result.success) return result;
+      } catch (netErr) {
+        console.warn('[Producer] Node unreachable, trying fallback:', baseUrl, netErr.message);
+      }
+    }
+    throw new Error('All nodes failed to accept transaction');
+  }
+
   // Async node getter with guaranteed fresh data
   async getNodeWithDiscovery() {
     // Load cache from storage if not loaded
@@ -5390,6 +5457,21 @@ export class WalletManager {
     };
   }
   
+  // Query any node to verify that walletAddress has an active registration on-chain.
+  // Returns { verified: true, node_id, node_type } or { verified: false }.
+  async checkOnChainActivation(walletAddress) {
+    try {
+      const apiUrl = this.getRandomBootstrapNode();
+      const url = `${apiUrl}/api/v1/verify-activation?wallet_address=${encodeURIComponent(walletAddress)}`;
+      const resp = await fetch(url, { method: 'GET', headers: { 'Content-Type': 'application/json' } });
+      if (!resp.ok) return { verified: false };
+      const data = await resp.json();
+      return data;
+    } catch (_) {
+      return { verified: false };
+    }
+  }
+
   // Generate Light Node pseudonym (matching backend logic)
   generateLightNodePseudonym(walletAddress) {
     // Generate blake3-style hash (using SHA256 as substitute)
@@ -5400,10 +5482,97 @@ export class WalletManager {
     return `light_${region}_${hash.substring(0, 8)}`;
   }
   
+  // v6.0: Create a NodeRegistration TX client-side and submit it to the current producer.
+  // Called after /api/v1/light-node/register returns registration_proof.
+  // Signing message: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
+  async createAndSubmitNodeRegistrationTx(nodeId, walletAddress, registrationProof, password, dilithiumKeys) {
+    const walletData = await this.loadWallet(password);
+    if (!walletData || !walletData.secretKey) {
+      throw new Error('Cannot sign NodeRegistration TX: wallet not loaded');
+    }
+
+    const qnetKeypair = walletData.qnetKeypair;
+    const privateKeyBytes = qnetKeypair?.privateKey
+      ? new Uint8Array(qnetKeypair.privateKey)
+      : new Uint8Array(walletData.secretKey.slice(0, 32));
+    const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
+    const publicKeyBytes = regeneratedKeypair.publicKey;
+    const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
+    const fullSecretKey = new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const message = `client_node_reg:${nodeId}:${walletAddress}:${registrationProof}:${timestamp}`;
+    const messageBytes = new TextEncoder().encode(message);
+
+    const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
+    const signature = Buffer.from(ed25519Sig).toString('hex');
+
+    const payload = {
+      from: walletAddress,
+      node_id: nodeId,
+      node_type: 'light',
+      wallet_address: walletAddress,
+      registration_proof: registrationProof,
+      timestamp,
+      signature,
+      public_key: publicKeyHex,
+    };
+
+    // Optionally add Dilithium3 signature for post-quantum security
+    if (dilithiumKeys) {
+      try {
+        const { signWithDilithium } = require('../crypto/DilithiumCrypto');
+        const dilSig = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
+        if (dilSig) {
+          payload.dilithium_signature = dilSig;
+          payload.dilithium_public_key = dilithiumKeys.publicKey;
+        }
+      } catch (_) { /* Dilithium is optional on the TX submission path */ }
+    }
+
+    // Get producer endpoint and submit
+    let producerUrl = null;
+    try {
+      producerUrl = await this.getProducerEndpoint();
+    } catch (_) { /* fallback below */ }
+
+    const nodes = [];
+    if (producerUrl) nodes.push(producerUrl);
+    nodes.push(this.getRandomBootstrapNode());
+    const tried = new Set();
+
+    for (const baseUrl of nodes) {
+      if (tried.has(baseUrl)) continue;
+      tried.add(baseUrl);
+      try {
+        const resp = await fetch(`${baseUrl}/api/v1/node-registration/submit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const result = await resp.json();
+        if (result.success) {
+          console.log('[NodeReg] TX submitted successfully, hash:', result.tx_hash, 'via', baseUrl);
+          return result;
+        }
+        console.warn('[NodeReg] TX rejected:', result.error);
+        return result;
+      } catch (netErr) {
+        console.warn('[NodeReg] Node unreachable, trying fallback:', baseUrl);
+      }
+    }
+    throw new Error('Failed to submit NodeRegistration TX: all nodes unreachable');
+  }
+
   // Register node with activation code
   // PRODUCTION: Uses real Dilithium3 (ML-DSA-65) signatures + PushService for correct API
   // FALLBACK: If Dilithium not available, stores locally and registers without quantum sig
   async registerNodeWithCode(activationCode, walletAddress, password) {
+    // Hoisted so catch block can reference them for storeActivationCode + on-chain recovery
+    let burnTxHash = null;
+    let burnAmount = null;
+    let burnWallet = null;
+
     try {
       const nodeType = 'light';
       const systemPseudonym = this.generateLightNodePseudonym(walletAddress);
@@ -5433,9 +5602,7 @@ export class WalletManager {
           // v4.3: Get burn TX data for STATELESS code ownership verification
           // Node needs burn_tx_hash + burn_amount to reconstruct XOR key and verify
           // that the activation code truly belongs to this wallet — no server state needed
-          let burnTxHash = null;
-          let burnAmount = null;
-          let burnWallet = null; // v4.6: Solana address used for code generation (Phase 1)
+          // Note: burnTxHash / burnAmount / burnWallet are hoisted to method scope for catch access
           try {
             const metaStr = await AsyncStorage.getItem('qnet_activation_meta_light');
             if (metaStr) {
@@ -5512,8 +5679,8 @@ export class WalletManager {
             throw new Error('Ed25519 wallet ownership signature is required. Ensure wallet has Solana private key.');
           }
 
-          // Register via PushService → POST /api/v1/light-node/register
-          // wallet_address = EON (for rewards), burn_wallet = Solana (for XOR)
+          // Step 1: Verify burn + register node locally on server
+          // Server returns node_id + registration_proof (no longer creates on-chain TX)
           registrationResult = await registerLightNode(
             activationCode,
             walletAddress,
@@ -5521,11 +5688,35 @@ export class WalletManager {
             quantumSignature,
             burnTxHash,
             burnAmount,
-            burnWallet, // v4.6: Solana address for XOR verification
-            ed25519Signature, // v4.7: Ed25519 signature proving wallet ownership
-            signatureTimestamp // v4.7: Timestamp for replay protection
+            burnWallet,
+            ed25519Signature,
+            signatureTimestamp
           );
           quantumSecured = true;
+
+          // Step 2: Create and submit NodeRegistration TX client-side (v6.0)
+          // TX is signed by wallet key and routed directly to the current producer.
+          // This replaces the old server-side TX creation and eliminates up-to-30-sec latency.
+          if (registrationResult && registrationResult.success && registrationResult.tx_required) {
+            try {
+              const txResult = await this.createAndSubmitNodeRegistrationTx(
+                registrationResult.node_id,
+                walletAddress,
+                registrationResult.registration_proof,
+                password,
+                dilithiumKeys
+              );
+              console.log('[Registration] NodeRegistration TX submitted:', txResult.tx_hash);
+              if (txResult.tx_hash) {
+                registrationResult.onchain_tx_hash = txResult.tx_hash;
+              }
+            } catch (txErr) {
+              // TX submission failure is non-fatal: the node is already registered locally
+              // on the server (ping/heartbeat works), TX will be retried or re-submitted later
+              console.warn('[Registration] NodeRegistration TX submission failed (non-fatal):', txErr.message);
+              registrationResult.tx_pending = true;
+            }
+          }
         }
       } catch (dilithiumError) {
         // Re-throw server/network errors as-is so WalletScreen shows proper error messages.
@@ -5585,9 +5776,8 @@ export class WalletManager {
 
     } catch (error) {
       console.warn('[Registration] Node activation failed:', error.message);
-      
+
       // Store activation code locally even on failure (paid via 1DEV burn)
-      // But DO NOT report success — registration requires Dilithium3 on blockchain
       // CRITICAL: preserve burnTxHash + burnAmount so future retries can send them to server
       try {
         await this.storeActivationCode(activationCode, 'light', password, {
@@ -5599,7 +5789,32 @@ export class WalletManager {
       } catch (storeError) {
         // Silent — at least we tried to save the code
       }
-      
+
+      // Race condition guard: even if the client got an error (network timeout,
+      // Solana indexing lag, partial response), the server might have already
+      // written the NodeRegistration TX to the chain. Verify before surfacing failure.
+      try {
+        const onChain = await this.checkOnChainActivation(walletAddress);
+        if (onChain && onChain.verified) {
+          console.log('[Registration] On-chain check confirms node is registered despite client error:', onChain.node_id);
+          const systemPseudonym = this.generateLightNodePseudonym(walletAddress);
+          await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, onChain.node_id || systemPseudonym);
+          await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
+          return {
+            success: true,
+            nodeType: onChain.node_type || 'light',
+            pseudonym: onChain.node_id || systemPseudonym,
+            burnTxHash: burnTxHash || null,
+            message: 'Node is already registered and active on blockchain.',
+            quantumSecured: true,
+            pendingRegistration: false,
+            recoveredFromOnChain: true
+          };
+        }
+      } catch (_) {
+        // On-chain check itself failed — fall through to error response
+      }
+
       return {
         success: false,
         error: error.message || 'Dilithium3 registration failed. Quantum signature is required.'
@@ -5953,13 +6168,13 @@ export class WalletManager {
       // Get public key for verification (32 bytes hex)
       const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
       
-      // Get random bootstrap node
-      const apiUrl = this.getRandomBootstrapNode();
+      // Use any bootstrap node to fetch nonce; then route TX to current producer
+      const anyNode = this.getRandomBootstrapNode();
       
       // CRITICAL v2.77: Get current nonce from blockchain state for replay protection
       let currentNonce = 0;
       try {
-        const accountResponse = await fetch(`${apiUrl}/api/v1/account/${fromAddress}`);
+        const accountResponse = await fetch(`${anyNode}/api/v1/account/${fromAddress}`);
         if (accountResponse.ok) {
           const accountData = await accountResponse.json();
           currentNonce = accountData.nonce || 0;
@@ -5970,7 +6185,6 @@ export class WalletManager {
       
       // v2.77: Create signature message with nonce (Ethereum-style)
       // CRITICAL: nonce in TX = account.nonce + 1 (like Ethereum)
-      // CRITICAL FIX v2.95.3: message MUST be defined BEFORE signing!
       const txNonce = currentNonce + 1;
       const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${txNonce}:${gasPrice}:${gasLimit}`;
       const messageBytes = new TextEncoder().encode(message);
@@ -5983,27 +6197,21 @@ export class WalletManager {
       const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
       const signature = Buffer.from(ed25519Sig).toString('hex');
       
-      // Submit transaction to REST API (uses handle_transaction_submit endpoint)
-      const response = await fetch(`${apiUrl}/api/v1/transaction`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          from: fromAddress,
-          to: toAddress,
-          amount: amountSmallest,
-          signature: signature,
-          public_key: publicKeyHex,
-          gas_price: gasPrice,
-          gas_limit: gasLimit,
-          nonce: txNonce // v2.77: account.nonce + 1 (Ethereum-style)
-        })
+      // v6.0: Producer-aware routing — submit TX directly to the current block producer.
+      // This guarantees inclusion in the NEXT microblock (~1 sec) instead of waiting
+      // for a random node to become producer (up to 30 sec with 5 nodes × 30-block slots).
+      const result = await this.submitTransactionToProducer({
+        from: fromAddress,
+        to: toAddress,
+        amount: amountSmallest,
+        signature: signature,
+        public_key: publicKeyHex,
+        gas_price: gasPrice,
+        gas_limit: gasLimit,
+        nonce: txNonce,
       });
       
-      const result = await response.json();
-      
-      if (!response.ok || !result.success) {
+      if (!result.success) {
         // v2.101: Show BOTH error and details for debugging
         const errorMsg = result.details 
           ? `${result.error}: ${result.details}`

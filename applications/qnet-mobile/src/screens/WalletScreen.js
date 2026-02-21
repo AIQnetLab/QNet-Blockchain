@@ -1588,6 +1588,19 @@ const WalletScreen = () => {
           'Code Expired',
           'This activation code has expired.\n\nPlease burn tokens again to obtain a new activation code.'
         );
+      } else if (
+          msg.includes('burn transaction not found') ||
+          msg.includes('not indexed yet') ||
+          msg.includes('solana rpc') ||
+          msg.includes('burn verification failed') ||
+          msg.includes('insufficient amount on solana')
+        ) {
+        showAlert(
+          'Burn Not Confirmed Yet',
+          'The Solana network has not yet confirmed your burn transaction.\n\n' +
+          'This usually resolves within 30–60 seconds. Please wait a moment and try activating again.\n\n' +
+          'Your activation code is saved — no need to burn tokens again.'
+        );
       } else if (msg.includes('network') || msg.includes('timeout') || msg.includes('fetch') || msg.includes('econnrefused')) {
         showAlert(
           'Network Error',

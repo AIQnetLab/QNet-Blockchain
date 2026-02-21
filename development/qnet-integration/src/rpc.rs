@@ -731,6 +731,38 @@ struct TransactionRequest {
     dilithium_public_key: Option<String>,
 }
 
+/// v6.0: Client-created NodeRegistration TX submit request
+/// Client signs: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
+/// This endpoint accepts the signed TX and routes it directly to the current producer.
+#[derive(Debug, Deserialize)]
+struct NodeRegistrationClientRequest {
+    /// EON wallet address of the node owner (= tx.from)
+    from: String,
+    /// Node pseudonym (from /api/v1/light-node/register response)
+    node_id: String,
+    /// "light" or "super"
+    node_type: String,
+    /// EON wallet address (same as from)
+    wallet_address: String,
+    /// Proof returned by /api/v1/light-node/register
+    registration_proof: String,
+    /// Unix timestamp used when signing (client must include exact value)
+    timestamp: u64,
+    /// Ed25519 signature over "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
+    signature: String,
+    /// Ed25519 public key (hex)
+    public_key: String,
+    /// Optional Dilithium3 signature for post-quantum security
+    #[serde(default)]
+    dilithium_signature: Option<String>,
+    /// Optional Dilithium3 public key
+    #[serde(default)]
+    dilithium_public_key: Option<String>,
+    /// Public API endpoint (Super nodes only; Light nodes always empty for privacy)
+    #[serde(default)]
+    api_endpoint: Option<String>,
+}
+
 /// Query parameters for transaction history API
 /// Supports pagination, filtering by type, and date range
 #[derive(Debug, Deserialize)]
@@ -1267,6 +1299,18 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_submit);
     
+    // v6.0: Client-created NodeRegistration TX submit (producer-aware routing)
+    let node_registration_submit = api_v1
+        .and(warp::path("node-registration"))
+        .and(warp::path("submit"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(128 * 1024)) // 128KB (Dilithium sig is large)
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_node_registration_client_submit);
+
     // Transaction get - RATE LIMITED v3.19
     let transaction_get = api_v1
         .and(warp::path("transaction"))
@@ -2192,7 +2236,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(activations_by_wallet)
         .or(generate_activation_code)
         .or(verify_activation)
-        .or(node_secure_info);
+        .or(node_secure_info)
+        .or(node_registration_submit);
 
     let consensus_routes = consensus_commit
         .or(consensus_reveal)
@@ -5913,39 +5958,28 @@ async fn handle_light_node_register(
         p2p.register_light_node(registration);
         println!("[INFO][GOSSIP] light_node_gossiped pseudonym={} push={}", light_node_pseudonym, push_type_str);
         
-        // v4.3: Create ON-CHAIN NodeRegistration TX for Light nodes (only for NEW nodes)
-        // + broadcast to all peers for faster inclusion in next block
+        // v6.0: Client-side TX creation flow
+        // NodeRegistration TX is now created and submitted by the CLIENT (wallet app),
+        // not by the server. This ensures:
+        // 1. TX is signed by the user's own key (not a server ephemeral key)
+        // 2. Client can route TX directly to the current producer (producer-aware routing)
+        // 3. NodeRegistration follows the same pipeline as Transfer TX
+        //
+        // The server returns registration_proof so the client can construct the TX.
+        // registration_proof = blake3(burn_tx_hash:node_id:wallet_address)[..32]
         if registration_result == "node_created" {
             let device_sig_hash = blake3::hash(register_request.device_id.as_bytes()).to_hex().to_string();
-            let mut registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
-                &light_node_pseudonym,
-                qnet_state::NodeType::Light,
-                &register_request.wallet_address,
-                &device_sig_hash[..32], // First 32 chars of device signature hash as proof
-            );
-
-            // v5.0: Sign with hybrid crypto (ephemeral Ed25519 + producer Dilithium3).
-            // Any node type (genesis or super) can process registrations.
-            sign_node_registration_tx(&mut registration_tx, &blockchain.get_node_id()).await;
-
-            // Add to mempool for inclusion in next block
-            let mempool = blockchain.get_mempool();
-            let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
-            let tx_hash = registration_tx.hash.clone();
-            if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
-                println!("[INFO][REG] light_onchain_tx node={} wallet={}... hash={}... signed=hybrid", 
-                         light_node_pseudonym, 
-                         &register_request.wallet_address[..16.min(register_request.wallet_address.len())],
-                         &tx_hash[..16.min(tx_hash.len())]);
-                // Broadcast to ALL peers so ANY producer includes it in next block
-                if let Some(ref p2p_ref) = blockchain.get_unified_p2p() {
-                    let _ = p2p_ref.broadcast_transaction(tx_bytes);
-                }
-            } else {
-                eprintln!("[WARN][REG] light_onchain_tx_failed node={}", light_node_pseudonym);
-            }
+            let _ = device_sig_hash; // kept for proof computation below
         }
     }
+    
+    // Compute registration_proof: deterministic, includes burn_tx_hash for on-chain verifiability
+    let registration_proof = {
+        let burn_hash = register_request.burn_tx_hash.as_deref().unwrap_or("no_burn");
+        let proof_input = format!("{}:{}:{}", burn_hash, light_node_pseudonym, register_request.wallet_address);
+        let h = blake3::hash(proof_input.as_bytes()).to_hex().to_string();
+        h[..32].to_string()
+    };
     
     // Calculate next ping time for this node
     let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&light_node_pseudonym);
@@ -5954,6 +5988,8 @@ async fn handle_light_node_register(
         "success": true,
         "message": "Light node registered successfully with privacy protection",
         "node_id": light_node_pseudonym,
+        "registration_proof": registration_proof,
+        "tx_required": true,   // Client must submit NodeRegistration TX via /api/v1/node-registration/submit
         "privacy_enabled": true,
         "push_type": push_type_str,
         "next_ping_time": next_ping_time,
@@ -9403,45 +9439,70 @@ async fn handle_register_node(
         }
     }
     
-    // v4.3 CRITICAL: Create ON-CHAIN NodeRegistration TX to propagate to ALL nodes.
-    // v4.9: Skip for migrations — node already exists on-chain, no duplicate TX needed.
-    //       Migration only updates local RocksDB + RewardManager + P2P announcement.
-    if !is_migration {
-        let mut registration_tx = crate::node::BlockchainNode::create_node_registration_tx(
-            &node_id,
-            if node_type == "super" { qnet_state::NodeType::Super } else { qnet_state::NodeType::Light },
-            wallet_address,
-            &format!("activation_{}", &activation_code[..16.min(activation_code.len())]),
-        );
+    // =========================================================================
+    // ON-CHAIN TX CREATION POLICY (v6.0):
+    //   Super nodes → TX created SERVER-SIDE (server has API endpoint info, no mobile client)
+    //   Light nodes → TX created CLIENT-SIDE (mobile wallet signs + routes to producer)
+    //                 Server returns registration_proof; client calls /node-registration/submit
+    //
+    // This matches the architectural split:
+    //   /api/v1/register          → Super/Genesis (server creates TX)
+    //   /api/v1/light-node/register → Light (server verifies burn, client creates TX)
+    // =========================================================================
+    
+    // Compute registration_proof for all node types (returned to caller)
+    let registration_proof = {
+        let burn_prefix = &activation_code[..16.min(activation_code.len())];
+        let proof_input = format!("activation_{}:{}:{}", burn_prefix, node_id, wallet_address);
+        let h = blake3::hash(proof_input.as_bytes()).to_hex().to_string();
+        h[..32].to_string()
+    };
+    
+    // Super node / Genesis: server creates TX (no mobile client, server knows endpoint)
+    // v4.9: Skip for migrations — node already on-chain.
+    let tx_created_server_side = if node_type == "super" || node_type == "genesis" {
+        if !is_migration {
+            // Use api_endpoint from request body if provided; empty string = node hides IP
+            let api_endpoint = body["api_endpoint"].as_str().unwrap_or("").to_string();
+            let mut registration_tx = crate::node::BlockchainNode::create_node_registration_tx_with_endpoint(
+                &node_id,
+                qnet_state::NodeType::Super,
+                wallet_address,
+                &registration_proof,
+                &api_endpoint,
+            );
+            sign_node_registration_tx(&mut registration_tx, &blockchain.get_node_id()).await;
 
-        // v5.0: Sign with hybrid crypto (ephemeral Ed25519 + producer Dilithium3).
-        // Any node type (genesis or super) can process registrations.
-        sign_node_registration_tx(&mut registration_tx, &blockchain.get_node_id()).await;
-
-        let mempool = blockchain.get_mempool();
-        let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
-        let tx_hash = registration_tx.hash.clone();
-        if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
-            println!("[INFO][REG] onchain_tx type={} node={} wallet={}... hash={}... signed=hybrid",
-                     node_type, node_id,
-                     &wallet_address[..16.min(wallet_address.len())],
-                     &tx_hash[..16.min(tx_hash.len())]);
-            // Broadcast to all peers so ANY producer can include it in next block
-            if let Some(p2p) = blockchain.get_unified_p2p() {
-                let _ = p2p.broadcast_transaction(tx_bytes);
+            let mempool = blockchain.get_mempool();
+            let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
+            let tx_hash = registration_tx.hash.clone();
+            if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
+                println!("[INFO][REG] super_onchain_tx node={} wallet={}... hash={}... signed=hybrid",
+                         node_id,
+                         &wallet_address[..16.min(wallet_address.len())],
+                         &tx_hash[..16.min(tx_hash.len())]);
+                if let Some(p2p) = blockchain.get_unified_p2p() {
+                    let _ = p2p.broadcast_transaction(tx_bytes);
+                }
+            } else {
+                eprintln!("[WARN][REG] super_onchain_tx_failed node={}", node_id);
             }
+            true
         } else {
-            eprintln!("[WARN][REG] onchain_tx_failed type={} node={}", node_type, node_id);
+            println!("[INFO][REG] migration_skip_onchain_tx node={} (already on-chain)", node_id);
+            false
         }
     } else {
-        println!("[INFO][REG] migration_skip_onchain_tx node={} (already on-chain)", node_id);
-    }
+        // Light node: client creates and submits the TX (producer-aware routing)
+        // Server only verifies burn TX and registers locally.
+        println!("[INFO][REG] light_node_tx_deferred_to_client node={}", node_id);
+        false
+    };
     
     // v4.0: Register VRF public key in global registry + persist to storage
     if !quantum_pubkey.is_empty() && quantum_pubkey != "default_quantum_key" {
         if let Ok(pk_bytes) = hex::decode(quantum_pubkey) {
             crate::genesis_constants::register_vrf_public_key(&node_id, &pk_bytes);
-            // Persist to RocksDB for restart survival
             if let Err(e) = blockchain.get_storage().save_vrf_public_key(&node_id, quantum_pubkey) {
                 println!("[WARN][REGISTER] vrf_pk_persist err={}", e);
             }
@@ -9456,10 +9517,16 @@ async fn handle_register_node(
                  node_type, node_id, wallet_address);
     }
     
+    // tx_required = true for Light nodes (client must submit NodeRegistration TX)
+    // tx_required = false for Super/Genesis (server already submitted TX)
+    let tx_required = !tx_created_server_side && (node_type == "light");
+    
     Ok(warp::reply::json(&json!({
         "success": true,
         "node_id": node_id,
         "quantum_pubkey": quantum_pubkey,
+        "registration_proof": registration_proof,
+        "tx_required": tx_required,
         "is_migration": is_migration,
         "message": if is_migration {
             format!("{} node migrated successfully (old server will be deactivated)", node_type)
@@ -11005,21 +11072,62 @@ async fn verify_burn_transaction_exists(
         });
         
         let client = reqwest::Client::new();
-        let response = client
-            .post(solana_rpc)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| format!("Solana RPC request failed: {}", e))?;
-            
-        if !response.status().is_success() {
-            return Err(format!("Solana RPC returned error: {}", response.status()));
+
+        // Solana devnet can take 5-15s to index a fresh transaction.
+        // Retry up to 3 times with 6s delay before giving up.
+        const MAX_ATTEMPTS: u8 = 3;
+        const RETRY_DELAY_SECS: u64 = 6;
+
+        let mut rpc_response: serde_json::Value = serde_json::Value::Null;
+        let mut last_err: Option<String> = None;
+        let mut confirmed = false;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            match client
+                .post(solana_rpc)
+                .json(&request_body)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+            {
+                Err(e) => {
+                    last_err = Some(format!("Solana RPC request failed: {}", e));
+                    println!("[WARN][BURN] solana_rpc_attempt={} err={}", attempt, last_err.as_ref().unwrap());
+                }
+                Ok(resp) if !resp.status().is_success() => {
+                    last_err = Some(format!("Solana RPC returned error: {}", resp.status()));
+                    println!("[WARN][BURN] solana_rpc_attempt={} http_err={}", attempt, last_err.as_ref().unwrap());
+                }
+                Ok(resp) => {
+                    match resp.json::<serde_json::Value>().await {
+                        Err(e) => {
+                            last_err = Some(format!("Failed to parse Solana RPC response: {}", e));
+                        }
+                        Ok(parsed) => {
+                            // If result is null → TX not indexed yet → retry
+                            if parsed["result"].is_null() {
+                                println!("[WARN][BURN] solana_tx_not_indexed_yet attempt={} tx={}...", 
+                                    attempt, &burn_tx_hash[..16.min(burn_tx_hash.len())]);
+                                last_err = Some("Solana TX not indexed yet".to_string());
+                            } else {
+                                rpc_response = parsed;
+                                confirmed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if attempt < MAX_ATTEMPTS {
+                println!("[INFO][BURN] retrying_solana_check in {}s attempt={}/{}", RETRY_DELAY_SECS, attempt, MAX_ATTEMPTS);
+                tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
+            }
         }
-        
-        let rpc_response: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse Solana RPC response: {}", e))?;
+
+        if !confirmed {
+            return Err(last_err.unwrap_or_else(|| "Solana RPC unavailable after retries".to_string()));
+        }
             
         // Check if transaction exists and contains burn to incinerator
         if let Some(result) = rpc_response["result"].as_object() {
@@ -11523,10 +11631,21 @@ async fn handle_producer_status(
     // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
     // Producer selection is deterministic via certified_timeout_round
     
+    // Resolve current producer's HTTP endpoint for direct TX routing
+    // Clients can submit TXs directly to the producer to minimize confirmation latency
+    let producer_endpoint = {
+        let public_nodes = blockchain.get_all_public_api_nodes().await;
+        public_nodes.into_iter()
+            .find(|(nid, ..)| *nid == current_producer)
+            .map(|(_, endpoint, ..)| endpoint)
+            .unwrap_or_default()
+    };
+    
     let status = json!({
         "current_height": current_height,
-        "is_producer": is_leader,  // Fixed: renamed for consistency
-        "current_producer": current_producer,  // ADDED: Show who should produce next block
+        "is_producer": is_leader,
+        "current_producer": current_producer,
+        "producer_endpoint": producer_endpoint,  // Direct HTTP endpoint for TX submission
         "node_id": node_id,
         "leadership_round": leadership_round,
         "next_rotation_height": next_rotation,
@@ -11536,6 +11655,149 @@ async fn handle_producer_status(
     });
     
     Ok(warp::reply::json(&status))
+}
+
+/// v6.0: Handle client-created NodeRegistration TX submission
+/// Flow:
+///   1. Client calls POST /api/v1/light-node/register  → gets node_id + registration_proof
+///   2. Client creates TX, signs with wallet Ed25519 key
+///   3. Client POSTs here (ideally to current producer for minimal latency)
+///   4. Server verifies signature, adds to mempool, broadcasts to P2P
+async fn handle_node_registration_client_submit(
+    req: NodeRegistrationClientRequest,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "transaction") {
+        return Ok(rate_limit_response);
+    }
+
+    // Validate EON address
+    if let Err(e) = validate_eon_address_with_error(&req.from) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid wallet address",
+            "details": e
+        })));
+    }
+
+    // Verify Ed25519 signature
+    // Message: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
+    let message = format!("client_node_reg:{}:{}:{}:{}",
+        req.node_id, req.wallet_address, req.registration_proof, req.timestamp);
+    
+    let sig_valid = verify_ed25519_client_signature(
+        &req.from,
+        &message,
+        &req.signature,
+        &req.public_key,
+    ).await;
+
+    if !sig_valid {
+        println!("[WARN][NODE-REG-CLIENT] ed25519_verify_failed from={}",
+                 &req.from[..16.min(req.from.len())]);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Signature verification failed",
+            "details": "Ed25519 signature does not match client_node_reg message"
+        })));
+    }
+
+    // Optionally verify Dilithium3 if present
+    if let (Some(ref dil_sig), Some(ref dil_pk)) = (&req.dilithium_signature, &req.dilithium_public_key) {
+        if !dil_sig.is_empty() && !dil_pk.is_empty() {
+            match verify_dilithium_client_signature(&message, dil_sig, dil_pk).await {
+                Ok(false) | Err(_) => {
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Dilithium3 signature verification failed"
+                    })));
+                }
+                Ok(true) => {}
+            }
+        }
+    }
+
+    // Early state-level check: reject already-registered nodes before mempool
+    // This gives immediate feedback to the client and prevents mempool pollution
+    {
+        let state_mgr = blockchain.get_state_manager();
+        let state = state_mgr.read().await;
+        if state.is_node_registered(&req.node_id) {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Node already registered",
+                "node_id": req.node_id
+            })));
+        }
+    }
+
+    // Build NodeRegistration TX
+    let node_type = if req.node_type == "super" {
+        qnet_state::NodeType::Super
+    } else {
+        qnet_state::NodeType::Light
+    };
+
+    let api_endpoint = if node_type == qnet_state::NodeType::Light {
+        String::new() // Light nodes never expose endpoint (mobile privacy)
+    } else {
+        req.api_endpoint.unwrap_or_default()
+    };
+
+    let mut reg_tx = crate::node::BlockchainNode::create_node_registration_tx_with_timestamp(
+        &req.node_id,
+        node_type,
+        &req.wallet_address,
+        &req.registration_proof,
+        &api_endpoint,
+        Some(req.timestamp),
+    );
+
+    // Mark as client-signed so build_canonical_verify_message uses the correct format
+    reg_tx.data = Some(format!("client_node_reg:{}:{}:{}:{}",
+        req.node_id, req.wallet_address, req.registration_proof, api_endpoint));
+
+    // Store client's Ed25519 signature (not a server ephemeral key)
+    reg_tx.signature = Some(req.signature.clone());
+    reg_tx.public_key = Some(req.public_key.clone());
+    if let Some(dil_sig) = req.dilithium_signature {
+        reg_tx.dilithium_signature = Some(dil_sig);
+    }
+    if let Some(dil_pk) = req.dilithium_public_key {
+        reg_tx.dilithium_public_key = Some(dil_pk);
+    }
+    // Recalculate hash with updated fields
+    reg_tx.hash = reg_tx.calculate_hash();
+
+    let tx_hash = reg_tx.hash.clone();
+    let tx_bytes = bincode::serialize(&reg_tx).unwrap_or_default();
+    let mempool = blockchain.get_mempool();
+
+    if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
+        println!("[INFO][NODE-REG-CLIENT] tx_added node={} wallet={}... hash={}...",
+                 req.node_id,
+                 &req.wallet_address[..16.min(req.wallet_address.len())],
+                 &tx_hash[..16.min(tx_hash.len())]);
+
+        // Broadcast to all peers so the current producer includes it in the next block
+        if let Some(p2p) = blockchain.get_unified_p2p() {
+            let _ = p2p.broadcast_transaction(tx_bytes);
+        }
+
+        Ok(warp::reply::json(&json!({
+            "success": true,
+            "tx_hash": tx_hash,
+            "node_id": req.node_id,
+            "message": "NodeRegistration TX submitted successfully"
+        })))
+    } else {
+        eprintln!("[WARN][NODE-REG-CLIENT] tx_add_failed node={}", req.node_id);
+        Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Failed to add TX to mempool (duplicate or mempool full)"
+        })))
+    }
 }
 
 /// Handle sync status request

@@ -31,21 +31,6 @@ static void bytes_to_hex(const uint8_t *bytes, size_t len, char *out) {
     out[2*len] = '\0';
 }
 
-static int hex_to_bytes(const char *hex, size_t hex_len, uint8_t *out) {
-    if (hex_len % 2 != 0) return -1;
-    for (size_t i = 0; i < hex_len / 2; i++) {
-        char hi = hex[2*i],   lo = hex[2*i+1];
-        int h = (hi >= '0' && hi <= '9') ? hi-'0' :
-                (hi >= 'a' && hi <= 'f') ? hi-'a'+10 :
-                (hi >= 'A' && hi <= 'F') ? hi-'A'+10 : -1;
-        int l = (lo >= '0' && lo <= '9') ? lo-'0' :
-                (lo >= 'a' && lo <= 'f') ? lo-'a'+10 :
-                (lo >= 'A' && lo <= 'F') ? lo-'A'+10 : -1;
-        if (h < 0 || l < 0) return -1;
-        out[i] = (uint8_t)((h << 4) | l);
-    }
-    return 0;
-}
 
 /**
  * Derive a deterministic 32-byte seed from a string using SHAKE-256.

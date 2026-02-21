@@ -17,6 +17,10 @@ const config = {
   },
   resolver: {
     extraNodeModules: {
+      // css-tree is a Node.js CSS parser pulled in by react-native-svg for its
+      // CSS-in-SVG feature. The wallet app does not use SvgCss/SvgWithCss, so
+      // replacing it with a stub is safe and prevents Hermes compile errors.
+      'css-tree': require.resolve('./css-tree-shim.js'),
       stream: require.resolve('readable-stream'),
       crypto: require.resolve('crypto-browserify'),
       'create-hmac': path.resolve(__dirname, 'create-hmac-polyfill.js'),
