@@ -14398,7 +14398,15 @@ impl BlockchainNode {
                                     // v2.93: System TX bypass signature/amount validation
                                     // CRITICAL FIX: Check by tx_type NOT just by from field!
                                     // HeartbeatCommitment has from=node_id, not "system_*"
-                                    let is_system_tx = tx.from == "system_emission" 
+                                    // v5.1: client-signed NodeRegistration (data starts with "client_node_reg:")
+                                    // is NOT a system TX — its Ed25519+Dilithium signatures MUST be verified.
+                                    // Only genesis/server NodeRegistration (no prefix) retains system bypass.
+                                    let is_client_nodereg = matches!(tx.tx_type,
+                                        qnet_state::TransactionType::NodeRegistration { .. }
+                                    ) && tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:");
+                                    
+                                    let is_system_tx = !is_client_nodereg && (
+                                        tx.from == "system_emission" 
                                         || tx.from == "system_ping_commitment"
                                         || tx.from.starts_with("system_")
                                         || matches!(tx.tx_type, 
@@ -14407,7 +14415,8 @@ impl BlockchainNode {
                                             qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
                                             qnet_state::TransactionType::RewardDistribution { .. } |
                                             qnet_state::TransactionType::NodeRegistration { .. }
-                                        );
+                                        )
+                                    );
                                     
                                     if is_system_tx {
                                         // System TX: only basic validation (no signature/amount check)
@@ -14418,9 +14427,13 @@ impl BlockchainNode {
                                     if let Err(_) = tx.validate() {
                                         return false;
                                     }
-                                    // Additional parallel checks: signature, balance, nonce
-                                    // v2.93: Only for USER transactions (system TX already skipped above)
-                                    if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
+                                    // NodeRegistration has amount=0 by protocol — exempt from amount check.
+                                    // All other user TX must have non-zero amount and Ed25519 signature.
+                                    if is_client_nodereg {
+                                        if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
+                                            return false;
+                                        }
+                                    } else if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
                                         return false;
                                     }
                                 }
@@ -22937,18 +22950,24 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             _ => return Ok(true),
         };
         
-        // v5.0: Use dilithium_public_key as the identity for key lookup, NOT tx.from.
-        // This supports two valid signing patterns:
-        //   1. User TX: dilithium_public_key = wallet_address = tx.from (standard user hybrid TX)
-        //   2. Server TX (NodeRegistration): dilithium_public_key = producer_node_id != tx.from
-        //      The producer node signs with its own long-term Dilithium key; tx.from is the
-        //      user wallet. Using tx.from here would fail because no user Dilithium key exists
-        //      server-side. Using dilithium_public_key selects the correct key for lookup.
-        let signer_id = match &tx.dilithium_public_key {
-            Some(pk) if !pk.is_empty() => pk.clone(),
-            _ => return Err(QNetError::ValidationError(
-                "dilithium_public_key required when dilithium_signature is present".to_string()
-            )),
+        // v5.1: signer_id selection depends on TX type and signing path:
+        //   1. Client-signed NodeRegistration (data starts with "client_node_reg:"):
+        //      The mobile client embeds node_id (pseudonym like "light_mobile_XXXXXXXX") in the
+        //      Dilithium signature format "dilithium_sig_{node_id}_{base64}". signer_id must be
+        //      node_id, NOT dilithium_public_key (which is the raw hex key — a different format).
+        //   2. All other TX: use dilithium_public_key as the node/signer identity for key lookup.
+        let signer_id = match &tx.tx_type {
+            qnet_state::TransactionType::NodeRegistration { node_id, .. }
+                if tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:") =>
+            {
+                node_id.clone()
+            }
+            _ => match &tx.dilithium_public_key {
+                Some(pk) if !pk.is_empty() => pk.clone(),
+                _ => return Err(QNetError::ValidationError(
+                    "dilithium_public_key required when dilithium_signature is present".to_string()
+                )),
+            }
         };
         
         let timestamp = tx.timestamp;
@@ -22988,12 +23007,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             _ => return Ok(true),
         };
         
-        // v5.0: Use dilithium_public_key as the signer identity — see async version for rationale.
-        let signer_id = match &tx.dilithium_public_key {
-            Some(pk) if !pk.is_empty() => pk.clone(),
-            _ => return Err(QNetError::ValidationError(
-                "dilithium_public_key required when dilithium_signature is present".to_string()
-            )),
+        // v5.1: Mirror async version — use node_id for client-signed NodeRegistration.
+        let signer_id = match &tx.tx_type {
+            qnet_state::TransactionType::NodeRegistration { node_id, .. }
+                if tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:") =>
+            {
+                node_id.clone()
+            }
+            _ => match &tx.dilithium_public_key {
+                Some(pk) if !pk.is_empty() => pk.clone(),
+                _ => return Err(QNetError::ValidationError(
+                    "dilithium_public_key required when dilithium_signature is present".to_string()
+                )),
+            }
         };
         
         let message = Self::build_canonical_verify_message(tx);

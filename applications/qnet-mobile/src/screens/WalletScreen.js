@@ -729,10 +729,10 @@ async function fetchCachedBlockHeight() {
   _blockHeightCache.inFlight = true;
   try {
     const apiUrl = getRandomGenesisNode();
-    const resp = await fetch(`${apiUrl}/api/v1/status`, { method: 'GET' });
+    const resp = await fetch(`${apiUrl}/api/v1/height`, { method: 'GET' });
     if (resp.ok) {
       const data = await resp.json();
-      const h = data.height || data.current_height || data.local_height || 0;
+      const h = data.height || data.network_height || data.current_height || data.local_height || 0;
       if (h > 0) {
         _blockHeightCache.height = h;
         _blockHeightCache.fetchedAt = Date.now();
