@@ -1615,10 +1615,10 @@ impl BlockchainNode {
         // Log analysis result
         if slashing_events.is_empty() {
             println!("[INFO][SLASH] epoch={}-{} analyzed={} slashing=0 no_cryptographic_violations", 
-                     start_height, end_height, end_height - start_height + 1);
+                     start_height, end_height, end_height.saturating_sub(start_height).saturating_add(1));
         } else {
             println!("[WARN][SLASH] epoch={}-{} analyzed={} violations={}", 
-                     start_height, end_height, end_height - start_height + 1, slashing_events.len());
+                     start_height, end_height, end_height.saturating_sub(start_height).saturating_add(1), slashing_events.len());
         }
         
         slashing_events
@@ -11612,7 +11612,7 @@ impl BlockchainNode {
                                         println!("[INFO][FORK] rollback from={} to={}", microblock_height, rollback_to);
                                         
                                         // Delete blocks from rollback_to+1 to current
-                                        for h in (rollback_to + 1)..=microblock_height {
+                                        for h in (rollback_to.saturating_add(1))..=microblock_height {
                                             if let Err(e) = storage.delete_microblock(h) {
                                                 println!("[WARN][FORK] delete_block_failed h={} err={}", h, e);
                                             }
@@ -11645,7 +11645,7 @@ impl BlockchainNode {
                                         LAST_BLOCK_PRODUCED_HEIGHT.store(rollback_to, Ordering::Relaxed);
                                         
                                         // Request fresh blocks and macroblocks from network
-                                        println!("[INFO][FORK] request_blocks from={} to={}", rollback_to + 1, network_height);
+                                        println!("[INFO][FORK] request_blocks from={} to={}", rollback_to.saturating_add(1), network_height);
                                         
                                         // Sync macroblocks first (they provide entropy for block validation)
                                         let target_mb = network_height / 90;
@@ -11656,14 +11656,14 @@ impl BlockchainNode {
                                         }
                                         
                                         // Then sync microblocks in batches
-                                        let mut sync_from = rollback_to + 1;
+                                        let mut sync_from = rollback_to.saturating_add(1);
                                         while sync_from <= network_height {
-                                            let sync_to = std::cmp::min(sync_from + 100, network_height);
+                                            let sync_to = std::cmp::min(sync_from.saturating_add(100), network_height);
                                             if let Err(e) = p2p.sync_blocks(sync_from, sync_to).await {
                                                 println!("[WARN][FORK] block_sync_failed h={} err={}", sync_from, e);
                                                 break;
                                             }
-                                            sync_from = sync_to + 1;
+                                            sync_from = sync_to.saturating_add(1);
                                             // Small delay between batches
                                             tokio::time::sleep(Duration::from_millis(100)).await;
                                         }
@@ -15481,7 +15481,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 // PRODUCTION: NON-BLOCKING MACROBLOCK - Swiss watch precision without stops!
                 // Microblocks continue flowing while macroblock consensus runs in background
-                if microblock_height - last_macroblock_trigger == 90 {
+                if microblock_height.saturating_sub(last_macroblock_trigger) == 90 {
                     // PRODUCTION: Performance report every macroblock
                     let shard_count = perf_config.shard_count;
                     let blocks_per_second = 1.0; // 1 microblock per second
@@ -15523,7 +15523,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             // SUCCESS: Macroblock created - trigger was updated correctly
                         } else {
                             // FAILURE: Calculate blocks without finalization using ORIGINAL trigger
-                            let blocks_without_finalization = check_height - current_trigger;
+                            let blocks_without_finalization = check_height.saturating_sub(current_trigger);
                             println!("[WARN][MB] Macroblock #{} not ready after {} blocks since last success", 
                                      expected_macroblock, blocks_without_finalization);
                             
@@ -15552,7 +15552,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // Before block 90, no macroblocks are expected, so don't run recovery
                 if microblock_height >= 90 {
                     // Check every 30 blocks after macroblock boundary
-                    let blocks_since_trigger = microblock_height - last_macroblock_trigger;
+                    let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
                     // CRITICAL FIX: PFP triggers 30 blocks after expected macroblock
                     // Block 120 (30 after 90), 150 (60 after 90), etc.
                     // Block 210 (30 after 180), 240 (60 after 180), etc.
@@ -17726,7 +17726,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Check if node is TOO FAR BEHIND (not synced)
         // CRITICAL: For consensus that starts EARLY (block 61 for macroblock 90),
         // we need to be more lenient because consensus_lookahead adds 29 blocks
-        if stored_height + max_allowed_lag < current_height - consensus_lookahead {
+        if stored_height + max_allowed_lag < current_height.saturating_sub(consensus_lookahead) {
             println!("[WARN][CONS] local_lag stored={} consensus={} max_lag={}", 
                      stored_height, current_height, max_allowed_lag);
             return false; // Cannot initiate or participate if not synced
@@ -18026,7 +18026,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Height 90: ((90-1)/90)+1 = 0+1 = 1 ✅
                     // Height 151: ((151-1)/90)+1 = 1+1 = 2 ✅
                     // Height 180: ((180-1)/90)+1 = 1+1 = 2 ✅
-                    let macroblock_index = ((current_height - 1) / 90) + 1;
+                    let macroblock_index = ((current_height.saturating_sub(1)) / 90) + 1;
                     
                     // v2.48 FIX: Check against GLOBAL finalized round, not local variable!
                     // This ensures all nodes use same source of truth for last finalized MB
@@ -18140,7 +18140,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 // Calculate block range for this macroblock
                                 // Macroblock #1: blocks 1-90
                                 // Macroblock #2: blocks 91-180, etc.
-                                let start_height = ((macroblock_index - 1) * 90) + 1;
+                                let start_height = ((macroblock_index.saturating_sub(1)) * 90) + 1;
                                 let end_height = macroblock_index * 90;
                                 
                                 // Determine if we're the initiator or participant
@@ -20616,7 +20616,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // CRITICAL: For ALL blocks >= 2, use REAL block hash ONLY
         // NO fallback to prevent chain integrity violations
-        match storage.load_microblock(current_height - 1) {
+        match storage.load_microblock(current_height.saturating_sub(1)) {
             Ok(Some(microblock_data)) => {
                 // Calculate hash from stored microblock data
                 use sha3::{Sha3_256, Digest};
@@ -20630,7 +20630,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             _ => {
                 // No fallback - return zero to signal sync needed
                 println!("[WARN][PROD] Cannot get hash for block {} - previous block {} not found", 
-                         current_height, current_height - 1);
+                         current_height, current_height.saturating_sub(1));
                 [0u8; 32]
             }
         }
@@ -21012,7 +21012,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // PRODUCTION: Leader initiates MacroBlock consensus
         if is_info() { println!("[INFO][MB_LEAD] init mb={} range={}-{} blocks={}", 
-                                macroblock_index, start_height, end_height, end_height - start_height + 1); }
+                                macroblock_index, start_height, end_height, end_height.saturating_sub(start_height).saturating_add(1)); }
         
         // PRODUCTION: Execute REAL Byzantine consensus for macroblock creation
         let consensus_data = {
@@ -21769,7 +21769,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 if is_info() { println!("[INFO][MB] created h={} round={}", macroblock.height, round); }
                 println!("[INFO][MB] aggregated={} h={}-{} leader={} bft={}", 
-                         end_height - start_height + 1, start_height, end_height,
+                         end_height.saturating_sub(start_height).saturating_add(1), start_height, end_height,
                          consensus_data.leader_id, consensus_data.participants.len());
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 

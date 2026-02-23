@@ -3540,8 +3540,8 @@ impl Storage {
         let mut macroblocks = Vec::new();
         
         // SCALABILITY: Limit to 10 macroblocks per batch
-        let actual_to = if to_index > from_index && to_index - from_index > 10 {
-            from_index + 9
+        let actual_to = if to_index > from_index && to_index.saturating_sub(from_index) > 10 {
+            from_index.saturating_add(9)
         } else {
             to_index
         };
@@ -5887,7 +5887,7 @@ impl Storage {
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
         
         let mut changed_accounts: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for block_height in (base_height + 1)..=height {
+        for block_height in (base_height.saturating_add(1))..=height {
             let block_key = format!("microblock_{}", block_height);
             if let Ok(Some(_block_data)) = self.persistent.db.get_cf(&microblocks_cf, block_key.as_bytes()) {
                 // In production, parse block and extract account changes

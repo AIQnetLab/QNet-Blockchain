@@ -14057,7 +14057,7 @@ impl SimplifiedP2P {
         // - height 28711 belongs to epoch 2 (blocks 14400-28799)
         let epoch_number = (consensus_start_height / BLOCKS_PER_EPOCH) + 1;  // 1-based
         let window_end_height = epoch_number * BLOCKS_PER_EPOCH;  // 14400, 28800, etc.
-        let window_start_height = window_end_height - BLOCKS_PER_EPOCH;  // 0, 14400, etc.
+        let window_start_height = window_end_height.saturating_sub(BLOCKS_PER_EPOCH);  // 0, 14400, etc.
         
         println!("[INFO][HEARTBEAT] epoch_window epoch={} blocks={}-{} input_h={} (v2.65 fix)", 
                  epoch_number, window_start_height, window_end_height, consensus_start_height);
@@ -15668,8 +15668,8 @@ impl SimplifiedP2P {
         
         // Validate request range (max 100 blocks per batch for performance)
         let max_batch = 100;
-        let actual_to = if to_height - from_height > max_batch {
-            from_height + max_batch - 1
+        let actual_to = if to_height.saturating_sub(from_height) > max_batch {
+            from_height.saturating_add(max_batch).saturating_sub(1)
         } else {
             to_height
         };
@@ -15893,8 +15893,8 @@ impl SimplifiedP2P {
         
         // SCALABILITY: Max 10 macroblocks per batch (~1MB max)
         let max_batch = 10;
-        let actual_to = if to_index > from_index && to_index - from_index > max_batch {
-            from_index + max_batch - 1
+        let actual_to = if to_index > from_index && to_index.saturating_sub(from_index) > max_batch {
+            from_index.saturating_add(max_batch).saturating_sub(1)
         } else {
             to_index
         };
@@ -16124,7 +16124,7 @@ impl SimplifiedP2P {
             if network_height == 0 {
                 0
             } else {
-                (network_height + 89) / 90
+                (network_height.saturating_add(89)) / 90
             }
         } else {
             0
@@ -16327,7 +16327,7 @@ impl SimplifiedP2P {
         }
         
         // STEP 2: Calculate adaptive timeout based on batch size
-        let requested_count = to_height - from_height + 1;
+        let requested_count = to_height.saturating_sub(from_height).saturating_add(1);
         let actual_batch_size = requested_count.min(100);  // Server sends max 100!
         let timeout_secs = match actual_batch_size {
             1 => 2,           // Single block - 2 sec
@@ -20719,7 +20719,7 @@ impl SimplifiedP2P {
         
         // Get candidates from macroblock snapshot (MUST use N-2 for consistency!)
         // FIX v2.92: Was N-1, now N-2 to match calculate_qualified_candidates in node.rs
-        let current_epoch = if height <= 90 { 1 } else { (height - 1) / 90 + 1 };
+        let current_epoch = if height <= 90 { 1 } else { (height.saturating_sub(1)) / 90 + 1 };
         let macroblock_index = current_epoch.saturating_sub(2);  // N-2!
         
         // Try to get from macroblock snapshot first
