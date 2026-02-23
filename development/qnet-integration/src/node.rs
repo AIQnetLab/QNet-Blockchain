@@ -6589,10 +6589,11 @@ impl BlockchainNode {
                     
                     // Also check if this block is way ahead of our chain (fork indicator)
                     // If block height > local + 100, producer might be on a fork
-                    if received_block.height > current_height + 100 {
+                    // saturating_add: prevents overflow when current_height is near u64::MAX
+                    if received_block.height > current_height.saturating_add(100) {
                         println!("[WARN][FORK] suspicious_block h={} local={} producer={} gap={}", 
                                  received_block.height, current_height, producer,
-                                 received_block.height - current_height);
+                                 received_block.height.saturating_sub(current_height));
                         // Don't exclude yet, but log for monitoring
                     }
                 }
@@ -6953,13 +6954,14 @@ impl BlockchainNode {
                                                         
                                                         // Rollback to fork point and resync
                                                         if fork_height <= local_height {
+                                                            let rollback_to = fork_height.saturating_sub(1);
                                                             // v3.23: Start rollback protection
-                                                            if !crate::storage::start_rollback_protection(fork_height - 1) {
+                                                            if !crate::storage::start_rollback_protection(rollback_to) {
                                                                 println!("[WARN][REORG] rollback_protection_busy");
                                                                 return; // Exit async task
                                                             }
                                                             
-                                                            if is_info() { println!("[INFO][REORG] rollback from={} to={}", local_height, fork_height - 1); }
+                                                            if is_info() { println!("[INFO][REORG] rollback from={} to={}", local_height, rollback_to); }
                                                             
                                                             for h in fork_height..=local_height {
                                                                 if let Err(e) = storage_clone.delete_microblock(h) {
@@ -6967,14 +6969,14 @@ impl BlockchainNode {
                                                                 }
                                                             }
                                                             
-                                                            *height_clone.write().await = fork_height - 1;
-                                                            storage_clone.set_chain_height(fork_height - 1).ok();
+                                                            *height_clone.write().await = rollback_to;
+                                                            storage_clone.set_chain_height(rollback_to).ok();
                                                             
                                                             crate::storage::end_rollback_protection();
                                                         }
                                                         
                                                         // Sync missing blocks
-                                                        let sync_to = std::cmp::min(network_height, fork_height + 100);
+                                                        let sync_to = std::cmp::min(network_height, fork_height.saturating_add(100));
                                                         if is_debug() { println!("[DBG][REORG] request from={} to={}", fork_height, sync_to); }
                                                         if let Err(e) = p2p.sync_blocks(fork_height, sync_to).await {
                                                             println!("[ERR][REORG] sync_failed err={}", e);
@@ -7022,9 +7024,10 @@ impl BlockchainNode {
                                                         
                                                         if high_rep_count >= MIN_PEERS_FOR_RESYNC {
                                                             if is_info() { println!("[INFO][REORG] resync validators={}", high_rep_count); }
+                                                            let rollback_to = fork_height.saturating_sub(1);
                                                             
                                                             // v3.23: Start rollback protection
-                                                            if !crate::storage::start_rollback_protection(fork_height - 1) {
+                                                            if !crate::storage::start_rollback_protection(rollback_to) {
                                                                 println!("[WARN][REORG] rollback_protection_busy case2");
                                                                 return; // Exit async task
                                                             }
@@ -7033,8 +7036,8 @@ impl BlockchainNode {
                                                             for h in fork_height..=local_height {
                                                                 let _ = storage_clone.delete_microblock(h);
                                                             }
-                                                            *height_clone.write().await = fork_height - 1;
-                                                            storage_clone.set_chain_height(fork_height - 1).ok();
+                                                            *height_clone.write().await = rollback_to;
+                                                            storage_clone.set_chain_height(rollback_to).ok();
                                                             
                                                             crate::storage::end_rollback_protection();
                                                             
@@ -7777,7 +7780,7 @@ impl BlockchainNode {
                         
                         // CRITICAL: Check if WE are producer for next block
                         // If yes, set flag for immediate production (skip sleep in main loop)
-                        let next_height = received_block.height + 1;
+                        let next_height = received_block.height.saturating_add(1);
                         let next_producer = Self::select_microblock_producer(
                             next_height,
                             &unified_p2p,
@@ -8101,7 +8104,7 @@ impl BlockchainNode {
                 // Re-request missing blocks for expired pending blocks
                 for (height, retry_count) in blocks_to_retry {
                     if height > 0 {
-                        let missing_height = height - 1;  // Previous block is likely missing
+                        let missing_height = height.saturating_sub(1);  // Previous block is likely missing
                         
                         // Check if we can request (rate limiting)
                         // PSEUDO-INFINITE v2.19.20: Exponential backoff for retries >= 10

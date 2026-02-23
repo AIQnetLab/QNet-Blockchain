@@ -5323,8 +5323,9 @@ impl SimplifiedP2P {
             if now > last_log + 2 {
                 GAP_SYNC_COOLDOWN.store(now, std::sync::atomic::Ordering::Relaxed);
                 
-                let from_height = local_height + 1;
-                let to_height = height - 1;
+                let from_height = local_height.saturating_add(1);
+                // saturating_sub: guard against height=0 (impossible in practice but safe)
+                let to_height = height.saturating_sub(1);
                 
                 // Signal gap to global pending queue (processed by node.rs sync loop)
                 PENDING_GAP_SYNC.store(from_height, std::sync::atomic::Ordering::Relaxed);
@@ -5628,7 +5629,7 @@ impl SimplifiedP2P {
         // MEMORY CLEANUP: Remove old entries to prevent memory leak
         // Keep only last 1000 blocks in processed set
         if height > 1000 && height % 100 == 0 {
-            let cleanup_threshold = height - 1000;
+            let cleanup_threshold = height.saturating_sub(1000);
             self.processed_shred_blocks.retain(|&h| h > cleanup_threshold);
             
             // CRITICAL: Also cleanup stale assemblies (incomplete block reconstructions)
@@ -7126,7 +7127,7 @@ impl SimplifiedP2P {
             consensus_height
         };
         
-        println!("[SYNC] ✅ Consensus blockchain height: {}", consensus_height);
+        println!("[INFO][SYNC] Consensus blockchain height: {}", consensus_height);
         
         // RACE CONDITION FIX: Update cached height
         // IMPROVED: Update both cache systems for smooth transition
