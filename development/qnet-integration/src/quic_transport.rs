@@ -130,6 +130,30 @@ pub struct QuicConnection {
     pub bytes_received: AtomicU64,
 }
 
+/// Returns true only if the connection is both explicitly open AND has had recent activity.
+/// `close_reason().is_none()` alone is insufficient: a connection can lose its peer silently
+/// (network partition, OS crash) without ever setting a close_reason — a "zombie" connection.
+/// Secondary check: if last_activity_ms is older than ZOMBIE_TIMEOUT_MS, treat as dead.
+pub fn is_connection_alive(conn: &QuicConnection) -> bool {
+    // Primary: explicit close sets close_reason
+    if conn.connection.close_reason().is_some() {
+        return false;
+    }
+    // Zombie detection: no activity for >60 seconds = dead peer
+    // Must be > keep_alive_interval (30s) to avoid false positives on idle connections
+    const ZOMBIE_TIMEOUT_MS: u64 = 60_000;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let last_ms = conn.last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
+    // Allow grace period for brand-new connections (last_activity_ms may be 0 initially)
+    if last_ms == 0 {
+        return conn.connected_at.elapsed().as_millis() as u64 <= ZOMBIE_TIMEOUT_MS;
+    }
+    now_ms.saturating_sub(last_ms) <= ZOMBIE_TIMEOUT_MS
+}
+
 // ============================================================================
 // TRANSPORT STATISTICS
 // ============================================================================
@@ -374,7 +398,7 @@ impl QuicTransport {
                                         
                                         if is_server_conn {
                                             existing_server_addr = Some(*entry.key());
-                                            existing_server_alive = entry.value().connection.close_reason().is_none();
+                                            existing_server_alive = crate::quic_transport::is_connection_alive(entry.value());
                                             break;
                                         }
                                     }
@@ -726,13 +750,12 @@ impl QuicTransport {
     /// CRITICAL: Thread-safe with double-check to prevent race conditions
     /// v2.24: Improved retry logic for handshake failures
     pub async fn connect(&self, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
-        // FIRST CHECK: Existing connection - but only if it's ALIVE
+        // FIRST CHECK: Existing connection - but only if it's truly ALIVE (not a zombie)
         if let Some(conn) = self.connections.get(&peer_addr) {
-            if conn.connection.close_reason().is_none() {
-                // Connection is alive - reuse it
+            if crate::quic_transport::is_connection_alive(&conn) {
                 return Ok(conn.clone());
             } else {
-                // Connection is dead - remove it and create new one
+                // Connection is dead or zombie - evict and reconnect
                 println!("[INFO][QUIC] removing_dead_conn peer={}", get_privacy_id_for_addr(&peer_addr.to_string()));
                 self.connections.remove(&peer_addr);
             }
@@ -750,7 +773,7 @@ impl QuicTransport {
             // CRITICAL FIX: Double-check before creating connection (race condition protection)
             // Another task may have created connection while we were waiting
             if let Some(conn) = self.connections.get(&peer_addr) {
-                if conn.connection.close_reason().is_none() {
+                if crate::quic_transport::is_connection_alive(&conn) {
                     return Ok(conn.clone());
                 }
             }
@@ -1002,10 +1025,12 @@ impl QuicTransport {
         
         send.finish().map_err(|e| format!("Finish failed: {}", e))?;
         
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        conn.last_activity_ms.store(now_ms, Ordering::Relaxed);
         conn.bytes_sent.fetch_add(wire_data.len() as u64, Ordering::Relaxed);
         conn.messages_sent.fetch_add(1, Ordering::Relaxed);
         
-        // Update stats
         {
             let mut stats = self.stats.write().await;
             stats.messages_sent += 1;
@@ -1168,6 +1193,9 @@ impl QuicTransport {
         
         send.finish().map_err(|e| format!("Finish failed: {}", e))?;
         
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        conn.last_activity_ms.store(now_ms, Ordering::Relaxed);
         conn.bytes_sent.fetch_add(wire_data.len() as u64, Ordering::Relaxed);
         conn.messages_sent.fetch_add(1, Ordering::Relaxed);
         
@@ -1426,14 +1454,13 @@ impl QuicTransport {
     /// v2.24: Get alive connection count (excludes dead connections)
     pub fn alive_connection_count(&self) -> usize {
         self.connections.iter()
-            .filter(|entry| entry.value().connection.close_reason().is_none())
+            .filter(|entry| crate::quic_transport::is_connection_alive(entry.value()))
             .count()
     }
-    
-    /// v2.24: Check if a specific connection is alive
+
     pub fn is_connection_alive(&self, peer_addr: &SocketAddr) -> bool {
         self.connections.get(peer_addr)
-            .map(|conn| conn.connection.close_reason().is_none())
+            .map(|conn| crate::quic_transport::is_connection_alive(&conn))
             .unwrap_or(false)
     }
     

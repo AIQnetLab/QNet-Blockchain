@@ -1070,23 +1070,35 @@ const WalletScreen = () => {
   }, [activeTab, wallet, burnProgress]);
 
   const loadBurnProgress = async () => {
+    let done = false;
+    const fallbackTimer = setTimeout(function() {
+      if (!done) { done = true; setBurnProgress('0.0'); }
+    }, 8000);
     try {
       const progress = await walletManager.getBurnProgress(isTestnet);
-      setBurnProgress(progress);
+      if (!done) { done = true; clearTimeout(fallbackTimer); setBurnProgress(progress); }
     } catch (error) {
-      // console.error('Failed to load burn progress:', error);
-      setBurnProgress('0.0');
+      if (!done) { done = true; clearTimeout(fallbackTimer); setBurnProgress('0.0'); }
     }
   };
-  
+
+  const _pricingFallback = {
+    cost: 1500, currency: '1DEV', phase: 1, mechanism: 'burn',
+    burnPercent: 0, baseCost: 1500,
+    description: 'Burn 1500 1DEV for activation', isEstimate: true
+  };
+
   // Load dynamic activation pricing
   const loadActivationPricing = async () => {
+    let done = false;
+    const fallbackTimer = setTimeout(function() {
+      if (!done) { done = true; setActivationPricing(_pricingFallback); }
+    }, 8000);
     try {
-      // v3.18: Use 'light' as default for pricing display
       const pricing = await walletManager.calculateActivationCost('light');
-      setActivationPricing(pricing);
+      if (!done) { done = true; clearTimeout(fallbackTimer); setActivationPricing(pricing); }
     } catch (error) {
-      setActivationPricing(null);
+      if (!done) { done = true; clearTimeout(fallbackTimer); setActivationPricing(_pricingFallback); }
     }
   };
   
@@ -2608,7 +2620,7 @@ const WalletScreen = () => {
       setImportStep(1); // Reset to step 1 for next time
       setLoading(false);
       
-      // Clear previous wallet's activation data and node status
+      // Clear activation and node state from previous wallet
       setActivatedNodeType(null);
       setActivationCode(null);
       setNodeRewards(null);
@@ -2737,7 +2749,7 @@ const WalletScreen = () => {
     // setPassword(''); // DON'T clear password
     setConfirmPassword('');
     setSeedConfirmWords({});
-    // Clear activation status for new wallet
+    // Clear activation and node state for new wallet
     setActivatedNodeType(null);
     setActivationCode(null);
     setNodeRewards(null);
@@ -5074,16 +5086,21 @@ const WalletScreen = () => {
                             setActivatedNodeType(nodeStatus);
                             setActivationCode(code);
                             setNodeStatus(null);
-                            
+                            // Clear stale node status from previous wallet sessions
+                            setLightNodeStatus(null);
+                            setServerNodeStatus(null);
+
                             // Persist activation state for restore on re-login
-                            const burnPseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
+                            const burnWalletAddr = wallet.qnetAddress || wallet.address;
+                            const burnPseudonym = walletManager.generateLightNodePseudonym(burnWalletAddr);
+                            setNodePseudonym(burnPseudonym); // ← set in state immediately, not just AsyncStorage
                             AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
                               nodeType: nodeStatus,
                               code: code,
                               pseudonym: burnPseudonym,
                               timestamp: Date.now(),
                               burnTxHash: result.signature,
-                              walletAddress: wallet.qnetAddress || wallet.address
+                              walletAddress: burnWalletAddr
                             })).catch(() => {});
                             AsyncStorage.setItem(`node_pseudonym_${code}`, burnPseudonym).catch(() => {});
                             
@@ -5245,7 +5262,8 @@ const WalletScreen = () => {
                     // This is independent of checkBlockchainForActivations — uses raw fetch, not @solana/web3.js
                     console.log('[RECOVER] Fetching burn TX directly from Solana RPC...');
                     try {
-                      const burnInfo = await walletManager.findBurnTransactionOnSolana(wallet.publicKey);
+                      const burnTimeout = new Promise(function(resolve) { setTimeout(function() { resolve(null); }, 12000); });
+                      const burnInfo = await Promise.race([walletManager.findBurnTransactionOnSolana(wallet.publicKey), burnTimeout]);
                       if (burnInfo && burnInfo.burnTxHash) {
                         console.log('[RECOVER] Found burn TX on Solana:', burnInfo.burnTxHash, 'type:', burnInfo.nodeType);
                         const nodeType = burnInfo.nodeType || 'light';

@@ -1286,7 +1286,28 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::get())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_download);
-    
+
+    // v5.0: GET /api/v1/snapshot/{height}/manifest - Chunk manifest for parallel download
+    let snapshot_manifest = api_v1
+        .and(warp::path("snapshot"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path("manifest"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_snapshot_manifest);
+
+    // v5.0: GET /api/v1/snapshot/{height}/chunk/{index} - Download specific chunk
+    let snapshot_chunk = api_v1
+        .and(warp::path("snapshot"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path("chunk"))
+        .and(warp::path::param::<usize>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_snapshot_chunk);
+
     // Transaction endpoints with IP-based rate limiting
     // SECURITY: Limit transaction body to 64KB (typical TX is <1KB)
     let transaction_submit = api_v1
@@ -2158,7 +2179,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(block_by_hash)
         .or(macroblock_by_index)
         .or(snapshot_latest)
-        .or(snapshot_download);
+        .or(snapshot_download)
+        .or(snapshot_manifest)
+        .or(snapshot_chunk);
         
     let account_routes = account_info
         .or(account_balance)
@@ -3688,7 +3711,7 @@ async fn handle_block_by_height(
     
     // v3.19: Validate height parameter (prevent resource exhaustion)
     let current_height = blockchain.get_height().await;
-    if height > current_height + 1000 {
+    if height > current_height.saturating_add(1000) {
         return Ok(warp::reply::json(&json!({
             "error": "Invalid height",
             "message": "Requested height is too far in the future",
@@ -3946,6 +3969,65 @@ async fn handle_snapshot_download(
             Ok(warp::reply::with_header(
                 warp::reply::with_header(
                     serde_json::to_vec(&error_response).unwrap_or_default(),
+                    "Content-Type",
+                    "application/json"
+                ),
+                "Content-Disposition",
+                ""
+            ))
+        }
+    }
+}
+
+/// v5.0: GET /api/v1/snapshot/{height}/manifest — chunk manifest for parallel download
+async fn handle_snapshot_manifest(
+    height: u64,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    match blockchain.get_storage().get_snapshot_manifest(height) {
+        Ok(Some(manifest)) => Ok(warp::reply::json(&manifest)),
+        Ok(None) => {
+            Ok(warp::reply::json(&json!({ "error": "Snapshot not found", "height": height })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({ "error": "Manifest error", "details": e.to_string() })))
+        }
+    }
+}
+
+/// v5.0: GET /api/v1/snapshot/{height}/chunk/{index} — download a single chunk
+async fn handle_snapshot_chunk(
+    height: u64,
+    chunk_index: usize,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    match blockchain.get_storage().get_snapshot_chunk(height, chunk_index as u64) {
+        Ok(Some(data)) => {
+            Ok(warp::reply::with_header(
+                warp::reply::with_header(
+                    data,
+                    "Content-Type",
+                    "application/octet-stream"
+                ),
+                "Content-Disposition",
+                format!("attachment; filename=\"snap_{}_{}.bin\"", height, chunk_index)
+            ))
+        }
+        Ok(None) => {
+            Ok(warp::reply::with_header(
+                warp::reply::with_header(
+                    serde_json::to_vec(&json!({"error":"Chunk not found"})).unwrap_or_default(),
+                    "Content-Type",
+                    "application/json"
+                ),
+                "Content-Disposition",
+                ""
+            ))
+        }
+        Err(e) => {
+            Ok(warp::reply::with_header(
+                warp::reply::with_header(
+                    serde_json::to_vec(&json!({"error": e.to_string()})).unwrap_or_default(),
                     "Content-Type",
                     "application/json"
                 ),
@@ -7995,7 +8077,7 @@ async fn handle_claim_rewards(
             if let Some(ref reward) = claim_result.reward {
                 // PRODUCTION v2.43.1: Save claim history to storage for /rewards/history API
                 let current_height = blockchain.get_height().await;
-                let current_epoch = (current_height / 14400) + 1;
+                let current_epoch = (current_height / 14400).saturating_add(1);
                 let current_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -8090,9 +8172,9 @@ async fn handle_get_pending_rewards(
     
     // Calculate current epoch boundaries
     let current_height = blockchain.get_height().await;
-    let current_epoch = (current_height / 14400) + 1;
-    let epoch_start = (current_epoch - 1) * 14400;
-    let epoch_end = current_epoch * 14400;
+    let current_epoch = (current_height / 14400).saturating_add(1);
+    let epoch_start = current_epoch.saturating_sub(1).saturating_mul(14400);
+    let epoch_end = current_epoch.saturating_mul(14400);
     let blocks_until_next = epoch_end.saturating_sub(current_height);
     
     // Determine node type from ID
@@ -8265,7 +8347,7 @@ async fn handle_get_reward_history(
     }
     
     let current_height = blockchain.get_height().await;
-    let current_epoch = (current_height / 14400) + 1;
+    let current_epoch = (current_height / 14400).saturating_add(1);
     
     // Pagination: default offset=0, limit=10, max limit=100
     let offset = query.offset.unwrap_or(0) as u64;
@@ -8378,7 +8460,7 @@ async fn handle_get_reward_pools(
     
     // Calculate current epoch info
     let current_height = blockchain.get_height().await;
-    let current_epoch = (current_height / 14400) + 1;
+    let current_epoch = (current_height / 14400).saturating_add(1);
     let blocks_in_epoch = current_height % 14400;
     
     // PRODUCTION v2.43.1: Use cached accumulated pools (10 sec TTL)
@@ -8504,7 +8586,7 @@ async fn handle_get_rewards_by_wallet(
     
     let mut nodes_info = Vec::new();
     let current_height = blockchain.get_height().await;
-    let current_epoch = (current_height / 14400) + 1;
+    let current_epoch = (current_height / 14400).saturating_add(1);
     
     // v3.1: Get active nodes list to determine online status
     let now = std::time::SystemTime::now()
@@ -8646,7 +8728,7 @@ async fn handle_get_pending_rewards_batch(
     let reward_manager = reward_manager_arc.read().await;
     
     let current_height = blockchain.get_height().await;
-    let current_epoch = (current_height / 14400) + 1;
+    let current_epoch = (current_height / 14400).saturating_add(1);
     
     // v3.34: Read authoritative totals from StateManager
     let state_arc = blockchain.get_state_manager();
@@ -8724,7 +8806,7 @@ async fn handle_get_reward_network_stats(
     }
     
     let current_height = blockchain.get_height().await;
-    let current_epoch = (current_height / 14400) + 1;
+    let current_epoch = (current_height / 14400).saturating_add(1);
     let storage = blockchain.get_storage();
     
     // Get accumulated pools from P2P
@@ -8827,7 +8909,7 @@ async fn handle_get_reward_summary(
     
     let storage = blockchain.get_storage();
     let current_height = blockchain.get_height().await;
-    let current_epoch = (current_height / 14400) + 1;
+    let current_epoch = (current_height / 14400).saturating_add(1);
     
     // Aggregated counters
     let mut total_claimed: u64 = 0;
@@ -10489,9 +10571,9 @@ async fn handle_consensus_commit(
             signature: generate_quantum_signature(&commit_request.node_id, &commit_request.commit_hash).await,
         };
 
-        // PRODUCTION v2.40: Get current block height for phase validation
-        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-        
+        // Use canonical height from blockchain (not stale atomic cache)
+        let current_height = blockchain.get_height().await;
+
         // Process commit through consensus engine with block height
         match consensus_engine.process_commit(commit, current_height).await {
             Ok(_) => {
@@ -10565,9 +10647,9 @@ async fn handle_consensus_reveal(
             signature: String::new(), // RPC external API - no signature
         };
 
-        // PRODUCTION v2.40.3: Get current block height for phase validation
-        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-        
+        // Use canonical height from blockchain (not stale atomic cache)
+        let current_height = blockchain.get_height().await;
+
         // Process reveal through consensus engine with block height (async)
         match consensus_engine.submit_reveal(reveal, current_height).await {
             Ok(_) => {
@@ -11659,20 +11741,14 @@ async fn handle_producer_status(
     
     // CRITICAL FIX: Calculate round for NEXT block (current_height + 1)
     // API shows producer status for the NEXT block to be produced
-    let next_height = current_height + 1;
-    let leadership_round = if next_height == 0 {
-        0  // Genesis block special case
-    } else if next_height <= 30 {
-        0  // Blocks 1-30 are round 0
+    let next_height = current_height.saturating_add(1);
+    let leadership_round = if next_height <= 30 {
+        0u64  // Blocks 0-30 are round 0
     } else {
-        (next_height - 1) / 30  // Blocks 31-60 = round 1, 61-90 = round 2, etc.
+        next_height.saturating_sub(1) / 30
     };
-    let next_rotation = (leadership_round + 1) * 30 + 1;  // Round N ends at N*30+30, next starts at N*30+31
-    let blocks_until_rotation = if current_height == 0 {
-        31 - current_height  // Special case for genesis
-    } else {
-        next_rotation - current_height
-    };
+    let next_rotation = leadership_round.saturating_add(1).saturating_mul(30).saturating_add(1);
+    let blocks_until_rotation = next_rotation.saturating_sub(current_height);
     
     // CRITICAL FIX: Get current producer for next block (already calculated above)
     let mut current_producer = if let Some(p2p) = blockchain.get_unified_p2p() {
@@ -12012,8 +12088,8 @@ async fn handle_block_statistics(
         "average_block_time": avg_block_time,
         "microblocks_produced": current_height,
         "macroblock_height": current_height / 90,
-        "next_macroblock": ((current_height / 90) + 1) * 90,
-        "blocks_until_macroblock": 90 - (current_height % 90),
+        "next_macroblock": (current_height / 90).saturating_add(1).saturating_mul(90),
+        "blocks_until_macroblock": 90u64.saturating_sub(current_height % 90),
         "pending_transactions": mempool_size,
         "average_tx_per_block": if current_height > 0 { mempool_size as f64 / current_height as f64 } else { 0.0 },
     });

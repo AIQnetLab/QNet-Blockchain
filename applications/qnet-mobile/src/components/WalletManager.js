@@ -3937,18 +3937,24 @@ export class WalletManager {
       const TOTAL_SUPPLY = 1000000000; // 1 billion total supply
       
       // Try to get current supply and calculate burned amount
-      const response = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTokenSupply',
-          params: [oneDevMint]
-        })
-      });
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+      let response;
+      try {
+        response = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getTokenSupply',
+            params: [oneDevMint]
+          })
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
       
       if (response.ok) {
         const data = await response.json();

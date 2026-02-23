@@ -198,14 +198,23 @@ impl StateMerkleTree {
         self.pending_updates
     }
     
-    /// Remove account
+    /// Remove account with immediate root recomputation
     pub fn remove(&mut self, address: &str) -> [u8; HASH_SIZE] {
         let addr_hash = Self::hash_address(address);
         self.leaves.remove(&addr_hash);
         self.dirty = true;
         self.pending_updates += 1;
-        // For remove, we recompute immediately (rare operation)
         self.finalize()
+    }
+
+    /// Remove account leaf WITHOUT root recomputation (lazy)
+    /// O(1) amortized — used during block rollback to batch multiple removals
+    /// Call finalize() once after all rollback operations complete
+    pub fn remove_lazy(&mut self, address: &str) {
+        let addr_hash = Self::hash_address(address);
+        self.leaves.remove(&addr_hash);
+        self.dirty = true;
+        self.pending_updates += 1;
     }
     
     /// Get current root (with lazy recomputation if dirty)
@@ -295,11 +304,32 @@ impl StateMerkleTree {
     
     fn hash_account(account: &Account) -> [u8; HASH_SIZE] {
         let mut hasher = Sha3_256::new();
-        hasher.update(b"QNET_ACCOUNT:");
+        hasher.update(b"QNET_ACCOUNT_V2:");
+        // Consensus-critical fields (modified only through deterministic block processing)
         hasher.update(&account.balance.to_le_bytes());
         hasher.update(&account.nonce.to_le_bytes());
-        hasher.update(&account.pending_rewards.to_le_bytes());
         hasher.update(account.address.as_bytes());
+        // Contract state — deterministically modified through ContractCall TXs
+        hasher.update(&[account.is_contract as u8]);
+        if let Some(ref code_hash) = account.contract_code_hash {
+            hasher.update(b"CODE:");
+            hasher.update(code_hash.as_bytes());
+        }
+        if !account.contract_storage.is_empty() {
+            hasher.update(b"STORAGE:");
+            // Keys MUST be sorted — HashMap iteration is non-deterministic
+            let mut sorted_keys: Vec<&String> = account.contract_storage.keys().collect();
+            sorted_keys.sort();
+            for key in sorted_keys {
+                hasher.update(key.as_bytes());
+                hasher.update(account.contract_storage[key].as_bytes());
+            }
+        }
+        // EXCLUDED from hash (updated out-of-band, not through block TXs):
+        //   - pending_rewards: updated via MacroBlock processing at non-deterministic timing
+        //     reflected in state_root only when claimed via RewardDistribution TX
+        //   - reputation: f64 is non-deterministic across platforms
+        //   - is_node, node_type, created_at, updated_at: metadata only
         let result = hasher.finalize();
         let mut arr = [0u8; HASH_SIZE];
         arr.copy_from_slice(&result);
@@ -452,34 +482,65 @@ impl Default for ChainState {
 // TX-level rollback NOT NEEDED - apply_transaction_lazy already atomic!
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Block-level snapshot for full block rollback on state_root mismatch
-/// Created ONCE per block - used only when state_root verification fails
-/// Memory: O(n) where n = accounts, but happens once per 1-second block
+/// Block-level journal for O(k) rollback where k = modified accounts.
+/// Records pre-images of accounts touched by transactions in this block.
+/// On rollback, restores only those accounts instead of the entire state.
 #[derive(Clone)]
 pub struct BlockSnapshot {
-    /// Full accounts snapshot
-    accounts: HashMap<String, Account>,
-    /// Block height
+    /// Pre-images of accounts that existed before modification
+    pre_images: HashMap<String, Account>,
+    /// Addresses of accounts created during this block (didn't exist before)
+    created_keys: HashSet<String>,
+    /// Block height for logging
     height: u64,
 }
 
 impl BlockSnapshot {
-    /// Create snapshot of current state (O(n) but ONCE per block)
-    pub fn new(accounts: &DashMap<String, Account>, height: u64) -> Self {
+    /// Create an empty journal for the upcoming block. O(1).
+    pub fn new(_accounts: &DashMap<String, Account>, height: u64) -> Self {
         Self {
-            accounts: accounts.iter().map(|e| (e.key().clone(), e.value().clone())).collect(),
+            pre_images: HashMap::new(),
+            created_keys: HashSet::new(),
             height,
         }
     }
-    
-    /// Get accounts for restore
-    pub fn accounts(&self) -> &HashMap<String, Account> {
-        &self.accounts
+
+    /// Record pre-images of addresses that a transaction is about to touch.
+    /// Must be called BEFORE each apply_transaction_lazy in the block.
+    /// Captures at most once per address (first write wins = original pre-image).
+    pub fn record_pre_images(&mut self, addresses: &[String], accounts: &DashMap<String, Account>) {
+        for addr in addresses {
+            if self.pre_images.contains_key(addr) || self.created_keys.contains(addr) {
+                continue; // already captured
+            }
+            match accounts.get(addr) {
+                Some(entry) => {
+                    self.pre_images.insert(addr.clone(), entry.value().clone());
+                }
+                None => {
+                    self.created_keys.insert(addr.clone());
+                }
+            }
+        }
     }
-    
-    /// Get snapshot height
+
+    /// Legacy accessor — returns pre-images for rollback
+    pub fn accounts(&self) -> &HashMap<String, Account> {
+        &self.pre_images
+    }
+
+    /// Accounts created during this block (to be removed on rollback)
+    pub fn created_keys(&self) -> &HashSet<String> {
+        &self.created_keys
+    }
+
     pub fn height(&self) -> u64 {
         self.height
+    }
+
+    /// Number of accounts journaled (pre-images + created)
+    pub fn journal_size(&self) -> usize {
+        self.pre_images.len() + self.created_keys.len()
     }
 }
 
@@ -1098,29 +1159,39 @@ impl StateManager {
         BlockSnapshot::new(&self.accounts, height)
     }
     
-    /// v3.39: Rollback entire block using snapshot
-    /// Used ONLY when state_root verification fails after all TXs applied
-    /// CRITICAL: Must also reset Merkle tree to match snapshot accounts!
+    /// v5.0: O(k) block rollback using journal pre-images
+    /// Only touches k modified/created accounts instead of rebuilding entire Merkle tree.
+    /// Previous approach: O(n) — destroy tree + re-insert all n accounts.
+    /// New approach: O(k) leaf updates + single finalize (recompute_root is O(n) but
+    /// avoids n BTreeMap insertions which were O(n log n) total).
     pub fn rollback_block(&self, snapshot: &BlockSnapshot) {
-        // 1. Clear and restore accounts
-        self.accounts.clear();
+        let k_removed = snapshot.created_keys().len();
+        let k_restored = snapshot.accounts().len();
+
+        // 1. Remove accounts created during this block from DashMap
+        for addr in snapshot.created_keys() {
+            self.accounts.remove(addr);
+        }
+
+        // 2. Restore pre-images of modified accounts into DashMap
         for (address, account) in snapshot.accounts() {
             self.accounts.insert(address.clone(), account.clone());
         }
-        
-        // 2. CRITICAL FIX: Reset Merkle tree completely and rebuild from snapshot
-        // Without this, leaves from failed attempt would corrupt future calculations!
+
+        // 3. O(k) incremental Merkle update — only touch changed leaves
         let mut tree = self.merkle_tree.write();
-        *tree = StateMerkleTree::new();  // Reset to empty tree
-        
-        // 3. Rebuild Merkle tree from snapshot accounts
+
+        for addr in snapshot.created_keys() {
+            tree.remove_lazy(addr);
+        }
         for (address, account) in snapshot.accounts() {
             tree.insert_lazy(address, account);
         }
-        // Tree is now dirty and will be finalized on next finalize_merkle() call
-        
-        println!("[INFO][STATE] block_rollback h={} accounts={} merkle_reset=true", 
-                 snapshot.height(), snapshot.accounts().len());
+
+        tree.finalize();
+
+        println!("[INFO][STATE] block_rollback h={} restored={} removed={} merkle=O(k) k={}",
+                 snapshot.height(), k_restored, k_removed, k_removed + k_restored);
     }
     
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -1270,22 +1341,19 @@ impl StateManager {
     pub fn update_pending_rewards(&self, node_wallet: &str, reward_amount: u64) -> StateResult<()> {
         let mut account = self.accounts.entry(node_wallet.to_string())
             .or_insert_with(|| Account::new(node_wallet.to_string()));
-        
-        // v2.100: CRITICAL FIX - SET not ADD!
-        // reward_amount is already the TOTAL accumulated from PhaseAwareRewardManager
+
+        // SET not ADD — reward_amount is TOTAL accumulated from PhaseAwareRewardManager
         account.pending_rewards = reward_amount;
-        
-        // v3.22: Lazy merkle update (finalized with block)
-        {
-            let account_clone = account.clone();
-            let mut tree = self.merkle_tree.write();
-            tree.insert_lazy(node_wallet, &account_clone);
-        }
-        
+
+        // Merkle tree is NOT updated here — it will be updated deterministically
+        // when the next block's apply_transaction_lazy + finalize_merkle runs.
+        // Updating Merkle out-of-band causes state_root divergence between nodes
+        // that process MacroBlocks at different times.
+
         println!("[INFO][STATE] pending_rewards_updated wallet={}... amount={} QNC",
                  &node_wallet[..node_wallet.len().min(16)],
                  reward_amount / 1_000_000_000);
-        
+
         Ok(())
     }
     

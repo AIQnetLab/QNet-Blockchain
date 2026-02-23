@@ -4678,6 +4678,8 @@ impl BlockchainNode {
         // from a clean in-memory state; the node will re-apply blocks from disk.
         let pre_snapshot_chain_height = storage.get_chain_height().unwrap_or(0);
         
+        let mut restored_snapshot_height: u64 = 0;
+
         match storage.load_latest_state_snapshot().await {
             Ok(Some((snapshot_height, state_root, accounts_data))) => {
                 // SAFETY: Reject snapshots that are ahead of committed blockchain data.
@@ -4692,8 +4694,8 @@ impl BlockchainNode {
                                 Ok(_) => {
                                     println!("[INFO][STATE] snapshot_restored height={} accounts={} size={}KB", 
                                              snapshot_height, accounts.len(), accounts_data.len() / 1024);
+                                    restored_snapshot_height = snapshot_height;
                                     
-                                    // Verify state_root matches
                                     match (*state_guard).calculate_state_root() {
                                         Ok(calculated_root) => {
                                             if calculated_root == state_root {
@@ -4728,6 +4730,76 @@ impl BlockchainNode {
             Err(e) => {
                 eprintln!("[WARN][STATE] snapshot_load_fail err={} starting_fresh", e);
             }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // v5.0: INCREMENTAL REPLAY — replay blocks from snapshot to chain tip
+        // Ensures state is fully consistent even if snapshot is behind chain_height.
+        // Without this, accounts modified between snapshot and tip are stale.
+        // ═══════════════════════════════════════════════════════════════════
+        if restored_snapshot_height > 0 && pre_snapshot_chain_height > restored_snapshot_height {
+            let replay_start = restored_snapshot_height.saturating_add(1);
+            let replay_end = pre_snapshot_chain_height;
+            let replay_count = replay_end.saturating_sub(replay_start).saturating_add(1);
+            println!("[INFO][STATE] incremental_replay start={} end={} blocks={}", replay_start, replay_end, replay_count);
+
+            let replay_time = std::time::Instant::now();
+            let mut replayed = 0u64;
+            let mut replay_errors = 0u64;
+
+            for h in replay_start..=replay_end {
+                match storage.load_microblock_auto_format(h) {
+                    Ok(Some(microblock)) => {
+                        let state_guard = state.write().await;
+                        for tx in &microblock.transactions {
+                            if let Err(e) = state_guard.apply_transaction_lazy(tx) {
+                                if is_debug() {
+                                    println!("[DBG][REPLAY] tx_skip h={} err={}", h, e);
+                                }
+                            }
+                        }
+                        // Apply gas refunds
+                        for tx in &microblock.transactions {
+                            let _ = state_guard.apply_gas_refund(tx, h);
+                        }
+                        // Finalize Merkle and verify state_root
+                        let _computed_root = state_guard.finalize_merkle();
+                        if microblock.state_root != [0u8; 32] {
+                            match state_guard.calculate_state_root() {
+                                Ok(full_root) if full_root != microblock.state_root => {
+                                    if replay_errors < 3 {
+                                        eprintln!("[WARN][REPLAY] state_root_mismatch h={} expected={} got={}",
+                                                 h, hex::encode(&microblock.state_root[..8]), hex::encode(&full_root[..8]));
+                                    }
+                                    replay_errors += 1;
+                                }
+                                Err(e) => {
+                                    if replay_errors < 3 {
+                                        eprintln!("[ERR][REPLAY] state_root_calc h={} err={}", h, e);
+                                    }
+                                    replay_errors += 1;
+                                }
+                                _ => {} // match
+                            }
+                        }
+                        replayed += 1;
+                    }
+                    Ok(None) => {
+                        println!("[WARN][REPLAY] block_missing h={} — state may be incomplete", h);
+                        replay_errors += 1;
+                    }
+                    Err(e) => {
+                        if replay_errors < 3 {
+                            eprintln!("[WARN][REPLAY] load_fail h={} err={}", h, e);
+                        }
+                        replay_errors += 1;
+                    }
+                }
+            }
+
+            let elapsed = replay_time.elapsed();
+            println!("[INFO][STATE] incremental_replay_done replayed={}/{} errors={} elapsed={:.2}s",
+                     replayed, replay_count, replay_errors, elapsed.as_secs_f64());
         }
         
         // Initialize production-ready mempool with AUTO-SCALING
@@ -5602,6 +5674,16 @@ impl BlockchainNode {
             }
         }
         
+        // v5.0: Share wallet identity with P2P layer for Dilithium3-signed HealthPing
+        if let (Some(ref identity), Some(ref p2p)) = (&blockchain.wallet_identity, &blockchain.unified_p2p) {
+            p2p.set_wallet_identity(identity.clone());
+        }
+
+        // v5.1: Start Kademlia DHT routing table refresh task
+        if let Some(ref p2p) = blockchain.unified_p2p {
+            p2p.start_kademlia_refresh_task();
+        }
+
         if is_debug() { println!("[DBG][NODE] created node_id={}", node_id); }
         
         // v4.0: Restore VRF public keys from persistent storage
@@ -7116,7 +7198,7 @@ impl BlockchainNode {
                             // For old blocks - no snapshot needed (saves ~200MB RAM per block)
                             // ═══════════════════════════════════════════════════════════════════
                             let has_state_root = microblock.state_root != [0u8; 32];
-                            let block_snapshot = if has_state_root {
+                            let mut block_snapshot = if has_state_root {
                                 Some(state_guard.create_block_snapshot(microblock.height))
                             } else {
                                 None
@@ -7136,6 +7218,13 @@ impl BlockchainNode {
                                 }
                             }
                             
+                            // Deferred side effects — applied ONLY after save_microblock succeeds.
+                            // On rollback (state_root mismatch / save failure) these are discarded.
+                            let mut deferred_pool3: u64 = 0;
+                            let mut deferred_registrations: Vec<(String, String, String)> = Vec::new();
+                            let mut deferred_emission_mbs: Vec<u64> = Vec::new();
+                            let mut deferred_reward_clears: Vec<(String, u64)> = Vec::new();
+
                             // Apply ALL transactions from block to state
                             for tx in &microblock.transactions {
                                 // SPECIAL HANDLING: RewardDistribution transactions
@@ -7173,8 +7262,8 @@ impl BlockchainNode {
                                     let current_epoch = microblock.height / EMISSION_BLOCK_INTERVAL;
                                     let emission_mb_index = if current_epoch >= 2 {
                                         // Delayed by 1 epoch: rewarding_epoch = current_epoch - 2
-                                        let rewarding_epoch = current_epoch - 2;
-                                        let rewarding_epoch_end_block = (rewarding_epoch + 1) * EMISSION_BLOCK_INTERVAL;
+                                        let rewarding_epoch = current_epoch.saturating_sub(2);
+                                        let rewarding_epoch_end_block = rewarding_epoch.saturating_add(1).saturating_mul(EMISSION_BLOCK_INTERVAL);
                                         rewarding_epoch_end_block / MICROBLOCKS_PER_MB
                                         // Block 28800: epoch=2, rewarding=0, end=14400, mb=160 ✓
                                         // Block 43200: epoch=3, rewarding=1, end=28800, mb=320 ✓
@@ -7208,21 +7297,8 @@ impl BlockchainNode {
                                                          emission_mb_index, tx.amount / 1_000_000_000, new_supply / 1_000_000_000); 
                                             }
                                             
-                                            // v3.0: CRITICAL - Mark as processed to prevent double emission
-                                            // when MacroBlock arrives later!
                                             if emission_mb_index > 0 {
-                                                let mut reward_mgr = reward_manager.write().await;
-                                                let mut processed_set = reward_mgr.get_processed_emission_macroblocks().clone();
-                                                processed_set.insert(emission_mb_index);
-                                                reward_mgr.set_processed_emission_macroblocks(processed_set.clone());
-                                                drop(reward_mgr);
-                                                
-                                                // Persist to storage
-                                                if let Err(e) = storage.save_processed_emission_macroblocks(&processed_set) {
-                                                    eprintln!("[WARN][STATE] processed_save_fail mb={} err={}", emission_mb_index, e);
-                                                } else if is_debug() {
-                                                    println!("[DBG][STATE] emission_marked_processed mb={}", emission_mb_index);
-                                                }
+                                                deferred_emission_mbs.push(emission_mb_index);
                                             }
                                         }
                                     }
@@ -7238,20 +7314,7 @@ impl BlockchainNode {
                                         let parts: Vec<&str> = data.split(':').collect();
                                         if parts.len() >= 2 && parts[0] == "reward_claim" {
                                             let claimed_node_id = parts[1];
-                                            
-                                            // Remove from reward_manager (RAM)
-                                            {
-                                                let mut reward_mgr = reward_manager.write().await;
-                                                let _ = reward_mgr.clear_pending_reward(claimed_node_id);
-                                            }
-                                            
-                                            // Remove from storage (RocksDB)
-                                            if let Err(e) = storage.delete_pending_reward(claimed_node_id) {
-                                                if is_debug() { println!("[DBG][CLAIM] delete_pending_fail node={} err={}", claimed_node_id, e); }
-                                            } else {
-                                                println!("[INFO][CLAIM] synced_claim node={} amount={} QNC", 
-                                                         claimed_node_id, tx.amount / 1_000_000_000);
-                                            }
+                                            deferred_reward_clears.push((claimed_node_id.to_string(), tx.amount));
                                         }
                                     }
                                 }
@@ -7260,12 +7323,19 @@ impl BlockchainNode {
                                 // v3.22: Use lazy Merkle update - finalize once after all TX
                                 // NOTE: apply_transaction_lazy is ALREADY atomic - no rollback needed!
                                 // (it works with local copy, writes to state only on success)
+                                // O(k) journal: capture pre-images of accounts this TX will touch
+                                if let Some(ref mut snap) = block_snapshot {
+                                    let affected = tx.get_all_affected_addresses();
+                                    snap.record_pre_images(&affected, &state_guard.accounts);
+                                }
+
                                 if let Err(e) = state_guard.apply_transaction_lazy(tx) {
-                                    // TX failed but state is NOT corrupted (atomic operation)
                                     println!("[WARN][STATE] tx_failed h={} hash={} err={}", 
                                              microblock.height, &tx.hash[..16.min(tx.hash.len())], e);
                                 } else {
-                                    // v3.36: Gas refund — return unused gas to sender (EIP-1559)
+                                    if let Some(ref mut snap) = block_snapshot {
+                                        snap.record_pre_images(&[tx.from.clone()], &state_guard.accounts);
+                                    }
                                     let _ = state_guard.apply_gas_refund(tx, microblock.height);
                                     
                                     // v3.18: Pool 2 REMOVED - fees go directly to block producer
@@ -7281,12 +7351,7 @@ impl BlockchainNode {
                                             .. 
                                         } => {
                                             if *amount > 0 {
-                                                // Add activation payment to Pool 3
-                                                // CRITICAL: This is distributed equally to ALL eligible nodes
-                                                if let Some(ref p2p) = unified_p2p {
-                                                    p2p.add_to_pool3(*amount);
-                                                }
-                                                if is_debug() { println!("[DBG][POOL3] activation_collected amount={} nanoQNC phase2", amount); }
+                                                deferred_pool3 = deferred_pool3.saturating_add(*amount);
                                             }
                                         }
                                         qnet_state::TransactionType::BatchNodeActivations { activation_data, .. } => {
@@ -7299,44 +7364,26 @@ impl BlockchainNode {
                                                 .sum();
                                             
                                             if total_pool3 > 0 {
-                                                if let Some(ref p2p) = unified_p2p {
-                                                    p2p.add_to_pool3(total_pool3);
-                                                }
-                                                if is_debug() { println!("[DBG][POOL3] batch_activation_collected amount={} nanoQNC count={}", 
-                                                         total_pool3, activation_data.len()); }
+                                                deferred_pool3 = deferred_pool3.saturating_add(total_pool3);
                                             }
                                         }
                                         // v2.71: Cache NodeRegistration on block receive for fast wallet lookups
                                         qnet_state::TransactionType::NodeRegistration { 
                                             node_id, node_type, wallet_address, .. 
                                         } => {
-                                            // Cache in RocksDB for fast access (blockchain is source of truth)
                                             let type_str = match node_type {
                                                 qnet_state::NodeType::Super => "super",
                                                 qnet_state::NodeType::Light => "light",
                                             };
-                                            let _ = storage.save_node_registration(node_id, type_str, wallet_address, 1.0);
-                                            if is_debug() { 
-                                                println!("[DBG][REG] cached_from_block node={} wallet={}... h={}", 
-                                                         node_id, &wallet_address[..16.min(wallet_address.len())], 
-                                                         received_block.height); 
-                                            }
+                                            deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone()));
                                         }
-                                        // v4.1: Index NodeActivation TX on block receive (same as NodeRegistration)
-                                        // Without this, verify-activation O(1) lookup fails for synced blocks
                                         qnet_state::TransactionType::NodeActivation { node_type, .. } => {
-                                            let wallet_addr = &tx.from;
                                             let type_str = match node_type {
                                                 qnet_state::account::NodeType::Super => "super",
                                                 qnet_state::account::NodeType::Light => "light",
                                             };
                                             let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
-                                            let _ = storage.save_node_registration(&activation_id, type_str, wallet_addr, 1.0);
-                                            if is_debug() {
-                                                println!("[DBG][ACT] cached_from_block wallet={}... h={}",
-                                                         &wallet_addr[..16.min(wallet_addr.len())],
-                                                         received_block.height);
-                                            }
+                                            deferred_registrations.push((activation_id, type_str.to_string(), tx.from.clone()));
                                         }
                                         _ => {} // Other transaction types
                                     }
@@ -7364,7 +7411,10 @@ impl BlockchainNode {
                                 };
                                 
                                 if !producer_wallet.is_empty() {
-                                    // v3.26: Use atomic fee crediting with race condition protection
+                                    // Journal pre-image of producer account before fee credit
+                                    if let Some(ref mut snap) = block_snapshot {
+                                        snap.record_pre_images(&[producer_wallet.clone()], &state_guard.accounts);
+                                    }
                                     match state_guard.credit_producer_fees_once(
                                         microblock.height, 
                                         &producer_wallet, 
@@ -7437,9 +7487,60 @@ impl BlockchainNode {
                                              microblock.transactions.len());
                                 }
                                 
-                                // State verified - now save the block
-                                storage.save_microblock(received_block.height, &decompressed_data)
-                                    .map_err(|e| format!("Storage error: {:?}", e))
+                                // State verified - now save the block.
+                                // CRITICAL: if save fails, roll back in-memory state to keep
+                                // RocksDB and StateManager consistent.
+                                match storage.save_microblock(received_block.height, &decompressed_data) {
+                                    Ok(()) => {
+                                        // Block saved — now apply deferred side effects (safe: block is committed)
+                                        if deferred_pool3 > 0 {
+                                            if let Some(ref p2p) = unified_p2p {
+                                                p2p.add_to_pool3(deferred_pool3);
+                                            }
+                                            if is_debug() { println!("[DBG][POOL3] deferred_pool3_applied amount={}", deferred_pool3); }
+                                        }
+                                        for (node_id, type_str, wallet) in &deferred_registrations {
+                                            let _ = storage.save_node_registration(node_id, &type_str, wallet, 1.0);
+                                        }
+                                        if is_debug() && !deferred_registrations.is_empty() {
+                                            println!("[DBG][REG] deferred_registrations_applied count={} h={}", 
+                                                     deferred_registrations.len(), microblock.height);
+                                        }
+                                        for mb_idx in &deferred_emission_mbs {
+                                            let mut reward_mgr = reward_manager.write().await;
+                                            let mut processed_set = reward_mgr.get_processed_emission_macroblocks().clone();
+                                            processed_set.insert(*mb_idx);
+                                            reward_mgr.set_processed_emission_macroblocks(processed_set.clone());
+                                            drop(reward_mgr);
+                                            if let Err(e) = storage.save_processed_emission_macroblocks(&processed_set) {
+                                                eprintln!("[WARN][STATE] deferred_emission_save_fail mb={} err={}", mb_idx, e);
+                                            }
+                                        }
+                                        for (node_id, amount) in &deferred_reward_clears {
+                                            {
+                                                let mut reward_mgr = reward_manager.write().await;
+                                                let _ = reward_mgr.clear_pending_reward(node_id);
+                                            }
+                                            if let Err(e) = storage.delete_pending_reward(node_id) {
+                                                if is_debug() { println!("[DBG][CLAIM] deferred_delete_fail node={} err={}", node_id, e); }
+                                            } else if is_info() {
+                                                println!("[INFO][CLAIM] synced_claim node={} amount={} QNC", 
+                                                         node_id, amount / 1_000_000_000);
+                                            }
+                                        }
+                                        Ok(())
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[ERR][BLOCK] save_failed_rolling_back h={} err={:?}", microblock.height, e);
+                                        if let Some(ref snapshot) = block_snapshot {
+                                            state_guard.rollback_block(snapshot);
+                                            if is_info() {
+                                                println!("[INFO][STATE] block_rollback h={} reason=save_failed", microblock.height);
+                                            }
+                                        }
+                                        Err(format!("storage_error h={} err={:?}", microblock.height, e))
+                                    }
+                                }
                             }
                         },
                         Err(e) => {
@@ -11020,6 +11121,8 @@ impl BlockchainNode {
                                                 .unwrap_or_default()
                                                 .as_secs(),
                                             height: our_height,
+                                            signature: String::new(),
+                                            public_key: String::new(),
                                         };
                                         
                                         let transport = transport_arc.read().await;

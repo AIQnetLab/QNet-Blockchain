@@ -131,6 +131,17 @@ pub struct PersistentStorage {
     db: DB,
 }
 
+/// v5.0: Snapshot manifest for chunked parallel download
+/// Each chunk is independently hashable and downloadable from different peers
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotManifest {
+    pub height: u64,
+    pub total_size: u64,
+    pub chunk_size: u64,
+    pub chunk_count: u64,
+    pub chunk_hashes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StorageStats {
     pub total_blocks: u64,
@@ -598,8 +609,8 @@ impl PersistentStorage {
         
         // v3.19: Reduced buffer sizes (64MB -> 16MB = 4x smaller WAL files)
         opts.set_max_open_files(500);  // Reduced from 1000
-        opts.set_use_fsync(false);     // Async fsync for better performance
-        opts.set_bytes_per_sync(524288); // 512KB sync interval (was 1MB)
+        opts.set_use_fsync(true);      // Synchronous fsync: guarantees WAL durability on crash
+        opts.set_bytes_per_sync(0);    // Disabled: fsync=true already guarantees durability
         opts.set_max_write_buffer_number(2);  // Reduced from 4
         opts.set_write_buffer_size(16777216); // 16MB (was 64MB) - 4x smaller WAL!
         opts.set_target_file_size_base(16777216); // 16MB (was 64MB)
@@ -683,6 +694,7 @@ impl PersistentStorage {
             ColumnFamilyDescriptor::new("attestations", create_hot_cf_opts()), // Hot: attestations
             ColumnFamilyDescriptor::new("heartbeats", create_hot_cf_opts()),   // Hot: heartbeats
             ColumnFamilyDescriptor::new("poh_state", create_hot_cf_opts()),    // Hot: PoH state
+            ColumnFamilyDescriptor::new("contract_storage", create_cf_opts()), // v5.0: Per-key contract state
         ];
         
         let db = match DB::open_cf_descriptors(&opts, path, cfs) {
@@ -1020,12 +1032,13 @@ impl PersistentStorage {
         // v3.41: Flush ALL column families (including ephemeral CFs)
         // CRITICAL: WAL can only be deleted when ALL CFs are flushed past it.
         // Missing CFs here caused WAL accumulation (1.8GB in 23h).
-        // Must match EXACTLY the CFs in DB::open_cf_descriptors (line 668-686)
+        // Must match EXACTLY the CFs in DB::open_cf_descriptors
         let cf_names = ["blocks", "transactions", "accounts", "metadata",
                         "microblocks", "consensus", "sync_state",
                         "pending_rewards", "node_registry", "ping_history",
                         "failover_events", "snapshots", "tx_index",
-                        "tx_by_address", "attestations", "heartbeats", "poh_state"];
+                        "tx_by_address", "attestations", "heartbeats", "poh_state",
+                        "contract_storage"];
         
         for cf_name in &cf_names {
             if let Some(cf) = self.db.cf_handle(cf_name) {
@@ -1172,7 +1185,8 @@ impl PersistentStorage {
                         "microblocks", "consensus", "sync_state",
                         "pending_rewards", "node_registry", "ping_history",
                         "failover_events", "snapshots", "tx_index",
-                        "tx_by_address", "attestations", "heartbeats", "poh_state"];
+                        "tx_by_address", "attestations", "heartbeats", "poh_state",
+                        "contract_storage"];
         
         for cf_name in &cf_names {
             if let Some(cf) = self.db.cf_handle(cf_name) {
@@ -1272,6 +1286,99 @@ impl PersistentStorage {
             .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
         
         self.db.put_cf(&accounts_cf, account.address.as_bytes(), &account_data)?;
+
+        // v5.0: Persist contract_storage to dedicated CF for per-key access
+        if account.is_contract {
+            if !account.contract_storage.is_empty() {
+                self.save_contract_storage(&account.address, &account.contract_storage)?;
+            } else {
+                // Storage cleared — remove stale keys from CF
+                let _ = self.delete_contract_storage(&account.address);
+            }
+        }
+
+        Ok(())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v5.0: CONTRACT STORAGE — RocksDB-backed per-key storage for smart contracts
+    // Keys: "{contract_address}\x00{storage_key}" → value bytes
+    // Enables efficient per-key reads/writes without serializing entire HashMap
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Persist all contract_storage entries for an account to the dedicated CF
+    pub fn save_contract_storage(&self, address: &str, storage: &std::collections::HashMap<String, String>) -> IntegrationResult<()> {
+        if storage.is_empty() {
+            return Ok(());
+        }
+        let cs_cf = self.db.cf_handle("contract_storage")
+            .ok_or_else(|| IntegrationError::StorageError("contract_storage CF not found".to_string()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        for (key, value) in storage {
+            let db_key = format!("{}\x00{}", address, key);
+            batch.put_cf(&cs_cf, db_key.as_bytes(), value.as_bytes());
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Load all contract_storage entries for a single contract address
+    pub fn load_contract_storage(&self, address: &str) -> IntegrationResult<std::collections::HashMap<String, String>> {
+        let cs_cf = self.db.cf_handle("contract_storage")
+            .ok_or_else(|| IntegrationError::StorageError("contract_storage CF not found".to_string()))?;
+        let prefix = format!("{}\x00", address);
+        let prefix_bytes = prefix.as_bytes();
+        let mut result = std::collections::HashMap::new();
+        let iter = self.db.prefix_iterator_cf(&cs_cf, prefix_bytes);
+        for item in iter {
+            let (key_bytes, val_bytes) = item?;
+            let key_str = std::str::from_utf8(&key_bytes).unwrap_or("");
+            if !key_str.starts_with(&prefix) {
+                break; // prefix iteration done
+            }
+            let storage_key = &key_str[prefix.len()..];
+            let storage_val = std::str::from_utf8(&val_bytes).unwrap_or("").to_string();
+            result.insert(storage_key.to_string(), storage_val);
+        }
+        Ok(result)
+    }
+
+    /// Set a single contract storage key (for incremental updates)
+    pub fn set_contract_storage_key(&self, address: &str, key: &str, value: &str) -> IntegrationResult<()> {
+        let cs_cf = self.db.cf_handle("contract_storage")
+            .ok_or_else(|| IntegrationError::StorageError("contract_storage CF not found".to_string()))?;
+        let db_key = format!("{}\x00{}", address, key);
+        self.db.put_cf(&cs_cf, db_key.as_bytes(), value.as_bytes())?;
+        Ok(())
+    }
+
+    /// Get a single contract storage value
+    pub fn get_contract_storage_key(&self, address: &str, key: &str) -> IntegrationResult<Option<String>> {
+        let cs_cf = self.db.cf_handle("contract_storage")
+            .ok_or_else(|| IntegrationError::StorageError("contract_storage CF not found".to_string()))?;
+        let db_key = format!("{}\x00{}", address, key);
+        match self.db.get_cf(&cs_cf, db_key.as_bytes())? {
+            Some(val) => Ok(Some(std::str::from_utf8(&val).unwrap_or("").to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete all contract storage entries for an address (contract destroy)
+    pub fn delete_contract_storage(&self, address: &str) -> IntegrationResult<()> {
+        let cs_cf = self.db.cf_handle("contract_storage")
+            .ok_or_else(|| IntegrationError::StorageError("contract_storage CF not found".to_string()))?;
+        let prefix = format!("{}\x00", address);
+        let mut batch = rocksdb::WriteBatch::default();
+        let iter = self.db.prefix_iterator_cf(&cs_cf, prefix.as_bytes());
+        for item in iter {
+            let (key_bytes, _) = item?;
+            let key_str = std::str::from_utf8(&key_bytes).unwrap_or("");
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            batch.delete_cf(&cs_cf, &key_bytes);
+        }
+        self.db.write(batch)?;
         Ok(())
     }
     
@@ -3065,32 +3172,50 @@ impl Storage {
         self.persistent.delete_macroblock(macroblock_index)
     }
     
-    /// Save state snapshot for efficient storage
-    /// v2.98: Fixed to use snapshot_{height} key format (was state_{height}) for consistency with load methods
+    /// Save state snapshot for in-memory StateManager restoration.
+    /// Payload: [type=0x01 | state_root(32) | accounts_bincode]
+    /// Wire: [sha3_hash(32) | uncompressed_len(8) | Zstd(payload)]
+    /// Written atomically with `latest_state_snap` pointer via WriteBatch.
     pub async fn save_state_snapshot(&self, height: u64, state_root: [u8; 32], state_data: Vec<u8>) -> IntegrationResult<()> {
-        // State snapshots are saved separately for efficient retrieval
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
-        
-        // v2.98: Use snapshot_ prefix to match load_state_snapshot() and load_latest_state_snapshot()
-        let key = format!("snapshot_{}", height);
-        
-        // Format: [state_root(32) | data_len(8) | compressed_data]
-        let mut value = Vec::new();
-        value.extend_from_slice(&state_root);
-        value.extend_from_slice(&(state_data.len() as u64).to_le_bytes());
-        
-        // Compress state data aggressively (Zstd-15)
-        let compressed = zstd::encode_all(&state_data[..], 15)
-            .map_err(|e| IntegrationError::Other(format!("State compression error: {}", e)))?;
-        
+
+        let key = format!("state_snap_{}", height);
+
+        // Payload: [type(1) | state_root(32) | accounts_bincode]
+        let mut payload = Vec::with_capacity(1 + 32 + state_data.len());
+        payload.push(0x01); // SNAP_TYPE_STATE
+        payload.extend_from_slice(&state_root);
+        payload.extend_from_slice(&state_data);
+        let uncompressed_len = payload.len() as u64;
+
+        // Compress payload with Zstd-15
+        let compressed = zstd::encode_all(&payload[..], 15)
+            .map_err(|e| IntegrationError::Other(format!("Snapshot compression error: {}", e)))?;
+
+        // Integrity hash over compressed data
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(&compressed);
+        let hash = hasher.finalize();
+
+        // Wire format: [sha3_hash(32) | uncompressed_len(8) | Zstd_compressed]
+        let mut value = Vec::with_capacity(40 + compressed.len());
+        value.extend_from_slice(hash.as_slice());
+        value.extend_from_slice(&uncompressed_len.to_le_bytes());
         value.extend_from_slice(&compressed);
-        
-        self.persistent.db.put_cf(&snapshots_cf, key.as_bytes(), &value)?;
-        
-        println!("[STATE] 💾 Saved state snapshot at height {} ({} KB compressed)", 
-                height, compressed.len() / 1024);
-        
+
+        // Atomic write: snapshot data + latest_state_snap pointer
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&snapshots_cf, key.as_bytes(), &value);
+        batch.put_cf(&snapshots_cf, b"latest_state_snap", &height.to_le_bytes());
+        self.persistent.db.write(batch)?;
+
+        if crate::node::is_info() {
+            println!("[INFO][SNAPSHOT] snap_saved h={} type=state compressed={}KB uncompressed={}KB",
+                     height, compressed.len() / 1024, uncompressed_len as usize / 1024);
+        }
+
         Ok(())
     }
     
@@ -3170,7 +3295,7 @@ impl Storage {
             // SAFETY: Can restore from any snapshot + replay macroblocks
             if height % 10 == 0 || height <= 10 {
                 self.save_state_snapshot(height, macroblock.state_root, state_data).await?;
-                println!("[STATE] 📸 State snapshot saved at macroblock #{} (every 10th)", height);
+                println!("[INFO][SNAPSHOT] State snapshot saved at macroblock #{} (every 10th)", height);
             }
         }
         
@@ -5489,47 +5614,55 @@ impl Storage {
         Ok(removed)
     }
     
-    /// v3.41: Cleanup old snapshots, keeping only the latest `keep_count`
-    /// Snapshot keys: "snapshot_{height}" — only latest 2-3 needed for sync
+    /// Cleanup old snapshots, keeping only the latest `keep_count` per type.
+    /// Keys: "full_snap_{height}" and "state_snap_{height}". Updates pointers atomically.
     pub fn cleanup_old_snapshots(&self, keep_count: usize) -> IntegrationResult<u32> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
-        
-        // Collect all snapshot heights
-        let mut snapshot_heights: Vec<u64> = Vec::new();
-        let iter = self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::Start);
-        
-        for item in iter {
-            let (key, _value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-            if let Some(height_str) = key_str.strip_prefix("snapshot_") {
-                if let Ok(height) = height_str.parse::<u64>() {
-                    snapshot_heights.push(height);
+
+        let mut removed = 0u32;
+
+        // Clean up both full_snap_ and state_snap_ independently
+        for prefix in &["full_snap_", "state_snap_"] {
+            let pointer_key: &[u8] = if *prefix == "full_snap_" {
+                b"latest_full_snap"
+            } else {
+                b"latest_state_snap"
+            };
+
+            let mut heights: Vec<u64> = Vec::new();
+            let iter = self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::Start);
+            for item in iter {
+                if let Ok((key, _)) = item {
+                    let key_str = String::from_utf8_lossy(&key);
+                    if let Some(h_str) = key_str.strip_prefix(prefix) {
+                        if let Ok(h) = h_str.parse::<u64>() {
+                            heights.push(h);
+                        }
+                    }
                 }
             }
-        }
-        
-        if snapshot_heights.len() <= keep_count {
-            return Ok(0); // Not enough snapshots to prune
-        }
-        
-        // Sort descending — keep the latest `keep_count`
-        snapshot_heights.sort_unstable_by(|a, b| b.cmp(a));
-        let to_delete = &snapshot_heights[keep_count..];
-        
-        let mut batch = WriteBatch::default();
-        let mut removed = 0u32;
-        
-        for height in to_delete {
-            let key = format!("snapshot_{}", height);
-            batch.delete_cf(&snapshots_cf, key.as_bytes());
-            removed += 1;
-        }
-        
-        if batch.len() > 0 {
+
+            if heights.len() <= keep_count {
+                continue;
+            }
+
+            heights.sort_unstable_by(|a, b| b.cmp(a));
+            let surviving_max = heights[0];
+            let to_delete = &heights[keep_count..];
+
+            let mut batch = WriteBatch::default();
+            for h in to_delete {
+                let key = format!("{}{}", prefix, h);
+                batch.delete_cf(&snapshots_cf, key.as_bytes());
+                removed += 1;
+            }
+
+            // Update pointer to the newest surviving snapshot
+            batch.put_cf(&snapshots_cf, pointer_key, &surviving_max.to_le_bytes());
             self.persistent.db.write(batch)?;
         }
-        
+
         Ok(removed)
     }
     
@@ -5988,31 +6121,71 @@ impl Storage {
             // Write end marker
             snapshot_data.extend_from_slice(b"REWARDS_END");
         }
+
+        // 6. v5.0: Include contract_storage for full state recovery
+        let mut contract_entries = 0u64;
+        if let Some(cs_cf) = self.persistent.db.cf_handle("contract_storage") {
+            snapshot_data.extend_from_slice(b"CONTRACT_STORAGE_V1");
+            let cs_iter = self.persistent.db.iterator_cf(&cs_cf, rocksdb::IteratorMode::Start);
+            for item in cs_iter {
+                let (key, value) = item?;
+                snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                snapshot_data.extend_from_slice(&key);
+                snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                snapshot_data.extend_from_slice(&value);
+                contract_entries += 1;
+            }
+            snapshot_data.extend_from_slice(b"CONTRACT_STORAGE_END");
+        }
+
+        // 7. v5.0: Include node_registry for producer wallet lookups after snapshot restore
+        let mut registry_count = 0u64;
+        if let Some(nr_cf) = self.persistent.db.cf_handle("node_registry") {
+            snapshot_data.extend_from_slice(b"NODE_REGISTRY_V1");
+            let nr_iter = self.persistent.db.iterator_cf(&nr_cf, rocksdb::IteratorMode::Start);
+            for item in nr_iter {
+                let (key, value) = item?;
+                snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                snapshot_data.extend_from_slice(&key);
+                snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                snapshot_data.extend_from_slice(&value);
+                registry_count += 1;
+            }
+            snapshot_data.extend_from_slice(b"NODE_REGISTRY_END");
+        }
         
-        // 6. Compress snapshot with LZ4 for efficient storage
-        let compressed = lz4_flex::compress_prepend_size(&snapshot_data);
-        
-        // 6. Calculate hash for integrity check
+        // Prepend type discriminator: 0x02 = SNAP_TYPE_FULL
+        let mut typed_data = Vec::with_capacity(1 + snapshot_data.len());
+        typed_data.push(0x02); // SNAP_TYPE_FULL
+        typed_data.extend_from_slice(&snapshot_data);
+
+        // Compress with Zstd-3 (fast for large snapshots, good ratio)
+        let uncompressed_len = typed_data.len() as u64;
+        let compressed = zstd::encode_all(&typed_data[..], 3)
+            .map_err(|e| IntegrationError::Other(format!("Full snapshot compression error: {}", e)))?;
+
+        // Integrity hash over compressed data
         use sha3::{Sha3_256, Digest};
         let mut hasher = Sha3_256::new();
         hasher.update(&compressed);
         let hash = hasher.finalize();
-        
-        // Save snapshot with metadata
-        let snapshot_key = format!("snapshot_{}", height);
-        let mut final_data = Vec::new();
-        final_data.extend_from_slice(&hash); // 32 bytes hash
-        final_data.extend_from_slice(&(compressed.len() as u64).to_le_bytes()); // 8 bytes size
-        final_data.extend_from_slice(&compressed); // Compressed data
-        
-        self.persistent.db.put_cf(&snapshots_cf, snapshot_key.as_bytes(), &final_data)?;
-        
-        // Update latest snapshot pointer
-        self.persistent.db.put_cf(&snapshots_cf, b"latest_snapshot", &height.to_le_bytes())?;
+
+        // Wire format: [sha3_hash(32) | uncompressed_len(8) | Zstd_compressed]
+        let snapshot_key = format!("full_snap_{}", height);
+        let mut final_data = Vec::with_capacity(40 + compressed.len());
+        final_data.extend_from_slice(hash.as_slice());
+        final_data.extend_from_slice(&uncompressed_len.to_le_bytes());
+        final_data.extend_from_slice(&compressed);
+
+        // Atomic write: full snapshot data + latest_full_snap pointer
+        let mut snap_batch = WriteBatch::default();
+        snap_batch.put_cf(&snapshots_cf, snapshot_key.as_bytes(), &final_data);
+        snap_batch.put_cf(&snapshots_cf, b"latest_full_snap", &height.to_le_bytes());
+        self.persistent.db.write(snap_batch)?;
         
         let duration = start_time.elapsed();
-        println!("[SNAPSHOT] ✅ Snapshot created: {} accounts, {} rewards, {} bytes compressed in {:.2}s", 
-                 account_count, rewards_count, compressed.len(), duration.as_secs_f64());
+        println!("[INFO][SNAPSHOT] full_snap_created h={} accounts={} rewards={} contracts={} registry={} compressed={}KB uncompressed={}KB elapsed={:.2}s",
+                 height, account_count, rewards_count, contract_entries, registry_count, compressed.len() / 1024, uncompressed_len as usize / 1024, duration.as_secs_f64());
         
         // PRODUCTION: Clean up old snapshots (keep only last 5)
         self.cleanup_old_snapshots(5)?;
@@ -6020,109 +6193,221 @@ impl Storage {
         Ok(())
     }
     
-    /// Load state snapshot from specified height
-    /// v2.98: Load latest state snapshot for node startup
-    /// Returns (height, state_root, accounts_data) or None if no snapshot exists
+    /// Load the latest state snapshot for in-memory StateManager restoration at startup.
+    /// Uses `latest_state_snap` pointer for O(1) lookup — avoids lexicographic ordering bugs with iterator.
+    /// Format: [sha3_hash(32) | uncompressed_len(8) | Zstd(state_root(32) | accounts_bincode)]
     pub async fn load_latest_state_snapshot(&self) -> IntegrationResult<Option<(u64, [u8; 32], Vec<u8>)>> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
-        
-        // Find latest snapshot by iterating (RocksDB stores keys sorted)
-        let mut iter = self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::End);
-        
-        if let Some(Ok((key, value))) = iter.next() {
-            // Parse key: "snapshot_{height}"
-            let key_str = String::from_utf8_lossy(&key);
-            if let Some(height_str) = key_str.strip_prefix("snapshot_") {
-                if let Ok(height) = height_str.parse::<u64>() {
-                    // Parse value: [state_root(32) | data_len(8) | compressed_data]
-                    if value.len() >= 40 {
-                        let state_root: [u8; 32] = value[..32].try_into()
-                            .map_err(|_| IntegrationError::StorageError("Invalid state_root size".to_string()))?;
-                        let _data_len = u64::from_le_bytes(value[32..40].try_into()
-                            .map_err(|_| IntegrationError::StorageError("Invalid data_len size".to_string()))?);
-                        let compressed_data = &value[40..];
-                        
-                        // Decompress with Zstd (matches save_state_snapshot compression)
-                        let accounts_data = zstd::decode_all(compressed_data)
-                            .map_err(|e| IntegrationError::Other(format!("State decompression error: {}", e)))?;
-                        
-                        println!("[STATE] loaded_snapshot height={} size={}KB", 
-                                height, accounts_data.len() / 1024);
-                        
-                        return Ok(Some((height, state_root, accounts_data)));
+
+        // O(1) pointer lookup
+        let latest_height = match self.persistent.db.get_cf(&snapshots_cf, b"latest_state_snap")? {
+            Some(data) if data.len() >= 8 => {
+                u64::from_le_bytes(data[..8].try_into()
+                    .map_err(|_| IntegrationError::StorageError("Invalid latest_state_snap pointer".to_string()))?)
+            }
+            _ => {
+                // Pointer missing — scan for state_snap_ keys (handles previous version upgrade)
+                let mut max_height = 0u64;
+                let iter = self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::Start);
+                for item in iter {
+                    if let Ok((key, _)) = item {
+                        let key_str = String::from_utf8_lossy(&key);
+                        if let Some(h_str) = key_str.strip_prefix("state_snap_") {
+                            if let Ok(h) = h_str.parse::<u64>() {
+                                if h > max_height { max_height = h; }
+                            }
+                        }
                     }
                 }
+                if max_height == 0 { return Ok(None); }
+                max_height
             }
+        };
+
+        let snapshot_key = format!("state_snap_{}", latest_height);
+        let value = match self.persistent.db.get_cf(&snapshots_cf, snapshot_key.as_bytes())? {
+            Some(v) => v,
+            None => {
+                eprintln!("[WARN][SNAPSHOT] latest_state_snap pointer h={} key missing — clearing stale pointer", latest_height);
+                return Ok(None);
+            }
+        };
+
+        // Bounds check: header is [sha3_hash(32) | uncompressed_len(8)] = 40 bytes + at least 1 byte data
+        if value.len() < 41 {
+            return Err(IntegrationError::StorageError(format!(
+                "State snapshot at h={} malformed: only {} bytes", latest_height, value.len()
+            )));
         }
-        
-        Ok(None)
+
+        let stored_hash = &value[..32];
+        let _uncompressed_len = u64::from_le_bytes(value[32..40].try_into()
+            .map_err(|_| IntegrationError::StorageError("Invalid snapshot header bytes".to_string()))?);
+        let compressed_data = &value[40..];
+
+        // Integrity check over compressed data
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(compressed_data);
+        let computed_hash = hasher.finalize();
+        if stored_hash != computed_hash.as_slice() {
+            return Err(IntegrationError::StorageError(format!(
+                "State snapshot at h={} integrity check failed", latest_height
+            )));
+        }
+
+        // Decompress with Zstd
+        let decompressed = zstd::decode_all(compressed_data)
+            .map_err(|e| IntegrationError::Other(format!("State snapshot decompression failed h={}: {}", latest_height, e)))?;
+
+        // Payload: [type(1) | state_root(32) | accounts_bincode]
+        if decompressed.len() < 33 {
+            return Err(IntegrationError::StorageError(format!(
+                "State snapshot payload too short h={}: {} bytes", latest_height, decompressed.len()
+            )));
+        }
+
+        let snap_type = decompressed[0];
+        if snap_type != 0x01 {
+            return Err(IntegrationError::StorageError(format!(
+                "State snapshot h={} has wrong type: 0x{:02x} (expected 0x01)", latest_height, snap_type
+            )));
+        }
+
+        let state_root: [u8; 32] = decompressed[1..33].try_into()
+            .map_err(|_| IntegrationError::StorageError("Invalid state_root in snapshot payload".to_string()))?;
+        let accounts_data = decompressed[33..].to_vec();
+
+        if crate::node::is_info() {
+            println!("[INFO][SNAPSHOT] state_snap_loaded h={} compressed={}KB accounts={}KB",
+                     latest_height, compressed_data.len() / 1024, accounts_data.len() / 1024);
+        }
+
+        Ok(Some((latest_height, state_root, accounts_data)))
     }
     
     /// v2.99: Load state snapshot by height and restore into StateManager
-    /// Returns (state_root, accounts_data) for direct StateManager restoration
+    /// Load a state snapshot by height and return (state_root, accounts_bincode) for StateManager restoration.
+    /// Payload: [type=0x01 | state_root(32) | accounts_bincode]
     pub async fn load_state_snapshot_by_height(&self, height: u64) -> IntegrationResult<Option<([u8; 32], Vec<u8>)>> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
-        
-        let snapshot_key = format!("snapshot_{}", height);
-        
+
+        let snapshot_key = format!("state_snap_{}", height);
+
         match self.persistent.db.get_cf(&snapshots_cf, snapshot_key.as_bytes())? {
             Some(value) => {
-                // Parse value: [state_root(32) | data_len(8) | compressed_data]
-                if value.len() >= 40 {
-                    let state_root: [u8; 32] = value[..32].try_into()
-                        .map_err(|_| IntegrationError::StorageError("Invalid state_root size".to_string()))?;
-                    let _data_len = u64::from_le_bytes(value[32..40].try_into()
-                        .map_err(|_| IntegrationError::StorageError("Invalid data_len size".to_string()))?);
-                    let compressed_data = &value[40..];
-                    
-                    // Decompress with Zstd
-                    let accounts_data = zstd::decode_all(compressed_data)
-                        .map_err(|e| IntegrationError::Other(format!("State decompression error: {}", e)))?;
-                    
-                    Ok(Some((state_root, accounts_data)))
-                } else {
-                    Err(IntegrationError::StorageError(format!("Invalid snapshot format at height {}", height)))
+                // Bounds check: [sha3_hash(32) | uncompressed_len(8)] + at least 1 byte compressed
+                if value.len() < 41 {
+                    return Err(IntegrationError::StorageError(format!(
+                        "Snapshot at h={} malformed: {} bytes", height, value.len()
+                    )));
                 }
+
+                let stored_hash = &value[..32];
+                let _uncompressed_len = u64::from_le_bytes(value[32..40].try_into()
+                    .map_err(|_| IntegrationError::StorageError("Invalid snapshot header".to_string()))?);
+                let compressed_data = &value[40..];
+
+                // Integrity check
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(compressed_data);
+                let computed_hash = hasher.finalize();
+                if stored_hash != computed_hash.as_slice() {
+                    return Err(IntegrationError::StorageError(format!(
+                        "Snapshot at h={} integrity check failed", height
+                    )));
+                }
+
+                // Decompress with Zstd
+                let decompressed = zstd::decode_all(compressed_data)
+                    .map_err(|e| IntegrationError::Other(format!("Snapshot decompression failed h={}: {}", height, e)))?;
+
+                // Payload: [type(1) | state_root(32) | accounts_bincode]
+                if decompressed.len() < 33 {
+                    return Err(IntegrationError::StorageError(format!(
+                        "State snapshot payload too short at h={}: {} bytes", height, decompressed.len()
+                    )));
+                }
+                if decompressed[0] != 0x01 {
+                    return Err(IntegrationError::StorageError(format!(
+                        "State snapshot h={} wrong type: 0x{:02x}", height, decompressed[0]
+                    )));
+                }
+                let state_root: [u8; 32] = decompressed[1..33].try_into()
+                    .map_err(|_| IntegrationError::StorageError("Invalid state_root in payload".to_string()))?;
+                let accounts_data = decompressed[33..].to_vec();
+
+                Ok(Some((state_root, accounts_data)))
             }
             None => Ok(None)
         }
     }
     
+    /// Load a full snapshot by height and restore accounts + rewards directly into RocksDB.
+    /// Payload: [type=0x02 | version(4) | height(8) | ts(8) | accounts | rewards]
     pub async fn load_state_snapshot(&self, height: u64) -> IntegrationResult<()> {
-        println!("[SNAPSHOT] 📂 Loading state snapshot from height {}", height);
-        
+        if crate::node::is_info() {
+            println!("[INFO][SNAPSHOT] full_snap_loading h={}", height);
+        }
+
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
-        
-        let snapshot_key = format!("snapshot_{}", height);
+
+        let snapshot_key = format!("full_snap_{}", height);
         let snapshot_data = self.persistent.db.get_cf(&snapshots_cf, snapshot_key.as_bytes())?
-            .ok_or_else(|| IntegrationError::StorageError(format!("Snapshot at height {} not found", height)))?;
-        
-        // Verify hash
+            .ok_or_else(|| IntegrationError::StorageError(format!("Full snapshot at h={} not found", height)))?;
+
+        // Bounds check: [sha3_hash(32) | uncompressed_len(8)] + at least 1 byte compressed
+        if snapshot_data.len() < 41 {
+            return Err(IntegrationError::StorageError(format!(
+                "Full snapshot at h={} malformed: only {} bytes", height, snapshot_data.len()
+            )));
+        }
+
         let stored_hash = &snapshot_data[..32];
-        let size = u64::from_le_bytes(snapshot_data[32..40].try_into().expect("Snapshot size field must be 8 bytes")) as usize;
+        let _uncompressed_len = u64::from_le_bytes(snapshot_data[32..40].try_into()
+            .map_err(|_| IntegrationError::StorageError("Invalid snapshot header".to_string()))?);
         let compressed_data = &snapshot_data[40..];
-        
+
+        // Integrity check
         use sha3::{Sha3_256, Digest};
         let mut hasher = Sha3_256::new();
         hasher.update(compressed_data);
         let computed_hash = hasher.finalize();
-        
+
         if stored_hash != computed_hash.as_slice() {
-            return Err(IntegrationError::StorageError("Snapshot integrity check failed".to_string()));
+            return Err(IntegrationError::StorageError(format!(
+                "Full snapshot at h={} integrity check failed", height
+            )));
         }
-        
-        // Decompress
-        let decompressed = lz4_flex::decompress_size_prepended(compressed_data)
-            .map_err(|e| IntegrationError::StorageError(format!("Decompression failed: {}", e)))?;
+
+        // Decompress with Zstd (unified format, same as save path)
+        let decompressed = zstd::decode_all(compressed_data)
+            .map_err(|e| IntegrationError::StorageError(format!("Full snapshot decompression failed h={}: {}", height, e)))?;
         
         // Parse and restore state
         let mut cursor = 0;
-        
+
+        // Verify type discriminator
+        if decompressed.is_empty() || decompressed[0] != 0x02 {
+            return Err(IntegrationError::StorageError(format!(
+                "Full snapshot h={} wrong type: 0x{:02x} (expected 0x02)", height,
+                decompressed.first().copied().unwrap_or(0)
+            )));
+        }
+        cursor += 1; // skip type byte
+
         // Check protocol version
-        let version = u32::from_le_bytes(decompressed[0..4].try_into().expect("Version field must be 4 bytes"));
+        if cursor + 4 > decompressed.len() {
+            return Err(IntegrationError::StorageError(format!(
+                "Full snapshot h={} truncated at version field", height
+            )));
+        }
+        let version = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into()
+            .map_err(|_| IntegrationError::StorageError("Invalid version field".to_string()))?);
         cursor += 4;
         
         if version != crate::node::PROTOCOL_VERSION {
@@ -6181,6 +6466,7 @@ impl Storage {
                 while cursor < decompressed.len() {
                     // Check for REWARDS_END marker (11 bytes)
                     if cursor + 11 <= decompressed.len() && &decompressed[cursor..cursor+11] == b"REWARDS_END" {
+                        cursor += 11; // Skip past marker so next section is reachable
                         break;
                     }
                     
@@ -6208,8 +6494,79 @@ impl Storage {
             }
         }
         
-        println!("[SNAPSHOT] ✅ Restored {} accounts, {} rewards from snapshot", account_count, rewards_count);
-        
+        // v5.0: Restore contract_storage from snapshot
+        let mut contract_count = 0u64;
+        if cursor + 19 <= decompressed.len() && &decompressed[cursor..cursor+19] == b"CONTRACT_STORAGE_V1" {
+            cursor += 19;
+            if let Some(cs_cf) = self.persistent.db.cf_handle("contract_storage") {
+                let mut cs_batch = WriteBatch::default();
+                while cursor < decompressed.len() {
+                    if cursor + 20 <= decompressed.len() && &decompressed[cursor..cursor+20] == b"CONTRACT_STORAGE_END" {
+                        cursor += 20;
+                        break;
+                    }
+                    if cursor + 4 > decompressed.len() { break; }
+                    let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().unwrap_or([0;4])) as usize;
+                    cursor += 4;
+                    if cursor + key_len > decompressed.len() { break; }
+                    let key = &decompressed[cursor..cursor+key_len];
+                    cursor += key_len;
+                    if cursor + 4 > decompressed.len() { break; }
+                    let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().unwrap_or([0;4])) as usize;
+                    cursor += 4;
+                    if cursor + value_len > decompressed.len() { break; }
+                    let value = &decompressed[cursor..cursor+value_len];
+                    cursor += value_len;
+                    cs_batch.put_cf(&cs_cf, key, value);
+                    contract_count += 1;
+                }
+                self.persistent.db.write(cs_batch)?;
+            }
+        }
+
+        // v5.0: Restore node_registry from snapshot
+        let mut registry_count = 0u64;
+        if cursor + 16 <= decompressed.len() && &decompressed[cursor..cursor+16] == b"NODE_REGISTRY_V1" {
+            cursor += 16;
+            if let Some(nr_cf) = self.persistent.db.cf_handle("node_registry") {
+                let mut nr_batch = WriteBatch::default();
+                while cursor < decompressed.len() {
+                    if cursor + 17 <= decompressed.len() && &decompressed[cursor..cursor+17] == b"NODE_REGISTRY_END" {
+                        let _ = cursor + 17; // consumed; loop breaks
+                        break;
+                    }
+                    if cursor + 4 > decompressed.len() { break; }
+                    let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().unwrap_or([0;4])) as usize;
+                    cursor += 4;
+                    if cursor + key_len > decompressed.len() { break; }
+                    let key = &decompressed[cursor..cursor+key_len];
+                    cursor += key_len;
+                    if cursor + 4 > decompressed.len() { break; }
+                    let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().unwrap_or([0;4])) as usize;
+                    cursor += 4;
+                    if cursor + value_len > decompressed.len() { break; }
+                    let value = &decompressed[cursor..cursor+value_len];
+                    cursor += value_len;
+                    nr_batch.put_cf(&nr_cf, key, value);
+                    registry_count += 1;
+                }
+                self.persistent.db.write(nr_batch)?;
+            }
+        }
+
+        if crate::node::is_info() {
+            println!("[INFO][SNAPSHOT] full_snap_restored h={} accounts={} rewards={} contracts={} registry={}",
+                     height, account_count, rewards_count, contract_count, registry_count);
+        }
+
+        // Post-restore integrity: verify account count is plausible
+        if account_count == 0 {
+            eprintln!("[ERR][SNAPSHOT] full_snap_empty h={} — 0 accounts restored, snapshot may be corrupted", height);
+            return Err(IntegrationError::StorageError(format!(
+                "Full snapshot h={} restored 0 accounts", height
+            )));
+        }
+
         Ok(())
     }
     
@@ -6235,8 +6592,10 @@ impl Storage {
             let snapshots_cf = self.persistent.db.cf_handle("snapshots")
                 .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
             
-            let snapshot_key = format!("snapshot_{}", height);
-            self.persistent.db.get_cf(&snapshots_cf, snapshot_key.as_bytes())?
+            let full_key = format!("full_snap_{}", height);
+            let state_key = format!("state_snap_{}", height);
+            self.persistent.db.get_cf(&snapshots_cf, full_key.as_bytes())?
+                .or(self.persistent.db.get_cf(&snapshots_cf, state_key.as_bytes())?)
                 .ok_or_else(|| IntegrationError::StorageError(format!("Snapshot at height {} not found", height)))?
         }; // RocksDB handle is dropped here
         
@@ -6398,8 +6757,8 @@ impl Storage {
             return Err(IntegrationError::StorageError("IPFS snapshot integrity check failed".to_string()));
         }
         
-        // Save snapshot locally
-        let snapshot_key = format!("snapshot_{}", height);
+        // Save snapshot locally (full format from IPFS)
+        let snapshot_key = format!("full_snap_{}", height);
         self.persistent.db.put_cf(&snapshots_cf, snapshot_key.as_bytes(), &data)?;
         
         // Save IPFS reference
@@ -6693,40 +7052,50 @@ impl Storage {
         }
     }
     
-    /// Get latest snapshot height for fast sync
+    /// Get the latest snapshot height available for fast sync.
+    /// Prefers full snapshots (latest_full_snap) over state snapshots (latest_state_snap),
+    /// falls back to numerical scan over all snapshot_* keys.
     pub fn get_latest_snapshot_height(&self) -> IntegrationResult<Option<u64>> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
-        
-        // Check for latest snapshot pointer
-        if let Ok(Some(data)) = self.persistent.db.get_cf(&snapshots_cf, b"latest_snapshot") {
-            let height = u64::from_le_bytes(data[..8].try_into()
-                .map_err(|_| IntegrationError::StorageError("Invalid snapshot height format".to_string()))?);
-            return Ok(Some(height));
+
+        // 1. Prefer full snapshot pointer (written by create_state_snapshot)
+        if let Ok(Some(data)) = self.persistent.db.get_cf(&snapshots_cf, b"latest_full_snap") {
+            if data.len() >= 8 {
+                if let Ok(bytes) = data[..8].try_into() {
+                    let height = u64::from_le_bytes(bytes);
+                    if height > 0 { return Ok(Some(height)); }
+                }
+            }
         }
-        
-        // Otherwise scan for snapshots
+
+        // 2. Fall back to state snapshot pointer (written by save_state_snapshot)
+        if let Ok(Some(data)) = self.persistent.db.get_cf(&snapshots_cf, b"latest_state_snap") {
+            if data.len() >= 8 {
+                if let Ok(bytes) = data[..8].try_into() {
+                    let height = u64::from_le_bytes(bytes);
+                    if height > 0 { return Ok(Some(height)); }
+                }
+            }
+        }
+
+        // 3. Scan for full_snap_ and state_snap_ keys (handles nodes without pointers)
         let mut latest_height = 0u64;
         let iter = self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::Start);
-        
         for item in iter {
-            let (key, _) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-            
-            if key_str.starts_with("snapshot_") {
-                if let Ok(height) = key_str.trim_start_matches("snapshot_").parse::<u64>() {
-                    if height > latest_height {
-                        latest_height = height;
+            if let Ok((key, _)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                let h_opt = key_str.strip_prefix("full_snap_")
+                    .or_else(|| key_str.strip_prefix("state_snap_"));
+                if let Some(h_str) = h_opt {
+                    if let Ok(h) = h_str.parse::<u64>() {
+                        if h > latest_height { latest_height = h; }
                     }
                 }
             }
         }
-        
-        if latest_height > 0 {
-            Ok(Some(latest_height))
-        } else {
-            Ok(None)
-        }
+
+        if latest_height > 0 { Ok(Some(latest_height)) } else { Ok(None) }
     }
     
     /// Get raw snapshot data for P2P download (v2.19.12)
@@ -6734,57 +7103,61 @@ impl Storage {
     pub fn get_snapshot_data(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
-        
-        let snapshot_key = format!("snapshot_{}", height);
-        
-        match self.persistent.db.get_cf(&snapshots_cf, snapshot_key.as_bytes())? {
-            Some(data) => Ok(Some(data)),
-            None => {
-                // Try state_ prefix as fallback
-                let state_key = format!("state_{}", height);
-                match self.persistent.db.get_cf(&snapshots_cf, state_key.as_bytes())? {
-                    Some(data) => Ok(Some(data)),
-                    None => Ok(None)
-                }
+
+        // Try full_snap_ first, then state_snap_
+        for prefix in &["full_snap_", "state_snap_"] {
+            let key = format!("{}{}", prefix, height);
+            if let Some(data) = self.persistent.db.get_cf(&snapshots_cf, key.as_bytes())? {
+                return Ok(Some(data));
             }
         }
+        Ok(None)
     }
     
-    /// Download snapshot from network for fast bootstrap
+    /// v5.0: Download snapshot from network — chunked parallel download with fallback
     pub async fn download_and_load_snapshot(&self, p2p: &crate::unified_p2p::SimplifiedP2P) -> IntegrationResult<u64> {
-        println!("[SNAPSHOT] 🔍 Searching for network snapshots...");
-        
         let peers = p2p.get_validated_active_peers();
         if peers.is_empty() {
             return Err(IntegrationError::Other("No peers available for snapshot download".to_string()));
         }
-        
-        // Query peers for latest snapshot
-        for peer in peers {
+
+        // Find best snapshot height from peers
+        let mut best_height = 0u64;
+        let mut peer_addrs: Vec<String> = Vec::new();
+        for peer in &peers {
             match self.query_peer_snapshot(&peer.addr).await {
                 Ok(Some((height, cid))) => {
-                    println!("[SNAPSHOT] 📥 Found snapshot at height {} from peer {}", height, peer.id);
-                    
-                    // Download from IPFS or directly from peer
+                    if height > best_height {
+                        best_height = height;
+                    }
+                    // IPFS fast path
                     if !cid.is_empty() && std::env::var("IPFS_ENABLED").unwrap_or_default() == "1" {
-                        // Try IPFS first
                         if let Ok(_) = self.download_snapshot_from_ipfs(&cid, height).await {
-                            println!("[SNAPSHOT] ✅ Downloaded snapshot from IPFS");
+                            println!("[INFO][SYNC] snapshot_from_ipfs h={}", height);
                             return Ok(height);
                         }
                     }
-                    
-                    // Fallback to direct P2P download
-                    if let Ok(_) = self.download_snapshot_from_peer(&peer.addr, height).await {
-                        println!("[SNAPSHOT] ✅ Downloaded snapshot from peer {}", peer.id);
-                        return Ok(height);
-                    }
+                    peer_addrs.push(peer.addr.clone());
                 },
                 _ => continue,
             }
         }
-        
-        Err(IntegrationError::Other("No snapshots available from network".to_string()))
+
+        if best_height == 0 || peer_addrs.is_empty() {
+            return Err(IntegrationError::Other("No snapshots available from network".to_string()));
+        }
+
+        println!("[INFO][SYNC] snapshot_download h={} peers={}", best_height, peer_addrs.len());
+
+        // Try chunked parallel download first (v5.0), fallback to single-peer
+        match self.download_snapshot_chunked(&peer_addrs, best_height).await {
+            Ok(()) => Ok(best_height),
+            Err(e) => {
+                println!("[WARN][SYNC] chunked_download_failed err={} fallback=legacy", e);
+                self.download_snapshot_legacy(&peer_addrs[0], best_height).await?;
+                Ok(best_height)
+            }
+        }
     }
     
     /// Query peer for available snapshots
@@ -6812,35 +7185,187 @@ impl Storage {
         Ok(None)
     }
     
-    /// Download snapshot directly from peer
-    async fn download_snapshot_from_peer(&self, peer_addr: &str, height: u64) -> IntegrationResult<()> {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v5.0: CHUNKED SNAP SYNC — parallel download from multiple peers
+    // Snapshot is split into 4MB chunks, each verified independently.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const SNAPSHOT_CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB per chunk
+
+    /// Get snapshot manifest (chunk count + per-chunk SHA3 hashes)
+    /// Used by peers to request individual chunks for parallel download
+    pub fn get_snapshot_manifest(&self, height: u64) -> IntegrationResult<Option<SnapshotManifest>> {
+        let data = match self.get_snapshot_data(height)? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let total_size = data.len();
+        let chunk_count = (total_size + Self::SNAPSHOT_CHUNK_SIZE - 1) / Self::SNAPSHOT_CHUNK_SIZE;
+        let mut chunk_hashes = Vec::with_capacity(chunk_count);
+        for i in 0..chunk_count {
+            let start = i * Self::SNAPSHOT_CHUNK_SIZE;
+            let end = std::cmp::min(start + Self::SNAPSHOT_CHUNK_SIZE, total_size);
+            let hash = sha3::Sha3_256::digest(&data[start..end]);
+            chunk_hashes.push(hex::encode(hash));
+        }
+        Ok(Some(SnapshotManifest {
+            height,
+            total_size: total_size as u64,
+            chunk_size: Self::SNAPSHOT_CHUNK_SIZE as u64,
+            chunk_count: chunk_count as u64,
+            chunk_hashes,
+        }))
+    }
+
+    /// Get a specific chunk of the snapshot (0-indexed)
+    pub fn get_snapshot_chunk(&self, height: u64, chunk_index: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        let data = match self.get_snapshot_data(height)? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let start = (chunk_index as usize) * Self::SNAPSHOT_CHUNK_SIZE;
+        if start >= data.len() {
+            return Ok(None);
+        }
+        let end = std::cmp::min(start + Self::SNAPSHOT_CHUNK_SIZE, data.len());
+        Ok(Some(data[start..end].to_vec()))
+    }
+
+    /// Download snapshot using chunked parallel protocol from multiple peers
+    /// Falls back to legacy single-request download if chunked protocol unavailable
+    pub async fn download_snapshot_chunked(&self, peer_addrs: &[String], height: u64) -> IntegrationResult<()> {
+        if peer_addrs.is_empty() {
+            return Err(IntegrationError::Other("No peers for chunked download".to_string()));
+        }
+        let start_time = std::time::Instant::now();
+
+        // Step 1: Fetch manifest from first responsive peer
+        let mut manifest: Option<SnapshotManifest> = None;
+        for addr in peer_addrs {
+            let url = format!("http://{}/api/v1/snapshot/{}/manifest", addr, height);
+            match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(m) = resp.json::<SnapshotManifest>().await {
+                        manifest = Some(m);
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        let manifest = match manifest {
+            Some(m) => m,
+            None => {
+                // Fallback: legacy single-request download from first peer
+                if crate::node::is_info() {
+                    println!("[INFO][SYNC] chunked_manifest_unavailable fallback=legacy");
+                }
+                return self.download_snapshot_legacy(&peer_addrs[0], height).await;
+            }
+        };
+
+        println!("[INFO][SYNC] chunked_download_start h={} chunks={} total={}MB",
+                 height, manifest.chunk_count, manifest.total_size / (1024 * 1024));
+
+        // Step 2: Download chunks in parallel (round-robin across peers)
+        let chunk_count = manifest.chunk_count as usize;
+        let mut assembled = vec![0u8; manifest.total_size as usize];
+        let chunk_size = manifest.chunk_size as usize;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| IntegrationError::Other(format!("HTTP client error: {}", e)))?;
+
+        // Download up to 4 chunks concurrently
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let chunks_result: Vec<(usize, IntegrationResult<Vec<u8>>)> = {
+            let mut handles = Vec::with_capacity(chunk_count);
+            for i in 0..chunk_count {
+                let peer = peer_addrs[i % peer_addrs.len()].clone();
+                let client = client.clone();
+                let expected_hash = manifest.chunk_hashes[i].clone();
+                let sem = semaphore.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let url = format!("http://{}/api/v1/snapshot/{}/chunk/{}", peer, height, i);
+                    let resp = client.get(&url).send().await
+                        .map_err(|e| IntegrationError::Other(format!("Chunk {} download: {}", i, e)))?;
+                    if !resp.status().is_success() {
+                        return Err(IntegrationError::Other(format!("Chunk {} HTTP {}", i, resp.status())));
+                    }
+                    let bytes = resp.bytes().await
+                        .map_err(|e| IntegrationError::Other(format!("Chunk {} read: {}", i, e)))?;
+                    let actual_hash = hex::encode(sha3::Sha3_256::digest(&bytes));
+                    if actual_hash != expected_hash {
+                        return Err(IntegrationError::Other(
+                            format!("Chunk {} hash mismatch expected={} got={}", i, &expected_hash[..16], &actual_hash[..16])
+                        ));
+                    }
+                    Ok(bytes.to_vec())
+                }));
+            }
+            let mut results = Vec::with_capacity(chunk_count);
+            for (i, h) in handles.into_iter().enumerate() {
+                let r = h.await.map_err(|e| IntegrationError::Other(format!("Chunk {} join: {}", i, e)))?;
+                results.push((i, r));
+            }
+            results
+        };
+
+        // Step 3: Assemble chunks into full snapshot
+        for (i, result) in chunks_result {
+            let chunk_data = result?;
+            let start = i * chunk_size;
+            let end = std::cmp::min(start + chunk_data.len(), assembled.len());
+            assembled[start..end].copy_from_slice(&chunk_data);
+        }
+
+        // Step 4: Save assembled snapshot to DB
+        {
+            let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+                .ok_or_else(|| IntegrationError::StorageError("snapshots CF not found".to_string()))?;
+            let key = format!("full_snap_{}", height);
+            self.persistent.db.put_cf(&snapshots_cf, key.as_bytes(), &assembled)?;
+        }
+
+        self.load_state_snapshot(height).await?;
+
+        let elapsed = start_time.elapsed();
+        println!("[INFO][SYNC] chunked_download_done h={} chunks={} total={}MB elapsed={:.1}s",
+                 height, chunk_count, manifest.total_size / (1024 * 1024), elapsed.as_secs_f64());
+        Ok(())
+    }
+
+    /// Legacy single-request snapshot download (backward compatibility)
+    async fn download_snapshot_legacy(&self, peer_addr: &str, height: u64) -> IntegrationResult<()> {
         let url = format!("http://{}/api/v1/snapshot/{}", peer_addr, height);
-        
         let response = reqwest::get(&url).await
             .map_err(|e| IntegrationError::Other(format!("Download error: {}", e)))?;
-        
         if !response.status().is_success() {
             return Err(IntegrationError::Other("Snapshot download failed".to_string()));
         }
-        
         let data = response.bytes().await
             .map_err(|e| IntegrationError::Other(format!("Download error: {}", e)))?;
-        
-        // Save snapshot to DB (sync operation - cf_handle doesn't cross await)
         {
             let snapshots_cf = self.persistent.db.cf_handle("snapshots")
-                .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
-            
-            let snapshot_key = format!("snapshot_{}", height);
-            self.persistent.db.put_cf(&snapshots_cf, snapshot_key.as_bytes(), &data)?;
+                .ok_or_else(|| IntegrationError::StorageError("snapshots CF not found".to_string()))?;
+            let key = format!("full_snap_{}", height);
+            self.persistent.db.put_cf(&snapshots_cf, key.as_bytes(), &data)?;
         }
-        
-        // Load into state (async)
         self.load_state_snapshot(height).await?;
-        
+        if crate::node::is_info() {
+            println!("[INFO][SYNC] legacy_snapshot_applied h={}", height);
+        }
         Ok(())
     }
-    
+
+    /// Download snapshot — tries chunked first, falls back to legacy
+    async fn download_snapshot_from_peer(&self, peer_addr: &str, height: u64) -> IntegrationResult<()> {
+        self.download_snapshot_chunked(&[peer_addr.to_string()], height).await
+    }
+
     /// Fast sync with snapshot for new nodes
     pub async fn fast_sync_with_snapshot(&self, p2p: &crate::unified_p2p::SimplifiedP2P, target_height: u64) -> IntegrationResult<()> {
         println!("[SYNC] ⚡ Starting fast sync to height {}", target_height);
