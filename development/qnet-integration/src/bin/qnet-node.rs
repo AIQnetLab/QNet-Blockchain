@@ -2439,6 +2439,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     
     // ═══════════════════════════════════════════════════════════════════════════
+    // AUTO NTP SYNC - Force time sync at startup before any consensus logic
+    // ═══════════════════════════════════════════════════════════════════════════
+    {
+        println!("[INFO][NTP] Attempting automatic time synchronization at startup...");
+        let mut synced = false;
+
+        // Try systemd-timesyncd (most Linux distros)
+        if !synced {
+            if let Ok(out) = std::process::Command::new("timedatectl")
+                .args(&["set-ntp", "true"])
+                .output()
+            {
+                if out.status.success() {
+                    // Trigger immediate step sync
+                    let _ = std::process::Command::new("systemctl")
+                        .args(&["restart", "systemd-timesyncd"])
+                        .output();
+                    println!("[INFO][NTP] systemd-timesyncd sync triggered ✅");
+                    synced = true;
+                }
+            }
+        }
+
+        // Try chrony (alternative NTP daemon)
+        if !synced {
+            if let Ok(out) = std::process::Command::new("chronyc")
+                .args(&["makestep"])
+                .output()
+            {
+                if out.status.success() {
+                    println!("[INFO][NTP] chrony makestep sync triggered ✅");
+                    synced = true;
+                }
+            }
+        }
+
+        // Try ntpdate (legacy fallback)
+        if !synced {
+            if let Ok(out) = std::process::Command::new("ntpdate")
+                .args(&["-u", "pool.ntp.org"])
+                .output()
+            {
+                if out.status.success() {
+                    println!("[INFO][NTP] ntpdate sync triggered ✅");
+                    synced = true;
+                }
+            }
+        }
+
+        if !synced {
+            println!("[WARN][NTP] Auto-sync unavailable (no permissions or tools). Ensure host NTP is active.");
+        }
+
+        // Brief wait for time daemon to apply correction
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // v3.10: NTP DRIFT CHECK - Fail-fast if system time is too far off
     // ═══════════════════════════════════════════════════════════════════════════
     // CRITICAL: QNet uses slot-based timing (genesis_ts + height) for determinism.

@@ -253,9 +253,8 @@ function transformTransaction(
     return null;
   }
 
-  // Use tx.timestamp (client-set) for display — closer to "when user sent it"
-  // Fallback to blockTimestamp if tx.timestamp is missing
-  let rawTs = Number(tx.timestamp) || blockTimestamp || 0;
+  // Always use blockTimestamp (authoritative, set by producer node) — never trust client timestamp
+  let rawTs = blockTimestamp || 0;
   if (!Number.isFinite(rawTs) || rawTs < 0) {
     warn('[Sync] Invalid timestamp, fallback to 0:', rawTs);
     rawTs = 0;

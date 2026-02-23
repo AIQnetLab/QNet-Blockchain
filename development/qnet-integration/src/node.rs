@@ -4670,9 +4670,21 @@ impl BlockchainNode {
         // SCALABILITY: Snapshot load is O(n) but happens ONCE at startup (acceptable even for 1M accounts)
         if is_info() { println!("[INFO][STATE] loading_latest_snapshot"); }
         
+        // FIX: Read chain_height early so we can validate snapshot consistency.
+        // If snapshot_height > chain_height the node was interrupted AFTER applying
+        // block state but BEFORE saving the block to disk.  Restoring this snapshot
+        // would make every subsequent apply produce state_root_mismatch on the same
+        // block (infinite retry loop).  In that case we skip the snapshot and start
+        // from a clean in-memory state; the node will re-apply blocks from disk.
+        let pre_snapshot_chain_height = storage.get_chain_height().unwrap_or(0);
+        
         match storage.load_latest_state_snapshot().await {
             Ok(Some((snapshot_height, state_root, accounts_data))) => {
-                if !accounts_data.is_empty() {
+                // SAFETY: Reject snapshots that are ahead of committed blockchain data.
+                if snapshot_height > pre_snapshot_chain_height {
+                    eprintln!("[WARN][STATE] snapshot_ahead_of_chain snapshot={} chain={} — discarding to prevent state_root_mismatch",
+                              snapshot_height, pre_snapshot_chain_height);
+                } else if !accounts_data.is_empty() {
                     match bincode::deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_data) {
                         Ok(accounts) => {
                             let state_guard = state.write().await;
@@ -8038,9 +8050,9 @@ impl BlockchainNode {
                         if let Ok(network_height) = p2p.sync_blockchain_height().await {
                             let local_height = *height.read().await;
                             
-                            if network_height > local_height + 50 {
+                            if network_height > local_height.saturating_add(50) {
                                 println!("[WARN][SYNC] behind_network local={} network={} gap={}", 
-                                         local_height, network_height, network_height - local_height);
+                                         local_height, network_height, network_height.saturating_sub(local_height));
                             }
                         }
                     }
@@ -9243,7 +9255,7 @@ impl BlockchainNode {
             if local_height > 0 {
                 // CRITICAL FIX: Sync with network before starting production
                 // This prevents creating blocks at wrong height when restarting
-                println!("[Node] 🔄 Syncing with network before starting production...");
+                println!("[INFO][NODE] Syncing with network before starting production...");
                 
                 if let Some(ref p2p) = self.unified_p2p {
                     // Try to get network height
@@ -9251,8 +9263,8 @@ impl BlockchainNode {
                         Ok(network_height) => {
                             let local_height = self.storage.get_chain_height().unwrap_or(0);
                             if network_height > local_height {
-                                println!("[Node] 📊 Network is ahead: {} vs local: {}", network_height, local_height);
-                                println!("[Node] 🔄 Syncing {} blocks before production...", network_height - local_height);
+                                println!("[INFO][NODE] Network is ahead: {} vs local: {}", network_height, local_height);
+                                println!("[[INFO][NODE] {} blocks before production...", network_height.saturating_sub(local_height));
                                 
                                 // OPTIMIZATION: Use parallel download for faster initial sync
                                 p2p.parallel_download_microblocks(&self.storage, local_height, network_height).await;
@@ -9265,7 +9277,7 @@ impl BlockchainNode {
                             }
                         }
                         Err(e) if e == "BOOTSTRAP_MODE" => {
-                            println!("[Node] 🚀 Bootstrap mode - starting production immediately");
+                            println!("[INFO][NODE] Bootstrap mode - starting production immediately");
                         }
                         Err(e) => {
                             println!("[WARN][NODE] Failed to get network height: {}, starting anyway", e);
@@ -9277,7 +9289,7 @@ impl BlockchainNode {
         if is_info() { println!("[INFO][NODE] microblock_production_start interval=1s"); }
         self.start_microblock_production().await;
         } else {
-            println!("[Node] 📱 Light node: Sync-only mode (no block production)");
+            println!("[INFO][NODE] Light node: Sync-only mode (no block production)");
             // Light nodes will sync through P2P received blocks
         }
         
@@ -9303,8 +9315,8 @@ impl BlockchainNode {
         // PRODUCTION: All nodes participate in P2P network and microblock production
         // Byzantine consensus participation is determined dynamically during macroblock rounds
         if let Some(unified_p2p) = &self.unified_p2p {
-            println!("[Node] 🌐 Node ready for P2P networking and microblock production");
-            println!("[Node] 🏛️ Byzantine consensus will activate during macroblock rounds only");
+            println!("[INFO][NODE] Node ready for P2P networking and microblock production");
+            println!("[INFO][NODE] Byzantine consensus will activate during macroblock rounds only");
         }
         
         // MOVED: API initialization moved to beginning of start() method
@@ -9339,15 +9351,15 @@ impl BlockchainNode {
             
             std::env::set_var("QNET_CURRENT_RPC_PORT", light_port.to_string());
             
-            println!("[Node] 🔌 Unified server: port {} (Light node)", light_port);
-            println!("[Node] 📱 Light node: Mobile-optimized endpoints");
+            println!("[INFO][NODE] Unified server: port {} (Light node)", light_port);
+            println!("[INFO][NODE] Light node: Mobile-optimized endpoints");
         }
         
         if is_info() { println!("[INFO][NODE] started"); }
         
         // Blockchain-based node management (no heartbeat required)
-        println!("🔗 Node status managed via blockchain records");
-        println!("📡 No heartbeat system - scalable for millions of nodes");
+        println!("[INFO][NODE] Node status managed via blockchain records");
+        println!("[INFO][NODE] No heartbeat system - scalable for millions of nodes");
 
         // FIXED: Keep the node running with device migration monitoring
         let mut migration_check_counter = 0;
@@ -9374,7 +9386,7 @@ impl BlockchainNode {
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
         
-        println!("[Node] 🛑 Blockchain node shutting down...");
+        println!("[ERR][NODE] Blockchain node shutting down...");
         Ok(())
     }
     
@@ -11129,7 +11141,18 @@ impl BlockchainNode {
                     let ram_height = *height.read().await;
                     
                     // CRITICAL: Use MAX of both to handle all sync paths
-                    let canonical_height = std::cmp::max(local_chain_height, ram_height);
+                    // SAFETY: Guard against u64::MAX (can appear if cache/state is corrupted).
+                    // Without this, the scan loop below iterates 18 quintillion entries → deadlock.
+                    let canonical_height = {
+                        let raw = std::cmp::max(local_chain_height, ram_height);
+                        if raw == u64::MAX || raw > 2_000_000_000 {
+                            println!("[ERR][SYNC] canonical_height_invalid={} local={} ram={} — clamping to local",
+                                     raw, local_chain_height, ram_height);
+                            local_chain_height
+                        } else {
+                            raw
+                        }
+                    };
                     
                     // INTERNAL SYNC: Update RAM if RocksDB is ahead (fixes API/other components)
                     if local_chain_height > ram_height {
@@ -12014,7 +12037,7 @@ impl BlockchainNode {
                         // If network is ahead of us, use network height
                         if network_height > microblock_height {
                             println!("[WARN][SYNC] Node behind network: local={}, network={}, gap={}", 
-                                     microblock_height, network_height, network_height - microblock_height);
+                                     microblock_height, network_height, network_height.saturating_sub(microblock_height));
                             network_height
                         } else {
                             microblock_height
@@ -12827,7 +12850,7 @@ impl BlockchainNode {
                                         let network_height = p2p.get_cached_network_height().unwrap_or(local_height);
                                         
                                         if network_height > local_height + 5 {
-                                            let gap = network_height - local_height;
+                                            let gap = network_height.saturating_sub(local_height);
                                             println!("[INFO][SYNC] aggressive_sync local={} network={} gap={}", 
                                                     local_height, network_height, gap);
                                             
@@ -18595,7 +18618,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 if network_height > 0 && local_height + 50 < network_height {
                     println!("[WARN][PFP] desync_skip local={} network={} gap={}", 
-                             local_height, network_height, network_height - local_height);
+                             local_height, network_height, network_height.saturating_sub(local_height));
                     return; // Do NOT participate - we're too far behind!
                 }
                 

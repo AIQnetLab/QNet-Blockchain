@@ -6988,7 +6988,7 @@ impl SimplifiedP2P {
         // v2.26.1: Fallback to max(peer heights) from HealthPing data
         // This ensures network_height is always accurate even without active sync
         let max_peer_height = self.get_max_peer_height();
-        if max_peer_height > 0 {
+        if max_peer_height > 0 && max_peer_height != u64::MAX && max_peer_height < 2_000_000_000 {
             return Some(max_peer_height);
         }
         
@@ -7000,8 +7000,13 @@ impl SimplifiedP2P {
     /// This provides real-time network height without HTTP calls
     pub fn get_max_peer_height(&self) -> u64 {
         // v2.51: Lock-free height collection
+        // SAFETY: Filter u64::MAX (corrupted/uninitialized) and unreasonably large values.
+        // If a peer somehow reports u64::MAX this cascades to every node's network_height.
         let mut peer_heights: Vec<u64> = self.connected_peers_lockfree.iter()
-            .filter(|e| e.value().last_block_height > 0)
+            .filter(|e| {
+                let h = e.value().last_block_height;
+                h > 0 && h != u64::MAX && h < 2_000_000_000
+            })
             .map(|e| e.value().last_block_height)
             .collect();
         
@@ -7081,8 +7086,12 @@ impl SimplifiedP2P {
         // v2.24.3: QUIC-ONLY SYNC - Use cached heights from PeerInfo
         // Heights are updated via heartbeats and block broadcasts (no HTTP queries needed)
         // SCALABILITY: O(n) where n = connected peers, zero network overhead
+        // SAFETY: Filter u64::MAX and unreasonably large values to prevent overflow cascades.
         let mut peer_heights: Vec<u64> = validated_peers.iter()
-            .filter(|p| p.last_block_height > 0)  // Only peers with known height
+            .filter(|p| {
+                let h = p.last_block_height;
+                h > 0 && h != u64::MAX && h < 2_000_000_000
+            })
             .map(|p| p.last_block_height)
             .collect();
         
@@ -7105,6 +7114,16 @@ impl SimplifiedP2P {
         } else {
             // Use maximum height - safe since we checked empty above
             peer_heights.into_iter().max().unwrap_or(0)
+        };
+        
+        // SAFETY: Never cache u64::MAX or absurdly large heights.
+        let consensus_height = if consensus_height == u64::MAX || consensus_height > 2_000_000_000 {
+            println!("[WARN][SYNC] consensus_height_invalid={} — falling back to local_height", consensus_height);
+            // Return local height so the node doesn't freeze; it will retry next cycle.
+            let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            return Ok(local_h);
+        } else {
+            consensus_height
         };
         
         println!("[SYNC] ✅ Consensus blockchain height: {}", consensus_height);

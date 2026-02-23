@@ -2608,12 +2608,14 @@ const WalletScreen = () => {
       setImportStep(1); // Reset to step 1 for next time
       setLoading(false);
       
-      // Clear previous wallet's activation data
+      // Clear previous wallet's activation data and node status
       setActivatedNodeType(null);
       setActivationCode(null);
       setNodeRewards(null);
       setNodePseudonym('');
-      setNodeStatus(null); // Reset node selection
+      setNodeStatus(null);
+      setLightNodeStatus(null);
+      setServerNodeStatus(null);
       
       // Clear stored activation data from AsyncStorage
       await AsyncStorage.removeItem('qnet_activation_codes');
@@ -2740,7 +2742,9 @@ const WalletScreen = () => {
     setActivationCode(null);
     setNodeRewards(null);
     setNodePseudonym('');
-    setNodeStatus(null); // Reset node selection
+    setNodeStatus(null);
+    setLightNodeStatus(null);
+    setServerNodeStatus(null);
     
     // Clear stored activation data from AsyncStorage
     AsyncStorage.removeItem('qnet_activation_codes');
@@ -2950,7 +2954,24 @@ const WalletScreen = () => {
                   setPassword('');
                   setActivatedNodeType(null);
                   setActivationCode(null);
-                  setNodeStatus(null); // Reset node selection
+                  setNodeStatus(null);
+                  setLightNodeStatus(null);
+                  setServerNodeStatus(null);
+                  setNodePseudonym('');
+                  setNodeRewards(null);
+                  // Clear ALL node-related AsyncStorage (both light and super)
+                  const keysAll = await AsyncStorage.getAllKeys();
+                  const nodeKeys = keysAll.filter(k =>
+                    k.startsWith('blockchain_check_') ||
+                    k.startsWith('node_pseudonym_') ||
+                    k === 'qnet_activation_codes' ||
+                    k === 'qnet_activation_meta_light' ||
+                    k === 'qnet_activation_meta_full' ||
+                    k === 'qnet_activation_meta_super' ||
+                    k === 'qnet_last_activated_node' ||
+                    k === 'qnet_cached_server_status'
+                  );
+                  if (nodeKeys.length > 0) await AsyncStorage.multiRemove(nodeKeys);
                   showAlert('Success', 'Wallet data cleared. You can now create a new wallet or import an existing one.');
                 } catch (clearError) {
                   // console.error('Error clearing wallet:', clearError);
@@ -3581,7 +3602,24 @@ const WalletScreen = () => {
               setHasWallet(false);
               setActivatedNodeType(null);
               setActivationCode(null);
-              setNodeStatus(null); // Reset node selection
+              setNodeStatus(null);
+              setLightNodeStatus(null);
+              setServerNodeStatus(null);
+              setNodePseudonym('');
+              setNodeRewards(null);
+              // Clear ALL node-related AsyncStorage (both light and super)
+              const keysAll = await AsyncStorage.getAllKeys();
+              const nodeKeys = keysAll.filter(k =>
+                k.startsWith('blockchain_check_') ||
+                k.startsWith('node_pseudonym_') ||
+                k === 'qnet_activation_codes' ||
+                k === 'qnet_activation_meta_light' ||
+                k === 'qnet_activation_meta_full' ||
+                k === 'qnet_activation_meta_super' ||
+                k === 'qnet_last_activated_node' ||
+                k === 'qnet_cached_server_status'
+              );
+              if (nodeKeys.length > 0) await AsyncStorage.multiRemove(nodeKeys);
               
             } catch (error) {
               showAlert('Error', 'Failed to delete wallet: ' + error.message);
