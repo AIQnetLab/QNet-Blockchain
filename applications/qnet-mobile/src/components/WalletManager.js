@@ -5605,30 +5605,30 @@ export class WalletManager {
             systemPseudonym
           );
 
-          // Part 2 (Ed25519): HYBRID v2.90 — gossip classical ownership proof
+          // Part 2 (Ed25519): HYBRID v6.1 — gossip classical ownership proof (MANDATORY)
           // Signs "light_node_gossip:{pseudonym}:{walletAddress}" with QNet wallet Ed25519 key.
-          // Allows all server nodes to verify P2P gossip without knowing the activation code.
+          // Server rejects registration if this signature is missing or invalid.
           let ed25519GossipSignature = null;
           let ed25519GossipPubkey = null;
-          try {
+          {
             const wd = await this.loadWallet(password);
-            if (wd) {
-              const qnetKeypair = wd.qnetKeypair;
-              const privateKeyBytes = qnetKeypair?.privateKey
-                ? new Uint8Array(qnetKeypair.privateKey)
-                : new Uint8Array((wd.secretKey || []).slice(0, 32));
-              if (privateKeyBytes.length === 32) {
-                const kp = nacl.sign.keyPair.fromSeed(privateKeyBytes);
-                ed25519GossipPubkey = Buffer.from(kp.publicKey).toString('hex'); // 64 hex chars
-                const fullSk = new Uint8Array([...privateKeyBytes, ...kp.publicKey]);
-                const gossipMsg = `light_node_gossip:${systemPseudonym}:${walletAddress}`;
-                const sig = nacl.sign.detached(new TextEncoder().encode(gossipMsg), fullSk);
-                ed25519GossipSignature = Buffer.from(sig).toString('hex'); // 128 hex chars
-                console.log('[Registration] Ed25519 gossip signature created for HYBRID auth');
-              }
+            if (!wd) {
+              throw new Error('Cannot load wallet — required for hybrid gossip signature');
             }
-          } catch (gossipSigErr) {
-            console.warn('[Registration] Ed25519 gossip signature failed (non-fatal):', gossipSigErr.message);
+            const qnetKeypair = wd.qnetKeypair;
+            const privateKeyBytes = qnetKeypair?.privateKey
+              ? new Uint8Array(qnetKeypair.privateKey)
+              : new Uint8Array((wd.secretKey || []).slice(0, 32));
+            if (privateKeyBytes.length !== 32) {
+              throw new Error('Ed25519 private key must be 32 bytes — wallet data corrupted');
+            }
+            const kp = nacl.sign.keyPair.fromSeed(privateKeyBytes);
+            ed25519GossipPubkey = Buffer.from(kp.publicKey).toString('hex');
+            const fullSk = new Uint8Array([...privateKeyBytes, ...kp.publicKey]);
+            const gossipMsg = `light_node_gossip:${systemPseudonym}:${walletAddress}`;
+            const sig = nacl.sign.detached(new TextEncoder().encode(gossipMsg), fullSk);
+            ed25519GossipSignature = Buffer.from(sig).toString('hex');
+            console.log('[Registration] Ed25519 gossip signature created (hybrid v6.1)');
           }
 
           // v4.3: Get burn TX data for STATELESS code ownership verification

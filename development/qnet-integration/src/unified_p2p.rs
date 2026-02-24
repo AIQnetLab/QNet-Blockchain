@@ -12179,7 +12179,9 @@ impl SimplifiedP2P {
                 
                 // GOSSIP TTL: Max 3 hops to prevent infinite propagation
                 if gossip_hop >= 3 {
-                    println!("[GOSSIP] ⏭️ Light node registration {} exceeded hop limit", node_id);
+                    if crate::node::is_debug() {
+                        println!("[DBG][GOSSIP] hop_limit_exceeded node={} hop={}", node_id, gossip_hop);
+                    }
                     return;
                 }
                 
@@ -12196,7 +12198,9 @@ impl SimplifiedP2P {
                         // Failures are tracked locally by each pinger node
                         // Gossip can only reset failures (successful re-registration)
                         if consecutive_failures > existing.consecutive_failures && consecutive_failures > 0 {
-                            println!("[GOSSIP] ⚠️ Ignoring suspicious failure count increase for {}", node_id);
+                            if crate::node::is_warn() {
+                                println!("[WARN][GOSSIP] suspicious_failure_increment_rejected node={}", node_id);
+                            }
                             return;
                         }
                     }
@@ -12212,27 +12216,45 @@ impl SimplifiedP2P {
                     if !signature.is_empty() && !quantum_pubkey.is_empty() {
                         let dilithium_ok = self.verify_mobile_dilithium_gossip(&wallet_address, &signature, &quantum_pubkey);
                         if !dilithium_ok {
-                            println!("[GOSSIP] ❌ Invalid Dilithium3 signature for Light node {}", node_id);
+                            if crate::node::is_warn() {
+                                println!("[WARN][GOSSIP] dilithium_invalid node={} wallet={}...",
+                                    node_id, &wallet_address[..16.min(wallet_address.len())]);
+                            }
                             return;
                         }
+                        if crate::node::is_debug() {
+                            println!("[DBG][GOSSIP] dilithium_ok node={}", node_id);
+                        }
                     } else {
-                        println!("[GOSSIP] ⚠️ Missing Dilithium3 signature for Light node {} — rejecting", node_id);
+                        if crate::node::is_warn() {
+                            println!("[WARN][GOSSIP] dilithium_missing_rejected node={} wallet={}...",
+                                node_id, &wallet_address[..16.min(wallet_address.len())]);
+                        }
                         return;
                     }
 
-                    // Part 2: Ed25519 — classical wallet ownership proof (if present)
+                    // Part 2: Ed25519 — classical wallet ownership proof (MANDATORY v6.1)
                     // Message: "light_node_gossip:{node_id}:{wallet_address}"
-                    // Older registrations (pre-v2.90) may lack Ed25519 — accept them with warning.
+                    // Both signature and public_key MUST be present — no fallback allowed.
                     if !ed25519_signature.is_empty() && !ed25519_public_key.is_empty() {
                         let gossip_msg = format!("light_node_gossip:{}:{}", node_id, wallet_address);
                         let ed25519_ok = self.verify_ed25519_gossip_signature(&gossip_msg, &ed25519_signature, &ed25519_public_key);
                         if !ed25519_ok {
-                            println!("[GOSSIP] ❌ Invalid Ed25519 signature for Light node {}", node_id);
+                            if crate::node::is_warn() {
+                                println!("[WARN][GOSSIP] ed25519_invalid node={} wallet={}...",
+                                    node_id, &wallet_address[..16.min(wallet_address.len())]);
+                            }
                             return;
                         }
+                        if crate::node::is_debug() {
+                            println!("[DBG][GOSSIP] ed25519_ok node={}", node_id);
+                        }
                     } else {
-                        // Pre-v2.90 gossip: Ed25519 not yet included — warn but accept
-                        println!("[GOSSIP] ⚠️ No Ed25519 hybrid signature for {} (pre-v2.90 node)", node_id);
+                        if crate::node::is_warn() {
+                            println!("[WARN][GOSSIP] ed25519_missing_rejected node={} wallet={}...",
+                                node_id, &wallet_address[..16.min(wallet_address.len())]);
+                        }
+                        return;
                     }
                 }
                 
@@ -12272,7 +12294,9 @@ impl SimplifiedP2P {
                     });
                 }
                 
-                println!("[GOSSIP] ✅ Light node {} registered (hop {})", node_id, gossip_hop);
+                if crate::node::is_info() {
+                    println!("[INFO][GOSSIP] light_node_accepted node={} hop={} hybrid=ok", node_id, gossip_hop);
+                }
                 
                 // RE-GOSSIP: Forward to other peers with incremented hop (including HYBRID sigs)
                 let forward_msg = NetworkMessage::LightNodeRegistration {
