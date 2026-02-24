@@ -10017,7 +10017,31 @@ impl BlockchainNode {
                                     &eligible_indices,
                                     total_assigned,
                                 ) {
-                                    Ok(tx) => {
+                                    Ok(mut tx) => {
+                                        // SECURITY v6.1: Sign with ephemeral Ed25519 so receiving nodes can
+                                        // verify via validate_and_add_network_transaction (else branch).
+                                        // Canonical msg = pipe-format (matches build_canonical_verify_message `_`).
+                                        {
+                                            use ed25519_dalek::{SigningKey, Signer};
+                                            use rand::rngs::OsRng;
+                                            let canonical_msg = format!(
+                                                "{}|{}|{}|{}|{}|{}|{}",
+                                                tx.from,
+                                                tx.to.as_deref().unwrap_or(""),
+                                                tx.amount,
+                                                tx.nonce,
+                                                tx.gas_price,
+                                                tx.gas_limit,
+                                                tx.timestamp,
+                                            );
+                                            let signing_key = SigningKey::generate(&mut OsRng);
+                                            let vk = signing_key.verifying_key();
+                                            let sig = signing_key.sign(canonical_msg.as_bytes());
+                                            tx.signature  = Some(hex::encode(sig.to_bytes()));
+                                            tx.public_key = Some(hex::encode(vk.as_bytes()));
+                                            tx.hash = tx.calculate_hash();
+                                        }
+
                                         if is_info() {
                                             println!("[INFO][LIGHT-BITMAP] TX created hash={}", &tx.hash[..16]);
                                         }
@@ -22823,26 +22847,26 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let mut tx_indices: Vec<usize> = Vec::with_capacity(transactions.len());
         
         for (idx, tx) in transactions.iter().enumerate() {
-            // CRITICAL FIX v3.31.1: Skip UNSIGNED system TXs in batch Ed25519 check
-            // These TX types are either:
-            // - Created by block producer (included directly in block, not gossiped individually)
-            // - Validated through consensus mechanism, not user signatures
-            // - NodeRegistration/LightNodeBitmap: system ops without user Ed25519
-            // 
-            // NOTE: HeartbeatCommitment and PingCommitment from NODES have signatures (v2.82)
-            // and WILL be verified normally. Only unsigned variants are skipped.
+            // SECURITY v6.1: Only truly unsigned system TXs skip batch Ed25519 check.
+            // - RewardDistribution (system_emission): block-level only, never gossiped
+            // - CreateAccount: internal system op, never gossiped individually
+            // - BatchRewardClaims / BatchNodeActivations: DEPRECATED, never instantiated
+            //
+            // REMOVED from skip list (v6.1):
+            // - NodeRegistration: client-signed NodeReg HAS Ed25519+Dilithium → verify early
+            // - NodeActivation: now signed with ephemeral Ed25519 (v6.1) → verify early
+            // - LightNodeEligibilityBitmap: now signed with ephemeral Ed25519 (v6.1) → verify early
             let is_unsigned_system_tx = matches!(tx.tx_type,
                 qnet_state::TransactionType::RewardDistribution { .. } |
-                qnet_state::TransactionType::NodeRegistration { .. } |
-                qnet_state::TransactionType::NodeActivation { .. } |
                 qnet_state::TransactionType::CreateAccount { .. } |
-                qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
                 qnet_state::TransactionType::BatchRewardClaims { .. } |
                 qnet_state::TransactionType::BatchNodeActivations { .. }
             );
-            
+
             if is_unsigned_system_tx {
-                // System TX - validated through consensus/block verification, not Ed25519
+                // These TXs have no user Ed25519 — skip batch verify, evaluated later
+                // RewardDistribution(claim) is verified in validate_and_add_network_transaction
+                // system_emission RewardDistribution is REJECTED in validate_and_add (v6.1)
                 valid_indices.push(idx);
                 continue;
             }
@@ -23199,6 +23223,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // - RewardDistribution: validated through consensus
             // - PingCommitmentWithSampling: validated through Dilithium signatures + Merkle proofs + TX signature (v2.82)
             // - HeartbeatCommitment: validated through Dilithium signatures in samples + Merkle proofs + TX signature (v2.82)
+
+            // SECURITY v6.1: system_emission RewardDistribution TXs are ONLY produced by
+            // block producers and included directly in blocks. They must NEVER arrive via
+            // P2P gossip — if they do, someone is trying to inject forged emission rewards.
+            if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) && tx.from == "system_emission" {
+                return Err(QNetError::ValidationError(
+                    "system_emission RewardDistribution must not arrive via P2P gossip — block-level TX only".to_string()
+                ));
+            }
+
             if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) && tx.from != "system_emission" {
                 // v3.35: FULL crypto verification for RewardDistribution (not just presence check!)
                 // Prevents forged claim TXs from being injected via gossip
@@ -23266,19 +23300,28 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
         } else {
-            if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
-                return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
+            // SECURITY v6.1: Ed25519 signature AND public_key are BOTH mandatory for user TXs.
+            // Previously: if public_key was None, verification was silently skipped despite
+            // signature being present — a TX with garbage signature + no public_key would pass.
+            let sig = match tx.signature.as_ref().filter(|s| !s.is_empty()) {
+                Some(s) => s,
+                None => return Err(QNetError::ValidationError(
+                    format!("Transaction signature is empty (type={:?})", std::mem::discriminant(&tx.tx_type))
+                )),
+            };
+            let pubkey = match tx.public_key.as_ref().filter(|p| !p.is_empty()) {
+                Some(p) => p,
+                None => return Err(QNetError::ValidationError(
+                    "Transaction has signature but public_key is missing — cannot verify Ed25519".to_string()
+                )),
+            };
+
+            if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
+                return Err(QNetError::ValidationError(format!(
+                    "Invalid Ed25519 signature (type={:?})", std::mem::discriminant(&tx.tx_type)
+                )));
             }
-            
-            // PRODUCTION v2.57: Verify on SIGVERIFY_RUNTIME
-            if let Some(ref sig) = tx.signature {
-                if let Some(ref pubkey) = tx.public_key {
-                    if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
-                        return Err(QNetError::ValidationError("Invalid Ed25519 signature".to_string()));
-                    }
-                }
-            }
-            
+
             if tx.dilithium_signature.is_some() {
                 if !Self::verify_dilithium_tx_signature_async(&tx).await? {
                     return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));

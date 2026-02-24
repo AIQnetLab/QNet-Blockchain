@@ -90,7 +90,7 @@ export async function detectPushProvider() {
 /**
  * Register Light node with detected push provider
  */
-export async function registerLightNode(nodeId, walletAddress, quantumPubkey, quantumSignature, burnTxHash = null, burnAmount = null, burnWallet = null, ed25519Signature = null, signatureTimestamp = null) {
+export async function registerLightNode(nodeId, walletAddress, quantumPubkey, quantumSignature, burnTxHash = null, burnAmount = null, burnWallet = null, ed25519Signature = null, signatureTimestamp = null, ed25519GossipSignature = null, ed25519GossipPubkey = null) {
   const pushProvider = await detectPushProvider();
   const apiUrl = await getRandomBootstrapNodeAsync();
 
@@ -115,6 +115,10 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
   // Prevents stolen code reuse — attacker cannot sign without Solana private key
   if (ed25519Signature) registrationData.ed25519_signature = ed25519Signature;
   if (signatureTimestamp != null) registrationData.signature_timestamp = signatureTimestamp;
+  // HYBRID v2.90: Ed25519 gossip signature for P2P authentication on all nodes
+  // Message: "light_node_gossip:{node_pseudonym}:{wallet_address}" — stable, no activation code
+  if (ed25519GossipSignature) registrationData.ed25519_gossip_signature = ed25519GossipSignature;
+  if (ed25519GossipPubkey) registrationData.ed25519_gossip_pubkey = ed25519GossipPubkey;
 
   // Add provider-specific data
   if (pushProvider.type === PushType.FCM) {

@@ -10479,9 +10479,9 @@ pub struct LightNodeRegistrationData {
     pub node_id: String,              // Privacy-preserving pseudonym
     pub wallet_address: String,       // Owner wallet for rewards
     pub device_token_hash: String,    // Hashed FCM token (for FCM) or empty
-    pub quantum_pubkey: String,       // Dilithium public key
+    pub quantum_pubkey: String,       // Dilithium3 (ML-DSA-65) public key
     pub registered_at: u64,           // Registration timestamp
-    pub signature: String,            // Ed25519 signature
+    pub signature: String,            // Dilithium3 quantum signature over wallet_address
     #[serde(default)]
     pub push_type: PushType,          // FCM | UnifiedPush | Polling
     #[serde(default)]
@@ -10492,6 +10492,12 @@ pub struct LightNodeRegistrationData {
     pub consecutive_failures: u8,     // Failed pings in a row (max 255)
     #[serde(default = "default_true")]
     pub is_active: bool,              // Node is active and should be pinged
+    // HYBRID SIGNATURE v2.90: Ed25519 + Dilithium3 for gossip authentication
+    // Message signed: "light_node_gossip:{node_id}:{wallet_address}"
+    #[serde(default)]
+    pub ed25519_signature: String,    // Ed25519 signature (QNet wallet key, 128 hex chars)
+    #[serde(default)]
+    pub ed25519_public_key: String,   // Ed25519 public key (32 bytes = 64 hex chars)
 }
 
 fn default_true() -> bool { true }
@@ -10809,13 +10815,14 @@ pub enum NetworkMessage {
     
     /// PRODUCTION: Light Node registration gossip for decentralized registry sync
     /// All Full/Super nodes maintain synchronized Light Node registry via gossip
+    /// HYBRID SIGNATURE v2.90: Ed25519 + Dilithium3 for double authentication
     LightNodeRegistration {
         node_id: String,              // Privacy-preserving pseudonym (hash-based)
         wallet_address: String,       // Owner wallet for reward claims
         device_token_hash: String,    // Hashed FCM token for privacy
-        quantum_pubkey: String,       // CRYSTALS-Dilithium public key
+        quantum_pubkey: String,       // CRYSTALS-Dilithium3 (ML-DSA-65) public key
         registered_at: u64,           // Registration timestamp
-        signature: String,            // Ed25519 signature from wallet
+        signature: String,            // Dilithium3 quantum signature over wallet_address
         gossip_hop: u8,               // Hop count for gossip TTL (max 3)
         #[serde(default)]
         push_type: PushType,          // FCM | UnifiedPush | Polling
@@ -10827,6 +10834,11 @@ pub enum NetworkMessage {
         consecutive_failures: u8,     // Failed pings counter
         #[serde(default = "default_true")]
         is_active: bool,              // Node activity status
+        // HYBRID: Ed25519 part (message: "light_node_gossip:{node_id}:{wallet_address}")
+        #[serde(default)]
+        ed25519_signature: String,    // Ed25519 signature (128 hex chars)
+        #[serde(default)]
+        ed25519_public_key: String,   // Ed25519 public key (64 hex chars)
     },
     
     /// PRODUCTION: Full/Super node heartbeat for self-attestation
@@ -12160,7 +12172,8 @@ impl SimplifiedP2P {
             NetworkMessage::LightNodeRegistration { 
                 node_id, wallet_address, device_token_hash, quantum_pubkey, 
                 registered_at, signature, gossip_hop, push_type, unified_push_endpoint,
-                last_seen, consecutive_failures, is_active
+                last_seen, consecutive_failures, is_active,
+                ed25519_signature, ed25519_public_key,
             } => {
                 self.update_peer_last_seen(from_peer);
                 
@@ -12189,14 +12202,38 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // PRODUCTION: Verify Ed25519 signature before accepting
-                // Format: "light_node_registration:{node_id}:{wallet_address}:{registered_at}"
-                let message = format!("light_node_registration:{}:{}:{}", node_id, wallet_address, registered_at);
-                let signature_valid = self.verify_ed25519_signature(&message, &signature, &wallet_address);
-                
-                if !signature_valid {
-                    println!("[GOSSIP] ❌ Invalid signature for Light node {}", node_id);
-                    return;
+                // HYBRID v2.90: Verify BOTH Dilithium3 + Ed25519 signatures
+                // Exception: genesis nodes (genesis_node_*) skip this check — they are trusted by definition.
+                // Dilithium3: mobile signs wallet_address with keypair derived from activation code
+                // Ed25519:    mobile signs "light_node_gossip:{node_id}:{wallet_address}" with QNet wallet key
+                let is_genesis = node_id.starts_with("genesis_");
+                if !is_genesis {
+                    // Part 1: Dilithium3 (ML-DSA-65) — quantum-resistant identity proof
+                    if !signature.is_empty() && !quantum_pubkey.is_empty() {
+                        let dilithium_ok = self.verify_mobile_dilithium_gossip(&wallet_address, &signature, &quantum_pubkey);
+                        if !dilithium_ok {
+                            println!("[GOSSIP] ❌ Invalid Dilithium3 signature for Light node {}", node_id);
+                            return;
+                        }
+                    } else {
+                        println!("[GOSSIP] ⚠️ Missing Dilithium3 signature for Light node {} — rejecting", node_id);
+                        return;
+                    }
+
+                    // Part 2: Ed25519 — classical wallet ownership proof (if present)
+                    // Message: "light_node_gossip:{node_id}:{wallet_address}"
+                    // Older registrations (pre-v2.90) may lack Ed25519 — accept them with warning.
+                    if !ed25519_signature.is_empty() && !ed25519_public_key.is_empty() {
+                        let gossip_msg = format!("light_node_gossip:{}:{}", node_id, wallet_address);
+                        let ed25519_ok = self.verify_ed25519_gossip_signature(&gossip_msg, &ed25519_signature, &ed25519_public_key);
+                        if !ed25519_ok {
+                            println!("[GOSSIP] ❌ Invalid Ed25519 signature for Light node {}", node_id);
+                            return;
+                        }
+                    } else {
+                        // Pre-v2.90 gossip: Ed25519 not yet included — warn but accept
+                        println!("[GOSSIP] ⚠️ No Ed25519 hybrid signature for {} (pre-v2.90 node)", node_id);
+                    }
                 }
                 
                 // Store in local registry with LRU eviction
@@ -12230,12 +12267,14 @@ impl SimplifiedP2P {
                         last_seen,
                         consecutive_failures,
                         is_active,
+                        ed25519_signature: ed25519_signature.clone(),
+                        ed25519_public_key: ed25519_public_key.clone(),
                     });
                 }
                 
                 println!("[GOSSIP] ✅ Light node {} registered (hop {})", node_id, gossip_hop);
                 
-                // RE-GOSSIP: Forward to other peers with incremented hop
+                // RE-GOSSIP: Forward to other peers with incremented hop (including HYBRID sigs)
                 let forward_msg = NetworkMessage::LightNodeRegistration {
                     node_id,
                     wallet_address,
@@ -12249,6 +12288,8 @@ impl SimplifiedP2P {
                     last_seen,
                     consecutive_failures,
                     is_active,
+                    ed25519_signature,
+                    ed25519_public_key,
                 };
                 self.gossip_to_random_peers(forward_msg, 3); // Forward to 3 random peers
             }
@@ -12391,11 +12432,12 @@ impl SimplifiedP2P {
                 self.update_peer_last_seen(from_peer);
                 println!("[SYNC] 📥 Light node registry request from {} (since {})", requester_id, last_sync_timestamp);
                 
-                // Collect registrations newer than last_sync_timestamp
+                // Collect registrations newer than or equal to last_sync_timestamp
+                // FIX: Use >= to include nodes registered at exactly last_sync_timestamp
                 let registrations: Vec<LightNodeRegistrationData> = {
                     let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     registry.values()
-                        .filter(|r| r.registered_at > last_sync_timestamp)
+                        .filter(|r| r.registered_at >= last_sync_timestamp)
                         .cloned()
                         .collect()
                 };
@@ -13055,7 +13097,97 @@ impl SimplifiedP2P {
         
         verifying_key.verify(message.as_bytes(), &signature).is_ok()
     }
-    
+
+    /// HYBRID v2.90: Verify Ed25519 gossip signature using explicit public key (64 hex chars).
+    /// Used for Light/Super node gossip authentication (classical part of hybrid scheme).
+    /// message: "light_node_gossip:{node_id}:{wallet_address}"
+    /// public_key_hex: 32 bytes = 64 hex chars (QNet wallet Ed25519 key)
+    fn verify_ed25519_gossip_signature(&self, message: &str, signature_hex: &str, public_key_hex: &str) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        if signature_hex.len() != 128 || public_key_hex.len() != 64 {
+            return false;
+        }
+
+        let pubkey_bytes = match hex::decode(public_key_hex) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let pubkey_arr: [u8; 32] = match pubkey_bytes.try_into() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let verifying_key = match VerifyingKey::from_bytes(&pubkey_arr) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+
+        let sig_bytes = match hex::decode(signature_hex) {
+            Ok(b) if b.len() == 64 => b,
+            _ => return false,
+        };
+        let sig_arr: [u8; 64] = match sig_bytes.try_into() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let sig = Signature::from_bytes(&sig_arr);
+
+        verifying_key.verify(message.as_bytes(), &sig).is_ok()
+    }
+
+    /// HYBRID v2.90: Verify Dilithium3 (ML-DSA-65) gossip signature.
+    /// Mobile app signs wallet_address with Dilithium3 keypair derived from activation code.
+    /// format: "dilithium_sig_{nodeId}_{base64([sig_len_LE][sig+msg][pk_len_LE][pk])}"
+    /// expected_message: wallet_address (the original message signed by the mobile app)
+    fn verify_mobile_dilithium_gossip(&self, expected_message: &str, formatted_signature: &str, public_key_hex: &str) -> bool {
+        use pqcrypto_dilithium::dilithium3;
+        use pqcrypto_traits::sign::*;
+
+        if !formatted_signature.starts_with("dilithium_sig_") {
+            // Fallback: raw hex Dilithium3 signed message
+            let pk_bytes = match hex::decode(public_key_hex) { Ok(b) => b, Err(_) => return false };
+            let sig_bytes = match hex::decode(formatted_signature) { Ok(b) => b, Err(_) => return false };
+            let mut signed_msg = sig_bytes;
+            signed_msg.extend_from_slice(expected_message.as_bytes());
+            let pk = match dilithium3::PublicKey::from_bytes(&pk_bytes) { Ok(k) => k, Err(_) => return false };
+            let sm = match dilithium3::SignedMessage::from_bytes(&signed_msg) { Ok(s) => s, Err(_) => return false };
+            return dilithium3::open(&sm, &pk).is_ok();
+        }
+
+        // Extract base64 payload: "dilithium_sig_{nodeId}_{base64}"
+        let base64_data = match formatted_signature.rfind('_') {
+            Some(pos) if pos > 14 => &formatted_signature[pos + 1..],
+            _ => return false,
+        };
+
+        let decoded = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_data) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+
+        if decoded.len() < 8 { return false; }
+        let signed_msg_len = u32::from_le_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]) as usize;
+        if decoded.len() < 4 + signed_msg_len + 4 { return false; }
+
+        let signed_message_bytes = &decoded[4..4 + signed_msg_len];
+        let pk_offset = 4 + signed_msg_len;
+        if decoded.len() < pk_offset + 4 { return false; }
+        let pk_len = u32::from_le_bytes([decoded[pk_offset], decoded[pk_offset+1], decoded[pk_offset+2], decoded[pk_offset+3]]) as usize;
+        if decoded.len() < pk_offset + 4 + pk_len { return false; }
+
+        let pk_bytes_from_sig = &decoded[pk_offset + 4..pk_offset + 4 + pk_len];
+        let pk_bytes_from_request = match hex::decode(public_key_hex) { Ok(b) => b, Err(_) => return false };
+        if pk_bytes_from_sig != pk_bytes_from_request.as_slice() { return false; }
+
+        let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes_from_request) { Ok(k) => k, Err(_) => return false };
+        let signed_message = match dilithium3::SignedMessage::from_bytes(signed_message_bytes) { Ok(s) => s, Err(_) => return false };
+
+        match dilithium3::open(&signed_message, &public_key) {
+            Ok(verified_msg) => verified_msg == expected_message.as_bytes(),
+            Err(_) => false,
+        }
+    }
+
     /// Verify signature for heartbeat (ASYNC version)
     /// PRODUCTION: Supports BOTH hybrid (NIST/Cisco) and legacy Dilithium formats
     pub async fn verify_dilithium_heartbeat_signature_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
@@ -14852,7 +14984,7 @@ impl SimplifiedP2P {
             registry.insert(registration.node_id.clone(), registration.clone());
         }
         
-        // Gossip to network
+        // Gossip to network (HYBRID v2.90: includes Ed25519 + Dilithium3)
         let msg = NetworkMessage::LightNodeRegistration {
             node_id: registration.node_id,
             wallet_address: registration.wallet_address,
@@ -14866,6 +14998,8 @@ impl SimplifiedP2P {
             last_seen: registration.last_seen,
             consecutive_failures: registration.consecutive_failures,
             is_active: registration.is_active,
+            ed25519_signature: registration.ed25519_signature,
+            ed25519_public_key: registration.ed25519_public_key,
         };
         
         self.gossip_to_random_peers(msg, 5);
@@ -14896,6 +15030,8 @@ impl SimplifiedP2P {
                     last_seen: registered_at,          // Conservative: last seen = registration time
                     consecutive_failures: 0,           // Assume healthy until proven otherwise
                     is_active: true,
+                    ed25519_signature: String::new(),  // Not persisted — re-gossiped on next registration
+                    ed25519_public_key: String::new(), // Not persisted — re-gossiped on next registration
                 });
                 added += 1;
             }

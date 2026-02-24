@@ -5595,8 +5595,8 @@ export class WalletManager {
           // Generate or load Dilithium3 keypair
           const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password);
 
-          // Sign wallet_address as the registration message (NOT empty string!)
-          // Server verifies: verify_dilithium_signature_for_contract(wallet_address, sig, pubkey)
+          // Part 1 (Dilithium3): Sign wallet_address — quantum-resistant identity proof
+          // Server verifies: verify_mobile_dilithium_signature(wallet_address, sig, pubkey)
           const registrationMessage = walletAddress;
           const quantumSignature = await signWithDilithium(
             registrationMessage,
@@ -5604,6 +5604,32 @@ export class WalletManager {
             dilithiumKeys.publicKey,
             systemPseudonym
           );
+
+          // Part 2 (Ed25519): HYBRID v2.90 — gossip classical ownership proof
+          // Signs "light_node_gossip:{pseudonym}:{walletAddress}" with QNet wallet Ed25519 key.
+          // Allows all server nodes to verify P2P gossip without knowing the activation code.
+          let ed25519GossipSignature = null;
+          let ed25519GossipPubkey = null;
+          try {
+            const wd = await this.loadWallet(password);
+            if (wd) {
+              const qnetKeypair = wd.qnetKeypair;
+              const privateKeyBytes = qnetKeypair?.privateKey
+                ? new Uint8Array(qnetKeypair.privateKey)
+                : new Uint8Array((wd.secretKey || []).slice(0, 32));
+              if (privateKeyBytes.length === 32) {
+                const kp = nacl.sign.keyPair.fromSeed(privateKeyBytes);
+                ed25519GossipPubkey = Buffer.from(kp.publicKey).toString('hex'); // 64 hex chars
+                const fullSk = new Uint8Array([...privateKeyBytes, ...kp.publicKey]);
+                const gossipMsg = `light_node_gossip:${systemPseudonym}:${walletAddress}`;
+                const sig = nacl.sign.detached(new TextEncoder().encode(gossipMsg), fullSk);
+                ed25519GossipSignature = Buffer.from(sig).toString('hex'); // 128 hex chars
+                console.log('[Registration] Ed25519 gossip signature created for HYBRID auth');
+              }
+            }
+          } catch (gossipSigErr) {
+            console.warn('[Registration] Ed25519 gossip signature failed (non-fatal):', gossipSigErr.message);
+          }
 
           // v4.3: Get burn TX data for STATELESS code ownership verification
           // Node needs burn_tx_hash + burn_amount to reconstruct XOR key and verify
@@ -5696,7 +5722,9 @@ export class WalletManager {
             burnAmount,
             burnWallet,
             ed25519Signature,
-            signatureTimestamp
+            signatureTimestamp,
+            ed25519GossipSignature,   // HYBRID v2.90: gossip Ed25519 sig
+            ed25519GossipPubkey       // HYBRID v2.90: gossip Ed25519 pubkey
           );
           quantumSecured = true;
 

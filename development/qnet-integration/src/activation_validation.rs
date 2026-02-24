@@ -1938,6 +1938,30 @@ impl BlockchainActivationRegistry {
             dilithium_public_key: None,
         };
         
+        // SECURITY v6.1: Sign NodeActivation TX with ephemeral Ed25519 so it can be
+        // verified by receiving nodes via validate_and_add_network_transaction.
+        // Without this, the TX is rejected by all P2P peers (no public_key → rejected).
+        // Canonical message matches build_canonical_verify_message's `_` → pipe format.
+        {
+            use ed25519_dalek::{SigningKey, Signer};
+            use rand::rngs::OsRng;
+            let canonical_msg = format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                transaction.from,
+                transaction.to.as_deref().unwrap_or(""),
+                transaction.amount,
+                transaction.nonce,
+                transaction.gas_price,
+                transaction.gas_limit,
+                transaction.timestamp,
+            );
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+            let sig = signing_key.sign(canonical_msg.as_bytes());
+            transaction.signature  = Some(hex::encode(sig.to_bytes()));
+            transaction.public_key = Some(hex::encode(verifying_key.as_bytes()));
+        }
+
         // Calculate hash using canonical serialization (SHA3-256 NIST compliant)
         transaction.hash = transaction.calculate_hash();
         

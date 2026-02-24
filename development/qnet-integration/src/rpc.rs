@@ -5663,6 +5663,13 @@ struct LightNodeRegisterRequest {
                                         // Signed with Solana private key (same key that burned tokens)
     #[serde(default)]
     signature_timestamp: Option<u64>,   // v4.7: Timestamp used in signature message (prevents replay)
+    // HYBRID v2.90: Gossip Ed25519 signature for P2P authentication (not burn proof)
+    // Message: "light_node_gossip:{node_pseudonym}:{wallet_address}"
+    // Signed with QNet wallet Ed25519 key (same key used to sign NodeRegistration TX)
+    #[serde(default)]
+    ed25519_gossip_signature: Option<String>,  // 128 hex chars (Ed25519 sig)
+    #[serde(default)]
+    ed25519_gossip_pubkey: Option<String>,     // 64 hex chars (QNet wallet Ed25519 pubkey)
 }
 
 async fn handle_light_node_register(
@@ -6085,6 +6092,7 @@ async fn handle_light_node_register(
         };
         
         // Register in P2P gossip-synced registry and broadcast to network
+        // HYBRID v2.90: include Ed25519 gossip signature for HYBRID P2P verification
         let registration = LightNodeRegistrationData {
             node_id: light_node_pseudonym.clone(),
             wallet_address: register_request.wallet_address.clone(),
@@ -6094,9 +6102,11 @@ async fn handle_light_node_register(
             signature: register_request.quantum_signature.clone(),
             push_type: push_type.clone(),
             unified_push_endpoint: register_request.unified_push_endpoint.clone(),
-            last_seen: now,               // Just registered = last seen now
-            consecutive_failures: 0,       // No failures yet
-            is_active: true,              // Active by default
+            last_seen: now,
+            consecutive_failures: 0,
+            is_active: true,
+            ed25519_signature: register_request.ed25519_gossip_signature.clone().unwrap_or_default(),
+            ed25519_public_key: register_request.ed25519_gossip_pubkey.clone().unwrap_or_default(),
         };
         p2p.register_light_node(registration);
         println!("[INFO][GOSSIP] light_node_gossiped pseudonym={} push={}", light_node_pseudonym, push_type_str);
@@ -9103,8 +9113,22 @@ async fn handle_register_node(
 ) -> Result<impl Reply, Rejection> {
     // PRODUCTION v2.41.1: node_type is REQUIRED - no defaults!
     // v3.18: Full nodes removed - only Light and Super allowed
+    // v6.1: Light node registration REMOVED from this endpoint.
+    //       Light nodes MUST use /api/v1/light-node/register which issues a proper
+    //       hybrid gossip signature (Ed25519 + Dilithium3).
+    //       This endpoint gossips with empty signatures → other nodes reject the gossip
+    //       → light node exists only on the receiving node (broken state, L1 violation).
+    //       L1 precedent: Ethereum EIP-2718 hard-blocked legacy TX format for typed TXs.
     let node_type = match body["node_type"].as_str() {
-        Some(t) if t == "light" || t == "super" => t,
+        Some("light") => {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Light node registration via /api/v1/register is disabled (v6.1).",
+                "hint": "Use POST /api/v1/light-node/register — supports hybrid Ed25519+Dilithium3 gossip signatures.",
+                "migration_endpoint": "/api/v1/light-node/register"
+            })));
+        },
+        Some(t) if t == "super" => t,
         Some("full") => {
             return Ok(warp::reply::json(&json!({
                 "success": false,
@@ -9543,6 +9567,8 @@ async fn handle_register_node(
                 last_seen: now,
                 consecutive_failures: 0,
                 is_active: true,
+                ed25519_signature: String::new(),
+                ed25519_public_key: String::new(),
             };
             p2p.register_light_node(registration);
         }
