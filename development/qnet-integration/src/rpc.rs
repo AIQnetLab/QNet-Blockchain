@@ -6359,7 +6359,34 @@ async fn handle_light_node_register(
         };
         p2p.register_light_node(registration);
         println!("[INFO][GOSSIP] light_node_gossiped pseudonym={} push={}", light_node_pseudonym, push_type_str);
-        
+
+        if !register_request.device_token.is_empty() {
+            let pt_str = match push_type {
+                crate::unified_p2p::PushType::FCM => "fcm",
+                crate::unified_p2p::PushType::UnifiedPush => "unifiedpush",
+                crate::unified_p2p::PushType::Polling => "polling",
+            };
+            match blockchain.get_storage().save_fcm_token(
+                &light_node_pseudonym,
+                &register_request.device_token,
+                pt_str,
+                register_request.unified_push_endpoint.as_deref(),
+            ) {
+                Ok(()) => {
+                    if crate::node::is_info() {
+                        println!("[INFO][LIGHT] fcm_token_saved pseudonym={} push={}",
+                                 light_node_pseudonym, pt_str);
+                    }
+                }
+                Err(e) => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][LIGHT] fcm_token_save_failed pseudonym={} err={}",
+                                 light_node_pseudonym, e);
+                    }
+                }
+            }
+        }
+
         // v6.0: Client-side TX creation flow
         // NodeRegistration TX is now created and submitted by the CLIENT (wallet app),
         // not by the server. This ensures:
@@ -7665,10 +7692,11 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
         .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
         .unwrap_or(false);
     
-    // SCALABILITY: Genesis handles 139 pings/sec = 8340 pings/min
-    // At 50ms avg latency, need 139 * 0.05 = 7 concurrent minimum
-    // Use 500 concurrent for headroom and burst handling
-    let max_concurrent_pings: usize = if is_genesis_node { 500 } else { 100 };
+    // SCALABILITY (10M+ light nodes): each genesis handles 2M nodes.
+    // Ping window = 240 min → 694 pings/sec per genesis.
+    // At 50ms avg FCM latency: 694 * 0.05 = 35 concurrent minimum.
+    // Use 1000 for comfortable headroom on burst registration waves.
+    let max_concurrent_pings: usize = if is_genesis_node { 1000 } else { 100 };
     
     let blockchain_for_pings = blockchain.clone();
     
@@ -7836,22 +7864,47 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                             // Send ping based on push type
                             match light_node.push_type {
                                 crate::unified_p2p::PushType::FCM => {
-                                    // FCM push notification (Google Play users)
-                                    let fcm = FCMPushService::new();
-                                    let device_token = light_node.device_token_hash
-                                        .replace("fcm_", "")
-                                        .replace("hash_", "");
-                                    
-                                    match fcm.send_ping_notification(&device_token, &light_node.node_id, &challenge).await {
-                                        Ok(()) => {
-                                            println!("[LIGHT] 📤 {} sent FCM to {} slot {} (awaiting response)", 
-                                                     role_str, light_node.node_id, current_slot);
-                                        }
-                                        Err(e) => {
-                                            if !e.contains("FCM_SERVER_KEY not configured") {
-                                                println!("[LIGHT] ❌ {} FCM error for {}: {}", 
-                                                         role_str, light_node.node_id, e);
+                                    // FCM push notification (Google Play users).
+                                    // Load the REAL FCM token from local RocksDB storage.
+                                    // The gossiped registry only carries a privacy hash —
+                                    // the actual 152-char token is stored in fcm_tokens CF.
+                                    let real_token_opt = blockchain.get_storage()
+                                        .get_fcm_data(&light_node.node_id)
+                                        .map(|(token, _, _)| token);
+
+                                    if let Some(real_token) = real_token_opt {
+                                        let fcm = FCMPushService::new();
+                                        match fcm.send_ping_notification(&real_token, &light_node.node_id, &challenge).await {
+                                            Ok(()) => {
+                                                if crate::node::is_info() {
+                                                    println!("[INFO][LIGHT] fcm_sent role={} node={} slot={}",
+                                                             role_str, light_node.node_id, current_slot);
+                                                }
                                             }
+                                            Err(e) => {
+                                                if !e.contains("FCM_SERVER_KEY not configured") {
+                                                    if crate::node::is_warn() {
+                                                        println!("[WARN][LIGHT] fcm_error role={} node={} err={}",
+                                                                 role_str, light_node.node_id, e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
+                                            challenges.insert(light_node.node_id.clone(), PendingChallenge {
+                                                challenge: challenge.clone(),
+                                                created_at: now,
+                                                expires_at: now + 180,
+                                            });
+                                        }
+                                        if crate::node::is_debug() {
+                                            println!("[DBG][LIGHT] fcm_token_missing role={} node={} action=polling_fallback",
+                                                     role_str, light_node.node_id);
                                         }
                                     }
                                 }
@@ -7928,16 +7981,46 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                 // This runs at slot N+3 to check slot N
                 let check_slot = if current_slot >= 3 { current_slot - 3 } else { 240 - 3 + current_slot };
                 
+                // Use the same GENESIS LINEAR SHARDING as get_light_nodes_to_ping().
+                // The old SHA3-based calculate_light_node_shard() used 0-255 shards
+                // which almost never matched the 0-4 genesis shard_id → failures
+                // were never counted and rewards never accumulated.
                 let nodes_in_check_slot: Vec<String> = {
-                    let registry = p2p.get_light_node_registry();
-                    registry.values()
-                        .filter(|node| {
-                            SimplifiedP2P::calculate_light_node_shard(&node.node_id) == p2p.get_shard_id() &&
-                            SimplifiedP2P::calculate_randomized_slot(&node.node_id, SimplifiedP2P::get_current_window_number()) == check_slot &&
-                            node.is_active
-                        })
-                        .map(|n| n.node_id.clone())
-                        .collect()
+                    let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
+                        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                        .unwrap_or(false);
+
+                    if !is_genesis {
+                        Vec::new()
+                    } else {
+                        let our_genesis_idx = std::env::var("QNET_BOOTSTRAP_ID")
+                            .ok()
+                            .and_then(|id| id.parse::<usize>().ok())
+                            .map(|id| id.saturating_sub(1))
+                            .unwrap_or(0);
+                        const GENESIS_COUNT: usize = 5;
+
+                        let registry = p2p.get_light_node_registry();
+                        let mut all_nodes: Vec<_> = registry.values().cloned().collect();
+                        all_nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+                        let total = all_nodes.len();
+                        if total == 0 {
+                            Vec::new()
+                        } else {
+                            let nodes_per_genesis = (total + GENESIS_COUNT - 1) / GENESIS_COUNT;
+                            let my_start = std::cmp::min(our_genesis_idx * nodes_per_genesis, total);
+                            let my_end = std::cmp::min(my_start + nodes_per_genesis, total);
+
+                            all_nodes[my_start..my_end]
+                                .iter()
+                                .filter(|node| {
+                                    node.is_active &&
+                                    SimplifiedP2P::calculate_randomized_slot(&node.node_id, SimplifiedP2P::get_current_window_number()) == check_slot
+                                })
+                                .map(|n| n.node_id.clone())
+                                .collect()
+                        }
+                    }
                 };
                 
                 for node_id in nodes_in_check_slot {
@@ -7948,30 +8031,11 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                     }
                 }
                 
-                // ================================================================
-                // PROBE INACTIVE NODES (once per window to check if back online)
-                // ================================================================
-                let inactive_to_probe = p2p.get_inactive_nodes_to_probe();
-                if !inactive_to_probe.is_empty() {
-                    println!("[LIGHT] 🔍 Probing {} inactive nodes", inactive_to_probe.len());
-                    
-                    for node in inactive_to_probe {
-                        // Store probe challenge (polling mode for probes)
-                        let challenge = generate_quantum_challenge();
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        
-                        if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
-                            challenges.insert(node.node_id.clone(), PendingChallenge {
-                                challenge,
-                                created_at: now,
-                                expires_at: now + 300, // 5 minute expiry for probes
-                            });
-                        }
-                    }
-                }
+                // INACTIVE PROBING DISABLED: Reactivation is manual-only
+                // via /api/v1/light-node/reactivate (user presses "I'm back").
+                // Rationale: automatic probing adds O(inactive_nodes) load per
+                // window on every genesis node with no guarantee the device is
+                // actually online. Manual reactivation is zero-cost for genesis.
             }
             
             // ================================================================

@@ -15068,6 +15068,42 @@ impl SimplifiedP2P {
         added
     }
     
+    /// Restore FCM push types from local RocksDB `fcm_tokens` CF after a node restart.
+    /// Called once during startup, right after `restore_light_nodes_from_storage`.
+    ///
+    /// Problem: `restore_light_nodes_from_storage` initialises all entries with
+    /// `push_type = Polling` because FCM tokens are not gossiped (privacy).
+    /// This method patches the in-memory registry with the real push_type/endpoint
+    /// so the ping service delivers FCM pushes immediately after reboot.
+    pub fn update_device_tokens_from_storage(
+        &self,
+        storage: &crate::storage::Storage,
+    ) {
+        let mut registry = match self.light_node_registry.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        let mut updated = 0usize;
+        for node in registry.values_mut() {
+            if let Some((_, push_type_str, endpoint)) = storage.get_fcm_data(&node.node_id) {
+                let new_push_type: PushType = match push_type_str.as_str() {
+                    "fcm"         => PushType::FCM,
+                    "unifiedpush" => PushType::UnifiedPush,
+                    _             => PushType::Polling,
+                };
+                node.push_type = new_push_type;
+                node.unified_push_endpoint = endpoint;
+                updated += 1;
+            }
+        }
+
+        if updated > 0 {
+            println!("[INFO][P2P] fcm_tokens_restored from_rocksdb count={} total_registry={}",
+                     updated, registry.len());
+        }
+    }
+
     /// Request Light Node registry sync from peers
     pub fn request_light_node_registry_sync(&self) {
         let now = std::time::SystemTime::now()

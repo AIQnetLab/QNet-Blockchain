@@ -695,6 +695,7 @@ impl PersistentStorage {
             ColumnFamilyDescriptor::new("heartbeats", create_hot_cf_opts()),   // Hot: heartbeats
             ColumnFamilyDescriptor::new("poh_state", create_hot_cf_opts()),    // Hot: PoH state
             ColumnFamilyDescriptor::new("contract_storage", create_cf_opts()), // v5.0: Per-key contract state
+            ColumnFamilyDescriptor::new("fcm_tokens", create_cf_opts()),        // FCM device tokens (genesis-local, not gossiped)
         ];
         
         let db = match DB::open_cf_descriptors(&opts, path, cfs) {
@@ -1038,7 +1039,7 @@ impl PersistentStorage {
                         "pending_rewards", "node_registry", "ping_history",
                         "failover_events", "snapshots", "tx_index",
                         "tx_by_address", "attestations", "heartbeats", "poh_state",
-                        "contract_storage"];
+                        "contract_storage", "fcm_tokens"];
         
         for cf_name in &cf_names {
             if let Some(cf) = self.db.cf_handle(cf_name) {
@@ -1186,7 +1187,7 @@ impl PersistentStorage {
                         "pending_rewards", "node_registry", "ping_history",
                         "failover_events", "snapshots", "tx_index",
                         "tx_by_address", "attestations", "heartbeats", "poh_state",
-                        "contract_storage"];
+                        "contract_storage", "fcm_tokens"];
         
         for cf_name in &cf_names {
             if let Some(cf) = self.db.cf_handle(cf_name) {
@@ -5373,6 +5374,56 @@ impl Storage {
         Ok(())
     }
     
+    // ============================================
+    // FCM TOKEN STORAGE (genesis-local, never gossiped)
+    // Stores real FCM device tokens so ping service can deliver push notifications.
+    // Tokens are NOT in the P2P gossip registry (privacy / gossip bandwidth).
+    // Key: node_id (pseudonym), Value: JSON { token, push_type, endpoint? }
+    // ============================================
+
+    /// Persist the real FCM device token for a light node (GDPR: stored only on the
+    /// genesis node that received the registration, never gossiped).
+    pub fn save_fcm_token(
+        &self,
+        node_id: &str,
+        token: &str,
+        push_type: &str,
+        endpoint: Option<&str>,
+    ) -> IntegrationResult<()> {
+        let fcm_cf = self.persistent.db.cf_handle("fcm_tokens")
+            .ok_or_else(|| IntegrationError::StorageError("fcm_tokens column family not found".to_string()))?;
+
+        let data = serde_json::json!({
+            "token": token,
+            "push_type": push_type,
+            "endpoint": endpoint.unwrap_or(""),
+            "updated_at": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        });
+
+        self.persistent.db.put_cf(&fcm_cf, node_id.as_bytes(), data.to_string().as_bytes())?;
+        Ok(())
+    }
+
+    /// Load FCM data for a light node.
+    /// Returns `(token, push_type, endpoint)` or `None` if not found.
+    pub fn get_fcm_data(&self, node_id: &str) -> Option<(String, String, Option<String>)> {
+        let fcm_cf = self.persistent.db.cf_handle("fcm_tokens")?;
+
+        let raw = self.persistent.db.get_cf(&fcm_cf, node_id.as_bytes()).ok()??;
+        let json: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+
+        let token = json["token"].as_str().unwrap_or("").to_string();
+        let push_type = json["push_type"].as_str().unwrap_or("polling").to_string();
+        let endpoint = json["endpoint"].as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        if token.is_empty() { None } else { Some((token, push_type, endpoint)) }
+    }
+
     // ============================================
     // PRODUCTION: ATTESTATION STORAGE (Light nodes)
     // ============================================

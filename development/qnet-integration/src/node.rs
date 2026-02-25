@@ -5725,6 +5725,11 @@ impl BlockchainNode {
                 Ok(_) => println!("[INFO][NODE] p2p_registry_restore no_nodes_in_storage"),
                 Err(e) => println!("[WARN][NODE] p2p_registry_restore err={}", e),
             }
+
+            // Restore FCM push types from local fcm_tokens CF so the ping service
+            // delivers real push notifications immediately after a node restart.
+            // (restore_light_nodes_from_storage defaults to Polling for privacy.)
+            p2p.update_device_tokens_from_storage(&*blockchain.storage);
         }
         
         // CRITICAL: Link deterministic reputation to P2P for unified access
@@ -11629,14 +11634,29 @@ impl BlockchainNode {
                                 if now_u64.saturating_sub(last_pfp) > pfp_cooldown {
                                     CHRONIC_STALL_LAST_PFP.store(now_u64, std::sync::atomic::Ordering::Relaxed);
                                     
-                                    let missing_mb = next_height / 90;
-                                    println!("[WARN][STALL] chronic_stall h={} delay={}s mb={} certified_round=0 → forcing PFP + resync",
-                                             next_height, local_delay, missing_mb);
+                                    let latest_mb = next_height / 90;
+                                    // v3.30: Scan for first missing macroblock to sync the right one
+                                    let missing_mb = {
+                                        let scan_start = if latest_mb > 10 { latest_mb - 10 } else { 1 };
+                                        let mut first_missing = latest_mb;
+                                        for idx in scan_start..=latest_mb {
+                                            let has_mb = storage.get_macroblock_by_height(idx)
+                                                .map(|mb| mb.is_some())
+                                                .unwrap_or(false);
+                                            if !has_mb {
+                                                first_missing = idx;
+                                                break;
+                                            }
+                                        }
+                                        first_missing
+                                    };
+                                    println!("[WARN][STALL] chronic_stall h={} delay={}s mb={} first_missing={} certified_round=0 → forcing PFP + resync",
+                                             next_height, local_delay, latest_mb, missing_mb);
                                     
-                                    // 1. Force macroblock sync from all peers
+                                    // 1. Force macroblock sync from all peers (target first missing)
                                     if let Some(p2p) = &unified_p2p {
                                         let _ = p2p.sync_macroblocks(
-                                            missing_mb.saturating_sub(1), missing_mb
+                                            missing_mb.saturating_sub(1), latest_mb
                                         ).await;
                                         
                                         // 2. Force block resync for last 90 blocks to recover gap
@@ -11725,10 +11745,16 @@ impl BlockchainNode {
                                         println!("[INFO][FORK] force_resync local={} network={} nodes={}", 
                                                  microblock_height, network_height, network_size);
                                         
-                                        // v2.83: MUCH LESS AGGRESSIVE rollback - only 10 blocks, not 90!
-                                        // This prevents destroying the entire chain on temporary stalls
-                                        let rollback_amount = 10; // Was 90, now only 10 blocks
-                                        let rollback_to = microblock_height.saturating_sub(rollback_amount);
+                                        // v3.30: Smart rollback — go to START of current macroblock cycle
+                                        // (position 0, before consensus window at blocks 61-90).
+                                        // Fixed 10-block rollback could land back inside the consensus
+                                        // window causing the same deadlock repeatedly.
+                                        let cycle_start = (microblock_height / 90) * 90;
+                                        let rollback_to = if cycle_start >= 90 {
+                                            cycle_start.saturating_sub(90)
+                                        } else {
+                                            0
+                                        };
                                         
                                         // v3.23: Start rollback protection
                                         if !crate::storage::start_rollback_protection(rollback_to) {
@@ -18676,7 +18702,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         ).await;
     }
     
-    /// PRODUCTION v2.42: Progressive Finalization Protocol with deterministic leader
+    /// PRODUCTION v3.30: Progressive Finalization Protocol with gap-fill
+    /// Scans for the FIRST missing macroblock instead of jumping to current_height/90.
+    /// This prevents gaps that make calculate_qualified_candidates return empty.
     async fn activate_progressive_finalization_with_level(
         storage: Arc<Storage>,
         consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
@@ -18684,11 +18712,29 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         unified_p2p: Option<Arc<SimplifiedP2P>>,
         blocks_without_finalization: u64,
     ) {
-        let expected_macroblock = current_height / 90;
+        let latest_macroblock = current_height / 90;
+        
+        // v3.30: Scan for FIRST missing macroblock to fill gaps sequentially.
+        // Without this, PFP could create mb#476 while #475 is missing,
+        // causing calculate_qualified_candidates to fail permanently.
+        let expected_macroblock = {
+            let mut first_missing = latest_macroblock;
+            let scan_start = if latest_macroblock > 10 { latest_macroblock - 10 } else { 1 };
+            for idx in scan_start..=latest_macroblock {
+                let has_mb = storage.get_macroblock_by_height(idx)
+                    .map(|mb| mb.is_some())
+                    .unwrap_or(false);
+                if !has_mb {
+                    first_missing = idx;
+                    break;
+                }
+            }
+            first_missing
+        };
         
         if is_info() { 
-            println!("[INFO][PFP] activated h={} mb={} blocks_without={}", 
-                     current_height, expected_macroblock, blocks_without_finalization); 
+            println!("[INFO][PFP] activated h={} mb={} blocks_without={} scan_target={}", 
+                     current_height, latest_macroblock, blocks_without_finalization, expected_macroblock); 
         }
         
         if let Some(p2p) = unified_p2p {
@@ -18732,12 +18778,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Get own node_id for leader selection
             let own_node_id = p2p.get_node_id();
             
+            let pfp_target_macroblock = expected_macroblock; // v3.30: capture gap-filled value
             tokio::spawn(async move {
                 // ═══════════════════════════════════════════════════════════════════
-                // PRODUCTION v2.42: DETERMINISTIC LEADER SELECTION FOR PFP
-                // Same architecture as normal consensus - ONE leader creates MacroBlock
+                // v3.30: Use gap-filled target from outer scan, not current_height/90
                 // ═══════════════════════════════════════════════════════════════════
-                let expected_macroblock = current_height / 90;
+                let expected_macroblock = pfp_target_macroblock;
                 
                 // ═══════════════════════════════════════════════════════════════════
                 // CRITICAL v2.45: DESYNC CHECK - Node MUST be synchronized to participate!
@@ -19220,14 +19266,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     // PRODUCTION: Byzantine consensus methods for commit-reveal protocol
     
     /// PRODUCTION: Execute REAL commit phase with inter-node communication
+    /// v3.30: Takes Arc<RwLock> instead of &mut engine to avoid holding write lock
+    /// for the entire 12+ second phase. Lock is acquired/released briefly per operation.
     async fn execute_real_commit_phase(
-        consensus_engine: &mut qnet_consensus::CommitRevealConsensus,
+        consensus: &Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
         participants: &[String],
         round_id: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         nonce_storage: &Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>,
-        node_id: &str,  // CRITICAL: Use validated node_id from startup
-        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // REAL P2P integration
+        node_id: &str,
+        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>,
     ) {
         // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
@@ -19276,8 +19324,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let reveal_message = format!("reveal_{}_{}", round_id, our_id);
             let reveal_data = reveal_message.as_bytes().to_vec();
             
-            // Calculate commit hash for OUR node only
-            let commit_hash = hex::encode(consensus_engine.calculate_commit_hash(&reveal_data, &nonce));
+            // Calculate commit hash for OUR node only (brief read lock)
+            let commit_hash = {
+                let engine = consensus.read().await;
+                hex::encode(engine.calculate_commit_hash(&reveal_data, &nonce))
+            };
             
             // Store nonce and reveal_data for OUR node only
             // CRITICAL FIX v2.53: Key MUST include round_id to prevent race condition!
@@ -19318,13 +19369,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     commit.node_id, round_id, commit.signature.len());
             }
             
-            // Submit OWN commit to consensus engine with round_id (NOT block_height!)
-            match consensus_engine.process_commit(commit.clone(), round_id).await {
+            // Submit OWN commit to consensus engine with round_id (brief write lock)
+            let process_result = {
+                let mut engine = consensus.write().await;
+                engine.process_commit(commit.clone(), round_id).await
+            };
+            match process_result {
                 Ok(_) => {
                     if is_debug() { println!("[DBG][CONS] own_commit id={}", our_id); }
                     
-                    // CRITICAL: Verify commit was actually stored
-                    let stored_commits = consensus_engine.get_current_commit_count();
+                    // CRITICAL: Verify commit was actually stored (brief read lock)
+                    let stored_commits = {
+                        let engine = consensus.read().await;
+                        engine.get_current_commit_count()
+                    };
                     if is_debug() { println!("[DBG][CONS] commits={}", stored_commits); }
                     
                     // PRODUCTION: Broadcast OWN commit to P2P network for other nodes
@@ -19413,23 +19471,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Try to read messages from consensus channel (non-blocking)
                     match consensus_rx_ref.try_recv() {
                         Ok(message) => {
-                            // PRODUCTION v2.40: Get current block height for phase validation
                             let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                             if is_debug() { println!("[DBG][CONS] p2p_msg h={}", current_height); }
                             
-                            let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message, current_height).await;
+                            // Brief write lock per message
+                            let (msg_node_id, success, error) = {
+                                let mut engine = consensus.write().await;
+                                Self::process_consensus_message(&mut engine, message, current_height).await
+                            };
                             
-                            // SECURITY: Reputation handled via DeterministicReputationState in macroblock
                             if !success {
                                 if let Some(err) = error {
-                                    // Invalid signature - report for slashing
                                     if err.contains("InvalidSignature") {
-                                        println!("[SECURITY] invalid_sig node={}", node_id);
+                                        println!("[SECURITY] invalid_sig node={}", msg_node_id);
                                         if let Some(ref p2p) = unified_p2p {
-                                            p2p.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid signature in consensus");
+                                            p2p.report_invalid_block(&msg_node_id, current_height, [0u8; 32], "Invalid signature in consensus");
                                         }
                                     }
-                                    // Phase/timing errors - no penalty (block-based phases handle this)
                                 }
                             }
                             
@@ -19440,19 +19498,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         }
                     }
                 } else {
-                    // No consensus channel available - this should not happen in production
                     if processed_messages == 0 {
                         println!("[WARN][CONS] No consensus channel available - P2P messages won't be processed!");
                     }
                 }
             }
             
-            // CRITICAL FIX: Short polling interval for faster consensus message processing
-            // 10ms polling allows up to 100 checks/sec without overwhelming CPU
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             
-            // Check current commit count in consensus engine  
-            let current_commits = consensus_engine.get_current_commit_count();
+            // Brief read lock for commit count check
+            let current_commits = {
+                let engine = consensus.read().await;
+                engine.get_current_commit_count()
+            };
             
             if processed_messages % 10 == 0 { // Log every 2 seconds
                 println!("[INFO][CONS] commits={} target={}", 
@@ -19467,8 +19525,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         }
         
-        // CRITICAL: Check if Byzantine threshold was reached
-        let final_commits = consensus_engine.get_current_commit_count();
+        // Brief read lock for final threshold check
+        let final_commits = {
+            let engine = consensus.read().await;
+            engine.get_current_commit_count()
+        };
         let byzantine_threshold = (participants.len() * 2 + 2) / 3;
         
         if final_commits >= byzantine_threshold {
@@ -19479,20 +19540,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                      final_commits, byzantine_threshold);
             println!("[ERR][CONS] Byzantine threshold NOT reached - consensus will fail");
             println!("[INFO][CONS] PFP_recovery enabled");
-            // Don't proceed to reveal phase - let PFP handle it
             return;
         }
     }
     
     /// PRODUCTION: Execute REAL reveal phase with inter-node communication
+    /// v3.30: Takes Arc<RwLock> instead of &mut engine to avoid holding write lock
+    /// for the entire 12+ second phase.
     async fn execute_real_reveal_phase(
-        consensus_engine: &mut qnet_consensus::CommitRevealConsensus,
+        consensus: &Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
         participants: &[String],
         round_id: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         nonce_storage: &Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>,
-        node_id: &str,  // CRITICAL: Use validated node_id from startup
-        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // REAL P2P integration
+        node_id: &str,
+        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>,
     ) {
         // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
@@ -19587,8 +19649,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // This ensures reveal is stored in correct round's state and matches commit
             // round_id is the macroblock height (90, 180, 270...) passed to this function
             
-            // Submit OWN reveal with round_id (NOT block_height!)
-            match consensus_engine.submit_reveal(reveal.clone(), round_id).await {
+            // Submit OWN reveal with round_id (brief write lock)
+            let reveal_result = {
+                let mut engine = consensus.write().await;
+                engine.submit_reveal(reveal.clone(), round_id).await
+            };
+            match reveal_result {
                 Ok(_) => {
                     if is_debug() { println!("[DBG][CONS] own_reveal id={}", our_id); }
                     
@@ -19670,45 +19736,44 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Try to read messages from consensus channel (non-blocking)
                     match consensus_rx_ref.try_recv() {
                         Ok(message) => {
-                            // PRODUCTION v2.40: Get current block height for phase validation
                             let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                             if is_debug() { println!("[DBG][CONS] p2p_reveal h={}", current_height); }
                             
-                            let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message, current_height).await;
+                            // Brief write lock per message
+                            let (msg_node_id, success, error) = {
+                                let mut engine = consensus.write().await;
+                                Self::process_consensus_message(&mut engine, message, current_height).await
+                            };
                             
-                            // SECURITY: Reputation handled via DeterministicReputationState in macroblock
                             if success {
                                 received_reveals += 1;
                             } else if let Some(err) = error {
-                                // Only report cryptographic errors, not timing issues
                                 if err.contains("InvalidSignature") || err.contains("InvalidReveal") {
-                                    println!("[SECURITY] invalid_reveal node={}", node_id);
+                                    println!("[SECURITY] invalid_reveal node={}", msg_node_id);
                                     if let Some(ref p2p) = unified_p2p {
-                                        p2p.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid reveal in consensus");
+                                        p2p.report_invalid_block(&msg_node_id, current_height, [0u8; 32], "Invalid reveal in consensus");
                                     }
                                 }
                             }
                             
                             processed_messages += 1;
                         }
-                        Err(_) => {
-                            // No message available, continue waiting
-                        }
+                        Err(_) => {}
                     }
                 } else {
-                    // No consensus channel available - this should not happen in production
                     if processed_messages == 0 {
                         println!("[WARN][CONS] No consensus channel available for reveal phase!");
                     }
                 }
             }
             
-            // CRITICAL FIX: Short polling interval for faster consensus message processing
-            // 10ms polling allows up to 100 checks/sec without overwhelming CPU
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             
-            // Check current reveal count in consensus engine
-            let current_reveals = consensus_engine.get_current_reveal_count();
+            // Brief read lock for reveal count check
+            let current_reveals = {
+                let engine = consensus.read().await;
+                engine.get_current_reveal_count()
+            };
             
             if processed_messages % 6 == 0 { // Log every 3 seconds 
                 println!("[INFO][CONS] reveals={} target={}", 
@@ -19723,8 +19788,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         }
         
-        // CRITICAL: Check if Byzantine threshold was reached for reveals
-        let final_reveals = consensus_engine.get_current_reveal_count();
+        // Brief read lock for final reveal threshold check
+        let final_reveals = {
+            let engine = consensus.read().await;
+            engine.get_current_reveal_count()
+        };
         let byzantine_threshold = (participants.len() * 2 + 2) / 3;
         
         if final_reveals >= byzantine_threshold {
@@ -20995,33 +21063,26 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         }
         
-        // Execute COMMIT phase
-        {
-            let mut consensus_engine = consensus.write().await;
-            Self::execute_real_commit_phase(
-                &mut consensus_engine,
-                &all_participants,
-                end_height,
-                &unified_p2p_option,
-                &consensus_nonce_storage,
-                node_id,
-                consensus_rx,
-            ).await;
-        }
+        // v3.30: Pass Arc directly — functions acquire/release lock internally per operation
+        Self::execute_real_commit_phase(
+            &consensus,
+            &all_participants,
+            end_height,
+            &unified_p2p_option,
+            &consensus_nonce_storage,
+            node_id,
+            consensus_rx,
+        ).await;
         
-        // Execute REVEAL phase
-        {
-            let mut consensus_engine = consensus.write().await;
-            Self::execute_real_reveal_phase(
-                &mut consensus_engine,
-                &all_participants,
-                end_height,
-                &unified_p2p_option,
-                &consensus_nonce_storage,
-                node_id,
-                consensus_rx,
-            ).await;
-        }
+        Self::execute_real_reveal_phase(
+            &consensus,
+            &all_participants,
+            end_height,
+            &unified_p2p_option,
+            &consensus_nonce_storage,
+            node_id,
+            consensus_rx,
+        ).await;
         
         // ═══════════════════════════════════════════════════════════════════════════
         // PRODUCTION v2.35: ROUND-BASED FAILOVER
@@ -21141,59 +21202,47 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if is_info() { println!("[INFO][MB_LEAD] init mb={} range={}-{} blocks={}", 
                                 macroblock_index, start_height, end_height, end_height.saturating_sub(start_height).saturating_add(1)); }
         
-        // PRODUCTION: Execute REAL Byzantine consensus for macroblock creation
-        let consensus_data = {
-            let mut consensus_engine = consensus.write().await;
-            
-            let round_id = end_height;
-            
-            // PRODUCTION v2.34: Use DETERMINISTIC participant list from N-2 macroblock!
-            // v3.16: Use end_height for deterministic epoch calculation
-            let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type, end_height).await;
-            let mut all_participants: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
-            all_participants.sort();
-            
-            if is_info() { println!("[INFO][MB_LEAD] participants={} source=n2_snapshot round={}", 
-                                    all_participants.len(), round_id); }
-            
-            // CRITICAL FIX: Progressive degradation for macroblock consensus
-            // Matches microblock logic to prevent deadlock in small networks
-            let network_size = all_participants.len(); // Use actual participants count
-            
-            // Determine required nodes based on ACTUAL network size
-            let required_byzantine_nodes = if network_size <= 10 {
-                // Small network or Genesis: Progressive requirements
-                match end_height {
-                    0..=900 => {
-                        // First 10 macroblocks: Allow degradation
-                        if network_size >= 4 { 4 }
-                        else if network_size >= 3 { 3 }
-                        else if network_size >= 2 { 2 }
-                        else { 1 } // Emergency: single node consensus
-                    },
-                    _ => {
-                        // After initial phase: Standard requirement but with flexibility
-                        std::cmp::min(4, network_size)
-                    }
-                }
-            } else {
-                // Large production network: Full Byzantine safety
-                4
-            };
-            
-            if all_participants.len() < required_byzantine_nodes {
-                if network_size <= 10 {
-                    println!("[WARN][CONS] DEGRADED Byzantine consensus: {}/{} nodes (small/Genesis network)", 
-                             all_participants.len(), required_byzantine_nodes);
-                    println!("[WARN][CONS] reduced_safety continuing");
-                    // Continue with degraded consensus rather than blocking
-                } else {
-                    return Err(format!("Insufficient nodes for Byzantine safety: {}/4", all_participants.len()));
+        // v3.30: Split consensus phases to avoid holding write lock for 24+ seconds
+        let round_id = end_height;
+        
+        let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type, end_height).await;
+        let mut all_participants: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+        all_participants.sort();
+        
+        if is_info() { println!("[INFO][MB_LEAD] participants={} source=n2_snapshot round={}", 
+                                all_participants.len(), round_id); }
+        
+        let network_size = all_participants.len();
+        
+        let required_byzantine_nodes = if network_size <= 10 {
+            match end_height {
+                0..=900 => {
+                    if network_size >= 4 { 4 }
+                    else if network_size >= 3 { 3 }
+                    else if network_size >= 2 { 2 }
+                    else { 1 }
+                },
+                _ => {
+                    std::cmp::min(4, network_size)
                 }
             }
-            
-            // STEP 2: Start consensus round with proper participants
-            // PRODUCTION v2.40.2: Use round_id (macroblock height) for epoch validation
+        } else {
+            4
+        };
+        
+        if all_participants.len() < required_byzantine_nodes {
+            if network_size <= 10 {
+                println!("[WARN][CONS] DEGRADED Byzantine consensus: {}/{} nodes (small/Genesis network)", 
+                         all_participants.len(), required_byzantine_nodes);
+                println!("[WARN][CONS] reduced_safety continuing");
+            } else {
+                return Err(format!("Insufficient nodes for Byzantine safety: {}/4", all_participants.len()));
+            }
+        }
+        
+        // STEP 2: Brief write lock for round setup only
+        {
+            let mut consensus_engine = consensus.write().await;
             match consensus_engine.start_round_at_height(all_participants.clone(), round_id) {
                 Ok(actual_round_id) => {
                     if is_info() { println!("[INFO][CONS] round={} epoch={}", actual_round_id, actual_round_id / 90); }
@@ -21235,66 +21284,64 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
             } else {
-                // First 2 macroblocks: Use Genesis fallback (no N-2 yet)
                 println!("[INFO][CONS] Genesis epoch mb={} - using Genesis seed fallback", macroblock_index);
             }
-            
-            // STEP 3: Execute REAL COMMIT phase with P2P communication
-            println!("[INFO][CONS] start_commit_phase");
-            // CRITICAL FIX: Create persistent storage for consensus nonces (shared between commit and reveal)
-            let consensus_nonce_storage = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-            let unified_p2p_option = Some(p2p.clone()); // Pass REAL P2P system
-            
-            // CRITICAL: Use macroblock height for P2P broadcast, not consensus round number!
-            // P2P expects height (90, 180, 270) to identify macroblock rounds
-            let macroblock_height = round_id; // round_id IS the end_height (90, 180, 270)
-            println!("[INFO][CONS] p2p_broadcast mb_h={}", macroblock_height);
-            
-            Self::execute_real_commit_phase(
-                &mut consensus_engine,
-                &all_participants,
-                macroblock_height,  // Pass height for P2P broadcast
-                &unified_p2p_option,
-                &consensus_nonce_storage,
-                node_id,  // Pass the validated node_id
-                consensus_rx,
-            ).await;
-            
-            // STEP 4: Execute REAL REVEAL phase with P2P communication  
-            println!("[INFO][CONS] start_reveal_phase");
-            Self::execute_real_reveal_phase(
-                &mut consensus_engine,
-                &all_participants,
-                macroblock_height,  // Use same height as commit phase
-                &unified_p2p_option,
-                &consensus_nonce_storage,
-                node_id,  // Pass the validated node_id
-                consensus_rx,
-            ).await;
-            
-            // CRITICAL FIX: Ensure reveal phase is complete before finalizing
-            // Check if we have enough reveals for Byzantine threshold
-            let current_reveals = consensus_engine.get_current_reveal_count();
+        } // v3.30: Write lock released here — before long-running commit/reveal phases
+        
+        // STEP 3: Execute REAL COMMIT phase (acquires/releases lock internally per operation)
+        println!("[INFO][CONS] start_commit_phase");
+        let consensus_nonce_storage = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let unified_p2p_option = Some(p2p.clone());
+        let macroblock_height = round_id;
+        println!("[INFO][CONS] p2p_broadcast mb_h={}", macroblock_height);
+        
+        Self::execute_real_commit_phase(
+            &consensus,
+            &all_participants,
+            macroblock_height,
+            &unified_p2p_option,
+            &consensus_nonce_storage,
+            node_id,
+            consensus_rx,
+        ).await;
+        
+        // STEP 4: Execute REAL REVEAL phase (acquires/releases lock internally per operation)
+        println!("[INFO][CONS] start_reveal_phase");
+        Self::execute_real_reveal_phase(
+            &consensus,
+            &all_participants,
+            macroblock_height,
+            &unified_p2p_option,
+            &consensus_nonce_storage,
+            node_id,
+            consensus_rx,
+        ).await;
+        
+        // STEP 5: Finalize consensus (brief locks)
+        let consensus_data = {
+            let current_reveals = {
+                let engine = consensus.read().await;
+                engine.get_current_reveal_count()
+            };
             let byzantine_threshold = (all_participants.len() * 2 + 2) / 3;
             
             if current_reveals < byzantine_threshold {
                 println!("[WARN][CONS] Insufficient reveals for finalization: {}/{} (need {})", 
                          current_reveals, all_participants.len(), byzantine_threshold);
-                // Wait a bit more for reveals to arrive
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 
-                // Check again after wait
-                let final_reveals = consensus_engine.get_current_reveal_count();
+                let final_reveals = {
+                    let engine = consensus.read().await;
+                    engine.get_current_reveal_count()
+                };
                 if final_reveals < byzantine_threshold {
                     println!("[ERR][CONS] Still insufficient reveals: {}/{}", 
                              final_reveals, byzantine_threshold);
-                    // Continue anyway to avoid blocking - consensus will fail gracefully
                 }
             }
             
-            // STEP 5: Finalize consensus and get result
-            // CRITICAL: Ensure we're still in reveal phase before finalizing
-            // This prevents "Not in reveal phase" error if advance_phase was called extra times
+            // Brief write lock for finalization
+            let mut consensus_engine = consensus.write().await;
             match consensus_engine.finalize_round() {
                 Ok(leader_id) => {
                     println!("[INFO][CONS] FINALIZED leader={}", leader_id);

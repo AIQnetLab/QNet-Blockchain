@@ -5480,12 +5480,18 @@ export class WalletManager {
 
   // Generate Light Node pseudonym (matching backend logic)
   generateLightNodePseudonym(walletAddress) {
-    // Generate blake3-style hash (using SHA256 as substitute)
-    const hash = CryptoJS.SHA256(`LIGHT_NODE_PRIVACY_${walletAddress}`).toString();
-    
-    // Format: light_mobile_[8_hex_chars]
-    const region = 'mobile'; // Mobile nodes always use 'mobile' region
-    return `light_${region}_${hash.substring(0, 8)}`;
+    // MUST match server: rpc.rs generate_light_node_pseudonym() uses blake3
+    // blake3::hash("LIGHT_NODE_PRIVACY_{wallet}") → first 8 hex chars
+    const { blake3 } = require('@noble/hashes/blake3.js');
+    const input = `LIGHT_NODE_PRIVACY_${walletAddress}`;
+    const inputBytes = new TextEncoder().encode(input);
+    const hashBytes = blake3(inputBytes);
+    // First 4 bytes → 8 hex chars (matches Rust: &pseudonym_hash.to_hex()[..8])
+    const hexHash = Array.from(hashBytes.slice(0, 4))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+    // Server uses QNET_REGION env var defaulting to "mobile"
+    return `light_mobile_${hexHash}`;
   }
   
   // v6.0: Create a NodeRegistration TX client-side and submit it to the current producer.
@@ -5616,11 +5622,13 @@ export class WalletManager {
               throw new Error('Cannot load wallet — required for hybrid gossip signature');
             }
             const qnetKeypair = wd.qnetKeypair;
-            const privateKeyBytes = qnetKeypair?.privateKey
+            // nacl secretKey = 64 bytes (seed[32] + pubkey[32]). Always slice to get seed.
+            const rawKeyBytes = qnetKeypair?.privateKey
               ? new Uint8Array(qnetKeypair.privateKey)
-              : new Uint8Array((wd.secretKey || []).slice(0, 32));
+              : new Uint8Array(wd.secretKey || []);
+            const privateKeyBytes = rawKeyBytes.slice(0, 32);
             if (privateKeyBytes.length !== 32) {
-              throw new Error('Ed25519 private key must be 32 bytes — wallet data corrupted');
+              throw new Error('Ed25519 seed must be 32 bytes — wallet data corrupted');
             }
             const kp = nacl.sign.keyPair.fromSeed(privateKeyBytes);
             ed25519GossipPubkey = Buffer.from(kp.publicKey).toString('hex');
