@@ -1,4 +1,4 @@
-﻿/**
+/**
  * QNet Wallet Background Service Worker - Production Version
  * Self-contained cryptography for Chrome Extension compatibility
  */
@@ -2874,13 +2874,16 @@ class ProductionCrypto {
     }
     
     // Encrypt wallet data with password
+    static ENCRYPT_ITERATIONS_V2 = 600_000; // OWASP 2024
+    static ENCRYPT_ITERATIONS_V1 = 100_000; // Legacy — decrypt only
+
     static async encryptWalletData(walletData, password) {
         try {
             const encoder = new TextEncoder();
             const data = encoder.encode(JSON.stringify(walletData));
             
             // Generate salt and IV
-            const salt = crypto.getRandomValues(new Uint8Array(16));
+            const salt = crypto.getRandomValues(new Uint8Array(32));
             const iv = crypto.getRandomValues(new Uint8Array(12));
             
             // Derive key from password
@@ -2896,7 +2899,7 @@ class ProductionCrypto {
                 {
                     name: 'PBKDF2',
                     salt: salt,
-                    iterations: 100000, // Industry standard for crypto wallets
+                    iterations: ProductionCrypto.ENCRYPT_ITERATIONS_V2,
                     hash: 'SHA-256'
                 },
                 passwordKey,
@@ -2916,7 +2919,7 @@ class ProductionCrypto {
                 encrypted: Array.from(new Uint8Array(encrypted)),
                 salt: Array.from(salt),
                 iv: Array.from(iv),
-                version: 1
+                version: 2
             };
         } catch (error) {
             // Error:('Wallet encryption failed:', error);
@@ -2995,13 +2998,15 @@ class ProductionCrypto {
                 ['deriveKey']
             );
             
-            // console.log('[DecryptWallet] Deriving encryption key...');
-            // Derive key
+            // Derive key — v2=600K (current), v1=100K (legacy, auto-migrates)
+            const iterations = (encryptedWalletData.version === 2)
+                ? ProductionCrypto.ENCRYPT_ITERATIONS_V2
+                : ProductionCrypto.ENCRYPT_ITERATIONS_V1;
             const key = await crypto.subtle.deriveKey(
                 {
                     name: 'PBKDF2',
                     salt: new Uint8Array(salt),
-                    iterations: 100000, // Industry standard for crypto wallets
+                    iterations,
                     hash: 'SHA-256'
                 },
                 passwordKey,
@@ -6342,13 +6347,14 @@ async function unlockWallet(password) {
             // Continue without migration
         }
         
-        // Store migrated wallet if it was updated
-        if (walletData.qnetAddress && walletData.qnetAddress.length >= 40) {
-            // Re-encrypt with migrated data
+        // Migrate vault to v2 (PBKDF2 600K) if stored as v1 (100K), or if QNet address was migrated
+        const needsMigration = (result.encryptedWallet?.version !== 2)
+            || (walletData.qnetAddress && walletData.qnetAddress.length >= 40
+                && result.encryptedWallet?.version !== 2);
+        if (needsMigration) {
             const updatedEncrypted = await ProductionCrypto.encryptWalletData(walletData, password);
             await chrome.storage.local.set({ encryptedWallet: updatedEncrypted });
             walletState.encryptedWallet = updatedEncrypted;
-            //console.log('[UnlockWallet] Wallet migrated to new QNet address format');
         }
         
         // Cache decrypted wallet data for future operations (like burning tokens)

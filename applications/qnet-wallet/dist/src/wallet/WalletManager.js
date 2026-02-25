@@ -6,6 +6,10 @@
 import { SecureCrypto } from '../crypto/SecureCrypto.js';
 
 export class WalletManager {
+    // Rate-limit constants
+    static RATE_LIMIT_KEY = 'qnet_ext_rate_limit';
+    static MAX_DELAY_MS   = 300_000; // 5 min cap
+
     constructor() {
         this.isUnlocked = false;
         this.currentWallet = null;
@@ -14,6 +18,8 @@ export class WalletManager {
         this.autoLockTimer = null;
         this.crypto = new SecureCrypto();
         this.isInitialized = false;
+        this._failedAttempts = 0;
+        this._lockoutUntil = 0;
     }
 
     /**

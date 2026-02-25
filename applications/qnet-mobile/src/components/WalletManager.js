@@ -4,6 +4,7 @@ import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { derivePath } from 'ed25519-hd-key';
 import * as bip39 from 'bip39';
 import nacl from 'tweetnacl'; // Ed25519 signing for node operations
+import * as Keychain from 'react-native-keychain';
 // v3.35: Centralized node configuration (no duplication!)
 // v4.10: Added getSolanaRpcUrl for centralized Solana RPC management
 import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl } from '../config/nodes';
@@ -12,7 +13,10 @@ export class WalletManager {
   constructor() {
     this.connection = new Connection(getSolanaRpcUrl(true), 'confirmed');
     this.keyCache = null; // Cache CryptoKey object (NOT the password) for faster unlock
-    
+    this._failedAttempts = 0;
+    this._lockoutUntil = 0;
+    this._rateLimitLoaded = false;
+
     // BIP39 wordlist (2048 words)
     this.BIP39_WORDLIST = [
       "abandon",
@@ -2568,7 +2572,7 @@ export class WalletManager {
       
       // Decrypt to get mnemonic
       let plaintext;
-      if (vaultData.version === 2) {
+      if (vaultData.version === 3 || vaultData.version === 2) {
         plaintext = await this._decryptGCM(vaultData, password);
       } else {
         plaintext = await this._decryptCBC(vaultData, password);
@@ -2579,51 +2583,133 @@ export class WalletManager {
       return null;
     }
   }
-  
-  // Quick password verification without loading full wallet
-  async verifyPassword(password) {
+
+  // ── Rate limiting (exponential backoff on failed password attempts) ──
+
+  static KEYCHAIN_SERVICE = 'com.qnet.wallet.biometric';
+
+  async _loadRateLimitState() {
+    if (this._rateLimitLoaded) return;
     try {
-      const storedWallet = await AsyncStorage.getItem('qnet_wallet');
-      if (!storedWallet) return false;
-      
-      const vaultData = JSON.parse(storedWallet);
-      
-      try {
-        let plaintext;
-        if (typeof vaultData === 'string' || !vaultData.salt) {
-          // Legacy format (no salt) — try CryptoJS direct decrypt
-          const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
-          plaintext = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
-        } else if (vaultData.version === 2) {
-          plaintext = await this._decryptGCM(vaultData, password);
-        } else {
-          plaintext = await this._decryptCBC(vaultData, password);
-        }
-        if (!plaintext) return false;
-        const wallet = JSON.parse(plaintext);
-        return !!(wallet && wallet.publicKey);
-      } catch {
-        return false;
+      const raw = await AsyncStorage.getItem('qnet_rate_limit');
+      if (raw) {
+        const { attempts, lockoutUntil } = JSON.parse(raw);
+        this._failedAttempts = attempts || 0;
+        this._lockoutUntil = lockoutUntil || 0;
       }
-    } catch (error) {
-      return false;
+    } catch { /* ignore */ }
+    this._rateLimitLoaded = true;
+  }
+
+  async _saveRateLimitState() {
+    try {
+      await AsyncStorage.setItem('qnet_rate_limit', JSON.stringify({
+        attempts: this._failedAttempts,
+        lockoutUntil: this._lockoutUntil,
+      }));
+    } catch { /* ignore */ }
+  }
+
+  _lockoutMs(n) {
+    if (n < 3) return 0;
+    return Math.min(1000 * Math.pow(2, n - 3), 300_000);
+  }
+
+  async _recordFailedAttempt() {
+    this._failedAttempts++;
+    const delay = this._lockoutMs(this._failedAttempts);
+    if (delay > 0) this._lockoutUntil = Date.now() + delay;
+    await this._saveRateLimitState();
+  }
+
+  async _resetRateLimit() {
+    this._failedAttempts = 0;
+    this._lockoutUntil = 0;
+    await this._saveRateLimitState();
+  }
+
+  async getPasswordLockStatus() {
+    await this._loadRateLimitState();
+    const now = Date.now();
+    if (this._lockoutUntil > now) {
+      return { locked: true, remainingMs: this._lockoutUntil - now, attempts: this._failedAttempts };
     }
+    return { locked: false, remainingMs: 0, attempts: this._failedAttempts };
+  }
+
+  // ── Keychain / biometric unlock ──────────────────────────────────────
+
+  async isBiometricSupported() {
+    try {
+      const type = await Keychain.getSupportedBiometryType();
+      return !!type;
+    } catch { return false; }
+  }
+
+  async getBiometryType() {
+    try {
+      return await Keychain.getSupportedBiometryType();
+    } catch { return null; }
+  }
+
+  async isBiometricEnabled() {
+    try {
+      const creds = await Keychain.getGenericPassword({
+        service: WalletManager.KEYCHAIN_SERVICE,
+      });
+      return !!creds;
+    } catch { return false; }
+  }
+
+  async enableBiometricUnlock(password) {
+    try {
+      const type = await Keychain.getSupportedBiometryType();
+      if (!type) return false;
+      await Keychain.setGenericPassword('qnet_wallet', password, {
+        service: WalletManager.KEYCHAIN_SERVICE,
+        accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_CURRENT_SET,
+        accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+      });
+      return true;
+    } catch { return false; }
+  }
+
+  async disableBiometricUnlock() {
+    try {
+      await Keychain.resetGenericPassword({ service: WalletManager.KEYCHAIN_SERVICE });
+      return true;
+    } catch { return false; }
+  }
+
+  async tryBiometricUnlock() {
+    try {
+      const creds = await Keychain.getGenericPassword({
+        service: WalletManager.KEYCHAIN_SERVICE,
+        authenticationPrompt: { title: 'Unlock QNet Wallet' },
+      });
+      if (!creds || !creds.password) return null;
+      return creds.password;
+    } catch { return null; }
   }
 
   // ---------------------------------------------------------------------------
-  // Secure crypto helpers (Web Crypto API — AES-256-GCM + PBKDF2 100K)
-  // Vault format v2: { version:2, salt, iv, encrypted } — all hex-encoded.
+  // Secure crypto helpers (Web Crypto API — AES-256-GCM + PBKDF2)
+  // Vault format v3: { version:3, salt, iv, encrypted } — PBKDF2 600K (current)
+  // Vault format v2: { version:2, salt, iv, encrypted } — PBKDF2 100K (legacy, auto-migrates)
   // ---------------------------------------------------------------------------
 
-  // Derive AES-GCM-256 CryptoKey from password + hex salt via PBKDF2 (100K).
-  async _deriveKeyNative(password, saltHex) {
+  static VAULT_ITERATIONS_V3 = 600_000; // OWASP 2024 recommendation
+  static VAULT_ITERATIONS_V2 = 100_000; // Legacy — kept for backward compat decrypt
+
+  // Derive AES-GCM-256 CryptoKey from password + hex salt via PBKDF2.
+  async _deriveKeyNative(password, saltHex, iterations = WalletManager.VAULT_ITERATIONS_V3) {
     const enc = new TextEncoder();
     const salt = this._hexToBytes(saltHex);
     const keyMaterial = await crypto.subtle.importKey(
       'raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']
     );
     return crypto.subtle.deriveKey(
-      { name: 'PBKDF2', salt, iterations: 100_000, hash: 'SHA-256' },
+      { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
       keyMaterial,
       { name: 'AES-GCM', length: 256 },
       false,
@@ -2631,11 +2717,11 @@ export class WalletManager {
     );
   }
 
-  // Encrypt plaintext string → { version, salt, iv, encrypted } (all hex).
+  // Encrypt plaintext string → { version:3, salt, iv, encrypted } (all hex).
   async _encryptGCM(plaintext, password) {
     const salt = crypto.getRandomValues(new Uint8Array(32));
     const iv   = crypto.getRandomValues(new Uint8Array(12));
-    const key  = await this._deriveKeyNative(password, this._bytesToHex(salt));
+    const key  = await this._deriveKeyNative(password, this._bytesToHex(salt), WalletManager.VAULT_ITERATIONS_V3);
     const enc  = new TextEncoder();
     const cipherBuf = await crypto.subtle.encrypt(
       { name: 'AES-GCM', iv },
@@ -2643,7 +2729,7 @@ export class WalletManager {
       enc.encode(plaintext)
     );
     return {
-      version:   2,
+      version:   3,
       salt:      this._bytesToHex(salt),
       iv:        this._bytesToHex(iv),
       encrypted: this._bytesToHex(new Uint8Array(cipherBuf)),
@@ -2651,9 +2737,12 @@ export class WalletManager {
     };
   }
 
-  // Decrypt vault v2 → plaintext string. Throws on wrong password.
+  // Decrypt vault v2 or v3 → plaintext string. Throws on wrong password.
   async _decryptGCM(vaultData, password) {
-    const key = await this._deriveKeyNative(password, vaultData.salt);
+    const iterations = vaultData.version === 3
+      ? WalletManager.VAULT_ITERATIONS_V3
+      : WalletManager.VAULT_ITERATIONS_V2;
+    const key = await this._deriveKeyNative(password, vaultData.salt, iterations);
     const plainBuf = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: this._hexToBytes(vaultData.iv) },
       key,
@@ -2725,11 +2814,11 @@ export class WalletManager {
         mnemonic: mnemonic // Will be encrypted below
       };
       
-      // Encrypt wallet data — AES-256-GCM + PBKDF2 100K
+      // Encrypt wallet data — AES-256-GCM + PBKDF2 600K (v3)
       const vaultData = await this._encryptGCM(JSON.stringify(storageData), password);
 
       // Cache the CryptoKey (NOT the password) for faster unlock
-      this.keyCache = await this._deriveKeyNative(password, vaultData.salt);
+      this.keyCache = await this._deriveKeyNative(password, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
       
       await AsyncStorage.setItem('qnet_wallet', JSON.stringify(vaultData));
       await AsyncStorage.setItem('qnet_wallet_address', walletData.address);
@@ -3153,15 +3242,16 @@ export class WalletManager {
         throw new Error('Wallet data is corrupted. Please create a new wallet or import existing one.');
       }
       
-      // Decrypt — support all vault versions with auto-migration to v2 (GCM)
+      // Decrypt — support all vault versions with auto-migration to v3 (GCM 600K)
       let plaintext;
       if (typeof vaultData === 'string' || !vaultData.salt) {
-        // v0: no salt/IV at all — direct CryptoJS password
+        // v0: no salt/IV — direct CryptoJS password (very old)
         const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
         plaintext = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
         if (!plaintext) throw new Error('Invalid password');
-      } else if (vaultData.version === 2) {
-        // v2: AES-256-GCM + PBKDF2 100K (current)
+      } else if (vaultData.version === 3 || vaultData.version === 2) {
+        // v3: AES-256-GCM + PBKDF2 600K (current)
+        // v2: AES-256-GCM + PBKDF2 100K (legacy, auto-migrates to v3)
         plaintext = await this._decryptGCM(vaultData, password);
       } else {
         // v1: AES-256-CBC + PBKDF2 10K (legacy) — migrate on first unlock
@@ -3173,15 +3263,15 @@ export class WalletManager {
       // Migrate old QNet address format if needed
       wallet = await this.migrateQNetAddress(wallet);
 
-      // If vault was not v2 yet, re-encrypt with GCM + 100K and cache CryptoKey
-      if (vaultData.version !== 2) {
+      // Migrate to v3 (PBKDF2 600K) if vault is not already v3
+      if (vaultData.version !== 3) {
         const newVault = await this._encryptGCM(JSON.stringify(wallet), password);
         await AsyncStorage.setItem('qnet_wallet', JSON.stringify(newVault));
-        this.keyCache = await this._deriveKeyNative(password, newVault.salt);
+        this.keyCache = await this._deriveKeyNative(password, newVault.salt, WalletManager.VAULT_ITERATIONS_V3);
       } else {
         // Cache CryptoKey (not password) for faster subsequent unlocks
         if (!this.keyCache) {
-          this.keyCache = await this._deriveKeyNative(password, vaultData.salt);
+          this.keyCache = await this._deriveKeyNative(password, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
         }
       }
 
@@ -4295,9 +4385,9 @@ export class WalletManager {
         return null;
       }
       
-      // Decrypt the activation code (v2=GCM, v1=CBC legacy)
+      // Decrypt the activation code (v3/v2=GCM, v1=CBC legacy)
       let decryptedStr;
-      if (codeData.version === 2) {
+      if (codeData.version === 3 || codeData.version === 2) {
         decryptedStr = await this._decryptGCM(codeData, password);
       } else {
         decryptedStr = await this._decryptCBC(codeData, password);
@@ -4938,7 +5028,7 @@ export class WalletManager {
           if (codeData.salt && codeData.iv && codeData.encrypted) {
             try {
               let code;
-              if (codeData.version === 2) {
+              if (codeData.version === 3 || codeData.version === 2) {
                 code = await this._decryptGCM(codeData, password);
               } else {
                 code = await this._decryptCBC(codeData, password);
@@ -6172,28 +6262,36 @@ export class WalletManager {
   
   // Quick password verification (faster than full decryption)
   async verifyPassword(password) {
+    await this._loadRateLimitState();
+    if (this._lockoutUntil > Date.now()) return false;
+
     try {
       const vaultDataStr = await AsyncStorage.getItem('qnet_wallet');
       if (!vaultDataStr) return false;
-      
-      const vaultData = JSON.parse(vaultDataStr);
-      if (!vaultData.encrypted) return false;
 
+      const vaultData = JSON.parse(vaultDataStr);
       try {
         let plaintext;
-        if (vaultData.version === 2) {
+        if (typeof vaultData === 'string' || !vaultData.salt) {
+          const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
+          plaintext = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
+        } else if (vaultData.version === 3 || vaultData.version === 2) {
           plaintext = await this._decryptGCM(vaultData, password);
         } else {
           plaintext = await this._decryptCBC(vaultData, password);
         }
-        JSON.parse(plaintext); // validate JSON
-        // Cache CryptoKey (not password) on successful verify
-        if (!this.keyCache) {
-          this.keyCache = await this._deriveKeyNative(password, vaultData.salt);
+        JSON.parse(plaintext);
+        if (!this.keyCache && vaultData.salt) {
+          const iters = vaultData.version === 3
+            ? WalletManager.VAULT_ITERATIONS_V3
+            : WalletManager.VAULT_ITERATIONS_V2;
+          this.keyCache = await this._deriveKeyNative(password, vaultData.salt, iters);
         }
+        await this._resetRateLimit();
         return true;
       } catch {
         this.keyCache = null;
+        await this._recordFailedAttempt();
         return false;
       }
     } catch (error) {

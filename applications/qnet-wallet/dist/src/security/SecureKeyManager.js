@@ -75,13 +75,13 @@ class SecureKeyManager {
             
             // 7. Store encrypted vault
             const vault = {
-                version: '4.0.0', // Updated version
-                addresses: addresses, // Public - OK to store
-                encryptedKeys: encryptedKeys, // Encrypted private keys
-                encryptedSeedPhrase: encryptedSeedPhrase, // OPTIONAL: Encrypted seed (secure!)
+                version: '4.1.0',
+                addresses: addresses,
+                encryptedKeys: encryptedKeys,
+                encryptedSeedPhrase: encryptedSeedPhrase,
                 salt: safeBase64Encode(String.fromCharCode(...salt)),
-                iterations: 100000,
-                algorithm: 'AES-GCM-256' // Specify encryption algorithm
+                iterations: 600_000, // OWASP 2024
+                algorithm: 'AES-GCM-256'
             };
             
             // 8. Store in IndexedDB (more secure than localStorage)
@@ -109,37 +109,55 @@ class SecureKeyManager {
             // 1. Load encrypted vault
             const vault = await this.loadVault();
             if (!vault) {
-                // Try legacy format for backward compatibility
+                // Auto-migrate legacy localStorage wallet to secure IndexedDB vault
                 const storedHash = localStorage.getItem('qnet_wallet_password_hash');
                 const encryptedWallet = localStorage.getItem('qnet_wallet_encrypted');
                 if (storedHash && encryptedWallet) {
                     const inputHash = safeBase64Encode(password + 'qnet_salt_2025');
-                    if (inputHash === storedHash) {
-                        // Legacy wallet detected - get mnemonic from old format
-                        let mnemonic = null;
-                        try {
-                            const walletData = JSON.parse(safeBase64Decode(encryptedWallet));
-                            mnemonic = walletData.mnemonic;
-                        } catch (e) {
-                            console.error('Failed to extract mnemonic from legacy wallet');
-                        }
-                        
-                        console.warn('⚠️ Legacy wallet format detected. Please migrate to secure format.');
-                        return { 
-                            success: true, 
-                            legacy: true,
-                            mnemonic: mnemonic, // Return legacy mnemonic
-                            warning: 'Legacy wallet format. Please re-create wallet for better security.'
-                        };
-                    }
+                    if (inputHash !== storedHash) throw new Error('Invalid password');
+
+                    // Extract mnemonic from legacy plaintext Base64
+                    let mnemonic = null;
+                    try {
+                        const walletData = JSON.parse(safeBase64Decode(encryptedWallet));
+                        mnemonic = walletData.mnemonic;
+                    } catch (e) { /* corrupted legacy data */ }
+
+                    if (!mnemonic) throw new Error('Legacy wallet corrupted. Please re-import using recovery phrase.');
+
+                    // Re-initialize with secure format (PBKDF2 600K + AES-GCM + IndexedDB)
+                    const migrated = await this.initializeWallet(password, mnemonic, true);
+                    if (!migrated.success) throw new Error('Migration failed: ' + migrated.error);
+
+                    // Wipe ALL legacy localStorage entries
+                    ['qnet_wallet_password_hash', 'qnet_wallet_encrypted',
+                     'qnet_wallet_secure', 'qnet_wallet_initialized', 'qnet_wallet_unlocked']
+                        .forEach(k => localStorage.removeItem(k));
+
+                    // Load the freshly-created vault and continue unlock normally
+                    const newVault = await this.loadVault();
+                    if (!newVault) throw new Error('Vault not found after migration');
+
+                    const salt = Uint8Array.from(safeBase64Decode(newVault.salt), c => c.charCodeAt(0));
+                    const passwordKey = await this.derivePasswordKey(password, salt, 600_000);
+                    this.sessionKeys = await this.decryptKeys(newVault.encryptedKeys, passwordKey);
+                    this.addresses = newVault.addresses;
+                    this.setAutoLock(15 * 60 * 1000);
+                    return {
+                        success: true,
+                        addresses: newVault.addresses,
+                        mnemonic: returnSeedPhrase ? mnemonic : null,
+                        migrated: true,
+                    };
                 }
                 throw new Error('No wallet found');
             }
             
-            // 2. Derive decryption key from password
+            // 2. Derive decryption key from password — use stored iterations for backward compat
             const salt = Uint8Array.from(safeBase64Decode(vault.salt), c => c.charCodeAt(0));
-            const passwordKey = await this.derivePasswordKey(password, salt);
-            
+            const vaultIterations = vault.iterations || 600_000;
+            const passwordKey = await this.derivePasswordKey(password, salt, vaultIterations);
+
             // 3. Decrypt private keys
             const keys = await this.decryptKeys(vault.encryptedKeys, passwordKey);
             
@@ -219,7 +237,7 @@ class SecureKeyManager {
             // Re-verify password
             const vault = await this.loadVault();
             const salt = Uint8Array.from(safeBase64Decode(vault.salt), c => c.charCodeAt(0));
-            const passwordKey = await this.derivePasswordKey(password, salt);
+            const passwordKey = await this.derivePasswordKey(password, salt, vault.iterations || 600_000);
             
             // Decrypt keys
             const keys = await this.decryptKeys(vault.encryptedKeys, passwordKey);
@@ -246,7 +264,8 @@ class SecureKeyManager {
     }
     
     // Derive password key using PBKDF2
-    async derivePasswordKey(password, salt) {
+    // iterations defaults to 600K (OWASP 2024); pass 100000 only for legacy vault decryption
+    async derivePasswordKey(password, salt, iterations = 600_000) {
         const encoder = new TextEncoder();
         const passwordBuffer = encoder.encode(password);
         
@@ -262,7 +281,7 @@ class SecureKeyManager {
             {
                 name: 'PBKDF2',
                 salt: salt,
-                iterations: 100000,
+                iterations,
                 hash: 'SHA-256'
             },
             passwordKey,
@@ -363,22 +382,10 @@ class SecureKeyManager {
     
     // Store vault with fallback to localStorage
     async storeVault(vault) {
-        try {
-            // Try IndexedDB first
-            if (typeof indexedDB !== 'undefined') {
-                return await this.storeVaultIndexedDB(vault);
-            }
-        } catch (e) {
-            // Fallback to localStorage
+        if (typeof indexedDB === 'undefined') {
+            throw new Error('IndexedDB not available. Vault storage requires IndexedDB.');
         }
-        
-        // Fallback to localStorage
-        try {
-            localStorage.setItem('qnet_wallet_vault', JSON.stringify(vault));
-            return Promise.resolve();
-        } catch (e) {
-            return Promise.reject(new Error('Failed to store vault'));
-        }
+        return this.storeVaultIndexedDB(vault);
     }
     
     // Store vault in IndexedDB
@@ -407,29 +414,14 @@ class SecureKeyManager {
         });
     }
     
-    // Load vault with fallback to localStorage
+    // Load vault from IndexedDB only — localStorage is not used for vault storage
     async loadVault() {
+        if (typeof indexedDB === 'undefined') return null;
         try {
-            // Try IndexedDB first
-            if (typeof indexedDB !== 'undefined') {
-                const result = await this.loadVaultIndexedDB();
-                if (result) return result;
-            }
+            return await this.loadVaultIndexedDB();
         } catch (e) {
-            // Fallback to localStorage
+            return null;
         }
-        
-        // Fallback to localStorage
-        try {
-            const stored = localStorage.getItem('qnet_wallet_vault');
-            if (stored) {
-                return JSON.parse(stored);
-            }
-        } catch (e) {
-            // Ignore
-        }
-        
-        return null;
     }
     
     // Load vault from IndexedDB
@@ -460,9 +452,9 @@ class SecureKeyManager {
                 return { success: false, error: 'No wallet found' };
             }
             
-            // 2. Verify old password by trying to decrypt
+            // 2. Verify old password by trying to decrypt (use stored iterations)
             const oldSalt = Uint8Array.from(safeBase64Decode(vault.salt), c => c.charCodeAt(0));
-            const oldPasswordKey = await this.derivePasswordKey(oldPassword, oldSalt);
+            const oldPasswordKey = await this.derivePasswordKey(oldPassword, oldSalt, vault.iterations || 600_000);
             
             // Try to decrypt keys with old password
             let keys;
@@ -501,24 +493,22 @@ class SecureKeyManager {
                 newEncryptedSeedPhrase = await this.encryptSeedPhrase(seedPhrase, newPasswordKey);
             }
             
-            // 7. Create updated vault
+            // 7. Create updated vault — upgrade iterations to 600K on password change
             const updatedVault = {
                 ...vault,
                 encryptedKeys: newEncryptedKeys,
                 encryptedSeedPhrase: newEncryptedSeedPhrase,
                 salt: safeBase64Encode(String.fromCharCode(...newSalt)),
+                iterations: 600_000,
+                version: '4.1.0',
                 updatedAt: Date.now()
             };
             
             // 8. Store updated vault
             await this.storeVault(updatedVault);
             
-            // 9. Also update legacy password hash if it exists
-            const legacyHash = localStorage.getItem('qnet_wallet_password_hash');
-            if (legacyHash) {
-                const newLegacyHash = safeBase64Encode(newPassword + 'qnet_salt_2025');
-                localStorage.setItem('qnet_wallet_password_hash', newLegacyHash);
-            }
+            // 9. Remove legacy plaintext password "hash" (Base64-reversible, insecure)
+            localStorage.removeItem('qnet_wallet_password_hash');
             
             // 10. Clear sensitive data from memory
             if (seedPhrase) {

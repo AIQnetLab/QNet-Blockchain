@@ -1731,9 +1731,7 @@ async function completeWalletSetup() {
         const legacyData = safeBase64Encode(JSON.stringify(legacyWalletData));
         localStorage.setItem('qnet_wallet_encrypted', legacyData);
         
-        // Also store password hash for legacy compatibility
-        const passwordHash = safeBase64Encode(setupState.password + 'qnet_salt_2025');
-        localStorage.setItem('qnet_wallet_password_hash', passwordHash);
+        // Legacy password hash removed — Base64(password+salt) is reversible, not a real hash.
         
         // Variable for storage event
         let encryptedData = legacyData;
@@ -1761,11 +1759,8 @@ async function completeWalletSetup() {
                 // Legacy format saved for backward compatibility only
                 // This will be removed in next major version
                 if (window.location.hostname === 'localhost' || window.location.protocol === 'file:') {
-                    // Only save legacy format in development/test environments
                     const legacyEncrypted = safeBase64Encode(JSON.stringify(walletData));
-                    const legacyPasswordHash = safeBase64Encode(setupState.password + 'qnet_salt_2025'); // Deprecated
                     localStorage.setItem('qnet_wallet_encrypted', legacyEncrypted);
-                    localStorage.setItem('qnet_wallet_password_hash', legacyPasswordHash);
                 }
                 
                 encryptedData = legacyEncrypted; // For storage event
@@ -1774,18 +1769,12 @@ async function completeWalletSetup() {
                 // Error:('Encryption failed:', error);
                 // Fallback to old method
                 encryptedData = safeBase64Encode(JSON.stringify(walletData));
-                const passwordHash = safeBase64Encode(setupState.password + 'qnet_salt_2025');
                 localStorage.setItem('qnet_wallet_encrypted', encryptedData);
-                localStorage.setItem('qnet_wallet_password_hash', passwordHash);
                 localStorage.setItem('qnet_wallet_unlocked', 'true');
             }
         } else {
-            // Fallback to old method (NOT SECURE - for compatibility)
-            // Warning:('⚠️ WARNING: Using legacy storage. Crypto library not available.');
             encryptedData = safeBase64Encode(JSON.stringify(walletData));
-            const passwordHash = safeBase64Encode(setupState.password + 'qnet_salt_2025');
             localStorage.setItem('qnet_wallet_encrypted', encryptedData);
-            localStorage.setItem('qnet_wallet_password_hash', passwordHash);
             localStorage.setItem('qnet_wallet_unlocked', 'true');
         }
         

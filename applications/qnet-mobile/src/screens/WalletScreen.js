@@ -99,6 +99,12 @@ const translations = {
     error: 'Error',
     success: 'Success',
     incorrect_password: 'Incorrect password',
+    wallet_locked: 'Wallet locked. Try again in',
+    biometric_unlock: 'Unlock with Biometrics',
+    enable_biometric: 'Biometric Unlock',
+    biometric_enabled_msg: 'Biometric unlock enabled',
+    biometric_disabled_msg: 'Biometric unlock disabled',
+    biometric_unavailable: 'Biometric authentication not available on this device',
     password_changed: 'Password changed successfully!',
     wallet_deleted: 'Wallet deleted successfully',
     session_expired: 'Session Expired',
@@ -207,6 +213,12 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     error: '错误',
     success: '成功',
     incorrect_password: '密码不正确',
+    wallet_locked: '钱包已锁定。请在后重试',
+    biometric_unlock: '生物识别解锁',
+    enable_biometric: '生物识别解锁',
+    biometric_enabled_msg: '生物识别解锁已启用',
+    biometric_disabled_msg: '生物识别解锁已禁用',
+    biometric_unavailable: '此设备不支持生物识别认证',
     password_changed: '密码更改成功！',
     wallet_deleted: '钱包删除成功',
     session_expired: '会话已过期',
@@ -262,6 +274,12 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     error: 'Ошибка',
     success: 'Успешно',
     incorrect_password: 'Неверный пароль',
+    wallet_locked: 'Кошелёк заблокирован. Повторите через',
+    biometric_unlock: 'Разблокировать биометрией',
+    enable_biometric: 'Биометрическая разблокировка',
+    biometric_enabled_msg: 'Биометрическая разблокировка включена',
+    biometric_disabled_msg: 'Биометрическая разблокировка отключена',
+    biometric_unavailable: 'Биометрическая аутентификация недоступна на этом устройстве',
     password_changed: 'Пароль успешно изменён!',
     wallet_deleted: 'Кошелёк успешно удалён',
     session_expired: 'Сессия истекла',
@@ -317,6 +335,12 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     error: 'Error',
     success: 'Éxito',
     incorrect_password: 'Contraseña incorrecta',
+    wallet_locked: 'Billetera bloqueada. Inténtelo de nuevo en',
+    biometric_unlock: 'Desbloquear con Biometría',
+    enable_biometric: 'Desbloqueo Biométrico',
+    biometric_enabled_msg: 'Desbloqueo biométrico activado',
+    biometric_disabled_msg: 'Desbloqueo biométrico desactivado',
+    biometric_unavailable: 'La autenticación biométrica no está disponible en este dispositivo',
     password_changed: '¡Contraseña cambiada con éxito!',
     wallet_deleted: 'Cartera eliminada con éxito',
     session_expired: 'Sesión Expirada',
@@ -372,6 +396,12 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     error: '오류',
     success: '성공',
     incorrect_password: '잘못된 비밀번호',
+    wallet_locked: '지갑이 잠겼습니다. 다시 시도하세요',
+    biometric_unlock: '생체 인식으로 잠금 해제',
+    enable_biometric: '생체 인식 잠금 해제',
+    biometric_enabled_msg: '생체 인식 잠금 해제가 활성화되었습니다',
+    biometric_disabled_msg: '생체 인식 잠금 해제가 비활성화되었습니다',
+    biometric_unavailable: '이 기기에서는 생체 인식 인증을 사용할 수 없습니다',
     password_changed: '비밀번호가 성공적으로 변경되었습니다!',
     wallet_deleted: '지갑이 성공적으로 삭제되었습니다',
     session_expired: '세션 만료',
@@ -427,6 +457,12 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     error: 'エラー',
     success: '成功',
     incorrect_password: 'パスワードが正しくありません',
+    wallet_locked: 'ウォレットがロックされています。後でもう一度お試しください',
+    biometric_unlock: '生体認証でロック解除',
+    enable_biometric: '生体認証ロック解除',
+    biometric_enabled_msg: '生体認証ロック解除が有効になりました',
+    biometric_disabled_msg: '生体認証ロック解除が無効になりました',
+    biometric_unavailable: 'このデバイスでは生体認証を利用できません',
     password_changed: 'パスワードが正常に変更されました！',
     wallet_deleted: 'ウォレットが正常に削除されました',
     session_expired: 'セッション期限切れ',
@@ -482,10 +518,15 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     error: 'Erro',
     success: 'Sucesso',
     incorrect_password: 'Senha incorreta',
+    wallet_locked: 'Carteira bloqueada. Tente novamente em',
+    biometric_unlock: 'Desbloquear com Biometria',
+    enable_biometric: 'Desbloqueio Biométrico',
+    biometric_enabled_msg: 'Desbloqueio biométrico ativado',
+    biometric_disabled_msg: 'Desbloqueio biométrico desativado',
+    biometric_unavailable: 'Autenticação biométrica não disponível neste dispositivo',
     password_changed: 'Senha alterada com sucesso!',
     wallet_deleted: 'Carteira excluída com sucesso',
     session_expired: 'Sessão Expirada',
-    wallet_locked: 'Carteira bloqueada por inatividade',
     logout_confirm: 'Tem certeza de que deseja sair?',
     delete_wallet_confirm: 'Tem certeza de que deseja excluir esta carteira? Certifique-se de ter feito backup da frase de recuperação!',
     i_saved_it: 'Eu Salvei',
@@ -537,10 +578,15 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     error: 'Erreur',
     success: 'Succès',
     incorrect_password: 'Mot de passe incorrect',
+    wallet_locked: 'Portefeuille verrouillé. Réessayez dans',
+    biometric_unlock: 'Déverrouiller par Biométrie',
+    enable_biometric: 'Déverrouillage Biométrique',
+    biometric_enabled_msg: 'Déverrouillage biométrique activé',
+    biometric_disabled_msg: 'Déverrouillage biométrique désactivé',
+    biometric_unavailable: 'L\'authentification biométrique n\'est pas disponible sur cet appareil',
     password_changed: 'Mot de passe changé avec succès!',
     wallet_deleted: 'Portefeuille supprimé avec succès',
     session_expired: 'Session Expirée',
-    wallet_locked: 'Portefeuille verrouillé en raison de l\'inactivité',
     logout_confirm: 'Êtes-vous sûr de vouloir vous déconnecter?',
     delete_wallet_confirm: 'Êtes-vous sûr de vouloir supprimer ce portefeuille? Assurez-vous d\'avoir sauvegardé votre phrase de récupération!',
     i_saved_it: 'Je l\'ai Sauvegardé',
@@ -592,10 +638,15 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     error: 'Fehler',
     success: 'Erfolg',
     incorrect_password: 'Falsches Passwort',
+    wallet_locked: 'Wallet gesperrt. Erneut versuchen in',
+    biometric_unlock: 'Mit Biometrie entsperren',
+    enable_biometric: 'Biometrisches Entsperren',
+    biometric_enabled_msg: 'Biometrisches Entsperren aktiviert',
+    biometric_disabled_msg: 'Biometrisches Entsperren deaktiviert',
+    biometric_unavailable: 'Biometrische Authentifizierung auf diesem Gerät nicht verfügbar',
     password_changed: 'Passwort erfolgreich geändert!',
     wallet_deleted: 'Wallet erfolgreich gelöscht',
     session_expired: 'Sitzung Abgelaufen',
-    wallet_locked: 'Wallet wegen Inaktivität gesperrt',
     logout_confirm: 'Sind Sie sicher, dass Sie sich abmelden möchten?',
     delete_wallet_confirm: 'Sind Sie sicher, dass Sie dieses Wallet löschen möchten? Stellen Sie sicher, dass Sie Ihre Wiederherstellungsphrase gesichert haben!',
     i_saved_it: 'Ich Habe Es Gespeichert',
@@ -647,10 +698,15 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     error: 'خطأ',
     success: 'نجح',
     incorrect_password: 'كلمة مرور غير صحيحة',
+    wallet_locked: 'المحفظة مقفلة. حاول مرة أخرى خلال',
+    biometric_unlock: 'فتح بالبيومترية',
+    enable_biometric: 'فتح البيومتري',
+    biometric_enabled_msg: 'تم تفعيل الفتح البيومتري',
+    biometric_disabled_msg: 'تم تعطيل الفتح البيومتري',
+    biometric_unavailable: 'المصادقة البيومترية غير متاحة على هذا الجهاز',
     password_changed: 'تم تغيير كلمة المرور بنجاح!',
     wallet_deleted: 'تم حذف المحفظة بنجاح',
     session_expired: 'انتهت الجلسة',
-    wallet_locked: 'تم قفل المحفظة بسبب عدم النشاط',
     logout_confirm: 'هل أنت متأكد أنك تريد تسجيل الخروج؟',
     delete_wallet_confirm: 'هل أنت متأكد أنك تريد حذف هذه المحفظة؟ تأكد من نسخ عبارة الاسترداد احتياطيًا!',
     i_saved_it: 'لقد حفظتها',
@@ -702,10 +758,15 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     error: 'Errore',
     success: 'Successo',
     incorrect_password: 'Password errata',
+    wallet_locked: 'Portafoglio bloccato. Riprova tra',
+    biometric_unlock: 'Sblocca con Biometria',
+    enable_biometric: 'Sblocco Biometrico',
+    biometric_enabled_msg: 'Sblocco biometrico abilitato',
+    biometric_disabled_msg: 'Sblocco biometrico disabilitato',
+    biometric_unavailable: 'Autenticazione biometrica non disponibile su questo dispositivo',
     password_changed: 'Password cambiata con successo!',
     wallet_deleted: 'Portafoglio eliminato con successo',
     session_expired: 'Sessione Scaduta',
-    wallet_locked: 'Portafoglio bloccato per inattività',
     logout_confirm: 'Sei sicuro di voler disconnetterti?',
     delete_wallet_confirm: 'Sei sicuro di voler eliminare questo portafoglio? Assicurati di aver eseguito il backup della frase di recupero!',
     i_saved_it: 'L\'ho Salvata',
@@ -833,6 +894,12 @@ const WalletScreen = () => {
   const [restoringNode, setRestoringNode] = useState(false); // Restore existing node in progress
   const [restoreNodeError, setRestoreNodeError] = useState(''); // Error message from restore attempt
   const [unlockError, setUnlockError] = useState(''); // Error message for unlock screen
+  const [biometricEnabled, setBiometricEnabled] = useState(false);
+  const [biometricSupported, setBiometricSupported] = useState(false);
+  const [showBiometricPasswordPrompt, setShowBiometricPasswordPrompt] = useState(false);
+  const [biometricPassword, setBiometricPassword] = useState('');
+  const [lockoutMs, setLockoutMs] = useState(0); // ms remaining in lockout
+  const lockoutTimerRef = React.useRef(null);
 
   // Throttle helper to prevent too frequent updates
   const lastActivityEmit = React.useRef(0);
@@ -883,11 +950,21 @@ const WalletScreen = () => {
     // Load wallet data in parallel
     checkWalletExists();
     loadSettings();
+    // Biometric support check
+    walletManager.isBiometricSupported().then(supported => setBiometricSupported(supported));
+    walletManager.isBiometricEnabled().then(enabled => setBiometricEnabled(enabled));
+    // Rate-limit state
+    walletManager.getPasswordLockStatus().then(({ locked, remainingMs }) => {
+      if (locked) _startLockoutCountdown(remainingMs);
+    });
     // Run Dilithium BC compatibility test once on startup
     try {
       const { runCompatibilityTest } = require('../crypto/DilithiumCrypto');
       runCompatibilityTest();
     } catch (e) {}
+    return () => {
+      if (lockoutTimerRef.current) clearInterval(lockoutTimerRef.current);
+    };
   }, []);
 
   // Load real burn progress when activation tab is selected
@@ -2781,18 +2858,49 @@ const WalletScreen = () => {
     });
   };
 
+  const _startLockoutCountdown = (remainingMs) => {
+    if (lockoutTimerRef.current) clearInterval(lockoutTimerRef.current);
+    setLockoutMs(remainingMs);
+    lockoutTimerRef.current = setInterval(() => {
+      setLockoutMs(prev => {
+        if (prev <= 1000) {
+          clearInterval(lockoutTimerRef.current);
+          lockoutTimerRef.current = null;
+          return 0;
+        }
+        return prev - 1000;
+      });
+    }, 1000);
+  };
+
+  const handleBiometricUnlock = async () => {
+    const pw = await walletManager.tryBiometricUnlock();
+    if (!pw) return;
+    await _doUnlock(pw);
+  };
+
   const unlockWallet = async () => {
+    if (lockoutMs > 0) return;
     if (!password) {
       setUnlockError(translations[language].incorrect_password);
       setTimeout(() => setUnlockError(''), 3000);
       return;
     }
-    
+    await _doUnlock(password);
+  };
+
+  const _doUnlock = async (pw) => {
     // Quick password check first (fast)
-    const isValid = await walletManager.verifyPassword(password);
+    const isValid = await walletManager.verifyPassword(pw);
     if (!isValid) {
-      setUnlockError(translations[language].incorrect_password);
-      setTimeout(() => setUnlockError(''), 3000);
+      const status = await walletManager.getPasswordLockStatus();
+      if (status.locked) {
+        _startLockoutCountdown(status.remainingMs);
+        setUnlockError('');
+      } else {
+        setUnlockError(translations[language].incorrect_password);
+        setTimeout(() => setUnlockError(''), 3000);
+      }
       return;
     }
 
@@ -2800,7 +2908,7 @@ const WalletScreen = () => {
     setShowSplash(false); // Hide splash immediately
     
     // Load wallet asynchronously
-    walletManager.loadWallet(password).then(loadedWallet => {
+    walletManager.loadWallet(pw).then(loadedWallet => {
       setWallet(loadedWallet);
       
       // Load balance in parallel
@@ -3586,6 +3694,11 @@ const WalletScreen = () => {
 
       // Re-encrypt wallet with new password
       await walletManager.storeWallet(walletData, newPassword);
+
+      // Update Keychain if biometric unlock is enabled
+      if (biometricEnabled) {
+        await walletManager.enableBiometricUnlock(newPassword);
+      }
       
       showAlert('Success', 'Password changed successfully!');
       setShowChangePassword(false);
@@ -3594,6 +3707,41 @@ const WalletScreen = () => {
       setConfirmNewPassword('');
     } catch (error) {
       showAlert('Error', 'Failed to change password: ' + error.message);
+    }
+  };
+
+  const handleToggleBiometric = async () => {
+    if (!biometricSupported) {
+      showAlert('Error', t('biometric_unavailable'));
+      return;
+    }
+    if (biometricEnabled) {
+      const ok = await walletManager.disableBiometricUnlock();
+      if (ok) {
+        setBiometricEnabled(false);
+        showAlert('', t('biometric_disabled_msg'));
+      }
+    } else {
+      // Prompt for password to store in Keychain
+      setShowBiometricPasswordPrompt(true);
+    }
+  };
+
+  const handleConfirmBiometricEnable = async () => {
+    const valid = await walletManager.verifyPassword(biometricPassword);
+    if (!valid) {
+      showAlert('Error', t('incorrect_password'));
+      setBiometricPassword('');
+      return;
+    }
+    const ok = await walletManager.enableBiometricUnlock(biometricPassword);
+    setBiometricPassword('');
+    setShowBiometricPasswordPrompt(false);
+    if (ok) {
+      setBiometricEnabled(true);
+      showAlert('', t('biometric_enabled_msg'));
+    } else {
+      showAlert('Error', t('biometric_unavailable'));
     }
   };
 
@@ -3610,6 +3758,8 @@ const WalletScreen = () => {
             try {
               await AsyncStorage.removeItem('qnet_wallet');
               await AsyncStorage.removeItem('qnet_wallet_address');
+              await walletManager.disableBiometricUnlock();
+              setBiometricEnabled(false);
               setWallet(null);
               setHasWallet(false);
               setActivatedNodeType(null);
@@ -4218,6 +4368,12 @@ const WalletScreen = () => {
   }
 
   if (!wallet) {
+    const lockoutSec = Math.ceil(lockoutMs / 1000);
+    const lockoutMin = Math.floor(lockoutSec / 60);
+    const lockoutDisplay = lockoutMin > 0
+      ? `${lockoutMin}m ${lockoutSec % 60}s`
+      : `${lockoutSec}s`;
+
     return (
       <SafeAreaView 
         style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
@@ -4225,26 +4381,47 @@ const WalletScreen = () => {
       >
         <View style={styles.centerContent}>
           <Text style={styles.title}>QNet Wallet</Text>
-          <Text style={styles.subtitle}>Unlock your wallet</Text>
-          
-          <TextInput
-            style={styles.input}
-            placeholder="Enter password"
-            placeholderTextColor="#888"
-            secureTextEntry
-            value={password}
-            onChangeText={setPassword}
-          />
-          
-          <TouchableOpacity 
-            style={styles.button}
-            onPress={unlockWallet}
-            disabled={loading}
-          >
-            <Text style={styles.buttonText}>
-              {loading ? 'Unlocking...' : 'Unlock Wallet'}
-            </Text>
-          </TouchableOpacity>
+          <Text style={styles.subtitle}>{t('unlock_wallet')}</Text>
+
+          {lockoutMs > 0 ? (
+            <View style={styles.lockoutBanner}>
+              <Text style={styles.lockoutText}>
+                {t('wallet_locked')} {lockoutDisplay}
+              </Text>
+            </View>
+          ) : (
+            <>
+              <TextInput
+                style={styles.input}
+                placeholder={t('enter_password')}
+                placeholderTextColor="#888"
+                secureTextEntry
+                value={password}
+                onChangeText={setPassword}
+                onSubmitEditing={unlockWallet}
+                returnKeyType="done"
+              />
+
+              <TouchableOpacity 
+                style={styles.button}
+                onPress={unlockWallet}
+                disabled={loading}
+              >
+                <Text style={styles.buttonText}>
+                  {loading ? 'Unlocking...' : t('unlock_wallet')}
+                </Text>
+              </TouchableOpacity>
+
+              {biometricEnabled && (
+                <TouchableOpacity
+                  style={[styles.button, { backgroundColor: '#1a1a2e', marginTop: 12 }]}
+                  onPress={handleBiometricUnlock}
+                >
+                  <Text style={styles.buttonText}>{t('biometric_unlock')}</Text>
+                </TouchableOpacity>
+              )}
+            </>
+          )}
         </View>
 
         {/* Error Toast */}
@@ -6054,6 +6231,17 @@ const WalletScreen = () => {
                   <Text style={styles.actionButtonText}>{t('change_password')}</Text>
                 </TouchableOpacity>
 
+                {biometricSupported && (
+                  <TouchableOpacity
+                    style={[styles.actionButton, biometricEnabled && { borderColor: '#4caf50', borderWidth: 1 }]}
+                    onPress={handleToggleBiometric}
+                  >
+                    <Text style={styles.actionButtonText}>
+                      {biometricEnabled ? '✓ ' : ''}{t('enable_biometric')}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
                 <TouchableOpacity 
                   style={styles.actionButton}
                   onPress={() => setShowExportSeed(true)}
@@ -6282,6 +6470,39 @@ const WalletScreen = () => {
                 disabled={loading}
               >
                 <Text style={styles.modalButtonText}>{loading ? t('changing') : t('change')}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      )}
+
+      {/* Biometric Enable Password Prompt */}
+      {showBiometricPasswordPrompt && (
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalBox}>
+            <Text style={styles.modalTitle}>{t('enable_biometric')}</Text>
+            <TextInput
+              style={styles.input}
+              placeholder={t('enter_current_password')}
+              placeholderTextColor="#888"
+              secureTextEntry
+              value={biometricPassword}
+              onChangeText={setBiometricPassword}
+              onSubmitEditing={handleConfirmBiometricEnable}
+              returnKeyType="done"
+            />
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={[styles.modalButton, styles.modalButtonSecondary, {flex: 1}]}
+                onPress={() => { setShowBiometricPasswordPrompt(false); setBiometricPassword(''); }}
+              >
+                <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalButton, styles.modalButtonPrimary, {flex: 1}]}
+                onPress={handleConfirmBiometricEnable}
+              >
+                <Text style={styles.modalButtonText}>{t('enable_biometric')}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -8007,6 +8228,22 @@ const styles = StyleSheet.create({
   errorToastText: {
     color: '#ffffff',
     fontSize: 16,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  lockoutBanner: {
+    backgroundColor: '#2a1a1a',
+    borderWidth: 1,
+    borderColor: '#ff4444',
+    borderRadius: 12,
+    paddingVertical: 20,
+    paddingHorizontal: 24,
+    marginTop: 16,
+    alignItems: 'center',
+  },
+  lockoutText: {
+    color: '#ff6b6b',
+    fontSize: 15,
     fontWeight: '600',
     textAlign: 'center',
   },
