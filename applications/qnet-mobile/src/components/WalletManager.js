@@ -1,7 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import CryptoJS from 'crypto-js';
-// Import native crypto for production - falls back to CryptoJS
-import 'react-native-get-random-values'; // Must be imported first
+import 'react-native-get-random-values'; // Must be imported first — polyfills crypto.getRandomValues
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { derivePath } from 'ed25519-hd-key';
 import * as bip39 from 'bip39';
@@ -13,8 +11,7 @@ import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl } 
 export class WalletManager {
   constructor() {
     this.connection = new Connection(getSolanaRpcUrl(true), 'confirmed');
-    this.keyCache = null; // Cache derived key for faster unlock
-    this.keyCachePassword = null; // Track which password the key is for
+    this.keyCache = null; // Cache CryptoKey object (NOT the password) for faster unlock
     
     // BIP39 wordlist (2048 words)
     this.BIP39_WORDLIST = [
@@ -2570,22 +2567,13 @@ export class WalletManager {
       const vaultData = JSON.parse(storedWallet);
       
       // Decrypt to get mnemonic
-      const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
-      const iv = CryptoJS.enc.Hex.parse(vaultData.iv);
-      
-      const key = await this.deriveKeyAsync(password, salt, 10000);
-      
-      const decrypted = CryptoJS.AES.decrypt(
-        vaultData.encrypted,
-        key,
-        {
-          iv: iv,
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7
-        }
-      );
-      
-      const walletData = JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
+      let plaintext;
+      if (vaultData.version === 2) {
+        plaintext = await this._decryptGCM(vaultData, password);
+      } else {
+        plaintext = await this._decryptCBC(vaultData, password);
+      }
+      const walletData = JSON.parse(plaintext);
       return walletData.mnemonic || null;
     } catch (error) {
       return null;
@@ -2600,70 +2588,114 @@ export class WalletManager {
       
       const vaultData = JSON.parse(storedWallet);
       
-      // Handle old format 
-      if (typeof vaultData === 'string' || !vaultData.salt) {
-        // Legacy format - try direct decryption
-        const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
-        try {
-          const decrypted = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
-          if (!decrypted) return false;
-          const wallet = JSON.parse(decrypted);
-          return wallet && wallet.publicKey ? true : false;
-        } catch (error) {
-          return false;
-        }
-      }
-      
-      // New format with salt and IV
-      const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
-      const iv = CryptoJS.enc.Hex.parse(vaultData.iv);
-      
-      // Use cached key if available
-      let key;
-      if (this.keyCachePassword === password && this.keyCache) {
-        key = this.keyCache;
-      } else {
-        // Derive key ASYNCHRONOUSLY using same parameters as storage
-        key = await this.deriveKeyAsync(password, salt, 10000);
-        this.keyCache = key;
-        this.keyCachePassword = password;
-      }
-      
-      // Decrypt
-      const decrypted = CryptoJS.AES.decrypt(
-        vaultData.encrypted,
-        key,
-        {
-          iv: iv,
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7
-        }
-      );
-      
       try {
-        const walletData = JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
-        return walletData && walletData.publicKey ? true : false;
-      } catch (error) {
-        return false; // Wrong password
+        let plaintext;
+        if (typeof vaultData === 'string' || !vaultData.salt) {
+          // Legacy format (no salt) — try CryptoJS direct decrypt
+          const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
+          plaintext = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
+        } else if (vaultData.version === 2) {
+          plaintext = await this._decryptGCM(vaultData, password);
+        } else {
+          plaintext = await this._decryptCBC(vaultData, password);
+        }
+        if (!plaintext) return false;
+        const wallet = JSON.parse(plaintext);
+        return !!(wallet && wallet.publicKey);
+      } catch {
+        return false;
       }
     } catch (error) {
       return false;
     }
   }
 
-  // Async PBKDF2 wrapper to avoid blocking UI
-  async deriveKeyAsync(password, salt, iterations = 10000) {
+  // ---------------------------------------------------------------------------
+  // Secure crypto helpers (Web Crypto API — AES-256-GCM + PBKDF2 100K)
+  // Vault format v2: { version:2, salt, iv, encrypted } — all hex-encoded.
+  // ---------------------------------------------------------------------------
+
+  // Derive AES-GCM-256 CryptoKey from password + hex salt via PBKDF2 (100K).
+  async _deriveKeyNative(password, saltHex) {
+    const enc = new TextEncoder();
+    const salt = this._hexToBytes(saltHex);
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']
+    );
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt, iterations: 100_000, hash: 'SHA-256' },
+      keyMaterial,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  }
+
+  // Encrypt plaintext string → { version, salt, iv, encrypted } (all hex).
+  async _encryptGCM(plaintext, password) {
+    const salt = crypto.getRandomValues(new Uint8Array(32));
+    const iv   = crypto.getRandomValues(new Uint8Array(12));
+    const key  = await this._deriveKeyNative(password, this._bytesToHex(salt));
+    const enc  = new TextEncoder();
+    const cipherBuf = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      enc.encode(plaintext)
+    );
+    return {
+      version:   2,
+      salt:      this._bytesToHex(salt),
+      iv:        this._bytesToHex(iv),
+      encrypted: this._bytesToHex(new Uint8Array(cipherBuf)),
+      timestamp: Date.now(),
+    };
+  }
+
+  // Decrypt vault v2 → plaintext string. Throws on wrong password.
+  async _decryptGCM(vaultData, password) {
+    const key = await this._deriveKeyNative(password, vaultData.salt);
+    const plainBuf = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: this._hexToBytes(vaultData.iv) },
+      key,
+      this._hexToBytes(vaultData.encrypted)
+    );
+    return new TextDecoder().decode(plainBuf);
+  }
+
+  _bytesToHex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  _hexToBytes(hex) {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+    }
+    return bytes;
+  }
+
+  // Legacy PBKDF2 (CryptoJS, kept ONLY to migrate old CBC vaults on first unlock).
+  async _deriveKeyLegacy(password, saltHex) {
+    const salt = CryptoJS.enc.Hex.parse(saltHex);
     return new Promise((resolve) => {
-      // Use setTimeout to avoid blocking the main thread
       setTimeout(() => {
-      const key = CryptoJS.PBKDF2(password, salt, {
-        keySize: 256/32,
-          iterations: iterations,
-        hasher: CryptoJS.algo.SHA256
-      });
-        resolve(key);
+        resolve(CryptoJS.PBKDF2(password, salt, {
+          keySize: 256 / 32, iterations: 10000, hasher: CryptoJS.algo.SHA256
+        }));
       }, 0);
     });
+  }
+
+  // Legacy AES-CBC decrypt (CryptoJS, for migrating old vaults only).
+  async _decryptCBC(vaultData, password) {
+    const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
+    const iv   = CryptoJS.enc.Hex.parse(vaultData.iv);
+    const key  = await this._deriveKeyLegacy(password, vaultData.salt);
+    const dec  = CryptoJS.AES.decrypt(vaultData.encrypted, key,
+      { iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 });
+    const str  = dec.toString(CryptoJS.enc.Utf8);
+    if (!str) throw new Error('Wrong password or corrupted wallet');
+    return str;
   }
 
   // Encrypt and store wallet with PBKDF2 + AES (like extension)
@@ -2693,38 +2725,11 @@ export class WalletManager {
         mnemonic: mnemonic // Will be encrypted below
       };
       
-      // Generate random salt (32 bytes)
-      const salt = CryptoJS.lib.WordArray.random(32);
-      
-      // Derive key using PBKDF2 ASYNCHRONOUSLY (10,000 iterations for security)
-      const key = await this.deriveKeyAsync(password, salt, 10000);
-      
-      // Cache the key for faster subsequent operations
-      this.keyCache = key;
-      this.keyCachePassword = password;
-      
-      // Generate random IV (16 bytes for AES)
-      const iv = CryptoJS.lib.WordArray.random(16);
-      
-      // Encrypt wallet data with mnemonic included
-      const encrypted = CryptoJS.AES.encrypt(
-        JSON.stringify(storageData), 
-        key,
-        { 
-          iv: iv,
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7
-        }
-      );
-      
-      // Store encrypted data with salt and IV
-      const vaultData = {
-        encrypted: encrypted.toString(),
-        salt: salt.toString(),
-        iv: iv.toString(),
-        version: 1,
-        timestamp: Date.now()
-      };
+      // Encrypt wallet data — AES-256-GCM + PBKDF2 100K
+      const vaultData = await this._encryptGCM(JSON.stringify(storageData), password);
+
+      // Cache the CryptoKey (NOT the password) for faster unlock
+      this.keyCache = await this._deriveKeyNative(password, vaultData.salt);
       
       await AsyncStorage.setItem('qnet_wallet', JSON.stringify(vaultData));
       await AsyncStorage.setItem('qnet_wallet_address', walletData.address);
@@ -3148,134 +3153,45 @@ export class WalletManager {
         throw new Error('Wallet data is corrupted. Please create a new wallet or import existing one.');
       }
       
-      // Handle old format (direct encryption without salt/IV)
+      // Decrypt — support all vault versions with auto-migration to v2 (GCM)
+      let plaintext;
       if (typeof vaultData === 'string' || !vaultData.salt) {
-        // Legacy format - try direct decryption
+        // v0: no salt/IV at all — direct CryptoJS password
         const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
-        const decrypted = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
-        if (!decrypted) {
-          throw new Error('Invalid password');
-        }
-        let wallet = JSON.parse(decrypted);
-        
-        // Migrate old QNet address format to new if needed
-        wallet = await this.migrateQNetAddress(wallet);
-        
-        // Store migrated wallet in new format
-        if (wallet.qnetAddress && wallet.qnetAddress.length >= 40) {
-          // Generate salt and IV for new format
-          const salt = CryptoJS.lib.WordArray.random(256/8);
-          const iv = CryptoJS.lib.WordArray.random(128/8);
-          
-          // Derive key ASYNCHRONOUSLY
-          const key = await this.deriveKeyAsync(password, salt, 10000);
-          
-          // Encrypt with new format
-          const updatedEncrypted = CryptoJS.AES.encrypt(
-            JSON.stringify(wallet),
-            key,
-            {
-              iv: iv,
-              mode: CryptoJS.mode.CBC,
-              padding: CryptoJS.pad.Pkcs7
-            }
-          ).toString();
-          
-          const updatedVaultData = {
-            encrypted: updatedEncrypted,
-            salt: salt.toString(CryptoJS.enc.Hex),
-            iv: iv.toString(CryptoJS.enc.Hex)
-          };
-          await AsyncStorage.setItem('qnet_wallet', JSON.stringify(updatedVaultData));
-          
-          // Also update the stored QNet address
-          await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
-        }
-        
-        // Remove mnemonic from memory for security
-        if (wallet.mnemonic) {
-          delete wallet.mnemonic;
-        }
-        return wallet;
-      }
-      
-      // New format with salt and IV
-      const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
-      const iv = CryptoJS.enc.Hex.parse(vaultData.iv);
-      
-      // Use cached key if available
-      let key;
-      if (this.keyCachePassword === password && this.keyCache) {
-        key = this.keyCache;
+        plaintext = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
+        if (!plaintext) throw new Error('Invalid password');
+      } else if (vaultData.version === 2) {
+        // v2: AES-256-GCM + PBKDF2 100K (current)
+        plaintext = await this._decryptGCM(vaultData, password);
       } else {
-        // Derive key ASYNCHRONOUSLY using same parameters as storage
-        key = await this.deriveKeyAsync(password, salt, 10000);
-        this.keyCache = key;
-        this.keyCachePassword = password;
+        // v1: AES-256-CBC + PBKDF2 10K (legacy) — migrate on first unlock
+        plaintext = await this._decryptCBC(vaultData, password);
       }
-      
-      // Decrypt
-      const decrypted = CryptoJS.AES.decrypt(
-        vaultData.encrypted,
-        key,
-        {
-          iv: iv,
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7
+
+      let wallet = JSON.parse(plaintext);
+
+      // Migrate old QNet address format if needed
+      wallet = await this.migrateQNetAddress(wallet);
+
+      // If vault was not v2 yet, re-encrypt with GCM + 100K and cache CryptoKey
+      if (vaultData.version !== 2) {
+        const newVault = await this._encryptGCM(JSON.stringify(wallet), password);
+        await AsyncStorage.setItem('qnet_wallet', JSON.stringify(newVault));
+        this.keyCache = await this._deriveKeyNative(password, newVault.salt);
+      } else {
+        // Cache CryptoKey (not password) for faster subsequent unlocks
+        if (!this.keyCache) {
+          this.keyCache = await this._deriveKeyNative(password, vaultData.salt);
         }
-      );
-      
-      let decryptedStr;
-      try {
-        decryptedStr = decrypted.toString(CryptoJS.enc.Utf8);
-      } catch (utf8Error) {
-        // console.error('UTF-8 decode error, likely wrong password');
-        throw new Error('Wrong password or corrupted wallet');
       }
-      
-      if (!decryptedStr) {
-        throw new Error('Wrong password or corrupted wallet');
+
+      if (wallet.qnetAddress) {
+        await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
       }
-      
-      try {
-        let wallet = JSON.parse(decryptedStr);
-        
-        // Migrate old QNet address format to new if needed
-        wallet = await this.migrateQNetAddress(wallet);
-        
-        // Store migrated wallet if it was updated
-        if (wallet.qnetAddress && wallet.qnetAddress.length >= 40) {
-          // Re-encrypt with migrated data
-          const updatedEncrypted = CryptoJS.AES.encrypt(
-            JSON.stringify(wallet),
-            key,
-            {
-              iv: iv,
-              mode: CryptoJS.mode.CBC,
-              padding: CryptoJS.pad.Pkcs7
-            }
-          ).toString();
-          
-          const updatedVaultData = {
-            encrypted: updatedEncrypted,
-            salt: vaultData.salt,
-            iv: vaultData.iv
-          };
-          await AsyncStorage.setItem('qnet_wallet', JSON.stringify(updatedVaultData));
-          
-          // Also update the stored QNet address
-          await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
-        }
-        
-        // Remove mnemonic from memory for security
-        if (wallet.mnemonic) {
-          delete wallet.mnemonic;
-        }
-        return wallet;
-      } catch (parseError) {
-        // console.error('Failed to parse decrypted data');
-        throw new Error('Wrong password or corrupted wallet');
-      }
+
+      // Remove mnemonic from returned object — caller uses getEncryptedMnemonic() explicitly
+      if (wallet.mnemonic) delete wallet.mnemonic;
+      return wallet;
     } catch (error) {
       // console.error('Error loading wallet:', error);
       throw error;
@@ -4346,26 +4262,12 @@ export class WalletManager {
         walletAddress: metadata.walletAddress || null  // The address used for activation
       }));
       
-      // Generate random salt and IV for this specific code
-      const salt = CryptoJS.lib.WordArray.random(16);
-      const iv = CryptoJS.lib.WordArray.random(16);
-      
-      // Derive key from password ASYNCHRONOUSLY
-      const key = await this.deriveKeyAsync(password, salt, 10000);
-      
-      // Encrypt the activation code
-      const encrypted = CryptoJS.AES.encrypt(code, key, {
-        iv: iv,
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7
-      });
-      
+      // Encrypt the activation code — AES-256-GCM + PBKDF2 100K
+      const codeVault = await this._encryptGCM(code, password);
+
       // Store encrypted code with metadata
       encryptedCodes[nodeType] = {
-        encrypted: encrypted.toString(),
-        salt: salt.toString(),
-        iv: iv.toString(),
-        timestamp: Date.now(),
+        ...codeVault,
         nodeType: nodeType
       };
       
@@ -4393,21 +4295,13 @@ export class WalletManager {
         return null;
       }
       
-      // Parse encryption parameters
-      const salt = CryptoJS.enc.Hex.parse(codeData.salt);
-      const iv = CryptoJS.enc.Hex.parse(codeData.iv);
-      
-      // Derive key from password ASYNCHRONOUSLY
-      const key = await this.deriveKeyAsync(password, salt, 10000);
-      
-      // Decrypt the activation code
-      const decrypted = CryptoJS.AES.decrypt(codeData.encrypted, key, {
-        iv: iv,
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7
-      });
-      
-      const decryptedStr = decrypted.toString(CryptoJS.enc.Utf8);
+      // Decrypt the activation code (v2=GCM, v1=CBC legacy)
+      let decryptedStr;
+      if (codeData.version === 2) {
+        decryptedStr = await this._decryptGCM(codeData, password);
+      } else {
+        decryptedStr = await this._decryptCBC(codeData, password);
+      }
       if (!decryptedStr) {
         throw new Error('Invalid password');
       }
@@ -5041,38 +4935,15 @@ export class WalletManager {
             continue;
           }
           
-          // Check if it's the new format with salt and iv
           if (codeData.salt && codeData.iv && codeData.encrypted) {
             try {
-              // Validate hex strings before parsing
-              if (typeof codeData.salt !== 'string' || typeof codeData.iv !== 'string') {
-                continue;
+              let code;
+              if (codeData.version === 2) {
+                code = await this._decryptGCM(codeData, password);
+              } else {
+                code = await this._decryptCBC(codeData, password);
               }
-              
-              // Parse encryption parameters
-              const salt = CryptoJS.enc.Hex.parse(codeData.salt);
-              const iv = CryptoJS.enc.Hex.parse(codeData.iv);
-              
-              // Check if parsing was successful
-              if (!salt || !iv || !salt.sigBytes || !iv.sigBytes) {
-                continue;
-              }
-              
-              // Derive key from password ASYNCHRONOUSLY
-              const key = await this.deriveKeyAsync(password, salt, 10000);
-              
-              // Decrypt the activation code
-              const decrypted = CryptoJS.AES.decrypt(codeData.encrypted, key, {
-                iv: iv,
-                mode: CryptoJS.mode.CBC,
-                padding: CryptoJS.pad.Pkcs7
-              });
-              
-              const code = decrypted.toString(CryptoJS.enc.Utf8);
               if (code && code.length > 0) {
-                // Validate code format
-                // Mobile can have any node type code - light, full, or super
-                
                 decryptedCodes[nodeType] = {
                   code,
                   timestamp: codeData.timestamp || Date.now()
@@ -5081,8 +4952,6 @@ export class WalletManager {
             } catch (decryptError) {
               // Decryption failed - skip this code
             }
-          } else {
-            // Old format - skip
           }
         } catch (err) {
           // Error processing this code - skip
@@ -6309,34 +6178,22 @@ export class WalletManager {
       
       const vaultData = JSON.parse(vaultDataStr);
       if (!vaultData.encrypted) return false;
-      
-      // Use cached key if password matches
-      let key;
-      if (this.keyCachePassword === password && this.keyCache) {
-        key = this.keyCache;
-      } else {
-        // Derive key ASYNCHRONOUSLY and cache it
-        key = await this.deriveKeyAsync(password, CryptoJS.enc.Hex.parse(vaultData.salt), 10000);
-        this.keyCache = key;
-        this.keyCachePassword = password;
-      }
-      
+
       try {
-        // Try to decrypt - if it fails, password is wrong
-        const decrypted = CryptoJS.AES.decrypt(vaultData.encrypted, key, {
-          iv: CryptoJS.enc.Hex.parse(vaultData.iv),
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7
-        });
-        
-        const decryptedStr = decrypted.toString(CryptoJS.enc.Utf8);
-        // Check if decryption produced valid JSON
-        JSON.parse(decryptedStr);
+        let plaintext;
+        if (vaultData.version === 2) {
+          plaintext = await this._decryptGCM(vaultData, password);
+        } else {
+          plaintext = await this._decryptCBC(vaultData, password);
+        }
+        JSON.parse(plaintext); // validate JSON
+        // Cache CryptoKey (not password) on successful verify
+        if (!this.keyCache) {
+          this.keyCache = await this._deriveKeyNative(password, vaultData.salt);
+        }
         return true;
       } catch {
-        // Clear cache on wrong password
         this.keyCache = null;
-        this.keyCachePassword = null;
         return false;
       }
     } catch (error) {
