@@ -15465,6 +15465,19 @@ impl SimplifiedP2P {
         }
     }
     
+    /// Update push_type + last_seen for a light node (called on token-refresh).
+    pub fn update_light_node_push_type(&self, node_id: &str, push_type_str: &str, timestamp: u64) {
+        let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        if let Some(node) = registry.get_mut(node_id) {
+            node.push_type = match push_type_str {
+                "fcm"         => PushType::FCM,
+                "unifiedpush" => PushType::UnifiedPush,
+                _             => PushType::Polling,
+            };
+            node.last_seen = timestamp;
+        }
+    }
+
     /// Mark Light node as successful (responded to ping)
     /// Resets failure counter and marks as active
     pub fn mark_light_node_ping_success(&self, node_id: &str) {

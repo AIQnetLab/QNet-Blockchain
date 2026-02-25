@@ -27,7 +27,9 @@ import {
   checkNodeStatus, 
   reactivateNode, 
   checkServerNodeStatus,
-  getAllNodesByWallet
+  getAllNodesByWallet,
+  refreshFcmTokenOnServer,
+  isTokenRefreshNeeded,
 } from '../services/PushService';
 import logger from '../utils/logger';
 import { getRandomGenesisNode } from '../config/nodes';
@@ -1531,11 +1533,27 @@ const WalletScreen = () => {
     setReactivatingNode(true);
     try {
       const result = await reactivateNode();
-      
+
       if (result.success) {
-        showAlert('Success', result.wasReactivated ? 
-          'Your node has been reactivated! Next ping scheduled.' : 
+        showAlert('Success', result.wasReactivated ?
+          'Your node has been reactivated! Next ping scheduled.' :
           'Your node is already active.');
+
+        // Refresh FCM token after reactivation (it may have changed while offline)
+        if (wallet && wallet.secretKey) {
+          try {
+            const nacl = require('tweetnacl');
+            const skBytes = wallet.secretKey instanceof Uint8Array
+              ? wallet.secretKey : new Uint8Array(wallet.secretKey);
+            const kp = nacl.sign.keyPair.fromSeed(skBytes.slice(0, 32));
+            const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
+            if (nodeInfoStr) {
+              const ni = JSON.parse(nodeInfoStr);
+              if (ni.nodeId) await refreshFcmTokenOnServer(ni.nodeId, kp.secretKey);
+            }
+          } catch (_) { /* non-critical */ }
+        }
+
         // Reload status
         await loadLightNodeStatus();
       } else {
@@ -2471,46 +2489,58 @@ const WalletScreen = () => {
     checkActivationStatus();
   }, [wallet, password]);
 
-  // Sync activation codes when app comes to foreground (battery-friendly)
+  // Sync activation codes + auto-refresh FCM token on foreground
   useEffect(() => {
     const handleAppStateChange = async (nextAppState) => {
-      // Only sync when coming back to active from background
-      if (nextAppState === 'active' && wallet && wallet.publicKey && password) {
-        try {
-          // Get mnemonic securely from encrypted storage
-          const mnemonic = await walletManager.getEncryptedMnemonic(password);
-          if (!mnemonic) return;
-          
-          // Silent sync in background - no loading indicators
+      if (nextAppState !== 'active' || !wallet || !wallet.publicKey || !password) return;
+
+      // ── 1. Activation code sync ──
+      try {
+        const mnemonic = await walletManager.getEncryptedMnemonic(password);
+        if (mnemonic) {
           const syncedCodes = await walletManager.syncActivationCodes(
             wallet.publicKey,
             mnemonic,
             password
           );
-          
           if (syncedCodes && Object.keys(syncedCodes).length > 0) {
             const nodeType = Object.keys(syncedCodes)[0];
             const codeData = syncedCodes[nodeType];
             const codeStr = typeof codeData === 'string' ? codeData : (codeData?.code || '');
             const isHashOnly = typeof codeStr === 'string' && codeStr.startsWith('HASH:');
             const isPending = codeData?.status === 'pending_activation';
-            
             if (!isHashOnly && !isPending && codeStr) {
-            setActivatedNodeType(nodeType);
+              setActivatedNodeType(nodeType);
               setActivationCode(codeStr);
             }
           }
-        } catch (error) {
-          // Silent fail - don't interrupt user
         }
-      }
+      } catch (_) { /* silent */ }
+
+      // ── 2. FCM token auto-refresh (debounced, lightweight) ──
+      try {
+        const needed = await isTokenRefreshNeeded();
+        if (!needed) return;
+
+        const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
+        if (!nodeInfoStr) return;
+        const nodeInfo = JSON.parse(nodeInfoStr);
+        if (!nodeInfo.nodeId) return;
+
+        // Derive Ed25519 gossip keypair from wallet seed
+        const nacl = require('tweetnacl');
+        const secretKeyBytes = wallet.secretKey instanceof Uint8Array
+          ? wallet.secretKey
+          : new Uint8Array(wallet.secretKey);
+        const privateKeyBytes = secretKeyBytes.slice(0, 32);
+        const kp = nacl.sign.keyPair.fromSeed(privateKeyBytes);
+
+        await refreshFcmTokenOnServer(nodeInfo.nodeId, kp.secretKey);
+      } catch (_) { /* silent — next foreground will retry */ }
     };
 
     const subscription = AppState.addEventListener('change', handleAppStateChange);
-    
-    return () => {
-      subscription.remove();
-    };
+    return () => { subscription.remove(); };
   }, [wallet, password]);
 
   // v3.31: Initialize node discovery + WebSocket + TX history when wallet ready

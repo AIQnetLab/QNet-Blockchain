@@ -150,6 +150,14 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
         nextPingWindow: result.next_ping_window,
       }));
 
+      // Seed last-sent token so refresh logic doesn't fire immediately
+      if (pushProvider.token) {
+        await AsyncStorage.multiSet([
+          ['qnet_last_sent_fcm_token', pushProvider.token],
+          ['qnet_last_token_refresh_ts', String(Math.floor(Date.now() / 1000))],
+        ]);
+      }
+
       // Setup polling if needed
       if (pushProvider.type === PushType.POLLING) {
         await setupPollingService(result.node_id, result.next_ping_time);
@@ -465,6 +473,112 @@ export async function checkNodeStatus() {
   }
 }
 
+// ─── FCM Token Refresh ───────────────────────────────────────────────
+// Lightweight Ed25519-signed token update — works without Dilithium.
+// Called on: AppState→active (if token changed), after reactivation,
+// or when `needsTokenRefresh` flag is set by onTokenRefresh callback.
+// Debounced: max 1 HTTP call per hour. Skips if token is unchanged.
+
+const TOKEN_REFRESH_DEBOUNCE_SEC = 3600; // 1 hour
+
+/**
+ * Refresh FCM token on all genesis nodes (via a single endpoint).
+ * @param {string} nodeId — light-node pseudonym
+ * @param {Uint8Array} ed25519SecretKey64 — 64-byte Ed25519 secret key (seed+pub)
+ * @returns {{ success, updated, reason? }}
+ */
+export async function refreshFcmTokenOnServer(nodeId, ed25519SecretKey64) {
+  try {
+    if (!nodeId || !ed25519SecretKey64) {
+      return { success: false, error: 'missing_params' };
+    }
+
+    const pushProvider = await detectPushProvider();
+    const currentToken = pushProvider.token;
+    if (!currentToken) {
+      return { success: true, updated: false, reason: 'no_fcm_token' };
+    }
+
+    // Skip if token unchanged since last successful refresh
+    const lastSent = await AsyncStorage.getItem('qnet_last_sent_fcm_token');
+    if (lastSent === currentToken) {
+      await AsyncStorage.setItem('qnet_needs_token_refresh', 'false');
+      return { success: true, updated: false, reason: 'unchanged' };
+    }
+
+    // Debounce: max 1 call per hour
+    const lastRefreshStr = await AsyncStorage.getItem('qnet_last_token_refresh_ts');
+    const now = Math.floor(Date.now() / 1000);
+    if (lastRefreshStr && (now - parseInt(lastRefreshStr, 10)) < TOKEN_REFRESH_DEBOUNCE_SEC) {
+      return { success: true, updated: false, reason: 'debounced' };
+    }
+
+    // Ed25519 signature: "token_refresh:{node_id}:{timestamp}"
+    const nacl = require('tweetnacl');
+    const timestamp = now;
+    const message = `token_refresh:${nodeId}:${timestamp}`;
+    const messageBytes = new TextEncoder().encode(message);
+    const sig = nacl.sign.detached(messageBytes, new Uint8Array(ed25519SecretKey64));
+    const signatureHex = Buffer.from(sig).toString('hex');
+
+    const apiUrl = await getRandomBootstrapNodeAsync();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    const response = await fetch(`${apiUrl}/api/v1/light-node/token-refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        node_id: nodeId,
+        device_token: currentToken,
+        push_type: pushProvider.type,
+        endpoint: pushProvider.endpoint || undefined,
+        signature: signatureHex,
+        timestamp,
+      }),
+    });
+    clearTimeout(timeoutId);
+
+    const result = await response.json();
+    if (result.success) {
+      await AsyncStorage.multiSet([
+        ['qnet_last_sent_fcm_token', currentToken],
+        ['qnet_last_token_refresh_ts', String(now)],
+        ['qnet_needs_token_refresh', 'false'],
+      ]);
+      if (result.updated) {
+        console.log('[Push] ✅ FCM token refreshed on server');
+      }
+    }
+    return result;
+  } catch (error) {
+    console.warn('[Push] Token refresh failed:', error.message || error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Check if FCM token refresh is pending (set by onTokenRefresh callback).
+ * Returns true if the stored token differs from the last-sent token,
+ * or if the needsTokenRefresh flag is explicitly set.
+ */
+export async function isTokenRefreshNeeded() {
+  try {
+    const flag = await AsyncStorage.getItem('qnet_needs_token_refresh');
+    if (flag === 'true') return true;
+
+    // Also compare current FCM token with last-sent
+    const lastSent = await AsyncStorage.getItem('qnet_last_sent_fcm_token');
+    if (!lastSent) return true; // never sent — first refresh after registration
+
+    const pushProvider = await detectPushProvider();
+    return pushProvider.token && pushProvider.token !== lastSent;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Reactivate Light node (called when user clicks "I'm back" button)
  * Returns true if reactivation successful
@@ -516,6 +630,9 @@ export async function reactivateNode() {
     const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, passwordHash);
     const signatureStr = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeInfo.nodeId);
 
+    // Include fresh FCM token so server updates all genesis nodes
+    const pushProvider = await detectPushProvider();
+
     const apiUrl = getRandomBootstrapNode();
     const response = await fetch(`${apiUrl}/api/v1/light-node/reactivate`, {
       method: 'POST',
@@ -525,6 +642,8 @@ export async function reactivateNode() {
         wallet_address: nodeInfo.walletAddress,
         signature: signatureStr,
         timestamp: timestamp,
+        device_token: pushProvider.token || undefined,
+        push_type: pushProvider.type,
       }),
     });
 
@@ -753,6 +872,10 @@ export default {
   // Light node status (for mobile ping system)
   checkNodeStatus,
   reactivateNode,
+  
+  // FCM token refresh (automatic, Ed25519-signed)
+  refreshFcmTokenOnServer,
+  isTokenRefreshNeeded,
   
   // Server node status (Super/Genesis - single API call)
   checkServerNodeStatus,

@@ -321,6 +321,13 @@ impl ApiRateLimiter {
             window_seconds: 3600,
             block_duration: 3600,
         });
+
+        // Light node token refresh: 2 requests/hour (FCM token updates are rare)
+        configs.insert("light_node_token_refresh".to_string(), RateLimitConfig {
+            max_requests: 2,
+            window_seconds: 3600,
+            block_duration: 1800,
+        });
         
         // Reward claims: 10 requests/hour
         configs.insert("claim_rewards".to_string(), RateLimitConfig {
@@ -2250,13 +2257,39 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_node_secure_info);
 
+    // Internal genesis-to-genesis FCM token sync (IP-restricted)
+    let internal_fcm_sync = api_v1
+        .and(warp::path("internal"))
+        .and(warp::path("fcm-token-sync"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::addr::remote())
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(handle_internal_fcm_token_sync);
+
+    // Public: lightweight FCM token refresh (Ed25519-signed)
+    let light_node_token_refresh = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("token-refresh"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::addr::remote())
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(|remote_addr: Option<std::net::SocketAddr>, body: TokenRefreshRequest, bc: Arc<BlockchainNode>| async move {
+            handle_light_node_token_refresh(remote_addr, body, bc).await
+        });
+
     let light_node_routes = light_node_register
+        .or(light_node_token_refresh)
         .or(light_node_ping_response)
         .or(light_node_reactivate)
         .or(light_node_status)
         .or(server_node_status)
         .or(light_node_next_ping)
         .or(light_node_pending_challenge)
+        .or(internal_fcm_sync)
         .or(claim_rewards)
         .or(pending_rewards)
         .or(reward_history)
@@ -5809,6 +5842,280 @@ struct LightNodeDevice {
     pub is_active: bool,           // Device status
 }
 
+/// Internal genesis-to-genesis FCM token sync (POST /api/v1/internal/fcm-token-sync)
+/// Only accepted from other genesis node IPs.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct FcmTokenSyncRequest {
+    pseudonym:  String,
+    token:      String,
+    push_type:  String,
+    #[serde(default)]
+    endpoint:   Option<String>,
+    /// Originating genesis node IP — used to avoid echo-back.
+    origin_ip:  String,
+}
+
+/// Fire-and-forget: broadcast a newly-registered FCM token to all peer genesis nodes
+/// so every genesis node can send FCM pings regardless of which one took the registration.
+async fn sync_fcm_token_to_genesis_peers(
+    pseudonym: &str,
+    token:     &str,
+    push_type: &str,
+    endpoint:  Option<&str>,
+    our_ip:    &str,
+) {
+    use crate::genesis_constants::GENESIS_NODE_IPS;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    let body = FcmTokenSyncRequest {
+        pseudonym: pseudonym.to_string(),
+        token:     token.to_string(),
+        push_type: push_type.to_string(),
+        endpoint:  endpoint.map(|s| s.to_string()),
+        origin_ip: our_ip.to_string(),
+    };
+
+    for (ip, _id) in GENESIS_NODE_IPS {
+        // Skip self
+        if *ip == our_ip || ip.is_empty() { continue; }
+
+        let url = format!("http://{}:8001/api/v1/internal/fcm-token-sync", ip);
+        match client.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if crate::node::is_info() {
+                    println!("[INFO][LIGHT] fcm_token_synced_to ip={} pseudonym={}", ip, pseudonym);
+                }
+            }
+            Ok(resp) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] fcm_token_sync_rejected ip={} status={}", ip, resp.status());
+                }
+            }
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] fcm_token_sync_failed ip={} err={}", ip, e);
+                }
+            }
+        }
+    }
+}
+
+/// Handler: POST /api/v1/internal/fcm-token-sync
+/// Accepts only requests from other genesis nodes (IP allowlist check).
+async fn handle_internal_fcm_token_sync(
+    remote_addr: Option<std::net::SocketAddr>,
+    req:         FcmTokenSyncRequest,
+    blockchain:  Arc<BlockchainNode>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    use crate::genesis_constants::GENESIS_NODE_IPS;
+
+    // IP allowlist — only genesis peers may call this
+    let caller_ip = remote_addr
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default();
+    let allowed = GENESIS_NODE_IPS.iter().any(|(ip, _)| *ip == caller_ip)
+        || caller_ip == "127.0.0.1"
+        || caller_ip == "::1";
+
+    if !allowed {
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] fcm_sync_rejected_unauthorized caller={}", caller_ip);
+        }
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"success": false, "error": "Unauthorized"})),
+            warp::http::StatusCode::FORBIDDEN,
+        ));
+    }
+
+    if req.token.is_empty() || req.pseudonym.is_empty() {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"success": false, "error": "Missing fields"})),
+            warp::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    match blockchain.get_storage().save_fcm_token(
+        &req.pseudonym,
+        &req.token,
+        &req.push_type,
+        req.endpoint.as_deref(),
+    ) {
+        Ok(()) => {
+            // Update in-memory push_type so ping service uses FCM immediately
+            // (without waiting for node restart / update_device_tokens_from_storage)
+            if let Some(p2p) = blockchain.get_unified_p2p() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                p2p.update_light_node_push_type(&req.pseudonym, &req.push_type, now);
+            }
+            if crate::node::is_info() {
+                println!("[INFO][LIGHT] fcm_token_synced_from ip={} pseudonym={} push={}",
+                         caller_ip, req.pseudonym, req.push_type);
+            }
+            Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"success": true})),
+                warp::http::StatusCode::OK,
+            ))
+        }
+        Err(e) => {
+            println!("[WARN][LIGHT] fcm_token_sync_save_failed pseudonym={} err={}", req.pseudonym, e);
+            Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"success": false, "error": e.to_string()})),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
+    }
+}
+
+/// Public endpoint: POST /api/v1/light-node/token-refresh
+/// Lightweight FCM token update — no activation code / burn_tx needed.
+/// Ed25519-signed for authentication.
+#[derive(Debug, serde::Deserialize)]
+struct TokenRefreshRequest {
+    node_id:      String,
+    device_token: String,
+    #[serde(default = "default_fcm_str")]
+    push_type:    String,
+    #[serde(default)]
+    endpoint:     Option<String>,
+    signature:    String,   // Ed25519 sign of "token_refresh:{node_id}:{timestamp}"
+    timestamp:    u64,
+}
+fn default_fcm_str() -> String { "fcm".to_string() }
+
+async fn handle_light_node_token_refresh(
+    remote_addr: Option<std::net::SocketAddr>,
+    req:         TokenRefreshRequest,
+    blockchain:  Arc<BlockchainNode>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Rate limit
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "light_node_token_refresh") {
+        return Ok(rate_limit_response);
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    // Timestamp within 5 minutes
+    if now.abs_diff(req.timestamp) > 300 {
+        return Ok(warp::reply::json(&serde_json::json!({
+            "success": false, "error": "Request expired"
+        })));
+    }
+
+    if req.node_id.is_empty() || req.device_token.is_empty() {
+        return Ok(warp::reply::json(&serde_json::json!({
+            "success": false, "error": "node_id and device_token required"
+        })));
+    }
+
+    // Verify node exists and get stored Ed25519 pubkey
+    let stored_pubkey = if let Some(p2p) = blockchain.get_unified_p2p() {
+        let registry = p2p.get_light_node_registry();
+        registry.get(&req.node_id).map(|n| n.ed25519_public_key.clone())
+    } else {
+        None
+    };
+
+    let pubkey_hex = match stored_pubkey {
+        Some(pk) if !pk.is_empty() => pk,
+        _ => {
+            return Ok(warp::reply::json(&serde_json::json!({
+                "success": false, "error": "Node not found or missing Ed25519 key"
+            })));
+        }
+    };
+
+    // Verify Ed25519 signature
+    let message = format!("token_refresh:{}:{}", req.node_id, req.timestamp);
+    let sig_valid = {
+        use ed25519_dalek::{Verifier, VerifyingKey, Signature};
+        let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
+            let pk_bytes = hex::decode(&pubkey_hex)?;
+            let sig_bytes = hex::decode(&req.signature)?;
+            if pk_bytes.len() != 32 || sig_bytes.len() != 64 {
+                return Ok(false);
+            }
+            let vk = VerifyingKey::from_bytes(&pk_bytes.try_into().map_err(|_| "pk len")?)?;
+            let sig = Signature::from_bytes(&sig_bytes.try_into().map_err(|_| "sig len")?);
+            Ok(vk.verify(message.as_bytes(), &sig).is_ok())
+        })();
+        result.unwrap_or(false)
+    };
+
+    if !sig_valid {
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] token_refresh_bad_sig node={}", req.node_id);
+        }
+        return Ok(warp::reply::json(&serde_json::json!({
+            "success": false, "error": "Invalid signature"
+        })));
+    }
+
+    // Deduplicate: skip if token hash is unchanged
+    let existing_hash = blockchain.get_storage()
+        .get_fcm_data(&req.node_id)
+        .map(|(t, _, _)| blake3::hash(t.as_bytes()).to_hex().to_string());
+    let new_hash = blake3::hash(req.device_token.as_bytes()).to_hex().to_string();
+    if existing_hash.as_deref() == Some(new_hash.as_str()) {
+        if crate::node::is_debug() {
+            println!("[DBG][LIGHT] token_refresh_skip node={} reason=unchanged", req.node_id);
+        }
+        return Ok(warp::reply::json(&serde_json::json!({
+            "success": true, "updated": false, "reason": "token_unchanged"
+        })));
+    }
+
+    // Save to RocksDB
+    let pt = match req.push_type.as_str() {
+        "unifiedpush" => "unifiedpush",
+        "polling"     => "polling",
+        _             => "fcm",
+    };
+    if let Err(e) = blockchain.get_storage().save_fcm_token(
+        &req.node_id, &req.device_token, pt, req.endpoint.as_deref(),
+    ) {
+        println!("[WARN][LIGHT] token_refresh_save_failed node={} err={}", req.node_id, e);
+        return Ok(warp::reply::json(&serde_json::json!({
+            "success": false, "error": "Storage error"
+        })));
+    }
+
+    // Update in-memory push_type + last_seen in P2P registry
+    if let Some(p2p) = blockchain.get_unified_p2p() {
+        p2p.update_light_node_push_type(&req.node_id, pt, now);
+    }
+
+    if crate::node::is_info() {
+        println!("[INFO][LIGHT] token_refreshed node={} push={}", req.node_id, pt);
+    }
+
+    // Sync to peer genesis nodes (fire-and-forget)
+    {
+        use crate::genesis_constants::GENESIS_NODE_IPS;
+        let node_id_clone = req.node_id.clone();
+        let token_clone = req.device_token.clone();
+        let pt_clone = pt.to_string();
+        let ep_clone = req.endpoint.clone();
+        let our_ip = {
+            let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+            GENESIS_NODE_IPS.iter().find(|(_, id)| *id == bid)
+                .map(|(ip, _)| ip.to_string()).unwrap_or_default()
+        };
+        tokio::spawn(async move {
+            sync_fcm_token_to_genesis_peers(&node_id_clone, &token_clone, &pt_clone, ep_clone.as_deref(), &our_ip).await;
+        });
+    }
+
+    Ok(warp::reply::json(&serde_json::json!({
+        "success": true, "updated": true
+    })))
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct LightNodeRegisterRequest {
     node_id: String,
@@ -6376,6 +6683,31 @@ async fn handle_light_node_register(
                     if crate::node::is_info() {
                         println!("[INFO][LIGHT] fcm_token_saved pseudonym={} push={}",
                                  light_node_pseudonym, pt_str);
+                    }
+                    // Sync FCM token to all other genesis nodes so any of them can ping.
+                    // Done in a fire-and-forget task — registration must not block on peer sync.
+                    {
+                        use crate::genesis_constants::GENESIS_NODE_IPS;
+                        let pseudonym_clone  = light_node_pseudonym.clone();
+                        let token_clone      = register_request.device_token.clone();
+                        let pt_str_clone     = pt_str.to_string();
+                        let endpoint_clone   = register_request.unified_push_endpoint.clone();
+                        let our_ip: String = {
+                            let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+                            GENESIS_NODE_IPS.iter()
+                                .find(|(_, id)| *id == bid)
+                                .map(|(ip, _)| ip.to_string())
+                                .unwrap_or_default()
+                        };
+                        tokio::spawn(async move {
+                            sync_fcm_token_to_genesis_peers(
+                                &pseudonym_clone,
+                                &token_clone,
+                                &pt_str_clone,
+                                endpoint_clone.as_deref(),
+                                &our_ip,
+                            ).await;
+                        });
                     }
                 }
                 Err(e) => {
@@ -7048,6 +7380,10 @@ struct ReactivateRequest {
     wallet_address: String,
     signature: String,  // Signature of "reactivate:{node_id}:{timestamp}"
     timestamp: u64,
+    #[serde(default)]
+    device_token: Option<String>,
+    #[serde(default)]
+    push_type: Option<String>,
 }
 
 /// Handle Light node reactivation request
@@ -7110,9 +7446,52 @@ async fn handle_light_node_reactivate(
     // Reactivate the node
     if let Some(p2p) = blockchain.get_unified_p2p() {
         p2p.mark_light_node_ping_success(&request.node_id);
-        println!("[LIGHT] 🔄 Node {} manually reactivated by user", request.node_id);
+        if crate::node::is_info() {
+            println!("[INFO][LIGHT] node_reactivated node={}", request.node_id);
+        }
     }
-    
+
+    // Update FCM token if provided (covers token refresh during offline period)
+    if let Some(ref token) = request.device_token {
+        if !token.is_empty() {
+            let pt = request.push_type.as_deref().unwrap_or("fcm");
+            let pt_normalized = match pt {
+                "unifiedpush" => "unifiedpush",
+                "polling"     => "polling",
+                _             => "fcm",
+            };
+            if let Err(e) = blockchain.get_storage().save_fcm_token(
+                &request.node_id, token, pt_normalized, None,
+            ) {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] reactivate_token_save_failed node={} err={}", request.node_id, e);
+                }
+            } else {
+                if let Some(p2p) = blockchain.get_unified_p2p() {
+                    let now_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    p2p.update_light_node_push_type(&request.node_id, pt_normalized, now_ts);
+                }
+                // Sync token to peer genesis nodes
+                let node_id_c = request.node_id.clone();
+                let token_c = token.clone();
+                let pt_c = pt_normalized.to_string();
+                let our_ip = {
+                    use crate::genesis_constants::GENESIS_NODE_IPS;
+                    let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+                    GENESIS_NODE_IPS.iter().find(|(_, id)| *id == bid)
+                        .map(|(ip, _)| ip.to_string()).unwrap_or_default()
+                };
+                tokio::spawn(async move {
+                    sync_fcm_token_to_genesis_peers(&node_id_c, &token_c, &pt_c, None, &our_ip).await;
+                });
+                if crate::node::is_info() {
+                    println!("[INFO][LIGHT] reactivate_token_updated node={} push={}", request.node_id, pt_normalized);
+                }
+            }
+        }
+    }
+
     // Calculate next ping time
     let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&request.node_id);
     
