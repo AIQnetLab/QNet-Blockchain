@@ -222,6 +222,19 @@ export async function verifyDilithium(message, signatureHex, publicKeyHex) {
 }
 
 /**
+ * Generate a raw Dilithium3 keypair from seed (no AES encryption).
+ * Used for ping delegation keys stored in Keychain (hardware-encrypted).
+ * @param {string} seed - Deterministic seed string
+ * @returns {Promise<{publicKey: string, secretKey: string}>} hex-encoded keys
+ */
+export async function generateRawDilithiumKeypair(seed) {
+  if (!DilithiumModule) {
+    throw new Error('DilithiumModule native module not found');
+  }
+  return DilithiumModule.generateKeypairFromSeed(seed);
+}
+
+/**
  * Check if Dilithium3 native module is available on this device.
  */
 export function isDilithiumAvailable() {

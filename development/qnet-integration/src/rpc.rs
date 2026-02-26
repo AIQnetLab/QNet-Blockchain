@@ -1594,13 +1594,22 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_register);
 
-    // Light node ping response endpoint (for mobile background response)
-    let light_node_ping_response = api_v1
+    // Light node ping response endpoint (GET for legacy, POST for Dilithium3 large sigs)
+    let light_node_ping_response_get = api_v1
         .and(warp::path("light-node"))
         .and(warp::path("ping-response"))
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_node_ping_response);
+
+    let light_node_ping_response_post = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("ping-response"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
 
@@ -2283,7 +2292,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
 
     let light_node_routes = light_node_register
         .or(light_node_token_refresh)
-        .or(light_node_ping_response)
+        .or(light_node_ping_response_get)
+        .or(light_node_ping_response_post)
         .or(light_node_reactivate)
         .or(light_node_status)
         .or(server_node_status)
@@ -5602,6 +5612,96 @@ async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: 
         }
     }
     
+    // PING DELEGATION v7.1: Dilithium3 ping key with Dilithium delegation cert
+    // Format: "ping_dilithium:<dilithium_sig>" where inner sig is "dilithium_sig_{nodeId}_{base64}"
+    // Verification:
+    //   1. Load ping_pubkey + ping_delegation_cert from P2P registry
+    //   2. Verify delegation cert: verify_mobile_dilithium_signature(quantum_pubkey, cert, msg)
+    //      where msg = "delegate_ping:{ping_pubkey}:{node_id}"
+    //   3. Verify ping sig: verify_mobile_dilithium_signature(ping_pubkey, inner_sig, challenge)
+    // Full quantum safety for background pings.
+    if signature.starts_with("ping_dilithium:") {
+        let inner_sig = &signature[15..]; // Skip "ping_dilithium:" prefix
+
+        let (ping_pk_hex, delegation_cert, quantum_pk) = if let Some(p2p) = blockchain.get_unified_p2p() {
+            let registry = p2p.get_light_node_registry();
+            if let Some(node) = registry.get(node_id) {
+                (
+                    node.ping_pubkey.clone(),
+                    node.ping_delegation_cert.clone(),
+                    node.quantum_pubkey.clone(),
+                )
+            } else {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] ping_dilithium_node_not_found node={}", node_id);
+                }
+                return false;
+            }
+        } else {
+            return false;
+        };
+
+        if ping_pk_hex.is_empty() || delegation_cert.is_empty() {
+            if crate::node::is_warn() {
+                println!("[WARN][LIGHT] ping_delegation_missing node={} action=reject_ping_dilithium", node_id);
+            }
+            return false;
+        }
+
+        // Step 1: Verify delegation cert (wallet Dilithium3 authorized the ping key)
+        let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, node_id);
+        let delegation_ok = verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &quantum_pk);
+        if !delegation_ok {
+            if crate::node::is_warn() {
+                println!("[WARN][LIGHT] ping_delegation_cert_invalid node={}", node_id);
+            }
+            return false;
+        }
+
+        // Step 2: Verify Dilithium3 ping signature against authorized ping_pubkey
+        let ping_verified = verify_mobile_dilithium_signature(challenge, inner_sig, &ping_pk_hex);
+
+        return if ping_verified {
+            if crate::node::is_info() {
+                println!("[INFO][LIGHT] ping_dilithium_verified node={} (delegation=ok, quantum-safe)", node_id);
+            }
+            true
+        } else {
+            if crate::node::is_warn() {
+                println!("[WARN][LIGHT] ping_dilithium_sig_invalid node={}", node_id);
+            }
+            false
+        };
+    }
+
+    // LEGACY: Ed25519 ping key (v7.0 clients, will be removed after migration)
+    if signature.starts_with("ping_ed25519:") {
+        let sig_hex = &signature[13..];
+
+        let (ping_pk_hex, delegation_cert, quantum_pk) = if let Some(p2p) = blockchain.get_unified_p2p() {
+            let registry = p2p.get_light_node_registry();
+            if let Some(node) = registry.get(node_id) {
+                (node.ping_pubkey.clone(), node.ping_delegation_cert.clone(), node.quantum_pubkey.clone())
+            } else { return false; }
+        } else { return false; };
+
+        if ping_pk_hex.is_empty() || delegation_cert.is_empty() { return false; }
+
+        let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, node_id);
+        if !verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &quantum_pk) { return false; }
+
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
+            let pk_bytes: [u8; 32] = hex::decode(&ping_pk_hex)?.try_into().map_err(|_| "pk len")?;
+            let sig_bytes: [u8; 64] = hex::decode(sig_hex)?.try_into().map_err(|_| "sig len")?;
+            let vk = VerifyingKey::from_bytes(&pk_bytes)?;
+            let sig = Signature::from_bytes(&sig_bytes);
+            Ok(vk.verify(challenge.as_bytes(), &sig).is_ok())
+        })();
+
+        return result.unwrap_or(false);
+    }
+
     // FALLBACK: Accept Ed25519-only during mobile migration period
     // Format: "light_hybrid_pending:<hex>" - temporary until Dilithium library added
     if signature.starts_with("light_hybrid_pending:") {
@@ -6149,6 +6249,14 @@ struct LightNodeRegisterRequest {
     ed25519_gossip_signature: Option<String>,  // 128 hex chars (Ed25519 sig)
     #[serde(default)]
     ed25519_gossip_pubkey: Option<String>,     // 64 hex chars (QNet wallet Ed25519 pubkey)
+    // PING DELEGATION v7.1: Dedicated Dilithium3 ping key for background pings.
+    // ping_pubkey is a separate Dilithium3 pubkey (3904 hex) or legacy Ed25519 (64 hex),
+    // stored in device Keychain (AFTER_FIRST_UNLOCK). ping_delegation_cert is Dilithium3
+    // signature of "delegate_ping:{ping_pubkey}:{node_pseudonym}" by the wallet quantum key.
+    #[serde(default)]
+    ping_pubkey: Option<String>,           // 3904 hex (Dilithium3) or 64 hex (legacy Ed25519)
+    #[serde(default)]
+    ping_delegation_cert: Option<String>,  // Dilithium3 sig of "delegate_ping:{ping_pubkey}:{node_id}"
 }
 
 async fn handle_light_node_register(
@@ -6527,6 +6635,41 @@ async fn handle_light_node_register(
             println!("[INFO][LIGHT] hybrid_gossip_verified pseudonym={} dilithium=ok ed25519=ok",
                 light_node_pseudonym);
         }
+
+        // ── Part 3: Ping Delegation Certificate (optional, v7.1) ──────────────
+        // ping_pubkey may be Ed25519 (64 hex, legacy v7.0) or Dilithium3 (3904 hex, v7.1+).
+        // The delegation cert is always Dilithium3-signed by quantum_pubkey.
+        if let (Some(pp), Some(cert)) = (
+            register_request.ping_pubkey.as_deref().filter(|s| !s.is_empty()),
+            register_request.ping_delegation_cert.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            if pp.len() != 64 && pp.len() != 3904 {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "ping_pubkey must be 64 hex (Ed25519) or 3904 hex (Dilithium3)",
+                })));
+            }
+            let delegation_msg = format!("delegate_ping:{}:{}", pp, light_node_pseudonym);
+            let cert_ok = verify_mobile_dilithium_signature(
+                &delegation_msg,
+                cert,
+                &register_request.quantum_pubkey,
+            );
+            if !cert_ok {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] ping_delegation_invalid pseudonym={}", light_node_pseudonym);
+                }
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Invalid ping delegation certificate (v7.0, Part 3)",
+                    "hint": "Sign 'delegate_ping:{ping_pubkey}:{node_pseudonym}' with Dilithium3 keypair"
+                })));
+            }
+            if crate::node::is_info() {
+                println!("[INFO][LIGHT] ping_delegation_ok pseudonym={} ping_pk={}...",
+                    light_node_pseudonym, &pp[..16.min(pp.len())]);
+            }
+        }
     }
 
     // Hash device token for privacy (GDPR compliance)
@@ -6663,6 +6806,8 @@ async fn handle_light_node_register(
             is_active: true,
             ed25519_signature: register_request.ed25519_gossip_signature.clone().unwrap_or_default(),
             ed25519_public_key: register_request.ed25519_gossip_pubkey.clone().unwrap_or_default(),
+            ping_pubkey: register_request.ping_pubkey.clone().unwrap_or_default(),
+            ping_delegation_cert: register_request.ping_delegation_cert.clone().unwrap_or_default(),
         };
         p2p.register_light_node(registration);
         println!("[INFO][GOSSIP] light_node_gossiped pseudonym={} push={}", light_node_pseudonym, push_type_str);
@@ -7925,7 +8070,12 @@ impl FCMPushService {
         // Get project ID from environment or use default
         let project_id = std::env::var("FCM_PROJECT_ID").unwrap_or_else(|_| "qnet-wallet".to_string());
         
-        // Create FCM message payload (V1 API format)
+        // Create FCM message payload (V1 API format).
+        // IMPORTANT: No top-level "notification" key — this is a data-only (silent) push.
+        // On iOS, if "notification" is present and the app is killed, iOS intercepts the
+        // push and shows a system banner WITHOUT waking the app for background processing.
+        // A silent push (data-only + content-available:1) wakes the app in the background
+        // so didReceiveRemoteNotification fires and JS setBackgroundMessageHandler can run.
         let message_payload = serde_json::json!({
             "message": {
                 "token": device_token,
@@ -7936,24 +8086,17 @@ impl FCMPushService {
                     "quantum_secure": "true",
                     "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().to_string()
                 },
-                "notification": {
-                    "title": "QNet Node Ping",
-                    "body": format!("Your QNet Light node {} requires response", &node_id[..8.min(node_id.len())]),
-                },
                 "android": {
-                    "priority": "high",
-                    "data": {
-                        "click_action": "FLUTTER_NOTIFICATION_CLICK"
-                    }
+                    "priority": "high"
                 },
                 "apns": {
                     "headers": {
-                        "apns-priority": "10"
+                        "apns-priority": "5",
+                        "apns-push-type": "background"
                     },
                     "payload": {
                         "aps": {
-                            "content-available": 1,
-                            "sound": "default"
+                            "content-available": 1
                         }
                     }
                 }
@@ -10267,6 +10410,8 @@ async fn handle_register_node(
                 is_active: true,
                 ed25519_signature: String::new(),
                 ed25519_public_key: String::new(),
+                ping_pubkey: String::new(),
+                ping_delegation_cert: String::new(),
             };
             p2p.register_light_node(registration);
         }

@@ -90,7 +90,7 @@ export async function detectPushProvider() {
 /**
  * Register Light node with detected push provider
  */
-export async function registerLightNode(nodeId, walletAddress, quantumPubkey, quantumSignature, burnTxHash = null, burnAmount = null, burnWallet = null, ed25519Signature = null, signatureTimestamp = null, ed25519GossipSignature = null, ed25519GossipPubkey = null) {
+export async function registerLightNode(nodeId, walletAddress, quantumPubkey, quantumSignature, burnTxHash = null, burnAmount = null, burnWallet = null, ed25519Signature = null, signatureTimestamp = null, ed25519GossipSignature = null, ed25519GossipPubkey = null, pingPubkey = null, pingDelegationCert = null) {
   const pushProvider = await detectPushProvider();
   const apiUrl = await getRandomBootstrapNodeAsync();
 
@@ -122,6 +122,9 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
   }
   registrationData.ed25519_gossip_signature = ed25519GossipSignature;
   registrationData.ed25519_gossip_pubkey = ed25519GossipPubkey;
+  // PING DELEGATION v7.0 (optional — graceful degradation if Keychain unavailable)
+  if (pingPubkey)        registrationData.ping_pubkey = pingPubkey;
+  if (pingDelegationCert) registrationData.ping_delegation_cert = pingDelegationCert;
 
   // Add provider-specific data
   if (pushProvider.type === PushType.FCM) {
@@ -334,51 +337,61 @@ export async function getNextPingTime() {
  */
 export async function respondToChallenge(nodeId, challenge) {
   try {
-    const CryptoJS = require('crypto-js');
+    const Keychain = require('react-native-keychain');
 
-    const passwordHash = await AsyncStorage.getItem('qnet_password_hash');
-    if (!passwordHash) {
-      console.warn('[Push] No password hash');
-      return false;
+    // ── PATH A: Dilithium3 ping delegation key (v7.1) — background-safe ──────
+    // Loads Dilithium3 ping secret key from Keychain (AFTER_FIRST_UNLOCK).
+    // No password needed. Full quantum safety for ping responses.
+    const pingNodeId = nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
+    if (pingNodeId) {
+      try {
+        const keychainEntry = await Keychain.getGenericPassword({
+          service: `qnet_ping_sk_${pingNodeId}`,
+        });
+        if (keychainEntry && keychainEntry.password) {
+          const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+          if (isDilithiumAvailable()) {
+            const pingSkHex = keychainEntry.password;
+            const pingPkHex = await AsyncStorage.getItem(`qnet_ping_dilithium_pk_${pingNodeId}`);
+            if (pingPkHex) {
+              const dilithiumSig = await signWithDilithium(challenge, pingSkHex, pingPkHex, pingNodeId);
+              const formattedSignature = `ping_dilithium:${dilithiumSig}`;
+
+              const apiUrl = await getRandomBootstrapNodeAsync();
+              const response = await fetch(
+                `${apiUrl}/api/v1/light-node/ping-response`,
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    node_id: pingNodeId,
+                    challenge,
+                    signature: formattedSignature,
+                  }),
+                }
+              );
+              const result = await response.json();
+              if (result.success) {
+                console.log('[Push] ✅ Ping response sent (Dilithium3 delegation, quantum-safe)');
+                await getNextPingTime();
+                return true;
+              }
+              console.warn('[Push] Dilithium3 delegation ping rejected:', result.error);
+            }
+          }
+        }
+      } catch (keychainErr) {
+        if (keychainErr.message && !keychainErr.message.includes('no item')) {
+          console.warn('[Push] Keychain unavailable for ping:', keychainErr.message);
+        }
+      }
     }
 
-    // MANDATORY: Dilithium3 signature for ping response
-    const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
-    if (!isDilithiumAvailable()) {
-      console.warn('[Push] Dilithium3 module required for ping');
-      return false;
-    }
-
-    const activationState = await AsyncStorage.getItem('qnet_last_activated_node');
-    const activationCode = activationState ? JSON.parse(activationState).code : null;
-    if (!activationCode) {
-      console.warn('[Push] No activation code found for ping');
-      return false;
-    }
-
-    const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, passwordHash);
-    const formattedSignature = await signWithDilithium(challenge, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
-
-    // Send response
-    const apiUrl = getRandomBootstrapNode();
-    const response = await fetch(
-      `${apiUrl}/api/v1/light-node/ping-response?node_id=${encodeURIComponent(nodeId)}&challenge=${encodeURIComponent(challenge)}&signature=${encodeURIComponent(formattedSignature)}`,
-      { method: 'GET' }
-    );
-
-    const result = await response.json();
-
-    if (result.success) {
-      console.log('[Push] ✅ Ping response sent successfully');
-      
-      // Update next ping time
-      await getNextPingTime();
-      
-      return true;
-    } else {
-      console.warn('[Push] Ping response failed:', result.error);
-      return false;
-    }
+    // PATH A is the only signing path — Keychain ping delegation key (Dilithium3).
+    // No fallback: if Keychain is unavailable the ping is missed and will be retried
+    // on the next ping window. The node is NOT penalised for a single missed ping.
+    console.warn('[Push] Dilithium3 ping key unavailable — ping missed (will retry next window)');
+    return false;
   } catch (error) {
     console.warn('[Push] Error responding to challenge:', error.message || error);
     return false;
@@ -559,6 +572,30 @@ export async function refreshFcmTokenOnServer(nodeId, ed25519SecretKey64) {
 }
 
 /**
+ * Background-safe FCM token refresh (v7.1).
+ * Called from onTokenRefresh — loads Ed25519 gossip key from Keychain
+ * so the refresh works without the wallet being unlocked.
+ */
+export async function backgroundRefreshFcmToken() {
+  try {
+    const Keychain = require('react-native-keychain');
+    const nodeId = await AsyncStorage.getItem('qnet_ping_node_id');
+    if (!nodeId) return;
+
+    const keychainEntry = await Keychain.getGenericPassword({
+      service: `qnet_gossip_sk_${nodeId}`,
+    });
+    if (!keychainEntry || !keychainEntry.password) return;
+
+    const skBytes = new Uint8Array(Buffer.from(keychainEntry.password, 'hex'));
+    await refreshFcmTokenOnServer(nodeId, skBytes);
+    console.log('[Push] ✅ FCM token refreshed in background');
+  } catch (e) {
+    console.warn('[Push] Background token refresh failed (will retry on foreground):', e.message);
+  }
+}
+
+/**
  * Check if FCM token refresh is pending (set by onTokenRefresh callback).
  * Returns true if the stored token differs from the last-sent token,
  * or if the needsTokenRefresh flag is explicitly set.
@@ -585,9 +622,6 @@ export async function isTokenRefreshNeeded() {
  */
 export async function reactivateNode() {
   try {
-    const nacl = require('tweetnacl');
-    const CryptoJS = require('crypto-js');
-
     const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
     if (!nodeInfoStr) {
       console.warn('[Push] No node to reactivate');
@@ -596,39 +630,36 @@ export async function reactivateNode() {
 
     const nodeInfo = JSON.parse(nodeInfoStr);
 
-    // Load wallet for signing
-    const walletDataStr = await AsyncStorage.getItem('qnet_wallet_encrypted');
-    if (!walletDataStr) {
-      return { success: false, error: 'No wallet found' };
-    }
-
-    const passwordHash = await AsyncStorage.getItem('qnet_password_hash');
-    if (!passwordHash) {
-      return { success: false, error: 'Wallet locked' };
-    }
-
-    // Decrypt wallet
-    const decrypted = CryptoJS.AES.decrypt(walletDataStr, passwordHash);
-    const walletData = JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
-
-    // Create reactivation signature with Dilithium3 (ML-DSA-65)
-    const timestamp = Math.floor(Date.now() / 1000);
-    const message = `reactivate:${nodeInfo.nodeId}:${timestamp}`;
-
-    // MANDATORY: Dilithium3 signature — no Ed25519 fallback
-    const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+    // Sign reactivation with the Dilithium3 ping delegation key stored in Keychain
+    // (AFTER_FIRST_UNLOCK — no password required, works when wallet is locked).
+    const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
     if (!isDilithiumAvailable()) {
       return { success: false, error: 'Dilithium3 module required for node reactivation' };
     }
 
-    const activationState = await AsyncStorage.getItem('qnet_last_activated_node');
-    const activationCode = activationState ? JSON.parse(activationState).code : null;
-    if (!activationCode) {
-      return { success: false, error: 'No activation code found for reactivation' };
+    const Keychain = require('react-native-keychain');
+    const pingNodeId = nodeInfo.nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
+    if (!pingNodeId) {
+      return { success: false, error: 'Node ID not found' };
     }
 
-    const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, passwordHash);
-    const signatureStr = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeInfo.nodeId);
+    const keychainEntry = await Keychain.getGenericPassword({
+      service: `qnet_ping_sk_${pingNodeId}`,
+    });
+    if (!keychainEntry || !keychainEntry.password) {
+      return { success: false, error: 'Ping delegation key unavailable — please re-register the node' };
+    }
+
+    const pingSkHex = keychainEntry.password;
+    const pingPkHex = await AsyncStorage.getItem(`qnet_ping_dilithium_pk_${pingNodeId}`);
+    if (!pingPkHex) {
+      return { success: false, error: 'Ping public key not found — please re-register the node' };
+    }
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const message = `reactivate:${pingNodeId}:${timestamp}`;
+    const dilithiumSig = await signWithDilithium(message, pingSkHex, pingPkHex, pingNodeId);
+    const signatureStr = `ping_dilithium:${dilithiumSig}`;
 
     // Include fresh FCM token so server updates all genesis nodes
     const pushProvider = await detectPushProvider();
@@ -876,6 +907,7 @@ export default {
   // FCM token refresh (automatic, Ed25519-signed)
   refreshFcmTokenOnServer,
   isTokenRefreshNeeded,
+  backgroundRefreshFcmToken,
   
   // Server node status (Super/Genesis - single API call)
   checkServerNodeStatus,

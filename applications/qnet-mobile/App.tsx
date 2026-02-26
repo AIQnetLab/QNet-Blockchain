@@ -54,11 +54,8 @@ function App(): React.JSX.Element {
             await handlePushMessage(remoteMessage.data);
           });
 
-          // Handle background/quit messages
-          messaging().setBackgroundMessageHandler(async remoteMessage => {
-            console.log('[FCM] Background message:', remoteMessage);
-            await handlePushMessage(remoteMessage.data);
-          });
+          // Background/quit handler is registered in index.js (top-level, headless-safe).
+          // Only foreground handler and listeners belong here.
 
           // Handle notification opened app
           messaging().onNotificationOpenedApp(remoteMessage => {
@@ -74,12 +71,16 @@ function App(): React.JSX.Element {
               }
             });
 
-          // Token refresh listener — queue refresh for next wallet-unlock
+          // Token refresh listener — immediately push to genesis nodes if possible
           const unsubscribeTokenRefresh = messaging().onTokenRefresh(async (newToken) => {
             console.log('[FCM] Token refreshed');
             const AsyncStorage = require('@react-native-async-storage/async-storage').default;
             await AsyncStorage.setItem('qnet_fcm_token', newToken);
             await AsyncStorage.setItem('qnet_needs_token_refresh', 'true');
+            try {
+              const { backgroundRefreshFcmToken } = require('./src/services/PushService');
+              await backgroundRefreshFcmToken();
+            } catch (_) {}
           });
 
           return () => {

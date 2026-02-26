@@ -10498,6 +10498,15 @@ pub struct LightNodeRegistrationData {
     pub ed25519_signature: String,    // Ed25519 signature (QNet wallet key, 128 hex chars)
     #[serde(default)]
     pub ed25519_public_key: String,   // Ed25519 public key (32 bytes = 64 hex chars)
+
+    // PING DELEGATION v7.1: Dedicated Dilithium3 ping key for background pings.
+    // Allows device to sign ping responses without unlocking the wallet.
+    // ping_pubkey is authorized by wallet Dilithium at registration via delegation_cert.
+    // Full quantum safety: both delegation cert AND ping signature use Dilithium3.
+    #[serde(default)]
+    pub ping_pubkey: String,          // Dilithium3 pubkey (3904 hex) or legacy Ed25519 (64 hex)
+    #[serde(default)]
+    pub ping_delegation_cert: String, // Dilithium sign of "delegate_ping:{ping_pubkey}:{node_id}"
 }
 
 fn default_true() -> bool { true }
@@ -10839,6 +10848,11 @@ pub enum NetworkMessage {
         ed25519_signature: String,    // Ed25519 signature (128 hex chars)
         #[serde(default)]
         ed25519_public_key: String,   // Ed25519 public key (64 hex chars)
+        // PING DELEGATION v7.1
+        #[serde(default)]
+        ping_pubkey: String,          // Dilithium3 ping pubkey (3904 hex) or legacy Ed25519 (64 hex)
+        #[serde(default)]
+        ping_delegation_cert: String, // Dilithium cert authorizing ping_pubkey
     },
     
     /// PRODUCTION: Full/Super node heartbeat for self-attestation
@@ -12174,6 +12188,7 @@ impl SimplifiedP2P {
                 registered_at, signature, gossip_hop, push_type, unified_push_endpoint,
                 last_seen, consecutive_failures, is_active,
                 ed25519_signature, ed25519_public_key,
+                ping_pubkey, ping_delegation_cert,
             } => {
                 self.update_peer_last_seen(from_peer);
                 
@@ -12291,6 +12306,8 @@ impl SimplifiedP2P {
                         is_active,
                         ed25519_signature: ed25519_signature.clone(),
                         ed25519_public_key: ed25519_public_key.clone(),
+                        ping_pubkey: ping_pubkey.clone(),
+                        ping_delegation_cert: ping_delegation_cert.clone(),
                     });
                 }
                 
@@ -12314,6 +12331,8 @@ impl SimplifiedP2P {
                     is_active,
                     ed25519_signature,
                     ed25519_public_key,
+                    ping_pubkey,
+                    ping_delegation_cert,
                 };
                 self.gossip_to_random_peers(forward_msg, 3); // Forward to 3 random peers
             }
@@ -15008,7 +15027,7 @@ impl SimplifiedP2P {
             registry.insert(registration.node_id.clone(), registration.clone());
         }
         
-        // Gossip to network (HYBRID v2.90: includes Ed25519 + Dilithium3)
+        // Gossip to network (HYBRID v2.90 + PING DELEGATION v7.0)
         let msg = NetworkMessage::LightNodeRegistration {
             node_id: registration.node_id,
             wallet_address: registration.wallet_address,
@@ -15024,6 +15043,8 @@ impl SimplifiedP2P {
             is_active: registration.is_active,
             ed25519_signature: registration.ed25519_signature,
             ed25519_public_key: registration.ed25519_public_key,
+            ping_pubkey: registration.ping_pubkey,
+            ping_delegation_cert: registration.ping_delegation_cert,
         };
         
         self.gossip_to_random_peers(msg, 5);
@@ -15045,17 +15066,19 @@ impl SimplifiedP2P {
                 registry.insert(node_id.clone(), LightNodeRegistrationData {
                     node_id,
                     wallet_address,
-                    device_token_hash: String::new(), // Not persisted in blockchain — populated on re-registration
-                    quantum_pubkey: String::new(),    // Re-sent by mobile app on re-registration
+                    device_token_hash: String::new(),
+                    quantum_pubkey: String::new(),
                     registered_at,
-                    signature: String::new(),          // Not needed for restored entries
-                    push_type: PushType::Polling,      // Default for restored — updated on re-registration
+                    signature: String::new(),
+                    push_type: PushType::Polling,
                     unified_push_endpoint: None,
-                    last_seen: registered_at,          // Conservative: last seen = registration time
-                    consecutive_failures: 0,           // Assume healthy until proven otherwise
+                    last_seen: registered_at,
+                    consecutive_failures: 0,
                     is_active: true,
-                    ed25519_signature: String::new(),  // Not persisted — re-gossiped on next registration
-                    ed25519_public_key: String::new(), // Not persisted — re-gossiped on next registration
+                    ed25519_signature: String::new(),
+                    ed25519_public_key: String::new(),
+                    ping_pubkey: String::new(),         // Populated on re-registration
+                    ping_delegation_cert: String::new(),// Populated on re-registration
                 });
                 added += 1;
             }

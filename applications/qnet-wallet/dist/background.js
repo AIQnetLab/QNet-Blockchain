@@ -5274,7 +5274,7 @@ async function encryptActivationCode(code) {
         const salt = crypto.getRandomValues(new Uint8Array(16));
         const iv = crypto.getRandomValues(new Uint8Array(12));
         
-        // Derive key from password
+        // Derive key from password — 600K (OWASP 2024)
         const passwordKey = await crypto.subtle.importKey(
             'raw',
             encoder.encode(walletState.encryptionKey),
@@ -5282,20 +5282,20 @@ async function encryptActivationCode(code) {
             false,
             ['deriveKey']
         );
-        
-            const key = await crypto.subtle.deriveKey(
-                {
-                    name: 'PBKDF2',
-                    salt: salt,
-                    iterations: 100000, // Industry standard for crypto wallets
-                    hash: 'SHA-256'
-                },
-                passwordKey,
-                { name: 'AES-GCM', length: 256 },
-                false,
-                ['encrypt']
-            );
-        
+
+        const key = await crypto.subtle.deriveKey(
+            {
+                name: 'PBKDF2',
+                salt: salt,
+                iterations: 600_000, // OWASP 2024
+                hash: 'SHA-256'
+            },
+            passwordKey,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['encrypt']
+        );
+
         // Encrypt data
         const encrypted = await crypto.subtle.encrypt(
             {
@@ -5305,15 +5305,14 @@ async function encryptActivationCode(code) {
             key,
             data
         );
-        
-        // Combine salt, iv, and encrypted data
+
+        // Combine salt, iv, and encrypted data — prefix "v2:" marks 600K iterations
         const combined = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
         combined.set(salt, 0);
         combined.set(iv, salt.length);
         combined.set(new Uint8Array(encrypted), salt.length + iv.length);
-        
-        // Convert to base64 for storage
-        return btoa(String.fromCharCode(...combined));
+
+        return 'v2:' + btoa(String.fromCharCode(...combined));
     } catch (error) {
                 // console.error('[Encrypt Code] Error:', error);
         throw new Error('Failed to encrypt activation code');
@@ -5329,14 +5328,25 @@ async function decryptActivationCode(encryptedCode) {
             throw new Error('No encryption key available');
         }
         
+        // Detect version: "v2:" prefix = 600K iterations; no prefix = legacy 100K
+        let iterations;
+        let rawBase64;
+        if (encryptedCode.startsWith('v2:')) {
+            iterations = 600_000; // OWASP 2024
+            rawBase64 = encryptedCode.slice(3);
+        } else {
+            iterations = 100_000; // Legacy — decrypt only, re-encrypted as v2 on next write
+            rawBase64 = encryptedCode;
+        }
+
         // Decode from base64
-        const combined = Uint8Array.from(atob(encryptedCode), c => c.charCodeAt(0));
-        
+        const combined = Uint8Array.from(atob(rawBase64), c => c.charCodeAt(0));
+
         // Extract salt, iv, and encrypted data
         const salt = combined.slice(0, 16);
         const iv = combined.slice(16, 28);
         const encrypted = combined.slice(28);
-        
+
         // Derive key from password
         const encoder = new TextEncoder();
         const passwordKey = await crypto.subtle.importKey(
@@ -5346,12 +5356,12 @@ async function decryptActivationCode(encryptedCode) {
             false,
             ['deriveKey']
         );
-        
+
         const key = await crypto.subtle.deriveKey(
             {
                 name: 'PBKDF2',
                 salt: salt,
-                iterations: 100000, // Industry standard for crypto wallets
+                iterations,
                 hash: 'SHA-256'
             },
             passwordKey,

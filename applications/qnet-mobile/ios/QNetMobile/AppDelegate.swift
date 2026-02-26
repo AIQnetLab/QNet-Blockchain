@@ -59,13 +59,27 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     print("[FCM] Token: \(fcmToken ?? "nil")")
     // Token will be handled by React Native Firebase SDK
   }
-  
-  // Handle remote notifications
+
+  // Handle APNs device token — required for FCM to work on iOS
   func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
     Messaging.messaging().apnsToken = deviceToken
   }
-  
-  // Handle foreground notifications
+
+  // Background/silent push handler — CRITICAL for ping responses when app is killed.
+  // iOS requires this native method to exist AND call completionHandler(.newData)
+  // to grant ~30 seconds of background execution time.
+  // Messaging.appDidReceiveMessage lets Firebase decode the APNs→FCM mapping and
+  // then invoke the JS setBackgroundMessageHandler registered in index.js.
+  func application(
+    _ application: UIApplication,
+    didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+    fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+  ) {
+    Messaging.messaging().appDidReceiveMessage(userInfo)
+    completionHandler(.newData)
+  }
+
+  // Handle foreground notifications (show banner while app is open)
   func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
     completionHandler([.banner, .badge, .sound])
   }

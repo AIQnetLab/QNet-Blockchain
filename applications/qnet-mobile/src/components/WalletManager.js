@@ -3242,20 +3242,18 @@ export class WalletManager {
         throw new Error('Wallet data is corrupted. Please create a new wallet or import existing one.');
       }
       
-      // Decrypt — support all vault versions with auto-migration to v3 (GCM 600K)
+      // Decrypt — support vault v1/v2/v3 with auto-migration to v3 (GCM 600K).
+      // v0 (no salt, direct CryptoJS) was removed — those wallets are too old to exist in production.
       let plaintext;
-      if (typeof vaultData === 'string' || !vaultData.salt) {
-        // v0: no salt/IV — direct CryptoJS password (very old)
-        const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
-        plaintext = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
-        if (!plaintext) throw new Error('Invalid password');
-      } else if (vaultData.version === 3 || vaultData.version === 2) {
+      if (vaultData.version === 3 || vaultData.version === 2) {
         // v3: AES-256-GCM + PBKDF2 600K (current)
         // v2: AES-256-GCM + PBKDF2 100K (legacy, auto-migrates to v3)
         plaintext = await this._decryptGCM(vaultData, password);
-      } else {
+      } else if (vaultData.salt) {
         // v1: AES-256-CBC + PBKDF2 10K (legacy) — migrate on first unlock
         plaintext = await this._decryptCBC(vaultData, password);
+      } else {
+        throw new Error('Unsupported wallet format. Please re-import using your recovery phrase.');
       }
 
       let wallet = JSON.parse(plaintext);
@@ -5596,7 +5594,73 @@ export class WalletManager {
             const sig = nacl.sign.detached(new TextEncoder().encode(gossipMsg), fullSk);
             ed25519GossipSignature = Buffer.from(sig).toString('hex');
             console.log('[Registration] Ed25519 gossip signature created (hybrid v6.1)');
+
+            // v7.1: Store ed25519 gossip key in Keychain for background FCM token refresh
+            try {
+              const KeychainGossip = require('react-native-keychain');
+              await KeychainGossip.setGenericPassword(
+                `gossip_key_${systemPseudonym}`,
+                Buffer.from(fullSk).toString('hex'),
+                {
+                  service: `qnet_gossip_sk_${systemPseudonym}`,
+                  accessible: KeychainGossip.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+                }
+              );
+            } catch (_) {}
           }
+
+          // ── PING DELEGATION v7.1: Dilithium3 (full quantum safety) ──────
+          // Dedicated Dilithium3 ping keypair stored in Keychain (hardware-encrypted).
+          // The wallet Dilithium key signs a delegation cert authorizing the ping key.
+          // Background FCM handler signs with ping key — wallet key stays encrypted.
+          let pingPubkeyHex = null;
+          let pingDelegationCert = null;
+          try {
+            const Keychain = require('react-native-keychain');
+            const { generateRawDilithiumKeypair } = require('../crypto/DilithiumCrypto');
+
+            const existingPingSk = await Keychain.getGenericPassword({
+              service: `qnet_ping_sk_${systemPseudonym}`,
+            });
+            const existingPingPk = await AsyncStorage.getItem(`qnet_ping_dilithium_pk_${systemPseudonym}`);
+
+            if (existingPingSk && existingPingSk.password
+                && existingPingPk && existingPingPk.length === 3904) {
+              pingPubkeyHex = existingPingPk;
+              console.log('[Registration] Reusing existing Dilithium3 ping keypair');
+            } else {
+              const randomBytes = crypto.getRandomValues(new Uint8Array(32));
+              const pingSeed = `QNET_PING_${Buffer.from(randomBytes).toString('hex')}`;
+              const pingKp = await generateRawDilithiumKeypair(pingSeed);
+              pingPubkeyHex = pingKp.publicKey;
+
+              await Keychain.setGenericPassword(
+                `ping_key_${systemPseudonym}`,
+                pingKp.secretKey,
+                {
+                  service: `qnet_ping_sk_${systemPseudonym}`,
+                  accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+                }
+              );
+              await AsyncStorage.setItem(`qnet_ping_dilithium_pk_${systemPseudonym}`, pingPubkeyHex);
+              console.log('[Registration] Dilithium3 ping keypair generated and stored');
+            }
+
+            const delegationMsg = `delegate_ping:${pingPubkeyHex}:${systemPseudonym}`;
+            pingDelegationCert = await signWithDilithium(
+              delegationMsg,
+              dilithiumKeys.secretKey,
+              dilithiumKeys.publicKey,
+              systemPseudonym,
+            );
+            await AsyncStorage.setItem('qnet_ping_node_id', systemPseudonym);
+            console.log('[Registration] Ping delegation cert created (quantum-safe)');
+          } catch (pingErr) {
+            console.warn('[Registration] Ping delegation setup failed (non-fatal):', pingErr.message);
+            pingPubkeyHex = null;
+            pingDelegationCert = null;
+          }
+          // ── END PING DELEGATION ─────────────────────────────────────────
 
           // v4.3: Get burn TX data for STATELESS code ownership verification
           // Node needs burn_tx_hash + burn_amount to reconstruct XOR key and verify
@@ -5691,7 +5755,9 @@ export class WalletManager {
             ed25519Signature,
             signatureTimestamp,
             ed25519GossipSignature,   // HYBRID v2.90: gossip Ed25519 sig
-            ed25519GossipPubkey       // HYBRID v2.90: gossip Ed25519 pubkey
+            ed25519GossipPubkey,      // HYBRID v2.90: gossip Ed25519 pubkey
+            pingPubkeyHex,            // PING DELEGATION v7.0: ping hot key pubkey
+            pingDelegationCert,       // PING DELEGATION v7.0: Dilithium cert
           );
           quantumSecured = true;
 
@@ -6272,13 +6338,12 @@ export class WalletManager {
       const vaultData = JSON.parse(vaultDataStr);
       try {
         let plaintext;
-        if (typeof vaultData === 'string' || !vaultData.salt) {
-          const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
-          plaintext = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
-        } else if (vaultData.version === 3 || vaultData.version === 2) {
+        if (vaultData.version === 3 || vaultData.version === 2) {
           plaintext = await this._decryptGCM(vaultData, password);
-        } else {
+        } else if (vaultData.salt) {
           plaintext = await this._decryptCBC(vaultData, password);
+        } else {
+          throw new Error('Unsupported vault format');
         }
         JSON.parse(plaintext);
         if (!this.keyCache && vaultData.salt) {
