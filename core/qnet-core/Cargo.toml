@@ -25,7 +25,7 @@ hex = "0.4.3"
 
 # Post-quantum cryptography - production ready with latest versions
 pqcrypto = "0.18"
-pqcrypto-dilithium = "0.5"
+pqcrypto-mldsa = "0.1"
 pqcrypto-kyber = "0.7"
 pqcrypto-falcon = "0.3"
 pqcrypto-sphincsplus = "0.7"

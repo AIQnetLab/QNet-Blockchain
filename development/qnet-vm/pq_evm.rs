@@ -1,11 +1,11 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use sha3::{Digest, Keccak256};
 use serde::{Deserialize, Serialize};
 
 // Post-Quantum Cryptography imports
 // Using CRYSTALS-Dilithium for signatures and CRYSTALS-KYBER for encryption
-use pqcrypto_dilithium::dilithium5;
+use pqcrypto_mldsa::mldsa87 as dilithium5;
 use pqcrypto_kyber::kyber1024;
 use pqcrypto_traits::sign::{PublicKey, SecretKey, SignedMessage};
 use pqcrypto_traits::kem::{Ciphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey, SharedSecret};

@@ -1,4 +1,4 @@
-﻿//! Production-ready post-quantum cryptography implementation
+//! Production-ready post-quantum cryptography implementation
 //! 
 //! This module implements Dilithium, Kyber, Falcon, and SPHINCS+ algorithms
 //! for quantum-resistant signatures and key exchange.
@@ -12,9 +12,9 @@ use sha3::{Sha3_256, Sha3_512, Digest};
 
 // Post-quantum cryptography imports with traits
 use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SecretKey as PQSecretKey, DetachedSignature as PQDetachedSignature, SignedMessage as PQSignedMessage};
-use pqcrypto_dilithium::dilithium2;
-use pqcrypto_dilithium::dilithium3;
-use pqcrypto_dilithium::dilithium5;
+use pqcrypto_mldsa::mldsa44 as dilithium2;
+use pqcrypto_mldsa::mldsa65 as dilithium3;
+use pqcrypto_mldsa::mldsa87 as dilithium5;
 use pqcrypto_kyber::kyber512;
 use pqcrypto_kyber::kyber768;
 use pqcrypto_kyber::kyber1024;
@@ -305,7 +305,7 @@ impl ProductionCrypto {
                 })?;
                 
                 match dilithium2::open(&signed_message, &public_key) {
-                    Ok(recovered_message) => Ok(recovered_message == message_hash),
+                    Ok(recovered_message) => Ok(ct_eq_open(&recovered_message, message_hash)),
                     Err(_) => Ok(false),
                 }
             }
@@ -325,7 +325,7 @@ impl ProductionCrypto {
                 })?;
                 
                 match dilithium3::open(&signed_message, &public_key) {
-                    Ok(recovered_message) => Ok(recovered_message == message_hash),
+                    Ok(recovered_message) => Ok(ct_eq_open(&recovered_message, message_hash)),
                     Err(_) => Ok(false),
                 }
             }
@@ -345,7 +345,7 @@ impl ProductionCrypto {
                 })?;
                 
                 match dilithium5::open(&signed_message, &public_key) {
-                    Ok(recovered_message) => Ok(recovered_message == message_hash),
+                    Ok(recovered_message) => Ok(ct_eq_open(&recovered_message, message_hash)),
                     Err(_) => Ok(false),
                 }
             }
@@ -464,7 +464,7 @@ impl ProductionCrypto {
                 })?;
                 
                 match sphincssha2128ssimple::open(&signed_message, &public_key) {
-                    Ok(recovered_message) => Ok(recovered_message == message_hash),
+                    Ok(recovered_message) => Ok(ct_eq_open(&recovered_message, message_hash)),
                     Err(_) => Ok(false),
                 }
             }
@@ -484,7 +484,7 @@ impl ProductionCrypto {
                 })?;
                 
                 match sphincssha2128fsimple::open(&signed_message, &public_key) {
-                    Ok(recovered_message) => Ok(recovered_message == message_hash),
+                    Ok(recovered_message) => Ok(ct_eq_open(&recovered_message, message_hash)),
                     Err(_) => Ok(false),
                 }
             }
@@ -504,7 +504,7 @@ impl ProductionCrypto {
                 })?;
                 
                 match sphincssha2192ssimple::open(&signed_message, &public_key) {
-                    Ok(recovered_message) => Ok(recovered_message == message_hash),
+                    Ok(recovered_message) => Ok(ct_eq_open(&recovered_message, message_hash)),
                     Err(_) => Ok(false),
                 }
             }
@@ -585,5 +585,14 @@ pub fn default_sphincs_params() -> SphincsParams {
         private_key_size: sphincssha2128ssimple::secret_key_bytes(),
         signature_size: sphincssha2128ssimple::signature_bytes(),
     }
+}
+
+/// Constant-time byte slice comparison — prevents timing side-channel attacks.
+#[inline(never)]
+fn ct_eq_open(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) { diff |= x ^ y; }
+    std::hint::black_box(diff) == 0
 }
 

@@ -1777,7 +1777,7 @@ impl BlockchainNode {
     /// For runtime TXs: use fixed_timestamp=None for current time
     /// 
     /// v3.35: api_endpoint parameter:
-    /// - Super/Genesis: pass public IP (e.g., "http://1.2.3.4:8001") or empty "" to hide
+    /// - Super/Genesis: pass public URL (e.g., "https://1.2.3.4:8001") or empty "" to hide
     /// - Light: MUST be empty "" (mobile privacy protection)
     pub fn create_node_registration_tx_with_timestamp(
         node_id: &str,
@@ -2145,7 +2145,7 @@ impl BlockchainNode {
             // v3.35: Genesis nodes are ALWAYS public - get IP from constants
             let api_endpoint = crate::genesis_constants::GENESIS_NODE_IPS.iter()
                 .find(|(_, id)| *id == *bootstrap_id)
-                .map(|(ip, _)| format!("http://{}:8001", ip))
+                .map(|(ip, _)| format!("https://{}:8001", ip))
                 .unwrap_or_default();
             
             let tx = Self::create_node_registration_tx_with_timestamp(
@@ -14275,7 +14275,7 @@ impl BlockchainNode {
                     // slot_seed = SHA3-256(prev_hash || block_height)
                     // VRF(wallet_sk, slot_seed) → (output, proof)
                     // output: 32-byte pseudorandom (QRB + leader election)
-                    // proof: ~3293-byte Dilithium3 detached signature (verifiable)
+                    // proof: ~3309-byte ML-DSA-65 detached signature (verifiable)
                     // ═══════════════════════════════════════════════════════════════════
                     let (qrb_output, qrb_proof) = {
                         let vrf = Self::get_vrf_static();
@@ -17654,7 +17654,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // PRODUCTION: Create registry instance with real QNet blockchain endpoints
         let qnet_rpc = std::env::var("QNET_RPC_URL")
             .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             
         // PRODUCTION v2.50: Lock-free storage access
@@ -20271,7 +20271,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     // v4.0: PRODUCTION — Pure Dilithium3 Block Signing
     // No HybridCrypto, no Ed25519, no certificates
     // Uses WalletIdentity from QNET_WALLET_SEED (detached_sign)
-    // Signature: ~3293 bytes (Dilithium3 NIST FIPS 204 Level 3)
+    // Signature: ~3309 bytes (ML-DSA-65 NIST FIPS 204 Level 3)
     // ═══════════════════════════════════════════════════════════════════
     async fn sign_microblock_with_dilithium(
         microblock: &qnet_state::MicroBlock,
@@ -20307,7 +20307,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let sk_bytes = vrf_ref.get_secret_key_bytes()
             .ok_or("[ERR][SIGN] VRF secret key not available")?;
         
-        use pqcrypto_dilithium::dilithium3;
+        use pqcrypto_mldsa::mldsa65 as dilithium3;
         use pqcrypto_traits::sign::{
             SecretKey as SkTrait,
             DetachedSignature as SigTrait,
@@ -20414,7 +20414,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let msg_hash = hasher2.finalize();
 
             // Verify Dilithium3 detached signature
-            use pqcrypto_dilithium::dilithium3;
+            use pqcrypto_mldsa::mldsa65 as dilithium3;
             use pqcrypto_traits::sign::{
                 PublicKey as PkTrait,
                 DetachedSignature as SigTrait2,
@@ -20621,7 +20621,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 // ═══════════════════════════════════════════════════════════════════
                 // v4.0: Dilithium3-VRF proof verification (replaces HybridCrypto cert)
-                // vrf_proof contains Dilithium3 detached signature (~3293 bytes)
+                // vrf_proof contains ML-DSA-65 detached signature (~3309 bytes)
                 // Verified against producer's registered VRF public key
                 // ═══════════════════════════════════════════════════════════════════
                 
@@ -24529,9 +24529,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // Try multiple geolocation services for reliability
         let geolocation_services = vec![
-            format!("http://ip-api.com/json/{}", ip),
+            format!("https://ip-api.com/json/{}", ip),
             format!("https://ipapi.co/{}/json/", ip),
-            format!("http://api.ipstack.com/{}?access_key=free", ip),
+            format!("https://api.ipstack.com/{}?access_key=free", ip),
         ];
         
         for service_url in geolocation_services {
@@ -24676,7 +24676,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // PRODUCTION: Initialize blockchain registry with real QNet nodes
         let qnet_rpc = std::env::var("QNET_RPC_URL")
             .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         
         if is_genesis_code {
@@ -24931,7 +24931,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         .unwrap_or_default();
                     
                     if !public_ip.is_empty() {
-                        format!("http://{}:8001", public_ip)
+                        format!("https://{}:8001", public_ip)
                     } else {
                         // No IP detected - node won't serve mobile apps
                         String::new()
@@ -24975,7 +24975,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let device_sig = self.get_device_signature();
             let genesis_url = std::env::var("QNET_RPC_URL")
                 .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                    .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+                    .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             
             let node_id_for_log = self.node_id.clone();
@@ -25214,7 +25214,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Build the genesis node API URL
         let genesis_api = std::env::var("QNET_RPC_URL")
             .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         
         // Query genesis node's RocksDB via REST API for the current device_id of our node
@@ -25293,7 +25293,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             .arg("3")
             .arg("--connect-timeout")
             .arg("3")
-            .arg("http://ip-api.com/json/?fields=continent")
+            .arg("https://ip-api.com/json/?fields=continent")
             .output()
             .await
         {
@@ -25520,7 +25520,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             .arg("-s")
             .arg("--max-time")
             .arg("3")
-            .arg("http://checkip.amazonaws.com")
+            .arg("https://checkip.amazonaws.com")
             .output()
             .await
         {

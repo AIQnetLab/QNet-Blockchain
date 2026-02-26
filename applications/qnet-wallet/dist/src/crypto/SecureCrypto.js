@@ -146,12 +146,12 @@ export class SecureCrypto {
             ['deriveKey']
         );
         
-        // Derive key with 250,000 iterations (stronger than before)
+        // Derive key with PBKDF2
         const key = await crypto.subtle.deriveKey(
             {
                 name: 'PBKDF2',
                 salt: salt,
-                iterations: 250000, // Increased from 100,000
+                iterations: 600_000, // OWASP 2024 (600K)
                 hash: 'SHA-256'
             },
             keyMaterial,
@@ -189,7 +189,7 @@ export class SecureCrypto {
                 {
                     name: 'PBKDF2',
                     salt: salt,
-                    iterations: 250000, // High iteration count for security
+                    iterations: 600_000, // OWASP 2024 (600K)
                     hash: 'SHA-256'
                 },
                 keyMaterial,
@@ -256,7 +256,7 @@ export class SecureCrypto {
                 {
                     name: 'PBKDF2',
                     salt: salt,
-                    iterations: 250000,
+                    iterations: 600_000, // OWASP 2024 (600K)
                     hash: 'SHA-256'
                 },
                 keyMaterial,

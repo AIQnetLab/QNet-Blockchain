@@ -1,21 +1,42 @@
 #!/usr/bin/env python3
 """
-Dilithium3 Post-Quantum Digital Signature Implementation
-NIST Level 3 Security (192-bit equivalent)
-Production-ready implementation for QNet blockchain
+DEPRECATED — DEVELOPMENT/TESTING ONLY — NOT FOR PRODUCTION USE
+================================================================
+This module contains a Python-only Dilithium3 approximation with REDUCED
+parameters (N=128, K=3, L=3 instead of N=256, K=6, L=5). It is NOT
+compatible with PQClean or pqcrypto-mldsa. Signatures produced here CANNOT
+be verified by the Rust node, Android, or iOS clients.
+
+Production QNet node (development/qnet-integration) uses:
+    pqcrypto_mldsa::mldsa65 (pqcrypto-mldsa 0.1, FIPS 204)
+    PK=1952 bytes, SK=4032 bytes, SIG=3309 bytes
+
+This file is retained only as a reference and MUST NOT be imported or used
+in production paths. Any import of this module in production code is a bug.
+================================================================
 """
 
 import hashlib
 import secrets
 import struct
+import warnings
 from typing import Tuple, Optional
+
+# Emit a runtime warning if this module is imported anywhere
+warnings.warn(
+    "dilithium.py is a DEPRECATED simulation — NOT cryptographically secure. "
+    "Production code must use the Rust pqcrypto-mldsa implementation.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 class Dilithium3:
     """
-    Dilithium3 post-quantum digital signature scheme
-    Based on NIST standardized algorithm
+    DEPRECATED: Python approximation of Dilithium3 with reduced parameters.
+    NOT compatible with PQClean or any standard implementation.
+    DO NOT USE IN PRODUCTION.
     """
-    
+
     # Dilithium3 parameters
     Q = 8380417  # Prime modulus
     N = 256      # Polynomial degree
@@ -27,11 +48,11 @@ class Dilithium3:
     GAMMA1 = (Q - 1) // 88
     GAMMA2 = GAMMA1 // 2
     OMEGA = 80   # Bound for number of 1's in hint
-    
-    # Key and signature sizes
-    PUBLIC_KEY_SIZE = 1952   # bytes
-    PRIVATE_KEY_SIZE = 4000  # bytes
-    SIGNATURE_SIZE = 3293    # bytes
+
+    # Correct PQClean / pqcrypto-mldsa sizes for reference — NOT what this class produces
+    PUBLIC_KEY_SIZE = 1952   # bytes  (correct)
+    PRIVATE_KEY_SIZE = 4032  # bytes  (was 4000 — incorrect)
+    SIGNATURE_SIZE = 3309    # bytes  (was 3293 — incorrect)
     
     def __init__(self):
         """Initialize Dilithium3 instance"""
@@ -39,13 +60,13 @@ class Dilithium3:
         
     def generate_keypair(self) -> Tuple[bytes, bytes]:
         """
-        Generate Dilithium3 key pair - MOBILE OPTIMIZED VERSION
-        Target: <50ms for mobile devices
+        DEPRECATED SIMULATION: generates a keypair with REDUCED parameters.
+        NOT compatible with PQClean Dilithium3 or pqcrypto-mldsa.
         """
-        # OPTIMIZATION: Use smaller parameters for mobile
-        mobile_n = 128  # Reduced from 256
-        mobile_k = 3    # Reduced from 6  
-        mobile_l = 3    # Reduced from 5
+        # SIMULATION: reduced parameters — NOT production Dilithium3
+        mobile_n = 128  # Reduced from 256 — INCOMPATIBLE with standard
+        mobile_k = 3    # Reduced from 6   — INCOMPATIBLE with standard
+        mobile_l = 3    # Reduced from 5   — INCOMPATIBLE with standard
         
         # Generate random seed
         seed = secrets.token_bytes(32)

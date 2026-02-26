@@ -390,7 +390,7 @@ pub struct Transaction {
     
     /// QUANTUM v2.25: Optional CRYSTALS-Dilithium3 signature for post-quantum security
     /// When present: TX is quantum-resistant + 50% higher gas cost
-    /// Format: hex-encoded Dilithium signature (~3293 bytes = 6586 hex chars)
+    /// Format: hex-encoded ML-DSA-65 signature (~3309 bytes = 6618 hex chars)
     /// Use case: High-value transfers, enterprise, paranoid users
     /// NOTE: No skip_serializing_if - bincode requires all fields to be serialized
     #[serde(default)]

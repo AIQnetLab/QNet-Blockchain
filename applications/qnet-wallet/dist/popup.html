@@ -866,7 +866,11 @@
 
     <!-- Load production version with working interface -->
     <script src="lib/crypto-js.min.js"></script>
+    <!-- Post-quantum cryptography: ML-DSA-65 (NIST FIPS 204 / Dilithium3) -->
+    <!-- noble-pq-ml-dsa.js sets window.QNetDilithiumLib; must load before DilithiumManager -->
+    <script src="lib/noble-pq-ml-dsa.js"></script>
     <script src="src/crypto/Ed25519.js"></script>
+    <script src="src/crypto/DilithiumManager.js"></script>
     <script src="src/security/SecureKeyManager.js"></script>
     <script src="popup.js"></script>
 </body>

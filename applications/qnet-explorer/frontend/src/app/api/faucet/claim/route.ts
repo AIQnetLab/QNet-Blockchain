@@ -235,11 +235,11 @@ async function sendQNCTokens(
   amount: number,
 ): Promise<{ success: boolean; txHash?: string; error?: string }> {
   const bootstrapNodes = [
-    'http://154.38.160.39:8001',
-    'http://62.171.157.44:8001',
-    'http://161.97.86.81:8001',
-    'http://5.189.130.160:8001',
-    'http://162.244.25.114:8001',
+    'https://154.38.160.39:8001',
+    'https://62.171.157.44:8001',
+    'https://161.97.86.81:8001',
+    'https://5.189.130.160:8001',
+    'https://162.244.25.114:8001',
   ];
   const qnetApiUrl =
     process.env.QNET_NODE_URL || bootstrapNodes[Math.floor(Math.random() * bootstrapNodes.length)];

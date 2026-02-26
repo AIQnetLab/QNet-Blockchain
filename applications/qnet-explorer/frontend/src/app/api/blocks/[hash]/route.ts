@@ -7,7 +7,7 @@ import type { Block, BlockTransaction } from '@/lib/types';
 // ============================================================================
 
 // Node RPC (fallback for real-time data)
-const NODE_RPC_URL = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
+const NODE_RPC_URL = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
 
 // Map transaction type to display name
 // v3.15: Claims from system_rewards_pool show as Transfer

@@ -12,7 +12,9 @@ import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl } 
 export class WalletManager {
   constructor() {
     this.connection = new Connection(getSolanaRpcUrl(true), 'confirmed');
-    this.keyCache = null; // Cache CryptoKey object (NOT the password) for faster unlock
+    this.keyCache = null;       // CryptoKey object (NOT the password), extractable:false
+    this._keyCacheSalt = null;  // Hex salt that was used to derive keyCache
+    this._keyCacheIter = 0;     // Iteration count used to derive keyCache
     this._failedAttempts = 0;
     this._lockoutUntil = 0;
     this._rateLimitLoaded = false;
@@ -2702,6 +2704,8 @@ export class WalletManager {
   static VAULT_ITERATIONS_V2 = 100_000; // Legacy — kept for backward compat decrypt
 
   // Derive AES-GCM-256 CryptoKey from password + hex salt via PBKDF2.
+  // If the result will be used as keyCache, caller is responsible for setting
+  // _keyCacheSalt and _keyCacheIter to enable reuse in _decryptGCM.
   async _deriveKeyNative(password, saltHex, iterations = WalletManager.VAULT_ITERATIONS_V3) {
     const enc = new TextEncoder();
     const salt = this._hexToBytes(saltHex);
@@ -2712,12 +2716,27 @@ export class WalletManager {
       { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
       keyMaterial,
       { name: 'AES-GCM', length: 256 },
-      false,
+      false,          // extractable: false — key bytes are never exposed
       ['encrypt', 'decrypt']
     );
   }
 
+  // Set keyCache and remember which salt/iterations produced it.
+  _setCachedKey(key, saltHex, iterations) {
+    this.keyCache      = key;
+    this._keyCacheSalt = saltHex;
+    this._keyCacheIter = iterations;
+  }
+
+  // Clear keyCache on failed attempts or vault change.
+  _clearCachedKey() {
+    this.keyCache      = null;
+    this._keyCacheSalt = null;
+    this._keyCacheIter = 0;
+  }
+
   // Encrypt plaintext string → { version:3, salt, iv, encrypted } (all hex).
+  // Returns { vault, derivedKey } — derivedKey can be cached to avoid a 2nd PBKDF2 call.
   async _encryptGCM(plaintext, password) {
     const salt = crypto.getRandomValues(new Uint8Array(32));
     const iv   = crypto.getRandomValues(new Uint8Array(12));
@@ -2728,13 +2747,16 @@ export class WalletManager {
       key,
       enc.encode(plaintext)
     );
-    return {
+    const vault = {
       version:   3,
       salt:      this._bytesToHex(salt),
       iv:        this._bytesToHex(iv),
       encrypted: this._bytesToHex(new Uint8Array(cipherBuf)),
       timestamp: Date.now(),
     };
+    // Return both vault and derivedKey so callers can cache the key
+    // without a redundant 2nd PBKDF2 call
+    return { vault, derivedKey: key };
   }
 
   // Decrypt vault v2 or v3 → plaintext string. Throws on wrong password.
@@ -2742,7 +2764,22 @@ export class WalletManager {
     const iterations = vaultData.version === 3
       ? WalletManager.VAULT_ITERATIONS_V3
       : WalletManager.VAULT_ITERATIONS_V2;
-    const key = await this._deriveKeyNative(password, vaultData.salt, iterations);
+    // Reuse cached key if it was derived from the same salt+iterations.
+    // This eliminates duplicate PBKDF2 calls when verifyPassword → loadWallet
+    // are called back-to-back (every unlock). On v3 vaults saves ~2-3s on device.
+    const canReuseCache =
+      this.keyCache &&
+      this._keyCacheSalt === vaultData.salt &&
+      this._keyCacheIter === iterations;
+    let key;
+    if (canReuseCache) {
+      key = this.keyCache;
+    } else {
+      key = await this._deriveKeyNative(password, vaultData.salt, iterations);
+      // Auto-cache freshly derived key so subsequent calls (verifyPassword → loadWallet)
+      // don't need to re-derive. Salt mismatch on migration path is handled in loadWallet.
+      this._setCachedKey(key, vaultData.salt, iterations);
+    }
     const plainBuf = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: this._hexToBytes(vaultData.iv) },
       key,
@@ -2815,11 +2852,10 @@ export class WalletManager {
       };
       
       // Encrypt wallet data — AES-256-GCM + PBKDF2 600K (v3)
-      const vaultData = await this._encryptGCM(JSON.stringify(storageData), password);
+      // derivedKey is reused for keyCache — no 2nd PBKDF2 call
+      const { vault: vaultData, derivedKey: vaultKey } = await this._encryptGCM(JSON.stringify(storageData), password);
+      this._setCachedKey(vaultKey, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
 
-      // Cache the CryptoKey (NOT the password) for faster unlock
-      this.keyCache = await this._deriveKeyNative(password, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
-      
       await AsyncStorage.setItem('qnet_wallet', JSON.stringify(vaultData));
       await AsyncStorage.setItem('qnet_wallet_address', walletData.address);
       
@@ -2855,11 +2891,11 @@ export class WalletManager {
     // Fallback to Genesis bootstrap nodes if no discovered nodes
     // These are the official Genesis nodes from genesis_constants.rs
     const genesisNodes = [
-      { url: 'http://154.38.160.39', region: 'North America' },
-      { url: 'http://62.171.157.44', region: 'Europe' },
-      { url: 'http://161.97.86.81', region: 'Europe' },
-      { url: 'http://5.189.130.160', region: 'Europe' },
-      { url: 'http://162.244.25.114', region: 'Europe' }
+      { url: 'https://154.38.160.39', region: 'North America' },
+      { url: 'https://62.171.157.44', region: 'Europe' },
+      { url: 'https://161.97.86.81', region: 'Europe' },
+      { url: 'https://5.189.130.160', region: 'Europe' },
+      { url: 'https://162.244.25.114', region: 'Europe' }
     ];
     
     // Try to discover new nodes from Genesis nodes
@@ -2889,7 +2925,7 @@ export class WalletManager {
               const discoveredNodes = data.peers
                 .filter(peer => peer.address && peer.address.includes(':'))
                 .map(peer => ({
-                  url: `http://${peer.address}`,
+                  url: `https://${peer.address}`,
                   nodeType: peer.node_type,
                   reputation: peer.reputation || 0, // v3.13: Store reputation!
                   lastSeen: Date.now()
@@ -2985,7 +3021,7 @@ export class WalletManager {
       });
       if (!resp.ok) return null;
       const data = await resp.json();
-      // producer_endpoint is a full HTTP URL (e.g. "http://162.244.25.114:8001/api/v1/")
+      // producer_endpoint is a full URL (e.g. "https://162.244.25.114:8001/api/v1/")
       // We need just the base URL (without /api/v1/) for our fetch calls
       const endpoint = data.producer_endpoint || '';
       if (!endpoint) return null;
@@ -3262,14 +3298,27 @@ export class WalletManager {
       wallet = await this.migrateQNetAddress(wallet);
 
       // Migrate to v3 (PBKDF2 600K) if vault is not already v3
+      let migrated = false;
+      const fromVersion = vaultData.version || 1;
       if (vaultData.version !== 3) {
-        const newVault = await this._encryptGCM(JSON.stringify(wallet), password);
-        await AsyncStorage.setItem('qnet_wallet', JSON.stringify(newVault));
-        this.keyCache = await this._deriveKeyNative(password, newVault.salt, WalletManager.VAULT_ITERATIONS_V3);
+        try {
+          // derivedKey is reused for keyCache — no 2nd PBKDF2 call needed
+          const { vault: newVault, derivedKey: newKey } = await this._encryptGCM(JSON.stringify(wallet), password);
+          await AsyncStorage.setItem('qnet_wallet', JSON.stringify(newVault));
+          this._setCachedKey(newKey, newVault.salt, WalletManager.VAULT_ITERATIONS_V3);
+          migrated = true;
+          console.log(`[INFO][WALLET] vault_migrated from_version=${fromVersion} to_version=3 iterations=${WalletManager.VAULT_ITERATIONS_V3}`);
+        } catch (migrationError) {
+          // Migration failed — wallet is still readable (old format), but log the failure
+          console.error(`[ERR][WALLET] vault_migration_failed from_version=${fromVersion} err=${migrationError.message}`);
+          // Re-throw so caller can show an error to user
+          throw new Error(`Wallet migration failed: ${migrationError.message}. Your wallet data is safe — please try again.`);
+        }
       } else {
-        // Cache CryptoKey (not password) for faster subsequent unlocks
+        // Cache CryptoKey for faster subsequent unlocks (skip if already cached by verifyPassword)
         if (!this.keyCache) {
-          this.keyCache = await this._deriveKeyNative(password, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
+          const k = await this._deriveKeyNative(password, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
+          this._setCachedKey(k, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
         }
       }
 
@@ -3279,9 +3328,12 @@ export class WalletManager {
 
       // Remove mnemonic from returned object — caller uses getEncryptedMnemonic() explicitly
       if (wallet.mnemonic) delete wallet.mnemonic;
+
+      // Attach migration info for caller to show notification
+      wallet._migrated = migrated;
+      wallet._migratedFromVersion = migrated ? fromVersion : null;
       return wallet;
     } catch (error) {
-      // console.error('Error loading wallet:', error);
       throw error;
     }
   }
@@ -3800,7 +3852,7 @@ export class WalletManager {
               (peer.reputation || 0) >= MIN_REPUTATION
             )
             .map(peer => ({
-              url: `http://${peer.address}`,
+              url: `https://${peer.address}`,
               reputation: peer.reputation,
               nodeType: peer.node_type,
               lastSeen: Date.now()
@@ -3882,11 +3934,11 @@ export class WalletManager {
     
     // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
     const bootstrapNodes = [
-      'http://154.38.160.39:8080',   // Genesis #1 - North America
-      'http://62.171.157.44:8080',   // Genesis #2 - Europe
-      'http://161.97.86.81:8080',    // Genesis #3 - Europe
-      'http://5.189.130.160:8080',   // Genesis #4 - Europe
-      'http://162.244.25.114:8080'   // Genesis #5 - Europe
+      'https://154.38.160.39:8080',   // Genesis #1 - North America
+      'https://62.171.157.44:8080',   // Genesis #2 - Europe
+      'https://161.97.86.81:8080',    // Genesis #3 - Europe
+      'https://5.189.130.160:8080',   // Genesis #4 - Europe
+      'https://162.244.25.114:8080'   // Genesis #5 - Europe
     ];
     
     // Try multiple bootstrap nodes for reliability
@@ -4350,8 +4402,8 @@ export class WalletManager {
         walletAddress: metadata.walletAddress || null  // The address used for activation
       }));
       
-      // Encrypt the activation code — AES-256-GCM + PBKDF2 100K
-      const codeVault = await this._encryptGCM(code, password);
+      // Encrypt the activation code — AES-256-GCM + PBKDF2 600K (v3)
+      const { vault: codeVault } = await this._encryptGCM(code, password);
 
       // Store encrypted code with metadata
       encryptedCodes[nodeType] = {
@@ -6346,16 +6398,13 @@ export class WalletManager {
           throw new Error('Unsupported vault format');
         }
         JSON.parse(plaintext);
-        if (!this.keyCache && vaultData.salt) {
-          const iters = vaultData.version === 3
-            ? WalletManager.VAULT_ITERATIONS_V3
-            : WalletManager.VAULT_ITERATIONS_V2;
-          this.keyCache = await this._deriveKeyNative(password, vaultData.salt, iters);
-        }
+        // For v2/v3 vaults: key was already cached inside _decryptGCM above.
+        // For v1 CBC vaults: skip caching — loadWallet will use _decryptCBC (CryptoJS)
+        // and migration creates a new salt, so a pre-cached key is never reused.
         await this._resetRateLimit();
         return true;
       } catch {
-        this.keyCache = null;
+        this._clearCachedKey();
         await this._recordFailedAttempt();
         return false;
       }

@@ -47,15 +47,35 @@ if (typeof self !== 'undefined') {
 
 // ALL Genesis nodes (load distributed from first request!)
 const QNET_GENESIS_NODES = [
-    'http://154.38.160.39:8001',   // North America
-    'http://62.171.157.44:8001',   // Europe  
-    'http://161.97.86.81:8001',    // Europe
-    'http://5.189.130.160:8001',   // Europe
-    'http://162.244.25.114:8001'   // Europe
+    'https://154.38.160.39:8001',   // North America
+    'https://62.171.157.44:8001',   // Europe  
+    'https://161.97.86.81:8001',    // Europe
+    'https://5.189.130.160:8001',   // Europe
+    'https://162.244.25.114:8001'   // Europe
 ];
 
 // Minimum reputation for verification nodes
 const QNET_MIN_REPUTATION = 0.70;
+
+// CSPRNG helpers (replace Math.random for security-sensitive values)
+function cryptoRandomHex(byteLength) {
+    const bytes = new Uint8Array(byteLength);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function cryptoRandomInt(max) {
+    const arr = new Uint32Array(1);
+    crypto.getRandomValues(arr);
+    return arr[0] % max;
+}
+
+function cryptoRandomBase36(length) {
+    const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+    const bytes = new Uint8Array(length);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes).map(b => chars[b % chars.length]).join('');
+}
 
 // Cache for discovered nodes (after first successful discovery)
 let qnetDiscoveredNodes = [];
@@ -295,7 +315,7 @@ async function discoverQNetHighRepNodes() {
                         (peer.reputation || 0) >= QNET_MIN_REPUTATION
                     )
                     .map(peer => ({
-                        url: `http://${peer.address}`,
+                        url: `https://${peer.address}`,
                         reputation: peer.reputation,
                         nodeType: peer.node_type
                     }))
@@ -3606,11 +3626,11 @@ class SolanaRPC {
         
         // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
         const bootstrapNodes = [
-            'http://154.38.160.39:8080',   // Genesis #1 - North America
-            'http://62.171.157.44:8080',   // Genesis #2 - Europe
-            'http://161.97.86.81:8080',    // Genesis #3 - Europe
-            'http://5.189.130.160:8080',   // Genesis #4 - Europe
-            'http://162.244.25.114:8080'   // Genesis #5 - Europe
+            'https://154.38.160.39:8080',   // Genesis #1 - North America
+            'https://62.171.157.44:8080',   // Genesis #2 - Europe
+            'https://161.97.86.81:8080',    // Genesis #3 - Europe
+            'https://5.189.130.160:8080',   // Genesis #4 - Europe
+            'https://162.244.25.114:8080'   // Genesis #5 - Europe
         ];
         
         // Try multiple bootstrap nodes for reliability
@@ -5966,11 +5986,13 @@ async function handleMessage(request, sender, sendResponse) {
                     const solanaAddress = request.address;
                     
                     // Mock Solana data for production demo
+                    const _rndBuf = new Uint32Array(2);
+                    crypto.getRandomValues(_rndBuf);
                     const solanaData = {
                         address: solanaAddress,
                         balances: {
-                            SOL: (Math.random() * 5).toFixed(2), // 0-5 SOL
-                            '1DEV': Math.floor(Math.random() * 3000) + 500 // 500-3500 1DEV
+                            SOL: ((_rndBuf[0] / 0xFFFFFFFF) * 5).toFixed(2),
+                            '1DEV': (_rndBuf[1] % 3000) + 500
                         }
                     };
                     
@@ -7037,13 +7059,13 @@ async function sendTransaction(transactionData) {
             // Log: ( Sending Solana transaction:', transactionData);
             
             // For now, simulate transaction
-            const txHash = 'sol_' + Math.random().toString(16).substr(2, 64);
+            const txHash = 'sol_' + cryptoRandomHex(32);
             return { signature: txHash, confirmed: true };
             
         } else {
             // QNet transaction (simulated)
             // Log: ( Sending QNet transaction:', transactionData);
-            const txHash = 'qnet_' + Math.random().toString(16).substr(2, 64);
+            const txHash = 'qnet_' + cryptoRandomHex(32);
             return { signature: txHash, confirmed: true };
         }
         
@@ -7073,7 +7095,7 @@ async function signMessage(message) {
             return signature;
         } else {
             // QNet signing (simulated)
-            const signature = 'qnet_signature_' + Math.random().toString(16).substr(2, 64);
+            const signature = 'qnet_signature_' + cryptoRandomHex(32);
             // Log: ( Message signed with QNet key');
             return signature;
         }
@@ -7198,7 +7220,7 @@ async function executeSwapWithFee(swapData) {
         // Simulate swap execution (in production, integrate with DEX APIs)
         const swapResult = {
             success: true,
-            transactionHash: 'swap_' + Math.random().toString(16).substr(2, 64),
+            transactionHash: 'swap_' + cryptoRandomHex(32),
             amountSwapped: amountAfterFee,
             platformFee: platformFee,
             feeRecipient: productionFeeRecipient,
@@ -7698,11 +7720,11 @@ async function getNetworkSize() {
     
     // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
     const bootstrapNodes = [
-        'http://154.38.160.39:8080',
-        'http://62.171.157.44:8080',
-        'http://161.97.86.81:8080',
-        'http://5.189.130.160:8080',
-        'http://162.244.25.114:8080'
+        'https://154.38.160.39:8080',
+        'https://62.171.157.44:8080',
+        'https://161.97.86.81:8080',
+        'https://5.189.130.160:8080',
+        'https://162.244.25.114:8080'
     ];
     
     for (const apiUrl of bootstrapNodes) {
@@ -7783,8 +7805,8 @@ async function getBurnPercentage() {
 async function burnOneDevTokens(request) {
     try {
         // FREE wallet - no burning needed, instant activation
-        const mockSignature = 'free_activation_' + Math.random().toString(36).substring(2, 15);
-        const mockBlockHeight = Math.floor(Math.random() * 1000000) + 200000000;
+        const mockSignature = 'free_activation_' + cryptoRandomBase36(13);
+        const mockBlockHeight = cryptoRandomInt(1000000) + 200000000;
 
         return {
             success: true,
@@ -7810,8 +7832,8 @@ async function burnOneDevTokens(request) {
 async function spendQNCToPool3(request) {
     try {
         // FREE wallet - instant activation without spending
-        const mockSignature = 'free_pool3_' + Math.random().toString(36).substring(2, 15);
-        const mockPoolTransfer = 'free_transfer_' + Math.random().toString(36).substring(2, 15);
+        const mockSignature = 'free_pool3_' + cryptoRandomBase36(13);
+        const mockPoolTransfer = 'free_transfer_' + cryptoRandomBase36(13);
 
         return {
             success: true,
@@ -7901,9 +7923,11 @@ function generateEONAddress() {
  */
 function generateSolanaAddress() {
     const chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    const randomBytes = new Uint8Array(44);
+    crypto.getRandomValues(randomBytes);
     let result = '';
     for (let i = 0; i < 44; i++) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
+        result += chars.charAt(randomBytes[i] % chars.length);
     }
     return result;
 }

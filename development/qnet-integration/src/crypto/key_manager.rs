@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::sync::{Arc, RwLock, OnceLock};
 use anyhow::{Result, anyhow};
-use pqcrypto_dilithium::dilithium3;
+use pqcrypto_mldsa::mldsa65 as dilithium3;
 use pqcrypto_traits::sign::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait, SignedMessage as SignedMessageTrait};
 use serde::{Serialize, Deserialize};
-use sha3::{Sha3_256, Sha3_512, Digest};
+use sha3::{Sha3_256, Digest};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.50: Lock-free key directory cache with OnceLock
@@ -33,7 +33,7 @@ impl DilithiumKeyManager {
         // CRITICAL: Try multiple fallback paths for Docker/production compatibility
         let final_key_dir = Self::ensure_writable_directory(key_dir)?;
         
-        println!("[KEY_MANAGER] 📁 Using key directory: {:?}", final_key_dir);
+        println!("[INFO][KEY] key_dir={:?}", final_key_dir);
         
         Ok(Self {
             key_dir: final_key_dir,
@@ -57,7 +57,6 @@ impl DilithiumKeyManager {
         let mut candidates: Vec<PathBuf> = vec![
             preferred.to_path_buf(),                              // Preferred path
             PathBuf::from("/app/data/keys"),                      // Docker persistent volume
-            PathBuf::from("/tmp/qnet_keys"),                      // Always writable fallback
         ];
         
         // Add optional paths if available
@@ -69,10 +68,10 @@ impl DilithiumKeyManager {
             candidates.push(data_dir.join("qnet").join("keys"));
         }
         
-        println!("[KEY_MANAGER] 🔍 Searching for writable key directory...");
+        println!("[INFO][KEY] searching for writable key directory");
         
         for (idx, path) in candidates.iter().enumerate() {
-            println!("[KEY_MANAGER]   [{}/{}] Testing: {:?}", idx + 1, candidates.len(), path);
+            if crate::node::is_debug() { println!("[DBG][KEY] testing dir [{}/{}] {:?}", idx + 1, candidates.len(), path); }
             
             // Try to create directory
             match fs::create_dir_all(path) {
@@ -82,7 +81,7 @@ impl DilithiumKeyManager {
                     match fs::write(&test_file, b"test") {
                         Ok(_) => {
                             let _ = fs::remove_file(&test_file); // Cleanup
-                            println!("[KEY_MANAGER] ✅ Selected writable directory: {:?}", path);
+                            println!("[INFO][KEY] selected_dir={:?}", path);
                             
                             // PRODUCTION v2.50: Cache with OnceLock (lock-free after this)
                             let _ = CACHED_KEY_DIR.set(path.clone());
@@ -90,30 +89,31 @@ impl DilithiumKeyManager {
                             return Ok(path.clone());
                         }
                         Err(e) => {
-                            println!("[KEY_MANAGER]   ❌ Cannot write to directory: {}", e);
+                            eprintln!("[ERR][KEY] dir_not_writable err={}", e);
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    println!("[KEY_MANAGER]   ❌ Cannot create directory: {}", e);
+                    eprintln!("[ERR][KEY] dir_create_failed err={}", e);
                     continue;
                 }
             }
         }
         
         // CRITICAL: If all fallbacks fail, provide detailed diagnostic
-        println!("[KEY_MANAGER] ❌ NO WRITABLE DIRECTORY FOUND!");
-        println!("[KEY_MANAGER] 🔍 Diagnostic information:");
-        println!("[KEY_MANAGER]   Current dir: {:?}", std::env::current_dir());
-        println!("[KEY_MANAGER]   User: {:?}", std::env::var("USER").or_else(|_| std::env::var("USERNAME")));
-        println!("[KEY_MANAGER]   Temp dir: {:?}", std::env::temp_dir());
+        eprintln!("[ERR][KEY] no writable directory found");
+        eprintln!("[ERR][KEY] diagnostic info:");
+        eprintln!("[ERR][KEY] cwd={:?} user={:?} tmp={:?}",
+            std::env::current_dir(),
+            std::env::var("USER").or_else(|_| std::env::var("USERNAME")),
+            std::env::temp_dir());
         
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(metadata) = fs::metadata(preferred) {
-                println!("[KEY_MANAGER]   Preferred dir permissions: {:o}", metadata.permissions().mode());
+                eprintln!("[ERR][KEY] preferred_dir_perms={:o}", metadata.permissions().mode());
             }
         }
         
@@ -125,12 +125,11 @@ impl DilithiumKeyManager {
     
     /// Initialize keys (load or generate)
     pub async fn initialize(&self) -> Result<()> {
-        println!("[KEY_MANAGER] 🔐 Initializing Dilithium key manager for node: {}", self.node_id);
-        println!("[KEY_MANAGER] 📁 Key directory: {:?}", self.key_dir);
+        println!("[INFO][KEY] init node={} dir={:?}", self.node_id, self.key_dir);
         
         // Directory should already exist from new(), but verify
         if !self.key_dir.exists() {
-            println!("[KEY_MANAGER] ⚠️ Key directory doesn't exist, creating now...");
+            println!("[INFO][KEY] creating key directory");
             fs::create_dir_all(&self.key_dir)
                 .map_err(|e| anyhow!("Failed to create key directory: {}", e))?;
         }
@@ -141,7 +140,7 @@ impl DilithiumKeyManager {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    println!("[KEY_MANAGER] 🔒 Directory permissions: {:o}", metadata.permissions().mode());
+                    println!("[INFO][KEY] dir_permissions={:o}", metadata.permissions().mode());
                 }
                 
                 if !metadata.is_dir() {
@@ -149,13 +148,13 @@ impl DilithiumKeyManager {
                 }
             }
             Err(e) => {
-                println!("[KEY_MANAGER] ❌ Cannot read directory metadata: {}", e);
+                eprintln!("[ERR][KEY] dir_metadata_failed err={}", e);
                 return Err(anyhow!("Cannot access key directory: {}", e));
             }
         }
         
         // Keypair will be loaded or generated on first use (lazy initialization)
-        println!("[KEY_MANAGER] 🎉 Key manager initialization complete!");
+        println!("[INFO][KEY] init complete");
         Ok(())
     }
     
@@ -183,7 +182,7 @@ impl DilithiumKeyManager {
         }
         
         // Generate new keypair ONCE and save it
-        println!("[KEY_MANAGER] 🔑 Generating new Dilithium3 keypair (one-time operation)...");
+        println!("[INFO][KEY] generating new ML-DSA-65 keypair (one-time)");
         
         // CRITICAL: Generate keypair only ONCE and persist it
         // This ensures the same keys are used across restarts
@@ -192,7 +191,7 @@ impl DilithiumKeyManager {
         // Save to disk immediately for persistence
         // CRITICAL: Node MUST NOT start without saved keys to prevent identity loss
         self.save_keypair_to_disk(&pk, &sk, &key_path)?;
-        println!("[KEY_MANAGER] ✅ Dilithium3 keypair saved to disk for persistence");
+        println!("[INFO][KEY] keypair saved to disk");
         
         // Cache the keypair
         {
@@ -211,34 +210,9 @@ impl DilithiumKeyManager {
         Ok(PublicKeyTrait::as_bytes(&public_key).to_vec())
     }
     
-    /// Sign data with Dilithium-based deterministic signature
-    /// This is quantum-resistant because:
-    /// 1. Uses Dilithium keypair as entropy source
-    /// 2. Uses SHA3-512 which is quantum-resistant
-    /// 3. Signature is deterministic and verifiable
-    /// 
-    /// NOTE: Returns only the 2420-byte signature part (legacy compatibility)
-    /// For full SignedMessage format, use sign_full()
-    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
-        // OPTIMIZATION: Use cached keypair from get_keypair()
-        let (_pk, sk) = self.get_keypair()?;
-        
-        // Sign with REAL Dilithium3 algorithm
-        let signature = dilithium3::sign(data, &sk);
-        
-        // Get signed message bytes from Dilithium3
-        let signed_msg_bytes = SignedMessageTrait::as_bytes(&signature);
-        
-        // Extract just the signature part (first 2420 bytes are signature, rest is message)
-        let sig_bytes = &signed_msg_bytes[..2420.min(signed_msg_bytes.len())];
-        
-        println!("✅ Generated REAL Dilithium3 quantum-resistant signature ({} bytes)", sig_bytes.len());
-        Ok(sig_bytes.to_vec())
-    }
-    
     /// Sign data and return FULL SignedMessage (signature + message)
     /// PRODUCTION: Use this for proper Dilithium3 verification with dilithium3::open()
-    /// Format: [signature(2420 bytes)] + [original message]
+    /// Format: [signature(3309 bytes)] + [original message]  (ML-DSA-65 FIPS 204)
     pub fn sign_full(&self, data: &[u8]) -> Result<Vec<u8>> {
         let (_pk, sk) = self.get_keypair()?;
         
@@ -248,8 +222,9 @@ impl DilithiumKeyManager {
         // Return the FULL SignedMessage bytes (signature + message)
         let signed_msg_bytes = SignedMessageTrait::as_bytes(&signature);
         
-        println!("✅ Generated FULL Dilithium3 SignedMessage ({} bytes = 2420 sig + {} msg)", 
-                 signed_msg_bytes.len(), data.len());
+        if crate::node::is_debug() {
+            println!("[DBG][KEY] sign_full size={}", signed_msg_bytes.len());
+        }
         Ok(signed_msg_bytes.to_vec())
     }
     
@@ -258,13 +233,13 @@ impl DilithiumKeyManager {
     /// We cannot derive the original seed from public key - that would be insecure!
     /// Instead, we verify the signature structure and entropy
     pub fn verify(&self, data: &[u8], signature: &[u8], public_key_bytes: &[u8]) -> Result<bool> {
-        if signature.len() != 2420 {
-            println!("❌ Invalid signature length: {} (expected 2420)", signature.len());
+        if signature.len() < 3309 {
+            eprintln!("[ERR][KEY] sig_too_small got={} min=3309", signature.len());
             return Ok(false);
         }
-        
+
         if public_key_bytes.len() != 1952 {
-            println!("❌ Invalid public key length: {} (expected 1952)", public_key_bytes.len());
+            eprintln!("[ERR][KEY] pk_size_invalid got={} expected=1952", public_key_bytes.len());
             return Ok(false);
         }
         
@@ -272,25 +247,28 @@ impl DilithiumKeyManager {
         let pk = <dilithium3::PublicKey as PublicKeyTrait>::from_bytes(public_key_bytes)
             .map_err(|_| anyhow!("Invalid public key format"))?;
         
-        // For verification, we need to reconstruct the signed message
-        // Dilithium3 expects signature + message concatenated
         let mut signed_msg = Vec::with_capacity(signature.len() + data.len());
         signed_msg.extend_from_slice(signature);
         signed_msg.extend_from_slice(data);
         
-        // Verify with REAL Dilithium3 algorithm
-        let valid = dilithium3::open(&dilithium3::SignedMessage::from_bytes(&signed_msg).unwrap_or_else(|_| {
-            // If can't parse, create dummy for return false
-            dilithium3::sign(&[], &dilithium3::keypair().1)
-        }), &pk).is_ok();
+        let signed_message = match dilithium3::SignedMessage::from_bytes(&signed_msg) {
+            Ok(sm) => sm,
+            Err(_) => {
+                eprintln!("[ERR][KEY] signed_msg_parse_failed len={}", signed_msg.len());
+                return Ok(false);
+            }
+        };
         
-        if valid {
-            println!("✅ REAL Dilithium3 signature verified successfully");
-        } else {
-            println!("❌ Dilithium3 signature verification failed");
+        match dilithium3::open(&signed_message, &pk) {
+            Ok(_) => {
+                if crate::node::is_debug() { println!("[DBG][KEY] sig_verified ok"); }
+                Ok(true)
+            }
+            Err(_) => {
+                eprintln!("[ERR][KEY] sig_verification_failed");
+                Ok(false)
+            }
         }
-        
-        Ok(valid)
     }
     
     /// Export public key for sharing
@@ -321,12 +299,12 @@ impl DilithiumKeyManager {
                     if key_bytes.len() == 32 {
                         let mut key = [0u8; 32];
                         key.copy_from_slice(&key_bytes);
-                        println!("[KEY_MANAGER] 🔐 Using encryption key from QNET_KEY_ENCRYPTION_SECRET");
+                        println!("[INFO][KEY] using encryption key from QNET_KEY_ENCRYPTION_SECRET");
                         return Ok(key);
                     }
                 }
             }
-            println!("[KEY_MANAGER] ⚠️ Invalid QNET_KEY_ENCRYPTION_SECRET format (need 64 hex chars)");
+            eprintln!("[ERR][KEY] invalid QNET_KEY_ENCRYPTION_SECRET format (need 64 hex chars)");
         }
         
         // 2. File-based secret with integrity check
@@ -343,13 +321,22 @@ impl DilithiumKeyManager {
                 let key_part = &secret_data[..32];
                 let stored_hash = &secret_data[32..40];
                 
-                // Verify integrity hash
+                // Verify integrity hash — constant-time to prevent timing attacks
                 let mut hasher = Sha3_256::new();
                 hasher.update(key_part);
                 hasher.update(b"QNET_SECRET_INTEGRITY_V1");
-                let computed_hash = &hasher.finalize()[..8];
-                
-                if stored_hash == computed_hash {
+                let hash_result = hasher.finalize();
+                let computed_hash = &hash_result[..8];
+
+                let hashes_equal = {
+                    let mut diff = 0u8;
+                    for (a, b) in stored_hash.iter().zip(computed_hash.iter()) {
+                        diff |= a ^ b;
+                    }
+                    std::hint::black_box(diff) == 0
+                };
+
+                if hashes_equal {
                     let mut key = [0u8; 32];
                     key.copy_from_slice(key_part);
                     return Ok(key);
@@ -364,11 +351,11 @@ impl DilithiumKeyManager {
                             Restore from backup or contact support."
                         ));
                     }
-                    println!("[KEY_MANAGER] ⚠️ Corrupted encryption secret (no keypair yet), regenerating...");
+                    eprintln!("[ERR][KEY] corrupted encryption secret (no keypair yet), regenerating");
                 }
             } else if secret_data.len() == 32 {
                 // Legacy format without hash - upgrade it
-                println!("[KEY_MANAGER] 🔄 Upgrading encryption secret to include integrity hash...");
+                println!("[INFO][KEY] upgrading encryption secret to include integrity hash");
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&secret_data);
                 
@@ -384,7 +371,7 @@ impl DilithiumKeyManager {
                         secret_data.len()
                     ));
                 }
-                println!("[KEY_MANAGER] ⚠️ Corrupted encryption secret, regenerating...");
+                eprintln!("[ERR][KEY] corrupted encryption secret (wrong size={}), regenerating", secret_data.len());
             }
         }
         
@@ -396,13 +383,18 @@ impl DilithiumKeyManager {
             ));
         }
         
-        println!("[KEY_MANAGER] 🔐 Generating new encryption secret (one-time operation)...");
-        let new_key: [u8; 32] = rand::random();
+        println!("[INFO][KEY] generating new encryption secret (one-time)");
+        let mut new_key = [0u8; 32];
+        {
+            use rand::RngCore;
+            use rand::rngs::OsRng;
+            OsRng.fill_bytes(&mut new_key);
+        }
         
         // Save with integrity hash
         self.save_encryption_secret(&new_key, &secret_path)?;
         
-        println!("[KEY_MANAGER] ✅ Encryption secret saved to {:?}", secret_path);
+        println!("[INFO][KEY] encryption_secret saved path={:?}", secret_path);
         Ok(new_key)
     }
     
@@ -465,7 +457,12 @@ impl DilithiumKeyManager {
         // Encrypt with AES-256-GCM
         let key = Key::<Aes256Gcm>::from_slice(&key_material);
         let cipher = Aes256Gcm::new(key);
-        let nonce_bytes = rand::random::<[u8; 12]>();
+        let mut nonce_bytes = [0u8; 12];
+        {
+            use rand::RngCore;
+            use rand::rngs::OsRng;
+            OsRng.fill_bytes(&mut nonce_bytes);
+        }
         let nonce = Nonce::from_slice(&nonce_bytes);
         
         let encrypted = cipher.encrypt(nonce, combined.as_ref())

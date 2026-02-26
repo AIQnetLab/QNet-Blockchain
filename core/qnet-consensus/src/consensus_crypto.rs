@@ -97,7 +97,7 @@ pub async fn verify_consensus_signature(
     // OPTIMIZED v2.24: Bincode + Zstd format
     // Actual sizes: Compact ~2.6KB bincode, Full ~5KB bincode (vs 27KB JSON legacy)
     if signature.is_empty() || signature.len() < 100 || signature.len() > 18000 {
-        println!("[CONSENSUS] ❌ Invalid signature length: {} (limit: 18000)", signature.len());
+        println!("[ERR][CONSENSUS_CRYPTO] invalid_signature_length len={} limit=18000", signature.len());
         return false;
     }
     
@@ -118,7 +118,7 @@ pub async fn verify_consensus_signature(
         // This is a pure Dilithium signature
         verify_dilithium_signature(node_id, message, signature).await
     } else {
-        println!("[CONSENSUS] ❌ Unknown signature format");
+        println!("[ERR][CONSENSUS_CRYPTO] unknown_signature_format");
         false
     }
 }
@@ -132,7 +132,7 @@ async fn verify_compact_binary_signature(
     signature: &str,
 ) -> bool {
     if !signature.starts_with("compact_bin:") {
-        println!("[CONSENSUS] ❌ Invalid compact_bin signature format");
+        println!("[ERR][CONSENSUS_CRYPTO] invalid_compact_bin_format");
         return false;
     }
     
@@ -142,7 +142,7 @@ async fn verify_compact_binary_signature(
     let binary_data = match general_purpose::STANDARD.decode(base64_data) {
         Ok(data) => data,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Failed to decode compact_bin base64: {}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] compact_bin_base64_decode_failed err={}", e);
             return false;
         }
     };
@@ -151,7 +151,7 @@ async fn verify_compact_binary_signature(
     let decompressed = match zstd::decode_all(binary_data.as_slice()) {
         Ok(data) => data,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Failed to decompress compact_bin: {}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] compact_bin_decompress_failed err={}", e);
             return false;
         }
     };
@@ -174,24 +174,24 @@ async fn verify_compact_binary_signature(
     let compact_sig: CompactSig = match bincode::deserialize(&decompressed) {
         Ok(sig) => sig,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Failed to deserialize compact_bin: {}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] compact_bin_deserialize_failed err={}", e);
             return false;
         }
     };
     
     // Verify node_id matches
     if compact_sig.node_id != node_id {
-        println!("[CONSENSUS] ❌ Node ID mismatch: expected {}, got {}", node_id, compact_sig.node_id);
+        println!("[ERR][CONSENSUS_CRYPTO] node_id_mismatch expected={} got={}", node_id, compact_sig.node_id);
         return false;
     }
     
     // Validate sizes
     if compact_sig.ephemeral_public_key.len() != 32 {
-        println!("[CONSENSUS] ❌ Invalid ephemeral key length: {}", compact_sig.ephemeral_public_key.len());
+        println!("[ERR][CONSENSUS_CRYPTO] invalid_ephemeral_key_length len={}", compact_sig.ephemeral_public_key.len());
         return false;
     }
     if compact_sig.message_signature.len() != 64 {
-        println!("[CONSENSUS] ❌ Invalid Ed25519 signature length: {}", compact_sig.message_signature.len());
+        println!("[ERR][CONSENSUS_CRYPTO] invalid_ed25519_sig_length len={}", compact_sig.message_signature.len());
         return false;
     }
     
@@ -207,7 +207,7 @@ async fn verify_compact_binary_signature(
     ) {
         Ok(pk) => pk,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Invalid ephemeral public key: {}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] invalid_ephemeral_public_key err={}", e);
             return false;
         }
     };
@@ -215,14 +215,14 @@ async fn verify_compact_binary_signature(
     let ed25519_sig = match ed25519_dalek::Signature::from_slice(&compact_sig.message_signature) {
         Ok(sig) => sig,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Invalid Ed25519 signature format: {}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] invalid_ed25519_sig_format err={}", e);
             return false;
         }
     };
     
     use ed25519_dalek::Verifier;
     if ephemeral_pk.verify(&message_hash, &ed25519_sig).is_err() {
-        println!("[CONSENSUS] ❌ Ed25519 verification FAILED (compact_bin)");
+        println!("[ERR][CONSENSUS_CRYPTO] ed25519_verification_failed format=compact_bin");
         return false;
     }
     
@@ -242,11 +242,11 @@ async fn verify_compact_binary_signature(
     let dilithium_valid = verify_dilithium_signature(node_id, &encapsulated_hex, &dilithium_sig_string).await;
     
     if !dilithium_valid {
-        println!("[CONSENSUS] ❌ Dilithium verification FAILED (compact_bin)");
+        println!("[ERR][CONSENSUS_CRYPTO] dilithium_verification_failed format=compact_bin");
         return false;
     }
     
-    println!("[CONSENSUS] ✅ Compact binary signature verified (v2.24)");
+    println!("[INFO][CONSENSUS_CRYPTO] compact_bin_signature_verified version=v2.24");
     true
 }
 
@@ -259,7 +259,7 @@ async fn verify_compact_hybrid_signature(
 ) -> bool {
     // Parse compact signature format: "compact:<json_data>"
     if !signature.starts_with("compact:") {
-        println!("[CONSENSUS] ❌ Invalid compact signature format");
+        println!("[ERR][CONSENSUS_CRYPTO] invalid_compact_signature_format");
         return false;
     }
     
@@ -286,7 +286,7 @@ async fn verify_compact_hybrid_signature(
                 
                 // Verify node_id matches
                 if sig_node_id != node_id {
-                    println!("[CONSENSUS] ❌ Node ID mismatch: expected {}, got {}", node_id, sig_node_id);
+                    println!("[ERR][CONSENSUS_CRYPTO] node_id_mismatch expected={} got={}", node_id, sig_node_id);
                     return false;
                 }
                 
@@ -358,11 +358,11 @@ async fn verify_compact_hybrid_signature(
                 
                 // OPTIMIZED v2.23: Check RAW bytes fields
                 if ed25519_sig_bytes.is_none() || dilithium_key_bytes.is_none() || ephemeral_pk_bytes.is_none() || signed_at == 0 {
-                    println!("[CONSENSUS] ❌ Compact signature missing components!");
-                    println!("[CONSENSUS]    Ed25519: {}", if ed25519_sig_bytes.is_some() {"✅"} else {"❌"});
-                    println!("[CONSENSUS]    Ephemeral PK: {}", if ephemeral_pk_bytes.is_some() {"✅"} else {"❌"});
-                    println!("[CONSENSUS]    Dilithium key: {}", if dilithium_key_bytes.is_some() {"✅"} else {"❌"});
-                    println!("[CONSENSUS]    Timestamp: {}", if signed_at > 0 {"✅"} else {"❌"});
+                    println!("[ERR][CONSENSUS_CRYPTO] compact_sig_missing_components ed25519={} ephemeral_pk={} dilithium={} timestamp={}",
+                        if ed25519_sig_bytes.is_some() {"ok"} else {"missing"},
+                        if ephemeral_pk_bytes.is_some() {"ok"} else {"missing"},
+                        if dilithium_key_bytes.is_some() {"ok"} else {"missing"},
+                        if signed_at > 0 {"ok"} else {"missing"});
                     return false;
                 }
                 
@@ -399,13 +399,13 @@ async fn verify_compact_hybrid_signature(
                 
                 // Validate Ed25519 signature component
                 if ed25519_sig_len != 64 {
-                    println!("[CONSENSUS] ❌ Invalid Ed25519 signature size: {} (expected 64)", ed25519_sig_len);
+                    println!("[ERR][CONSENSUS_CRYPTO] invalid_ed25519_sig_size size={} expected=64", ed25519_sig_len);
                     return false;
                 }
                 
                 // OPTIMIZED v2.23: Validate RAW bytes Dilithium signature
                 if dilithium_key_raw.len() < 2500 {
-                    println!("[CONSENSUS] ❌ Invalid Dilithium key signature size: {} (too small, expected ~4500)", dilithium_key_raw.len());
+                    println!("[ERR][CONSENSUS_CRYPTO] invalid_dilithium_key_sig_size size={} min=4500", dilithium_key_raw.len());
                     return false;
                 }
                 
@@ -415,12 +415,12 @@ async fn verify_compact_hybrid_signature(
                 match ed_sig_array {
                     Ok(arr) => {
                         if Ed25519Signature::try_from(arr.as_ref()).is_err() {
-                            println!("[CONSENSUS] ❌ Ed25519 signature malformed!");
+                            println!("[ERR][CONSENSUS_CRYPTO] ed25519_signature_malformed");
                             return false;
                         }
                     },
                     Err(_) => {
-                        println!("[CONSENSUS] ❌ Ed25519 signature wrong size!");
+                        println!("[ERR][CONSENSUS_CRYPTO] ed25519_signature_wrong_size");
                         return false;
                     }
                 }
@@ -430,7 +430,7 @@ async fn verify_compact_hybrid_signature(
                 // ephemeral_key || message_hash || timestamp
                 // This provides both key binding AND message integrity
                 
-                println!("[CONSENSUS] 🔐 Verifying Dilithium key signature (NIST/Cisco)...");
+                println!("[INFO][CONSENSUS_CRYPTO] verifying_dilithium_key_signature standard=NIST_Cisco");
                 
                 // OPTIMIZED v2.23: Use RAW bytes directly
                 let mut encapsulated_data = Vec::new();
@@ -454,24 +454,18 @@ async fn verify_compact_hybrid_signature(
                 ).await;
                 
                 if !dilithium_key_valid {
-                    println!("[CONSENSUS] ❌ Dilithium signature verification FAILED!");
-                    println!("[CONSENSUS]    This could indicate a quantum attack attempt!");
+                    println!("[ERR][CONSENSUS_CRYPTO] dilithium_signature_verification_failed note=possible_quantum_attack");
                     return false;
                 }
                 
-                println!("[CONSENSUS] ✅ Signatures verified:");
-                println!("[CONSENSUS]    Node: {}", node_id);
-                println!("[CONSENSUS]    Certificate: {}", cert_serial);
-                println!("[CONSENSUS]    Ed25519: ✅");
-                println!("[CONSENSUS]    Dilithium: ✅ (quantum-resistant)");
-                println!("[CONSENSUS]    NIST/Cisco: ✅");
+                println!("[INFO][CONSENSUS_CRYPTO] signatures_verified node={} cert={} ed25519=ok dilithium=ok nist_cisco=ok", node_id, cert_serial);
                 
                 return true;
             }
         }
     }
     
-    println!("[CONSENSUS] ❌ Compact signature structure invalid");
+    println!("[ERR][CONSENSUS_CRYPTO] compact_signature_structure_invalid");
     false
 }
 
@@ -484,7 +478,7 @@ async fn verify_hybrid_binary_signature(
 ) -> bool {
     // Parse binary signature format: "hybrid_bin:<base64_bincode_data>"
     if !signature.starts_with("hybrid_bin:") {
-        println!("[CONSENSUS] ❌ Invalid hybrid_bin signature format");
+        println!("[ERR][CONSENSUS_CRYPTO] invalid_hybrid_bin_format");
         return false;
     }
     
@@ -494,25 +488,25 @@ async fn verify_hybrid_binary_signature(
     let binary_data = match general_purpose::STANDARD.decode(base64_data) {
         Ok(data) => data,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Failed to decode base64: {}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] hybrid_bin_base64_decode_failed err={}", e);
             return false;
         }
     };
     
-    println!("[CONSENSUS] 🔐 Verifying hybrid_bin signature ({}KB bincode)", binary_data.len() / 1024);
+    println!("[INFO][CONSENSUS_CRYPTO] verifying_hybrid_bin_signature size_kb={}", binary_data.len() / 1024);
     
     // Decompress and deserialize
     use std::io::Read;
     let mut decoder = match zstd::Decoder::new(&binary_data[..]) {
         Ok(d) => d,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Zstd decode failed: {}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] zstd_decode_failed err={}", e);
             return false;
         }
     };
     let mut decompressed = Vec::new();
     if let Err(e) = decoder.read_to_end(&mut decompressed) {
-        println!("[CONSENSUS] ❌ Zstd read failed: {}", e);
+        println!("[ERR][CONSENSUS_CRYPTO] zstd_read_failed err={}", e);
         return false;
     }
     
@@ -546,15 +540,14 @@ async fn verify_hybrid_binary_signature(
     let sig: BinaryHybridSignature = match bincode::deserialize(&decompressed) {
         Ok(s) => s,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Bincode deserialize failed: {}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] bincode_deserialize_failed err={}", e);
             return false;
         }
     };
     
     // Verify certificate belongs to claimed node
     if sig.certificate.node_id != node_id {
-        println!("[CONSENSUS] ❌ Certificate node_id mismatch: {} vs {}", 
-                 sig.certificate.node_id, node_id);
+        println!("[ERR][CONSENSUS_CRYPTO] cert_node_id_mismatch cert_node={} expected={}", sig.certificate.node_id, node_id);
         return false;
     }
     
@@ -566,7 +559,7 @@ async fn verify_hybrid_binary_signature(
         .unwrap_or_default()
         .as_secs();
     if now > sig.certificate.expires_at + CERTIFICATE_GRACE_PERIOD_SECS {
-        println!("[CONSENSUS] ❌ Certificate expired (beyond {}s grace period)", CERTIFICATE_GRACE_PERIOD_SECS);
+        println!("[ERR][CONSENSUS_CRYPTO] certificate_expired grace_period_secs={}", CERTIFICATE_GRACE_PERIOD_SECS);
         return false;
     }
     
@@ -604,7 +597,7 @@ async fn verify_hybrid_binary_signature(
     ).await;
     
     if !dilithium_key_valid {
-        println!("[CONSENSUS] ❌ Dilithium key signature verification FAILED");
+        println!("[ERR][CONSENSUS_CRYPTO] dilithium_key_sig_verification_failed");
         return false;
     }
     
@@ -613,7 +606,7 @@ async fn verify_hybrid_binary_signature(
     let ephemeral_pk = match VerifyingKey::from_bytes(&sig.ephemeral_public_key.try_into().unwrap_or([0u8; 32])) {
         Ok(pk) => pk,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Invalid ephemeral public key: {}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] invalid_ephemeral_public_key err={}", e);
             return false;
         }
     };
@@ -621,18 +614,18 @@ async fn verify_hybrid_binary_signature(
     let ed25519_sig = match Signature::from_slice(&sig.message_signature) {
         Ok(s) => s,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Invalid Ed25519 signature: {}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] invalid_ed25519_signature err={}", e);
             return false;
         }
     };
     
     // CRITICAL: Ed25519 signed RAW message bytes, not HEX string
     if ephemeral_pk.verify(&message_bytes, &ed25519_sig).is_err() {
-        println!("[CONSENSUS] ❌ Ed25519 message signature verification FAILED");
+        println!("[ERR][CONSENSUS_CRYPTO] ed25519_message_sig_verification_failed");
         return false;
     }
     
-    println!("[CONSENSUS] ✅ Hybrid_bin signature verified successfully (bincode format)");
+    println!("[INFO][CONSENSUS_CRYPTO] hybrid_bin_signature_verified format=bincode");
     true
 }
 
@@ -645,7 +638,7 @@ async fn verify_hybrid_signature(
 ) -> bool {
     // Parse hybrid signature format: "hybrid:<json_data>"
     if !signature.starts_with("hybrid:") {
-        println!("[CONSENSUS] ❌ Invalid hybrid signature format");
+        println!("[ERR][CONSENSUS_CRYPTO] invalid_hybrid_signature_format");
         return false;
     }
     
@@ -699,14 +692,14 @@ async fn verify_hybrid_signature(
             .unwrap_or(0);
         
         if !has_certificate || !has_message_sig {
-            println!("[CONSENSUS] ❌ Hybrid signature missing required fields");
+            println!("[ERR][CONSENSUS_CRYPTO] hybrid_sig_missing_required_fields");
             return false;
         }
         
         // OPTIMIZED v2.23: Verify with RAW bytes
         if let (Some(dilithium_raw), Some(ephemeral_raw)) = (dilithium_key_bytes, ephemeral_pk_bytes) {
             if signed_at > 0 {
-                println!("[CONSENSUS] 🔐 Verifying hybrid Dilithium signature...");
+                println!("[INFO][CONSENSUS_CRYPTO] verifying_hybrid_dilithium_signature");
                 
                 // Compute message hash
                 // CRITICAL FIX: message is HEX string, must decode to bytes first!
@@ -740,27 +733,25 @@ async fn verify_hybrid_signature(
                 ).await;
                 
                 if !dilithium_key_valid {
-                    println!("[CONSENSUS] ❌ Hybrid Dilithium signature FAILED!");
+                    println!("[ERR][CONSENSUS_CRYPTO] hybrid_dilithium_signature_failed");
                     return false;
                 }
                 
-                println!("[CONSENSUS] ✅ Hybrid signature verified (quantum-resistant)");
-                println!("[CONSENSUS]    Node: {}", node_id);
-                println!("[CONSENSUS]    Dilithium: ✅");
+                println!("[INFO][CONSENSUS_CRYPTO] hybrid_signature_verified node={} dilithium=ok", node_id);
                 return true;
             }
         }
         
         // Legacy: structure-only validation (for backwards compatibility)
         // This should be deprecated in production
-        println!("[CONSENSUS] ⚠️ Hybrid signature without Dilithium - legacy mode");
+        println!("[WARN][CONSENSUS_CRYPTO] hybrid_sig_without_dilithium mode=legacy");
         if has_certificate && has_message_sig {
-            println!("[CONSENSUS] ✅ Hybrid signature structure valid (legacy)");
+            println!("[INFO][CONSENSUS_CRYPTO] hybrid_signature_structure_valid mode=legacy");
             return true;
         }
     }
     
-    println!("[CONSENSUS] ❌ Invalid hybrid signature structure");
+    println!("[ERR][CONSENSUS_CRYPTO] invalid_hybrid_signature_structure");
     false
 }
 
@@ -772,7 +763,7 @@ async fn verify_dilithium_signature(
 ) -> bool {
     // PRODUCTION: Parse Dilithium signature format
     if !signature.starts_with("dilithium_sig_") {
-        println!("[CONSENSUS] ❌ Invalid signature format: expected 'dilithium_sig_' prefix");
+        println!("[ERR][CONSENSUS_CRYPTO] invalid_signature_format expected_prefix=dilithium_sig_");
         return false;
     }
     
@@ -782,7 +773,7 @@ async fn verify_dilithium_signature(
     // Find the LAST '_' to separate node_id from base64 signature
     let last_underscore_pos = signature_part.rfind('_');
     if last_underscore_pos.is_none() {
-        println!("[CONSENSUS] ❌ Signature format invalid: missing separator");
+        println!("[ERR][CONSENSUS_CRYPTO] signature_format_invalid missing=separator");
         return false;
     }
     
@@ -792,8 +783,7 @@ async fn verify_dilithium_signature(
     
     // Validate extracted node_id matches expected
     if extracted_node_id != node_id {
-        println!("[CONSENSUS] ❌ Node ID mismatch: expected '{}', got '{}'", 
-                 node_id, extracted_node_id);
+        println!("[ERR][CONSENSUS_CRYPTO] node_id_mismatch expected={} got={}", node_id, extracted_node_id);
         return false;
     }
     
@@ -801,27 +791,26 @@ async fn verify_dilithium_signature(
     let signature_bytes = match general_purpose::STANDARD.decode(signature_base64) {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("[CONSENSUS] ❌ Failed to decode base64 signature: {}", e);
+            eprintln!("[ERR][CONSENSUS] sig_base64_decode_failed node={} err={}", node_id, e);
             return false;
         }
     };
-    
-    // PRODUCTION: Real CRYSTALS-Dilithium verification using pqcrypto
-    // Our combined format includes signature + message + public key
-    // Minimum size check (at least signature + metadata)
-    if signature_bytes.len() < 2420 {
-        println!("[CONSENSUS] ❌ Signature too small: {} bytes (min 2420 for Dilithium3)", 
-                 signature_bytes.len());
+
+    // Combined format: [sig_len(4)] + [SignedMessage(sig+msg)] + [pk_len(4)] + [pk(1952)]
+    // Minimum size: ML-DSA-65 signature (3309 bytes) + message + metadata
+    if signature_bytes.len() < 3309 {
+        eprintln!("[ERR][CONSENSUS] sig_too_small node={} size={} min=3309",
+                 node_id, signature_bytes.len());
         return false;
     }
-    
-    // CRITICAL: Call actual Dilithium verification through async runtime
+
+    // CRITICAL: Call actual ML-DSA-65 verification through async runtime
     let valid = verify_with_real_dilithium(node_id, message, &signature_bytes).await;
-    
+
     if valid {
-        println!("[CONSENSUS] ✅ Signature verified for node: {}", node_id);
+        println!("[INFO][CONSENSUS] sig_verified node={}", node_id);
     } else {
-        println!("[CONSENSUS] ❌ Invalid signature from node: {}", node_id);
+        eprintln!("[ERR][CONSENSUS] sig_invalid node={}", node_id);
     }
     
     valid
@@ -833,47 +822,44 @@ async fn verify_with_real_dilithium(
     message: &str,
     signature_bytes: &[u8],
 ) -> bool {
-    // PRODUCTION: ALWAYS use real CRYSTALS-Dilithium - NO FALLBACK
-    println!("[CONSENSUS] 🔐 Using CRYSTALS-Dilithium3 verification (NIST post-quantum)");
-    
-    // Verify signature structure
+    // Verify signature structure: all-zero is trivially invalid
     if signature_bytes.iter().all(|&b| b == 0) {
-        println!("[CONSENSUS] ❌ All-zero signature detected - INVALID");
+        eprintln!("[ERR][CONSENSUS] sig_all_zeros node={}", node_id);
         return false;
     }
-    
-    // Check entropy in first 2420 bytes (the actual signature part)
-    let sig_part = &signature_bytes[..std::cmp::min(2420, signature_bytes.len())];
+
+    // Entropy check on the ML-DSA-65 signature part (3309 bytes, CTILDEBYTES=48)
+    let sig_part = &signature_bytes[..std::cmp::min(3309, signature_bytes.len())];
     let unique_bytes: std::collections::HashSet<_> = sig_part.iter().collect();
-    if unique_bytes.len() < 200 {  // Dilithium3 signatures have high entropy
-        println!("[CONSENSUS] ❌ Insufficient entropy ({} unique bytes) - NOT a real Dilithium signature", unique_bytes.len());
+    if unique_bytes.len() < 200 {
+        eprintln!("[ERR][CONSENSUS] sig_low_entropy node={} unique={} threshold=200",
+                 node_id, unique_bytes.len());
         return false;
     }
-    
-    // Parse combined format if it matches our structure
-    // Format: [sig_len(4)] + [signature(2420) + message] + [pk_len(4)] + [public_key(1952)]
+
+    // Parse combined format: [sig_len(4)] + [SignedMessage(sig+msg)] + [pk_len(4)] + [pk(1952)]
     if signature_bytes.len() < 8 {
-        println!("[CONSENSUS] ❌ Signature too short for combined format");
+        eprintln!("[ERR][CONSENSUS] sig_too_short node={} size={}", node_id, signature_bytes.len());
         return false;
     }
-    
+
     let signed_len = u32::from_le_bytes([
         signature_bytes[0],
         signature_bytes[1],
         signature_bytes[2],
         signature_bytes[3],
     ]) as usize;
-    
-    // Validate format
-    if signed_len <= 2420 || 4 + signed_len >= signature_bytes.len() {
-        println!("[CONSENSUS] ❌ Invalid combined format structure");
+
+    // ML-DSA-65 SignedMessage must be at least 3309 bytes (sig) + 1 byte (msg) = 3310 minimum
+    if signed_len <= 3309 || 4 + signed_len >= signature_bytes.len() {
+        eprintln!("[ERR][CONSENSUS] sig_format_invalid node={} signed_len={}", node_id, signed_len);
         return false;
     }
     
     // Extract public key from the end of signature
     let pk_len_start = 4 + signed_len;
     if pk_len_start + 4 > signature_bytes.len() {
-        println!("[CONSENSUS] ❌ Missing public key length field");
+        println!("[ERR][CONSENSUS_CRYPTO] missing_public_key_length_field");
         return false;
     }
     
@@ -887,66 +873,73 @@ async fn verify_with_real_dilithium(
     let pk_start = pk_len_start + 4;
     
     // CRITICAL: Dilithium3 public key MUST be exactly 1952 bytes (NIST standard)
-    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_mldsa::mldsa65 as dilithium3;
     if pk_len != dilithium3::public_key_bytes() {
-        println!("[CONSENSUS] ❌ Invalid public key size: {} (expected {})", 
-                 pk_len, dilithium3::public_key_bytes());
+        eprintln!("[ERR][CONSENSUS] pk_size_invalid node={} got={} expected={}",
+                 node_id, pk_len, dilithium3::public_key_bytes());
         return false;
     }
-    
+
     if pk_start + pk_len != signature_bytes.len() {
-        println!("[CONSENSUS] ❌ Signature length mismatch");
+        eprintln!("[ERR][CONSENSUS] sig_len_mismatch node={}", node_id);
         return false;
     }
-    
+
     // Extract components
-    let signed_message_bytes = &signature_bytes[4..4 + signed_len];  // signature + message
+    let signed_message_bytes = &signature_bytes[4..4 + signed_len];
     let public_key_bytes = &signature_bytes[pk_start..pk_start + pk_len];
-    
-    println!("[CONSENSUS] 📦 Extracted: signed_msg={} bytes, pubkey={} bytes", 
-             signed_message_bytes.len(), public_key_bytes.len());
-    
-    // Parse Dilithium3 public key
+
+    // Parse ML-DSA-65 public key
     let public_key = match dilithium3::PublicKey::from_bytes(public_key_bytes) {
         Ok(pk) => pk,
         Err(_) => {
-            println!("[CONSENSUS] ❌ Failed to parse Dilithium3 public key");
+            eprintln!("[ERR][CONSENSUS] pk_parse_failed node={}", node_id);
             return false;
         }
     };
-    
-    // Parse signed message (signature + message combined)
+
+    // Parse SignedMessage (signature + message combined)
     let signed_message = match dilithium3::SignedMessage::from_bytes(signed_message_bytes) {
         Ok(sm) => sm,
         Err(_) => {
-            println!("[CONSENSUS] ❌ Failed to parse Dilithium3 signed message");
+            eprintln!("[ERR][CONSENSUS] signed_msg_parse_failed node={}", node_id);
             return false;
         }
     };
-    
-    // PRODUCTION: Real CRYSTALS-Dilithium3 verification using pqcrypto
+
+    // ML-DSA-65 (FIPS 204) verification via pqcrypto-mldsa
     match dilithium3::open(&signed_message, &public_key) {
         Ok(recovered_message) => {
-            // Verify recovered message matches expected
             let expected_msg = message.as_bytes();
-            let expected_with_prefix = format!("{}:{}", node_id, message);
-            
-            if recovered_message == expected_msg || recovered_message == expected_with_prefix.as_bytes() {
-                println!("[CONSENSUS] ✅ Dilithium3 signature VERIFIED (quantum-resistant)");
-                println!("[CONSENSUS] ✅ Message integrity confirmed");
-                println!("[CONSENSUS] ✅ Public key: {}...", hex::encode(&public_key_bytes[..8]));
+            // Constant-time comparison to prevent timing side-channel attacks
+            if ct_eq(recovered_message.as_slice(), expected_msg) {
+                println!("[INFO][CONSENSUS] mldsa65_verified node={} pk={}...",
+                         node_id, hex::encode(&public_key_bytes[..8]));
                 return true;
             } else {
-                println!("[CONSENSUS] ❌ Message mismatch after verification");
-                println!("[CONSENSUS]    Expected: {}", message);
-                println!("[CONSENSUS]    Recovered: {} bytes", recovered_message.len());
+                eprintln!("[ERR][CONSENSUS] msg_mismatch node={} expected_len={} recovered_len={}",
+                         node_id, expected_msg.len(), recovered_message.len());
                 return false;
             }
         }
         Err(_) => {
-            println!("[CONSENSUS] ❌ Dilithium3 signature verification FAILED");
-            println!("[CONSENSUS]    Possible reasons: forged signature, wrong key, tampered data");
+            eprintln!("[ERR][CONSENSUS] mldsa65_verify_failed node={}", node_id);
             return false;
         }
     }
+}
+
+/// Constant-time byte slice comparison — prevents timing side-channel attacks.
+/// Returns true only if slices are equal in length and content.
+#[inline(never)]
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    // Use black_box to prevent compiler from optimising the loop away
+    std::hint::black_box(diff) == 0
 }

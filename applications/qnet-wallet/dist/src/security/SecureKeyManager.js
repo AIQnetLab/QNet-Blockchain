@@ -113,6 +113,9 @@ class SecureKeyManager {
                 const storedHash = localStorage.getItem('qnet_wallet_password_hash');
                 const encryptedWallet = localStorage.getItem('qnet_wallet_encrypted');
                 if (storedHash && encryptedWallet) {
+                    // LEGACY MIGRATION: old wallets stored base64(password+salt) — NOT secure.
+                    // We must keep base64 verification here; stored hash format cannot change.
+                    // After migration to IndexedDB vault (v4.1.0), this path is never used again.
                     const inputHash = safeBase64Encode(password + 'qnet_salt_2025');
                     if (inputHash !== storedHash) throw new Error('Invalid password');
 
@@ -129,9 +132,10 @@ class SecureKeyManager {
                     const migrated = await this.initializeWallet(password, mnemonic, true);
                     if (!migrated.success) throw new Error('Migration failed: ' + migrated.error);
 
-                    // Wipe ALL legacy localStorage entries
-                    ['qnet_wallet_password_hash', 'qnet_wallet_encrypted',
-                     'qnet_wallet_secure', 'qnet_wallet_initialized', 'qnet_wallet_unlocked']
+                    // Remove insecure legacy localStorage entries (base64 "hash", plaintext mnemonic)
+                    localStorage.removeItem('qnet_wallet_password_hash');
+                    localStorage.removeItem('qnet_wallet_encrypted');
+                    ['qnet_wallet_secure', 'qnet_wallet_initialized', 'qnet_wallet_unlocked']
                         .forEach(k => localStorage.removeItem(k));
 
                     // Load the freshly-created vault and continue unlock normally

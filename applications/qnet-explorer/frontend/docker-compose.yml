@@ -14,7 +14,7 @@ services:
       - NEXT_PUBLIC_API_URL=http://localhost:8545
       - NEXT_PUBLIC_NETWORK=mainnet
       - DATABASE_URL=postgresql://qnet_user:${POSTGRES_PASSWORD}@host.docker.internal:5432/qnet_explorer
-      - QNET_API_URL=${QNET_API_URL:-http://162.244.25.114:8001}
+      - QNET_API_URL=${QNET_API_URL:-https://162.244.25.114:8001}
       - REDIS_URL=${REDIS_URL:-}
       - SECURITY_WEBHOOK_URL=${SECURITY_WEBHOOK_URL:-}
       - ALERT_EMAIL=${ALERT_EMAIL:-}

@@ -185,7 +185,8 @@ export class PasswordPrompt {
     
     // Generate unique prompt ID
     generatePromptId() {
-        return `prompt_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const rb = new Uint8Array(6); crypto.getRandomValues(rb);
+        return `prompt_${Date.now()}_${Array.from(rb).map(b=>b.toString(36)).join('').slice(0,9)}`;
     }
     
     // Escape HTML

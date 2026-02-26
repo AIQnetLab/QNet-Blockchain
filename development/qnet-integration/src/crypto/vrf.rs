@@ -8,7 +8,7 @@
 // SHA3-256 for domain separation + output derivation
 // Dilithium3 detached_sign for proof generation (deterministic in PQClean)
 
-use pqcrypto_dilithium::dilithium3;
+use pqcrypto_mldsa::mldsa65 as dilithium3;
 use pqcrypto_traits::sign::{
     PublicKey as PkTrait,
     SecretKey as SkTrait,
@@ -21,10 +21,10 @@ const DOMAIN_EVAL: &[u8] = b"QNet_Dilithium3_VRF_Eval_v3";
 const DOMAIN_OUTPUT: &[u8] = b"QNet_Dilithium3_VRF_Output_v3";
 const DOMAIN_SLOT: &[u8] = b"QNet_VRF_SlotSeed_v3";
 
-/// Dilithium3 sizes
+/// ML-DSA-65 (FIPS 204) sizes — CTILDEBYTES=48
 pub const D3_PK_BYTES: usize = 1952;
 pub const D3_SK_BYTES: usize = 4032;
-pub const D3_SIG_BYTES: usize = 3293;
+pub const D3_SIG_BYTES: usize = 3309;
 
 /// VRF evaluation result
 #[derive(Debug, Clone)]

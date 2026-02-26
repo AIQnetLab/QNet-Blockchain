@@ -10,11 +10,11 @@
 // Genesis node public API endpoints (infrastructure backbone)
 // These nodes are always available for initial bootstrap
 export const GENESIS_NODES = [
-  'http://154.38.160.39',   // Genesis 001 - North America (nginx cache :80)
-  'http://62.171.157.44',   // Genesis 002 - Europe (nginx cache :80)
-  'http://161.97.86.81',    // Genesis 003 - Europe (nginx cache :80)
-  'http://5.189.130.160',   // Genesis 004 - Europe (nginx cache :80)
-  'http://162.244.25.114',  // Genesis 005 - Europe (nginx cache :80)
+  'https://154.38.160.39',   // Genesis 001 - North America
+  'https://62.171.157.44',   // Genesis 002 - Europe
+  'https://161.97.86.81',    // Genesis 003 - Europe
+  'https://5.189.130.160',   // Genesis 004 - Europe
+  'https://162.244.25.114',  // Genesis 005 - Europe
 ];
 
 // Node discovery settings

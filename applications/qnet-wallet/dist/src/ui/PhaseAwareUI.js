@@ -490,9 +490,9 @@ export class PhaseAwareUI {
             // PRODUCTION: Get active nodes from server's cached public stats
             try {
                 const bootstrapNodes = [
-                    'http://154.38.160.39:8080',
-                    'http://62.171.157.44:8080',
-                    'http://161.97.86.81:8080'
+                    'https://154.38.160.39:8080',
+                    'https://62.171.157.44:8080',
+                    'https://161.97.86.81:8080'
                 ];
                 for (const apiUrl of bootstrapNodes) {
                     try {

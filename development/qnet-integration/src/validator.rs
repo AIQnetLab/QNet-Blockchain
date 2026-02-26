@@ -162,54 +162,57 @@ impl BlockValidator {
             )),
         };
         
-        println!("[VALIDATOR] 🔐 QUANTUM: Verifying Dilithium3 signature for TX from {}", tx.from);
-        
-        // Decode signature (~3293 bytes)
+        if crate::node::is_info() {
+            println!("[INFO][VALIDATOR] mldsa65_verify from={}", tx.from);
+        }
+
+        // Decode signature (ML-DSA-65 / FIPS 204: 3309 bytes)
         let sig_bytes = hex::decode(dilithium_sig)
-            .map_err(|e| IntegrationError::ValidationError(format!("Invalid Dilithium signature hex: {}", e)))?;
-        
-        // Decode public key (~1952 bytes)
+            .map_err(|e| IntegrationError::ValidationError(format!("sig_hex_decode_failed err={}", e)))?;
+
+        // Decode public key (ML-DSA-65: 1952 bytes)
         let pubkey_bytes = hex::decode(dilithium_pubkey)
-            .map_err(|e| IntegrationError::ValidationError(format!("Invalid Dilithium public key hex: {}", e)))?;
-        
-        // Expected sizes for Dilithium3
-        const DILITHIUM3_SIG_SIZE: usize = 3293;
-        const DILITHIUM3_PK_SIZE: usize = 1952;
-        
-        if sig_bytes.len() != DILITHIUM3_SIG_SIZE {
+            .map_err(|e| IntegrationError::ValidationError(format!("pk_hex_decode_failed err={}", e)))?;
+
+        // ML-DSA-65 (FIPS 204) sizes: SIG=3309 (CTILDEBYTES=48), PK=1952
+        const MLDSA65_SIG_SIZE: usize = 3309;
+        const MLDSA65_PK_SIZE: usize = 1952;
+
+        if sig_bytes.len() != MLDSA65_SIG_SIZE {
             return Err(IntegrationError::ValidationError(format!(
-                "Invalid Dilithium3 signature size: {} (expected {})", sig_bytes.len(), DILITHIUM3_SIG_SIZE
+                "mldsa65_sig_size_invalid got={} expected={}", sig_bytes.len(), MLDSA65_SIG_SIZE
             )));
         }
-        
-        if pubkey_bytes.len() != DILITHIUM3_PK_SIZE {
+
+        if pubkey_bytes.len() != MLDSA65_PK_SIZE {
             return Err(IntegrationError::ValidationError(format!(
-                "Invalid Dilithium3 public key size: {} (expected {})", pubkey_bytes.len(), DILITHIUM3_PK_SIZE
+                "mldsa65_pk_size_invalid got={} expected={}", pubkey_bytes.len(), MLDSA65_PK_SIZE
             )));
         }
-        
+
         // Create message to verify (same as Ed25519)
         let message = self.create_client_signing_message(tx)?;
-        
-        // PRODUCTION: Real Dilithium3 verification
-        use pqcrypto_dilithium::dilithium3::{verify_detached_signature, PublicKey, DetachedSignature};
+
+        // PRODUCTION: ML-DSA-65 (FIPS 204) verification
+        use pqcrypto_mldsa::mldsa65::{verify_detached_signature, PublicKey, DetachedSignature};
         use pqcrypto_traits::sign::PublicKey as _;
         use pqcrypto_traits::sign::DetachedSignature as _;
-        
+
         let pk = PublicKey::from_bytes(&pubkey_bytes)
-            .map_err(|_| IntegrationError::ValidationError("Invalid Dilithium3 public key format".to_string()))?;
-        
+            .map_err(|_| IntegrationError::ValidationError("mldsa65_pk_parse_failed".to_string()))?;
+
         let sig = DetachedSignature::from_bytes(&sig_bytes)
-            .map_err(|_| IntegrationError::ValidationError("Invalid Dilithium3 signature format".to_string()))?;
-        
+            .map_err(|_| IntegrationError::ValidationError("mldsa65_sig_parse_failed".to_string()))?;
+
         match verify_detached_signature(&sig, &message, &pk) {
             Ok(_) => {
-                println!("[VALIDATOR] ✅ QUANTUM: Dilithium3 signature verified for TX from {}", tx.from);
-                println!("[VALIDATOR] 🛡️ TX is POST-QUANTUM RESISTANT (+50% gas fee applied)");
+                if crate::node::is_info() {
+                    println!("[INFO][VALIDATOR] mldsa65_verified from={}", tx.from);
+                }
                 Ok(true)
             }
             Err(_) => {
-                println!("[VALIDATOR] ❌ QUANTUM: Invalid Dilithium3 signature from {}", tx.from);
+                eprintln!("[ERR][VALIDATOR] mldsa65_verify_failed from={}", tx.from);
                 Ok(false)
             }
         }

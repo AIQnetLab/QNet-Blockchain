@@ -31,7 +31,9 @@ export class TokenList {
         for (const [symbol, token] of Object.entries(this.tokens)) {
             try {
                 // For now, use mock balances - will be replaced with real blockchain calls
-                this.balances[symbol] = Math.random() * 1000;
+                const _rb = new Uint32Array(1);
+                crypto.getRandomValues(_rb);
+                this.balances[symbol] = (_rb[0] / 0xFFFFFFFF) * 1000;
             } catch (error) {
                 console.error(`Failed to load balance for ${symbol}:`, error);
                 this.balances[symbol] = 0;

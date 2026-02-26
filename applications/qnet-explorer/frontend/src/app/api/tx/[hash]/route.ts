@@ -58,7 +58,7 @@ function formatAmount(amount: number | string | undefined): string {
 
 // Validate and sanitize NODE_RPC_URL to prevent SSRF
 function getNodeRpcUrl(): string {
-  const url = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
+  const url = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
@@ -75,11 +75,11 @@ function getNodeRpcUrl(): string {
         hostname.startsWith('172.26.') || hostname.startsWith('172.27.') ||
         hostname.startsWith('172.28.') || hostname.startsWith('172.29.') ||
         hostname.startsWith('172.30.') || hostname.startsWith('172.31.')) {
-      return 'http://162.244.25.114:8001';
+      return 'https://162.244.25.114:8001';
     }
     return url;
   } catch {
-    return 'http://162.244.25.114:8001';
+    return 'https://162.244.25.114:8001';
   }
 }
 

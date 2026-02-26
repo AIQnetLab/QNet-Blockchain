@@ -3052,16 +3052,16 @@ impl SimplifiedP2P {
             Ok(b) => b,
             Err(_) => return false,
         };
-        let pk = match pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&pk_bytes) {
+        let pk = match pqcrypto_mldsa::mldsa65::PublicKey::from_bytes(&pk_bytes) {
             Ok(pk) => pk,
             Err(_) => return false,
         };
-        let sig = match pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(&sig_bytes) {
+        let sig = match pqcrypto_mldsa::mldsa65::DetachedSignature::from_bytes(&sig_bytes) {
             Ok(s) => s,
             Err(_) => return false,
         };
         let payload = format!("QNET_HEALTH_PING_V1:{}:{}:{}", from, timestamp, height);
-        pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, payload.as_bytes(), &pk).is_ok()
+        pqcrypto_mldsa::mldsa65::verify_detached_signature(&sig, payload.as_bytes(), &pk).is_ok()
     }
 
     /// v2.24.3: Now stores height in PeerInfo for QUIC-only sync
@@ -6397,7 +6397,7 @@ impl SimplifiedP2P {
             .map(|(_, addr)| addr)
             .unwrap_or(peer_addr);
         
-        let url = format!("http://{}/api/v1/microblock/{}", ip_port, block_height);
+        let url = format!("https://{}/api/v1/microblock/{}", ip_port, block_height);
         
         // Use global HTTP client (shared connection pool)
         match HTTP_CLIENT.get(&url)
@@ -7365,7 +7365,7 @@ impl SimplifiedP2P {
         // PRODUCTION: Real HTTP request to peer's API endpoint
         // GENESIS PERIOD FIX: Only try port 8001 to avoid connection confusion
         // All Genesis nodes run unified API server on port 8001
-        let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
+        let endpoint = format!("https://{}:8001/api/v1/height", peer_ip);
         
         match self.query_peer_height_http(&endpoint).await {
             Ok(height) => Ok(height),
@@ -7527,7 +7527,7 @@ impl SimplifiedP2P {
         let challenge = crate::rpc::generate_quantum_challenge();
         
         // Send challenge to peer via secure channel
-        let auth_endpoint = format!("http://{}/api/v1/auth/challenge", peer_addr);
+        let auth_endpoint = format!("https://{}/api/v1/auth/challenge", peer_addr);
         
         // Use tokio HTTP client instead of curl for production
         let client = match Self::create_secure_http_client() {
@@ -7588,8 +7588,9 @@ impl SimplifiedP2P {
     /// Generate quantum-resistant challenge for peer authentication
     fn generate_quantum_challenge() -> [u8; 32] {
         use rand::RngCore;
+        use rand::rngs::OsRng;
         let mut challenge = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut challenge);
+        OsRng.fill_bytes(&mut challenge);
         challenge
     }
     
@@ -10665,7 +10666,7 @@ pub enum NetworkMessage {
         round: u64,              // Leadership round (= rotation period)
         node_id: String,         // Claiming node
         vrf_output: Vec<u8>,     // 32-byte VRF output
-        vrf_proof: Vec<u8>,      // ~3293-byte Dilithium3 detached signature
+        vrf_proof: Vec<u8>,      // ~3309-byte ML-DSA-65 detached signature
         slot_seed: Vec<u8>,      // 32-byte slot seed (for verification)
         reputation: f64,         // Node's reputation at claim time
         timestamp: u64,          // Claim timestamp
@@ -11500,7 +11501,7 @@ impl SimplifiedP2P {
                         // SCALABILITY:
                         //   TTL=3: covers 1000^3 = 1B nodes (3 hops × 1000 peers/hop)
                         //   TTL=4: covers 1000^4 = 1T nodes (theoretical max)
-                        //   Claim size: ~5.3 KB (pk=1952 + proof=3293 + overhead)
+                        //   Claim size: ~5.3 KB (pk=1952 + proof=3309 + overhead)
                         //   Bandwidth per relay: 5.3 KB × √1000 ≈ 167 KB (acceptable)
                         //   Total network: 20 claims × 167 KB × 3 hops = ~10 MB/round
                         // ═══════════════════════════════════════════════════════════════
@@ -12892,7 +12893,7 @@ impl SimplifiedP2P {
             return;
         }
         
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rngs::OsRng;
         let selected: Vec<_> = peers.choose_multiple(&mut rng, count.min(peers.len())).collect();
         
         for peer in selected {
@@ -12921,7 +12922,7 @@ impl SimplifiedP2P {
             return;
         }
         
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rngs::OsRng;
         let selected: Vec<_> = peers.choose_multiple(&mut rng, count.min(peers.len())).collect();
         
         for peer in selected {
@@ -13183,7 +13184,7 @@ impl SimplifiedP2P {
     /// format: "dilithium_sig_{nodeId}_{base64([sig_len_LE][sig+msg][pk_len_LE][pk])}"
     /// expected_message: wallet_address (the original message signed by the mobile app)
     fn verify_mobile_dilithium_gossip(&self, expected_message: &str, formatted_signature: &str, public_key_hex: &str) -> bool {
-        use pqcrypto_dilithium::dilithium3;
+        use pqcrypto_mldsa::mldsa65 as dilithium3;
         use pqcrypto_traits::sign::*;
 
         if !formatted_signature.starts_with("dilithium_sig_") {
@@ -17423,7 +17424,7 @@ impl SimplifiedP2P {
                                 // CRITICAL v2.21.3: Regular nodes - validate peer is reachable
                                 // Quick connectivity check before adding (prevents phantom peers)
                                 let peer_ip = new_peer.addr.split(':').next().unwrap_or("");
-                                let check_url = format!("http://{}:8001/health", peer_ip);
+                                let check_url = format!("https://{}:8001/health", peer_ip);
                                 
                                 let is_reachable = match reqwest::Client::builder()
                                     .timeout(std::time::Duration::from_secs(2))
@@ -17502,7 +17503,7 @@ impl SimplifiedP2P {
         // CRITICAL FIX: Use existing working query_node_for_peers logic
         // Make actual HTTP request to /api/v1/peers endpoint
         let ip = node_addr.split(':').next().unwrap_or(node_addr);
-        let endpoint = format!("http://{}:8001/api/v1/peers", ip);
+        let endpoint = format!("https://{}:8001/api/v1/peers", ip);
         
         println!("[P2P] 📞 Requesting peer list from {}", get_privacy_id_for_addr(&ip));
         
@@ -18325,7 +18326,7 @@ impl SimplifiedP2P {
         // Always notify all Super nodes (consensus validators)
         for (peer_id, peer_info) in super_nodes.iter() {
                 // Send security alert via HTTP endpoint
-                let url = format!("http://{}:{}/api/v1/security/alert", 
+                let url = format!("https://{}:{}/api/v1/security/alert", 
                                 peer_info.addr, 8001);
                 
                 let alert_json = alert_data.clone();
@@ -18360,12 +18361,12 @@ impl SimplifiedP2P {
         // SCALABILITY: For other peers, only notify a random sample (max 10)
         // This prevents network storm when we have millions of nodes
         use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rngs::OsRng;
         let sample_size = std::cmp::min(10, other_peers.len());
         let sampled_peers: Vec<_> = other_peers.choose_multiple(&mut rng, sample_size).cloned().collect();
         
         for (peer_id, peer_info) in sampled_peers.iter() {
-            let url = format!("http://{}:{}/api/v1/security/alert", 
+            let url = format!("https://{}:{}/api/v1/security/alert", 
                             peer_info.addr, self.port);
             
             let alert_json = alert_data.clone();
@@ -18676,7 +18677,7 @@ impl SimplifiedP2P {
             peer_list
         } else {
             use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rngs::OsRng;
             peer_list.choose_multiple(&mut rng, 3).cloned().collect()
         };
         
@@ -18688,7 +18689,7 @@ impl SimplifiedP2P {
                 let peer_port = 8001; // Standard QNet port
                 handle.spawn(async move {
                     // Send audit entry to peer for distributed storage
-                    let url = format!("http://{}:{}/api/v1/audit/store", 
+                    let url = format!("https://{}:{}/api/v1/audit/store", 
                                     info.addr, peer_port);
                     
                     if let Ok(client) = reqwest::Client::builder()

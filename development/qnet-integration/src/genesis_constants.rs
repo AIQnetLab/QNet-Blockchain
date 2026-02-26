@@ -121,7 +121,7 @@ pub fn is_valid_system_signature(message: &[u8], signature_hex: &str) -> bool {
     }
     
     // PRODUCTION: Verify Dilithium signature
-    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_mldsa::mldsa65 as dilithium3;
     use pqcrypto_traits::sign::{PublicKey as PQPublicKeyTrait, SignedMessage as PQSignedMessageTrait};
     
     // Decode public key and signature

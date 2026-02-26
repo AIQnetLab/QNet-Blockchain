@@ -196,7 +196,7 @@ class SecurityTester {
                 'Clears memory': content.includes('.fill(0)'),
                 'Uses AES-GCM': content.includes('AES-GCM'),
                 'Generates salt': content.includes('crypto.getRandomValues'),
-                '100000 PBKDF2 iterations': content.includes('iterations: 100000')
+                '600000 PBKDF2 iterations (OWASP 2024)': content.includes('600000') || content.includes('600_000')
             };
             
             let featureScore = 0;

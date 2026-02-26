@@ -397,7 +397,12 @@ impl BatchOperationsManager {
             .unwrap_or_default()
             .as_secs();
         
-        let random_suffix = rand::random::<u32>();
+        let random_suffix = {
+            let mut buf = [0u8; 4];
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut buf);
+            u32::from_le_bytes(buf)
+        };
         
         match operation_type {
             BatchOperationType::RewardClaims => format!("batch_rewards_{}_{}", timestamp, random_suffix),

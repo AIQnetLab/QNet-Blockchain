@@ -130,7 +130,7 @@ export async function GET(
     // 2. Failed TXs (e.g. duplicate reward claims) are in blocks but didn't change state
     // 3. Gas fees not accounted for properly
     // NOW: Use node API for balance, PostgreSQL only for TX history
-    const NODE_API = process.env.QNET_API_URL || 'http://162.244.25.114:8001';
+    const NODE_API = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
     const API_KEY = process.env.QNET_API_KEY || '';
     const nodeHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
     if (API_KEY) nodeHeaders['X-API-Key'] = API_KEY;

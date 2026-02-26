@@ -1,4 +1,4 @@
-﻿//! File encryption for LSM storage protection
+//! File encryption for LSM storage protection
 //! 
 //! This module provides AES-256-GCM encryption for protecting files on disk
 //! while maintaining blockchain transparency. Data content remains publicly
@@ -12,18 +12,19 @@ use rand::RngCore;
 /// File encryption system for protecting data at rest
 /// NOTE: This encrypts only the file storage, not the data content
 /// All blockchain data remains publicly queryable via APIs
+/// Master key is generated via OsRng — not derived from any public identifier
 #[derive(Clone)]
 pub struct FileEncryption {
-    /// Master encryption key for file protection (256-bit)
+    /// Master encryption key for file protection (256-bit, OsRng-generated)
     master_key: Vec<u8>,
-    
+
     /// Encryption enabled flag
     enabled: bool,
-    
-    /// Key derivation salt (256-bit)
+
+    /// Random salt stored for reference (not used in key derivation)
     salt: [u8; 32],
-    
-    /// Node identifier for key derivation
+
+    /// Node identifier (stored for record-keeping, not used in key derivation)
     node_id: String,
 }
 
@@ -100,27 +101,20 @@ impl From<std::io::Error> for EncryptionError {
 }
 
 impl FileEncryption {
-    /// Create new file encryption system
+    /// Create new file encryption system.
+    /// Master key is fully random (OsRng), independent of node_id.
     pub fn new(enabled: bool, node_id: String) -> Result<Self, EncryptionError> {
+        use rand::RngCore;
+        use rand::rngs::OsRng;
+
         let mut salt = [0u8; 32];
-        if enabled {
-            // Generate cryptographically secure random salt
-            use rand::RngCore;
-            rand::thread_rng().fill_bytes(&mut salt);
-        }
-        
-        // Generate 256-bit master key for AES-256-GCM
         let mut master_key = vec![0u8; 32];
+
         if enabled {
-            // Derive key from node ID and random salt for uniqueness
-            let mut hasher = Sha3_256::new();
-            hasher.update(node_id.as_bytes());
-            hasher.update(&salt);
-            hasher.update(b"qnet_lsm_encryption_key");
-            let key_hash = hasher.finalize();
-            master_key.copy_from_slice(&key_hash);
+            OsRng.fill_bytes(&mut salt);
+            OsRng.fill_bytes(&mut master_key);
         }
-        
+
         Ok(Self {
             master_key,
             enabled,
@@ -156,8 +150,9 @@ impl FileEncryption {
         }
         
         // Generate unique nonce for this encryption
+        use rand::rngs::OsRng;
         let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        OsRng.fill_bytes(&mut nonce);
         
         // Create file header
         let header = EncryptedFileHeader {
@@ -317,21 +312,18 @@ impl FileEncryption {
         }
         
         // Generate new salt
-        rand::thread_rng().fill_bytes(&mut self.salt);
+        {
+            use rand::RngCore;
+            use rand::rngs::OsRng;
+            OsRng.fill_bytes(&mut self.salt);
+        }
         
-        // Derive new key
-        let mut hasher = Sha3_256::new();
-        hasher.update(self.node_id.as_bytes());
-        hasher.update(&self.salt);
-        hasher.update(b"qnet_lsm_encryption_key_rotated");
-        hasher.update(&std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_le_bytes());
-        
-        let key_hash = hasher.finalize();
-        self.master_key.copy_from_slice(&key_hash);
+        // Generate a fresh random master key (independent of node_id)
+        {
+            use rand::RngCore;
+            use rand::rngs::OsRng;
+            OsRng.fill_bytes(&mut self.master_key);
+        }
         
         Ok(())
     }

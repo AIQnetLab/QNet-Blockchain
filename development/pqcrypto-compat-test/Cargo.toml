@@ -6,7 +6,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-pqcrypto-dilithium = { version = "0.5" }
+pqcrypto-mldsa = { version = "0.1" }
 pqcrypto-traits = "0.3"
 hex = "0.4"
 

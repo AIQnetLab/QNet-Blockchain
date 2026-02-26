@@ -45,11 +45,11 @@ class DynamicPricing {
         
         // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
         this.bootstrapNodes = [
-            'http://154.38.160.39:8080',   // Genesis #1 - North America
-            'http://62.171.157.44:8080',   // Genesis #2 - Europe
-            'http://161.97.86.81:8080',    // Genesis #3 - Europe
-            'http://5.189.130.160:8080',   // Genesis #4 - Europe
-            'http://162.244.25.114:8080'   // Genesis #5 - Europe
+            'https://154.38.160.39:8080',   // Genesis #1 - North America
+            'https://62.171.157.44:8080',   // Genesis #2 - Europe
+            'https://161.97.86.81:8080',    // Genesis #3 - Europe
+            'https://5.189.130.160:8080',   // Genesis #4 - Europe
+            'https://162.244.25.114:8080'   // Genesis #5 - Europe
         ];
     }
     

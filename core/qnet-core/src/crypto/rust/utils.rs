@@ -1,20 +1,20 @@
 //! Cryptographic utilities for QNet
 
-use rand::{RngCore, Rng};
-use rand::thread_rng;
+use rand::RngCore;
+use rand::rngs::OsRng;
 use crate::crypto::rust::production_crypto::{ProductionCrypto, CryptoErrorWithKind as CryptoError, CryptoErrorKind};
 
 /// Generate a random nonce for use in cryptographic operations
 pub fn generate_nonce() -> [u8; 32] {
     let mut nonce = [0u8; 32];
-    rand::thread_rng().fill(&mut nonce);
+    OsRng.fill_bytes(&mut nonce);
     nonce
 }
 
 /// Generate a random seed for key derivation
 pub fn generate_seed() -> [u8; 64] {
     let mut seed = [0u8; 64];
-    rand::thread_rng().fill(&mut seed);
+    OsRng.fill_bytes(&mut seed);
     seed
 }
 

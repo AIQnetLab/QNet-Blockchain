@@ -1,0 +1,17 @@
+{
+  "name": "qnet-wallet",
+  "version": "2.1.4",
+  "description": "QNet Wallet browser extension with post-quantum Dilithium-3 hybrid signatures",
+  "private": true,
+  "dependencies": {
+    "@noble/post-quantum": "^0.5.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.3",
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "build:dilithium": "node tools/dilithium-wasm/build.js",
+    "build": "npm run build:dilithium"
+  }
+}

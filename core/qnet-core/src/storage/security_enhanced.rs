@@ -467,8 +467,9 @@ pub enum SecurityError {
 /// Generate cryptographically secure random nonce
 fn generate_random_nonce() -> [u8; 12] {
     use rand::RngCore;
+    use rand::rngs::OsRng;
     let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    OsRng.fill_bytes(&mut nonce);
     nonce
 }
 

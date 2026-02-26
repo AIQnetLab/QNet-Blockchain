@@ -156,7 +156,7 @@ if (-not $SkipPasswordChange) {
 # Generated: $timestamp
 
 DATABASE_URL=postgresql://qnet_user:$newPassword@localhost:5432/qnet_explorer
-QNET_API_URL=http://162.244.25.114:8001
+QNET_API_URL=https://162.244.25.114:8001
 DB_SSL=false
 "@
     

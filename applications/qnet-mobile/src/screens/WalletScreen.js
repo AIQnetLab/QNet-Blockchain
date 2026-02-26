@@ -2920,9 +2920,14 @@ const WalletScreen = () => {
   };
 
   const _doUnlock = async (pw) => {
-    // Quick password check first (fast)
+    // Show loading immediately — PBKDF2 verification takes 1-3s
+    setLoading(true);
+    setUnlockError('');
+
+    // Quick password check first (PBKDF2 decrypt to verify)
     const isValid = await walletManager.verifyPassword(pw);
     if (!isValid) {
+      setLoading(false);
       const status = await walletManager.getPasswordLockStatus();
       if (status.locked) {
         _startLockoutCountdown(status.remainingMs);
@@ -2934,11 +2939,28 @@ const WalletScreen = () => {
       return;
     }
 
-    // Optimized: Set UI state immediately, decrypt in background
-    setShowSplash(false); // Hide splash immediately
-    
-    // Load wallet asynchronously
+    // Password verified — hide splash, keep loading spinner visible
+    setShowSplash(false);
+
+    // Load wallet asynchronously (may trigger vault migration)
     walletManager.loadWallet(pw).then(loadedWallet => {
+      setLoading(false);
+      // Show migration notification if vault was upgraded
+      if (loadedWallet._migrated) {
+        const fromVersion = loadedWallet._migratedFromVersion || 1;
+        const fromIterations = fromVersion === 2 ? '100,000' : '10,000';
+        setTimeout(() => {
+          Alert.alert(
+            'Security Upgrade',
+            `Your wallet has been automatically upgraded to enhanced security (PBKDF2 600,000 iterations instead of ${fromIterations}).\n\nYour funds and keys are safe — this is a one-time improvement.`,
+            [{ text: 'OK', style: 'default' }]
+          );
+        }, 1000); // Small delay so main UI renders first
+      }
+      // Clean internal migration flags before storing in state
+      delete loadedWallet._migrated;
+      delete loadedWallet._migratedFromVersion;
+
       setWallet(loadedWallet);
       
       // Load balance in parallel
@@ -3082,6 +3104,18 @@ const WalletScreen = () => {
         });
       }, 100);
     }).catch(error => {
+      setLoading(false);
+      // Migration error — wallet is readable but re-encryption failed
+      if (error.message && error.message.includes('Wallet migration failed')) {
+        Alert.alert(
+          'Security Upgrade Failed',
+          `${error.message}\n\nYour wallet is still accessible. Please close the app and try again. If the problem persists, contact support.`,
+          [{ text: 'OK', style: 'default' }]
+        );
+        // Show the splash again so user can retry
+        setShowSplash(true);
+        return;
+      }
       // Check if it's a corrupted wallet issue
       if (error.message && (error.message.includes('Malformed UTF-8') || 
           error.message.includes('corrupted'))) {

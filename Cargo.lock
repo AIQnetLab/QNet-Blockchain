@@ -2956,19 +2956,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pqcrypto-dilithium"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "685de0fa68c6786559d5fcdaa414f0cd68ef3f5d162f61823bd7424cd276726f"
-dependencies = [
- "cc",
- "glob",
- "libc",
- "pqcrypto-internals",
- "pqcrypto-traits",
-]
-
-[[package]]
 name = "pqcrypto-falcon"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3294,7 +3281,7 @@ dependencies = [
  "lazy_static",
  "log",
  "parking_lot 0.12.5",
- "pqcrypto-dilithium",
+ "pqcrypto-mldsa",
  "pqcrypto-traits",
  "prometheus",
  "proptest",
@@ -3328,9 +3315,9 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "pqcrypto",
- "pqcrypto-dilithium",
  "pqcrypto-falcon 0.3.0",
  "pqcrypto-kyber",
+ "pqcrypto-mldsa",
  "pqcrypto-sphincsplus",
  "pqcrypto-traits",
  "rand 0.8.5",
@@ -3382,7 +3369,7 @@ dependencies = [
  "once_cell",
  "parking_lot 0.12.5",
  "pqcrypto",
- "pqcrypto-dilithium",
+ "pqcrypto-mldsa",
  "pqcrypto-traits",
  "prometheus",
  "proptest",

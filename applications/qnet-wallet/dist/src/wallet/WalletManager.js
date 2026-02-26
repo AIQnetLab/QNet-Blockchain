@@ -5,6 +5,12 @@
 
 import { SecureCrypto } from '../crypto/SecureCrypto.js';
 
+function _cryptoHex(byteLen) {
+    const b = new Uint8Array(byteLen);
+    crypto.getRandomValues(b);
+    return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
 export class WalletManager {
     // Rate-limit constants
     static RATE_LIMIT_KEY = 'qnet_ext_rate_limit';
@@ -496,7 +502,7 @@ export class WalletManager {
             // Fallback for testnet development
             if (error.message.includes('ECONNREFUSED') || error.message.includes('fetch')) {
                 console.log('🔄 QNet API unavailable, using testnet fallback');
-                const txHash = 'qnet_' + Date.now().toString(16) + Math.random().toString(16).substr(2, 8);
+                const txHash = 'qnet_' + Date.now().toString(16) + _cryptoHex(4);
                 return {
                     signature: txHash,
                     confirmed: true,
@@ -531,7 +537,7 @@ export class WalletManager {
      */
     generateTransactionHash() {
         const timestamp = Date.now().toString();
-        const random = Math.random().toString(36).substring(2);
+        const random = _cryptoHex(16);
         return `0x${this.crypto.hash(timestamp + random)}`;
     }
 } 

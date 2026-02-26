@@ -27,7 +27,8 @@ pub type NodeId = [u8; KEY_SIZE];
 /// Generate a random node ID
 pub fn generate_node_id() -> NodeId {
     let mut id = [0u8; KEY_SIZE];
-    rand::thread_rng().fill(&mut id);
+    use rand::rngs::OsRng;
+    OsRng.fill(&mut id);
     id
 }
 

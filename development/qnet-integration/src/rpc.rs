@@ -729,7 +729,7 @@ struct TransactionRequest {
     public_key: String,
     /// QUANTUM v2.25: Optional Dilithium3 signature for post-quantum security
     /// When present: TX is quantum-resistant, gas cost +50%
-    /// Format: hex-encoded (~6586 chars for 3293 bytes)
+    /// Format: hex-encoded (~6618 chars for 3309 bytes)
     #[serde(default)]
     dilithium_signature: Option<String>,
     /// QUANTUM v2.25: Dilithium3 public key (required if dilithium_signature present)
@@ -3406,7 +3406,7 @@ async fn handle_validators_with_proof(
             let region = get_genesis_region_by_ip(genesis_ip).unwrap_or("Europe");
             validators.push(json!({
                 "node_id": node_id,
-                "address": format!("http://{}:8001", genesis_ip), // v3.35: Full URL format
+                "address": format!("https://{}:8001", genesis_ip),
                 "node_type": "Super",
                 "reputation": real_rep.max(0.7), // Genesis minimum 0.7
                 "last_seen": current_time,
@@ -5117,7 +5117,7 @@ async fn handle_node_discovery(
             "region": peer.region,
             "last_seen": peer.last_seen,
             "reputation": real_reputation, // v3.19: From blockchain!
-            "api_endpoint": format!("http://{}:8001/api/v1/", peer.address)
+            "api_endpoint": format!("https://{}:8001/api/v1/", peer.address)
         })
     }).collect();
     
@@ -5126,7 +5126,8 @@ async fn handle_node_discovery(
             "node_id": blockchain.get_public_display_name(),
             "node_type": format!("{:?}", blockchain.get_node_type()),
             "region": format!("{:?}", blockchain.get_region()),
-            "api_endpoint": format!("http://0.0.0.0:8001/api/v1/")
+            "api_endpoint": format!("https://{}:8001/api/v1/",
+                std::env::var("QNET_PUBLIC_IP").unwrap_or_else(|_| "0.0.0.0".to_string()))
         },
         "available_nodes": peer_nodes,
         "total_nodes": peer_nodes.len() + 1,
@@ -5454,7 +5455,7 @@ async fn verify_dilithium_client_signature(
     signature_hex: &str,
     public_key_hex: &str
 ) -> Result<bool, String> {
-    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_mldsa::mldsa65 as dilithium3;
     use pqcrypto_traits::sign::*;
     
     // Basic validation
@@ -5483,7 +5484,7 @@ async fn verify_dilithium_client_signature(
         }
     };
     
-    // Decode signature (Dilithium3 signature is 3293 bytes)
+    // Decode signature (ML-DSA-65 signature is 3309 bytes, CTILDEBYTES=48)
     let sig_bytes = match hex::decode(signature_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -5795,9 +5796,10 @@ async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: 
 
 // Generate quantum-resistant challenge
 pub fn generate_quantum_challenge() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let challenge_bytes: [u8; 32] = rng.gen();
+    use rand::RngCore;
+    use rand::rngs::OsRng;
+    let mut challenge_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut challenge_bytes);
     hex::encode(challenge_bytes)
 }
 
@@ -10604,41 +10606,44 @@ async fn handle_auth_challenge(
         }
     };
     
-    // Generate CRYSTALS-Dilithium signature (production implementation)
     let node_id = blockchain.get_node_id();
-    let mut signature_data = Vec::with_capacity(2420); // Dilithium signature size
     
-    // Create deterministic signature based on challenge and node identity
-    let mut hasher = Sha3_256::new();
-    hasher.update(&challenge_bytes);
-    hasher.update(node_id.as_bytes());
-    hasher.update(b"qnet-dilithium-auth-v1");
-    hasher.update(&request.timestamp.to_be_bytes());
+    // PRODUCTION: Sign challenge with REAL Dilithium3 via quantum crypto
+    let challenge_msg = format!("auth_challenge:{}:{}", hex::encode(&challenge_bytes), request.timestamp);
     
-    let seed = hasher.finalize();
+    let (signature_hex, pubkey_hex) = match crate::node::try_get_quantum_crypto() {
+        Some(crypto) => {
+            match crypto.create_consensus_signature(&node_id, &challenge_msg).await {
+                Ok(sig) => {
+                    let pk_bytes = match crate::key_manager::DilithiumKeyManager::new(
+                        node_id.to_string(),
+                        std::path::Path::new(&std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "/app/data".to_string())).join("keys").as_path()
+                    ) {
+                        Ok(km) => km.get_public_key().unwrap_or_default(),
+                        Err(_) => Vec::new(),
+                    };
+                    (sig.signature, hex::encode(&pk_bytes))
+                }
+                Err(e) => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][AUTH] dilithium_sign_failed err={}", e);
+                    }
+                    return Ok(warp::reply::json(&json!({ "error": "Signature generation failed" })));
+                }
+            }
+        }
+        None => {
+            return Ok(warp::reply::json(&json!({ "error": "Quantum crypto not initialized" })));
+        }
+    };
     
-    // PRODUCTION: Generate real Dilithium signature pattern
-    for i in 0..2420 {
-        signature_data.push(seed[i % 32]);
+    if crate::node::is_info() {
+        println!("[INFO][AUTH] p2p_challenge_signed node={}", node_id);
     }
-    
-    // PRODUCTION: Generate real Dilithium public key
-    let mut pubkey_data = Vec::with_capacity(1312); // Dilithium public key size
-    let mut pubkey_hasher = Sha3_256::new();
-    pubkey_hasher.update(node_id.as_bytes());
-    pubkey_hasher.update(b"qnet-dilithium-pubkey-v1");
-    let pubkey_seed = pubkey_hasher.finalize();
-    
-    for i in 0..1312 {
-        pubkey_data.push(pubkey_seed[i % 32]);
-    }
-    
-    println!("[AUTH] ✅ P2P authentication challenge processed for peer");
-    println!("[AUTH] 🔐 Generated CRYSTALS-Dilithium response (2420 byte signature)");
     
     let response = AuthChallengeResponse {
-        signature: hex::encode(&signature_data),
-        public_key: hex::encode(&pubkey_data),
+        signature: signature_hex,
+        public_key: pubkey_hex,
         node_id: node_id.to_string(),
         timestamp: current_time,
     };
@@ -13350,14 +13355,14 @@ async fn handle_contract_deploy(
 
 /// Verify Dilithium3 signature from mobile client (Android DilithiumModule / Bouncy Castle)
 /// Format: "dilithium_sig_{nodeId}_{base64}" where base64 decodes to:
-///   [signed_msg_len(4 LE)] [signedMessage = sig(3293) + msg(N)] [pk_len(4 LE)] [pk(1952)]
+///   [signed_msg_len(4 LE)] [signedMessage = sig(3309) + msg(N)] [pk_len(4 LE)] [pk(1952)]
 /// Both Bouncy Castle and pqcrypto use the same NIST FIPS 204 standard
 fn verify_mobile_dilithium_signature(
     expected_message: &str,
     formatted_signature: &str,
     public_key_hex: &str,
 ) -> bool {
-    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_mldsa::mldsa65 as dilithium3;
     use pqcrypto_traits::sign::*;
     
     // Step 1: Extract base64 payload from formatted string
@@ -13489,7 +13494,7 @@ async fn verify_dilithium_signature_for_contract(
     signature_hex: &str,
     public_key_hex: &str,
 ) -> bool {
-    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_mldsa::mldsa65 as dilithium3;
     use pqcrypto_traits::sign::*;
     
     // Decode public key

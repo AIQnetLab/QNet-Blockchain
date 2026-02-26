@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { createHash, randomBytes } from 'crypto';
 
 export async function GET(request: NextRequest) {
   const buildInfo = {
@@ -51,19 +52,34 @@ export async function GET(request: NextRequest) {
   });
 }
 
-// Simple function to get file hash (placeholder)
 async function getFileHash(filename: string): Promise<string> {
-  // In real version this will be SHA-256 hash of file
-  // For demo using fixed values
-  const hashes: Record<string, string> = {
-    'package.json': 'sha256:a1b2c3d4e5f6...',
-    'next.config.js': 'sha256:f6e5d4c3b2a1...',
-  };
-  return hashes[filename] || 'sha256:' + Math.random().toString(36).substring(2, 15);
+  try {
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const filePath = path.join(process.cwd(), filename);
+    const content = await fs.readFile(filePath);
+    return 'sha256:' + createHash('sha256').update(content).digest('hex');
+  } catch {
+    return 'sha256:unavailable';
+  }
 }
 
-// Simple function to get directory hash (placeholder)  
 async function getDirectoryHash(dirname: string): Promise<string> {
-  // In real version this will be aggregated hash of all files in directory
-  return 'sha256:' + Math.random().toString(36).substring(2, 15);
-} 
+  try {
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const dirPath = path.join(process.cwd(), dirname);
+    const hash = createHash('sha256');
+    const entries = await fs.readdir(dirPath, { recursive: true, withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile()) {
+        const fp = path.join(entry.parentPath ?? entry.path, entry.name);
+        const content = await fs.readFile(fp);
+        hash.update(content);
+      }
+    }
+    return 'sha256:' + hash.digest('hex');
+  } catch {
+    return 'sha256:unavailable';
+  }
+}

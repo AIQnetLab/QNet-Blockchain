@@ -1,11 +1,11 @@
-/// Dilithium3 compatibility test: verifies BC-generated signatures with pqcrypto-dilithium 0.5
+/// ML-DSA-65 compatibility test: verifies Android pqclean C signatures against pqcrypto-mldsa 0.1
 /// Usage: cargo run --example dilithium_compat_test
 ///
 /// Paste the PK_HEX and SIG_HEX from Android logcat (DILITHIUM_COMPAT tag) into the constants below.
-/// Then run. If VERIFIED prints, BC 1.75 is compatible with pqcrypto-dilithium 0.5.
+/// Then run. If VERIFIED prints, Android NDK pqclean is compatible with pqcrypto-mldsa 0.1 (FIPS 204).
 
-use pqcrypto_dilithium::dilithium3;
-use pqcrypto_traits::sign::{PublicKey as _, SignedMessage as _, VerificationError};
+use pqcrypto_mldsa::mldsa65 as dilithium3;
+use pqcrypto_traits::sign::{PublicKey as _, SignedMessage as _};
 
 // BC 1.75 DilithiumParameters.dilithium3 output (from Android DILITHIUM_COMPAT logcat)
 const PK_HEX: &str = "ccb6c54340d78e150609989a91b1687fc7f4c1608c5a7cbba43d6848c6e3cd2e43bff5fd42a05e3cc6bb4b5f567f02462f1260503fa968b38a9f7b356c8ea0c7f3e3b82d14e38e2e5188295217ee7305955543f6fcd8f77c1ee22314ca5dc7e84881301527435a7e3d2a15f555c51b54c145743e4705404acc3dd1c28f25b38abde801009b30ea2d4f341a430578583f09199a64e362c66bb5b18962f9ed7d2eabba87a96952ac11cdab444c5cf5861f9cb3be9b6e535b2be4aeebe8b7fcef7e6b78c8e610d19e9fd31b5bc57692e85be4da5f54e059e5952902cff4f7d7455436f64891f5c02ed4294e98c10ca019a1cd01097341ff2e7b722094f4b77755a21b0c03a52050a23c37b88a3bd4e4a3fd453ff29b87b74d130438e0f1c16e48b4869936f2fe9129a788c6d83629f709897e779c604183dbde6c064b19b8156101dddca0ad6b87120800c8f9dfeea382bd1496d624e21e01ebf0716b1355217f9ebd000ee0e07a7aa5ad586747cdc4a9a0bbcc5280056a76deeccecfbd1dcf3cf3fd9690bf38cb33a11717b9c6cc0021885a6af524c09a803c171ef33c71db17808e9b9b04c566a7f31a62f927b7af4d2aae1f6d03a6077e0972762e2e298dad83ac5cb6e9c78241872e655f57f9ce872cef4edc80957ed67f58f3968567604f44b28551fb40dac51ba8d475acaf138b98adb42999c4e5742c734df1dbdb0259e1312e6b19ceb57adfe2dcb520d6695b77b966e9c2f0d77dd1387333818ba34876c4bca5509b40d3a660015e5f4338f2aba1d900fd51ad375f325a7960b574ba54df2d90c1f1a4fcb048872c7f9613092a65d9fd74499754b8f0c706c2149b5d873ce76ccc108a68ed526fd29c622698e6d2a77bc4f2d0d51765a9d78e31c5c9c9137146da081153ba12c600d5b6da506ce02dbafc462e8e1f246d25a449123fe1deb85fd6b9c3739725e7a0887cb40ec919d584775aa2b2b94ed84ede2a6f69abbc9715ec946d079d6b1e97e06ae0fe7da9e693829a887e46c9c36565707eced9bd08b69e9615a7ab5fc552677424cec754b3f42b37e27bfa2acaa02ab4393556f3b320308e1a4c30649ba8d4b7ced9e1cd3f599aa269d588ee87c0f2cee01d4d8ad936574ae6038a53c0720db48ea8a91e898820bdc51336d044f8c06a766d562857ef94c283503293825e16d828479e62de29f32d00512e0ced72da209560d09e39d68101937a07e96acfca3cb541a5b009143e277c3c29514ad7af4f81079b82417b3b04a615c64f2585520d88dadffaacac6ca7e513952a0345b5b9b7c10b7a06b74038207803984a9ecebcc110ec7a59fdec6894e85feea46ce2ebaa4535fb8c5bac3de48108776c2cfc4d27883121f50ccfe143ac1e01af84617f66883c58274dbc737b05e4b038385dc5e591e4cfe6e71c7d4a64212865e39ecd9a45e63f0886d6297ce17cd04439401c6d1bc4074269dddec2939e00e875f4c90f9eb40b9daa4bff8aa1d894c420fff934b17d0d3dafba5339270c9eaa203d80e601967c321296c11ea2cd4567fa814897f9a9cea1fe972bd390e5bb031a16e2b325392ba12281ce04a8ed4daaaccd2fb38d718602744a09031e9d05203222140dc896dab4e386cbab6ca08a3f3c6625263bec1f4966ab13ec5d48147ed641a4641b7f19408a820852351d8df01237d8ce35acf29984d5425bcd41b9ceb50229631d341d564f6d12215bf2fe79501ce61a8d7a7d22e195dc796f4fad79f4350e25df37167b58f2160b93a4debd3d5a39723ae7f5abf2d38c17550272e277bb70f94724d435996a547e932926df4bbd28710c3b7233d7f4f4d15c497aba8762ccf797a9f8087aba1290b4c45ba0f7c4c8de55bf10e49525922e1de8da9a6348f70a53e017b16ebc7ba31323a63118310521d348b355099826bc3d23b6a9a740de78007d8fa9ec682b3624c86263896d2edd344eeeac300abc24a47cb7429b9e5a2584fefd466829f406ce747b7d8a00763e3d58541e8c3ccf60c17ae7e8fe5976623e1c94ba2e36fc3bda86149f36206b10f66cac56a785677b00d12eac518572026aa7c77a72474c828eaf8f53e476830550585fbabfd2ca7cf424ac08e0deb21cb3e78164bce3c184cc23aa175449d6cc020d51671e03ab9b7180de223b2651553467a227b59b5351065b5f99f2634ffb4e2f63ca79eaa6a2e385ee4ff3a0fae79e3379943c57bc36aa20487ab55df661e171686e913754853243b08a21ac64f17d9505354d9e82637f24c0b68715f58e39be59186ab983417838afcb30659b99537b8ee2f84b344c92114e098351448852d4dde7e02fee0974e943069761d1461f1d7cbe01ae6eb8f51d5f5ebefc90b19e7bfd5ea76a2358a614207535e5aa031c79e1e9234eb22b2bc204481d9b2a96e023c44c890ff7a467a6bfc3683093aecf8686ba89adbf2160704eb1903e0e862990c0120fc1d0d01ca77ff77dccd0ace6673d5881865290fe1ee507e87858ae466720baed9195df8e5dd241dd31e6ddd004d794594e0212d1aa46cd464967441baca6ec287773fa10ee59902ba9b84f69ffd3521ddf627a882563cd03db081a1549d8088aa3c0a67566e140fed04462e67c2be61bc0f916a4f73b32431a591e4765bed2f863ee6fa23c1edf3af507adfa16b0cf973845b04e2fc493027953ea07d33f8d869daf5dae2fd5b01a7ef5a2b90013a39fbd527884a96016ad45d284f93bd7261235d36f58431ff6842e179cd527";
@@ -31,14 +31,14 @@ fn main() {
     let sig_bytes = hex_decode(SIG_HEX);
 
     println!("PK  length: {} (expected 1952)", pk_bytes.len());
-    println!("SIG length: {} (expected 3293)", sig_bytes.len());
+    println!("SIG length: {} (expected 3309)", sig_bytes.len());
 
     let pk = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
         Ok(k) => { println!("PublicKey::from_bytes → OK"); k }
         Err(e) => { println!("PublicKey::from_bytes → FAILED: {:?}", e); return; }
     };
 
-    // pqcrypto open() expects: signature (3293 bytes) || message
+    // pqcrypto open() expects: SignedMessage = signature (3309 bytes, ML-DSA-65) || message
     let mut sm_bytes = sig_bytes.clone();
     sm_bytes.extend_from_slice(MESSAGE);
 
@@ -49,12 +49,12 @@ fn main() {
 
     match dilithium3::open(&sm, &pk) {
         Ok(msg) => {
-            println!("RESULT: ✅ VERIFIED — BC 1.75 is COMPATIBLE with pqcrypto-dilithium 0.5");
-            println!("Recovered message: {:?}", String::from_utf8_lossy(&msg));
+            println!("RESULT: VERIFIED — Android pqclean C is COMPATIBLE with pqcrypto-mldsa 0.1");
+            println!("recovered_msg={:?}", String::from_utf8_lossy(&msg));
         }
         Err(e) => {
-            println!("RESULT: ❌ FAILED — BC 1.75 is NOT compatible with pqcrypto-dilithium 0.5");
-            println!("Error: {:?}", e);
+            println!("RESULT: FAILED — signature NOT compatible with pqcrypto-mldsa 0.1");
+            println!("err={:?}", e);
         }
     }
 }

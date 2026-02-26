@@ -41,7 +41,7 @@ const BOOTSTRAP_NODES: string[] = (() => {
     return [apiUrl];
   }
   // Priority 3: Default (should be overridden in production .env)
-  return ['http://162.244.25.114:8001'];
+  return ['https://162.244.25.114:8001'];
 })();
 
 function getRandomBootstrapNode(): string {
@@ -178,11 +178,17 @@ async function getEligibleValidators(): Promise<EligibleValidator[]> {
 }
 
 // Normalize node URL (handles both "http://ip:port" and "ip:port" formats)
+// Use HTTPS for real IPs, HTTP only for localhost/127.0.0.1
 function normalizeNodeUrl(address: string): string {
   if (address.startsWith('http://') || address.startsWith('https://')) {
+    // Replace http with https for real IPs (not localhost/127.0.0.1)
+    if (address.startsWith('http://') && !address.includes('localhost') && !address.includes('127.0.0.1')) {
+      return address.replace('http://', 'https://');
+    }
     return address;
   }
-  return `http://${address}`;
+  const isLocal = address.includes('localhost') || address.includes('127.0.0.1');
+  return isLocal ? `http://${address}` : `https://${address}`;
 }
 
 // Fisher-Yates shuffle

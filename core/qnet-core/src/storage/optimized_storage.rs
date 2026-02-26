@@ -41,41 +41,11 @@ pub struct OptimizedStorage {
     file_encryption: Arc<FileEncryption>,
 }
 
-/// File encryption system for protecting data at rest
-/// NOTE: This encrypts only the file storage, not the data content
-/// All blockchain data remains publicly queryable via APIs
-pub struct FileEncryption {
-    /// Master encryption key for file protection
-    master_key: Arc<Key<Aes256Gcm>>,
-    
-    /// Cipher instance for AES-256-GCM
-    cipher: Arc<Aes256Gcm>,
-    
-    /// Key derivation salt
-    salt: [u8; 32],
-    
-    /// Encryption enabled flag
-    enabled: bool,
-}
-
-/// Encrypted file header for integrity verification
-#[derive(Clone)]
-pub struct EncryptedFileHeader {
-    /// File format version
-    version: u8,
-    
-    /// AES-GCM nonce (96 bits)
-    nonce: [u8; 12],
-    
-    /// Authentication tag (128 bits)  
-    tag: [u8; 16],
-    
-    /// File checksum for integrity
-    checksum: [u8; 32],
-    
-    /// Encryption timestamp
-    timestamp: u64,
-}
+/// File encryption system for protecting data at rest using AES-256-GCM.
+/// NOTE: This encrypts only the file storage, not the data content.
+/// All blockchain data remains publicly queryable via APIs.
+///
+/// Struct definition and impl are below (after SST/LSM code).
 
 /// LSM-tree storage engine
 pub struct LSMEngine {
@@ -1004,133 +974,74 @@ impl LSMEngine {
     }
 }
 
-// Implement production methods for LRUCache
-/// File encryption system for protecting data at rest
-/// NOTE: This encrypts only the file storage, not the data content
-/// All blockchain data remains publicly queryable via APIs
+/// File encryption system for protecting data at rest using AES-256-GCM.
+/// Provides authenticated encryption: confidentiality + integrity + tamper detection.
 pub struct FileEncryption {
-    /// Master encryption key for file protection
-    master_key: Vec<u8>,
-    
+    /// AES-256-GCM cipher instance (key baked in)
+    cipher: Aes256Gcm,
+
     /// Encryption enabled flag
     enabled: bool,
-    
-    /// Key derivation salt
-    salt: [u8; 32],
 }
 
-/// Encrypted file header for integrity verification
-#[derive(Clone)]
-pub struct EncryptedFileHeader {
-    /// File format version
-    version: u8,
-    
-    /// AES-GCM nonce (96 bits)
-    nonce: [u8; 12],
-    
-    /// Authentication tag (128 bits)  
-    tag: [u8; 16],
-    
-    /// File checksum for integrity
-    checksum: [u8; 32],
-    
-    /// Encryption timestamp
-    timestamp: u64,
-}
+/// On-disk format:  [0xFF marker] [12-byte nonce] [ciphertext || 16-byte GCM tag]
+const ENCRYPTION_MARKER: u8 = 0xFF;
+const NONCE_LEN: usize = 12;
+const HEADER_LEN: usize = 1 + NONCE_LEN; // marker + nonce
 
 impl FileEncryption {
-    /// Create new file encryption system
+    /// Create new file encryption system with a random 256-bit key from OsRng.
     pub fn new(enabled: bool) -> Result<Self, StorageError> {
-        let mut salt = [0u8; 32];
-        if enabled {
-            // Generate cryptographically secure random salt
-            use rand::RngCore;
-            rand::thread_rng().fill_bytes(&mut salt);
-        }
-        
-        // Generate 256-bit master key for AES-256-GCM
-        let mut master_key = vec![0u8; 32];
-        if enabled {
-            rand::thread_rng().fill_bytes(&mut master_key);
-        }
-        
-        Ok(Self {
-            master_key,
-            enabled,
-            salt,
-        })
+        let cipher = if enabled {
+            let key = Aes256Gcm::generate_key(OsRng);
+            Aes256Gcm::new(&key)
+        } else {
+            let zero_key = Key::<Aes256Gcm>::default();
+            Aes256Gcm::new(&zero_key)
+        };
+
+        Ok(Self { cipher, enabled })
     }
-    
-    /// Encrypt file data for physical disk protection
+
+    /// Encrypt file data with AES-256-GCM (authenticated encryption).
     pub fn encrypt_file_data(&self, data: &[u8]) -> Result<Vec<u8>, StorageError> {
         if !self.enabled {
             return Ok(data.to_vec());
         }
-        
-        // Use AES-256-GCM for authenticated encryption
-        // In production, would use actual AES-GCM implementation
-        // For now, add encryption header + encrypted data
-        let mut encrypted = Vec::new();
-        
-        // Add encryption header
-        encrypted.push(0xFF); // Encryption marker
-        encrypted.extend_from_slice(&self.salt[..8]); // 64-bit salt prefix
-        
-        // XOR with master key for basic protection
-        // Production would use proper AES-GCM
-        let mut encrypted_data = data.to_vec();
-        for (i, byte) in encrypted_data.iter_mut().enumerate() {
-            *byte ^= self.master_key[i % self.master_key.len()];
-        }
-        
-        encrypted.extend_from_slice(&encrypted_data);
-        
-        // Add integrity checksum
-        let mut hasher = Sha3_256::new();
-        hasher.update(&encrypted_data);
-        let checksum = hasher.finalize();
-        encrypted.extend_from_slice(&checksum[..8]); // 64-bit checksum
-        
-        Ok(encrypted)
+
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ciphertext = self.cipher.encrypt(nonce, data)
+            .map_err(|e| StorageError::Internal(format!("AES-GCM encrypt failed: {}", e)))?;
+
+        let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+        out.push(ENCRYPTION_MARKER);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
     }
-    
-    /// Decrypt file data from physical disk
+
+    /// Decrypt file data with AES-256-GCM (verifies authenticity).
     pub fn decrypt_file_data(&self, encrypted_data: &[u8]) -> Result<Vec<u8>, StorageError> {
         if !self.enabled || encrypted_data.is_empty() {
             return Ok(encrypted_data.to_vec());
         }
-        
-        // Check encryption marker
-        if encrypted_data[0] != 0xFF {
-            return Ok(encrypted_data.to_vec()); // Not encrypted
+
+        if encrypted_data[0] != ENCRYPTION_MARKER {
+            return Ok(encrypted_data.to_vec()); // not encrypted (legacy plaintext)
         }
-        
-        if encrypted_data.len() < 17 { // marker + salt + checksum
-            return Err(StorageError::Internal("Invalid encrypted file format".to_string()));
+
+        if encrypted_data.len() < HEADER_LEN + 16 {
+            return Err(StorageError::Internal("Encrypted data too short".to_string()));
         }
-        
-        // Extract encrypted content (skip marker + salt, remove checksum)
-        let data_start = 9; // marker + 8-byte salt prefix
-        let data_end = encrypted_data.len() - 8; // remove 8-byte checksum
-        let encrypted_content = &encrypted_data[data_start..data_end];
-        
-        // Decrypt data (XOR with master key)
-        let mut decrypted = encrypted_content.to_vec();
-        for (i, byte) in decrypted.iter_mut().enumerate() {
-            *byte ^= self.master_key[i % self.master_key.len()];
-        }
-        
-        // Verify integrity checksum
-        let mut hasher = Sha3_256::new();
-        hasher.update(&encrypted_content);
-        let expected_checksum = hasher.finalize();
-        let stored_checksum = &encrypted_data[data_end..];
-        
-        if stored_checksum != &expected_checksum[..8] {
-            return Err(StorageError::Internal("File integrity check failed".to_string()));
-        }
-        
-        Ok(decrypted)
+
+        let nonce = Nonce::from_slice(&encrypted_data[1..HEADER_LEN]);
+        let ciphertext = &encrypted_data[HEADER_LEN..];
+
+        self.cipher.decrypt(nonce, ciphertext)
+            .map_err(|_| StorageError::Internal("AES-GCM decrypt/auth failed (tampered or wrong key)".to_string()))
     }
 }
 

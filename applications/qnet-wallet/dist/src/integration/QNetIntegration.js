@@ -589,7 +589,7 @@ export class QNetIntegration {
      */
     async makeRPCCall(method, params = {}, httpMethod = 'GET') {
         try {
-            const apiUrl = this.rpcUrl || 'http://localhost:5000';
+            const apiUrl = this.rpcUrl || 'https://localhost:5000';
             const endpoint = `${apiUrl}/api/v1/${method}`;
             
             const options = {

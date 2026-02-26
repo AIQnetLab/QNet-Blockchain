@@ -56,7 +56,7 @@ pub struct MicroBlock {
     #[serde(default)]
     pub vrf_output: Option<[u8; 32]>,
     
-    /// VRF proof: Dilithium3 detached signature (~3293 bytes)
+    /// VRF proof: ML-DSA-65 detached signature (~3309 bytes)
     /// Verifiable by any node with producer's registered public key
     #[serde(default)]
     pub vrf_proof: Option<Vec<u8>>,

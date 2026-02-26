@@ -35,8 +35,8 @@ sha3 = "0.10.8"
 hex = "0.4.3"
 base64 = "0.22"
 
-# CRYSTALS-Dilithium for quantum-resistant signatures (MANDATORY)
-pqcrypto-dilithium = "0.5"
+# ML-DSA-65 (FIPS 204) for quantum-resistant signatures (MANDATORY)
+pqcrypto-mldsa = "0.1"
 pqcrypto-traits = "0.3"
 
 # Ed25519 for hybrid signatures

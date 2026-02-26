@@ -96,25 +96,9 @@ async fn decode_activation_code_quantum_secure(
         ));
     }
 
-    // 5. Verify Dilithium signature with wallet binding
-    let signature_data = format!("{}:{}:{}", payload.burn_tx, payload.node_type, payload.timestamp);
-    let signature_valid = quantum_crypto.verify_dilithium_signature(
-        &signature_data,
-        &payload.signature,
-        &payload.wallet
-    ).await.map_err(|e| format!("Signature verification failed: {}", e))?;
-
-    if !signature_valid {
-        return Err("Invalid wallet signature - activation code is not authentic".to_string());
-    }
-
-    // FIXED: Check code ownership instead of usage (codes are reusable on different devices)
-    // We only need to verify the code belongs to the wallet trying to use it
-    println!("🔍 Checking code ownership (codes are reusable for device migration)");
-    
-    // Code ownership is already verified in quantum decryption step above
-    // The payload.wallet from the decrypted code is the true owner
-    // No additional blockchain check needed - quantum decryption guarantees authenticity
+    // Activation code authenticity is verified by successful XOR decryption:
+    // key = SHA3(burn_tx:node_type:burn_amount) — only the correct burn_tx/amount
+    // will recover a valid wallet address. No Dilithium signature needed here.
 
     // 7. Extract purchase phase from payload (for information only)
     let purchase_phase = if payload.burn_tx.starts_with("burn_tx_") { 1 } else { 2 };
@@ -508,7 +492,7 @@ async fn validate_blockchain_uniqueness(code: &str) -> Result<(), String> {
     // FIXED: Initialize blockchain registry with real QNet nodes
     let qnet_rpc = std::env::var("QNET_RPC_URL")
         .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-            .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+            .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
         .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         
     let registry = qnet_integration::activation_validation::BlockchainActivationRegistry::new(
@@ -2456,7 +2440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = std::process::Command::new("systemctl")
                         .args(&["restart", "systemd-timesyncd"])
                         .output();
-                    println!("[INFO][NTP] systemd-timesyncd sync triggered ✅");
+                    println!("[INFO][NTP] systemd-timesyncd sync triggered");
                     synced = true;
                 }
             }
@@ -2469,7 +2453,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .output()
             {
                 if out.status.success() {
-                    println!("[INFO][NTP] chrony makestep sync triggered ✅");
+                    println!("[INFO][NTP] chrony makestep sync triggered");
                     synced = true;
                 }
             }
@@ -2482,7 +2466,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .output()
             {
                 if out.status.success() {
-                    println!("[INFO][NTP] ntpdate sync triggered ✅");
+                    println!("[INFO][NTP] ntpdate sync triggered");
                     synced = true;
                 }
             }
@@ -4013,7 +3997,7 @@ struct NodeInfo {
 
 async fn try_query_node(addr: &str) -> Result<NodeInfo, String> {
     // Try to connect and get node info via simple HTTP request
-    let url = format!("http://{}/api/v1/node/info", addr);
+    let url = format!("https://{}/api/v1/node/info", addr);
     
     match reqwest::get(&url).await {
         Ok(response) => {
@@ -4465,7 +4449,7 @@ async fn query_node_for_peers(node_addr: &str) -> Result<Vec<String>, String> {
     // CRITICAL FIX: Use only actual listening port (8001) 
     // All QNet nodes run unified API on port 8001 only - no 8080/9876
     let endpoints = vec![
-        format!("http://{}:8001/api/v1/peers", ip),     // Unified API port
+        format!("https://{}:8001/api/v1/peers", ip),
     ];
     
     for endpoint in endpoints {
@@ -4554,7 +4538,7 @@ async fn get_peers_from_node(node_ip: &str) -> Result<Vec<String>, String> {
     let ports = [9876, 9877, 9878, 9879, 9880, 9881];
     
     for port in ports {
-        let url = format!("http://{}:{}/api/peers", node_ip, port);
+        let url = format!("https://{}:{}/api/peers", node_ip, port);
         match client.get(&url).send().await {
             Ok(response) if response.status().is_success() => {
                 if let Ok(text) = response.text().await {

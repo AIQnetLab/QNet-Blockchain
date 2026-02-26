@@ -272,7 +272,7 @@ impl TransactionPool {
         }
         
         if removed_count > 0 {
-            println!("[TransactionPool] 🧹 Cleaned up {} old transaction duplicates", removed_count);
+            println!("[INFO][STORAGE] cleanup_old_tx_duplicates count={}", removed_count);
         }
         
         Ok(removed_count)
@@ -701,7 +701,7 @@ impl PersistentStorage {
         let db = match DB::open_cf_descriptors(&opts, path, cfs) {
             Ok(db) => db,
             Err(e) => {
-                eprintln!("❌ RocksDB Error: {}", e);
+                eprintln!("[ERR][STORAGE] rocksdb_error err={}", e);
                 return Err(IntegrationError::StorageError(format!("RocksDB initialization failed: {}", e)));
             }
         };
@@ -1216,7 +1216,7 @@ impl PersistentStorage {
         let confirm_reset = std::env::var("QNET_CONFIRM_RESET").unwrap_or_default();
         
         if force_reset != "1" || confirm_reset != "YES" {
-            println!("[Storage] ⚠️ REFUSING to reset chain height!");
+            println!("[WARN][STORAGE] refusing_chain_height_reset");
             println!("[Storage]    To reset, set BOTH:");
             println!("[Storage]    - QNET_FORCE_RESET=1");
             println!("[Storage]    - QNET_CONFIRM_RESET=YES");
@@ -1227,7 +1227,7 @@ impl PersistentStorage {
         
         // Additional safety: Log the reset with timestamp
         let timestamp = chrono::Utc::now();
-        println!("[Storage] ⚠️⚠️⚠️ CHAIN HEIGHT RESET INITIATED ⚠️⚠️⚠️");
+        println!("[WARN][STORAGE] chain_height_reset_initiated");
         println!("[Storage]    Timestamp: {}", timestamp);
         println!("[Storage]    Requested by: QNET_FORCE_RESET + QNET_CONFIRM_RESET");
         
@@ -1244,8 +1244,8 @@ impl PersistentStorage {
         let height_bytes = 0u64.to_be_bytes();
         self.db.put_cf(&metadata_cf, b"chain_height", height_bytes)?;
         
-        println!("[Storage] ✅ Chain height reset: {} -> 0", current_height);
-        println!("[Storage] ⚠️  Data loss: {} blocks deleted", current_height);
+        println!("[INFO][STORAGE] chain_height_reset from={} to=0", current_height);
+        println!("[WARN][STORAGE] data_loss blocks_deleted={}", current_height);
         Ok(())
     }
     
@@ -1444,7 +1444,7 @@ impl PersistentStorage {
         // CRITICAL: Do NOT save encryption key to database!
         // Key is derived from activation code when needed
         
-        println!("[Storage] 🔐 Activation code encrypted with AES-256-GCM (key NOT stored)");
+        println!("[INFO][STORAGE] activation_code_encrypted cipher=AES-256-GCM key_not_stored=true");
         Ok(())
     }
     
@@ -1504,26 +1504,24 @@ impl PersistentStorage {
                         // PRODUCTION: Log device migration if detected
                         let current_device = Self::get_device_signature_for_tracking();
                         if stored_device_signature != current_device {
-                            println!("[Storage] 🔄 Device signature changed (migration or new hardware):");
-                            println!("   Stored: {}...", &stored_device_signature[..8.min(stored_device_signature.len())]);
-                            println!("   Current: {}...", &current_device[..8.min(current_device.len())]);
+                            println!("[INFO][STORAGE] device_signature_changed reason=migration_or_new_hardware stored={}... current={}...", &stored_device_signature[..8.min(stored_device_signature.len())], &current_device[..8.min(current_device.len())]);
                         }
                         
                         // Log IP changes (normal for migrations)
                         let current_server_ip = Self::get_server_ip();
                         if current_server_ip != stored_server_ip {
-                            println!("[Storage] 📍 Server IP changed: {} → {} (migration/restart)", 
+                            println!("[INFO][STORAGE] server_ip_changed from={} to={} reason=migration_or_restart",
                                      stored_server_ip, current_server_ip);
                         }
                         
-                        println!("[Storage] ✅ Activation code loaded and validated (AES-256-GCM)");
+                        println!("[INFO][STORAGE] activation_loaded cipher=AES-256-GCM");
                         return Ok(Some((saved_code.to_string(), node_type, timestamp)));
                     } else {
                         return Err(IntegrationError::SecurityError("Invalid AES-256 activation format".to_string()));
                     }
                 } else {
                     // LEGACY FORMAT: Check for old XOR encryption with state_key
-                    println!("[Storage] 🔄 Detected legacy activation format - attempting migration");
+                    println!("[INFO][STORAGE] legacy_activation_detected action=migration");
                     
                     match self.db.get_cf(&metadata_cf, b"state_key")? {
                         Some(_) => {
@@ -1548,7 +1546,7 @@ impl PersistentStorage {
         let parts: Vec<&str> = activation_str.split(':').collect();
         
         if parts.len() == 3 {
-            println!("⚠️  WARNING: Using legacy activation format (upgrading to secure format recommended)");
+            println!("[WARN][STORAGE] legacy_activation_format upgrade_recommended=true");
             let code = parts[0].to_string();
             let node_type = parts[1].parse::<u8>().unwrap_or(1);
             let timestamp = parts[2].parse::<u64>().unwrap_or(0);
@@ -1592,7 +1590,7 @@ impl PersistentStorage {
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         
         self.db.put_cf(&metadata_cf, b"activation_burn_tx", burn_tx.as_bytes())?;
-        println!("[Storage] 🔗 Burn TX saved for activation: {}...", &burn_tx[..8.min(burn_tx.len())]);
+        println!("[INFO][STORAGE] burn_tx_saved tx={}...", &burn_tx[..8.min(burn_tx.len())]);
         Ok(())
     }
     
@@ -1624,7 +1622,7 @@ impl PersistentStorage {
         
         // CRITICAL: Do NOT save encryption key - it's derived from activation code!
         
-        println!("[Storage] ✅ Activation migrated to device: {} (AES-256-GCM)", &new_device_signature[..16.min(new_device_signature.len())]);
+        println!("[INFO][STORAGE] activation_migrated device={}... cipher=AES-256-GCM", &new_device_signature[..16.min(new_device_signature.len())]);
         Ok(())
     }
     
@@ -1684,7 +1682,7 @@ impl PersistentStorage {
             let primary_hash = hex::encode(Sha3_256::digest(code.as_bytes()));
             identity_components.push(format!("stable_code_hash:{}", &primary_hash[..16]));
             
-            println!("[IDENTITY] 🔐 Genesis stable identity components: activation_code + bootstrap_id");
+            println!("[INFO][IDENTITY] genesis_identity_components=activation_code+bootstrap_id");
         } else {
             // PRODUCTION: Full identity with system info (after bootstrap)
             identity_components.push(format!("user:{}", 
@@ -1831,8 +1829,9 @@ impl PersistentStorage {
         let cipher = Aes256Gcm::new(&key_bytes.into());
         
         // Generate random nonce (12 bytes for GCM)
+        use rand::rngs::OsRng;
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill(&mut nonce_bytes);
+        OsRng.fill(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         
         // Encrypt with authenticated encryption (AEAD)
@@ -1972,7 +1971,7 @@ impl PersistentStorage {
         // This prevents race conditions and ensures data consistency
         if let Some(existing) = self.db.get_cf(&microblocks_cf, key.as_bytes())? {
             if !existing.is_empty() {
-                println!("[Storage] ℹ️ Macroblock #{} already exists - skipping save (idempotent)", height);
+                println!("[INFO][STORAGE] macroblock_exists_skip h={} idempotent=true", height);
                 return Ok(());
             }
         }
@@ -1988,7 +1987,7 @@ impl PersistentStorage {
         batch.put_cf(&metadata_cf, b"latest_macroblock_hash", &hash);
         
         self.db.write(batch)?;
-        println!("[Storage] ✅ Macroblock #{} saved successfully", height);
+        println!("[INFO][STORAGE] macroblock_saved h={}", height);
         Ok(())
     }
     
@@ -2647,7 +2646,7 @@ impl Storage {
         if deleted > 0 {
             self.persistent.db.write(batch)?;
             rotation.decrement(deleted);
-            println!("[LightRotation] 🔄 Rotated {} old headers (keeping last {})", 
+            println!("[INFO][STORAGE] light_rotation_ok rotated={} kept={}",
                 deleted, rotation.max_headers);
         }
         
@@ -2823,7 +2822,7 @@ impl Storage {
                 println!("   Consider setting QNET_AGGRESSIVE_PRUNING=0 until network grows.");
             } else {
                 println!("");
-                println!("✅ Network safety: OK ({} Super nodes maintain archive)", super_node_count);
+                println!("[INFO][STORAGE] network_safety=ok super_nodes={} maintains_archive=true", super_node_count);
                 println!("   Aggressive pruning is safe but irreversible.");
                 println!("   You will depend on Super nodes for historical data.");
             }
@@ -3066,7 +3065,7 @@ impl Storage {
         // Log pattern compression results (every 100 blocks)
         if height % 100 == 0 && total_original_size > 0 {
             let tx_savings = (1.0 - total_compressed_size as f64 / total_original_size as f64) * 100.0;
-            println!("[PATTERN] 🎯 Block #{}: TX compression {} → {} bytes ({:.1}% reduction)",
+            println!("[INFO][STORAGE] tx_compression h={} original_bytes={} compressed_bytes={} reduction_pct={:.1}",
                      height, total_original_size, total_compressed_size, tx_savings);
         }
         
@@ -3113,7 +3112,7 @@ impl Storage {
             let original_size = bincode::serialize(microblock).unwrap_or_default().len();
             let efficient_size = compressed_block.len();
             let savings = (1.0 - efficient_size as f64 / original_size as f64) * 100.0;
-            println!("[EFFICIENT] 📦 Block #{}: {} → {} bytes ({:.1}% reduction, {} TXs stored separately)",
+            println!("[INFO][STORAGE] efficient_block h={} original_bytes={} stored_bytes={} reduction_pct={:.1} txs_separate={}",
                      height, original_size, efficient_size, savings, microblock.transactions.len());
         }
         
@@ -3126,7 +3125,7 @@ impl Storage {
     
     /// Delete a microblock at the specified height (for fork resolution)
     pub fn delete_microblock(&self, height: u64) -> IntegrationResult<()> {
-        println!("[Storage] 🗑️ Deleting microblock at height {}", height);
+        println!("[INFO][STORAGE] delete_microblock h={}", height);
         // Also delete associated PoH state
         let _ = self.persistent.delete_poh_state(height);
         self.persistent.delete_microblock(height)
@@ -3230,7 +3229,7 @@ impl Storage {
         self.persistent.db.put(key, serialized)
             .map_err(|e| format!("Failed to save checkpoint: {}", e))?;
         
-        println!("[STORAGE] 📍 Checkpoint saved at height {}", height);
+        println!("[INFO][STORAGE] checkpoint_saved h={}", height);
         Ok(())
     }
     
@@ -3254,7 +3253,7 @@ impl Storage {
     pub async fn save_macroblock(&self, height: u64, macroblock: &qnet_state::MacroBlock) -> IntegrationResult<()> {
         // Check if storage is critically full before accepting new macroblocks
         if self.is_storage_critically_full()? {
-            println!("[Storage] 🚨 Storage critically full - attempting emergency cleanup before save_macroblock");
+            println!("[WARN][STORAGE] storage_critically_full action=emergency_cleanup_before_save_macroblock");
             self.emergency_cleanup()?;
             
             if self.is_storage_critically_full()? {
@@ -3343,14 +3342,14 @@ impl Storage {
         // Priority 1: Explicit network size from monitoring/orchestration
         if let Ok(size_str) = std::env::var("QNET_TOTAL_NETWORK_NODES") {
             if let Ok(size) = size_str.parse::<usize>() {
-                println!("[Storage] 📊 Network size from monitoring: {} nodes", size);
+                println!("[INFO][STORAGE] network_size_from_monitoring nodes={}", size);
                 return size;
             }
         }
         
         // Priority 2: Genesis phase detection (5 bootstrap nodes)
         if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
-            println!("[Storage] 🌱 Genesis phase: 5 bootstrap nodes");
+            println!("[INFO][STORAGE] genesis_phase bootstrap_nodes=5");
             return 5;
         }
         
@@ -3363,13 +3362,13 @@ impl Storage {
             }
             
             if count > 0 {
-                println!("[Storage] 🔗 Blockchain registry: {} activated nodes", count);
+                println!("[INFO][STORAGE] blockchain_registry activated_nodes={}", count);
                 return count;
             }
         }
         
         // Priority 4: Conservative default (small network assumption)
-        println!("[Storage] ⚠️ No network data found, using conservative default: 100 nodes");
+        println!("[WARN][STORAGE] no_network_data default_nodes=100");
         100 // Conservative: assume small network to avoid over-sharding
     }
     
@@ -3405,7 +3404,7 @@ impl Storage {
             return Ok(());
         }
         
-        println!("[PRUNING] 🎯 Pruning microblocks finalized by macroblock {}", macroblock.height);
+        println!("[INFO][STORAGE] pruning_microblocks macroblock={}", macroblock.height);
         
         let microblocks_cf = self.persistent.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
@@ -3436,14 +3435,14 @@ impl Storage {
                 
                 // Log leader transitions (every 30 blocks)
                 if micro_height % 30 == 0 {
-                    println!("[PRUNING] 🔄 Leader rotation point at microblock {}", micro_height);
+                    println!("[INFO][STORAGE] leader_rotation_point microblock={}", micro_height);
                 }
             }
         }
         
         if pruned > 0 {
             self.persistent.db.write(batch)?;
-            println!("[PRUNING] ✅ Pruned {} microblocks (3 leader rotations finalized)", pruned);
+            println!("[INFO][STORAGE] pruned_microblocks count={} rotations=3", pruned);
             
             // v3.19: Trigger compaction to reclaim disk space immediately
             self.persistent.db.compact_range_cf(&microblocks_cf, None::<&[u8]>, None::<&[u8]>);
@@ -3685,12 +3684,12 @@ impl Storage {
                 if bincode::deserialize::<qnet_state::MacroBlock>(&data).is_ok() {
                     macroblocks.push((index, data));
                 } else {
-                    println!("[MACROBLOCK-SYNC] ⚠️ Invalid macroblock data at index {}", index);
+                    println!("[WARN][STORAGE] invalid_macroblock_data index={}", index);
                 }
             }
         }
         
-        println!("[MACROBLOCK-SYNC] 📦 Prepared {} macroblocks for sync (indices {}-{})", 
+        println!("[INFO][STORAGE] macroblock_sync_prepared count={} indices={}-{}", 
                  macroblocks.len(), from_index, actual_to);
         
         Ok(macroblocks)
@@ -3749,7 +3748,7 @@ impl Storage {
                 let tx_cf = match self.persistent.db.cf_handle("transactions") {
                     Some(cf) => cf,
                     None => {
-                        println!("[Storage] ⚠️ transactions CF not found for block {}", height);
+                        println!("[WARN][STORAGE] tx_cf_not_found block={}", height);
                         continue;
                     }
                 };
@@ -3769,14 +3768,14 @@ impl Storage {
                             let _ = self.transaction_pool.store_transaction(*tx_hash, tx.clone());
                             transactions.push(tx);
                         } else {
-                            println!("[Storage] ⚠️ Failed to deserialize TX {} for block {}", tx_hash_hex, height);
+                            println!("[WARN][STORAGE] tx_deserialize_failed tx={} block={}", tx_hash_hex, height);
                         }
                     }
                     Ok(None) => {
-                        println!("[Storage] ⚠️ Transaction {} not found in storage for block {}", tx_hash_hex, height);
+                        println!("[WARN][STORAGE] tx_not_found tx={} block={}", tx_hash_hex, height);
                     }
                     Err(e) => {
-                        println!("[Storage] ⚠️ Error loading TX {}: {}", tx_hash_hex, e);
+                        println!("[WARN][STORAGE] tx_load_err tx={} err={}", tx_hash_hex, e);
                     }
                 }
             }
@@ -3814,7 +3813,7 @@ impl Storage {
                         let mut hash_array = [0u8; 32];
                         hash_array.copy_from_slice(&hash_bytes);
                         if let Err(e) = self.transaction_pool.store_transaction(hash_array, tx.clone()) {
-                            println!("[Storage] ⚠️ Failed to cache legacy transaction {}: {}", hex::encode(hash_array), e);
+                            println!("[WARN][STORAGE] legacy_tx_cache_failed tx={} err={}", hex::encode(hash_array), e);
                         }
                     }
                 }
@@ -3838,7 +3837,7 @@ impl Storage {
         
         // Check if it's already in efficient format
         if bincode::deserialize::<qnet_state::EfficientMicroBlock>(&microblock_data).is_ok() {
-            println!("[Storage] ✅ Microblock {} already in efficient format", height);
+            println!("[INFO][STORAGE] microblock_already_efficient height={}", height);
             return Ok(false);
         }
         
@@ -3848,14 +3847,14 @@ impl Storage {
                 format!("Failed to deserialize legacy microblock {}: {}", height, e)
             ))?;
         
-        println!("[Storage] 🔄 Converting legacy microblock {} to efficient format", height);
+        println!("[INFO][STORAGE] microblock_converting_to_efficient height={}", height);
         
         // Save in new format with delta compression
         let block_data = bincode::serialize(&legacy_block)
             .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
         self.save_block_with_delta(height, &block_data)?;
         
-        println!("[Storage] ✅ Migrated microblock {} to efficient format", height);
+        println!("[INFO][STORAGE] microblock_migrated height={}", height);
         Ok(true)
     }
     
@@ -3863,26 +3862,26 @@ impl Storage {
     pub fn batch_migrate_legacy_microblocks(&self, start_height: u64, end_height: u64) -> IntegrationResult<u64> {
         let mut migrated_count = 0;
         
-        println!("[Storage] 🚀 Starting batch migration of microblocks {} to {}", start_height, end_height);
+        println!("[INFO][STORAGE] batch_migration_start from={} to={}", start_height, end_height);
         
         for height in start_height..=end_height {
             match self.migrate_legacy_microblock_to_efficient(height) {
                 Ok(true) => {
                     migrated_count += 1;
                     if migrated_count % 100 == 0 {
-                        println!("[Storage] 📊 Migration progress: {} microblocks converted", migrated_count);
+                        println!("[INFO][STORAGE] migration_progress converted={}", migrated_count);
                     }
                 },
                 Ok(false) => {
                     // Already efficient or doesn't exist
                 },
                 Err(e) => {
-                    println!("[Storage] ⚠️ Failed to migrate microblock {}: {}", height, e);
+                    println!("[WARN][STORAGE] microblock_migrate_failed height={} err={}", height, e);
                 }
             }
         }
         
-        println!("[Storage] 🎉 Batch migration completed: {} microblocks converted to efficient format", migrated_count);
+        println!("[INFO][STORAGE] batch_migration_done converted={}", migrated_count);
         
         Ok(migrated_count)
     }
@@ -3919,11 +3918,11 @@ impl Storage {
     pub fn migrate_all_poh_states(&self) -> IntegrationResult<u64> {
         let chain_height = self.persistent.get_chain_height()?;
         if chain_height == 0 {
-            println!("[POH_MIGRATION] ℹ️ No blocks to migrate");
+            println!("[INFO][STORAGE] poh_migration_no_blocks");
             return Ok(0);
         }
         
-        println!("[POH_MIGRATION] 🚀 Starting PoH state migration for {} blocks", chain_height + 1);
+        println!("[INFO][STORAGE] poh_migration_start blocks={}", chain_height + 1);
         
         let mut migrated = 0u64;
         let mut skipped = 0u64;
@@ -3936,7 +3935,7 @@ impl Storage {
                     if migrated % 1000 == 0 {
                         let elapsed = start_time.elapsed().as_secs();
                         let rate = if elapsed > 0 { migrated / elapsed } else { migrated };
-                        println!("[POH_MIGRATION] 📊 Progress: {} migrated, {} skipped ({} blocks/sec)", 
+                        println!("[INFO][STORAGE] poh_migration_progress migrated={} skipped={} rate={}", 
                                 migrated, skipped, rate);
                     }
                 }
@@ -3944,13 +3943,13 @@ impl Storage {
                     skipped += 1;
                 }
                 Err(e) => {
-                    println!("[POH_MIGRATION] ⚠️ Failed to migrate PoH state for block {}: {}", height, e);
+                    println!("[WARN][STORAGE] poh_migrate_failed height={} err={}", height, e);
                 }
             }
         }
         
         let elapsed = start_time.elapsed();
-        println!("[POH_MIGRATION] ✅ Migration completed in {:.2}s: {} migrated, {} skipped", 
+        println!("[INFO][STORAGE] poh_migration_done elapsed={:.2}s migrated={} skipped={}", 
                 elapsed.as_secs_f64(), migrated, skipped);
         
         Ok(migrated)
@@ -3977,11 +3976,11 @@ impl Storage {
             .map_err(|e| IntegrationError::Other(format!("Zstd compression error: {}", e)))?;
             
         if compressed.len() < data.len() {
-            println!("[Compression] ✅ Archive data compressed ({} -> {} bytes)", 
+            println!("[INFO][STORAGE] archive_compressed from={} to={}", 
                     data.len(), compressed.len());
             Ok(compressed)
         } else {
-            println!("[Compression] ⏭️ Archive data not compressed (no benefit)");
+            println!("[INFO][STORAGE] archive_compress_skipped reason=no_benefit");
             Ok(data.to_vec())
         }
     }
@@ -3991,13 +3990,13 @@ impl Storage {
         // Try to decompress with Zstd first
         match zstd::decode_all(data) {
             Ok(decompressed) => {
-                println!("[Compression] ✅ Archive data decompressed: {} -> {} bytes", 
+                println!("[INFO][STORAGE] archive_decompressed from={} to={}", 
                         data.len(), decompressed.len());
                 Ok(decompressed)
             },
             Err(_) => {
                 // Data might not be compressed, return as-is
-                println!("[Compression] ⏭️ Data not compressed, returning as-is");
+                println!("[INFO][STORAGE] data_not_compressed returning_as_is=true");
                 Ok(data.to_vec())
             }
         }
@@ -4011,7 +4010,7 @@ impl Storage {
             return Ok(Vec::new());
         }
         
-        println!("[Compression] 🔄 Compressing transaction pool with {} transactions", tx_count);
+        println!("[INFO][STORAGE] tx_pool_compress_start count={}", tx_count);
         
         // Serialize all transactions
         let transactions = self.transaction_pool.transactions.read()
@@ -4030,7 +4029,7 @@ impl Storage {
         let compressed = zstd::encode_all(&serialized[..], 6) // Level 6 for good compression
             .map_err(|e| IntegrationError::Other(format!("Zstd compression error: {}", e)))?;
             
-        println!("[Compression] ✅ Transaction pool compressed ({} -> {} bytes)", 
+        println!("[INFO][STORAGE] tx_pool_compressed from={} to={}", 
                 serialized.len(), compressed.len());
                 
         Ok(compressed)
@@ -4052,7 +4051,7 @@ impl Storage {
         
         let usage_percentage = (actual_usage as f64 / self.max_storage_size as f64) * 100.0;
         
-        println!("[Storage] 📊 Storage usage: {:.1} GB / {:.1} GB ({:.1}%)", 
+        println!("[INFO][STORAGE] storage_usage used_gb={:.1} total_gb={:.1} pct={:.1}%", 
                 actual_usage as f64 / (1024.0 * 1024.0 * 1024.0),
                 self.max_storage_size as f64 / (1024.0 * 1024.0 * 1024.0),
                 usage_percentage);
@@ -4060,22 +4059,22 @@ impl Storage {
         // Trigger cleanup at different thresholds
         match usage_percentage {
             p if p >= 95.0 => {
-                println!("[Storage] 🚨 CRITICAL: Storage 95%+ full, triggering emergency cleanup");
+                println!("[WARN][STORAGE] storage_critical_95pct_full triggering=emergency_cleanup");
                 self.emergency_cleanup()?;
                 Ok(false) // Emergency state
             },
             p if p >= 85.0 => {
-                println!("[Storage] ⚠️ WARNING: Storage 85%+ full, triggering aggressive cleanup");
+                println!("[WARN][STORAGE] storage_warn_85pct_full triggering=aggressive_cleanup");
                 self.aggressive_cleanup()?;
                 Ok(false) // Warning state
             },
             p if p >= 70.0 => {
-                println!("[Storage] 📋 INFO: Storage 70%+ full, triggering standard cleanup");
+                println!("[INFO][STORAGE] storage_70pct_full triggering=standard_cleanup");
                 self.standard_cleanup()?;
                 Ok(true) // Normal operation
             },
             _ => {
-                println!("[Storage] ✅ Storage usage normal ({:.1}%)", usage_percentage);
+                println!("[INFO][STORAGE] storage_normal pct={:.1}%", usage_percentage);
                 Ok(true) // Normal operation
             }
         }
@@ -4103,7 +4102,7 @@ impl Storage {
         }
         
         if let Err(e) = visit_dir(std::path::Path::new(path), &mut total_size) {
-            println!("[Storage] ⚠️ Failed to calculate directory size: {}", e);
+            println!("[WARN][STORAGE] dir_size_failed err={}", e);
             // Fallback: return estimated size
             return Ok(self.estimate_storage_usage());
         }
@@ -4125,11 +4124,11 @@ impl Storage {
     
     /// Standard cleanup (70-85% full) - remove ONLY cache data, preserve blockchain history
     fn standard_cleanup(&self) -> IntegrationResult<()> {
-        println!("[Storage] 🧹 Starting standard cleanup (cache cleanup only - blockchain history preserved)");
+        println!("[INFO][STORAGE] standard_cleanup_start cache_only=true history_preserved=true");
         
         // 1. Clean transaction pool cache (this is OK - only removes duplicates)
         let removed_tx = self.transaction_pool.cleanup_old_duplicates()?;
-        println!("[Storage] 📦 Removed {} old transaction duplicates from cache", removed_tx);
+        println!("[INFO][STORAGE] tx_duplicates_removed count={}", removed_tx);
         
         // 2. CRITICAL CORRECTION: DO NOT delete blockchain history!
         // Instead, implement proper cache management
@@ -4140,15 +4139,15 @@ impl Storage {
         
         // 4. Force RocksDB compaction to optimize storage efficiency
         self.persistent.db.compact_range::<&[u8], &[u8]>(None, None);
-        println!("[Storage] 🗜️ Database compaction completed - optimized storage layout");
+        println!("[INFO][STORAGE] db_compaction_done mode=standard");
         
-        println!("[Storage] ✅ Standard cleanup completed (blockchain history preserved)");
+        println!("[INFO][STORAGE] standard_cleanup_done history_preserved=true");
         Ok(())
     }
     
     /// Aggressive cleanup (85-95% full) - CACHE cleanup only, blockchain history preserved
     fn aggressive_cleanup(&self) -> IntegrationResult<()> {
-        println!("[Storage] 🔥 Starting aggressive cleanup (cache optimization - blockchain history preserved)");
+        println!("[INFO][STORAGE] aggressive_cleanup_start cache_only=true history_preserved=true");
         
         // 1. PRODUCTION: More aggressive transaction pool cleanup (6 hours instead of 24)
         let current_time = SystemTime::now()
@@ -4174,7 +4173,7 @@ impl Storage {
                 creation_times.remove(&hash);
             }
             
-            println!("[Storage] 🧨 Aggressive transaction CACHE cleanup: removed duplicates older than 6 hours");
+            println!("[INFO][STORAGE] aggressive_tx_cache_cleaned older_than=6h");
         }
         
         // 2. CRITICAL CORRECTION: DO NOT delete blockchain history!
@@ -4183,15 +4182,15 @@ impl Storage {
         
         // 4. PRODUCTION: Force RocksDB compaction to reclaim space immediately
         self.persistent.db.compact_range::<&[u8], &[u8]>(None, None);
-        println!("[Storage] 🗜️ Database compaction completed - optimized storage efficiency");
+        println!("[INFO][STORAGE] db_compaction_done mode=aggressive");
         
-        println!("[Storage] ⚡ Aggressive cleanup completed (blockchain history preserved)");
+        println!("[INFO][STORAGE] aggressive_cleanup_done history_preserved=true");
         Ok(())
     }
     
     /// Emergency cleanup (95%+ full) - remove all non-essential data
     fn emergency_cleanup(&self) -> IntegrationResult<()> {
-        println!("[Storage] 🚨 EMERGENCY CLEANUP: Storage critically full, removing all non-essential data");
+        println!("[WARN][STORAGE] emergency_cleanup_start reason=storage_critically_full");
         
         if !self.emergency_cleanup_enabled {
             return Err(IntegrationError::StorageError(
@@ -4224,41 +4223,41 @@ impl Storage {
                 creation_times.remove(&hash);
             }
             
-            println!("[Storage] 🆘 EMERGENCY: Cleared transaction pool (kept only last 1 hour)");
+            println!("[WARN][STORAGE] emergency_tx_pool_cleared kept=1h");
         }
         
         // 2. CRITICAL CORRECTION: DO NOT delete blockchain history even in emergency!
         // Instead, maximum compression and cache optimization
-        println!("[Storage] 🆘 EMERGENCY: Applying maximum compression to blockchain data");
+        println!("[WARN][STORAGE] emergency_compression_start target=blockchain_data");
         
         // Emergency compression of blockchain data
         // Note: Compression now happens automatically via adaptive compression
         
         // 3. PRODUCTION: Force maximum compression on all remaining data
         self.persistent.db.compact_range::<&[u8], &[u8]>(None, None);
-        println!("[Storage] 🗜️ Emergency compaction completed");
+        println!("[INFO][STORAGE] db_compaction_done mode=emergency");
         
         // 4. CRITICAL CORRECTION: DO NOT delete transaction history from blockchain!
         // Emergency optimization through compression only
-        println!("[Storage] 🆘 EMERGENCY: Optimizing storage through compression (history preserved)");
+        println!("[WARN][STORAGE] emergency_optimize_start mode=compression history_preserved=true");
         
-        println!("[Storage] 🆘 Emergency cleanup completed - node should continue operation");
+        println!("[WARN][STORAGE] emergency_cleanup_done node_status=operational");
         
         // Check if we're still critically full after cleanup
         let post_cleanup_usage = self.get_directory_size(&std::env::var("QNET_DATA_DIR").unwrap_or_else(|_| "./node_data".to_string()))?;
         let post_cleanup_percentage = (post_cleanup_usage as f64 / self.max_storage_size as f64) * 100.0;
         
         if post_cleanup_percentage >= 90.0 {
-            println!("[Storage] 🚨 CRITICAL: Even after emergency cleanup, storage is {:.1}% full!", post_cleanup_percentage);
-            println!("[Storage] 💡 IMMEDIATE ADMIN ACTIONS REQUIRED:");
+            println!("[WARN][STORAGE] post_emergency_still_critical pct={:.1}%", post_cleanup_percentage);
+            println!("[WARN][STORAGE] admin_action_required urgency=immediate");
             println!("[Storage]    1. Add more disk space immediately");
             println!("[Storage]    2. Set QNET_MAX_STORAGE_GB=500 or higher");
             println!("[Storage]    3. Monitor disk usage closely");
             println!("[Storage]    4. Consider moving to server with larger storage");
-            println!("[Storage] ⚠️  NODE WILL STRUGGLE TO ACCEPT NEW BLOCKS!");
+            println!("[WARN][STORAGE] node_storage_critical accept_blocks=degraded");
         } else {
-            println!("[Storage] ✅ Emergency cleanup successful - storage now at {:.1}%", post_cleanup_percentage);
-            println!("[Storage] 💡 RECOMMENDED ACTIONS:");
+            println!("[INFO][STORAGE] emergency_cleanup_done pct={:.1}%", post_cleanup_percentage);
+            println!("[INFO][STORAGE] recommended_actions");
             println!("[Storage]    1. Consider increasing QNET_MAX_STORAGE_GB=500");
             println!("[Storage]    2. Plan for long-term storage growth");
         }
@@ -4286,7 +4285,7 @@ impl Storage {
     /// Update maximum storage size (for runtime configuration)
     pub fn update_max_storage_size(&mut self, new_size_gb: u64) {
         self.max_storage_size = new_size_gb * 1024 * 1024 * 1024;
-        println!("[Storage] 🔧 Updated maximum storage size to {} GB", new_size_gb);
+        println!("[INFO][STORAGE] max_storage_updated size_gb={}", new_size_gb);
     }
     
     /// Get compression level based on block age
@@ -4335,7 +4334,7 @@ impl Storage {
                 
                 // Only use compression if it reduces size by at least 10%
                 if compressed.len() < (block_data.len() * 9 / 10) {
-                    println!("[Compression] ✅ Level {:?} applied ({} -> {} bytes, {:.1}% reduction)", 
+                    println!("[INFO][STORAGE] compress_level_applied level={:?} from={} to={} reduction={:.1}%", 
                             compression_level, block_data.len(), compressed.len(),
                             (1.0 - compressed.len() as f64 / block_data.len() as f64) * 100.0);
                     Ok(compressed)
@@ -4351,7 +4350,7 @@ impl Storage {
         // Try to decompress with zstd - if it fails, data is not compressed
         match zstd::decode_all(data) {
             Ok(decompressed) => {
-                println!("[Compression] ✅ Decompressed {} -> {} bytes", data.len(), decompressed.len());
+                println!("[INFO][STORAGE] decompressed from={} to={}", data.len(), decompressed.len());
                 Ok(decompressed)
             },
             Err(_) => {
@@ -4474,7 +4473,7 @@ impl Storage {
         // Log compression efficiency
         if compressed_data.len() < original_data.len() {
             let reduction = (1.0 - compressed_data.len() as f64 / original_data.len() as f64) * 100.0;
-            println!("[PATTERN] ✅ Transaction compressed via {:?} pattern: {} -> {} bytes ({:.1}% reduction)",
+            println!("[INFO][STORAGE] tx_pattern_compressed pattern={:?} from={} to={} reduction={:.1}%",
                     pattern, original_data.len(), compressed_data.len(), reduction);
         }
         
@@ -4523,7 +4522,7 @@ impl Storage {
     
     /// PRODUCTION: Recompress old blocks with appropriate compression level
     pub async fn recompress_old_blocks(&self) -> IntegrationResult<()> {
-        println!("[Storage] 🗜️ Starting adaptive recompression of old blocks");
+        println!("[INFO][STORAGE] adaptive_recompress_start");
         
         let current_height = self.get_chain_height()?;
         let microblocks_cf = self.persistent.db.cf_handle("microblocks")
@@ -4582,7 +4581,7 @@ impl Storage {
             // Apply batch
             if !batch.is_empty() {
                 self.persistent.db.write(batch)?;
-                println!("[Storage] 📦 Recompressed batch {}-{}: {} blocks, saved {} KB",
+                println!("[INFO][STORAGE] recompress_batch from={} to={} blocks={} saved_kb={}",
                         batch_start, batch_end, recompressed_count, space_saved / 1024);
             }
             
@@ -4595,14 +4594,14 @@ impl Storage {
         // Force compaction to reclaim space
         self.persistent.db.compact_range_cf(&microblocks_cf, None::<&[u8]>, None::<&[u8]>);
         
-        println!("[Storage] ✅ Adaptive recompression complete: {} blocks, {} MB saved",
+        println!("[INFO][STORAGE] adaptive_recompress_done blocks={} saved_mb={}",
                 recompressed_count, space_saved / (1024 * 1024));
         
         // PRODUCTION: Also recompress old transactions with stronger Zstd
         // Done synchronously to avoid Send issues with RocksDB handles
         let tx_saved = self.recompress_old_transactions_sync()?;
         if tx_saved > 0 {
-            println!("[Storage] ✅ Transaction recompression saved {} MB", tx_saved / (1024 * 1024));
+            println!("[INFO][STORAGE] tx_recompress_saved saved_mb={}", tx_saved / (1024 * 1024));
         }
         
         Ok(())
@@ -4707,7 +4706,7 @@ impl Storage {
             self.persistent.db.compact_range_cf(&tx_cf, None::<&[u8]>, None::<&[u8]>);
         }
         
-        println!("[Storage] 🗜️ Recompressed {} old transactions, saved {} KB",
+        println!("[INFO][STORAGE] tx_recompress_done count={} saved_kb={}",
                 recompressed_count, space_saved / 1024);
         
         Ok(space_saved)
@@ -4741,7 +4740,7 @@ impl Storage {
         let recommended = std::cmp::max(estimated_total_gb, min_recommended);
         
         if recommended > (self.max_storage_size / (1024 * 1024 * 1024)) {
-            println!("[Storage] 💡 RECOMMENDATION: Current limit {} GB, recommended {} GB for blockchain age {:.1} years", 
+            println!("[INFO][STORAGE] storage_recommendation current_gb={} recommended_gb={} age_years={:.1}", 
                     self.max_storage_size / (1024 * 1024 * 1024),
                     recommended,
                     blockchain_age_years);
@@ -6029,7 +6028,7 @@ impl Storage {
             return Ok(()); // Not a snapshot height
         }
         
-        println!("[SNAPSHOT] 📸 Creating incremental snapshot at height {}", height);
+        println!("[INFO][STORAGE] incremental_snapshot_start height={}", height);
         let start_time = std::time::Instant::now();
         
         // Find the previous snapshot to base delta on
@@ -6098,7 +6097,7 @@ impl Storage {
         self.persistent.db.put_cf(&snapshots_cf, snapshot_key.as_bytes(), &final_data)?;
         
         let duration = start_time.elapsed();
-        println!("[SNAPSHOT] ✅ Incremental snapshot created: {} bytes in {:.2}s (base: {})", 
+        println!("[INFO][STORAGE] incremental_snapshot_created bytes={} elapsed={:.2}s base={}", 
                  compressed.len(), duration.as_secs_f64(), base_height);
         
         Ok(())
@@ -6112,7 +6111,7 @@ impl Storage {
             return Ok(()); // Not a full snapshot height
         }
         
-        println!("[SNAPSHOT] 📸 Creating state snapshot at height {}", height);
+        println!("[INFO][STORAGE] state_snapshot_start height={}", height);
         let start_time = std::time::Instant::now();
         
         // Get snapshot column family
@@ -6462,7 +6461,7 @@ impl Storage {
         cursor += 4;
         
         if version != crate::node::PROTOCOL_VERSION {
-            println!("[SNAPSHOT] ⚠️ Version mismatch: snapshot v{}, current v{}", 
+            println!("[WARN][STORAGE] snapshot_version_mismatch snapshot_v={} current_v={}", 
                      version, crate::node::PROTOCOL_VERSION);
         }
         
@@ -6636,7 +6635,7 @@ impl Storage {
             }
         };
         
-        println!("[IPFS] 📤 Uploading snapshot at height {} to IPFS...", height);
+        println!("[INFO][STORAGE] ipfs_snapshot_upload_start height={}", height);
         
         // Get snapshot data BEFORE any async operations (avoids Send issues)
         let snapshot_data = {
@@ -6692,7 +6691,7 @@ impl Storage {
                     self.persistent.db.put_cf(&snapshots_cf, ipfs_key.as_bytes(), cid.as_bytes())?;
                 } // cf_handle is dropped here
                 
-                println!("[IPFS] ✅ Snapshot uploaded to IPFS: {}", cid);
+                println!("[INFO][STORAGE] ipfs_snapshot_uploaded cid={}", cid);
                 
                 // PRODUCTION: Pin the content to ensure persistence (now safe after cf_handle is dropped)
                 self.pin_ipfs_content(&ipfs_api, cid).await?;
@@ -6718,7 +6717,7 @@ impl Storage {
             .map_err(|e| IntegrationError::Other(format!("IPFS pin failed: {}", e)))?;
         
         if response.status().is_success() {
-            println!("[IPFS] 📌 Content pinned: {}", cid);
+            println!("[INFO][STORAGE] ipfs_content_pinned cid={}", cid);
             Ok(())
         } else {
             Err(IntegrationError::StorageError(format!("Failed to pin IPFS content: {}", cid)))
@@ -6738,7 +6737,7 @@ impl Storage {
             }
         };
         
-        println!("[IPFS] 📥 Downloading snapshot from IPFS: {}", cid);
+        println!("[INFO][STORAGE] ipfs_snapshot_download_start cid={}", cid);
         
         // PRODUCTION: Try gateways from environment or peers
         let mut gateways = vec![ipfs_gateway.clone()];
@@ -6764,28 +6763,28 @@ impl Storage {
         // Try each gateway until success
         for gateway in &gateways {
             let url = format!("{}/ipfs/{}", gateway, cid);
-            println!("[IPFS] 🔄 Trying gateway: {}", gateway);
+            println!("[INFO][STORAGE] ipfs_trying_gateway url={}", gateway);
             
             match client.get(&url).send().await {
                 Ok(response) if response.status().is_success() => {
                     match response.bytes().await {
                         Ok(data) => {
                             snapshot_data = Some(data.to_vec());
-                            println!("[IPFS] ✅ Downloaded {} bytes from {}", data.len(), gateway);
+                            println!("[INFO][STORAGE] ipfs_downloaded bytes={} gateway={}", data.len(), gateway);
                             break;
                         },
                         Err(e) => {
-                            println!("[IPFS] ⚠️ Failed to read data from {}: {}", gateway, e);
+                            println!("[WARN][STORAGE] ipfs_read_failed gateway={} err={}", gateway, e);
                             continue;
                         }
                     }
                 },
                 Ok(response) => {
-                    println!("[IPFS] ⚠️ Gateway {} returned status: {}", gateway, response.status());
+                    println!("[WARN][STORAGE] ipfs_gateway_error gateway={} status={}", gateway, response.status());
                     continue;
                 },
                 Err(e) => {
-                    println!("[IPFS] ⚠️ Failed to connect to {}: {}", gateway, e);
+                    println!("[WARN][STORAGE] ipfs_connect_failed gateway={} err={}", gateway, e);
                     continue;
                 }
             }
@@ -6816,7 +6815,7 @@ impl Storage {
         let ipfs_key = format!("ipfs_{}", height);
         self.persistent.db.put_cf(&snapshots_cf, ipfs_key.as_bytes(), cid.as_bytes())?;
         
-        println!("[IPFS] ✅ Snapshot saved from IPFS (height: {})", height);
+        println!("[INFO][STORAGE] ipfs_snapshot_saved height={}", height);
         
         Ok(())
     }
@@ -6835,7 +6834,7 @@ impl Storage {
     
     /// Share snapshot via P2P network (announce IPFS CID to peers)
     pub async fn announce_snapshot_to_peers(&self, height: u64, cid: &str, p2p: &crate::unified_p2p::SimplifiedP2P) {
-        println!("[P2P] 📢 Announcing snapshot to peers: height={}, CID={}", height, cid);
+        println!("[INFO][STORAGE] snapshot_announcing height={} cid={}", height, cid);
         
         // Create announcement message
         let announcement = json!({
@@ -6858,7 +6857,7 @@ impl Storage {
             p2p.send_network_message(&peer.addr, message);
         }
         
-        println!("[P2P] ✅ Snapshot announcement sent to {} peers", peers.len());
+        println!("[INFO][STORAGE] snapshot_announced peers={}", peers.len());
     }
     
     /// SLIDING WINDOW: Prune old blocks outside of retention window
@@ -6886,7 +6885,7 @@ impl Storage {
             return Ok(()); // Don't prune before first snapshot
         }
         
-        println!("[PRUNING] 🗑️ Starting block pruning (keeping blocks {} and newer)", prune_before);
+        println!("[INFO][STORAGE] block_pruning_start keeping_from={}", prune_before);
         
         let microblocks_cf = self.persistent.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
@@ -6913,7 +6912,7 @@ impl Storage {
                 if self.persistent.db.get_cf(&microblocks_cf, macro_key.as_bytes())?.is_some() {
                     batch.delete_cf(&microblocks_cf, macro_key.as_bytes());
                     pruned_count += 1;
-                    println!("[PRUNING] 🔥 Pruning macroblock #{} (at microblock height {})", 
+                    println!("[INFO][STORAGE] macroblock_pruned macro_num={} micro_height={}", 
                             macro_number, height);
                 }
             }
@@ -6936,14 +6935,14 @@ impl Storage {
             Some(format!("microblock_{}", last_snapshot).as_bytes()),
             Some(format!("microblock_{}", prune_before).as_bytes()));
         
-        println!("[PRUNING] ✅ Pruned {} blocks (before height {}), keeping snapshot at {}", 
+        println!("[INFO][STORAGE] blocks_pruned count={} before_height={} snapshot_at={}", 
                 pruned_count, prune_before, last_snapshot);
         
         // CRITICAL: Also prune transactions from pruned blocks
         // Transactions are stored separately and must be cleaned up
         let tx_pruned = self.prune_old_transactions(prune_before)?;
         if tx_pruned > 0 {
-            println!("[PRUNING] ✅ Pruned {} old transactions", tx_pruned);
+            println!("[INFO][STORAGE] txs_pruned count={}", tx_pruned);
         }
         
         // Update metadata
@@ -7043,7 +7042,7 @@ impl Storage {
     
     /// Light node pruning - keep only block headers and recent state
     fn prune_for_light_node(&self) -> IntegrationResult<()> {
-        println!("[PRUNING] 🪶 Light node mode - keeping only headers and state");
+        println!("[INFO][STORAGE] light_node_prune_start mode=headers_only");
         
         let microblocks_cf = self.persistent.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
@@ -7076,7 +7075,7 @@ impl Storage {
             self.persistent.db.write(batch)?;
         }
         
-        println!("[PRUNING] ✅ Converted {} blocks to headers-only format", converted);
+        println!("[INFO][STORAGE] blocks_to_headers converted={}", converted);
         
         Ok(())
     }
@@ -7214,7 +7213,7 @@ impl Storage {
     /// Query peer for available snapshots
     async fn query_peer_snapshot(&self, peer_addr: &str) -> IntegrationResult<Option<(u64, String)>> {
         // Query peer's /api/v1/snapshot endpoint
-        let url = format!("http://{}/api/v1/snapshot/latest", peer_addr);
+        let url = format!("https://{}/api/v1/snapshot/latest", peer_addr);
         
         match reqwest::get(&url).await {
             Ok(response) => {
@@ -7293,7 +7292,7 @@ impl Storage {
         // Step 1: Fetch manifest from first responsive peer
         let mut manifest: Option<SnapshotManifest> = None;
         for addr in peer_addrs {
-            let url = format!("http://{}/api/v1/snapshot/{}/manifest", addr, height);
+            let url = format!("https://{}/api/v1/snapshot/{}/manifest", addr, height);
             match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(m) = resp.json::<SnapshotManifest>().await {
@@ -7340,7 +7339,7 @@ impl Storage {
                 let sem = semaphore.clone();
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let url = format!("http://{}/api/v1/snapshot/{}/chunk/{}", peer, height, i);
+                    let url = format!("https://{}/api/v1/snapshot/{}/chunk/{}", peer, height, i);
                     let resp = client.get(&url).send().await
                         .map_err(|e| IntegrationError::Other(format!("Chunk {} download: {}", i, e)))?;
                     if !resp.status().is_success() {
@@ -7391,7 +7390,7 @@ impl Storage {
 
     /// Legacy single-request snapshot download (backward compatibility)
     async fn download_snapshot_legacy(&self, peer_addr: &str, height: u64) -> IntegrationResult<()> {
-        let url = format!("http://{}/api/v1/snapshot/{}", peer_addr, height);
+        let url = format!("https://{}/api/v1/snapshot/{}", peer_addr, height);
         let response = reqwest::get(&url).await
             .map_err(|e| IntegrationError::Other(format!("Download error: {}", e)))?;
         if !response.status().is_success() {
@@ -7419,22 +7418,22 @@ impl Storage {
 
     /// Fast sync with snapshot for new nodes
     pub async fn fast_sync_with_snapshot(&self, p2p: &crate::unified_p2p::SimplifiedP2P, target_height: u64) -> IntegrationResult<()> {
-        println!("[SYNC] ⚡ Starting fast sync to height {}", target_height);
+        println!("[INFO][STORAGE] fast_sync_start target_height={}", target_height);
         
         // For Light nodes, only sync recent state
         if self.storage_mode == StorageMode::Light {
-            println!("[SYNC] 📱 Light node: syncing only recent headers");
+            println!("[INFO][STORAGE] fast_sync_light_node mode=recent_headers_only");
             return Ok(());
         }
         
         // Try to find and load a snapshot
         match self.download_and_load_snapshot(p2p).await {
             Ok(snapshot_height) => {
-                println!("[SYNC] 📸 Loaded snapshot at height {}", snapshot_height);
+                println!("[INFO][STORAGE] snapshot_loaded height={}", snapshot_height);
                 
                 // Now sync remaining blocks from snapshot to target
                 if target_height > snapshot_height {
-                    println!("[SYNC] 📥 Syncing remaining {} blocks...", 
+                    println!("[INFO][STORAGE] sync_remaining_start count={}", 
                             target_height - snapshot_height);
                     // The node will handle syncing remaining blocks
                 }
@@ -7442,7 +7441,7 @@ impl Storage {
                 Ok(())
             },
             Err(e) => {
-                println!("[SYNC] ⚠️ Snapshot sync failed: {:?}, falling back to full sync", e);
+                println!("[WARN][STORAGE] snapshot_sync_failed err={:?} fallback=full_sync", e);
                 // Fall back to normal sync
                 Err(e)
             }

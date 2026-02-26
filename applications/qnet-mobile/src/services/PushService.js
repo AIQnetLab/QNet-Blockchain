@@ -183,7 +183,9 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
 async function getDeviceId() {
   let deviceId = await AsyncStorage.getItem('qnet_device_id');
   if (!deviceId) {
-    deviceId = 'device_' + Math.random().toString(36).substr(2, 16);
+    const bytes = new Uint8Array(12);
+    crypto.getRandomValues(bytes);
+    deviceId = 'device_' + Array.from(bytes).map(b => b.toString(36)).join('').slice(0, 16);
     await AsyncStorage.setItem('qnet_device_id', deviceId);
   }
   return deviceId;
@@ -337,7 +339,7 @@ export async function getNextPingTime() {
  */
 export async function respondToChallenge(nodeId, challenge) {
   try {
-    const Keychain = require('react-native-keychain');
+      const Keychain = require('react-native-keychain');
 
     // ── PATH A: Dilithium3 ping delegation key (v7.1) — background-safe ──────
     // Loads Dilithium3 ping secret key from Keychain (AFTER_FIRST_UNLOCK).

@@ -15,7 +15,7 @@
  *   "dilithium_sig_{pseudonym}_{base64([sig_len_LE][signed_msg][pk_len_LE][pk])}"
  *
  * Security:
- *   - Secret key encrypted with AES-256-GCM + PBKDF2 (100,000 iterations, SHA-256)
+ *   - Secret key encrypted with AES-256-GCM + PBKDF2 (600,000 iterations, SHA-256)
  *   - Unique random salt per keypair, stored alongside encrypted data
  *   - No CryptoJS — uses react-native-quick-crypto (native bindings) for AES-GCM
  */
@@ -37,7 +37,7 @@ const DILITHIUM_SK_KEY  = 'qnet_dilithium_secret_key_enc'; // encrypted blob
 const DILITHIUM_SALT_KEY = 'qnet_dilithium_salt';
 
 // PBKDF2 parameters — OWASP 2024
-const PBKDF2_ITERATIONS = 100_000;
+const PBKDF2_ITERATIONS = 600_000;
 const PBKDF2_HASH       = 'SHA-256';
 const AES_KEY_BITS      = 256;
 
@@ -133,7 +133,7 @@ function hexToBytes(hex) {
 
 /**
  * Generate or load Dilithium3 keypair for a given activation code.
- * Secret key is encrypted with AES-256-GCM + PBKDF2 (100K iterations).
+ * Secret key is encrypted with AES-256-GCM + PBKDF2 (600K iterations).
  *
  * @param {string} activationCode - QNET-XXXXXX-XXXXXX-XXXXXX format
  * @param {string} password       - Wallet password (never stored)
