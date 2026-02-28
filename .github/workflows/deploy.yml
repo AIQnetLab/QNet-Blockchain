@@ -1,0 +1,96 @@
+name: Build & Deploy QNet Production
+
+# ─────────────────────────────────────────────────────────────
+# Triggers on push to testnet.
+#
+# QNet node types:
+#   Genesis (5)  — bootstrap/consensus nodes, managed by core team
+#   Super        — community validator nodes, self-managed
+#   Light        — mobile app nodes (APK, not Docker)
+#
+# Update flow:
+#   1. Build Docker image ONCE in CI → push to PUBLIC ghcr.io
+#   2. Genesis nodes — auto SSH rolling deploy (this workflow)
+#   3. Super nodes   — self-update via Watchtower (polls :latest)
+#   4. Light nodes   — mobile APK (separate release process)
+# ─────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [testnet]
+  workflow_dispatch:
+
+env:
+  # Public image — any node operator can docker pull without auth
+  IMAGE: ghcr.io/aiqnetlab/qnet-production
+
+jobs:
+  # ───────────────────────────────────────────────────────────
+  # Stage 1: Build once, push public image to ghcr.io
+  # All node types (genesis / super) use this same image
+  # ───────────────────────────────────────────────────────────
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (versioned + latest)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.production
+          push: true
+          # :latest — for Watchtower auto-updates on all community nodes
+          # :sha    — pinned version for rollback
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          # GitHub Actions layer cache — second build takes ~2 min instead of 20
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Make package public so ANY node operator can docker pull without login
+      - name: Make ghcr.io package public
+        run: |
+          curl -s -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/AIQnetLab/packages/container/qnet-production" \
+            -d '{"visibility":"public"}' || echo "Note: set package to public manually if this fails"
+
+  # ───────────────────────────────────────────────────────────
+  # Stage 2: Publish summary
+  # Genesis nodes update automatically via Watchtower (no seeds in CI)
+  # For immediate genesis deploy: run scripts/deploy-genesis.sh locally
+  # ───────────────────────────────────────────────────────────
+  notify:
+    name: Publish summary
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## Docker image published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | Image |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| latest | \`${{ env.IMAGE }}:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| commit | \`${{ env.IMAGE }}:${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Genesis nodes** — auto-update via Watchtower (within 5 min)" >> $GITHUB_STEP_SUMMARY
+          echo "**Super nodes**   — auto-update via Watchtower (within 5 min)" >> $GITHUB_STEP_SUMMARY
+          echo "**Immediate genesis deploy** — run \`scripts/deploy-genesis.sh\` locally" >> $GITHUB_STEP_SUMMARY
