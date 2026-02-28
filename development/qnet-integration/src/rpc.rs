@@ -3406,7 +3406,7 @@ async fn handle_validators_with_proof(
             let region = get_genesis_region_by_ip(genesis_ip).unwrap_or("Europe");
             validators.push(json!({
                 "node_id": node_id,
-                "address": format!("https://{}:8001", genesis_ip),
+                "address": format!("http://{}:8001", genesis_ip),
                 "node_type": "Super",
                 "reputation": real_rep.max(0.7), // Genesis minimum 0.7
                 "last_seen": current_time,
@@ -5117,7 +5117,7 @@ async fn handle_node_discovery(
             "region": peer.region,
             "last_seen": peer.last_seen,
             "reputation": real_reputation, // v3.19: From blockchain!
-            "api_endpoint": format!("https://{}:8001/api/v1/", peer.address)
+            "api_endpoint": format!("http://{}:8001/api/v1/", peer.address)
         })
     }).collect();
     
@@ -5126,7 +5126,7 @@ async fn handle_node_discovery(
             "node_id": blockchain.get_public_display_name(),
             "node_type": format!("{:?}", blockchain.get_node_type()),
             "region": format!("{:?}", blockchain.get_region()),
-            "api_endpoint": format!("https://{}:8001/api/v1/",
+            "api_endpoint": format!("http://{}:8001/api/v1/",
                 std::env::var("QNET_PUBLIC_IP").unwrap_or_else(|_| "0.0.0.0".to_string()))
         },
         "available_nodes": peer_nodes,

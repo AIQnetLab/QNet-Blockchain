@@ -405,7 +405,7 @@ async fn self_connectivity_test(external_ip: &str) -> CheckResult {
     let name = "Self-connectivity test".to_string();
     
     // Try API port since it should be running
-    let url = format!("https://{}:8001/api/v1/node/health", external_ip);
+    let url = format!("http://{}:8001/api/v1/node/health", external_ip);
     
     match timeout(Duration::from_secs(5), reqwest::get(&url)).await {
         Ok(Ok(response)) if response.status().is_success() => CheckResult {

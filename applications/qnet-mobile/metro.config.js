@@ -16,16 +16,14 @@ const config = {
     inlineRequires: false,
   },
   resolver: {
+    // Disable experimental exports-map resolution — causes spurious WARN on subpaths
+    // not listed in package.json "exports" (noble/hashes, rpc-websockets, etc.).
+    // File-based resolution is identical in behaviour and is the stable Metro path.
+    unstable_enablePackageExports: false,
     extraNodeModules: {
-      // css-tree is a Node.js CSS parser pulled in by react-native-svg for its
-      // CSS-in-SVG feature. The wallet app does not use SvgCss/SvgWithCss, so
-      // replacing it with a stub is safe and prevents Hermes compile errors.
       'css-tree': require.resolve('./css-tree-shim.js'),
       stream: require.resolve('readable-stream'),
-      crypto: require.resolve('crypto-browserify'),
-      'create-hmac': path.resolve(__dirname, 'create-hmac-polyfill.js'),
-      'create-hash': require.resolve('crypto-browserify'),
-      'pbkdf2': require.resolve('crypto-browserify'),
+      crypto: require.resolve('react-native-quick-crypto'),
       events: require.resolve('events'),
       _stream_writable: require.resolve('readable-stream/lib/_stream_writable'),
       _stream_readable: require.resolve('readable-stream/lib/_stream_readable'),

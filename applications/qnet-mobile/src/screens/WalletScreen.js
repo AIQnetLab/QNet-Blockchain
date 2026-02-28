@@ -2756,8 +2756,11 @@ const WalletScreen = () => {
       // Force immediate balance load without delay
       loadBalance(imported.publicKey);
       
-      // Store wallet in background (non-blocking) - async PBKDF2 won't block UI
-      walletManager.storeWallet(imported, password).then(async () => {
+      // Save wallet before showing UI — with quick-crypto PBKDF2 is native (< 1s).
+      // Must complete before UI advances: closing app mid-save loses the wallet.
+      await walletManager.storeWallet(imported, password);
+      // Sync activation codes after save
+      (async () => {
         // After wallet is saved, sync activation codes
         try {
           const mnemonic = await walletManager.getEncryptedMnemonic(password);
@@ -2800,10 +2803,7 @@ const WalletScreen = () => {
           // Silent fail - activation sync is not critical
           console.log('Activation sync failed:', error.message);
         }
-      }).catch(error => {
-        // If save fails, show error but keep wallet in memory
-        showAlert('Warning', 'Wallet imported but not saved: ' + error.message);
-      });
+      })();
     } catch (error) {
       setLoading(false);
       showAlert('Error', 'Failed to import wallet: ' + error.message);
@@ -2847,16 +2847,27 @@ const WalletScreen = () => {
       return;
     }
     
-    // All words correct, save wallet
-    // Optimized: Set UI state immediately, save in background
+    // All words correct — save wallet FIRST, then show UI.
+    // With react-native-quick-crypto PBKDF2 is native and takes < 1s.
+    // We must not show the wallet before it's saved: if the user closes the
+    // app before storeWallet completes, the vault is never written to AsyncStorage
+    // and the wallet disappears on next launch ("seed phrase reset" bug).
+    setLoading(true);
+    try {
+      await walletManager.storeWallet(tempWallet, tempWallet.password);
+    } catch (error) {
+      setLoading(false);
+      showAlert('Error', 'Failed to save wallet: ' + (error.message || 'Unknown error'));
+      return;
+    }
+    setLoading(false);
+    setTempWallet(null);
+
     setWallet(tempWallet);
     setHasWallet(true);
     setShowSeedConfirm(false);
-    // Keep password in state for subsequent operations (like node activation)
-    // setPassword(''); // DON'T clear password
     setConfirmPassword('');
     setSeedConfirmWords({});
-    // Clear activation and node state for new wallet
     setActivatedNodeType(null);
     setActivationCode(null);
     setNodeRewards(null);
@@ -2864,28 +2875,16 @@ const WalletScreen = () => {
     setNodeStatus(null);
     setLightNodeStatus(null);
     setServerNodeStatus(null);
-    
-    // Clear stored activation data from AsyncStorage
+
     AsyncStorage.removeItem('qnet_activation_codes');
     AsyncStorage.removeItem('qnet_activation_meta_light');
     AsyncStorage.removeItem('qnet_activation_meta_full');
     AsyncStorage.removeItem('qnet_activation_meta_super');
     AsyncStorage.removeItem('qnet_last_activated_node');
     AsyncStorage.removeItem(`blockchain_check_${tempWallet.publicKey}`);
-    
-    // Switch to assets tab immediately
+
     setActiveTab('assets');
     loadBalance(tempWallet.publicKey);
-    
-    // Save wallet in background (non-blocking) - async PBKDF2 won't block UI
-    walletManager.storeWallet(tempWallet, tempWallet.password).then(() => {
-      setTempWallet(null);
-    }).catch(error => {
-      // If save fails, revert UI state
-      showAlert('Error', 'Failed to save wallet: ' + (error.message || 'Unknown error'));
-      setWallet(null);
-      setHasWallet(false);
-    });
   };
 
   const _startLockoutCountdown = (remainingMs) => {

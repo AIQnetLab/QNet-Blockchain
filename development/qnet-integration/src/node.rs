@@ -2145,7 +2145,7 @@ impl BlockchainNode {
             // v3.35: Genesis nodes are ALWAYS public - get IP from constants
             let api_endpoint = crate::genesis_constants::GENESIS_NODE_IPS.iter()
                 .find(|(_, id)| *id == *bootstrap_id)
-                .map(|(ip, _)| format!("https://{}:8001", ip))
+                .map(|(ip, _)| format!("http://{}:8001", ip))
                 .unwrap_or_default();
             
             let tx = Self::create_node_registration_tx_with_timestamp(
@@ -17654,7 +17654,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // PRODUCTION: Create registry instance with real QNet blockchain endpoints
         let qnet_rpc = std::env::var("QNET_RPC_URL")
             .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
+                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             
         // PRODUCTION v2.50: Lock-free storage access
@@ -24676,7 +24676,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // PRODUCTION: Initialize blockchain registry with real QNet nodes
         let qnet_rpc = std::env::var("QNET_RPC_URL")
             .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
+                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         
         if is_genesis_code {
@@ -24931,7 +24931,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         .unwrap_or_default();
                     
                     if !public_ip.is_empty() {
-                        format!("https://{}:8001", public_ip)
+                        format!("http://{}:8001", public_ip)
                     } else {
                         // No IP detected - node won't serve mobile apps
                         String::new()
@@ -24975,7 +24975,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let device_sig = self.get_device_signature();
             let genesis_url = std::env::var("QNET_RPC_URL")
                 .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                    .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
+                    .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             
             let node_id_for_log = self.node_id.clone();
@@ -25214,7 +25214,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Build the genesis node API URL
         let genesis_api = std::env::var("QNET_RPC_URL")
             .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
+                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         
         // Query genesis node's RocksDB via REST API for the current device_id of our node

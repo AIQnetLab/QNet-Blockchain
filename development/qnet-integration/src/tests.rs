@@ -42,11 +42,11 @@ impl Default for TestConfig {
     fn default() -> Self {
         Self {
             endpoints: vec![
-                "https://154.38.160.39:8001".to_string(),
-                "https://62.171.157.44:8001".to_string(),
-                "https://161.97.86.81:8001".to_string(),
-                "https://5.189.130.160:8001".to_string(),
-                "https://162.244.25.114:8001".to_string(),
+                "http://154.38.160.39:8001".to_string(),
+                "http://62.171.157.44:8001".to_string(),
+                "http://161.97.86.81:8001".to_string(),
+                "http://5.189.130.160:8001".to_string(),
+                "http://162.244.25.114:8001".to_string(),
             ],
             timeout: Duration::from_secs(10),
             stress_iterations: 1000,

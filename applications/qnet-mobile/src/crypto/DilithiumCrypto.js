@@ -17,17 +17,12 @@
  * Security:
  *   - Secret key encrypted with AES-256-GCM + PBKDF2 (600,000 iterations, SHA-256)
  *   - Unique random salt per keypair, stored alongside encrypted data
- *   - No CryptoJS — uses react-native-quick-crypto (native bindings) for AES-GCM
+  *   - No CryptoJS — uses react-native-quick-crypto (native JSI) for PBKDF2 + AES-256-GCM
  */
 
 import { NativeModules, Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-
-// Use react-native-quick-crypto which exposes the Web Crypto API natively.
-// Falls back to the global crypto if running in a Hermes/JSI environment
-// that already polyfills it (Expo SDK 49+).
 import 'react-native-get-random-values'; // polyfill getRandomValues
-const subtle = crypto.subtle;
 
 const { DilithiumModule } = NativeModules;
 
@@ -38,8 +33,6 @@ const DILITHIUM_SALT_KEY = 'qnet_dilithium_salt';
 
 // PBKDF2 parameters — OWASP 2024
 const PBKDF2_ITERATIONS = 600_000;
-const PBKDF2_HASH       = 'SHA-256';
-const AES_KEY_BITS      = 256;
 
 // Valid pqclean Dilithium3 SK: 4032 raw bytes = 8064 hex chars
 const EXPECTED_SK_HEX_LEN = 4032 * 2;
@@ -49,29 +42,21 @@ const EXPECTED_SK_HEX_LEN = 4032 * 2;
 // ---------------------------------------------------------------------------
 
 /**
- * Derive AES-GCM-256 key from password + salt via PBKDF2.
+ * Derive AES-GCM-256 key from password + salt via PBKDF2-SHA256 (600K iterations).
+ * Uses react-native-quick-crypto (OpenSSL JSI) — runs on C++ thread, non-blocking.
  */
 async function deriveAesKey(password, saltHex) {
-  const enc = new TextEncoder();
+  // react-native-quick-crypto: crypto.subtle runs on native C++ JSI thread — non-blocking.
+  // Use Buffer.from() instead of TextEncoder — Buffer is always available via QuickCrypto.install().
+  const passwordBytes = Buffer.from(password == null ? '' : String(password), 'utf8');
   const salt = hexToBytes(saltHex);
-
-  const keyMaterial = await subtle.importKey(
-    'raw',
-    enc.encode(password),
-    'PBKDF2',
-    false,
-    ['deriveKey']
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', passwordBytes, 'PBKDF2', false, ['deriveKey']
   );
-
-  return subtle.deriveKey(
-    {
-      name: 'PBKDF2',
-      salt,
-      iterations: PBKDF2_ITERATIONS,
-      hash: PBKDF2_HASH,
-    },
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
     keyMaterial,
-    { name: 'AES-GCM', length: AES_KEY_BITS },
+    { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt']
   );
@@ -80,18 +65,17 @@ async function deriveAesKey(password, saltHex) {
 /**
  * Encrypt hex-encoded secret key with AES-GCM-256.
  * Returns JSON string: { iv, ciphertext } (both hex-encoded).
+ * ciphertext = raw ciphertext || 16-byte auth tag (matches crypto.subtle layout).
  */
 async function encryptSecretKey(secretKeyHex, password, saltHex) {
   const key = await deriveAesKey(password, saltHex);
   const iv  = crypto.getRandomValues(new Uint8Array(12));
-  const enc = new TextEncoder();
-
-  const cipherBuf = await subtle.encrypt(
+  const plainBytes = Buffer.from(secretKeyHex == null ? '' : String(secretKeyHex), 'utf8');
+  const cipherBuf = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
     key,
-    enc.encode(secretKeyHex)
+    plainBytes
   );
-
   return JSON.stringify({
     iv:         bytesToHex(iv),
     ciphertext: bytesToHex(new Uint8Array(cipherBuf)),
@@ -101,18 +85,17 @@ async function encryptSecretKey(secretKeyHex, password, saltHex) {
 /**
  * Decrypt AES-GCM-256 encrypted secret key.
  * Returns hex-encoded secret key string.
+ * Handles ciphertext || 16-byte auth tag layout (crypto.subtle + crypto-browserify).
  */
 async function decryptSecretKey(encryptedJson, password, saltHex) {
   const { iv, ciphertext } = JSON.parse(encryptedJson);
   const key = await deriveAesKey(password, saltHex);
-
-  const plainBuf = await subtle.decrypt(
+  const plainBuf = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: hexToBytes(iv) },
     key,
     hexToBytes(ciphertext)
   );
-
-  return new TextDecoder().decode(plainBuf);
+  return Buffer.from(plainBuf).toString('utf8');
 }
 
 function bytesToHex(bytes) {

@@ -6397,7 +6397,7 @@ impl SimplifiedP2P {
             .map(|(_, addr)| addr)
             .unwrap_or(peer_addr);
         
-        let url = format!("https://{}/api/v1/microblock/{}", ip_port, block_height);
+        let url = format!("http://{}/api/v1/microblock/{}", ip_port, block_height);
         
         // Use global HTTP client (shared connection pool)
         match HTTP_CLIENT.get(&url)
@@ -7365,7 +7365,7 @@ impl SimplifiedP2P {
         // PRODUCTION: Real HTTP request to peer's API endpoint
         // GENESIS PERIOD FIX: Only try port 8001 to avoid connection confusion
         // All Genesis nodes run unified API server on port 8001
-        let endpoint = format!("https://{}:8001/api/v1/height", peer_ip);
+        let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
         
         match self.query_peer_height_http(&endpoint).await {
             Ok(height) => Ok(height),
@@ -7527,7 +7527,7 @@ impl SimplifiedP2P {
         let challenge = crate::rpc::generate_quantum_challenge();
         
         // Send challenge to peer via secure channel
-        let auth_endpoint = format!("https://{}/api/v1/auth/challenge", peer_addr);
+        let auth_endpoint = format!("http://{}/api/v1/auth/challenge", peer_addr);
         
         // Use tokio HTTP client instead of curl for production
         let client = match Self::create_secure_http_client() {
@@ -17424,7 +17424,7 @@ impl SimplifiedP2P {
                                 // CRITICAL v2.21.3: Regular nodes - validate peer is reachable
                                 // Quick connectivity check before adding (prevents phantom peers)
                                 let peer_ip = new_peer.addr.split(':').next().unwrap_or("");
-                                let check_url = format!("https://{}:8001/health", peer_ip);
+                                let check_url = format!("http://{}:8001/health", peer_ip);
                                 
                                 let is_reachable = match reqwest::Client::builder()
                                     .timeout(std::time::Duration::from_secs(2))
@@ -17503,7 +17503,7 @@ impl SimplifiedP2P {
         // CRITICAL FIX: Use existing working query_node_for_peers logic
         // Make actual HTTP request to /api/v1/peers endpoint
         let ip = node_addr.split(':').next().unwrap_or(node_addr);
-        let endpoint = format!("https://{}:8001/api/v1/peers", ip);
+        let endpoint = format!("http://{}:8001/api/v1/peers", ip);
         
         println!("[P2P] 📞 Requesting peer list from {}", get_privacy_id_for_addr(&ip));
         
@@ -18326,7 +18326,7 @@ impl SimplifiedP2P {
         // Always notify all Super nodes (consensus validators)
         for (peer_id, peer_info) in super_nodes.iter() {
                 // Send security alert via HTTP endpoint
-                let url = format!("https://{}:{}/api/v1/security/alert", 
+                let url = format!("http://{}:{}/api/v1/security/alert", 
                                 peer_info.addr, 8001);
                 
                 let alert_json = alert_data.clone();
@@ -18366,7 +18366,7 @@ impl SimplifiedP2P {
         let sampled_peers: Vec<_> = other_peers.choose_multiple(&mut rng, sample_size).cloned().collect();
         
         for (peer_id, peer_info) in sampled_peers.iter() {
-            let url = format!("https://{}:{}/api/v1/security/alert", 
+            let url = format!("http://{}:{}/api/v1/security/alert", 
                             peer_info.addr, self.port);
             
             let alert_json = alert_data.clone();
@@ -18689,7 +18689,7 @@ impl SimplifiedP2P {
                 let peer_port = 8001; // Standard QNet port
                 handle.spawn(async move {
                     // Send audit entry to peer for distributed storage
-                    let url = format!("https://{}:{}/api/v1/audit/store", 
+                    let url = format!("http://{}:{}/api/v1/audit/store", 
                                     info.addr, peer_port);
                     
                     if let Ok(client) = reqwest::Client::builder()

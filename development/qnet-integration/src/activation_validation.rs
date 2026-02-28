@@ -362,11 +362,7 @@ impl BlockchainActivationRegistry {
             genesis_nodes.split(',')
                 .map(|ip| {
                     let ip = ip.trim();
-                    if ip == "127.0.0.1" || ip == "localhost" || ip.starts_with("10.") {
-                        format!("http://{}:8001", ip)
-                    } else {
-                        format!("https://{}:8001", ip)
-                    }
+                    format!("http://{}:8001", ip)
                 })
                 .collect()
         };
@@ -2657,7 +2653,7 @@ impl BlockchainActivationRegistry {
             .build()
             .map_err(|e| IntegrationError::NetworkError(e.to_string()))?;
             
-        let shutdown_url = format!("https://{}/api/v1/shutdown", target);
+        let shutdown_url = format!("http://{}/api/v1/shutdown", target);
         
         match client.post(&shutdown_url)
             .json(&serde_json::json!({

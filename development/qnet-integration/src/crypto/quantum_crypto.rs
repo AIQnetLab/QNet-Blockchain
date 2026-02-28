@@ -1037,7 +1037,7 @@ impl QNetQuantumCrypto {
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(
             Some(std::env::var("QNET_RPC_URL")
                 .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                    .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
+                    .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string()))
         );
         
@@ -1086,7 +1086,7 @@ impl QNetQuantumCrypto {
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(
             Some(std::env::var("QNET_RPC_URL")
                 .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                    .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
+                    .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string()))
         );
         

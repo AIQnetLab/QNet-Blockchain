@@ -492,7 +492,7 @@ async fn validate_blockchain_uniqueness(code: &str) -> Result<(), String> {
     // FIXED: Initialize blockchain registry with real QNet nodes
     let qnet_rpc = std::env::var("QNET_RPC_URL")
         .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-            .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); if ip == "127.0.0.1" || ip == "localhost" { format!("http://{}:8001", ip) } else { format!("https://{}:8001", ip) } }))
+            .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
         .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         
     let registry = qnet_integration::activation_validation::BlockchainActivationRegistry::new(
@@ -3997,7 +3997,7 @@ struct NodeInfo {
 
 async fn try_query_node(addr: &str) -> Result<NodeInfo, String> {
     // Try to connect and get node info via simple HTTP request
-    let url = format!("https://{}/api/v1/node/info", addr);
+    let url = format!("http://{}/api/v1/node/info", addr);
     
     match reqwest::get(&url).await {
         Ok(response) => {
@@ -4449,7 +4449,7 @@ async fn query_node_for_peers(node_addr: &str) -> Result<Vec<String>, String> {
     // CRITICAL FIX: Use only actual listening port (8001) 
     // All QNet nodes run unified API on port 8001 only - no 8080/9876
     let endpoints = vec![
-        format!("https://{}:8001/api/v1/peers", ip),
+        format!("http://{}:8001/api/v1/peers", ip),
     ];
     
     for endpoint in endpoints {
@@ -4538,7 +4538,7 @@ async fn get_peers_from_node(node_ip: &str) -> Result<Vec<String>, String> {
     let ports = [9876, 9877, 9878, 9879, 9880, 9881];
     
     for port in ports {
-        let url = format!("https://{}:{}/api/peers", node_ip, port);
+        let url = format!("http://{}:{}/api/peers", node_ip, port);
         match client.get(&url).send().await {
             Ok(response) if response.status().is_success() => {
                 if let Ok(text) = response.text().await {

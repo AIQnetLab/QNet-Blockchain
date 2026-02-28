@@ -7213,7 +7213,7 @@ impl Storage {
     /// Query peer for available snapshots
     async fn query_peer_snapshot(&self, peer_addr: &str) -> IntegrationResult<Option<(u64, String)>> {
         // Query peer's /api/v1/snapshot endpoint
-        let url = format!("https://{}/api/v1/snapshot/latest", peer_addr);
+        let url = format!("http://{}/api/v1/snapshot/latest", peer_addr);
         
         match reqwest::get(&url).await {
             Ok(response) => {
@@ -7292,7 +7292,7 @@ impl Storage {
         // Step 1: Fetch manifest from first responsive peer
         let mut manifest: Option<SnapshotManifest> = None;
         for addr in peer_addrs {
-            let url = format!("https://{}/api/v1/snapshot/{}/manifest", addr, height);
+            let url = format!("http://{}/api/v1/snapshot/{}/manifest", addr, height);
             match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(m) = resp.json::<SnapshotManifest>().await {
@@ -7339,7 +7339,7 @@ impl Storage {
                 let sem = semaphore.clone();
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let url = format!("https://{}/api/v1/snapshot/{}/chunk/{}", peer, height, i);
+                    let url = format!("http://{}/api/v1/snapshot/{}/chunk/{}", peer, height, i);
                     let resp = client.get(&url).send().await
                         .map_err(|e| IntegrationError::Other(format!("Chunk {} download: {}", i, e)))?;
                     if !resp.status().is_success() {
@@ -7390,7 +7390,7 @@ impl Storage {
 
     /// Legacy single-request snapshot download (backward compatibility)
     async fn download_snapshot_legacy(&self, peer_addr: &str, height: u64) -> IntegrationResult<()> {
-        let url = format!("https://{}/api/v1/snapshot/{}", peer_addr, height);
+        let url = format!("http://{}/api/v1/snapshot/{}", peer_addr, height);
         let response = reqwest::get(&url).await
             .map_err(|e| IntegrationError::Other(format!("Download error: {}", e)))?;
         if !response.status().is_success() {

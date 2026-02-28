@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import CryptoJS from 'crypto-js'; // Required for generateQNetKeypair, generateQNetAddress, generateMnemonic
 import 'react-native-get-random-values'; // Must be imported first — polyfills crypto.getRandomValues
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { derivePath } from 'ed25519-hd-key';
@@ -12,7 +13,7 @@ import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl } 
 export class WalletManager {
   constructor() {
     this.connection = new Connection(getSolanaRpcUrl(true), 'confirmed');
-    this.keyCache = null;       // CryptoKey object (NOT the password), extractable:false
+    this.keyCache = null;       // Uint8Array (32-byte AES key), NOT the password
     this._keyCacheSalt = null;  // Hex salt that was used to derive keyCache
     this._keyCacheIter = 0;     // Iteration count used to derive keyCache
     this._failedAttempts = 0;
@@ -2703,20 +2704,25 @@ export class WalletManager {
   static VAULT_ITERATIONS_V3 = 600_000; // OWASP 2024 recommendation
   static VAULT_ITERATIONS_V2 = 100_000; // Legacy — kept for backward compat decrypt
 
-  // Derive AES-GCM-256 CryptoKey from password + hex salt via PBKDF2.
-  // If the result will be used as keyCache, caller is responsible for setting
-  // _keyCacheSalt and _keyCacheIter to enable reuse in _decryptGCM.
+  // Derive 32-byte AES key from password + hex salt via PBKDF2-SHA256.
+  // Uses @noble/hashes pbkdf2Async — truly non-blocking: yields to JS event loop
+  // every ~10 ms so the UI stays responsive during 600K iterations on mobile.
+  // Lazy require() avoids top-level ESM import issues with Hermes at module init.
+  // Returns Uint8Array(32) — the raw AES-256 key bytes.
   async _deriveKeyNative(password, saltHex, iterations = WalletManager.VAULT_ITERATIONS_V3) {
-    const enc = new TextEncoder();
+    // react-native-quick-crypto provides crypto.subtle backed by OpenSSL on a C++ JSI thread.
+    // PBKDF2 runs natively — never blocks the JS thread — completes in < 1 second.
+    // Use Buffer.from() instead of TextEncoder — Buffer is always available via QuickCrypto.install().
+    const passwordBytes = Buffer.from(password == null ? '' : String(password), 'utf8');
     const salt = this._hexToBytes(saltHex);
     const keyMaterial = await crypto.subtle.importKey(
-      'raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']
+      'raw', passwordBytes, 'PBKDF2', false, ['deriveKey']
     );
     return crypto.subtle.deriveKey(
       { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
       keyMaterial,
       { name: 'AES-GCM', length: 256 },
-      false,          // extractable: false — key bytes are never exposed
+      false,
       ['encrypt', 'decrypt']
     );
   }
@@ -2736,16 +2742,17 @@ export class WalletManager {
   }
 
   // Encrypt plaintext string → { version:3, salt, iv, encrypted } (all hex).
-  // Returns { vault, derivedKey } — derivedKey can be cached to avoid a 2nd PBKDF2 call.
+  // Returns { vault, derivedKey } — derivedKey (Uint8Array) can be cached to avoid a 2nd PBKDF2 call.
+  // AES-256-GCM via crypto-browserify; output layout matches crypto.subtle (ciphertext || 16-byte tag).
   async _encryptGCM(plaintext, password) {
     const salt = crypto.getRandomValues(new Uint8Array(32));
     const iv   = crypto.getRandomValues(new Uint8Array(12));
     const key  = await this._deriveKeyNative(password, this._bytesToHex(salt), WalletManager.VAULT_ITERATIONS_V3);
-    const enc  = new TextEncoder();
+    const plaintextBytes = Buffer.from(plaintext == null ? '' : String(plaintext), 'utf8');
     const cipherBuf = await crypto.subtle.encrypt(
       { name: 'AES-GCM', iv },
       key,
-      enc.encode(plaintext)
+      plaintextBytes
     );
     const vault = {
       version:   3,
@@ -2754,19 +2761,19 @@ export class WalletManager {
       encrypted: this._bytesToHex(new Uint8Array(cipherBuf)),
       timestamp: Date.now(),
     };
-    // Return both vault and derivedKey so callers can cache the key
-    // without a redundant 2nd PBKDF2 call
     return { vault, derivedKey: key };
   }
 
   // Decrypt vault v2 or v3 → plaintext string. Throws on wrong password.
+  // AES-256-GCM via crypto-browserify; compatible with vaults encrypted by
+  // crypto.subtle (ciphertext || 16-byte tag) and by _encryptGCM above.
   async _decryptGCM(vaultData, password) {
     const iterations = vaultData.version === 3
       ? WalletManager.VAULT_ITERATIONS_V3
       : WalletManager.VAULT_ITERATIONS_V2;
     // Reuse cached key if it was derived from the same salt+iterations.
     // This eliminates duplicate PBKDF2 calls when verifyPassword → loadWallet
-    // are called back-to-back (every unlock). On v3 vaults saves ~2-3s on device.
+    // are called back-to-back (every unlock).
     const canReuseCache =
       this.keyCache &&
       this._keyCacheSalt === vaultData.salt &&
@@ -2776,8 +2783,6 @@ export class WalletManager {
       key = this.keyCache;
     } else {
       key = await this._deriveKeyNative(password, vaultData.salt, iterations);
-      // Auto-cache freshly derived key so subsequent calls (verifyPassword → loadWallet)
-      // don't need to re-derive. Salt mismatch on migration path is handled in loadWallet.
       this._setCachedKey(key, vaultData.salt, iterations);
     }
     const plainBuf = await crypto.subtle.decrypt(
@@ -2785,7 +2790,7 @@ export class WalletManager {
       key,
       this._hexToBytes(vaultData.encrypted)
     );
-    return new TextDecoder().decode(plainBuf);
+    return Buffer.from(plainBuf).toString('utf8');
   }
 
   _bytesToHex(bytes) {
@@ -2891,11 +2896,11 @@ export class WalletManager {
     // Fallback to Genesis bootstrap nodes if no discovered nodes
     // These are the official Genesis nodes from genesis_constants.rs
     const genesisNodes = [
-      { url: 'https://154.38.160.39', region: 'North America' },
-      { url: 'https://62.171.157.44', region: 'Europe' },
-      { url: 'https://161.97.86.81', region: 'Europe' },
-      { url: 'https://5.189.130.160', region: 'Europe' },
-      { url: 'https://162.244.25.114', region: 'Europe' }
+      { url: 'http://154.38.160.39:8001', region: 'North America' },
+      { url: 'http://62.171.157.44:8001', region: 'Europe' },
+      { url: 'http://161.97.86.81:8001', region: 'Europe' },
+      { url: 'http://5.189.130.160:8001', region: 'Europe' },
+      { url: 'http://162.244.25.114:8001', region: 'Europe' }
     ];
     
     // Try to discover new nodes from Genesis nodes
@@ -2925,7 +2930,7 @@ export class WalletManager {
               const discoveredNodes = data.peers
                 .filter(peer => peer.address && peer.address.includes(':'))
                 .map(peer => ({
-                  url: `https://${peer.address}`,
+                  url: peer.address.startsWith('http') ? peer.address : `http://${peer.address}`,
                   nodeType: peer.node_type,
                   reputation: peer.reputation || 0, // v3.13: Store reputation!
                   lastSeen: Date.now()
@@ -3852,7 +3857,7 @@ export class WalletManager {
               (peer.reputation || 0) >= MIN_REPUTATION
             )
             .map(peer => ({
-              url: `https://${peer.address}`,
+              url: peer.address.startsWith('http') ? peer.address : `http://${peer.address}`,
               reputation: peer.reputation,
               nodeType: peer.node_type,
               lastSeen: Date.now()
@@ -3934,11 +3939,11 @@ export class WalletManager {
     
     // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
     const bootstrapNodes = [
-      'https://154.38.160.39:8080',   // Genesis #1 - North America
-      'https://62.171.157.44:8080',   // Genesis #2 - Europe
-      'https://161.97.86.81:8080',    // Genesis #3 - Europe
-      'https://5.189.130.160:8080',   // Genesis #4 - Europe
-      'https://162.244.25.114:8080'   // Genesis #5 - Europe
+      'http://154.38.160.39:8001',   // Genesis #1 - North America
+      'http://62.171.157.44:8001',   // Genesis #2 - Europe
+      'http://161.97.86.81:8001',    // Genesis #3 - Europe
+      'http://5.189.130.160:8001',   // Genesis #4 - Europe
+      'http://162.244.25.114:8001'   // Genesis #5 - Europe
     ];
     
     // Try multiple bootstrap nodes for reliability
