@@ -30,6 +30,9 @@ services:
       - QNET_API_PORT=8001
       - QNET_REGION=na
       - DOCKER_ENV=1
+      # SECURITY v6.2: Required for /api/v1/shutdown endpoint authorization
+      # Generate with: openssl rand -hex 32
+      - QNET_ADMIN_SECRET=${QNET_ADMIN_SECRET:?QNET_ADMIN_SECRET must be set in .env}
     command: qnet-node
     ports:
       - "8001:8001"   # Unified API/RPC
@@ -82,6 +85,7 @@ services:
       - QNET_API_PORT=8001
       - QNET_REGION=eu
       - DOCKER_ENV=1
+      - QNET_ADMIN_SECRET=${QNET_ADMIN_SECRET:?QNET_ADMIN_SECRET must be set in .env}
     command: qnet-node
     ports:
       - "8002:8001"   # Unified API/RPC (mapped to 8002 on host)
@@ -136,6 +140,7 @@ services:
       - QNET_API_PORT=8001
       - QNET_REGION=asia
       - DOCKER_ENV=1
+      - QNET_ADMIN_SECRET=${QNET_ADMIN_SECRET:?QNET_ADMIN_SECRET must be set in .env}
     command: qnet-node
     ports:
       - "8003:8001"   # Unified API/RPC (mapped to 8003 on host)

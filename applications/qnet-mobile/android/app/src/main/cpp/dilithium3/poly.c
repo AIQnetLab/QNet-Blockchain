@@ -473,16 +473,18 @@ void PQCLEAN_DILITHIUM3_CLEAN_poly_uniform_gamma1(poly *a,
 *              SHAKE256(seed).
 *
 * Arguments:   - poly *c: pointer to output polynomial
-*              - const uint8_t mu[]: byte array containing seed of length SEEDBYTES
+*              - const uint8_t mu[]: byte array containing seed of length CTILDEBYTES
+*              NOTE: ML-DSA-65 (FIPS 204) absorbs CTILDEBYTES (48) not SEEDBYTES (32).
+*              Both are passed in, only CTILDEBYTES bytes are used for the challenge hash.
 **************************************************/
-void PQCLEAN_DILITHIUM3_CLEAN_poly_challenge(poly *c, const uint8_t seed[SEEDBYTES]) {
+void PQCLEAN_DILITHIUM3_CLEAN_poly_challenge(poly *c, const uint8_t seed[CTILDEBYTES]) {
     unsigned int i, b, pos;
     uint64_t signs;
     uint8_t buf[SHAKE256_RATE];
     shake256incctx state;
 
     shake256_inc_init(&state);
-    shake256_inc_absorb(&state, seed, SEEDBYTES);
+    shake256_inc_absorb(&state, seed, CTILDEBYTES);
     shake256_inc_finalize(&state);
     shake256_inc_squeeze(buf, sizeof buf, &state);
 

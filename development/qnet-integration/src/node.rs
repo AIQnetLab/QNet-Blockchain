@@ -216,10 +216,14 @@ lazy_static::lazy_static! {
 }
 
 /// BUG 1: Register that consensus passed for block, now waiting for data
+/// CRITICAL FIX: Use entry().or_insert() to preserve existing timer and retry count.
+/// Previous code used insert() which reset Instant::now() and request_count=0 every
+/// loop iteration, preventing the 8-second timeout from ever firing.
 pub fn register_consensus_awaiting_block(height: u64, producer: &str) {
     let mut awaiting = CONSENSUS_AWAITING_BLOCK.write();
-    awaiting.insert(height, (std::time::Instant::now(), producer.to_string(), 0));
-    if is_info() {
+    let is_new = !awaiting.contains_key(&height);
+    awaiting.entry(height).or_insert_with(|| (std::time::Instant::now(), producer.to_string(), 0));
+    if is_new && is_info() {
         println!("[INFO][CONS] awaiting_block h={} producer={}", height, producer);
     }
 }
@@ -368,6 +372,31 @@ pub fn set_timeout_round(round: u64, height: u64) {
 /// Reset timeout round when block is received
 pub fn reset_timeout_round() {
     CURRENT_TIMEOUT_ROUND.store(0, Ordering::SeqCst);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRODUCER VALIDATION CACHE: Tracks expected producer per height
+// Populated by main consensus loop, checked in validate_received_microblock.
+// Prevents accepting blocks from wrong producers (e.g. node producing in isolation).
+// ═══════════════════════════════════════════════════════════════════════════════
+lazy_static::lazy_static! {
+    static ref EXPECTED_PRODUCER_CACHE: ParkingRwLock<std::collections::HashMap<u64, (String, u64)>> =
+        ParkingRwLock::new(std::collections::HashMap::new());
+}
+
+/// Cache the expected producer for a given block height (called from main loop)
+pub fn cache_expected_producer(height: u64, producer: &str, timeout_round: u64) {
+    let mut cache = EXPECTED_PRODUCER_CACHE.write();
+    cache.insert(height, (producer.to_string(), timeout_round));
+    if cache.len() > 200 {
+        let min_height = height.saturating_sub(100);
+        cache.retain(|h, _| *h >= min_height);
+    }
+}
+
+/// Get the expected producer for a given block height (None if not cached / historical)
+pub fn get_expected_producer(height: u64) -> Option<(String, u64)> {
+    EXPECTED_PRODUCER_CACHE.read().get(&height).cloned()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4879,7 +4908,9 @@ impl BlockchainNode {
         }
         
         // Validate no process ID in production node IDs (fallback detection)
-        if node_id.contains(&std::process::id().to_string()) {
+        // v4.3: Use starts_with to avoid false positive when Docker PID=1 matches "001"
+        let fallback_pattern = format!("node_{}_", std::process::id());
+        if node_id.starts_with(&fallback_pattern) {
             if is_warn() { println!("[WARN][NODE] fallback_id id={} not_for_production", node_id); }
         }
         let consensus_config = qnet_consensus::ConsensusConfig {
@@ -8588,6 +8619,33 @@ impl BlockchainNode {
             }
         }
         
+        // 5.7 v4.3: Producer validation — reject blocks from unexpected producers
+        // Grace period: if timeout_round advanced, a different producer is legitimate
+        if let Some((expected_producer, expected_round)) = get_expected_producer(microblock.height) {
+            if microblock.producer != expected_producer {
+                let dominated_by_timeout = expected_round > 0;
+                if !dominated_by_timeout {
+                    if is_warn() {
+                        println!(
+                            "[WARN][SEC] wrong_producer h={} expected={} got={} round={}",
+                            microblock.height, expected_producer, microblock.producer, expected_round
+                        );
+                    }
+                    return Err(format!(
+                        "Wrong producer for block #{}: expected {} but got {}",
+                        microblock.height, expected_producer, microblock.producer
+                    ));
+                } else {
+                    if is_debug() {
+                        println!(
+                            "[DBG][SEC] producer_override_timeout h={} expected={} got={} round={}",
+                            microblock.height, expected_producer, microblock.producer, expected_round
+                        );
+                    }
+                }
+            }
+        }
+
         // 6. CRITICAL: Detect database substitution attack
         // If we already have this height, verify it's the same block
         // v3.11 FIX: With EFFICIENT storage, raw bytes hash will NEVER match!
@@ -12424,8 +12482,9 @@ impl BlockchainNode {
                     timeout_round  // CRITICAL: Pass timeout_round for deterministic failover!
                 ).await;
                 
-                // CRITICAL: Simple producer check - let natural consensus handle lagging
-                // Nodes at different heights naturally won't interfere with each other
+                // v4.3: Cache expected producer for incoming block validation
+                cache_expected_producer(next_block_height, &current_producer, timeout_round);
+
                 let mut is_my_turn_to_produce = current_producer == node_id;
                 
                 // ═══════════════════════════════════════════════════════════════════════════
@@ -16455,15 +16514,35 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         next_winner.node_id.clone()
                 } else {
                         // All VRF claimants exhausted — use secondary with timeout as extra entropy
-                        let fallback_idx = DilithiumVrf::deterministic_fallback(
-                            &slot_input, current_height, leadership_round + timeout_round, candidates.len(),
-                        );
-                        let timeout_secondary = &candidates[fallback_idx].0;
-                        if is_info() {
-                            println!("[INFO][VRF] timeout_secondary h={} round={} timeout={} producer={}",
-                                     current_height, leadership_round, timeout_round, timeout_secondary);
+                        // CRITICAL FIX: Exclude ALL previously failed producers from fallback pool.
+                        // Without this, deterministic_fallback(hash % N) can land on the same
+                        // failed producer, causing permanent deadlock when MAX_TIMEOUT_ROUNDS is reached.
+                        let fallback_candidates: Vec<&(String, f64)> = candidates.iter()
+                            .filter(|(id, _)| !excluded.contains(id))
+                            .collect();
+
+                        if !fallback_candidates.is_empty() {
+                            let fallback_idx = DilithiumVrf::deterministic_fallback(
+                                &slot_input, current_height, leadership_round + timeout_round, fallback_candidates.len(),
+                            );
+                            let timeout_secondary = &fallback_candidates[fallback_idx].0;
+                            if is_info() {
+                                println!("[INFO][VRF] timeout_secondary h={} round={} timeout={} producer={} pool={}",
+                                         current_height, leadership_round, timeout_round, timeout_secondary, fallback_candidates.len());
+                            }
+                            timeout_secondary.clone()
+                        } else {
+                            // All candidates exhausted (shouldn't happen with N>1) — wrap around
+                            let fallback_idx = DilithiumVrf::deterministic_fallback(
+                                &slot_input, current_height, leadership_round + timeout_round, candidates.len(),
+                            );
+                            let timeout_secondary = &candidates[fallback_idx].0;
+                            if is_warn() {
+                                println!("[WARN][VRF] timeout_all_exhausted h={} round={} timeout={} producer={}",
+                                         current_height, leadership_round, timeout_round, timeout_secondary);
+                            }
+                            timeout_secondary.clone()
                         }
-                        timeout_secondary.clone()
                     }
                 } else {
                 winner

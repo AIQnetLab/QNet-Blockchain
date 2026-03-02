@@ -17,9 +17,10 @@ use pqcrypto_traits::sign::{
 use sha3::{Sha3_256, Digest};
 
 // Domain separation constants
-const DOMAIN_EVAL: &[u8] = b"QNet_Dilithium3_VRF_Eval_v3";
-const DOMAIN_OUTPUT: &[u8] = b"QNet_Dilithium3_VRF_Output_v3";
-const DOMAIN_SLOT: &[u8] = b"QNet_VRF_SlotSeed_v3";
+// v4: includes public key binding for formal VRF uniqueness guarantee
+const DOMAIN_EVAL: &[u8] = b"QNet_Dilithium3_VRF_Eval_v4";
+const DOMAIN_OUTPUT: &[u8] = b"QNet_Dilithium3_VRF_Output_v4";
+const DOMAIN_SLOT: &[u8] = b"QNet_VRF_SlotSeed_v4";
 
 /// ML-DSA-65 (FIPS 204) sizes — CTILDEBYTES=48
 pub const D3_PK_BYTES: usize = 1952;
@@ -127,10 +128,13 @@ impl DilithiumVrf {
     // ── Core VRF ─────────────────────────────────────────────────────────
 
     /// Evaluate VRF (deterministic: same sk+input → same output)
+    /// v4: public key bound into domain hash for formal uniqueness
     pub fn evaluate(&self, input: &[u8]) -> Result<VrfOutput, String> {
         let sk_bytes = self.sk.as_ref()
             .ok_or("[ERR][VRF] not initialized")?;
-        let msg = Self::hash_input(input);
+        let pk_bytes = self.pk.as_ref()
+            .ok_or("[ERR][VRF] pk not initialized")?;
+        let msg = Self::hash_input_keyed(input, pk_bytes);
         let sk = dilithium3::SecretKey::from_bytes(sk_bytes)
             .map_err(|e| format!("[ERR][VRF] sk_parse err={:?}", e))?;
         let sig = dilithium3::detached_sign(&msg, &sk);
@@ -140,11 +144,12 @@ impl DilithiumVrf {
     }
 
     /// Verify VRF proof (stateless, no secret key needed)
+    /// v4: verifies pk-bound domain hash — prevents cross-key output collisions
     pub fn verify_static(pk_bytes: &[u8], input: &[u8], vrf: &VrfOutput) -> Result<bool, String> {
         if pk_bytes.len() != D3_PK_BYTES {
             return Err(format!("[ERR][VRF] verify pk_size={}", pk_bytes.len()));
         }
-        let msg = Self::hash_input(input);
+        let msg = Self::hash_input_keyed(input, pk_bytes);
         let pk = dilithium3::PublicKey::from_bytes(pk_bytes)
             .map_err(|e| format!("[ERR][VRF] pk_parse err={:?}", e))?;
         let sig = dilithium3::DetachedSignature::from_bytes(&vrf.proof)
@@ -235,9 +240,13 @@ impl DilithiumVrf {
 
     // ── Internal helpers ─────────────────────────────────────────────────
 
-    fn hash_input(input: &[u8]) -> Vec<u8> {
+    /// v4: key-bound domain hash — H(domain || pk_fingerprint || input)
+    /// pk_fingerprint = SHA3-256(pk)[..16] — 128 bits, sufficient for domain binding
+    fn hash_input_keyed(input: &[u8], pk: &[u8]) -> Vec<u8> {
+        let pk_fp = Sha3_256::digest(pk);
         let mut h = Sha3_256::new();
         h.update(DOMAIN_EVAL);
+        h.update(&pk_fp[..16]);
         h.update(input);
         h.finalize().to_vec()
     }

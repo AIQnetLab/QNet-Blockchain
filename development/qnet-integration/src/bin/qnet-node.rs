@@ -16,7 +16,7 @@
 //! - Smart synchronization and compression
 //! - Enterprise security and monitoring
 
-use qnet_integration::node::{BlockchainNode, NodeType, Region};
+use qnet_integration::node::{BlockchainNode, NodeType, Region, is_info, is_warn, is_debug};
 use qnet_integration::quantum_crypto::{QNetQuantumCrypto, ActivationPayload};
 use qnet_integration::unified_p2p::get_privacy_id_for_addr;
 use qnet_integration::GLOBAL_GENESIS_TIMESTAMP;
@@ -1562,64 +1562,66 @@ fn get_current_server_ip() -> String {
     "auto-detected".to_string()  // Special marker for auto-detection failure
 }
 
-// Get external IP address (Docker/Container-friendly) - FIXED: No curl dependency
+// Get external IP address (Docker/Container-friendly)
+// v6.2: Runs blocking HTTP on a dedicated OS thread to avoid stalling tokio runtime
 fn get_external_ip() -> Result<String, String> {
-    println!("[DEBUG] 🔧 get_external_ip() called - attempting IP detection");
-    
-    // CRITICAL FIX: Use blocking HTTP client to avoid Tokio runtime conflicts
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build() {
-        Ok(client) => client,
-        Err(e) => {
-            println!("[DEBUG] ❌ Failed to create HTTP client: {}", e);
-            return Err(format!("HTTP client error: {}", e));
-        }
-    };
-    
-    let ip_services = vec![
-        "https://api.ipify.org",
-        "https://ifconfig.me/ip", 
-        "https://icanhazip.com",
-    ];
-    
-    for service in ip_services {
-        println!("[DEBUG] 🔧 Trying IP service: {}", service);
-        
-        match client.get(service).send() {
-            Ok(response) if response.status().is_success() => {
-                match response.text() {
-                    Ok(ip_text) => {
-                        let ip = ip_text.trim().to_string();
-                        
-                        if !ip.is_empty() && ip.contains('.') && !ip.contains("error") && !ip.contains("timeout") {
-                            if validate_ip_address_security(&ip) {
-                                println!("[DEBUG] ✅ IP detected via {}: {}", service, ip);
-                                println!("[IP] 🌐 External IP detected via {}: {}", service, ip);
-                                return Ok(ip);
-                            } else {
-                                println!("[DEBUG] ❌ IP failed security validation: {}", ip);
+    if is_debug() { println!("[DBG][IP] get_external_ip called"); }
+
+    std::thread::spawn(|| {
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build() {
+            Ok(c) => c,
+            Err(e) => {
+                if is_warn() { println!("[WARN][IP] http_client_create_fail err={}", e); }
+                return Err(format!("HTTP client error: {}", e));
+            }
+        };
+
+        let ip_services = [
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+            "https://icanhazip.com",
+        ];
+
+        for service in ip_services {
+            if is_debug() { println!("[DBG][IP] trying_service url={}", service); }
+
+            match client.get(service).send() {
+                Ok(response) if response.status().is_success() => {
+                    match response.text() {
+                        Ok(ip_text) => {
+                            let ip = ip_text.trim().to_string();
+                            if !ip.is_empty() && ip.contains('.') && !ip.contains("error") && !ip.contains("timeout") {
+                                if validate_ip_address_security(&ip) {
+                                    if is_info() { println!("[INFO][IP] external_ip_detected service={} ip={}", service, ip); }
+                                    return Ok(ip);
+                                } else if is_debug() {
+                                    println!("[DBG][IP] security_validation_fail ip={}", ip);
+                                }
+                            } else if is_debug() {
+                                println!("[DBG][IP] invalid_response service={} body={}", service, ip);
                             }
-                        } else {
-                            println!("[DEBUG] ❌ Invalid IP response: {}", ip);
+                        }
+                        Err(e) => {
+                            if is_debug() { println!("[DBG][IP] response_read_err service={} err={}", service, e); }
                         }
                     }
-                    Err(e) => {
-                        println!("[DEBUG] ❌ Response read error from {}: {}", service, e);
-                    }
+                }
+                Ok(response) => {
+                    if is_debug() { println!("[DBG][IP] http_err service={} status={}", service, response.status()); }
+                }
+                Err(e) => {
+                    if is_debug() { println!("[DBG][IP] request_fail service={} err={}", service, e); }
                 }
             }
-            Ok(response) => {
-                println!("[DEBUG] ❌ HTTP error {} from {}", response.status(), service);
-            }
-            Err(e) => {
-                println!("[DEBUG] ❌ Request failed for {}: {}", service, e);
-            }
         }
-    }
-    
-    println!("[DEBUG] ❌ All IP services failed");
-    Err("Could not detect external IP".to_string())
+
+        if is_warn() { println!("[WARN][IP] all_services_failed"); }
+        Err("Could not detect external IP".to_string())
+    })
+    .join()
+    .unwrap_or_else(|_| Err("IP detection thread panicked".to_string()))
 }
 
 // Get local network IP address

@@ -3797,10 +3797,8 @@ let walletState = {
     solanaRPC: null,
     balanceCache: new Map(),
     pendingBalanceRequests: new Map(), // Debounce parallel requests
-    encryptionKey: null, // Store encryption key for activation codes
-    encryptedActivationCodes: {}, // Store encrypted activation codes
+    encryptionKey: null, // Wallet decryption key (stored after unlock)
     transactionHistory: new Map(),
-    isActivatingNode: false, // Lock to prevent concurrent node activations
     rpcPerformance: new Map(), // Track RPC performance for smart selection
     lastSuccessfulRpc: null, // Remember fastest RPC
     prefetchQueue: new Set() // Queue for prefetching data
@@ -3916,249 +3914,6 @@ async function initializeWallet() {
     } catch (error) {
         // Error:('Failed to initialize wallet:', error);
     }
-}
-
-/**
- * Burn tokens and activate node
- */
-async function burnAndActivateNode(nodeType, amount) {
-    
-    // Check if activation is already in progress (prevent race conditions)
-    if (walletState.isActivatingNode) {
-        return { success: false, error: 'Node activation already in progress. Please wait.' };
-    }
-    
-    try {
-        // Set lock to prevent concurrent activations
-        walletState.isActivatingNode = true;
-        
-        if (!walletState.isUnlocked || walletState.accounts.length === 0) {
-            walletState.isActivatingNode = false;
-            return { success: false, error: 'Wallet is locked' };
-        }
-
-        const account = walletState.accounts[0];
-        const solanaAddress = account.solanaAddress;
-
-        if (!solanaAddress) {
-            walletState.isActivatingNode = false;
-            return { success: false, error: 'No Solana address found' };
-        }
-
-        // Check if any node is already activated on this wallet
-        const storageData = await chrome.storage.local.get(['walletData', 'encryptedActivationCodes']);
-        const existingCodes = storageData.encryptedActivationCodes || {};
-        
-        if (Object.keys(existingCodes).length > 0) {
-            // Found existing activation - determine which type
-            const existingType = Object.keys(existingCodes)[0];
-            // v3.18: Only Light and Super nodes
-            const nodeTypeNames = { 
-                light: 'Light Node', 
-                super: 'Super Node' 
-            };
-            walletState.isActivatingNode = false;
-            return { 
-                success: false, 
-                error: `This wallet already has an active ${nodeTypeNames[existingType] || 'node'}. One wallet can only run one node.` 
-            };
-        }
-
-        // Get current 1DEV token balance
-        const localData = await chrome.storage.local.get(['mainnet']);
-        const isMainnet = localData.mainnet === true;
-        const tokenMint = isMainnet ? ONE_DEV_TOKEN_MINT.mainnet : ONE_DEV_TOKEN_MINT.devnet;
-        
-        
-        const currentBalance = await getBalance(solanaAddress, tokenMint);
-        
-        
-        if (currentBalance === null || currentBalance === undefined || currentBalance === 0) {
-            walletState.isActivatingNode = false;
-            
-            // More detailed error for debugging
-            const networkName = isMainnet ? 'Mainnet' : 'Devnet';
-            return { 
-                success: false, 
-                error: `Failed to check 1DEV token balance on ${networkName}. Make sure you have 1DEV tokens at address: ${solanaAddress.substring(0, 8)}...` 
-            };
-        }
-
-        if (currentBalance < amount) {
-            walletState.isActivatingNode = false;
-            return { success: false, error: `Insufficient 1DEV balance: ${currentBalance.toFixed(2)} available, ${amount} required.` };
-        }
-
-        // Burn tokens - send to burn address
-        
-        // Solana burn address (null address)
-        const BURN_ADDRESS = '11111111111111111111111111111112';
-        
-        // Variable to store activation code
-        let activationCode = null;
-        
-        try {
-            // Starting real token burn
-            
-            // Get token account info
-            const tokenAccountInfo = await getTokenAccountInfo(solanaAddress, tokenMint);
-            if (!tokenAccountInfo) {
-                // console.error('[Node Activation] Token account not found!');
-                // console.error('[Node Activation] Address:', solanaAddress);
-                // console.error('[Node Activation] Token mint:', tokenMint);
-                // console.error('[Node Activation] Network:', isMainnet ? 'Mainnet' : 'Devnet');
-                
-                // Try to get SOL balance to see if the wallet is accessible
-                const solBalance = await getBalance(solanaAddress);
-                // console.error('[Node Activation] SOL balance check:', solBalance, 'SOL');
-                
-                walletState.isActivatingNode = false;
-                return { 
-                    success: false, 
-                    error: `Token account not found. Make sure you have 1DEV tokens on ${isMainnet ? 'mainnet' : 'devnet'}. Token mint: ${tokenMint}` 
-                };
-            }
-            
-            // Create burn transaction
-            const burnAmount = amount * 1000000; // Convert to 6 decimals for 1DEV
-            const burnTxSignature = await createAndSendBurnTransaction(
-                solanaAddress,
-                tokenAccountInfo.pubkey,
-                tokenMint,
-                burnAmount,
-                isMainnet,
-                nodeType  // Pass node type for MEMO
-            );
-            
-            if (!burnTxSignature) {
-                // Real burn failed - DO NOT generate code
-                // console.error('[Node Activation] ❌ Burn transaction failed!');
-                // console.error('[Node Activation] Tokens were NOT burned');
-                // console.error('[Node Activation] Possible reasons:');
-                // console.error('- Insufficient SOL for transaction fee (~0.001 SOL needed)');
-                // console.error('- Network connection issues');
-                // console.error('- RPC endpoint problems');
-                
-                walletState.isActivatingNode = false;
-                return { 
-                    success: false, 
-                    error: 'Failed to burn tokens. Check you have SOL for gas fees (~0.001 SOL). Tokens were NOT burned.' 
-                };
-            }
-            
-            // Transaction was sent - even if not yet confirmed
-            // Burn transaction sent successfully
-            
-            // Record burn in contract
-            // Contract will track burn stats on-chain
-            
-            // Get seed phrase for deterministic code generation
-            let seedPhrase = null;
-            
-            // First try to use already decrypted data from memory
-            if (walletState.decryptedWalletData && walletState.decryptedWalletData.mnemonic) {
-                seedPhrase = walletState.decryptedWalletData.mnemonic;
-                // console.log('[Node Activation] Using seed phrase from memory');
-            } else if (walletState.encryptionKey) {
-                // If not in memory, decrypt from storage
-                const storageData = await chrome.storage.local.get(['encryptedWallet']);
-                if (storageData.encryptedWallet) {
-                    try {
-                        const decrypted = await ProductionCrypto.decryptWalletData(
-                            storageData.encryptedWallet,
-                            walletState.encryptionKey
-                        );
-                        seedPhrase = decrypted.mnemonic;
-                        // console.log('[Node Activation] Decrypted seed phrase from storage');
-                    } catch (err) {
-                        // console.error('[Node Activation] Could not decrypt seed phrase:', err);
-                    }
-                }
-            }
-            
-            // Generate DETERMINISTIC activation code using seed phrase           
-            activationCode = await generateActivationCode(nodeType, solanaAddress, seedPhrase);            
-            
-        } catch (error) {
-            // console.error('[Node Activation] Critical error during burn process:', error);
-            walletState.isActivatingNode = false;
-            return { 
-                success: false, 
-                error: 'Transaction failed: ' + (error.message || 'Unknown error. Check console for details.') 
-            };
-        }
-        
-        // Only continue if we have activation code (meaning burn was successful)
-        if (!activationCode) {
-            // console.error('[Node Activation] No activation code - burn must have failed');
-            walletState.isActivatingNode = false;
-            return { 
-                success: false, 
-                error: 'Cannot generate activation code without successful token burn' 
-            };
-        }
-        
-        // Encrypt activation code before storing (similar to seed phrase)
-        const currentStorageData = await chrome.storage.local.get(['walletData', 'encryptedActivationCodes']);
-        const walletData = currentStorageData.walletData || {};
-        
-        // Store encrypted activation codes separately for better security
-        let encryptedCodes = currentStorageData.encryptedActivationCodes || {};
-        
-        // Double-check: ensure no other nodes are activated (protection against race conditions)
-        if (Object.keys(encryptedCodes).length > 0) {
-            const existingType = Object.keys(encryptedCodes)[0];
-            // v3.18: Only Light and Super nodes
-            const nodeTypeNames = { 
-                light: 'Light Node', 
-                super: 'Super Node' 
-            };
-            walletState.isActivatingNode = false;
-            return { 
-                success: false, 
-                error: `This wallet already has an active ${nodeTypeNames[existingType] || 'node'}. One wallet can only run one node.` 
-            };
-        }
-        
-        // Encrypt the activation code using wallet's encryption key
-        const encryptedCode = await encryptActivationCode(activationCode);
-        
-        encryptedCodes[nodeType] = {
-            encryptedCode: encryptedCode,
-            timestamp: Date.now(),
-            address: solanaAddress
-        };
-        
-        // Update node status
-        walletData.nodeStatus = {
-            active: true,
-            type: nodeType,
-            activationTime: Date.now()
-        };
-        
-        // Store both encrypted codes and wallet data
-        await chrome.storage.local.set({ 
-            'walletData': walletData,
-            'encryptedActivationCodes': encryptedCodes
-        });
-        
-        // Update in-memory state (store encrypted version)
-        walletState.nodeStatus = walletData.nodeStatus;
-        walletState.encryptedActivationCodes = encryptedCodes;
-
-        return { 
-            success: true, 
-            activationCode: activationCode
-        };
-
-    } catch (error) {
-                // console.error('Node activation error:', error);
-        return { success: false, error: error.message || 'Failed to activate node' };
-    } finally {
-        // Always release the lock
-        walletState.isActivatingNode = false;
-    }
-
 }
 
 /**
@@ -4935,530 +4690,6 @@ async function waitForTransactionConfirmation(rpcUrl, signature) {
     }
 }
 
-
-/**
- * Check blockchain for burn transactions to find activated nodes
- */
-async function checkBlockchainForActivations(walletAddress) {
-    // console.log('[checkBlockchainForActivations] Checking blockchain for wallet:', walletAddress?.substring(0, 8) + '...');
-    try {
-        const activatedNodes = [];
-        
-        // Get network setting
-        const localData = await chrome.storage.local.get(['mainnet']);
-        const isMainnet = localData.mainnet === true;
-        // console.log('[checkBlockchainForActivations] Network:', isMainnet ? 'mainnet' : 'devnet');
-        
-        // Initialize RPC if not already
-        if (!walletState.solanaRPC) {
-            const network = isMainnet ? 'mainnet' : 'devnet';
-            walletState.solanaRPC = new SolanaRPC(network);
-        }
-        
-        // Check for burn transactions in Phase 1
-        // Look for SPL Token burns of 1DEV tokens
-        const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
-        const DEV_TOKEN_MINT = isMainnet 
-            ? '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump' // 1DEV token mint mainnet (CORRECT)
-            : '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'; // 1DEV token mint testnet/devnet
-        
-        try {
-            // Get connection
-            const rpc = isMainnet ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com';
-            const response = await fetch(rpc, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    jsonrpc: '2.0',
-                    id: 1,
-                    method: 'getSignaturesForAddress',
-                    params: [
-                        walletAddress,
-                        { limit: 100 }
-                    ]
-                })
-            });
-            
-            const data = await response.json();
-            // console.log('[checkBlockchainForActivations] RPC response received, transactions count:', data.result?.length || 0);
-            
-            if (data.result && Array.isArray(data.result)) {
-                // console.log('[checkBlockchainForActivations] Processing', data.result.length, 'transactions');
-                // Check each transaction
-                for (const tx of data.result) {
-                    // console.log('[checkBlockchainForActivations] Checking transaction:', tx.signature?.substring(0, 10) + '...');
-                    // Get transaction details
-                    const txResponse = await fetch(rpc, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            jsonrpc: '2.0',
-                            id: 1,
-                            method: 'getTransaction',
-                            params: [tx.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
-                        })
-                    });
-                    
-                    const txData = await txResponse.json();
-                    if (txData.result && txData.result.meta && !txData.result.meta.err) {
-                        // First check parsed instructions (easier to work with)
-                        const parsedInstructions = txData.result?.transaction?.message?.instructions;
-                        if (parsedInstructions) {
-                            for (const inst of parsedInstructions) {
-                                // Check for parsed burn instruction
-                                if (inst.parsed && inst.parsed.type === 'burn' && inst.program === 'spl-token') {
-                                    const mint = inst.parsed.info?.mint;
-                                    const amount = inst.parsed.info?.amount;
-                                    
-                                    // console.log('[checkBlockchainForActivations] Found SPL token burn - mint:', mint, 'amount:', amount);
-                                    // console.log('[checkBlockchainForActivations] Expected 1DEV mint:', DEV_TOKEN_MINT);
-                                    
-                        if (mint === DEV_TOKEN_MINT && amount) {
-                            const burnedAmount = parseInt(amount);
-                            // console.log('[checkBlockchainForActivations] ✅ 1DEV burned:', burnedAmount / 1000000, '1DEV');
-                            
-                            // Check if it's in Phase 1 range (dynamic pricing: 300-1500 1DEV)
-                            if (burnedAmount >= 300000000 && burnedAmount <= 1500000000) {
-                                // console.log('[checkBlockchainForActivations] ✅ Found node activation burn, checking for MEMO...');
-                                
-                                // Look for MEMO instruction in the same transaction
-                                let nodeType = null;
-                                const parsedInstructions = txData.result?.transaction?.message?.instructions;
-                                if (parsedInstructions) {
-                                    for (const memoInst of parsedInstructions) {
-                                        if (memoInst.program === 'spl-memo' || 
-                                            (memoInst.programId && memoInst.programId === 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr')) {
-                                            // Found memo instruction - parse the data
-                                            let memoData = null;
-                                            if (memoInst.parsed) {
-                                                memoData = memoInst.parsed;
-                                            } else if (memoInst.data) {
-                                                // Decode base64 or base58 data
-                                                try {
-                                                    memoData = atob(memoInst.data);
-                                                } catch (e) {
-                                                    // Try as raw string if base64 fails
-                                                    memoData = memoInst.data;
-                                                }
-                                            }
-                                            
-                                            if (memoData && typeof memoData === 'string') {
-                                                // Check if it's our node type memo
-                                                const match = memoData.match(/QNET_NODE_TYPE:(\w+)/);
-                                                if (match && match[1]) {
-                                                    nodeType = match[1].toLowerCase();
-                                                    // console.log('[checkBlockchainForActivations] ✅ Found node type in MEMO:', nodeType);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                // v3.18: Only Light and Super nodes
-                                if (nodeType && ['light', 'super'].includes(nodeType)) {
-                                    // Found exact type from memo!
-                                    // console.log('[checkBlockchainForActivations] ✅ Exact node type determined from MEMO:', nodeType);
-                                    return [nodeType];
-                                } else {
-                                    // Old activation without memo - return all types
-                                    // console.log('[checkBlockchainForActivations] No MEMO found (old activation), returning all types');
-                                    return ['light', 'super'];  // v3.18: Only Light and Super
-                                }
-                            }
-                        } else if (mint !== DEV_TOKEN_MINT) {
-                            // console.log('[checkBlockchainForActivations] ❌ Wrong token mint, not 1DEV');
-                        }
-                                }
-                            }
-                        }
-                        
-                        // Fallback to manual checking if parsed data not available
-                        const instructions = txData.result?.transaction?.message?.instructions;
-                        const accountKeys = txData.result?.transaction?.message?.accountKeys;
-                        
-                        if (instructions && accountKeys) {
-                            for (const inst of instructions) {
-                                // Check if instruction involves Token Program
-                                if (inst.programIdIndex !== undefined) {
-                                    const programId = accountKeys[inst.programIdIndex];
-                                    
-                                    // Check for SPL Token burn instruction
-                                    if (programId === TOKEN_PROGRAM_ID) {
-                                        // This is a token program instruction
-                                        // Check if it's a burn by looking at the instruction data
-                                        // Burn instruction starts with 8 (discriminator for burn)
-                                        if (inst.data && typeof inst.data === 'string') {
-                                            // Decode base58 data
-                                            try {
-                                                const decodedData = atob(inst.data);
-                                                const instructionType = decodedData.charCodeAt(0);
-                                                
-                                                // SPL Token Burn instruction type is 8
-                                                if (instructionType === 8) {
-                                                    // console.log('[checkBlockchainForActivations] Found SPL Token burn in tx:', tx.signature.substring(0, 10) + '...');
-                                                    // Check token balances to see if 1DEV was burned
-                                                    const preBalances = txData.result?.meta?.preTokenBalances || [];
-                                                    const postBalances = txData.result?.meta?.postTokenBalances || [];
-                                                    
-                                                    for (const preBalance of preBalances) {
-                                                        if (preBalance.mint === DEV_TOKEN_MINT) {
-                                                            // Found 1DEV balance change
-                                                            const preBal = parseInt(preBalance.uiTokenAmount?.amount || '0');
-                                                            const postBalance = postBalances.find(pb => pb.accountIndex === preBalance.accountIndex);
-                                                            const postBal = parseInt(postBalance?.uiTokenAmount?.amount || '0');
-                                                            
-                                                            if (preBal > postBal) {
-                                                                const burned = preBal - postBal;
-                                                                // console.log('[checkBlockchainForActivations] ✅ 1DEV burned (manual check):', burned / 1000000, '1DEV');
-                                                                
-                                                                // Check if it's in Phase 1 range (dynamic pricing: 300-1500 1DEV)
-                                                                if (burned >= 300000000 && burned <= 1500000000) {
-                                                                    // console.log('[checkBlockchainForActivations] ✅ Found node activation burn (manual)!');
-                                                                    return ['light', 'super'];  // v3.18: Only Light and Super
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            } catch (e) {
-                                                // Failed to decode instruction data
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (rpcError) {
-            // console.error('[checkBlockchainForActivations] RPC check failed:', rpcError);
-            // console.error('[checkBlockchainForActivations] RPC URL used:', rpc);
-            // console.error('[checkBlockchainForActivations] Wallet address:', walletAddress);
-            // Continue without blockchain check
-        }
-        
-        // console.log('[checkBlockchainForActivations] No burn transactions found');
-        return activatedNodes;
-    } catch (error) {
-                // console.error('[checkBlockchainForActivations] Error:', error);
-        return [];
-    }
-}
-
-/**
- * Sync activation codes from blockchain (called on wallet restore)
- */
-async function syncActivationCodes(walletAddress, seedPhrase) {
-    // console.log('[syncActivationCodes] Starting sync for wallet:', walletAddress?.substring(0, 8) + '...');
-    try {
-        // Generate deterministic codes for all node types
-        // v3.18: Only Light and Super nodes
-        const codes = {
-            light: await generateActivationCode('light', walletAddress, seedPhrase),
-            super: await generateActivationCode('super', walletAddress, seedPhrase)
-        };
-        
-        // console.log('[syncActivationCodes] Generated codes for all types');
-        
-        // Check blockchain for existing burn transactions (Phase 1)
-        const activatedNodes = await checkBlockchainForActivations(walletAddress);
-        
-        // console.log('[syncActivationCodes] Blockchain check returned:', activatedNodes);
-        
-        // Build encrypted activation codes object for activated nodes only
-        const encryptedCodes = {};
-        
-        // If we found activated nodes on blockchain
-        if (activatedNodes && activatedNodes.length > 0) {
-            // Check if we already have a stored code to maintain consistency
-            const stored = await chrome.storage.local.get(['encryptedActivationCodes']);
-            const existingCodes = stored.encryptedActivationCodes || {};
-            
-            if (Object.keys(existingCodes).length > 0) {
-                // Already have a code stored - keep it
-                // console.log('[syncActivationCodes] Keeping existing node type:', Object.keys(existingCodes));
-                return existingCodes;
-            }
-            
-            // Check if we have exact node type from MEMO
-            if (activatedNodes.length === 1) {
-                // Exact type determined from MEMO!
-                const nodeType = activatedNodes[0];
-                const code = codes[nodeType];
-                
-                if (code) {
-                    // console.log('[syncActivationCodes] Storing code for node type (from MEMO):', nodeType);
-                    const encryptedCode = await encryptActivationCode(code);
-                    encryptedCodes[nodeType] = {
-                        encryptedCode: encryptedCode,
-                        timestamp: Date.now(),
-                        nodeType: nodeType
-                    };
-                    // console.log('[syncActivationCodes] Code stored for:', nodeType);
-                }
-            } else {
-                // Old activation without MEMO - can't determine exact type
-                // console.log('[syncActivationCodes] ⚠️ Old activation detected without MEMO');
-                // console.log('[syncActivationCodes] Cannot determine exact node type');
-                // console.log('[syncActivationCodes] Please re-activate your node with latest version');
-                
-                // Don't store anything - user needs to re-activate
-                return null;
-            }
-        }
-        
-        // Return encrypted codes if any were found
-        if (Object.keys(encryptedCodes).length > 0) {
-            // console.log('[syncActivationCodes] Returning newly encrypted codes for:', Object.keys(encryptedCodes));
-            return encryptedCodes;
-        }
-        
-        // Check if we have stored codes locally (for backward compatibility)
-        const stored = await chrome.storage.local.get(['encryptedActivationCodes']);
-        const existingCodes = stored.encryptedActivationCodes || {};
-        
-        // console.log('[syncActivationCodes] Checking local storage, found:', Object.keys(existingCodes));
-        
-        if (Object.keys(existingCodes).length > 0) {
-            // console.log('[syncActivationCodes] Returning existing codes from storage');
-            return existingCodes;
-        }
-        
-        // console.log('[syncActivationCodes] No codes found - neither on blockchain nor in storage');
-        return null;
-    } catch (error) {
-                // console.error('[syncActivationCodes] Error:', error);
-        return null;
-    }
-}
-
-/**
- * Generate deterministic activation code from seed phrase
- * Same seed + nodeType = same code (for sync between devices)
- */
-async function generateActivationCode(nodeType, address, seedPhrase = null) {
-    // Generate DETERMINISTIC activation code
-    let entropy;
-    
-    if (seedPhrase) {
-        // Use seed phrase for deterministic generation (preferred)
-        const seedData = `${seedPhrase}-${nodeType}-QNET_ACTIVATION_V2`;
-        
-        // Log first few words of seed phrase for verification (safe to log partial)
-        const seedWords = seedPhrase.split(' ');
-        // console.log('[generateActivationCode] Using seed phrase starting with:', seedWords[0], seedWords[1], '...');
-        
-        // Use Web Crypto API for SHA-256 hashing
-        const encoder = new TextEncoder();
-        const data = encoder.encode(seedData);
-        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        entropy = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-    } else {
-        // Fallback: generate random for backward compatibility
-        const randomBytes = new Uint8Array(32);
-        crypto.getRandomValues(randomBytes);
-        entropy = Array.from(randomBytes)
-        .map(b => b.toString(16).padStart(2, '0'))
-            .join('');
-    }
-    
-    // Create three 6-character segments from entropy
-    const entropyUpper = entropy.toUpperCase();
-    const segment1 = entropyUpper.substring(0, 6);
-    const segment2 = entropyUpper.substring(6, 12);
-    const segment3 = entropyUpper.substring(12, 18);
-    
-    // Format as QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
-    const formatted = `QNET-${segment1}-${segment2}-${segment3}`;
-    
-    return formatted;
-}
-
-/**
- * Encrypt activation code for secure storage
- */
-async function encryptActivationCode(code) {
-    try {
-        if (!walletState.encryptionKey) {
-            throw new Error('No encryption key available');
-        }
-        
-        // Use AES-GCM for strong encryption (same as ProductionCrypto)
-        const encoder = new TextEncoder();
-        const data = encoder.encode(code);
-        
-        // Generate salt and IV
-        const salt = crypto.getRandomValues(new Uint8Array(16));
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        
-        // Derive key from password — 600K (OWASP 2024)
-        const passwordKey = await crypto.subtle.importKey(
-            'raw',
-            encoder.encode(walletState.encryptionKey),
-            'PBKDF2',
-            false,
-            ['deriveKey']
-        );
-
-        const key = await crypto.subtle.deriveKey(
-            {
-                name: 'PBKDF2',
-                salt: salt,
-                iterations: 600_000, // OWASP 2024
-                hash: 'SHA-256'
-            },
-            passwordKey,
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['encrypt']
-        );
-
-        // Encrypt data
-        const encrypted = await crypto.subtle.encrypt(
-            {
-                name: 'AES-GCM',
-                iv: iv
-            },
-            key,
-            data
-        );
-
-        // Combine salt, iv, and encrypted data — prefix "v2:" marks 600K iterations
-        const combined = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
-        combined.set(salt, 0);
-        combined.set(iv, salt.length);
-        combined.set(new Uint8Array(encrypted), salt.length + iv.length);
-
-        return 'v2:' + btoa(String.fromCharCode(...combined));
-    } catch (error) {
-                // console.error('[Encrypt Code] Error:', error);
-        throw new Error('Failed to encrypt activation code');
-    }
-}
-
-/**
- * Decrypt activation code from storage
- */
-async function decryptActivationCode(encryptedCode) {
-    try {
-        if (!walletState.encryptionKey) {
-            throw new Error('No encryption key available');
-        }
-        
-        // Detect version: "v2:" prefix = 600K iterations; no prefix = legacy 100K
-        let iterations;
-        let rawBase64;
-        if (encryptedCode.startsWith('v2:')) {
-            iterations = 600_000; // OWASP 2024
-            rawBase64 = encryptedCode.slice(3);
-        } else {
-            iterations = 100_000; // Legacy — decrypt only, re-encrypted as v2 on next write
-            rawBase64 = encryptedCode;
-        }
-
-        // Decode from base64
-        const combined = Uint8Array.from(atob(rawBase64), c => c.charCodeAt(0));
-
-        // Extract salt, iv, and encrypted data
-        const salt = combined.slice(0, 16);
-        const iv = combined.slice(16, 28);
-        const encrypted = combined.slice(28);
-
-        // Derive key from password
-        const encoder = new TextEncoder();
-        const passwordKey = await crypto.subtle.importKey(
-            'raw',
-            encoder.encode(walletState.encryptionKey),
-            'PBKDF2',
-            false,
-            ['deriveKey']
-        );
-
-        const key = await crypto.subtle.deriveKey(
-            {
-                name: 'PBKDF2',
-                salt: salt,
-                iterations,
-                hash: 'SHA-256'
-            },
-            passwordKey,
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['decrypt']
-        );
-        
-        // Decrypt data
-        const decrypted = await crypto.subtle.decrypt(
-            {
-                name: 'AES-GCM',
-                iv: iv
-            },
-            key,
-            encrypted
-        );
-        
-        // Convert back to string
-        const decoder = new TextDecoder();
-        return decoder.decode(decrypted);
-    } catch (error) {
-                // console.error('[Decrypt Code] Error:', error);
-        throw new Error('Failed to decrypt activation code');
-    }
-}
-
-/**
- * Export activation code (similar to recovery phrase export)
- */
-async function exportActivationCode(password, nodeType) {
-    try {
-        // Verify password
-        const unlocked = await unlockWallet(password);
-        if (!unlocked.success) {
-            return { success: false, error: 'Invalid password' };
-        }
-        
-        // Get encrypted activation codes from storage
-        const storageData = await chrome.storage.local.get(['encryptedActivationCodes']);
-        const encryptedCodes = storageData.encryptedActivationCodes || {};
-        
-        if (!encryptedCodes[nodeType]) {
-            return { success: false, error: 'No activation code found for this node type' };
-        }
-        
-        // Decrypt the activation code
-        const decryptedCode = await decryptActivationCode(encryptedCodes[nodeType].encryptedCode);
-        
-        if (!decryptedCode) {
-            return { success: false, error: 'Failed to decrypt activation code' };
-        }
-        
-        return { 
-            success: true, 
-            activationCode: decryptedCode,
-            timestamp: encryptedCodes[nodeType].timestamp,
-            nodeType: nodeType
-        };
-        
-    } catch (error) {
-                // console.error('Export activation code error:', error);
-        return { success: false, error: error.message };
-    }
-}
-
-/**
- * Message handler
- */
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    handleMessage(request, sender, sendResponse);
-    return true; // Keep message channel open for async response
-});
-
-/**
- * Handle incoming messages
- */
 async function handleMessage(request, sender, sendResponse) {
     try {
         // Message received
@@ -5586,17 +4817,6 @@ async function handleMessage(request, sender, sendResponse) {
                     sendResponse({ success: false, error: error.message });
                 }
                 break;
-                
-            case 'BURN_AND_ACTIVATE':
-                // Security check: ensure request is from our extension popup
-                if (sender.tab || !sender.url?.includes('popup.html')) {
-                    sendResponse({ success: false, error: 'Unauthorized request. Node activation must be done through the wallet interface.' });
-                    break;
-                }
-                const burnResult = await burnAndActivateNode(request.nodeType, request.amount);
-                sendResponse(burnResult);
-                break;
-                
             case 'VERIFY_PASSWORD':
                 try {
                     // Always verify password, even if wallet is unlocked
@@ -5632,11 +4852,6 @@ async function handleMessage(request, sender, sendResponse) {
                     // console.error('[VERIFY_PASSWORD] Unexpected error:', error);
                     sendResponse({ success: false, error: error.message });
                 }
-                break;
-                
-            case 'EXPORT_ACTIVATION_CODE':
-                const exportResult = await exportActivationCode(request.password, request.nodeType);
-                sendResponse(exportResult);
                 break;
                 
             case 'CLEAR_CACHE':
@@ -5684,12 +4899,6 @@ async function handleMessage(request, sender, sendResponse) {
                 const networkSizeResult = await getNetworkSize();
                 sendResponse(networkSizeResult);
                 break;
-                
-            case 'BURN_1DEV_TOKENS':
-                const burn1DevResult = await burnOneDevTokens(request);
-                sendResponse(burn1DevResult);
-                break;
-                
             case 'SETUP_COMPLETE':
                 try {
                     // Wallet setup completed, opening main wallet
@@ -5766,7 +4975,6 @@ async function handleMessage(request, sender, sendResponse) {
                             
                             startAutoLockTimer();
                             startBalanceUpdates();
-                            startActivationSync();
                         }
                     }
                     
@@ -5800,37 +5008,6 @@ async function handleMessage(request, sender, sendResponse) {
                 } catch (error) {
                     sendResponse({ success: false, error: error.message });
                 }
-                break;
-                
-            case 'SPEND_QNC_TO_POOL3':
-                try {
-                    // CRITICAL: Check phase before allowing QNC spend
-                    const currentPhase = request.phase || 1;
-                    if (currentPhase < 2) {
-                        sendResponse({
-                            success: false,
-                            error: 'PHASE_1_ACTIVE: QNC activations are disabled in Phase 1. Use 1DEV burn instead.',
-                            phase: currentPhase
-                        });
-                        return true;
-                    }
-
-                    // Proceed with QNC to Pool 3 operation
-                    const result = await spendQNCToPool3(request);
-                    sendResponse({
-                        success: true,
-                        signature: result.signature,
-                        poolTransfer: result.poolTransfer,
-                        phase: currentPhase
-                    });
-                } catch (error) {
-                    // Error:('Failed to spend QNC to Pool 3:', error);
-                    sendResponse({
-                        success: false,
-                        error: error.message
-                    });
-                }
-                return true;
                 
             case 'GET_BURN_PERCENTAGE':
                 try {
@@ -6178,7 +5355,6 @@ async function createWallet(password, mnemonic) {
             walletExists: true,
             encryptedWallet: encryptedWallet,
             currentNetwork: 'solana',
-            encryptedActivationCodes: {} // Clear old activation codes from previous wallet
         });
         
         // Auto-unlock wallet after creation
@@ -6187,7 +5363,6 @@ async function createWallet(password, mnemonic) {
         walletState.encryptionKey = password; // Store encryption key for activation codes
         walletState.decryptedWalletData = walletData; // Cache decrypted wallet data
         walletState.currentNetwork = 'solana';
-        walletState.encryptedActivationCodes = {}; // Clear old activation codes from memory
         
         // Load accounts
         await loadWalletAccounts(walletData);
@@ -6211,7 +5386,6 @@ async function createWallet(password, mnemonic) {
         // Start timers
         startAutoLockTimer();
         startBalanceUpdates();
-        startActivationSync();
         
         // Prefetch critical data for new wallet
         setTimeout(() => prefetchCriticalData(), 100); // Small delay to ensure wallet is fully initialized
@@ -6248,19 +5422,6 @@ async function importWallet(password, mnemonic) {
         const result = await createWallet(password, mnemonic);
         
         if (result.success) {
-            
-            // Sync activation codes from blockchain (restore existing activations)
-            try {
-                const address = result.address || result.solanaAddress;
-                if (address && mnemonic) {
-                    const existingCodes = await syncActivationCodes(address, mnemonic);
-                    if (existingCodes) {
-                        // Store the synced codes
-                        await chrome.storage.local.set({ encryptedActivationCodes: existingCodes });
-                    }
-                }
-            } catch (syncError) {
-                // Silent fail - no previous activations
             }
         }
         
@@ -6424,29 +5585,9 @@ async function unlockWallet(password) {
         //console.log('[UnlockWallet] Starting auto-lock timer and balance updates');
         startAutoLockTimer();
         startBalanceUpdates();
-        startActivationSync(); // Start periodic activation sync
         
         // Prefetch critical data for instant UI
         prefetchCriticalData();
-        
-        // Sync activation codes from blockchain in background
-        setTimeout(async () => {
-            try {
-                const address = walletState.accounts[0]?.solanaAddress || walletState.accounts[0]?.address;
-                const mnemonic = walletData.mnemonic;
-                
-                if (address && mnemonic) {
-                    const existingCodes = await syncActivationCodes(address, mnemonic);
-                    if (existingCodes) {
-                        // Store the synced codes
-                        await chrome.storage.local.set({ encryptedActivationCodes: existingCodes });
-                    }
-                }
-            } catch (syncError) {
-                // Silent fail - sync in background
-                // console.log('[UnlockWallet] Background sync error:', syncError);
-            }
-        }, 100);
         
         // Log: ( Wallet unlocked successfully');
         return { success: true, accounts: walletState.accounts };
@@ -6482,9 +5623,6 @@ async function lockWallet() {
         clearInterval(balanceUpdateInterval);
         balanceUpdateInterval = null;
     }
-    
-    // Stop activation sync
-    stopActivationSync();
     
     // Clear lock time but do NOT save isUnlocked to local storage
     await chrome.storage.local.set({
@@ -7386,9 +6524,7 @@ async function prefetchCriticalData() {
             // SOL balance
             getBalance(account.solanaAddress),
             // 1DEV token balance
-            getBalance(account.solanaAddress, tokenMint),
-            // Check for existing activation codes
-            chrome.storage.local.get(['encryptedActivationCodes'])
+            getBalance(account.solanaAddress, tokenMint)
         ];
         
         // Execute all prefetches in parallel - don't wait for results
@@ -7403,73 +6539,6 @@ async function prefetchCriticalData() {
     }
 }
 
-/**
- * Start periodic activation code sync for browser extension (every 30 seconds)
- */
-function startActivationSync() {
-    // console.log('[ActivationSync] Starting activation sync...');
-    
-    // Clear existing interval if any
-    if (walletState.syncInterval) {
-        clearInterval(walletState.syncInterval);
-        walletState.syncInterval = null;
-    }
-    
-    // Do immediate sync first
-    if (walletState.isUnlocked && walletState.accounts.length > 0 && walletState.decryptedWalletData) {
-        const address = walletState.accounts[0]?.solanaAddress || walletState.accounts[0]?.address;
-        const mnemonic = walletState.decryptedWalletData.mnemonic;
-        
-        // console.log('[ActivationSync] Syncing for address:', address?.substring(0, 8) + '...');
-        
-        if (address && mnemonic) {
-            syncActivationCodes(address, mnemonic).then(syncedCodes => {
-                // console.log('[ActivationSync] Sync completed, codes found:', syncedCodes ? Object.keys(syncedCodes) : 'none');
-                if (syncedCodes) {
-                    chrome.storage.local.set({ encryptedActivationCodes: syncedCodes });
-                    walletState.encryptedActivationCodes = syncedCodes;
-                }
-            }).catch(error => {
-                // console.error('[ActivationSync] Initial sync error:', error);
-            });
-        } else {
-            // console.log('[ActivationSync] Missing address or mnemonic');
-        }
-    } else {
-        // console.log('[ActivationSync] Not ready - unlocked:', walletState.isUnlocked, 'accounts:', walletState.accounts.length);
-    }
-    
-    // Set up periodic sync interval (30 seconds for browser - no battery concern)
-    walletState.syncInterval = setInterval(async () => {
-        if (walletState.isUnlocked && walletState.accounts.length > 0 && walletState.decryptedWalletData) {
-            try {
-                const address = walletState.accounts[0]?.solanaAddress || walletState.accounts[0]?.address;
-                const mnemonic = walletState.decryptedWalletData.mnemonic;
-                
-                if (address && mnemonic) {
-                    const syncedCodes = await syncActivationCodes(address, mnemonic);
-                    if (syncedCodes) {
-                        await chrome.storage.local.set({ encryptedActivationCodes: syncedCodes });
-                        walletState.encryptedActivationCodes = syncedCodes;
-                    }
-                }
-            } catch (error) {
-                // Silent fail - don't interrupt user
-                // console.log('[ActivationSync] Background sync error:', error);
-            }
-        }
-    }, 30000); // 30 seconds
-}
-
-/**
- * Stop periodic activation sync
- */
-function stopActivationSync() {
-    if (walletState.syncInterval) {
-        clearInterval(walletState.syncInterval);
-        walletState.syncInterval = null;
-    }
-}
 
 /**
  * Check if wallet exists
@@ -7799,56 +6868,6 @@ async function getBurnPercentage() {
     }
 }
 
-/**
- * FREE activation - no burning needed
- */
-async function burnOneDevTokens(request) {
-    try {
-        // FREE wallet - no burning needed, instant activation
-        const mockSignature = 'free_activation_' + cryptoRandomBase36(13);
-        const mockBlockHeight = cryptoRandomInt(1000000) + 200000000;
-
-        return {
-            success: true,
-            signature: mockSignature,
-            blockHeight: mockBlockHeight,
-            phase: request.phase || 1,
-            amount: 0, // FREE - no cost
-            nodeType: request.nodeType,
-            free: true
-        };
-    } catch (error) {
-        // Error:('Failed to activate:', error);
-        return {
-            success: false,
-            error: error.message
-        };
-    }
-}
-
-/**
- * FREE activation - no QNC spending needed
- */
-async function spendQNCToPool3(request) {
-    try {
-        // FREE wallet - instant activation without spending
-        const mockSignature = 'free_pool3_' + cryptoRandomBase36(13);
-        const mockPoolTransfer = 'free_transfer_' + cryptoRandomBase36(13);
-
-        return {
-            success: true,
-            signature: mockSignature,
-            poolTransfer: mockPoolTransfer,
-            amount: 0, // FREE - no cost
-            nodeType: request.nodeType,
-            networkSize: request.networkSize,
-            free: true
-        };
-    } catch (error) {
-        // Error:('Failed to activate:', error);
-        throw error;
-    }
-}
 
 /**
  * Get network age years since QNet mainnet launch

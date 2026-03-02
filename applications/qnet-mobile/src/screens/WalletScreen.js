@@ -1843,9 +1843,12 @@ const WalletScreen = () => {
           'Could not connect to the QNet network.\n\nPlease check your internet connection and try again.'
         );
       } else if (msg.includes('dilithium') || msg.includes('quantum signature') || msg.includes('signature')) {
+        const detail = error.message || '';
         showAlert(
           'Signature Error',
-          'Failed to create quantum-secure signature for node registration.\n\nPlease try again. If the problem persists, restart the app.'
+          'Failed to create quantum-secure signature for node registration.\n\n' +
+          (detail ? `Details: ${detail}\n\n` : '') +
+          'Please try again. If the problem persists, restart the app.'
         );
       } else {
         showAlert(

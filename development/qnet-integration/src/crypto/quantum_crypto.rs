@@ -1215,56 +1215,59 @@ impl QNetQuantumCrypto {
         Ok(timestamp / 1000) // Convert from milliseconds to seconds
     }
 
-    /// Get burn transaction hash from blockchain records
-    /// Get burn_tx AND burn_amount from blockchain registry
-    /// CRITICAL: Both values must match what was used during code generation for XOR decryption!
+    /// Get burn_tx AND burn_amount required for XOR decryption key.
+    /// Priority: (1) QNET_BURN_TX_HASH / QNET_BURN_AMOUNT env vars,
+    ///           (2) blockchain activation registry,
+    ///           (3) genesis bootstrap codes — hardcoded sentinel values.
+    /// Non-genesis codes with no env vars and no registry entry → hard error (no silent fallback).
     async fn get_burn_tx_and_amount_from_blockchain(&self, activation_code: &str, node_type: &str) -> Result<(String, u64)> {
-        // PRODUCTION: Query QNet blockchain activation registry
+        // Genesis bootstrap codes don't use XOR encryption — skip all checks.
+        if activation_code.starts_with("QNET-BOOT") {
+            return Ok(("genesis_bootstrap".to_string(), 0));
+        }
+
+        // Priority 1: env vars set by Docker (-e QNET_BURN_TX_HASH=... -e QNET_BURN_AMOUNT=...)
+        let env_burn_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
+        let env_burn_amount = std::env::var("QNET_BURN_AMOUNT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        if !env_burn_tx.is_empty() && env_burn_amount > 0 {
+            println!("[INFO][QUANTUM_CRYPTO] xor_key_from_env tx={}... amount={}", safe_preview(&env_burn_tx, 8), env_burn_amount);
+            return Ok((env_burn_tx, env_burn_amount));
+        }
+
+        // Priority 2: activation registry in blockchain (node already registered once before)
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
-        
-        // Hash the activation code (registry stores hashes, not plaintext codes)
         let code_hash = registry.hash_activation_code_for_blockchain(activation_code)
             .map_err(|e| anyhow!("Failed to hash activation code: {}", e))?;
-        
-        // Query registry for activation record
+
         match registry.get_activation_record_by_hash(&code_hash).await {
-            Ok(Some(record)) => {
-                if !record.tx_hash.is_empty() {
-                    println!("[INFO][QUANTUM_CRYPTO] node_retrieved_from_registry");
-                    println!("[DEBUG][QUANTUM_CRYPTO] burn_tx={}... burn_amount={}", safe_preview(&record.tx_hash, 8), record.activation_amount);
-                    return Ok((record.tx_hash, record.activation_amount));
-                }
+            Ok(Some(record)) if !record.tx_hash.is_empty() => {
+                println!("[INFO][QUANTUM_CRYPTO] xor_key_from_registry tx={}... amount={}",
+                    safe_preview(&record.tx_hash, 8), record.activation_amount);
+                return Ok((record.tx_hash, record.activation_amount));
             }
-            Ok(None) => {
-                eprintln!("[WARN][QUANTUM_CRYPTO] no_activation_record code_hash={}...", safe_preview(&code_hash, 8));
-            }
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("[WARN][QUANTUM_CRYPTO] registry_query_failed err={}", e);
             }
         }
-        
-        // FALLBACK: For Genesis nodes or codes without registry entry
-        // Genesis nodes use predefined values
-        if activation_code.starts_with("QNET-BOOT") {
-            let fallback_tx = format!("genesis_burn_{}", &blake3::hash(activation_code.as_bytes()).to_hex()[..16]);
-            eprintln!("[WARN][QUANTUM_CRYPTO] genesis_fallback tx={}...", safe_preview(&fallback_tx, 8));
-            return Ok((fallback_tx, 0)); // Genesis nodes don't use XOR encryption
-        }
-        
-        // For non-Genesis codes without registry entry, use default Phase 1 base price
-        // This is a fallback and may cause decryption failure if actual price was different
-        let fallback_tx = format!("unknown_burn_{}", &blake3::hash(activation_code.as_bytes()).to_hex()[..16]);
-        let fallback_amount = 1500u64; // Phase 1 base price
-        eprintln!("[WARN][QUANTUM_CRYPTO] using_fallback tx={}... amount={}", safe_preview(&fallback_tx, 8), fallback_amount);
-        Ok((fallback_tx, fallback_amount))
+
+        // No source found — hard error. Silent fallback would silently corrupt XOR decryption.
+        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        eprintln!("❌ ACTIVATION FAILED: QNET_BURN_TX_HASH or QNET_BURN_AMOUNT not provided");
+        eprintln!("   XOR decryption requires the exact Solana burn transaction and amount");
+        eprintln!("   used when the activation code was generated.");
+        eprintln!("");
+        eprintln!("   Required Docker env vars:");
+        eprintln!("     -e QNET_BURN_TX_HASH=\"<your_solana_burn_tx_signature>\"");
+        eprintln!("     -e QNET_BURN_AMOUNT=\"1500\"");
+        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        std::process::exit(1);
     }
     
-    /// DEPRECATED: Use get_burn_tx_and_amount_from_blockchain instead
-    #[allow(dead_code)]
-    async fn get_burn_tx_from_blockchain(&self, activation_code: &str, node_type: &str) -> Result<String> {
-        let (burn_tx, _) = self.get_burn_tx_and_amount_from_blockchain(activation_code, node_type).await?;
-        Ok(burn_tx)
-    }
 
     /// Get DYNAMIC burn amount based on current blockchain state (PHASE 1 or PHASE 2)
     /// 

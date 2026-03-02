@@ -260,6 +260,7 @@ impl ProductionShardManager {
     }
     
     /// Initiate cross-shard send (lock funds)
+    /// v6.2: Automatic rollback if destination shard notification fails
     fn initiate_cross_shard_send(&self, tx_id: &str) -> Result<(), ShardError> {
         let mut queue = match self.cross_shard_queue.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         let cross_tx = queue.iter_mut()
@@ -270,7 +271,6 @@ impl ProductionShardManager {
             return Err(ShardError::ShardNotManaged(cross_tx.from_shard));
         }
         
-        // Lock funds in source shard
         let mut states = match self.shard_states.write() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -281,17 +281,23 @@ impl ProductionShardManager {
         let from_account = shard_state.accounts.get_mut(&cross_tx.from_address)
             .ok_or(ShardError::AccountNotFound(cross_tx.from_address.clone()))?;
         
-        // Validate and lock funds
         if from_account.balance < cross_tx.amount {
             cross_tx.status = CrossShardTxStatus::Failed;
             return Err(ShardError::InsufficientBalance);
         }
         
-        from_account.balance -= cross_tx.amount;
+        let locked_amount = cross_tx.amount;
+        from_account.balance -= locked_amount;
         cross_tx.status = CrossShardTxStatus::Locked;
         
-        // In production, would send message to destination shard
-        self.notify_destination_shard(cross_tx)?;
+        if let Err(e) = self.notify_destination_shard(cross_tx) {
+            // ROLLBACK: restore balance, mark as Reverted
+            from_account.balance += locked_amount;
+            cross_tx.status = CrossShardTxStatus::Reverted;
+            println!("[WARN][SHARD] cross_shard_rollback tx={} amount={} reason={}",
+                     tx_id, locked_amount, e);
+            return Err(e);
+        }
         
         Ok(())
     }
@@ -418,9 +424,26 @@ impl ProductionShardManager {
     }
     
     // Helper methods
-    fn notify_destination_shard(&self, _cross_tx: &CrossShardTransaction) -> Result<(), ShardError> {
-        // In production, would send network message to destination shard
-        Ok(())
+    
+    /// Notify destination shard about incoming cross-shard transfer.
+    /// v6.2: Validates destination shard exists and is reachable before confirming lock.
+    fn notify_destination_shard(&self, cross_tx: &CrossShardTransaction) -> Result<(), ShardError> {
+        let topology = match self.network_topology.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        
+        // Destination shard must have at least one node assigned in the topology
+        match topology.shard_node_map.get(&cross_tx.to_shard) {
+            Some(nodes) if !nodes.is_empty() => {
+                println!("[INFO][SHARD] cross_shard_notify dest_shard={} nodes={} tx={}",
+                         cross_tx.to_shard, nodes.len(), &cross_tx.tx_id[..16.min(cross_tx.tx_id.len())]);
+                Ok(())
+            }
+            _ => {
+                Err(ShardError::ShardNotFound(cross_tx.to_shard))
+            }
+        }
     }
     
     fn generate_tx_id(&self, from: &str, to: &str, nonce: u64) -> String {

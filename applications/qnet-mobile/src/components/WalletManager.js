@@ -3543,18 +3543,18 @@ export class WalletManager {
       
       // Hash address (same as Rust: b"QNET_ADDR:" + address.as_bytes())
       const addrHashHex = sha3_256(this.concatBytes(
-        new TextEncoder().encode('QNET_ADDR:'),
-        new TextEncoder().encode(address)
+        Buffer.from('QNET_ADDR:', 'utf8'),
+        Buffer.from(address, 'utf8')
       ));
       
       // Hash account data (same as Rust: b"QNET_ACCOUNT:" + balance(8) + nonce(8) + pending_rewards(8) + address)
       // CRITICAL: Use raw bytes, not hex strings!
       const accountDataBytes = this.concatBytes(
-        new TextEncoder().encode('QNET_ACCOUNT:'),
+        Buffer.from('QNET_ACCOUNT:', 'utf8'),
         this.uint64ToBytes(balance),           // 8 bytes little-endian
         this.uint64ToBytes(nonce),             // 8 bytes little-endian
         this.uint64ToBytes(0),                 // pending_rewards = 0 for basic proof
-        new TextEncoder().encode(address)      // address string bytes
+        Buffer.from(address, 'utf8')           // address string bytes
       );
       let currentHash = sha3_256(accountDataBytes);
       
@@ -3617,18 +3617,17 @@ export class WalletManager {
       );
       
       // Build hash (same as Rust: b"QNET_VALIDATOR_SET:" + epoch + validators)
-      const encoder = new TextEncoder();
       let dataToHash = this.concatBytes(
-        encoder.encode('QNET_VALIDATOR_SET:'),
+        Buffer.from('QNET_VALIDATOR_SET:', 'utf8'),
         this.uint64ToBytes(epoch)
       );
       
       for (const v of sorted) {
         dataToHash = this.concatBytes(
           dataToHash,
-          encoder.encode(v.node_id || ''),
-          encoder.encode(v.address || ''),
-          encoder.encode(v.node_type || ''),
+          Buffer.from(v.node_id || '', 'utf8'),
+          Buffer.from(v.address || '', 'utf8'),
+          Buffer.from(v.node_type || '', 'utf8'),
           this.float64ToBytes(v.reputation || 0),
           this.uint64ToBytes(v.last_seen || 0),
           new Uint8Array([v.is_active ? 1 : 0])
@@ -5289,7 +5288,7 @@ export class WalletManager {
       // v4.7: Include Ed25519 signature + burn_wallet for wallet ownership proof
       const sigTimestamp = Math.floor(Date.now() / 1000);
       const ed25519Message = `qnet_register:${activationCode}:${sigTimestamp}`;
-      const ed25519MsgBytes = new TextEncoder().encode(ed25519Message);
+      const ed25519MsgBytes = Buffer.from(ed25519Message, 'utf8');
       const ed25519Sig = nacl.sign.detached(ed25519MsgBytes, new Uint8Array(walletData.secretKey));
       const ed25519SigHex = Array.from(ed25519Sig).map(b => b.toString(16).padStart(2, '0')).join('');
       
@@ -5498,8 +5497,7 @@ export class WalletManager {
     // blake3::hash("LIGHT_NODE_PRIVACY_{wallet}") → first 8 hex chars
     const { blake3 } = require('@noble/hashes/blake3.js');
     const input = `LIGHT_NODE_PRIVACY_${walletAddress}`;
-    const inputBytes = new TextEncoder().encode(input);
-    const hashBytes = blake3(inputBytes);
+    const hashBytes = blake3(Buffer.from(input, 'utf8'));
     // First 4 bytes → 8 hex chars (matches Rust: &pseudonym_hash.to_hex()[..8])
     const hexHash = Array.from(hashBytes.slice(0, 4))
       .map(b => b.toString(16).padStart(2, '0'))
@@ -5528,7 +5526,7 @@ export class WalletManager {
 
     const timestamp = Math.floor(Date.now() / 1000);
     const message = `client_node_reg:${nodeId}:${walletAddress}:${registrationProof}:${timestamp}`;
-    const messageBytes = new TextEncoder().encode(message);
+    const messageBytes = Buffer.from(message, 'utf8');
 
     const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
     const signature = Buffer.from(ed25519Sig).toString('hex');
@@ -5648,7 +5646,7 @@ export class WalletManager {
             ed25519GossipPubkey = Buffer.from(kp.publicKey).toString('hex');
             const fullSk = new Uint8Array([...privateKeyBytes, ...kp.publicKey]);
             const gossipMsg = `light_node_gossip:${systemPseudonym}:${walletAddress}`;
-            const sig = nacl.sign.detached(new TextEncoder().encode(gossipMsg), fullSk);
+            const sig = nacl.sign.detached(Buffer.from(gossipMsg, 'utf8'), fullSk);
             ed25519GossipSignature = Buffer.from(sig).toString('hex');
             console.log('[Registration] Ed25519 gossip signature created (hybrid v6.1)');
 
@@ -5784,7 +5782,7 @@ export class WalletManager {
             if (wd && wd.secretKey) {
               signatureTimestamp = Math.floor(Date.now() / 1000);
               const message = `qnet_register:${activationCode}:${signatureTimestamp}`;
-              const messageBytes = new TextEncoder().encode(message);
+              const messageBytes = Buffer.from(message, 'utf8');
               const secretKeyBytes = new Uint8Array(wd.secretKey);
               const sig = nacl.sign.detached(messageBytes, secretKeyBytes);
               ed25519Signature = Array.from(sig).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -5846,6 +5844,7 @@ export class WalletManager {
         // Re-throw server/network errors as-is so WalletScreen shows proper error messages.
         // Only wrap actual Dilithium/Ed25519 crypto errors.
         const msg = dilithiumError.message || '';
+        console.error('[Registration] Error in quantum registration block:', msg);
         const isCryptoError = msg.includes('DilithiumModule') ||
           msg.includes('Dilithium3') ||
           msg.includes('dilithium') ||
@@ -6114,7 +6113,7 @@ export class WalletManager {
       // Hybrid signature: Ed25519 (ownership) + Dilithium3 (quantum-safe)
       // Format matches validator's create_client_signing_message: "claim_rewards:from:to"
       const message = `claim_rewards:${nodeId}:${walletAddress}`;
-      const messageBytes = new TextEncoder().encode(message);
+      const messageBytes = Buffer.from(message, 'utf8');
       
       // Ed25519 signature (nacl needs 64-byte secret key = privateKey + publicKey)
       const fullSecretKey = privateKeyBytes.length === 64 
@@ -6311,7 +6310,7 @@ export class WalletManager {
       // CRITICAL: nonce in TX = account.nonce + 1 (like Ethereum)
       const txNonce = currentNonce + 1;
       const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${txNonce}:${gasPrice}:${gasLimit}`;
-      const messageBytes = new TextEncoder().encode(message);
+      const messageBytes = Buffer.from(message, 'utf8');
       
       // Sign with Ed25519 (nacl needs 64-byte secret key = privateKey + publicKey)
       const fullSecretKey = privateKeyBytes.length === 64 

@@ -99,13 +99,17 @@ int PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_signature(uint8_t *sig,
     rhoprime = mu + CRHBYTES;
     PQCLEAN_DILITHIUM3_CLEAN_unpack_sk(rho, tr, key, &t0, &s1, &s2, sk);
 
-    /* Compute mu = CRH(tr, msg) */
-    shake256_inc_init(&state);
-    shake256_inc_absorb(&state, tr, TRBYTES);
-    shake256_inc_absorb(&state, m, mlen);
-    shake256_inc_finalize(&state);
-    shake256_inc_squeeze(mu, CRHBYTES, &state);
-    shake256_inc_ctx_release(&state);
+    /* Compute mu = CRH(tr, 0x00 || 0x00 || msg)  — FIPS 204 ML-DSA pure-mode domain */
+    {
+        const uint8_t ml_dsa_prefix[2] = {0x00, 0x00};
+        shake256_inc_init(&state);
+        shake256_inc_absorb(&state, tr, TRBYTES);
+        shake256_inc_absorb(&state, ml_dsa_prefix, 2);
+        shake256_inc_absorb(&state, m, mlen);
+        shake256_inc_finalize(&state);
+        shake256_inc_squeeze(mu, CRHBYTES, &state);
+        shake256_inc_ctx_release(&state);
+    }
 
     for (n = 0; n < RNDBYTES; n++) {
         rnd[n] = 0;
@@ -140,7 +144,7 @@ rej:
     shake256_inc_finalize(&state);
     shake256_inc_squeeze(sig, CTILDEBYTES, &state);
     shake256_inc_ctx_release(&state);
-    PQCLEAN_DILITHIUM3_CLEAN_poly_challenge(&cp, sig); /* uses only the first SEEDBYTES bytes of sig */
+    PQCLEAN_DILITHIUM3_CLEAN_poly_challenge(&cp, sig); /* ML-DSA-65: uses all CTILDEBYTES (48) bytes */
     PQCLEAN_DILITHIUM3_CLEAN_poly_ntt(&cp);
 
     /* Compute z, reject if it reveals secret */
@@ -254,17 +258,21 @@ int PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_verify(const uint8_t *sig,
         return -1;
     }
 
-    /* Compute CRH(H(rho, t1), msg) */
+    /* Compute mu = CRH(H(pk), 0x00 || 0x00 || msg)  — FIPS 204 ML-DSA pure-mode domain */
     shake256(mu, CRHBYTES, pk, PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES);
-    shake256_inc_init(&state);
-    shake256_inc_absorb(&state, mu, CRHBYTES);
-    shake256_inc_absorb(&state, m, mlen);
-    shake256_inc_finalize(&state);
-    shake256_inc_squeeze(mu, CRHBYTES, &state);
-    shake256_inc_ctx_release(&state);
+    {
+        const uint8_t ml_dsa_prefix[2] = {0x00, 0x00};
+        shake256_inc_init(&state);
+        shake256_inc_absorb(&state, mu, CRHBYTES);
+        shake256_inc_absorb(&state, ml_dsa_prefix, 2);
+        shake256_inc_absorb(&state, m, mlen);
+        shake256_inc_finalize(&state);
+        shake256_inc_squeeze(mu, CRHBYTES, &state);
+        shake256_inc_ctx_release(&state);
+    }
 
     /* Matrix-vector multiplication; compute Az - c2^dt1 */
-    PQCLEAN_DILITHIUM3_CLEAN_poly_challenge(&cp, c); /* uses only the first SEEDBYTES bytes of c */
+    PQCLEAN_DILITHIUM3_CLEAN_poly_challenge(&cp, c); /* ML-DSA-65: uses all CTILDEBYTES (48) bytes */
     PQCLEAN_DILITHIUM3_CLEAN_polyvec_matrix_expand(mat, rho);
 
     PQCLEAN_DILITHIUM3_CLEAN_polyvecl_ntt(&z);

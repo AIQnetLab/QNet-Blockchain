@@ -1264,6 +1264,7 @@ impl PersistentStorage {
         }
     }
     
+    /// v6.2: Block integrity verification on read — recomputes hash and compares with stored value.
     pub async fn load_block_by_height(&self, height: u64) -> IntegrationResult<Option<qnet_state::Block>> {
         let block_cf = self.db.cf_handle("blocks")
             .ok_or_else(|| IntegrationError::StorageError("blocks column family not found".to_string()))?;
@@ -1273,6 +1274,21 @@ impl PersistentStorage {
             Some(data) => {
                 let block: qnet_state::Block = bincode::deserialize(&data)
                     .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+                
+                // Verify block hash integrity against stored hash
+                let hash_key = format!("hash_{}", height);
+                if let Some(hash_data) = self.db.get_cf(&block_cf, hash_key.as_bytes())? {
+                    let stored_hash: [u8; 32] = bincode::deserialize(&hash_data)
+                        .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+                    let computed_hash = block.hash();
+                    if stored_hash != computed_hash {
+                        return Err(IntegrationError::StorageError(format!(
+                            "Block at h={} integrity check failed: stored={} computed={}",
+                            height, hex::encode(stored_hash), hex::encode(computed_hash)
+                        )));
+                    }
+                }
+                
                 Ok(Some(block))
             }
             None => Ok(None),

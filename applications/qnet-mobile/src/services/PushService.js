@@ -532,7 +532,7 @@ export async function refreshFcmTokenOnServer(nodeId, ed25519SecretKey64) {
     const nacl = require('tweetnacl');
     const timestamp = now;
     const message = `token_refresh:${nodeId}:${timestamp}`;
-    const messageBytes = new TextEncoder().encode(message);
+    const messageBytes = Buffer.from(message, 'utf8');
     const sig = nacl.sign.detached(messageBytes, new Uint8Array(ed25519SecretKey64));
     const signatureHex = Buffer.from(sig).toString('hex');
 

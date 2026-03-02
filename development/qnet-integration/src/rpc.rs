@@ -10749,33 +10749,44 @@ async fn handle_register_device(
 }
 
 /// Handle graceful shutdown request for node replacement
-/// SECURITY: Only allowed from localhost or with QNET_ADMIN_SECRET
+/// SECURITY v6.2: QNET_ADMIN_SECRET is MANDATORY — without it shutdown is DENIED
 async fn handle_graceful_shutdown(
     shutdown_request: Value,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
     
-    // SECURITY: Check admin secret if provided
-    let admin_secret = std::env::var("QNET_ADMIN_SECRET").ok();
+    // SECURITY v6.2: QNET_ADMIN_SECRET must be configured, otherwise shutdown is blocked entirely
+    let admin_secret = match std::env::var("QNET_ADMIN_SECRET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => {
+            if is_warn() {
+                println!("[WARN][API] shutdown_rejected reason=QNET_ADMIN_SECRET_not_configured");
+            }
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Shutdown disabled: QNET_ADMIN_SECRET not configured on this node"
+            })));
+        }
+    };
+    
     let request_secret = shutdown_request.get("admin_secret")
         .and_then(|v| v.as_str());
     
-    // Only allow if:
-    // 1. No admin secret is set (dev mode), OR
-    // 2. Request provides correct admin secret
-    if let Some(secret) = &admin_secret {
-        match request_secret {
-            Some(req_secret) if req_secret == secret => {
-                // OK - correct secret provided
+    match request_secret {
+        Some(req_secret) if req_secret == &admin_secret => {
+            if is_info() {
+                println!("[INFO][API] shutdown_authorized secret_match=true");
             }
-            _ => {
-                println!("⚠️  SHUTDOWN REJECTED: Invalid or missing admin_secret");
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Unauthorized: admin_secret required"
-                })));
+        }
+        _ => {
+            if is_warn() {
+                println!("[WARN][API] shutdown_rejected reason=invalid_or_missing_admin_secret");
             }
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Unauthorized: invalid or missing admin_secret"
+            })));
         }
     }
 
