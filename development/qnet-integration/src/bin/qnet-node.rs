@@ -2954,41 +2954,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // v3.50: certificate_history no longer persisted (Dilithium-only verification)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    tokio::select! {
-        // Normal monitoring loop
-        _ = node_handle => {
-            println!("[SHUTDOWN] Node monitoring ended unexpectedly");
+    // v5.0: Handle both SIGINT (Ctrl+C) and SIGTERM (docker stop)
+    // Docker sends SIGTERM on `docker stop`. Without this, the process ignores
+    // SIGTERM and gets SIGKILL after 10s, losing unflushed macroblock data.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate()
+    ).expect("failed to register SIGTERM handler");
+
+    let shutdown_handler = async {
+        let signal_name;
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => { signal_name = "SIGINT"; }
+                _ = sigterm.recv() => { signal_name = "SIGTERM"; }
+            }
         }
-        
-        // Graceful shutdown on Ctrl+C or SIGTERM
-        _ = tokio::signal::ctrl_c() => {
-            println!("\n[SHUTDOWN] 🛑 Received shutdown signal...");
-            println!("[SHUTDOWN] 💾 Saving certificate history...");
-            
-            // Persist certificate history before exit
-            if node_type != NodeType::Light {
-                if let Some(p2p) = node.get_unified_p2p() {
-                    // Use QNET_STORAGE_PATH (set during init) with fallback to "data"
-                    let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
-                    let data_dir = std::path::Path::new(&storage_path);
-                    if let Err(e) = std::fs::create_dir_all(&data_dir) {
-                        println!("[SHUTDOWN] ⚠️ Failed to create data dir {}: {}", storage_path, e);
-                    } else if let Ok(mut cert_manager) = p2p.certificate_manager.write() {
-                        // v3.18: Full node type removed - only Light and Super remain
-                        let unified_node_type = match node_type {
-                            NodeType::Light => qnet_integration::unified_p2p::NodeType::Light,
-                            NodeType::Super => qnet_integration::unified_p2p::NodeType::Super,
-                        };
-                        match cert_manager.persist_to_disk(&data_dir, unified_node_type) {
-                            Ok(_) => println!("[SHUTDOWN] ✅ Certificate history saved to {}", storage_path),
-                            Err(e) => println!("[SHUTDOWN] ⚠️ Failed to save certificates: {}", e),
-                        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+            signal_name = "SIGINT";
+        }
+
+        println!("\n[SHUTDOWN] Received {} — starting graceful shutdown...", signal_name);
+
+        // 1. Flush RocksDB (WAL → SST), prevents macroblock/block data loss
+        let storage = node.get_storage();
+        match storage.flush_all() {
+            Ok(()) => println!("[SHUTDOWN] storage.flush_all() complete"),
+            Err(e) => println!("[ERR][SHUTDOWN] storage.flush_all() failed: {}", e),
+        }
+
+        // 2. Persist certificate history
+        if node_type != NodeType::Light {
+            if let Some(p2p) = node.get_unified_p2p() {
+                let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
+                let data_dir = std::path::Path::new(&storage_path);
+                if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                    println!("[WARN][SHUTDOWN] create_dir fail: {}", e);
+                } else if let Ok(mut cert_manager) = p2p.certificate_manager.write() {
+                    let unified_node_type = match node_type {
+                        NodeType::Light => qnet_integration::unified_p2p::NodeType::Light,
+                        NodeType::Super => qnet_integration::unified_p2p::NodeType::Super,
+                    };
+                    match cert_manager.persist_to_disk(&data_dir, unified_node_type) {
+                        Ok(_) => println!("[SHUTDOWN] certificates saved to {}", storage_path),
+                        Err(e) => println!("[WARN][SHUTDOWN] cert save failed: {}", e),
                     }
                 }
             }
-            
-            println!("[SHUTDOWN] ✅ Graceful shutdown complete");
         }
+
+        println!("[SHUTDOWN] graceful shutdown complete");
+    };
+
+    tokio::select! {
+        _ = node_handle => {
+            println!("[SHUTDOWN] Node monitoring ended unexpectedly");
+        }
+        _ = shutdown_handler => {}
     }
     
     Ok(())

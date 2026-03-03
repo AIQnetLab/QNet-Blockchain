@@ -10814,17 +10814,19 @@ async fn handle_graceful_shutdown(
     // Start graceful shutdown process in background
     let blockchain_clone = blockchain.clone();
     tokio::spawn(async move {
-        println!("⏳ Starting graceful shutdown sequence...");
-        
-        // Stop accepting new connections/requests
-        println!("🔒 Stopping new request acceptance...");
+        println!("[INFO][SHUTDOWN] starting graceful shutdown sequence...");
         
         // Wait for timeout period to allow current requests to complete
         tokio::time::sleep(tokio::time::Duration::from_secs(timeout_seconds)).await;
         
-        println!("💀 SHUTDOWN: Node terminating due to replacement");
+        // v5.0: Flush RocksDB before exit to prevent macroblock data loss
+        let storage = blockchain_clone.get_storage();
+        match storage.flush_all() {
+            Ok(()) => println!("[INFO][SHUTDOWN] storage.flush_all() complete"),
+            Err(e) => println!("[ERR][SHUTDOWN] storage.flush_all() failed: {}", e),
+        }
         
-        // Force exit the process
+        println!("[INFO][SHUTDOWN] node terminating");
         std::process::exit(0);
     });
 

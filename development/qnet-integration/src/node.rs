@@ -10330,10 +10330,57 @@ impl BlockchainNode {
                 println!("[GENESIS] 📊 Bootstrap mode: {}, Bootstrap ID: '{}'", is_bootstrap_mode, bootstrap_id);
                 
                 if is_bootstrap_mode && bootstrap_id == "001" {
-                    // CRITICAL: Only node_001 creates Genesis in bootstrap mode
-                    println!("[GENESIS] 🌍 Node 001: Creating Genesis Block as primary genesis node...");
+                    // v5.0: Before creating genesis, check if network already has one.
+                    // If node_001 restarts with empty storage but the network is running,
+                    // creating a new genesis (with current timestamp) would produce an
+                    // incompatible chain. Try to sync from peers first.
+                    println!("[INFO][GEN] node_001 storage empty — checking network for existing genesis...");
+                    let mut synced_from_network = false;
                     
-                    // Create Genesis Block using existing genesis module
+                    if let Some(ref p2p) = unified_p2p {
+                        const MAX_SYNC_ATTEMPTS: u32 = 8; // 8 × 2s = 16s max wait
+                        for attempt in 1..=MAX_SYNC_ATTEMPTS {
+                            let _ = p2p.sync_blocks(0, 0).await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            
+                            let storage_for_check = storage.clone();
+                            let check = tokio::task::spawn_blocking(move || {
+                                storage_for_check.load_microblock_auto_format(0)
+                            }).await.unwrap_or(Ok(None));
+                            
+                            if let Ok(Some(existing_genesis)) = check {
+                                println!("[INFO][GEN] genesis received from network after {} attempts (ts={})",
+                                         attempt, existing_genesis.timestamp);
+                                
+                                if let Ok(stored_height) = storage.get_chain_height() {
+                                    microblock_height = stored_height;
+                                    *height.write().await = stored_height;
+                                }
+                                crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                                    existing_genesis.timestamp,
+                                    std::sync::atomic::Ordering::Relaxed
+                                );
+                                crate::update_global_pricing_state(0.0, 5, existing_genesis.timestamp);
+                                let now = get_timestamp_safe();
+                                LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                                LAST_BLOCK_PRODUCED_HEIGHT.store(microblock_height, std::sync::atomic::Ordering::Relaxed);
+                                synced_from_network = true;
+                                break;
+                            }
+                            
+                            if attempt % 4 == 0 {
+                                println!("[INFO][GEN] no genesis from network yet (attempt {}/{})", attempt, MAX_SYNC_ATTEMPTS);
+                            }
+                        }
+                    }
+                    
+                    if synced_from_network {
+                        println!("[INFO][GEN] node_001 synced genesis from running network — skipping creation");
+                        // Fall through to main loop (genesis exists in storage now)
+                    } else {
+                    // First-ever network start: no peers have genesis yet
+                    println!("[INFO][GEN] no existing genesis in network — creating new one");
+                    
                     use crate::genesis::{GenesisConfig, create_genesis_block};
                     let genesis_config = GenesisConfig::default();
                     
@@ -10682,6 +10729,7 @@ impl BlockchainNode {
                         }
                         Err(e) => println!("[GENESIS] ❌ Failed to create Genesis Block: {}", e),
                     }
+                    } // end of `if !synced_from_network` else block
                 } else if is_bootstrap_mode {
                     // Other bootstrap nodes (002-005) wait for Genesis from node_001
                     println!("[GENESIS] ⏳ Node {}: Waiting for Genesis block from primary node...", bootstrap_id);
@@ -17527,28 +17575,101 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
                 Ok(None) => {
                     // ═══════════════════════════════════════════════════════════════════════════
-                    // v3.2: CRITICAL FIX - NO FALLBACK! Node MUST sync before participating!
+                    // v5.0: LOCAL MACROBLOCK SELF-ASSEMBLY
+                    // Before giving up, check if ALL microblocks for this macroblock exist
+                    // in local storage. If yes — assemble it locally (deterministic, same on
+                    // all nodes that have the same blocks). This prevents permanent desync when
+                    // ALL nodes lost the macroblock (e.g. after simultaneous restarts) but
+                    // still have the constituent blocks in RocksDB.
                     // ═══════════════════════════════════════════════════════════════════════════
-                    //
-                    // OLD BEHAVIOR (BROKEN): 
-                    //   Return fallback list from get_validated_active_peers()
-                    //   PROBLEM: Different nodes see different peers → different candidates → FORK!
-                    //
-                    // NEW BEHAVIOR (CORRECT):
-                    //   Return EMPTY LIST → node excluded from consensus
-                    //   Trigger SYNCHRONOUS sync attempt → node recovers on next round
-                    //   NO non-deterministic fallbacks!
-                    //
-                    // This is the ONLY correct approach because:
-                    // 1. Any fallback based on local state is NON-DETERMINISTIC
-                    // 2. Different nodes have different local P2P state
-                    // 3. Non-deterministic candidates → non-deterministic initiator → FORK
-                    // ═══════════════════════════════════════════════════════════════════════════
+                    let mb_start = if required_macroblock > 0 { (required_macroblock - 1) * 90 + 1 } else { 1 };
+                    let mb_end = required_macroblock * 90;
                     
+                    let mut all_microblocks_present = true;
+                    for h in mb_start..=mb_end {
+                        match storage.load_microblock(h) {
+                            Ok(Some(_)) => {}
+                            _ => { all_microblocks_present = false; break; }
+                        }
+                    }
+                    
+                    if all_microblocks_present && mb_end > 0 {
+                        println!("[INFO][CAND] mb={} NOT_FOUND but all microblocks {}-{} present — assembling locally",
+                                 required_macroblock, mb_start, mb_end);
+                        
+                        let storage_clone = storage.clone();
+                        let mb_idx = required_macroblock;
+                        let genesis_ids: Vec<String> = (1..=5)
+                            .map(|i| format!("genesis_node_{:03}", i))
+                            .collect();
+                        
+                        // Synchronous assembly — we need the result NOW for this round
+                        let dummy_consensus = std::sync::Arc::new(tokio::sync::RwLock::new(
+                            qnet_consensus::CommitRevealConsensus::new(
+                                "self_assembly".to_string(),
+                                qnet_consensus::ConsensusConfig::default(),
+                            )
+                        ));
+                        let assembly_result = Self::create_emergency_macroblock_internal(
+                            storage_clone,
+                            dummy_consensus,
+                            mb_end,
+                            genesis_ids,
+                            "local_self_assembly",
+                        ).await;
+                        
+                        match assembly_result {
+                            Ok(()) => {
+                                println!("[INFO][CAND] mb={} self-assembled — retrying candidate lookup", mb_idx);
+                                // Retry: macroblock should now exist in storage
+                                if let Ok(Some(macroblock_data)) = storage.get_macroblock_by_height(mb_idx) {
+                                    if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
+                                        if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
+                                            if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
+                                                if !producers.is_empty() {
+                                                    let mut all_qualified: Vec<(String, f64)> = producers.iter()
+                                                        .map(|p| (p.node_id.clone(), p.reputation))
+                                                        .collect();
+                                                    all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
+                                                    println!("[INFO][CAND] mb={} self-assembly success — {} candidates", mb_idx, all_qualified.len());
+                                                    return all_qualified;
+                                                }
+                                            }
+                                        }
+                                        // Fallback: use commits
+                                        if !macroblock.consensus_data.commits.is_empty() {
+                                            let mut all_qualified: Vec<(String, f64)> = macroblock.consensus_data.commits.keys()
+                                                .map(|id| {
+                                                    let rep = p2p.get_deterministic_reputation()
+                                                        .map(|rep_arc| {
+                                                            let state = rep_arc.read();
+                                                            state.get_reputation(id,
+                                                                std::time::SystemTime::now()
+                                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                                    .unwrap_or_default()
+                                                                    .as_secs())
+                                                        })
+                                                        .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
+                                                    (id.clone(), rep / 100.0)
+                                                })
+                                                .collect();
+                                            all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
+                                            return all_qualified;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("[WARN][CAND] mb={} self-assembly failed: {}", mb_idx, e);
+                            }
+                        }
+                    }
+                    
+                    // Original desync path: macroblock missing AND can't self-assemble
                     println!("[ERR][CAND] DESYNC: mb={} NOT_FOUND h={} - node EXCLUDED from consensus!", 
                              required_macroblock, current_height);
                     
-                    // Trigger sync for missing MacroBlock (but don't use result for THIS round)
+                    // Trigger async sync for missing MacroBlock
                     let current_tasks = ACTIVE_MACROBLOCK_CHECK_TASKS.load(std::sync::atomic::Ordering::Relaxed);
                     if current_tasks < MAX_CONCURRENT_MACROBLOCK_CHECKS {
                         let p2p_clone = p2p.clone();
@@ -17565,7 +17686,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             }
                             let _guard = TaskGuard;
                             
-                            // v3.2: Clear pending sync first to ensure fresh request
                             crate::unified_p2p::clear_macroblock_pending_sync(missing_index);
                             
                             println!("[SYNC] Requesting missing MacroBlock #{} for consensus recovery", missing_index);
@@ -17575,8 +17695,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         });
                     }
                     
-                    // v3.2: Return EMPTY list - node cannot participate without MB N-2
-                    // This is CRITICAL for determinism - no fallbacks allowed!
                     return Vec::new();
                 }
                 Err(e) => {
@@ -19126,9 +19244,43 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         }
                     }
                     
-                    // Leader failed - but we should NOT create our own to avoid fork!
-                    // Next PFP cycle will select new leader
-                    println!("[WARN][PFP] leader_timeout mb={} leader={} action=wait_next_cycle", expected_macroblock, pfp_leader);
+                    // v5.0: Leader failed — attempt LOCAL self-assembly from microblocks.
+                    // This is DETERMINISTIC: all nodes with the same blocks produce
+                    // the identical macroblock (same hashes, same state_accumulator).
+                    // Prevents permanent deadlock when PFP leader is unavailable.
+                    let mb_start_h = if expected_macroblock > 0 { (expected_macroblock - 1) * 90 + 1 } else { 1 };
+                    let mb_end_h = expected_macroblock * 90;
+                    let mut can_self_assemble = true;
+                    for h in mb_start_h..=mb_end_h {
+                        if storage_finalize.load_microblock(h).ok().flatten().is_none() {
+                            can_self_assemble = false;
+                            break;
+                        }
+                    }
+                    
+                    if can_self_assemble {
+                        println!("[INFO][PFP] leader_timeout mb={} leader={} — self-assembling from local microblocks {}-{}",
+                                 expected_macroblock, pfp_leader, mb_start_h, mb_end_h);
+                        match Self::create_emergency_macroblock_internal(
+                            storage_finalize.clone(),
+                            consensus_finalize.clone(),
+                            mb_end_h,
+                            participants.clone(),
+                            "pfp_self_assembly",
+                        ).await {
+                            Ok(()) => {
+                                println!("[INFO][PFP] self-assembled mb={} after leader timeout", expected_macroblock);
+                                // Broadcast to help other nodes
+                                if let Ok(Some(mb_data)) = storage_finalize.get_macroblock_by_height(expected_macroblock) {
+                                    let compressed = zstd::encode_all(&mb_data[..], 3).unwrap_or_else(|_| mb_data.clone());
+                                    let _ = p2p_finalize.broadcast_macroblock(expected_macroblock, compressed, expected_macroblock).await;
+                                }
+                            }
+                            Err(e) => println!("[WARN][PFP] self-assembly failed mb={}: {}", expected_macroblock, e),
+                        }
+                    } else {
+                        println!("[WARN][PFP] leader_timeout mb={} leader={} no_local_microblocks — waiting", expected_macroblock, pfp_leader);
+                    }
                 }
             });
         }

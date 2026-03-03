@@ -48,6 +48,7 @@ services:
     networks:
       - qnet-testnet
     restart: unless-stopped
+    stop_grace_period: 60s
     mem_limit: 4g
     cpus: '2.0'
     healthcheck:
@@ -101,6 +102,7 @@ services:
     networks:
       - qnet-testnet
     restart: unless-stopped
+    stop_grace_period: 60s
     mem_limit: 2g
     cpus: '1.0'
     depends_on:
@@ -156,6 +158,7 @@ services:
     networks:
       - qnet-testnet
     restart: unless-stopped
+    stop_grace_period: 60s
     mem_limit: 2g
     cpus: '1.0'
     depends_on:
