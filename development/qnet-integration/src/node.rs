@@ -1280,9 +1280,9 @@ pub struct BlockchainNode {
     // Replaces simple HashSet for retry mechanism support
     heartbeat_commitment_tracker: Arc<DashMap<u64, HeartbeatCommitmentStatus>>,
     
-    // PRODUCTION v2.78: Track sent PingCommitment TXs by epoch (Full/Super nodes ping Light nodes)
-    // HashSet of epoch numbers for which ping commitment was already sent
-    sent_ping_commitments: Arc<RwLock<std::collections::HashSet<u64>>>,
+    // PRODUCTION v2.78: Track BitmapCommitment TXs by epoch with confirmation + retry
+    // Same pattern as heartbeat_commitment_tracker for consistency
+    bitmap_commitment_tracker: Arc<DashMap<u64, HeartbeatCommitmentStatus>>,
     
     // Verifiable Time Sequence (VTS) for time synchronization
     quantum_poh: Option<Arc<crate::quantum_poh::QuantumPoH>>,
@@ -3956,8 +3956,9 @@ impl BlockchainNode {
                      total_light_nodes, nodes_per_genesis);
         }
         
-        // Scan commitment window (last 50 blocks before epoch end)
-        let scan_start = if window_end_height >= 50 { window_end_height - 50 } else { window_start_height };
+        // Scan the FULL commitment window — same logic as heartbeats (no 50-block restriction).
+        // Bitmap TX can land anywhere in the epoch, not only in the last 50 blocks.
+        let scan_start = window_start_height;
         
         // v2.89: Track processed Genesis to prevent duplicate TX processing
         let mut processed_genesis: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4024,33 +4025,23 @@ impl BlockchainNode {
             }
         }
         
-        // If bitmap TXs found, use them (on-chain proof!)
+        // ON-CHAIN ONLY: BitmapTX is the authoritative proof.
+        // No fallback — if BitmapTX didn't land in this window, Light node
+        // is simply not eligible this epoch (retry mechanism ensures delivery
+        // with gas_price=u64::MAX + 3 retries + ACK forwarding).
         if found_bitmap_txs > 0 {
             if is_info() {
                 println!("[INFO][PING-COLLECTION] ON-CHAIN: {} bitmap TXs, {} unique Light nodes",
                          found_bitmap_txs, bitmap_eligible.len());
             }
-            return Ok(bitmap_eligible);
+        } else {
+            if is_warn() {
+                println!("[WARN][PING-COLLECTION] No bitmap TXs found in blocks {}-{} — Light nodes not eligible this epoch",
+                         window_start_height, window_end_height);
+            }
         }
         
-        // FALLBACK: No bitmap TXs, use P2P RAM attestations (backward compat)
-        if is_warn() {
-            println!("[WARN][PING-COLLECTION] No bitmap TXs found, falling back to P2P RAM attestations");
-        }
-        
-        let all_attestations = p2p.get_attestations_for_block_range(window_start_height, window_end_height);
-        let mut light_node_pings: HashMap<String, u32> = HashMap::new();
-        
-        for (light_node_id, _slot, _pinger_id, _timestamp, _block_height) in all_attestations {
-            light_node_pings.insert(light_node_id, 1);
-        }
-        
-        if is_info() {
-            println!("[INFO][PING-COLLECTION] FALLBACK: {} unique Light nodes from RAM",
-                     light_node_pings.len());
-        }
-        
-        Ok(light_node_pings)
+        Ok(bitmap_eligible)
     }
     
     /// v2.68: Process reward window and RETURN emission TX (don't add to mempool)
@@ -5671,7 +5662,7 @@ impl BlockchainNode {
             reward_manager,
             // v2.96: DashMap for confirmation tracking + retry
             heartbeat_commitment_tracker: Arc::new(DashMap::new()),
-            sent_ping_commitments: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            bitmap_commitment_tracker: Arc::new(DashMap::new()),
             quantum_poh,  // Already Option - None for Light nodes, Some for Full/Super
             quantum_poh_receiver: poh_receiver,  // Already Option
             parallel_executor,
@@ -9670,7 +9661,7 @@ impl BlockchainNode {
         let node_type = self.node_type.clone(); // v3.0: For producer selection
         let quantum_poh = self.quantum_poh.clone(); // v3.0: For producer selection
         let heartbeat_tracker = self.heartbeat_commitment_tracker.clone();
-        let sent_ping_commitments = self.sent_ping_commitments.clone();
+        let bitmap_tracker = self.bitmap_commitment_tracker.clone();
         let is_running = self.is_running.clone();
         
         tokio::spawn(async move {
@@ -9995,15 +9986,33 @@ impl BlockchainNode {
                             println!("[DBG][LIGHT-BITMAP] Skipping - not a Genesis node");
                         }
                     } else {
-                        let already_sent = {
-                            let sent = sent_ping_commitments.read().await;
-                            sent.contains(&current_epoch)
-                        };
-                        
-                        if already_sent {
-                            if is_info() {
-                                println!("[INFO][LIGHT-BITMAP] Already sent for epoch={}", current_epoch);
+                        // v7.0: Full confirmation + retry tracking (same as HeartbeatCommitment)
+                        let should_send = if let Some(status) = bitmap_tracker.get(&current_epoch) {
+                            if status.is_confirmed() {
+                                if is_info() {
+                                    println!("[INFO][LIGHT-BITMAP] Already confirmed epoch={} block={}",
+                                             current_epoch, status.confirmed_at_height.unwrap_or(0));
+                                }
+                                false
+                            } else {
+                                let blocks_since_sent = current_height.saturating_sub(status.sent_at_height);
+                                if blocks_since_sent >= RETRY_AFTER_BLOCKS && status.retry_count < MAX_RETRIES {
+                                    println!("[WARN][LIGHT-BITMAP] TX not confirmed after {} blocks, retry #{} epoch={}",
+                                             blocks_since_sent, status.retry_count + 1, current_epoch);
+                                    true
+                                } else if status.retry_count >= MAX_RETRIES {
+                                    println!("[ERR][LIGHT-BITMAP] Max retries ({}) reached epoch={}", MAX_RETRIES, current_epoch);
+                                    false
+                                } else {
+                                    false
+                                }
                             }
+                        } else {
+                            true
+                        };
+
+                        if !should_send {
+                            // Skip — already confirmed or waiting
                         } else {
                             if is_info() {
                                 println!("[INFO][LIGHT-BITMAP] Creating bitmap TX for epoch={}", current_epoch);
@@ -10036,9 +10045,10 @@ impl BlockchainNode {
                                 // v2.95 FIX: Skip TX creation if no Light nodes registered
                                 // Genesis nodes should REST when there's nothing to ping
                                 if total_light_nodes == 0 {
-                                    // Mark as "sent" to avoid repeated checks this epoch
-                                    let mut sent = sent_ping_commitments.write().await;
-                                    sent.insert(current_epoch);
+                                    // Mark as confirmed to avoid repeated checks
+                                    let mut status = HeartbeatCommitmentStatus::new("no_light_nodes".to_string(), current_height);
+                                    status.mark_confirmed(current_height);
+                                    bitmap_tracker.insert(current_epoch, status);
                                     if is_debug() {
                                         println!("[DBG][LIGHT-BITMAP] No Light nodes registered - skipping epoch={}", current_epoch);
                                     }
@@ -10081,32 +10091,50 @@ impl BlockchainNode {
                                     total_assigned,
                                 ) {
                                     Ok(mut tx) => {
-                                        // SECURITY v6.1: Sign with ephemeral Ed25519 so receiving nodes can
-                                        // verify via validate_and_add_network_transaction (else branch).
-                                        // Canonical msg = pipe-format (matches build_canonical_verify_message `_`).
+                                        // HYBRID SIGNATURE (Ed25519 + Dilithium3) — same as HeartbeatCommitment
+                                        let canonical_msg = format!(
+                                            "{}|{}|{}|{}|{}|{}|{}",
+                                            tx.from,
+                                            tx.to.as_deref().unwrap_or(""),
+                                            tx.amount,
+                                            tx.nonce,
+                                            tx.gas_price,
+                                            tx.gas_limit,
+                                            tx.timestamp,
+                                        );
+
+                                        // Step 1: Ed25519 ephemeral signature (forward secrecy)
                                         {
                                             use ed25519_dalek::{SigningKey, Signer};
                                             use rand::rngs::OsRng;
-                                            let canonical_msg = format!(
-                                                "{}|{}|{}|{}|{}|{}|{}",
-                                                tx.from,
-                                                tx.to.as_deref().unwrap_or(""),
-                                                tx.amount,
-                                                tx.nonce,
-                                                tx.gas_price,
-                                                tx.gas_limit,
-                                                tx.timestamp,
-                                            );
                                             let signing_key = SigningKey::generate(&mut OsRng);
                                             let vk = signing_key.verifying_key();
                                             let sig = signing_key.sign(canonical_msg.as_bytes());
                                             tx.signature  = Some(hex::encode(sig.to_bytes()));
                                             tx.public_key = Some(hex::encode(vk.as_bytes()));
-                                            tx.hash = tx.calculate_hash();
                                         }
 
+                                        // Step 2: Dilithium3 signature (quantum-resistant, linked to node identity)
+                                        if let Some(crypto) = try_get_quantum_crypto() {
+                                            match crypto.create_consensus_signature(&node_id, &canonical_msg).await {
+                                                Ok(dilithium_sig) => {
+                                                    tx.dilithium_signature = Some(dilithium_sig.signature);
+                                                    tx.dilithium_public_key = Some(node_id.clone());
+                                                }
+                                                Err(e) => {
+                                                    if is_warn() {
+                                                        println!("[WARN][LIGHT-BITMAP] Dilithium signing failed: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        tx.hash = tx.calculate_hash();
+
                                         if is_info() {
-                                            println!("[INFO][LIGHT-BITMAP] TX created hash={}", &tx.hash[..16]);
+                                            let has_dil = tx.dilithium_signature.is_some();
+                                            println!("[INFO][LIGHT-BITMAP] TX created hash={} hybrid_sig=Ed25519+Dilithium3({})",
+                                                     &tx.hash[..16], has_dil);
                                         }
                                         
                                         match bincode::serialize(&tx) {
@@ -10119,14 +10147,25 @@ impl BlockchainNode {
                                                 }
                                                 
                                                 if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
-                                                    let mut sent = sent_ping_commitments.write().await;
-                                                    sent.insert(current_epoch);
-                                                    
-                                                    if is_info() {
-                                                        println!("[INFO][LIGHT-BITMAP] TX submitted to mempool epoch={}", current_epoch);
+                                                    let tx_hash_clone = tx.hash.clone();
+                                                    if let Some(mut existing) = bitmap_tracker.get_mut(&current_epoch) {
+                                                        existing.increment_retry();
+                                                        existing.value_mut().sent_at_height = current_height;
+                                                        existing.value_mut().tx_hash = tx_hash_clone.clone();
+                                                        println!("[INFO][LIGHT-BITMAP] TX retry #{} submitted epoch={} hash={}",
+                                                                 existing.retry_count, current_epoch, &tx_hash_clone[..16]);
+                                                    } else {
+                                                        bitmap_tracker.insert(
+                                                            current_epoch,
+                                                            HeartbeatCommitmentStatus::new(tx_hash_clone.clone(), current_height)
+                                                        );
+                                                        if is_info() {
+                                                            println!("[INFO][LIGHT-BITMAP] TX submitted to mempool epoch={} hash={}",
+                                                                     current_epoch, &tx_hash_clone[..16]);
+                                                        }
                                                     }
                                                     
-                                                    // v3.0: Deterministic producer forwarding with rotation boundary handling
+                                                    // v7.0: Deterministic producer forwarding with ACK (identical to HeartbeatCommitment)
                                                     let next_height = current_height + 1;
                                                     let producer_next = Self::select_microblock_producer(
                                                         next_height,
@@ -10145,21 +10184,43 @@ impl BlockchainNode {
                                                         Some(&storage),
                                                         &quantum_poh,
                                                     ).await;
-                                                    
-                                                    // Forward to producer of next block
+
+                                                    if is_info() {
+                                                        println!("[INFO][GULF-STREAM] BitmapTX selecting producers: next_h={} prod_next={} prod_next+1={}",
+                                                                 next_height, producer_next, producer_next_plus_one);
+                                                    }
+
+                                                    let mut forwarded_to_producer = false;
+                                                    let mut sent_to: Vec<String> = Vec::new();
+
+                                                    // Forward to producer of next block (with ACK)
                                                     if !producer_next.is_empty() && producer_next != node_id {
                                                         if let Some(producer_addr) = p2p.get_peer_addr_by_id(&producer_next) {
                                                             let tx_msg = NetworkMessage::Transaction { 
                                                                 data: tx_bytes_for_broadcast.clone() 
                                                             };
-                                                            p2p.send_network_message(&producer_addr, tx_msg);
-                                                            if is_info() {
-                                                                println!("[INFO][LIGHT-BITMAP] TX forwarded to producer={}", producer_next);
+                                                            match p2p.send_critical_tx_with_ack(&producer_addr, tx_msg).await {
+                                                                Ok(()) => {
+                                                                    forwarded_to_producer = true;
+                                                                    sent_to.push(producer_next.clone());
+                                                                    if is_info() {
+                                                                        println!("[INFO][GULF-STREAM] BitmapTX ACK_CONFIRMED producer={}", producer_next);
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    println!("[WARN][GULF-STREAM] BitmapTX ACK_FAILED producer={} error={}", producer_next, e);
+                                                                }
                                                             }
+                                                        } else {
+                                                            println!("[WARN][GULF-STREAM] producer_addr_not_found producer={} - relying on gossip only!", producer_next);
+                                                        }
+                                                    } else if producer_next == node_id {
+                                                        if is_info() {
+                                                            println!("[INFO][GULF-STREAM] BitmapTX - WE are the producer, no forwarding needed");
                                                         }
                                                     }
                                                     
-                                                    // Handle rotation boundary
+                                                    // Handle rotation boundary (with ACK)
                                                     if producer_next_plus_one != producer_next && 
                                                        !producer_next_plus_one.is_empty() && 
                                                        producer_next_plus_one != node_id {
@@ -10167,23 +10228,31 @@ impl BlockchainNode {
                                                             let tx_msg = NetworkMessage::Transaction { 
                                                                 data: tx_bytes_for_broadcast.clone() 
                                                             };
-                                                            p2p.send_network_message(&producer_addr, tx_msg);
-                                                            if is_info() {
-                                                                println!("[INFO][LIGHT-BITMAP] TX forwarded to next_producer={} (rotation)", producer_next_plus_one);
+                                                            if let Ok(()) = p2p.send_critical_tx_with_ack(&producer_addr, tx_msg).await {
+                                                                forwarded_to_producer = true;
+                                                                sent_to.push(producer_next_plus_one.clone());
+                                                                if is_info() {
+                                                                    println!("[INFO][GULF-STREAM] BitmapTX ACK_CONFIRMED rotation_producer={}", producer_next_plus_one);
+                                                                }
                                                             }
                                                         }
                                                     }
                                                     
                                                     // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
-                                                    
-                                                    // Backup gossip
+
+                                                    if is_info() && forwarded_to_producer {
+                                                        println!("[INFO][LIGHT-BITMAP] TX forwarded to producers={:?} next_h={}", sent_to, next_height);
+                                                    }
+
+                                                    // Backup gossip (reliability - if producer fails or network issues)
                                                     if let Err(e) = p2p.broadcast_transaction(tx_bytes_for_broadcast) {
                                                         if is_warn() {
-                                                            println!("[WARN][LIGHT-BITMAP] Broadcast failed: {}", e);
+                                                            println!("[WARN][LIGHT-BITMAP] Broadcast failed epoch={} error={}", current_epoch, e);
                                                         }
                                                     } else {
                                                         if is_info() {
-                                                            println!("[INFO][LIGHT-BITMAP] TX broadcast to network");
+                                                            println!("[INFO][LIGHT-BITMAP] TX broadcast to network epoch={} hash={} direct_fwd={}",
+                                                                     current_epoch, &tx_hash_clone[..16], forwarded_to_producer);
                                                         }
                                                     }
                                                 } else {
@@ -10210,16 +10279,45 @@ impl BlockchainNode {
                         }
                     }
                     
-                    // v3.1: CRITICAL - Cleanup old sent_ping_commitments to prevent memory leak at scale
-                    // Keep only last 10 epochs
-                    if current_epoch > 10 {
-                        let min_epoch = current_epoch.saturating_sub(10);
-                        let mut sent = sent_ping_commitments.write().await;
-                        let before_len = sent.len();
-                        sent.retain(|epoch| *epoch >= min_epoch);
-                        let removed = before_len.saturating_sub(sent.len());
-                        if removed > 0 && is_info() {
-                            println!("[INFO][PING_COMMIT] cleanup removed={} epochs min_epoch={}", removed, min_epoch);
+                    // v7.0: CONFIRMATION CHECK — scan recent blocks for our BitmapTX
+                    {
+                        let pending_epochs: Vec<u64> = bitmap_tracker.iter()
+                            .filter(|entry| !entry.value().is_confirmed())
+                            .map(|entry| *entry.key())
+                            .collect();
+
+                        for epoch in pending_epochs {
+                            if let Some(mut status) = bitmap_tracker.get_mut(&epoch) {
+                                let scan_start = status.sent_at_height;
+                                let scan_end = current_height.min(scan_start + 20);
+
+                                for check_height in scan_start..=scan_end {
+                                    if let Ok(Some(block_data)) = storage.load_microblock_auto_format(check_height) {
+                                        for tx in &block_data.transactions {
+                                            if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } = &tx.tx_type {
+                                                if genesis_id == &node_id && tx.hash == status.tx_hash {
+                                                    status.mark_confirmed(check_height);
+                                                    println!("[INFO][LIGHT-BITMAP] TX CONFIRMED epoch={} block={} hash={}",
+                                                             epoch, check_height, &status.tx_hash[..16]);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if status.is_confirmed() { break; }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Cleanup old epochs (keep last 10)
+                        if current_epoch > 10 {
+                            let min_epoch = current_epoch.saturating_sub(10);
+                            let before_len = bitmap_tracker.len();
+                            bitmap_tracker.retain(|epoch, _| *epoch >= min_epoch);
+                            let removed = before_len.saturating_sub(bitmap_tracker.len());
+                            if removed > 0 && is_info() {
+                                println!("[INFO][LIGHT-BITMAP] cleanup removed={} epochs min_epoch={}", removed, min_epoch);
+                            }
                         }
                     }
                 }
@@ -21999,11 +22097,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     let is_emission_mb = mb_index > 0 && mb_index % EMISSION_MB_INTERVAL == 0;
                     
                     if is_emission_mb {
-                        // EMISSION MacroBlock - collect Light node attestations from BLOCKCHAIN
-                        // ARCHITECTURE: Read PingCommitment TXs from commitment window blocks
-                        
-                        let window_start = (mb_index / EMISSION_MB_INTERVAL - 1) * 14400 + 14350; // Last 50 blocks
-                        let window_end = (mb_index / EMISSION_MB_INTERVAL) * 14400;
+                        // DEFERRED REWARDS: same window formula as reward_heartbeats.
+                        // Pings in epoch E → bitmap TX submitted in epoch E →
+                        // rewards distributed at emission MacroBlock of epoch E+1.
+                        // Scan the FULL previous epoch (14400 blocks), identical to heartbeats.
+                        let window_start = (mb_index / EMISSION_MB_INTERVAL - 1) * 14400;
+                        let window_end = window_start + 14400;
                         
                         // Collect Light node attestations from P2P RAM storage
                         let storage_clone = storage.clone();
@@ -26727,7 +26826,7 @@ impl Clone for BlockchainNode {
             perf_config: self.perf_config.clone(),
             security_config: self.security_config.clone(),
             heartbeat_commitment_tracker: self.heartbeat_commitment_tracker.clone(),
-            sent_ping_commitments: self.sent_ping_commitments.clone(),
+            bitmap_commitment_tracker: self.bitmap_commitment_tracker.clone(),
             height: self.height.clone(),
             is_running: self.is_running.clone(),
             node_registration_cache: self.node_registration_cache.clone(),

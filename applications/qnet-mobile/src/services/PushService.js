@@ -337,7 +337,7 @@ export async function getNextPingTime() {
  * Respond to ping challenge (sign and send)
  * MANDATORY: Dilithium3 (ML-DSA-65) quantum signature — no Ed25519 fallback
  */
-export async function respondToChallenge(nodeId, challenge) {
+export async function respondToChallenge(nodeId, challenge, responseUrl) {
   try {
       const Keychain = require('react-native-keychain');
 
@@ -359,7 +359,7 @@ export async function respondToChallenge(nodeId, challenge) {
               const dilithiumSig = await signWithDilithium(challenge, pingSkHex, pingPkHex, pingNodeId);
               const formattedSignature = `ping_dilithium:${dilithiumSig}`;
 
-              const apiUrl = await getRandomBootstrapNodeAsync();
+              const apiUrl = responseUrl || await getRandomBootstrapNodeAsync();
               const response = await fetch(
                 `${apiUrl}/api/v1/light-node/ping-response`,
                 {
@@ -405,8 +405,8 @@ export async function respondToChallenge(nodeId, challenge) {
  */
 export async function handlePushMessage(data) {
   if (data?.action === 'ping_response' && data?.challenge && data?.node_id) {
-    console.log('[Push] 📥 Ping received:', data.node_id);
-    return await respondToChallenge(data.node_id, data.challenge);
+    console.log('[Push] 📥 Ping received:', data.node_id, 'from:', data.response_url || 'random');
+    return await respondToChallenge(data.node_id, data.challenge, data.response_url);
   }
   return false;
 }

@@ -2902,6 +2902,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // Start background node monitoring
+    // v8.0: Read QNET_HALT_HEIGHT once at startup for coordinated upgrades.
+    // Cosmos equivalent: halt-height flag. When ALL nodes set the same halt height,
+    // they all stop gracefully at the same block → operator updates binaries → restarts.
+    // Use case: breaking consensus changes (hard fork).
+    // Normal rolling updates: leave unset (nodes restart one-by-one, catch up via snapshot).
+    let halt_height: Option<u64> = std::env::var("QNET_HALT_HEIGHT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+
+    if let Some(h) = halt_height {
+        println!("[INFO][HALT] QNET_HALT_HEIGHT={} — node will stop at this block (coordinated upgrade)", h);
+    }
+
     let node_clone = node.clone();
     let node_handle = tokio::spawn(async move {
         // Keep node running and monitor
@@ -2914,6 +2927,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("[MONITOR] ✅ {} peers connected", peer_count);
                 } else {
                     println!("[MONITOR] ⚠️ No peers connected - running standalone");
+                }
+            }
+
+            // v8.0: QNET_HALT_HEIGHT — coordinated upgrade stop
+            // Works like Cosmos halt-height: set same value on all nodes,
+            // they all stop at that block → update binaries → restart.
+            if let Some(stop_at) = halt_height {
+                let current_height = node_clone.get_height().await;
+                if current_height >= stop_at {
+                    println!("[INFO][HALT] Reached halt_height={} current={} — flushing and stopping for coordinated upgrade",
+                             stop_at, current_height);
+                    let storage = node_clone.get_storage();
+                    match storage.flush_all() {
+                        Ok(()) => println!("[INFO][HALT] storage.flush_all() complete"),
+                        Err(e) => println!("[ERR][HALT] storage.flush_all() failed: {}", e),
+                    }
+                    println!("[INFO][HALT] Node stopped. Update binary and restart (remove QNET_HALT_HEIGHT).");
+                    std::process::exit(0);
                 }
             }
         }

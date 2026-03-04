@@ -8055,7 +8055,7 @@ impl FCMPushService {
         Ok(access_token)
     }
     
-    async fn send_ping_notification(&self, device_token: &str, node_id: &str, challenge: &str) -> Result<(), String> {
+    async fn send_ping_notification(&self, device_token: &str, node_id: &str, challenge: &str, response_url: &str) -> Result<(), String> {
         // PRODUCTION: Real FCM notification using Google's FCM HTTP v1 API
         
         // Get OAuth2 access token (from Service Account or legacy key)
@@ -8085,6 +8085,7 @@ impl FCMPushService {
                     "action": "ping_response",
                     "node_id": node_id,
                     "challenge": challenge,
+                    "response_url": response_url,
                     "quantum_secure": "true",
                     "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().to_string()
                 },
@@ -8397,8 +8398,16 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                         .map(|(token, _, _)| token);
 
                                     if let Some(real_token) = real_token_opt {
+                                        let our_response_url = {
+                                            use crate::genesis_constants::GENESIS_NODE_IPS;
+                                            let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+                                            GENESIS_NODE_IPS.iter()
+                                                .find(|(_, id)| *id == bid)
+                                                .map(|(ip, _)| format!("http://{}:8001", ip))
+                                                .unwrap_or_default()
+                                        };
                                         let fcm = FCMPushService::new();
-                                        match fcm.send_ping_notification(&real_token, &light_node.node_id, &challenge).await {
+                                        match fcm.send_ping_notification(&real_token, &light_node.node_id, &challenge, &our_response_url).await {
                                             Ok(()) => {
                                                 if crate::node::is_info() {
                                                     println!("[INFO][LIGHT] fcm_sent role={} node={} slot={}",
@@ -8435,11 +8444,20 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                 crate::unified_p2p::PushType::UnifiedPush => {
                                     // UnifiedPush notification (F-Droid users)
                                     if let Some(endpoint) = &light_node.unified_push_endpoint {
+                                        let up_response_url = {
+                                            use crate::genesis_constants::GENESIS_NODE_IPS;
+                                            let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+                                            GENESIS_NODE_IPS.iter()
+                                                .find(|(_, id)| *id == bid)
+                                                .map(|(ip, _)| format!("http://{}:8001", ip))
+                                                .unwrap_or_default()
+                                        };
                                         let client = reqwest::Client::new();
                                         let payload = serde_json::json!({
                                             "action": "ping_response",
                                             "node_id": light_node.node_id,
                                             "challenge": challenge,
+                                            "response_url": up_response_url,
                                             "timestamp": std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
                                                 .unwrap_or_default()
