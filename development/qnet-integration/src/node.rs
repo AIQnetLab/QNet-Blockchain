@@ -399,6 +399,12 @@ pub fn get_expected_producer(height: u64) -> Option<(String, u64)> {
     EXPECTED_PRODUCER_CACHE.read().get(&height).cloned()
 }
 
+/// v3.31: Clear stale entries above rollback height
+pub fn clear_expected_producer_cache_above(max_height: u64) {
+    let mut cache = EXPECTED_PRODUCER_CACHE.write();
+    cache.retain(|h, _| *h <= max_height);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.50: Lock-free global storage with OnceCell + Arc
 // RocksDB does NOT support multiple connections - single instance shared immutably
@@ -6267,12 +6273,15 @@ impl BlockchainNode {
                                 }
                             }
                             
-                            // Update chain height to network height
+                            // Update chain height to network height (all sources of truth)
                             {
                                 let mut height_guard = blockchain_for_sync.height.write().await;
                                 *height_guard = network_height;
                             }
                             blockchain_for_sync.storage.set_chain_height(network_height).ok();
+                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                network_height, std::sync::atomic::Ordering::Relaxed
+                            );
                             
                             // End rollback protection
                             crate::storage::end_rollback_protection();
@@ -6280,6 +6289,10 @@ impl BlockchainNode {
                             // NOTE: Macroblocks ahead of network will be overwritten during re-sync
                             // Storage uses height as key, so new macroblocks will replace old ones
                             let network_macroblock_index = network_height / 90;
+                            
+                            // v3.31: Clear pending sync queues after rollback
+                            crate::unified_p2p::clear_all_pending_sync();
+                            clear_expected_producer_cache_above(network_height);
                             
                             if is_info() { println!("[INFO][ROLLBACK] complete new_height={}", network_height); }
                             if is_info() { println!("[INFO][SYNC] req_fresh_blocks"); }
@@ -7080,8 +7093,15 @@ impl BlockchainNode {
                                                             
                                                             *height_clone.write().await = rollback_to;
                                                             storage_clone.set_chain_height(rollback_to).ok();
+                                                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                                                rollback_to, std::sync::atomic::Ordering::Relaxed
+                                                            );
                                                             
                                                             crate::storage::end_rollback_protection();
+                                                            
+                                                            // v3.31: Clear pending sync queues after rollback
+                                                            crate::unified_p2p::clear_all_pending_sync();
+                                                            clear_expected_producer_cache_above(rollback_to);
                                                         }
                                                         
                                                         // Sync missing blocks
@@ -7147,8 +7167,15 @@ impl BlockchainNode {
                                                             }
                                                             *height_clone.write().await = rollback_to;
                                                             storage_clone.set_chain_height(rollback_to).ok();
+                                                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                                                rollback_to, std::sync::atomic::Ordering::Relaxed
+                                                            );
                                                             
                                                             crate::storage::end_rollback_protection();
+                                                            
+                                                            // v3.31: Clear pending sync queues after rollback
+                                                            crate::unified_p2p::clear_all_pending_sync();
+                                                            clear_expected_producer_cache_above(rollback_to);
                                                             
                                                             // Request blocks from network
                                                             // sync_blocks() selects best_peer (highest combined reputation)
@@ -11984,18 +12011,31 @@ impl BlockchainNode {
                                             }
                                         }
                                         
-                                        // Update local height
+                                        // Update local height (all 3 sources of truth)
                                         microblock_height = rollback_to;
                                         {
                                             let mut h = height.write().await;
                                             *h = rollback_to;
                                         }
                                         storage.set_chain_height(rollback_to).ok();
+                                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                            rollback_to, std::sync::atomic::Ordering::Relaxed
+                                        );
                                         
                                         // End rollback protection
                                         crate::storage::end_rollback_protection();
                                         
                                         println!("[INFO][FORK] rollback_complete new_h={}", rollback_to);
+                                        
+                                        // v3.31: Clear ALL stale state after rollback
+                                        // Without this, stale entries block re-queueing of blocks
+                                        // causing dup_pending on ALL sync responses → sync deadlock
+                                        crate::unified_p2p::clear_all_pending_sync();
+                                        clear_expected_producer_cache_above(rollback_to);
+                                        FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                                        FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
+                                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
+                                        println!("[INFO][FORK] cleared_pending_sync_queues");
                                         
                                         // Reset stall timer to prevent immediate re-trigger
                                         LAST_BLOCK_PRODUCED_TIME.store(current_time, Ordering::Relaxed);
@@ -12042,16 +12082,14 @@ impl BlockchainNode {
                 // Using global flags defined at module level
                 
                 // DEADLOCK PROTECTION: Guard that automatically clears sync flag on drop (panic, error, success)
-                // v3.0: BUT NOT if initial sync target is still pending!
+                // v3.31: ALWAYS clear — previous conditional logic caused permanent deadlock
+                // after fork rollback when SYNC_TARGET_HEIGHT was non-zero
                 struct FastSyncGuard;
                 impl Drop for FastSyncGuard {
                     fn drop(&mut self) {
-                        // v3.0: Don't clear if initial sync target not reached
-                        let target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
-                        if target == 0 {
-                            FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                        }
-                        FAST_SYNC_START_TIME.store(0, Ordering::Relaxed); // Clear deadlock timer
+                        FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                        FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
+                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                     }
                 }
                 
@@ -12116,29 +12154,26 @@ impl BlockchainNode {
                                      height_difference, microblock_height, network_height);
                             
                             // DEADLOCK DETECTION: Check if fast sync is stuck
-                            // CRITICAL FIX v2.21.3: Also detect stuck sync with start_time=0
-                            // v3.0: Skip if initial sync target is pending
+                            // v3.31: ALWAYS check regardless of SYNC_TARGET_HEIGHT
+                            // Previous condition (initial_sync_target == 0) caused deadlock
+                            // after fork rollback when target was non-zero
                             let current_time = get_timestamp_safe();
-                            let initial_sync_target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
                             
-                            if FAST_SYNC_IN_PROGRESS.load(Ordering::SeqCst) && initial_sync_target == 0 {
+                            if FAST_SYNC_IN_PROGRESS.load(Ordering::SeqCst) {
                                 let sync_start_time = FAST_SYNC_START_TIME.load(Ordering::Relaxed);
                                 
-                                // CRITICAL FIX: If start_time is 0 but flag is set - sync is stuck!
                                 if sync_start_time == 0 {
                                     println!("[SYNC] 🔓 DEADLOCK DETECTED: Fast sync flag set but start_time=0, clearing flag");
                                     FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                                    SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                                 } else {
                                     let sync_elapsed = current_time.saturating_sub(sync_start_time);
                                     
-                                    // CRITICAL FIX v2.21.3: Use >= instead of >
                                     if sync_elapsed >= SYNC_DEADLOCK_TIMEOUT_SECS {
                                         println!("[SYNC] 🔓 DEADLOCK DETECTED: Fast sync stuck for {}s, force clearing flag", sync_elapsed);
-                                        // CRITICAL: Must reset flag despite race condition risk
-                                        // Better to have potential parallel sync than permanent deadlock
                                         FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                         FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
-                                        // Continue to start new sync below
+                                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                                     }
                                 }
                             }
