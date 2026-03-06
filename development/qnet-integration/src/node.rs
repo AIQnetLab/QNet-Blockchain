@@ -6363,7 +6363,7 @@ impl BlockchainNode {
                             }
                             
                             set_node_state(NodeState::Producing { 
-                                round: network_height / 30, 
+                                round: network_height / ROTATION_INTERVAL_BLOCKS, 
                                 current_height: network_height,
                             });
                             if is_info() { println!("[INFO][SYNC] fork_resolved"); }
@@ -6729,7 +6729,6 @@ impl BlockchainNode {
         let mut mismatch_counter: std::collections::HashMap<u64, (u32, std::time::Instant)> = 
             std::collections::HashMap::new();
         const MISMATCH_RECOVERY_THRESHOLD: u32 = 5;
-        let mut state_recovery_in_progress = false;
         
         loop {
             // Check both channels - prioritize retries
@@ -8013,7 +8012,7 @@ impl BlockchainNode {
                     
                     // CRITICAL FIX: Check if we're the producer for next block after rotation boundary
                     // This ensures nodes immediately know they're selected after receiving rotation block
-                    if received_block.height > 0 && received_block.height % 30 == 0 {
+                    if received_block.height > 0 && received_block.height % ROTATION_INTERVAL_BLOCKS == 0 {
                         // Just received last block of a round (30, 60, 90...)
                         if is_debug() { println!("[DBG][ROTATION] boundary h={} check=next_producer", received_block.height); }
                         if is_debug() { println!("[DBG][ROTATION] block_type={} producer_id={:?}", received_block.block_type, block_producer_id); }
@@ -8069,7 +8068,7 @@ impl BlockchainNode {
                                     
                                     if is_debug() { 
                                         println!("[DBG][REP] rotation={} node={} rep={:.1}%", 
-                                            received_block.height / 30, producer_id, new_rep); 
+                                            received_block.height / ROTATION_INTERVAL_BLOCKS, producer_id, new_rep); 
                                     }
                                 }
                             }
@@ -8274,8 +8273,7 @@ impl BlockchainNode {
                         entry.0 += 1;
                         let fail_count = entry.0;
                         
-                        if fail_count >= MISMATCH_RECOVERY_THRESHOLD && !state_recovery_in_progress {
-                            state_recovery_in_progress = true;
+                        if fail_count >= MISMATCH_RECOVERY_THRESHOLD {
                             println!("[ERR][STATE] persistent_mismatch h={} fails={} — triggering state recovery from macroblock snapshot",
                                      received_block.height, fail_count);
                             
@@ -8349,7 +8347,6 @@ impl BlockchainNode {
                                     mismatch_counter.remove(&received_block.height);
                                 }
                             }
-                            state_recovery_in_progress = false;
                         } else if fail_count < MISMATCH_RECOVERY_THRESHOLD {
                             if is_info() {
                                 println!("[INFO][STATE] mismatch_count h={} fails={}/{}", 
@@ -12461,7 +12458,7 @@ impl BlockchainNode {
                                     let sync_from_height = if microblock_height < network_height {
                                         // Check if we're at rotation boundary where sync might fail
                                         // Rotation happens after blocks 30, 60, 90... (not block 0 which is genesis)
-                                        let is_rotation_boundary = microblock_height > 0 && (microblock_height % 30) == 0;
+                                        let is_rotation_boundary = microblock_height > 0 && (microblock_height % ROTATION_INTERVAL_BLOCKS) == 0;
                                         if is_rotation_boundary {
                                             // At rotation boundary, be conservative - sync current height
                                             microblock_height
@@ -13009,7 +13006,7 @@ impl BlockchainNode {
                 }
                 
                 // STATE MACHINE: Update to Producing or Validating
-                let leadership_round = if next_block_height <= 30 { 0 } else { (next_block_height - 1) / 30 };
+                let leadership_round = if next_block_height <= ROTATION_INTERVAL_BLOCKS { 0 } else { (next_block_height - 1) / ROTATION_INTERVAL_BLOCKS };
                 if is_my_turn_to_produce {
                     set_node_state(NodeState::Producing { 
                         round: leadership_round, 
@@ -13044,7 +13041,7 @@ impl BlockchainNode {
                 // Without this check, a producer elected by a minority (due to missing VRF claims)
                 // starts producing immediately while the majority elected someone else → fork.
                 // Cost: ~2-3s added to first block of each rotation (every 30 blocks).
-                if next_block_height > 1 && (next_block_height - 1) % 30 == 0 {
+                if next_block_height > 1 && (next_block_height - 1) % ROTATION_INTERVAL_BLOCKS == 0 {
                     let entropy_role = if is_my_turn_to_produce { "producer" } else { "validator" };
                     if is_info() {
                         println!("[INFO][CONS] rotation_boundary h={} role={} entropy_check", next_block_height, entropy_role);
@@ -13652,18 +13649,32 @@ impl BlockchainNode {
                 }
                 
                 if is_my_turn_to_produce {
-                    // v3.32: Check for competing producer BEFORE each block in rotation
-                    // If another node's block arrived for our round, we're in the minority — yield
-                    let vrf_round_check = if next_block_height > 30 { (next_block_height - 1) / 30 } else { 0 };
-                    if crate::unified_p2p::has_competing_producer(vrf_round_check) {
-                        let rival_h = crate::unified_p2p::get_competing_producer_height();
-                        println!("[INFO][CONS] competing_producer_in_rotation round={} rival_h={} our_h={} → yielding",
-                                 vrf_round_check, rival_h, next_block_height);
-                        is_my_turn_to_produce = false;
-                        *is_leader.write().await = false;
-                        set_node_state(NodeState::Idle { last_height: microblock_height });
-                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                        continue;
+                    // v3.35: BFT-based competing producer check (replaces v3.32 flag)
+                    // Yield ONLY when 2/3+ of connected peers attested to a competing block
+                    // at our height. Single-block flag was too aggressive (caused genesis deadlock).
+                    let competing_attestations = crate::unified_p2p::get_attestation_count(next_block_height);
+                    if competing_attestations > 0 {
+                        let peer_count = if let Some(ref p2p) = unified_p2p {
+                            p2p.get_peer_count()
+                        } else { 0 };
+                        if peer_count >= 2 {
+                            let bft_threshold = (peer_count * 2 + 2) / 3;
+                            if competing_attestations >= bft_threshold {
+                                if is_info() {
+                                    println!("[INFO][CONS] competing_producer_bft h={} attestations={}/{} threshold={} → yielding",
+                                             next_block_height, competing_attestations, peer_count, bft_threshold);
+                                }
+                                is_my_turn_to_produce = false;
+                                *is_leader.write().await = false;
+                                set_node_state(NodeState::Idle { last_height: microblock_height });
+                                crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                                crate::unified_p2p::clear_competing_producer();
+                                continue;
+                            } else if is_debug() {
+                                println!("[DBG][CONS] competing_attestations h={} count={}/{} threshold={} — producing",
+                                         next_block_height, competing_attestations, peer_count, bft_threshold);
+                            }
+                        }
                     }
                     
                     // PRODUCTION: This node is selected as microblock producer for this round
@@ -14719,7 +14730,7 @@ impl BlockchainNode {
                     let (poh_hash, poh_count) = if next_block_height > 1 {
                         // CRITICAL: At rotation boundaries, wait for previous block if needed
                         // This prevents PoH regression when producer changes
-                        let is_rotation_start = next_block_height > 1 && ((next_block_height - 1) % 30) == 0;
+                        let is_rotation_start = next_block_height > 1 && ((next_block_height - 1) % ROTATION_INTERVAL_BLOCKS) == 0;
                         
                         // Use auto-format loader that handles both EfficientMicroBlock and legacy MicroBlock
                         let mut prev_block_result = storage.load_microblock_auto_format(next_block_height - 1);
@@ -14829,7 +14840,7 @@ impl BlockchainNode {
                             );
                             match vrf.evaluate(&slot_seed) {
                                 Ok(vrf_out) => {
-                                if next_block_height % 30 == 1 {
+                                if next_block_height % ROTATION_INTERVAL_BLOCKS == 1 {
                                         println!("[INFO][VRF] h={} dilithium3=true pq=fips204_level3",
                                                  next_block_height);
                                     }
@@ -15309,7 +15320,7 @@ impl BlockchainNode {
                         
                         // v2.24: CRITICAL - Call process_block for OWN blocks immediately!
                         // This ensures producer's reputation is updated at rotation boundary
-                        if height_for_storage % 30 == 0 && height_for_storage > 0 {
+                        if height_for_storage % ROTATION_INTERVAL_BLOCKS == 0 && height_for_storage > 0 {
                             if let Some(ref p2p) = p2p_for_reward {
                                 if let Some(rep_arc) = p2p.get_deterministic_reputation() {
                                     use qnet_consensus::deterministic_reputation::BlockData;
@@ -15355,7 +15366,7 @@ impl BlockchainNode {
                                             .as_secs());
                                     if is_info() {
                                         println!("[INFO][REP] own_rotation r={} rep={:.1}%", 
-                                            height_for_storage / 30, new_rep);
+                                            height_for_storage / ROTATION_INTERVAL_BLOCKS, new_rep);
                                     }
                                 }
                             }
@@ -15532,7 +15543,7 @@ impl BlockchainNode {
                     // v2.24: CRITICAL - Producer MUST call process_block for OWN blocks!
                     // This ensures producer's reputation is updated immediately
                     // Previously this was only done when RECEIVING blocks from P2P
-                    if microblock.height % 30 == 0 && microblock.height > 0 {
+                    if microblock.height % ROTATION_INTERVAL_BLOCKS == 0 && microblock.height > 0 {
                         if let Some(ref p2p) = unified_p2p {
                             if let Some(rep_arc) = p2p.get_deterministic_reputation() {
                                 use qnet_consensus::deterministic_reputation::BlockData;
@@ -15569,8 +15580,8 @@ impl BlockchainNode {
 
                                 let new_rep = rep_state.get_reputation(&microblock.producer, microblock.timestamp);
                                 if is_info() {
-                                    println!("[INFO][REP] producer={} rotation={} blocks={}/30 rep={:.1}%", 
-                                        microblock.producer, microblock.height / 30, blocks_by_producer, new_rep);
+                                    println!("[INFO][REP] producer={} rotation={} blocks={}/{} rep={:.1}%", 
+                                        microblock.producer, microblock.height / ROTATION_INTERVAL_BLOCKS, blocks_by_producer, ROTATION_INTERVAL_BLOCKS, new_rep);
                                 }
                             }
                         }
@@ -15581,11 +15592,11 @@ impl BlockchainNode {
                         rotation_tracker.check_rotation_complete(microblock.height).await {
                         
                         if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
-                            println!("[ROTATION] ✅ {} completed full rotation #{} ({}/30 blocks)", 
-                                    rotation_producer, microblock.height / 30, blocks_created);
+                            println!("[ROTATION] ✅ {} completed full rotation #{} ({}/{} blocks)", 
+                                    rotation_producer, microblock.height / ROTATION_INTERVAL_BLOCKS, blocks_created, ROTATION_INTERVAL_BLOCKS);
                         } else {
-                            println!("[ROTATION] ⚠️ {} partial rotation #{} ({}/30 blocks)", 
-                                    rotation_producer, microblock.height / 30, blocks_created);
+                            println!("[ROTATION] ⚠️ {} partial rotation #{} ({}/{} blocks)", 
+                                    rotation_producer, microblock.height / ROTATION_INTERVAL_BLOCKS, blocks_created, ROTATION_INTERVAL_BLOCKS);
                         }
                     }
                     
@@ -15896,7 +15907,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             if is_info() { println!("[INFO][SYNC] local_block h={} advance={}", expected_height, microblock_height); }
                             
                             // Rotation boundary check for logging
-                            let is_rotation_boundary = expected_height > 0 && (expected_height % 30) == 0;
+                            let is_rotation_boundary = expected_height > 0 && (expected_height % ROTATION_INTERVAL_BLOCKS) == 0;
                             if is_rotation_boundary {
                                 if is_debug() { println!("[DBG][SYNC] rotation_boundary h={}", expected_height); }
                             }
@@ -15921,7 +15932,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             // Calculate block properties for logging
                             let blocks_since_last_macro = expected_height_timeout % 90;
                             let is_consensus_period = blocks_since_last_macro >= 61 && blocks_since_last_macro <= 90;
-                            let is_rotation_boundary = expected_height_timeout > 1 && ((expected_height_timeout - 1) % 30) == 0;
+                            let is_rotation_boundary = expected_height_timeout > 1 && ((expected_height_timeout - 1) % ROTATION_INTERVAL_BLOCKS) == 0;
                             
                             // CRITICAL FIX v2.19.18: Prevent multiple failover tasks for same block height
                             // Without this, each main loop iteration spawns a NEW failover task
@@ -16254,7 +16265,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Block 120 (30 after 90), 150 (60 after 90), etc.
                     // Block 210 (30 after 180), 240 (60 after 180), etc.
                     // Don't trigger at macroblock boundaries (90, 180, 270...)
-                    if blocks_since_trigger >= 30 && blocks_since_trigger % 30 == 0 && (microblock_height % 90) != 0 {
+                    if blocks_since_trigger >= ROTATION_INTERVAL_BLOCKS && blocks_since_trigger % ROTATION_INTERVAL_BLOCKS == 0 && (microblock_height % 90) != 0 {
                         // Check if macroblock still missing
                         // CRITICAL FIX v2.26.8: Use consistent formula for expected_macroblock
                         // Primary: use trigger-based calculation (always correct after fix #1)
@@ -16849,7 +16860,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // At rotation boundary: wait brief window for claims to arrive
                 // Within rotation: use cached claims (already collected)
                 let is_rotation_boundary = current_height > 0 && 
-                    ((current_height - 1) % 30 == 0 || current_height == 1);
+                    ((current_height - 1) % ROTATION_INTERVAL_BLOCKS == 0 || current_height == 1);
                 
                 if is_rotation_boundary {
                     // ═══════════════════════════════════════════════════════════════
@@ -18414,7 +18425,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // Calculate validator rotation round from finalized height
         // This ensures ALL synchronized nodes select the SAME validators
-        let validator_round = finalized_height / 30;
+        let validator_round = finalized_height / ROTATION_INTERVAL_BLOCKS;
         
         println!("[VALIDATOR-SELECTION] 🎲 Finality Window applied:");
         println!("  ├── Current height: {}", current_height);
@@ -20993,7 +21004,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let sig_hex = hex::encode(&sig_bytes);
         let prefixed = format!("dilithium3_v4:{}", sig_hex);
         
-        if microblock.height % 30 == 1 {
+        if microblock.height % ROTATION_INTERVAL_BLOCKS == 1 {
             println!("[INFO][SIGN] h={} dilithium3=fips204 size={}", microblock.height, prefixed.len());
         }
         
@@ -21557,7 +21568,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 hash.copy_from_slice(&result);
                 
                 // DEBUG: Log entropy source at rotation boundaries for fork detection
-                if current_height > 30 && (current_height - 1) % 30 == 0 {
+                if current_height > ROTATION_INTERVAL_BLOCKS && (current_height - 1) % ROTATION_INTERVAL_BLOCKS == 0 {
                     println!("[FINALITY] Entropy from block #{}: producer={}, hash={}", 
                              entropy_block_height, 
                              microblock.producer,

@@ -462,7 +462,7 @@ pub fn release_sync_slot(from_height: u64) {
 // from a different producer for the same rotation, it yields immediately.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static COMPETING_PRODUCER_ROUND: AtomicU64 = AtomicU64::new(0);
+static COMPETING_PRODUCER_ROUND: AtomicU64 = AtomicU64::new(u64::MAX);
 static COMPETING_PRODUCER_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 /// Signal that a competing producer was detected for the given round/height
@@ -483,7 +483,7 @@ pub fn get_competing_producer_height() -> u64 {
 
 /// Clear competing producer flag (on new rotation or after yielding)
 pub fn clear_competing_producer() {
-    COMPETING_PRODUCER_ROUND.store(0, Ordering::SeqCst);
+    COMPETING_PRODUCER_ROUND.store(u64::MAX, Ordering::SeqCst);
     COMPETING_PRODUCER_HEIGHT.store(0, Ordering::SeqCst);
 }
 
