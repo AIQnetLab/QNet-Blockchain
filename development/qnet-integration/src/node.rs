@@ -6722,6 +6722,15 @@ impl BlockchainNode {
         // 10s still prevents reorg DoS while allowing recovery within 2-3 attempts.
         const FORK_ATTEMPT_COOLDOWN_SECS: u64 = 10;
         
+        // v3.34: Per-height state_root_mismatch counter — breaks infinite retry loop.
+        // Key: block_height, Value: (fail_count, first_seen).
+        // When a block fails state_root check 5+ times, we stop retrying and trigger
+        // state recovery from the last macroblock snapshot instead.
+        let mut mismatch_counter: std::collections::HashMap<u64, (u32, std::time::Instant)> = 
+            std::collections::HashMap::new();
+        const MISMATCH_RECOVERY_THRESHOLD: u32 = 5;
+        let mut state_recovery_in_progress = false;
+        
         loop {
             // Check both channels - prioritize retries
             let (received_block, is_retry) = tokio::select! {
@@ -7012,14 +7021,15 @@ impl BlockchainNode {
                                                 requested_blocks.insert(missing_height, (std::time::Instant::now(), request_count));
                                                 
                                                 // CRITICAL: Actually request the missing block via P2P
+                                                // v3.34: Dedup — skip if sync for this height is already in-flight
                                                 if let Some(p2p) = &unified_p2p {
+                                                    if !crate::unified_p2p::try_acquire_sync_slot(missing_height) {
+                                                        if is_debug() { println!("[DBG][SYNC] dedup_skip h={} already_inflight", missing_height); }
+                                                    } else {
                                                     let p2p_clone = p2p.clone();
-                                                    let retry_missing_height = missing_height;  // Clone for retry logic
+                                                    let retry_missing_height = missing_height;
                                                     tokio::spawn(async move {
-                                                        // CRITICAL FIX: Retry mechanism for missing blocks
-                                                        // Try up to 3 times with exponential backoff
                                                         for attempt in 1..=3 {
-                                                        // SPECIAL CASE: Genesis block request
                                                             if retry_missing_height == 0 {
                                                                 if is_debug() { println!("[DBG][BLOCK] request_genesis attempt={}", attempt); }
                                                             if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
@@ -7033,13 +7043,10 @@ impl BlockchainNode {
                                                                     break;
                                                             }
                                                         } else {
-                                                            // v3.7: CRITICAL FIX - Request BATCH if far behind!
-                                                            // Check network height and request range if gap > 5
                                                             let network_h = p2p_clone.get_max_peer_height();
                                                             let gap = network_h.saturating_sub(retry_missing_height);
                                                             
                                                             let (from, to) = if gap > 5 && retry_missing_height > 0 {
-                                                                // Far behind - request batch
                                                                 let batch_end = std::cmp::min(network_h, retry_missing_height + 50);
                                                                 if is_info() {
                                                                     println!("[INFO][SYNC] batch_request gap={} range={}-{}", 
@@ -7047,7 +7054,6 @@ impl BlockchainNode {
                                                                 }
                                                                 (retry_missing_height, batch_end)
                                                             } else {
-                                                                // Small gap - just request missing block
                                                                 (retry_missing_height, retry_missing_height)
                                                             };
                                                             
@@ -7063,7 +7069,9 @@ impl BlockchainNode {
                                                             }
                                                         }
                                                         }
+                                                        crate::unified_p2p::release_sync_slot(retry_missing_height);
                                                     });
+                                                    } // end dedup else
                                                 }
                                             } else {
                                                 if is_debug() { println!("[DBG][BLOCK] rate_limit delay h={}", missing_height); }
@@ -8254,7 +8262,110 @@ impl BlockchainNode {
                 },
                 Err(e) => {
                     eprintln!("[ERR][BLOCK] store_failed h={} err={}", received_block.height, e);
+                    
+                    // v3.34: Track consecutive state_root_mismatch per height.
+                    // Without this, a diverged state causes an infinite retry loop:
+                    //   mismatch → rollback(no-op) → stall → re-request → mismatch → ...
+                    // which eventually freezes the server (12h+ loop observed in production).
+                    if e.contains("state_root_mismatch") {
+                        let entry = mismatch_counter
+                            .entry(received_block.height)
+                            .or_insert((0, std::time::Instant::now()));
+                        entry.0 += 1;
+                        let fail_count = entry.0;
+                        
+                        if fail_count >= MISMATCH_RECOVERY_THRESHOLD && !state_recovery_in_progress {
+                            state_recovery_in_progress = true;
+                            println!("[ERR][STATE] persistent_mismatch h={} fails={} — triggering state recovery from macroblock snapshot",
+                                     received_block.height, fail_count);
+                            
+                            // STATE RECOVERY: reload from last macroblock snapshot + replay
+                            let recovery_result: Result<(), String> = async {
+                                let snap = storage.load_latest_state_snapshot().await
+                                    .map_err(|e| format!("snapshot_load: {}", e))?;
+                                
+                                let (snap_height, _snap_root, accounts_data) = match snap {
+                                    Some(s) if !s.2.is_empty() => s,
+                                    _ => return Err("no_valid_snapshot".to_string()),
+                                };
+                                
+                                let chain_h = storage.get_chain_height().unwrap_or(0);
+                                if snap_height > chain_h {
+                                    return Err(format!("snapshot_ahead snap={} chain={}", snap_height, chain_h));
+                                }
+                                
+                                let accounts: Vec<(String, qnet_state::Account)> = bincode::deserialize(&accounts_data)
+                                    .map_err(|e| format!("deserialize: {}", e))?;
+                                let accounts_count = accounts.len();
+                                
+                                {
+                                    let state_guard = state.write().await;
+                                    state_guard.restore_accounts(accounts)
+                                        .map_err(|e| format!("restore: {}", e))?;
+                                }
+                                
+                                println!("[INFO][STATE] snapshot_restored h={} accounts={}", snap_height, accounts_count);
+                                
+                                // Replay blocks from snapshot to chain tip
+                                let replay_from = snap_height.saturating_add(1);
+                                let replay_to = chain_h;
+                                if replay_from <= replay_to {
+                                    let mut replayed = 0u64;
+                                    let mut replay_errs = 0u64;
+                                    for h in replay_from..=replay_to {
+                                        match storage.load_microblock_auto_format(h) {
+                                            Ok(Some(mb)) => {
+                                                let sg = state.write().await;
+                                                for tx in &mb.transactions {
+                                                    let _ = sg.apply_transaction_lazy(tx);
+                                                }
+                                                for tx in &mb.transactions {
+                                                    let _ = sg.apply_gas_refund(tx, h);
+                                                }
+                                                let _ = sg.finalize_merkle();
+                                                replayed += 1;
+                                            }
+                                            _ => { replay_errs += 1; }
+                                        }
+                                    }
+                                    println!("[INFO][STATE] recovery_replay snap={} chain={} replayed={} errors={}",
+                                             snap_height, replay_to, replayed, replay_errs);
+                                }
+                                
+                                Ok(())
+                            }.await;
+                            
+                            match recovery_result {
+                                Ok(()) => {
+                                    println!("[INFO][STATE] recovery_complete clearing_mismatch_counters resuming_sync");
+                                    mismatch_counter.clear();
+                                    pending_blocks.clear();
+                                    requested_blocks.clear();
+                                    crate::unified_p2p::release_sync_slot(received_block.height);
+                                    crate::unified_p2p::clear_all_pending_sync();
+                                }
+                                Err(reason) => {
+                                    println!("[ERR][STATE] recovery_failed reason={} — will retry on next threshold", reason);
+                                    mismatch_counter.remove(&received_block.height);
+                                }
+                            }
+                            state_recovery_in_progress = false;
+                        } else if fail_count < MISMATCH_RECOVERY_THRESHOLD {
+                            if is_info() {
+                                println!("[INFO][STATE] mismatch_count h={} fails={}/{}", 
+                                         received_block.height, fail_count, MISMATCH_RECOVERY_THRESHOLD);
+                            }
+                        }
+                    }
                 }
+            }
+            
+            // v3.34: Periodic cleanup of stale mismatch counters (prevent memory leak)
+            if !mismatch_counter.is_empty() {
+                let current_chain_h = storage.get_chain_height().unwrap_or(0);
+                mismatch_counter.retain(|h, (_, first_seen)| {
+                    *h >= current_chain_h && first_seen.elapsed().as_secs() < 600
+                });
             }
             
             // CRITICAL FIX: Fast retry for certificate race condition (every 2 seconds)
@@ -8433,32 +8544,35 @@ impl BlockchainNode {
                             requested_blocks.insert(missing_height, (std::time::Instant::now(), (retry_count as u8).saturating_add(1)));
                             
                             // v3.7: CRITICAL FIX - Request BATCH of blocks, not just one!
-                            // Problem: Requesting 1 block at a time with 5s timeout = node NEVER catches up
-                            // Solution: Check network height and request ALL missing blocks in one batch
+                            // v3.34: Dedup — skip if sync for this height is already in-flight
                             if let Some(p2p) = &unified_p2p {
+                                if !crate::unified_p2p::try_acquire_sync_slot(missing_height) {
+                                    if is_debug() { println!("[DBG][SYNC] rerequest_dedup_skip h={}", missing_height); }
+                                } else {
                                 let p2p_clone = p2p.clone();
                                 let missing = missing_height;
                                 let local_h = storage.get_chain_height().unwrap_or(0);
                                 let network_h = p2p.get_max_peer_height();
                                 
                                 tokio::spawn(async move {
-                                    // If far behind (>5 blocks), request BATCH up to network height
                                     let gap = network_h.saturating_sub(local_h);
                                     let (from, to) = if gap > 5 {
-                                        // Request batch: from local+1 to min(network, local+100)
                                         let batch_end = std::cmp::min(network_h, local_h + 100);
-                                        println!("[INFO][SYNC] batch_rerequest local={} network={} gap={} range={}-{}", 
-                                                 local_h, network_h, gap, local_h + 1, batch_end);
+                                        if crate::node::is_info() {
+                                            println!("[INFO][SYNC] batch_rerequest local={} network={} gap={} range={}-{}", 
+                                                     local_h, network_h, gap, local_h + 1, batch_end);
+                                        }
                                         (local_h + 1, batch_end)
                                     } else {
-                                        // Small gap - just request the missing block
                                         (missing, missing)
                                     };
                                     
                                     if let Err(e) = p2p_clone.sync_blocks(from, to).await {
                                         println!("[WARN][BLOCK] rerequest_failed h={}-{} err={}", from, to, e);
                                     }
+                                    crate::unified_p2p::release_sync_slot(missing);
                                 });
+                                } // end dedup else
                             }
                             
                             // Reset timestamp for pending block (give it more time)

@@ -415,6 +415,47 @@ pub fn clear_all_pending_sync_macroblocks() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// v3.34: SYNC DEDUP — prevents thundering herd when MISSING_PREVIOUS spawns
+// dozens of tokio tasks for the same height range. Only one sync_blocks request
+// per height is allowed at a time; subsequent spawns for the same from_height
+// are skipped until the in-flight request completes (clears the flag).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static SYNC_INFLIGHT_FROM: AtomicU64 = AtomicU64::new(0);
+static SYNC_INFLIGHT_TS: AtomicU64 = AtomicU64::new(0);
+
+/// Try to acquire sync slot for a given from_height.
+/// Returns true if this caller won the slot (should proceed with sync).
+/// Returns false if another sync for this height is already in-flight.
+/// Auto-expires after 30 seconds to prevent stuck slots.
+pub fn try_acquire_sync_slot(from_height: u64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let prev_from = SYNC_INFLIGHT_FROM.load(Ordering::SeqCst);
+    let prev_ts = SYNC_INFLIGHT_TS.load(Ordering::SeqCst);
+    
+    // Same height already in-flight and not expired (30s TTL)
+    if prev_from == from_height && now.saturating_sub(prev_ts) < 30 {
+        return false;
+    }
+    
+    // Try to claim the slot (CAS to prevent races between tokio tasks)
+    if SYNC_INFLIGHT_FROM.compare_exchange(prev_from, from_height, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        SYNC_INFLIGHT_TS.store(now, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
+/// Release sync slot after sync completes or fails.
+pub fn release_sync_slot(from_height: u64) {
+    let _ = SYNC_INFLIGHT_FROM.compare_exchange(from_height, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // v3.32: COMPETING PRODUCER DETECTION
 // Prevents VRF split-brain forks when different nodes elect different producers
 // due to incomplete claim gossip. If a node starts producing but receives blocks
