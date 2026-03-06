@@ -369,13 +369,20 @@ impl QuicTransport {
                                 return;
                             }
                             
-                            // SECURITY v6.2: TLS cert SAN check (best-effort, server side)
-                            // Server cannot verify client cert — clients connect with no_client_auth (one-way TLS).
-                            // node_id authenticity is guaranteed by Dilithium-signed consensus messages.
-                            if is_debug() {
-                                match Self::verify_peer_cert_node_id(&connection, &remote_node_id) {
-                                    Ok(()) => println!("[DBG][QUIC] cert_san_ok side=server node={}", remote_node_id),
-                                    Err(e) => println!("[DBG][QUIC] cert_san_unavailable side=server node={} reason={}", remote_node_id, e),
+                            // SECURITY v3.33: TLS cert SAN check (server side).
+                            // One-way TLS: client cert usually unavailable → Err("peer_identity unavailable") → OK.
+                            // But if cert IS presented and SAN mismatches → close (potential MitM).
+                            match Self::verify_peer_cert_node_id(&connection, &remote_node_id) {
+                                Ok(()) => {
+                                    if is_debug() { println!("[DBG][QUIC] cert_san_ok side=server node={}", remote_node_id); }
+                                }
+                                Err(e) if e.contains("SAN does not contain") => {
+                                    println!("[ERR][QUIC] cert_san_MISMATCH side=server node={} reason={} → closing", remote_node_id, e);
+                                    connection.close(quinn::VarInt::from_u32(403), b"SAN_MISMATCH");
+                                    return;
+                                }
+                                Err(_) => {
+                                    // peer_identity unavailable — normal for one-way TLS
                                 }
                             }
                             
@@ -884,21 +891,25 @@ impl QuicTransport {
             return Err("Self-connect not allowed".to_string());
         }
         
-        // SECURITY v6.2: TLS cert SAN check (best-effort, client side)
-        // Quinn exposes peer cert when server presents it during TLS handshake.
-        // If unavailable (None), connection proceeds — Dilithium signatures in consensus
-        // provide the binding between node_id and cryptographic identity.
+        // SECURITY v3.33: STRICT TLS cert SAN verification (client side).
+        // If peer_identity is available (server presented cert), SAN MUST match.
+        // SAN mismatch = potential MitM → close connection immediately.
+        // peer_identity unavailable (one-way TLS) = allowed, Dilithium provides auth.
         match Self::verify_peer_cert_node_id(&connection, &remote_node_id) {
             Ok(()) => {
                 if is_info() {
                     println!("[INFO][QUIC] cert_san_verified side=client node={}", remote_node_id);
                 }
             }
+            Err(e) if e.contains("SAN does not contain") => {
+                println!("[ERR][QUIC] cert_san_MISMATCH side=client node={} reason={} → closing", remote_node_id, e);
+                connection.close(quinn::VarInt::from_u32(403), b"SAN_MISMATCH");
+                return Err(format!("TLS SAN mismatch for node {}: {}", remote_node_id, e));
+            }
             Err(e) => {
                 if is_debug() {
-                    println!("[DBG][QUIC] cert_san_unavailable side=client node={} reason={}", remote_node_id, e);
+                    println!("[DBG][QUIC] cert_unavailable side=client node={} reason={}", remote_node_id, e);
                 }
-                // Not fatal — degrade gracefully, Dilithium provides auth
             }
         }
         

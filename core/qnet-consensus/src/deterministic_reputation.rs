@@ -224,9 +224,16 @@ impl SlashingEvent {
         }
     }
     
-    /// Check if offense results in permanent ban
+    /// v3.33: ALL slashing offenses = permanent ban, no recovery.
+    /// QNet has no staking — the only deterrent is irrevocable network exclusion.
+    /// Cryptographic proof is required for all offenses (no false positives).
     pub fn is_permanent_ban(offense: &SlashingType) -> bool {
-        matches!(offense, SlashingType::ChainFork { .. })
+        match offense {
+            SlashingType::DoubleSign { .. } => true,
+            SlashingType::InvalidBlock { .. } => true,
+            SlashingType::ChainFork { .. } => true,
+            SlashingType::ConsecutiveMissedBlocks { .. } => false,
+        }
     }
     
     /// Compute evidence hash for verification
@@ -553,9 +560,11 @@ impl DeterministicReputationState {
             let new_rep = (current - event.penalty).max(0.0);
             self.reputations.insert(event.offender.clone(), new_rep);
             
-            // Check for permanent ban
+            // v3.33: Permanent ban for cryptographically proven offenses
             if SlashingEvent::is_permanent_ban(&event.offense) {
                 self.permanent_bans.insert(event.offender.clone());
+                self.reputations.insert(event.offender.clone(), 0.0);
+                println!("[SLASH] PERMANENT_BAN node={} offense={:?}", event.offender, std::mem::discriminant(&event.offense));
             }
         }
         

@@ -445,6 +445,26 @@ pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 // This prevents round mismatch between nodes
 pub static LAST_FINALIZED_CONSENSUS_ROUND: AtomicU64 = AtomicU64::new(0);
 
+// v3.33: FORMAL FINALITY — blocks at or below this height are IRREVERSIBLE.
+// Updated when macroblock is saved (macroblock covers 90 microblocks).
+// All rollback paths MUST check this: rollback below finalized height is FORBIDDEN.
+// This provides the same guarantee as Casper FFG checkpoints.
+pub static LAST_FINALIZED_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// v3.33: Check if rollback to target_height is allowed by finality rules.
+/// Returns Err with reason if rollback would violate finality.
+pub fn check_finality_allows_rollback(target_height: u64) -> Result<(), String> {
+    let finalized = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+    if finalized > 0 && target_height < finalized {
+        Err(format!(
+            "FINALITY_VIOLATION: rollback to {} blocked — blocks up to {} are finalized (macroblock consensus)",
+            target_height, finalized
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 // CRITICAL FIX v2.49: Prevent duplicate consensus tasks for same MacroBlock
 // Only ONE consensus task can be active per MacroBlock index at any time
 // Uses compare_exchange to atomically check-and-set
@@ -1519,16 +1539,47 @@ impl BlockchainNode {
     /// - Double-signing (2 signatures on conflicting blocks at same height)
     /// - Invalid block production (signature/hash verification failure)
     fn compute_automatic_jails(
-        _commit_participants: &std::collections::HashSet<String>,
-        _reveal_participants: &std::collections::HashSet<String>,
-        _timestamp: u64
+        commit_participants: &std::collections::HashSet<String>,
+        reveal_participants: &std::collections::HashSet<String>,
+        timestamp: u64
     ) -> Vec<qnet_consensus::deterministic_reputation::AutomaticJail> {
-        // PRODUCTION v2.40: Return empty - no automatic jails for timing issues
-        // Commit-without-reveal is handled by:
-        // 1. No reward (+1% consensus participation)
-        // 2. Small penalty (-1% PENALTY_MISSED_CONSENSUS)
-        // This avoids cascade jailing from network timing issues
-        Vec::new()
+        // v3.33: Re-enabled automatic jails for commit-without-reveal.
+        // Nodes that commit but don't reveal disrupt macroblock consensus.
+        // Progressive jail: 1h → 24h → 7d → 30d → 90d → 1y.
+        // Only jails nodes that DID commit (proving they were online) but
+        // didn't reveal (either malicious or severely misconfigured).
+        use qnet_consensus::deterministic_reputation::AutomaticJail;
+        use sha3::{Sha3_256, Digest};
+
+        let commit_only: Vec<String> = commit_participants
+            .difference(reveal_participants)
+            .cloned()
+            .collect();
+
+        let mut jails = Vec::new();
+        for node_id in commit_only {
+            let mut hasher = Sha3_256::new();
+            hasher.update(b"AUTO_JAIL_COMMIT_NO_REVEAL:");
+            hasher.update(node_id.as_bytes());
+            hasher.update(&timestamp.to_le_bytes());
+            let result = hasher.finalize();
+            let mut evidence_hash = [0u8; 32];
+            evidence_hash.copy_from_slice(&result);
+
+            let jail = AutomaticJail {
+                node_id: node_id.clone(),
+                offense_count: 1, // Will be updated by DeterministicReputationState
+                jail_start_height: 0,
+                jail_duration: AutomaticJail::calculate_duration(1),
+                reason: "commit_without_reveal".to_string(),
+                evidence_hash,
+            };
+            jails.push(jail);
+            if is_info() {
+                println!("[INFO][JAIL] auto_jail node={} reason=commit_no_reveal", node_id);
+            }
+        }
+        jails
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -6265,6 +6316,12 @@ impl BlockchainNode {
                             let rollback_from = network_height + 1;
                             let rollback_to = local_height;
                             
+                            // v3.33: FINALITY CHECK — cannot rollback below finalized macroblock
+                            if let Err(reason) = crate::node::check_finality_allows_rollback(network_height) {
+                                println!("[ERR][ROLLBACK] {} — skipping rollback", reason);
+                                return;
+                            }
+                            
                             if is_info() { println!("[INFO][ROLLBACK] deleting from={} to={}", rollback_from, rollback_to); }
                             
                             for h in rollback_from..=rollback_to {
@@ -6718,6 +6775,28 @@ impl BlockchainNode {
                                  received_block.height.saturating_sub(current_height));
                         // Don't exclude yet, but log for monitoring
                     }
+                    
+                    // v3.32: COMPETING PRODUCER DETECTION on block reception
+                    // If we're currently producing and receive a valid block from a DIFFERENT
+                    // producer in the same rotation round → signal split-brain conflict.
+                    // The production loop will check this flag and yield immediately.
+                    if producer != &node_id {
+                        let block_round = if received_block.height > 0 {
+                            (received_block.height - 1) / ROTATION_INTERVAL_BLOCKS
+                        } else { 0 };
+                        if let NodeState::Producing { round, .. } = get_node_state() {
+                            if block_round == round {
+                                crate::unified_p2p::set_competing_producer(round, received_block.height);
+                                if is_info() {
+                                    println!("[INFO][CONS] competing_producer_block h={} producer={} our_round={}",
+                                             received_block.height, producer, round);
+                                }
+                            } else if is_debug() {
+                                println!("[DBG][CONS] other_round_block h={} producer={} block_round={} our_round={}",
+                                         received_block.height, producer, block_round, round);
+                            }
+                        }
+                    }
                 }
                 
                 // Periodically clear expired exclusions
@@ -7077,6 +7156,13 @@ impl BlockchainNode {
                                                         // Rollback to fork point and resync
                                                         if fork_height <= local_height {
                                                             let rollback_to = fork_height.saturating_sub(1);
+                                                            
+                                                            // v3.33: FINALITY CHECK
+                                                            if let Err(reason) = crate::node::check_finality_allows_rollback(rollback_to) {
+                                                                println!("[ERR][REORG] {} — skipping reorg", reason);
+                                                                return;
+                                                            }
+                                                            
                                                             // v3.23: Start rollback protection
                                                             if !crate::storage::start_rollback_protection(rollback_to) {
                                                                 println!("[WARN][REORG] rollback_protection_busy");
@@ -7113,21 +7199,43 @@ impl BlockchainNode {
                                                             if is_info() { println!("[INFO][REORG] resolved synced=longer_chain"); }
                                                         }
                                                     }
-                                                    // CASE 2: Same height - resync from network to resolve
-                                                    // ARCHITECTURE: We can't know which chain is "correct" without querying peers
-                                                    // The safest approach is to resync and let the network decide
+                                                    // CASE 2: Same height - use attestation count as tie-breaker first.
+                                                    // v3.33: Only attestations for OUR specific block hash count.
+                                                    // This prevents attestations for the rival fork from being counted.
                                                     else if network_height == local_height && fork_height <= local_height {
-                                                        if is_info() { println!("[INFO][REORG] same_height={} fork=detected resync=network", local_height); }
-                                                        
-                                                        // Get our hash at fork_height for logging
-                                                        let our_hash = if let Ok(Some(our_block)) = storage_clone.load_microblock(fork_height) {
-                                                            use sha3::{Sha3_256, Digest};
-                                                            let mut hasher = Sha3_256::new();
-                                                            hasher.update(&our_block);
-                                                            hex::encode(&hasher.finalize()[0..8])
-                                                        } else {
-                                                            "unknown".to_string()
-                                                        };
+                                                        // Compute SHA3-256 of our local block at fork_height
+                                                        let our_local_hash: Option<[u8; 32]> =
+                                                            storage_clone.load_microblock(fork_height)
+                                                                .ok()
+                                                                .and_then(|opt| opt)
+                                                                .map(|block_data| {
+                                                                    use sha3::{Sha3_256, Digest};
+                                                                    let mut h = Sha3_256::new();
+                                                                    h.update(&block_data);
+                                                                    let mut arr = [0u8; 32];
+                                                                    arr.copy_from_slice(&h.finalize());
+                                                                    arr
+                                                                });
+
+                                                        let our_attest = our_local_hash
+                                                            .map(|hash| crate::unified_p2p::get_attestation_count_for_hash(fork_height, &hash))
+                                                            .unwrap_or(0);
+
+                                                        if our_attest > 0 {
+                                                            if is_info() {
+                                                                println!("[INFO][REORG] attest_fork_choice h={} attestations_for_our_hash={} keeping_local",
+                                                                         fork_height, our_attest);
+                                                            }
+                                                            // Our specific block has attestations — keep it, do NOT resync
+                                                            *reorg_flag.write().await = false;
+                                                            return;
+                                                        }
+                                                        if is_info() { println!("[INFO][REORG] same_height={} fork=detected no_attestations_for_our_hash resync=network", local_height); }
+
+                                                        // Get our hash at fork_height for logging (hex prefix)
+                                                        let our_hash = our_local_hash
+                                                            .map(|h| hex::encode(&h[..8]))
+                                                            .unwrap_or_else(|| "unknown".to_string());
                                                         
                                                         if is_debug() { println!("[DBG][REORG] our_block h={} hash={}", fork_height, our_hash); }
                                                         if is_debug() { println!("[DBG][REORG] fork_from={}", fork_producer_clone); }
@@ -7154,6 +7262,12 @@ impl BlockchainNode {
                                                         if high_rep_count >= MIN_PEERS_FOR_RESYNC {
                                                             if is_info() { println!("[INFO][REORG] resync validators={}", high_rep_count); }
                                                             let rollback_to = fork_height.saturating_sub(1);
+                                                            
+                                                            // v3.33: FINALITY CHECK
+                                                            if let Err(reason) = crate::node::check_finality_allows_rollback(rollback_to) {
+                                                                println!("[ERR][REORG] {} — skipping resync", reason);
+                                                                return;
+                                                            }
                                                             
                                                             // v3.23: Start rollback protection
                                                             if !crate::storage::start_rollback_protection(rollback_to) {
@@ -7582,6 +7696,38 @@ impl BlockchainNode {
                                                          node_id, amount / 1_000_000_000);
                                             }
                                         }
+                                        
+                                        // v3.33: Broadcast block attestation with real Dilithium signature
+                                        if let Some(ref p2p) = unified_p2p {
+                                            let mut block_hasher = Sha3_256::new();
+                                            block_hasher.update(&decompressed_data);
+                                            let hash_result = block_hasher.finalize();
+                                            let mut attest_hash = [0u8; 32];
+                                            attest_hash.copy_from_slice(&hash_result);
+
+                                            // Sign "QNET_ATTEST:{height}:{hash_hex}" with Dilithium3 (same key as block signing)
+                                            let attest_msg = format!("QNET_ATTEST:{}:{}", received_block.height, hex::encode(&attest_hash));
+                                            let attest_sig: Vec<u8> = {
+                                                use pqcrypto_mldsa::mldsa65 as dilithium3;
+                                                use pqcrypto_traits::sign::SecretKey as SkTrait;
+                                                use pqcrypto_traits::sign::DetachedSignature as SigTrait;
+                                                GLOBAL_VRF_INSTANCE.lock().ok()
+                                                    .and_then(|g| g.clone())
+                                                    .and_then(|vrf| vrf.get_secret_key_bytes())
+                                                    .and_then(|sk_bytes| {
+                                                        dilithium3::SecretKey::from_bytes(&sk_bytes).ok()
+                                                            .map(|sk| dilithium3::detached_sign(attest_msg.as_bytes(), &sk))
+                                                            .map(|sig| SigTrait::as_bytes(&sig).to_vec())
+                                                    })
+                                                    .unwrap_or_default()
+                                            };
+
+                                            if !attest_sig.is_empty() {
+                                                p2p.broadcast_block_attestation(received_block.height, attest_hash, attest_sig);
+                                            }
+                                            crate::unified_p2p::cleanup_old_attestations(received_block.height);
+                                        }
+                                        
                                         Ok(())
                                     }
                                     Err(e) => {
@@ -7740,7 +7886,8 @@ impl BlockchainNode {
                                 let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
                                 if round > prev_round {
                                     LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
-                                    if is_debug() { println!("[DBG][MB-P2P] finalized_round={} mb={}", round, mb_height); }
+                                    LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
+                                    if is_debug() { println!("[DBG][MB-P2P] finalized_round={} mb={} finality_h={}", round, mb_height, round); }
                                 }
                             }
                             
@@ -11666,14 +11813,18 @@ impl BlockchainNode {
                     }
                 }
                 
-                // CPU OPTIMIZATION: Log CPU stats every 30 seconds
-                if cpu_check_counter % 30 == 0 {
-                    let elapsed = start_time.elapsed().as_secs();
-                    let thread_count = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1);
-                    println!("[CPU] 📊 Node uptime: {}s | Threads: {} | Block: #{}", 
-                            elapsed, thread_count, microblock_height);
+                // v3.33: Check stall/timeout every 5 iterations (was 30).
+                // BFT Timeout needs frequent checks (12s grace + 6s rounds).
+                // CPU stats still log every 30s to avoid spam.
+                if cpu_check_counter % 5 == 0 {
+                    if cpu_check_counter % 30 == 0 {
+                        let elapsed = start_time.elapsed().as_secs();
+                        let thread_count = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1);
+                        println!("[CPU] 📊 Node uptime: {}s | Threads: {} | Block: #{}", 
+                                elapsed, thread_count, microblock_height);
+                    }
                     
                     // DEADLOCK DETECTION: Check if we're stuck on same height for too long
                     if microblock_height == last_production_height {
@@ -11741,13 +11892,13 @@ impl BlockchainNode {
                         // Local delay detection (triggers voting, NOT producer selection)
                         let local_delay = current_time.saturating_sub(last_block_time + 1);
                         
-                        // v4.0: BFT Timeout Constants (like Tendermint/HotStuff)
-                        // Grace period: time to wait before voting for timeout
-                        // Vote interval: time between timeout rounds
-                        // Max rounds: prevents infinite failover loops
-                        const TIMEOUT_GRACE_PERIOD: u64 = 30;  // 30s grace (Ethereum uses 12s slots)
-                        const TIMEOUT_VOTE_INTERVAL: u64 = 15; // 15s per round
-                        const MAX_TIMEOUT_ROUNDS: u64 = 10;    // Max 10 rounds = 150s max failover
+                        // v3.33: Optimized BFT Timeout Constants
+                        // Target recovery: 15-25s (was 60-90s).
+                        // Grace period MUST exceed: VRF collection (4s) + entropy consensus (4s) + block creation (1s) + NTP drift (±2s).
+                        // Safe minimum grace = 12s. Vote interval = 2× NTP drift + propagation.
+                        const TIMEOUT_GRACE_PERIOD: u64 = 12;  // 12s grace (covers VRF+entropy+NTP)
+                        const TIMEOUT_VOTE_INTERVAL: u64 = 6;  // 6s per round (2× NTP drift + WAN margin)
+                        const MAX_TIMEOUT_ROUNDS: u64 = 10;    // Max 10 rounds = 72s max failover
                         
                         // Calculate which timeout_round we SHOULD vote for (local view)
                         let proposed_timeout_round = if local_delay <= TIMEOUT_GRACE_PERIOD {
@@ -11986,6 +12137,12 @@ impl BlockchainNode {
                                         } else {
                                             0
                                         };
+                                        
+                                        // v3.33: FINALITY CHECK — cannot rollback below finalized macroblock
+                                        if let Err(reason) = check_finality_allows_rollback(rollback_to) {
+                                            println!("[ERR][FORK] {} — skipping stall recovery rollback", reason);
+                                            continue;
+                                        }
                                         
                                         // v3.23: Start rollback protection
                                         if !crate::storage::start_rollback_protection(rollback_to) {
@@ -12768,13 +12925,16 @@ impl BlockchainNode {
                 // This prevents different nodes selecting different producers
                 // Rotation happens when creating blocks 31, 61, 91... (first block of new round)
                 //
-                // v3.3: SKIP entropy consensus if WE ARE THE PRODUCER!
-                // Producer already knows they are producer - no need to wait for consensus
-                // This was causing blocking delays that triggered false emergency failovers!
-                // Only NON-producers need to wait for consensus to know who the producer is.
-                if next_block_height > 1 && (next_block_height - 1) % 30 == 0 && !is_my_turn_to_produce {
-                    // We're at a rotation boundary (blocks 31, 61, 91...) AND we're NOT the producer
-                    println!("[INFO][CONS] rotation_boundary h={} we_are_validator", next_block_height);
+                // v3.33: ALL nodes (including producer) verify entropy consensus at rotation boundary.
+                // v3.3 skipped this for producers — root cause of VRF split-brain forks.
+                // Without this check, a producer elected by a minority (due to missing VRF claims)
+                // starts producing immediately while the majority elected someone else → fork.
+                // Cost: ~2-3s added to first block of each rotation (every 30 blocks).
+                if next_block_height > 1 && (next_block_height - 1) % 30 == 0 {
+                    let entropy_role = if is_my_turn_to_produce { "producer" } else { "validator" };
+                    if is_info() {
+                        println!("[INFO][CONS] rotation_boundary h={} role={} entropy_check", next_block_height, entropy_role);
+                    }
                     
                     if let Some(p2p) = &unified_p2p {
                         // CRITICAL FIX: Use FINALITY_WINDOW for entropy consensus (Byzantine-safe)
@@ -13109,18 +13269,22 @@ impl BlockchainNode {
                             // v3.25: ISOLATION CHECK with dynamic threshold
                             // Cannot produce without minimum consensus proportional to network size
                             if total_responses < min_production_responses && next_block_height > 10 {
-                                println!("[ERR][CONS] isolated_node responses={} min_required={} sample={} h={}", 
-                                         total_responses, min_production_responses, sample_size, next_block_height);
-                                println!("[INFO][CONS] skip_production reason=insufficient_consensus");
-                                
-                                // STATE MACHINE: Isolated state
-                                set_node_state(NodeState::Error {
-                                    reason: format!("Isolated: {} responses, need {} (40% of {})", 
-                                                    total_responses, min_production_responses, sample_size),
-                                    recoverable: true,
-                                });
-                                
-                                // Do NOT produce - wait for network connectivity
+                                if is_my_turn_to_produce {
+                                    // v3.33: Producer yields — don't self-exclude, BFT Timeout will select next
+                                    println!("[INFO][CONS] producer_yield_isolated h={} responses={}/{}", 
+                                             next_block_height, total_responses, min_production_responses);
+                                    is_my_turn_to_produce = false;
+                                    *is_leader.write().await = false;
+                                    set_node_state(NodeState::Idle { last_height: microblock_height });
+                                } else {
+                                    println!("[ERR][CONS] isolated_node responses={} min_required={} sample={} h={}", 
+                                             total_responses, min_production_responses, sample_size, next_block_height);
+                                    set_node_state(NodeState::Error {
+                                        reason: format!("Isolated: {} responses, need {} (40% of {})", 
+                                                        total_responses, min_production_responses, sample_size),
+                                        recoverable: true,
+                                    });
+                                }
                                 continue;
                             }
                             
@@ -13132,19 +13296,26 @@ impl BlockchainNode {
                                     println!("[ERR][CONS] fork_detected mismatches={} matches=0 total={}", 
                                              mismatches, total_responses);
                                     
-                                    // STATE MACHINE: Fork detected error
-                                    set_node_state(NodeState::Error {
-                                        reason: format!("Fork: {} mismatches, 0 matches", mismatches),
-                                        recoverable: true,
-                                    });
-                                    
-                                    // v3.10: Self-exclude from production
-                                    let rotation_interval = 30u64;
-                                    let exclude_until = ((next_block_height / rotation_interval) + 3) * rotation_interval;
-                                    exclude_producer(&node_id, "entropy_fork_detected", exclude_until);
-                                    println!("[INFO][CONS] self_excluded until_h={}", exclude_until);
-                                    
-                                    // Skip this rotation round to prevent fork
+                                    if is_my_turn_to_produce {
+                                        // v3.33: Producer yields this rotation only — BFT Timeout handles failover.
+                                        // Don't self-exclude for 3 rotations: we may have correct entropy
+                                        // while the minority has stale data. Let timeout protocol decide.
+                                        println!("[INFO][CONS] producer_yield_fork h={} mismatches={}", 
+                                                 next_block_height, mismatches);
+                                        is_my_turn_to_produce = false;
+                                        *is_leader.write().await = false;
+                                        set_node_state(NodeState::Idle { last_height: microblock_height });
+                                    } else {
+                                        set_node_state(NodeState::Error {
+                                            reason: format!("Fork: {} mismatches, 0 matches", mismatches),
+                                            recoverable: true,
+                                        });
+                                        // v3.10: Validators self-exclude from production for 3 rotations
+                                        let rotation_interval = 30u64;
+                                        let exclude_until = ((next_block_height / rotation_interval) + 3) * rotation_interval;
+                                        exclude_producer(&node_id, "entropy_fork_detected", exclude_until);
+                                        println!("[INFO][CONS] self_excluded until_h={}", exclude_until);
+                                    }
                                     continue;
                                 } else if matches == 0 && (total_responses < MIN_FORK_DETECTION_RESPONSES || next_block_height <= 10) {
                                     // v3.11: Not enough data to confirm fork - likely startup/sync phase
@@ -13155,13 +13326,20 @@ impl BlockchainNode {
                                     println!("[ERR][CONS] fork_detected mismatches={} matches={} majority=disagree", 
                                              mismatches, matches);
                                     
-                                    // STATE MACHINE: Fork detected error
-                                    set_node_state(NodeState::Error {
-                                        reason: format!("Fork: {} mismatches vs {} matches", mismatches, matches),
-                                        recoverable: true,
-                                    });
-                                    
-                                    // Skip this rotation round to prevent fork
+                                    if is_my_turn_to_produce {
+                                        // v3.33: Producer yields — majority disagrees with our entropy,
+                                        // meaning majority selected a different producer. We're in the minority.
+                                        println!("[INFO][CONS] producer_yield_majority h={} mismatches={} matches={}", 
+                                                 next_block_height, mismatches, matches);
+                                        is_my_turn_to_produce = false;
+                                        *is_leader.write().await = false;
+                                        set_node_state(NodeState::Idle { last_height: microblock_height });
+                                    } else {
+                                        set_node_state(NodeState::Error {
+                                            reason: format!("Fork: {} mismatches vs {} matches", mismatches, matches),
+                                            recoverable: true,
+                                        });
+                                    }
                                     continue;
                                 } else {
                                     // Minority disagrees - continue (Byzantine resilience)
@@ -13337,14 +13515,12 @@ impl BlockchainNode {
                             }
                         }
                     }
-                } else if next_block_height > 1 && (next_block_height - 1) % 30 == 0 && is_my_turn_to_produce {
-                    // v3.3: Producer at rotation boundary - SKIP entropy consensus wait!
-                    // Producer already knows they are producer - no blocking wait needed
-                    // This fixes the issue where producer was delayed by consensus, causing false emergencies
-                    if is_info() {
-                        println!("[INFO][CONS] rotation_boundary h={} we_are_producer skip_consensus_wait", next_block_height);
-                    }
                 }
+                // v3.33: Removed v3.32 conflict detection window (800ms sleep) — dead code.
+                // Entropy consensus (above) now handles ALL nodes at rotation boundary,
+                // making the separate 800ms producer sleep unnecessary. The competing
+                // producer detection in block reception (line ~6730) and production loop
+                // (line ~13425) remains as a secondary safety net.
                 
                 // CRITICAL FIX: Update NODE_IS_SYNCHRONIZED for ALL nodes BEFORE producer check
                 // This was a BUG: flag was only updated in else branch (non-producers)
@@ -13362,6 +13538,20 @@ impl BlockchainNode {
                 }
                 
                 if is_my_turn_to_produce {
+                    // v3.32: Check for competing producer BEFORE each block in rotation
+                    // If another node's block arrived for our round, we're in the minority — yield
+                    let vrf_round_check = if next_block_height > 30 { (next_block_height - 1) / 30 } else { 0 };
+                    if crate::unified_p2p::has_competing_producer(vrf_round_check) {
+                        let rival_h = crate::unified_p2p::get_competing_producer_height();
+                        println!("[INFO][CONS] competing_producer_in_rotation round={} rival_h={} our_h={} → yielding",
+                                 vrf_round_check, rival_h, next_block_height);
+                        is_my_turn_to_produce = false;
+                        *is_leader.write().await = false;
+                        set_node_state(NodeState::Idle { last_height: microblock_height });
+                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                        continue;
+                    }
+                    
                     // PRODUCTION: This node is selected as microblock producer for this round
                     *is_leader.write().await = true;
                     
@@ -18464,8 +18654,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // v2.48: Initialize global atomic with round number (mb_index * 90)
                     let round = highest * 90;
                     LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
-                    println!("[CONSENSUS-LISTENER] 📊 Initialized from storage: last macroblock #{} round={} (chain height: {})", 
-                             highest, round, chain_height);
+                    LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
+                    println!("[CONSENSUS-LISTENER] 📊 Initialized from storage: last macroblock #{} round={} finality_h={} (chain height: {})", 
+                             highest, round, round, chain_height);
                 }
             }
             
@@ -18696,6 +18887,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 // v2.48 FIX: Update global round ONLY when MB is SAVED!
                                                 let round = mb_idx * 90;
                                                 LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
+                                                LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
                                                 if is_info() { 
                                                     println!("[INFO][ASYNC-CONS] mb={} result=ok saved=true round={} time={:?}", 
                                                              mb_idx, round, cons_time); 
@@ -19595,6 +19787,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // v2.48 FIX: Update global finalized round after successful save
         let round = macroblock.height * 90;
         LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
+        LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
         
         if is_info() { 
             println!("[INFO][PFP] saved mb={} type={} blocks={} participants={} round={}", 
@@ -22304,6 +22497,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // v2.48 FIX: Update global finalized round IMMEDIATELY after save!
                 let round = macroblock.height * 90;
                 LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
+                LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
                 
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 if is_info() { println!("[INFO][MB] created h={} round={}", macroblock.height, round); }
@@ -24511,7 +24705,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
             if round > prev_round {
                 LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
-                println!("[INFO][MB-SYNC] finalized_round_updated mb={} round={}", index, round);
+                LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
+                println!("[INFO][MB-SYNC] finalized_round_updated mb={} round={} finality_h={}", index, round, round);
             }
             
             // v2.24: Apply reputation snapshot from macroblock

@@ -414,6 +414,122 @@ pub fn clear_all_pending_sync_macroblocks() {
     PENDING_SYNC_MACROBLOCKS.clear();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// v3.32: COMPETING PRODUCER DETECTION
+// Prevents VRF split-brain forks when different nodes elect different producers
+// due to incomplete claim gossip. If a node starts producing but receives blocks
+// from a different producer for the same rotation, it yields immediately.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static COMPETING_PRODUCER_ROUND: AtomicU64 = AtomicU64::new(0);
+static COMPETING_PRODUCER_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Signal that a competing producer was detected for the given round/height
+pub fn set_competing_producer(round: u64, height: u64) {
+    COMPETING_PRODUCER_ROUND.store(round, Ordering::SeqCst);
+    COMPETING_PRODUCER_HEIGHT.store(height, Ordering::SeqCst);
+}
+
+/// Check if a competing producer was detected for the given round
+pub fn has_competing_producer(round: u64) -> bool {
+    COMPETING_PRODUCER_ROUND.load(Ordering::SeqCst) == round
+}
+
+/// Get the height at which competing producer was first seen
+pub fn get_competing_producer_height() -> u64 {
+    COMPETING_PRODUCER_HEIGHT.load(Ordering::SeqCst)
+}
+
+/// Clear competing producer flag (on new rotation or after yielding)
+pub fn clear_competing_producer() {
+    COMPETING_PRODUCER_ROUND.store(0, Ordering::SeqCst);
+    COMPETING_PRODUCER_HEIGHT.store(0, Ordering::SeqCst);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v3.33: BLOCK ATTESTATION — committee-based microblock confirmation
+// After receiving a valid microblock, validators broadcast attestation (hash signature).
+// Producer collects attestations; blocks with 2/3+ attestations have higher fork-choice weight.
+// Scalability: Only qualified producers attest (≤1000 per round, not all light nodes).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use dashmap::DashMap as AttestDashMap;
+
+/// Single block attestation from a validator
+#[derive(Debug, Clone)]
+pub struct BlockAttestation {
+    pub block_height: u64,
+    pub block_hash: [u8; 32],
+    pub attester_id: String,
+    pub signature: Vec<u8>,
+    pub timestamp: u64,
+}
+
+/// Attestation store: (block_height) -> Vec<BlockAttestation>
+/// DashMap for lock-free concurrent access from P2P message handlers
+static BLOCK_ATTESTATIONS: once_cell::sync::Lazy<AttestDashMap<u64, Vec<BlockAttestation>>> =
+    once_cell::sync::Lazy::new(|| AttestDashMap::new());
+
+/// Submit an attestation for a block.
+/// Deduplication: one entry per (height, attester_id) — ignores re-sends from same node.
+pub fn submit_block_attestation(attestation: BlockAttestation) {
+    let height = attestation.block_height;
+    let mut entry = BLOCK_ATTESTATIONS
+        .entry(height)
+        .or_insert_with(Vec::new);
+    // Dedup: skip if this attester already submitted for this height
+    if !entry.iter().any(|a| a.attester_id == attestation.attester_id) {
+        entry.push(attestation);
+    }
+}
+
+/// Get total attestation count for a height (all hashes combined).
+pub fn get_attestation_count(block_height: u64) -> usize {
+    BLOCK_ATTESTATIONS
+        .get(&block_height)
+        .map(|v| v.len())
+        .unwrap_or(0)
+}
+
+/// Get attestation count for a SPECIFIC block hash at a given height.
+/// Used in fork choice: only count attestations that confirm OUR local block.
+pub fn get_attestation_count_for_hash(block_height: u64, block_hash: &[u8; 32]) -> usize {
+    BLOCK_ATTESTATIONS
+        .get(&block_height)
+        .map(|v| v.iter().filter(|a| &a.block_hash == block_hash).count())
+        .unwrap_or(0)
+}
+
+/// Get all attestations for a block height.
+pub fn get_attestations(block_height: u64) -> Vec<BlockAttestation> {
+    BLOCK_ATTESTATIONS
+        .get(&block_height)
+        .map(|v| v.clone())
+        .unwrap_or_default()
+}
+
+/// Check if block has sufficient attestations (2/3+ of qualified validators)
+/// for a SPECIFIC block hash — not just any attestations at that height.
+pub fn has_sufficient_attestations_for_hash(block_height: u64, block_hash: &[u8; 32], total_qualified: usize) -> bool {
+    let count = get_attestation_count_for_hash(block_height, block_hash);
+    let threshold = (total_qualified * 2 + 2) / 3; // Byzantine 2/3+ threshold
+    count >= threshold
+}
+
+/// Legacy: check sufficient attestations by height (kept for API compatibility)
+pub fn has_sufficient_attestations(block_height: u64, total_qualified: usize) -> bool {
+    let count = get_attestation_count(block_height);
+    let threshold = (total_qualified * 2 + 2) / 3;
+    count >= threshold
+}
+
+/// Cleanup old attestations (keep only last 100 blocks)
+pub fn cleanup_old_attestations(current_height: u64) {
+    if current_height <= 100 { return; }
+    let cutoff = current_height - 100;
+    BLOCK_ATTESTATIONS.retain(|h, _| *h > cutoff);
+}
+
 /// v3.1: Cleanup stale entries from PENDING_SYNC_MACROBLOCKS
 pub fn cleanup_pending_sync_macroblocks() -> usize {
     let now = std::time::SystemTime::now()
@@ -10984,6 +11100,18 @@ pub enum NetworkMessage {
         closest_peers: Vec<(String, String)>, // (node_id, addr) pairs
         request_id: u64,
     },
+
+    /// v3.33: Block Attestation — validator confirms block validity after receiving it.
+    /// Attestation = Dilithium signature over (block_height || block_hash).
+    /// Blocks with 2/3+ attestations have higher fork-choice weight.
+    /// Scalability: only qualified producers attest (~20 VRF winners + ~100 entropy sample).
+    BlockAttestationMsg {
+        block_height: u64,
+        block_hash: Vec<u8>,       // 32-byte SHA3 hash of microblock
+        attester_id: String,       // Node that verified and attests
+        signature: Vec<u8>,        // Dilithium3 signature over "QNET_ATTEST:{height}:{hash}"
+        timestamp: u64,
+    },
 }
 
 /// PRODUCTION: Active node info for gossip sync
@@ -11645,6 +11773,59 @@ impl SimplifiedP2P {
             NetworkMessage::FindNodeResponse { responder_id: _, closest_peers, request_id: _ } => {
                 self.update_peer_last_seen(from_peer);
                 self.handle_find_node_response(&closest_peers);
+            }
+
+            // v3.33: Block Attestation — validator confirms block validity
+            NetworkMessage::BlockAttestationMsg { block_height, block_hash, attester_id, signature, timestamp } => {
+                self.update_peer_last_seen(from_peer);
+
+                // Skip unsigned attestations (empty sig = invalid)
+                if signature.is_empty() {
+                    return;
+                }
+
+                // Verify Dilithium3 signature: "QNET_ATTEST:{height}:{hash_hex}"
+                let sig_ok = if let Some(pk_bytes) = crate::genesis_constants::get_vrf_public_key(&attester_id) {
+                    use pqcrypto_mldsa::mldsa65 as dilithium3;
+                    use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
+                    let attest_msg = format!("QNET_ATTEST:{}:{}", block_height, hex::encode(&block_hash));
+                    let pk_ok = dilithium3::PublicKey::from_bytes(&pk_bytes).ok();
+                    let sig_ok = dilithium3::DetachedSignature::from_bytes(&signature).ok();
+                    match (pk_ok, sig_ok) {
+                        (Some(pk), Some(sig)) => dilithium3::verify_detached_signature(&sig, attest_msg.as_bytes(), &pk).is_ok(),
+                        _ => false,
+                    }
+                } else {
+                    // Attester not in key registry — accept during bootstrap/genesis phase
+                    // (same grace as VRF claim handler: first N blocks no pk required)
+                    block_height < 100
+                };
+
+                if !sig_ok {
+                    if crate::node::is_warn() {
+                        println!("[WARN][ATTEST] invalid_sig h={} from={}", block_height, attester_id);
+                    }
+                    return;
+                }
+
+                let hash_arr: [u8; 32] = if block_hash.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&block_hash);
+                    arr
+                } else {
+                    [0u8; 32]
+                };
+                submit_block_attestation(BlockAttestation {
+                    block_height,
+                    block_hash: hash_arr,
+                    attester_id: attester_id.clone(),
+                    signature,
+                    timestamp,
+                });
+                if crate::node::is_debug() {
+                    println!("[DBG][ATTEST] verified h={} from={} total={}", 
+                             block_height, attester_id, get_attestation_count(block_height));
+                }
             }
 
             #[allow(deprecated)]
@@ -19836,6 +20017,66 @@ impl SimplifiedP2P {
                 }
             }
         });
+    }
+
+    /// v3.33: Broadcast block attestation to all validators.
+    /// Called by validators after successfully verifying a received microblock.
+    pub fn broadcast_block_attestation(
+        &self,
+        block_height: u64,
+        block_hash: [u8; 32],
+        signature: Vec<u8>,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Store own attestation locally
+        submit_block_attestation(BlockAttestation {
+            block_height,
+            block_hash,
+            attester_id: self.node_id.clone(),
+            signature: signature.clone(),
+            timestamp: now,
+        });
+
+        let msg = NetworkMessage::BlockAttestationMsg {
+            block_height,
+            block_hash: block_hash.to_vec(),
+            attester_id: self.node_id.clone(),
+            signature,
+            timestamp: now,
+        };
+
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        let peers = self.get_all_validator_addresses();
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+
+        handle.spawn(async move {
+            if quic_enabled {
+                if let Some(ref qt_lock) = quic_transport {
+                    let qt = qt_lock.read().await;
+                    for peer_str in &peers {
+                        let ip = peer_str.split(':').next().unwrap_or(peer_str);
+                        let quic_addr_str = format!("{}:10876", ip);
+                        if let Ok(peer_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
+                            let _ = qt.broadcast_to(peer_addr, &msg).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        if crate::node::is_debug() {
+            println!("[DBG][ATTEST] broadcast h={} hash={}", 
+                     block_height, hex::encode(&block_hash[..8]));
+        }
     }
 
     /// v4.0: Get verified leader claims for a given round
