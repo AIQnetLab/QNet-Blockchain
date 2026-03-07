@@ -367,7 +367,22 @@ pub fn mark_macroblock_pending_sync(index: u64) -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    
+
+    // v3.36: Check if macroblock is already pending but STALE (same pattern as microblocks)
+    // Without this, stale entries from failed requests permanently block re-processing:
+    // response arrives → insert returns Some(old) → .is_none() = false → data discarded
+    if let Some(entry) = PENDING_SYNC_MACROBLOCKS.get(&index) {
+        let timestamp = *entry;
+        if now.saturating_sub(timestamp) < PENDING_SYNC_MACROBLOCK_TTL_SECS {
+            return false;
+        }
+        drop(entry);
+        PENDING_SYNC_MACROBLOCKS.remove(&index);
+        if crate::node::is_debug() {
+            println!("[DBG][MB-SYNC] stale_pending_cleared idx={} age={}s", index, now.saturating_sub(timestamp));
+        }
+    }
+
     // v3.2: If queue is near full, do proactive cleanup FIRST
     if PENDING_SYNC_MACROBLOCKS.len() >= MAX_PENDING_SYNC_MACROBLOCKS - 10 {
         // Emergency cleanup: remove stale entries (TTL expired)

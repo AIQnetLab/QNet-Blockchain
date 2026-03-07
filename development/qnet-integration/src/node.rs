@@ -6349,6 +6349,7 @@ impl BlockchainNode {
                             
                             // v3.31: Clear pending sync queues after rollback
                             crate::unified_p2p::clear_all_pending_sync();
+                            crate::unified_p2p::clear_all_pending_sync_macroblocks();
                             clear_expected_producer_cache_above(network_height);
                             
                             if is_info() { println!("[INFO][ROLLBACK] complete new_height={}", network_height); }
@@ -6729,6 +6730,16 @@ impl BlockchainNode {
         let mut mismatch_counter: std::collections::HashMap<u64, (u32, std::time::Instant)> = 
             std::collections::HashMap::new();
         const MISMATCH_RECOVERY_THRESHOLD: u32 = 5;
+
+        // v3.36: Per-height "Wrong producer" counter — detects reputation divergence.
+        // When a block is rejected as "Wrong producer" 3+ times, the node's reputation
+        // state has diverged from the network (missed macroblock). Trigger macroblock
+        // recovery instead of endlessly rejecting valid blocks and penalizing peers.
+        let mut wrong_producer_counter: std::collections::HashMap<u64, (u32, std::time::Instant)> =
+            std::collections::HashMap::new();
+        const WRONG_PRODUCER_RECOVERY_THRESHOLD: u32 = 3;
+        let mut last_wp_recovery_attempt = std::time::Instant::now().checked_sub(Duration::from_secs(120)).unwrap_or_else(std::time::Instant::now);
+        const WP_RECOVERY_COOLDOWN_SECS: u64 = 60;
         
         loop {
             // Check both channels - prioritize retries
@@ -6767,10 +6778,12 @@ impl BlockchainNode {
                     // Check if producer is excluded
                     if is_producer_excluded(producer, current_height) {
                         if is_debug() {
-                            println!("[DBG][FORK] ignored_block h={} producer={} reason=excluded", 
+                            println!("[DBG][FORK] ignored_block h={} producer={} reason=excluded",
                                      received_block.height, producer);
                         }
-                        // Don't process - just skip
+                        // v3.36: Clear pending sync so block can be re-requested later
+                        // Without this, excluded blocks stay in PENDING_SYNC_BLOCKS forever → memory leak + dup_pending
+                        crate::unified_p2p::clear_block_pending_sync(received_block.height);
                         continue;
                     }
                     
@@ -7194,6 +7207,7 @@ impl BlockchainNode {
                                                             
                                                             // v3.31: Clear pending sync queues after rollback
                                                             crate::unified_p2p::clear_all_pending_sync();
+                                                            crate::unified_p2p::clear_all_pending_sync_macroblocks();
                                                             clear_expected_producer_cache_above(rollback_to);
                                                         }
                                                         
@@ -7296,6 +7310,7 @@ impl BlockchainNode {
                                                             
                                                             // v3.31: Clear pending sync queues after rollback
                                                             crate::unified_p2p::clear_all_pending_sync();
+                                                            crate::unified_p2p::clear_all_pending_sync_macroblocks();
                                                             clear_expected_producer_cache_above(rollback_to);
                                                             
                                                             // Request blocks from network
@@ -7330,6 +7345,57 @@ impl BlockchainNode {
                                         // Continue processing other blocks immediately
                                         if is_debug() { println!("[DBG][REORG] fork_analysis=background status=continue"); }
                                     }
+                                }
+                            }
+                        } else if e.contains("Wrong producer") {
+                            // v3.36: "Wrong producer" means this node's reputation diverged
+                            // from the network (missed macroblock). Track failures and trigger
+                            // macroblock recovery instead of penalizing valid peers.
+                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
+
+                            let wp_entry = wrong_producer_counter
+                                .entry(received_block.height)
+                                .or_insert((0, std::time::Instant::now()));
+                            wp_entry.0 += 1;
+                            let wp_fails = wp_entry.0;
+
+                            if wp_fails < WRONG_PRODUCER_RECOVERY_THRESHOLD {
+                                if is_info() {
+                                    println!("[INFO][CONS] wrong_producer h={} fails={}/{} — waiting for macroblock sync",
+                                             received_block.height, wp_fails, WRONG_PRODUCER_RECOVERY_THRESHOLD);
+                                }
+                            } else if last_wp_recovery_attempt.elapsed().as_secs() < WP_RECOVERY_COOLDOWN_SECS {
+                                if is_info() {
+                                    println!("[INFO][CONS] wrong_producer h={} fails={} — recovery cooldown ({}s left)",
+                                             received_block.height, wp_fails,
+                                             WP_RECOVERY_COOLDOWN_SECS - last_wp_recovery_attempt.elapsed().as_secs());
+                                }
+                            } else {
+                                last_wp_recovery_attempt = std::time::Instant::now();
+                                println!("[WARN][CONS] wrong_producer h={} fails={} — reputation diverged, triggering macroblock recovery",
+                                         received_block.height, wp_fails);
+
+                                let mb_index = received_block.height / 90;
+                                let scan_from = if mb_index > 5 { mb_index - 5 } else { 1 };
+
+                                for idx in scan_from..=mb_index {
+                                    crate::unified_p2p::clear_macroblock_pending_sync(idx);
+                                }
+
+                                clear_expected_producer_cache_above(received_block.height.saturating_sub(1));
+
+                                // Spawn recovery in background to avoid blocking block processing loop
+                                // sync_macroblocks can take up to 75s (5 peers × 15s timeout)
+                                if let Some(p2p) = &unified_p2p {
+                                    let p2p_clone = p2p.clone();
+                                    let recovery_height = received_block.height;
+                                    tokio::spawn(async move {
+                                        if let Err(err) = p2p_clone.sync_macroblocks(scan_from, mb_index).await {
+                                            println!("[WARN][CONS] mb_recovery_failed h={} err={}", recovery_height, err);
+                                        } else {
+                                            println!("[INFO][CONS] mb_recovery_complete h={} range={}-{}", recovery_height, scan_from, mb_index);
+                                        }
+                                    });
                                 }
                             }
                         } else {
@@ -8337,10 +8403,12 @@ impl BlockchainNode {
                                 Ok(()) => {
                                     println!("[INFO][STATE] recovery_complete clearing_mismatch_counters resuming_sync");
                                     mismatch_counter.clear();
+                                    wrong_producer_counter.clear();
                                     pending_blocks.clear();
                                     requested_blocks.clear();
                                     crate::unified_p2p::release_sync_slot(received_block.height);
                                     crate::unified_p2p::clear_all_pending_sync();
+                                    crate::unified_p2p::clear_all_pending_sync_macroblocks();
                                 }
                                 Err(reason) => {
                                     println!("[ERR][STATE] recovery_failed reason={} — will retry on next threshold", reason);
@@ -8348,6 +8416,11 @@ impl BlockchainNode {
                                 }
                             }
                         } else if fail_count < MISMATCH_RECOVERY_THRESHOLD {
+                            // v3.36: Clear pending sync to allow immediate re-request
+                            // Without this, block stays in PENDING_SYNC_BLOCKS for 60s TTL,
+                            // delaying each retry attempt and extending recovery time from
+                            // ~5 seconds to ~5 minutes.
+                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
                             if is_info() {
                                 println!("[INFO][STATE] mismatch_count h={} fails={}/{}", 
                                          received_block.height, fail_count, MISMATCH_RECOVERY_THRESHOLD);
@@ -8362,6 +8435,13 @@ impl BlockchainNode {
                 let current_chain_h = storage.get_chain_height().unwrap_or(0);
                 mismatch_counter.retain(|h, (_, first_seen)| {
                     *h >= current_chain_h && first_seen.elapsed().as_secs() < 600
+                });
+            }
+
+            // v3.36: Periodic cleanup of wrong_producer counters
+            if !wrong_producer_counter.is_empty() {
+                wrong_producer_counter.retain(|_, (_, first_seen)| {
+                    first_seen.elapsed().as_secs() < 300
                 });
             }
             
@@ -12148,6 +12228,14 @@ impl BlockchainNode {
                                     
                                     // 1. Force macroblock sync from all peers (target first missing)
                                     if let Some(p2p) = &unified_p2p {
+                                        // v3.36: Clear stale macroblock pending entries before requesting
+                                        // Without this, mark_macroblock_pending_sync returns false for stale
+                                        // entries, silently discarding the response → sync never completes
+                                        for idx in missing_mb.saturating_sub(1)..=latest_mb {
+                                            crate::unified_p2p::clear_macroblock_pending_sync(idx);
+                                        }
+                                        clear_expected_producer_cache_above(next_height.saturating_sub(1));
+
                                         let _ = p2p.sync_macroblocks(
                                             missing_mb.saturating_sub(1), latest_mb
                                         ).await;
@@ -12299,6 +12387,10 @@ impl BlockchainNode {
                                         // Without this, stale entries block re-queueing of blocks
                                         // causing dup_pending on ALL sync responses → sync deadlock
                                         crate::unified_p2p::clear_all_pending_sync();
+                                        // v3.36: Also clear macroblock pending — without this,
+                                        // deleted macroblocks stay "pending" and responses are
+                                        // discarded by mark_macroblock_pending_sync → recovery fails
+                                        crate::unified_p2p::clear_all_pending_sync_macroblocks();
                                         clear_expected_producer_cache_above(rollback_to);
                                         FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                         FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
