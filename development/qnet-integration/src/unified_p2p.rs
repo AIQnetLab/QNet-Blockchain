@@ -15603,6 +15603,28 @@ impl SimplifiedP2P {
         let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
         attestations.contains_key(&key)
     }
+
+    /// Check if attestation already exists for Light node anywhere in the current 4-hour window.
+    /// Used by ping scheduling: once a node attests in ANY slot of the window, skip it for the
+    /// rest of the window. The 3-slot retry window (slot_diff <= 2) is only for FAILURES — if
+    /// the node already proved liveness this window, no further FCM notifications are needed.
+    ///
+    /// O(1): checks only the 3 possible slots (primary + 2 retries) instead of scanning all entries.
+    pub fn has_attestation_in_window(&self, light_node_id: &str) -> bool {
+        let current_window = Self::get_current_window_number();
+        let primary_slot = Self::calculate_randomized_slot(light_node_id, current_window);
+        let window_start = current_window * 4 * 60 * 60;
+        let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
+
+        [primary_slot, (primary_slot + 1) % 240, (primary_slot + 2) % 240]
+            .iter()
+            .any(|&slot| {
+                let key = format!("{}:{}", light_node_id, slot);
+                attestations.get(&key)
+                    .map(|a| a.timestamp >= window_start)
+                    .unwrap_or(false)
+            })
+    }
     
     /// Get Light nodes assigned to THIS Full/Super node (DYNAMIC distribution)
     pub fn get_light_nodes_in_shard(&self) -> Vec<LightNodeRegistrationData> {
@@ -15694,8 +15716,10 @@ impl SimplifiedP2P {
                 continue;
             }
             
-            // Check if attestation already exists (prevent duplicate pings)
-            if self.has_attestation(&node.node_id, current_slot) {
+            // Skip if already attested in ANY slot of the current 4h window.
+            // The 3-slot retry window is only for failures — if the node already proved
+            // liveness this window, no further FCM notifications are needed.
+            if self.has_attestation_in_window(&node.node_id) {
                 continue;
             }
             

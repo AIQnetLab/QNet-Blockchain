@@ -14537,12 +14537,13 @@ impl BlockchainNode {
                             // v2.68: Separate system TX from user TX
                             // v2.71: NodeRegistration is also system TX (no state execution needed)
                             // v2.87: HeartbeatCommitment/PingCommitment are validator reward TX
-                            let is_system = tx.from == "system_emission" 
+                            let is_system = tx.from == "system_emission"
                                 || tx.from == "system_ping_commitment"
                                 || tx.from.starts_with("system_")
                                 || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. })
                                 || matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. })
-                                || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. });
+                                || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. })
+                                || matches!(tx.tx_type, qnet_state::TransactionType::LightNodeEligibilityBitmap { .. });
                             
                             if is_system {
                                 system_txs.push(tx);
@@ -23384,7 +23385,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let is_system_transaction = matches!(tx.tx_type, 
             qnet_state::TransactionType::RewardDistribution | 
             qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
-            qnet_state::TransactionType::HeartbeatCommitment { .. }
+            qnet_state::TransactionType::HeartbeatCommitment { .. } |
+            qnet_state::TransactionType::LightNodeEligibilityBitmap { .. }
         );
         
         if is_system_transaction {
@@ -24099,7 +24101,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let is_system_tx = matches!(tx.tx_type, 
             qnet_state::TransactionType::RewardDistribution | 
             qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
-            qnet_state::TransactionType::HeartbeatCommitment { .. }
+            qnet_state::TransactionType::HeartbeatCommitment { .. } |
+            qnet_state::TransactionType::LightNodeEligibilityBitmap { .. }
         );
         
         if is_system_tx {
@@ -24153,7 +24156,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // L1 security requirement: Both Ed25519 AND Dilithium signatures MUST be present and valid
             if matches!(tx.tx_type, 
                 qnet_state::TransactionType::HeartbeatCommitment { .. } | 
-                qnet_state::TransactionType::PingCommitmentWithSampling { .. }
+                qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
+                qnet_state::TransactionType::LightNodeEligibilityBitmap { .. }
             ) {
                 // MANDATORY: Ed25519 signature REQUIRED
                 let (sig, pubkey) = match (&tx.signature, &tx.public_key) {

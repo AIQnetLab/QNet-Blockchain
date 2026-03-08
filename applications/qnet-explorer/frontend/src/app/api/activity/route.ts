@@ -62,7 +62,8 @@ function mapTxType(type: string, fromAddress?: string): string {
     // Heartbeat (ALL node activity attestations)
     'heartbeatcommitment': 'Heartbeat',           // Full/Super nodes
     'pingcommitmentwithsampling': 'Heartbeat',    // Light nodes (legacy)
-    'lightnodeeligibilitybitmap': 'Heartbeat',    // Light nodes (bitmap)
+    'lightnodeeligibilitybitmap': 'Heartbeat',    // Light nodes (bitmap) — Rust Serde name
+    'bitmapcommitment': 'Heartbeat',              // Light nodes (bitmap) — API string name
     'pingattestation': 'Heartbeat',               // Legacy ping
     
     // Smart Contracts
