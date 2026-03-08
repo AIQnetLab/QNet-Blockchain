@@ -10400,12 +10400,15 @@ impl BlockchainNode {
                                 let epoch_start = current_epoch * EMISSION_BLOCK_INTERVAL;
                                 let epoch_end = (current_epoch + 1) * EMISSION_BLOCK_INTERVAL;
                                 let all_attestations = p2p.get_attestations_for_block_range(epoch_start, epoch_end);
-                                
-                                // Filter to only pings from THIS Genesis node
-                                let my_pings: Vec<_> = all_attestations.into_iter()
-                                    .filter(|(_, _, pinger_id, _, _)| pinger_id == &node_id)
-                                    .collect();
-                                
+
+                                // Use ALL attestations for the epoch regardless of which genesis
+                                // node received the FCM response. The light node device sends its
+                                // signed reply to whichever genesis endpoint it reaches first
+                                // (FCM → Google → device → any genesis HTTP). Eligibility is
+                                // determined by shard membership below, not by pinger_id.
+                                // pinger_id filter is kept only in PingCommitmentWithSampling
+                                // (Merkle proof of "I personally pinged these nodes").
+
                                 // Get total assigned Light nodes for this Genesis
                                 // Genesis nodes divide Light nodes: each gets 1/5 of registry
                                 let genesis_idx = std::env::var("QNET_BOOTSTRAP_ID")
@@ -10453,22 +10456,32 @@ impl BlockchainNode {
                                 } else {
 
                                 let total_assigned = my_end - my_start;
-                                
-                                // Convert pings to local indices (0-based within this Genesis shard)
-                                // Light node registry index → local index
-                                // v2.89: Use index_map for O(1) lookup instead of O(n log n)
-                                let eligible_indices: Vec<u32> = my_pings.iter()
-                                    .filter_map(|(light_node_id, _, _, _, _)| {
-                                        // Get global index from index_map (O(1) lookup)
-                                        index_map.get(light_node_id)
-                                            .map(|&global_idx| global_idx.saturating_sub(my_start))
-                                            .filter(|&local_idx| local_idx < total_assigned)
-                                    })
-                                    .collect();
-                                
+
+                                // Convert attested light nodes to shard-local indices.
+                                // global_idx is deduplicated by node_id thanks to filter_map:
+                                // if multiple attestations exist for the same light_node_id we
+                                // still produce exactly one local index for that node, because
+                                // filter_map skips None and we collect into a Vec (duplicates
+                                // at this stage are later deduplicated by the bitmap set-bit logic).
+                                // Only nodes whose global index falls inside [my_start, my_end)
+                                // are counted — this is the shard ownership check.
+                                let eligible_indices: Vec<u32> = {
+                                    let mut seen = std::collections::HashSet::new();
+                                    all_attestations.iter()
+                                        .filter_map(|(light_node_id, _, _, _, _)| {
+                                            if !seen.insert(light_node_id.clone()) {
+                                                return None; // deduplicate same node attested multiple times
+                                            }
+                                            index_map.get(light_node_id)
+                                                .filter(|&&global_idx| global_idx >= my_start && global_idx < my_end)
+                                                .map(|&global_idx| global_idx - my_start)
+                                        })
+                                        .collect()
+                                };
+
                                 if is_info() {
-                                    println!("[INFO][LIGHT-BITMAP] Genesis {} has {} eligible / {} assigned Light nodes",
-                                             genesis_idx + 1, eligible_indices.len(), total_assigned);
+                                    println!("[INFO][LIGHT-BITMAP] Genesis {} shard [{},{}) → {} eligible / {} assigned Light nodes",
+                                             genesis_idx + 1, my_start, my_end, eligible_indices.len(), total_assigned);
                                 }
                                 
                                 // Create bitmap TX

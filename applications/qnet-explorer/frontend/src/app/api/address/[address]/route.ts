@@ -75,9 +75,16 @@ function mapTxType(type: string, fromAddress?: string): string {
     'contractcall': 'Smart Contract',
     'registration': 'Registration',
     'reward': 'Reward',
+    'heartbeatcommitment': 'Heartbeat',
+    'heartbeat': 'Heartbeat',
+    'lightnodeeligibilitybitmap': 'Heartbeat',
+    'bitmapcommitment': 'Heartbeat',
+    'pingcommitmentwithsampling': 'System',
+    'pingattestation': 'System',
   };
   
   if (map[normalized]) return map[normalized];
+  if (normalized.includes('heartbeat') || normalized.includes('bitmap')) return 'Heartbeat';
   if (normalized.includes('reward') || normalized.includes('emission')) return 'Reward';
   return 'Transfer';
 }

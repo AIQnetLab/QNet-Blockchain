@@ -30,6 +30,10 @@ function mapTxType(type: string | object | undefined, fromAddress?: string): str
     'ContractCall': 'Smart Contract',
     'HeartbeatCommitment': 'Heartbeat',
     'Heartbeat': 'Heartbeat',
+    'LightNodeEligibilityBitmap': 'Heartbeat',  // Light node bitmap — Rust enum name
+    'bitmap_commitment': 'Heartbeat',            // Light node bitmap — API string name
+    'bitmapcommitment': 'Heartbeat',             // Light node bitmap — lowercased variant
+    'lightnodeeligibilitybitmap': 'Heartbeat',   // Light node bitmap — fully lowercased
     'CreateAccount': 'System',
     'BatchRewardClaims': 'Reward',
     'BatchNodeActivations': 'Node Activation',
@@ -37,7 +41,7 @@ function mapTxType(type: string | object | undefined, fromAddress?: string): str
     'PingAttestation': 'System',
     'PingCommitmentWithSampling': 'System',
   };
-  return map[typeStr] || 'Transfer';
+  return map[typeStr] || map[typeStr.toLowerCase()] || 'Transfer';
 }
 
 // Format amount from nanoQNC to QNC (ALWAYS divide by 1e9)
