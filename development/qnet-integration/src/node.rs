@@ -1535,51 +1535,20 @@ impl BlockchainNode {
     /// - They get small penalty (-1%) via PENALTY_MISSED_CONSENSUS
     /// - This is sufficient deterrent without cascade jail problems
     /// 
-    /// Jails are ONLY for cryptographically provable severe offenses:
+    /// Automatic jails — ONLY for cryptographically provable severe offenses:
     /// - Double-signing (2 signatures on conflicting blocks at same height)
     /// - Invalid block production (signature/hash verification failure)
+    ///
+    /// commit_no_reveal is NOT jailed: it's a distributed timing issue (race condition
+    /// between INITIATOR's reveal-phase early exit at BFT threshold and PARTICIPANT's
+    /// reveal broadcast timing), not a Byzantine attack. The soft penalty of -1% reputation
+    /// per missed reveal (applied in process_macroblock) is sufficient.
     fn compute_automatic_jails(
-        commit_participants: &std::collections::HashSet<String>,
-        reveal_participants: &std::collections::HashSet<String>,
-        timestamp: u64
+        _commit_participants: &std::collections::HashSet<String>,
+        _reveal_participants: &std::collections::HashSet<String>,
+        _timestamp: u64
     ) -> Vec<qnet_consensus::deterministic_reputation::AutomaticJail> {
-        // v3.33: Re-enabled automatic jails for commit-without-reveal.
-        // Nodes that commit but don't reveal disrupt macroblock consensus.
-        // Progressive jail: 1h → 24h → 7d → 30d → 90d → 1y.
-        // Only jails nodes that DID commit (proving they were online) but
-        // didn't reveal (either malicious or severely misconfigured).
-        use qnet_consensus::deterministic_reputation::AutomaticJail;
-        use sha3::{Sha3_256, Digest};
-
-        let commit_only: Vec<String> = commit_participants
-            .difference(reveal_participants)
-            .cloned()
-            .collect();
-
-        let mut jails = Vec::new();
-        for node_id in commit_only {
-            let mut hasher = Sha3_256::new();
-            hasher.update(b"AUTO_JAIL_COMMIT_NO_REVEAL:");
-            hasher.update(node_id.as_bytes());
-            hasher.update(&timestamp.to_le_bytes());
-            let result = hasher.finalize();
-            let mut evidence_hash = [0u8; 32];
-            evidence_hash.copy_from_slice(&result);
-
-            let jail = AutomaticJail {
-                node_id: node_id.clone(),
-                offense_count: 1, // Will be updated by DeterministicReputationState
-                jail_start_height: 0,
-                jail_duration: AutomaticJail::calculate_duration(1),
-                reason: "commit_without_reveal".to_string(),
-                evidence_hash,
-            };
-            jails.push(jail);
-            if is_info() {
-                println!("[INFO][JAIL] auto_jail node={} reason=commit_no_reveal", node_id);
-            }
-        }
-        jails
+        Vec::new()
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -10011,32 +9980,34 @@ impl BlockchainNode {
         }
     }
     
-    /// PRODUCTION v2.78: Start commitment TX submission loop
-    /// Runs in parallel with block production to submit HeartbeatCommitment and PingCommitment TXs
+    /// PRODUCTION v8.0: Parallel commitment TX pipeline (L1-level architecture)
+    /// Two independent tasks run in parallel:
+    /// - Task 1: HeartbeatCommitment (lightweight, ~100ms per iteration)
+    /// - Task 2: BitmapTX (heavyweight, ~500ms+, independent height read + 3-block Gulf Stream)
     /// Submission window: last 50 blocks before epoch end (e.g., blocks 14350-14399)
-    /// 
-    /// v3.0 FIX: Uses select_microblock_producer to determine CURRENT producer
-    /// This fixes race condition where current_producer_info was stale
     async fn start_commitment_tx_loop(&self) {
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Task 1: HeartbeatCommitment Loop (lightweight, fast ~100ms)
+        // ═══════════════════════════════════════════════════════════════════════════
+        {
         let storage = self.storage.clone();
         let height = self.height.clone();
         let unified_p2p = self.unified_p2p.clone();
         let mempool = self.mempool.clone();
         let node_id = self.node_id.clone();
-        let node_type = self.node_type.clone(); // v3.0: For producer selection
-        let quantum_poh = self.quantum_poh.clone(); // v3.0: For producer selection
+        let node_type = self.node_type.clone();
+        let quantum_poh = self.quantum_poh.clone();
         let heartbeat_tracker = self.heartbeat_commitment_tracker.clone();
-        let bitmap_tracker = self.bitmap_commitment_tracker.clone();
         let is_running = self.is_running.clone();
         
         tokio::spawn(async move {
             const EMISSION_BLOCK_INTERVAL: u64 = 14400;
             const COMMITMENT_WINDOW_START: u64 = 50;
-            const RETRY_AFTER_BLOCKS: u64 = 10; // Retry if not confirmed after 10 blocks
-            const MAX_RETRIES: u8 = 3; // Maximum retry attempts
+            const RETRY_AFTER_BLOCKS: u64 = 10;
+            const MAX_RETRIES: u8 = 3;
             
             if is_info() {
-                println!("[INFO][COMMIT-LOOP] Commitment TX loop started with retry support");
+                println!("[INFO][HEARTBEAT-LOOP] HeartbeatCommitment TX loop started (independent task)");
             }
             
             while *is_running.read().await {
@@ -10052,9 +10023,8 @@ impl BlockchainNode {
                 
                 let current_epoch = current_height / EMISSION_BLOCK_INTERVAL;
                 
-                // DEBUG: Log when entering commitment window
                 if is_info() {
-                    println!("[INFO][COMMIT-LOOP] Entering commitment window height={} epoch={} blocks_until_end={}", 
+                    println!("[INFO][HEARTBEAT-LOOP] Commitment window height={} epoch={} blocks_until_end={}", 
                              current_height, current_epoch, blocks_until_epoch_end);
                 }
                 
@@ -10325,8 +10295,6 @@ impl BlockchainNode {
                     }
                     
                     // v3.1: CRITICAL - Cleanup old epochs to prevent memory leak at scale
-                    // Keep only last 10 epochs (10 * 14400 blocks = ~40 hours of data)
-                    // With millions of nodes, old epochs MUST be cleaned up!
                     if current_epoch > 10 {
                         let min_epoch = current_epoch.saturating_sub(10);
                         let before_len = heartbeat_tracker.len();
@@ -10337,16 +10305,60 @@ impl BlockchainNode {
                         }
                     }
                 }
+            }
+        });
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Task 2: BitmapTX Loop (heavyweight, independent parallel pipeline)
+        // Fresh height re-read + 3-block Gulf Stream forwarding
+        // ═══════════════════════════════════════════════════════════════════════════
+        {
+        let storage = self.storage.clone();
+        let height = self.height.clone();
+        let unified_p2p = self.unified_p2p.clone();
+        let mempool = self.mempool.clone();
+        let node_id = self.node_id.clone();
+        let node_type = self.node_type.clone();
+        let quantum_poh = self.quantum_poh.clone();
+        let bitmap_tracker = self.bitmap_commitment_tracker.clone();
+        let is_running = self.is_running.clone();
+        
+        tokio::spawn(async move {
+            const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+            const COMMITMENT_WINDOW_START: u64 = 50;
+            const RETRY_AFTER_BLOCKS: u64 = 10;
+            const MAX_RETRIES: u8 = 3;
+            
+            if is_info() {
+                println!("[INFO][BITMAP-LOOP] BitmapTX loop started (independent task, parallel pipeline)");
+            }
+            
+            while *is_running.read().await {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 
-                // v2.89: LightNodeEligibilityBitmap TX (replaces PingCommitment)
-                // ONLY Genesis nodes create bitmap TX with eligible Light nodes
+                let current_height = *height.read().await;
+                let blocks_until_epoch_end = EMISSION_BLOCK_INTERVAL - (current_height % EMISSION_BLOCK_INTERVAL);
+                let should_create_commitments = blocks_until_epoch_end <= COMMITMENT_WINDOW_START && blocks_until_epoch_end > 0;
+                
+                if !should_create_commitments {
+                    continue;
+                }
+                
+                let current_epoch = current_height / EMISSION_BLOCK_INTERVAL;
+                
+                if is_info() {
+                    println!("[INFO][BITMAP-LOOP] Commitment window height={} epoch={} blocks_until_end={}", 
+                             current_height, current_epoch, blocks_until_epoch_end);
+                }
+
+                // v8.0: LightNodeEligibilityBitmap TX (parallel pipeline)
                 {
                     let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
                         .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
                         .unwrap_or(false);
                     
                     if !is_genesis_node {
-                        // Non-Genesis nodes don't create Light node TX
                         if is_debug() {
                             println!("[DBG][LIGHT-BITMAP] Skipping - not a Genesis node");
                         }
@@ -10429,6 +10441,17 @@ impl BlockchainNode {
                                 let nodes_per_genesis = (total_light_nodes + 4) / 5; // Ceiling division
                                 let my_start = genesis_idx * nodes_per_genesis;
                                 let my_end = std::cmp::min(my_start + nodes_per_genesis, total_light_nodes);
+
+                                if my_start >= my_end {
+                                    let mut status = HeartbeatCommitmentStatus::new("no_assigned_nodes".to_string(), current_height);
+                                    status.mark_confirmed(current_height);
+                                    bitmap_tracker.insert(current_epoch, status);
+                                    if is_info() {
+                                        println!("[INFO][LIGHT-BITMAP] Genesis {} shard empty (start={} >= end={}, total={}) - skip",
+                                                 genesis_idx + 1, my_start, my_end, total_light_nodes);
+                                    }
+                                } else {
+
                                 let total_assigned = my_end - my_start;
                                 
                                 // Convert pings to local indices (0-based within this Genesis shard)
@@ -10530,83 +10553,62 @@ impl BlockchainNode {
                                                         }
                                                     }
                                                     
-                                                    // v7.0: Deterministic producer forwarding with ACK (identical to HeartbeatCommitment)
-                                                    let next_height = current_height + 1;
-                                                    let producer_next = Self::select_microblock_producer(
-                                                        next_height,
-                                                        &unified_p2p,
-                                                        &node_id,
-                                                        node_type.clone(),
-                                                        Some(&storage),
-                                                        &quantum_poh,
-                                                    ).await;
-                                                    
-                                                    let producer_next_plus_one = Self::select_microblock_producer(
-                                                        next_height + 1,
-                                                        &unified_p2p,
-                                                        &node_id,
-                                                        node_type.clone(),
-                                                        Some(&storage),
-                                                        &quantum_poh,
-                                                    ).await;
-
-                                                    if is_info() {
-                                                        println!("[INFO][GULF-STREAM] BitmapTX selecting producers: next_h={} prod_next={} prod_next+1={}",
-                                                                 next_height, producer_next, producer_next_plus_one);
-                                                    }
-
+                                                    // v8.0: Fresh height re-read + 3-block Gulf Stream forwarding
+                                                    // Re-read height AFTER heavy TX creation to target correct producer
+                                                    let fresh_height = *height.read().await;
                                                     let mut forwarded_to_producer = false;
                                                     let mut sent_to: Vec<String> = Vec::new();
 
-                                                    // Forward to producer of next block (with ACK)
-                                                    if !producer_next.is_empty() && producer_next != node_id {
-                                                        if let Some(producer_addr) = p2p.get_peer_addr_by_id(&producer_next) {
+                                                    // 3-block landing zone: forward to producers of H+1, H+2, H+3
+                                                    let target_heights = [fresh_height + 1, fresh_height + 2, fresh_height + 3];
+                                                    
+                                                    if is_info() {
+                                                        println!("[INFO][GULF-STREAM] BitmapTX 3-block forwarding: fresh_h={} targets={:?}",
+                                                                 fresh_height, target_heights);
+                                                    }
+
+                                                    for &target_h in &target_heights {
+                                                        let producer = Self::select_microblock_producer(
+                                                            target_h,
+                                                            &unified_p2p,
+                                                            &node_id,
+                                                            node_type.clone(),
+                                                            Some(&storage),
+                                                            &quantum_poh,
+                                                        ).await;
+
+                                                        if producer.is_empty() || producer == node_id || sent_to.contains(&producer) {
+                                                            if producer == node_id && !sent_to.contains(&producer) {
+                                                                if is_info() {
+                                                                    println!("[INFO][GULF-STREAM] BitmapTX h={} - WE are the producer", target_h);
+                                                                }
+                                                            }
+                                                            continue;
+                                                        }
+
+                                                        if let Some(producer_addr) = p2p.get_peer_addr_by_id(&producer) {
                                                             let tx_msg = NetworkMessage::Transaction { 
                                                                 data: tx_bytes_for_broadcast.clone() 
                                                             };
                                                             match p2p.send_critical_tx_with_ack(&producer_addr, tx_msg).await {
                                                                 Ok(()) => {
                                                                     forwarded_to_producer = true;
-                                                                    sent_to.push(producer_next.clone());
+                                                                    sent_to.push(producer.clone());
                                                                     if is_info() {
-                                                                        println!("[INFO][GULF-STREAM] BitmapTX ACK_CONFIRMED producer={}", producer_next);
+                                                                        println!("[INFO][GULF-STREAM] BitmapTX ACK_CONFIRMED h={} producer={}", target_h, producer);
                                                                     }
                                                                 }
                                                                 Err(e) => {
-                                                                    println!("[WARN][GULF-STREAM] BitmapTX ACK_FAILED producer={} error={}", producer_next, e);
+                                                                    println!("[WARN][GULF-STREAM] BitmapTX ACK_FAILED h={} producer={} error={}", target_h, producer, e);
                                                                 }
                                                             }
                                                         } else {
-                                                            println!("[WARN][GULF-STREAM] producer_addr_not_found producer={} - relying on gossip only!", producer_next);
-                                                        }
-                                                    } else if producer_next == node_id {
-                                                        if is_info() {
-                                                            println!("[INFO][GULF-STREAM] BitmapTX - WE are the producer, no forwarding needed");
+                                                            println!("[WARN][GULF-STREAM] BitmapTX producer_addr_not_found h={} producer={}", target_h, producer);
                                                         }
                                                     }
-                                                    
-                                                    // Handle rotation boundary (with ACK)
-                                                    if producer_next_plus_one != producer_next && 
-                                                       !producer_next_plus_one.is_empty() && 
-                                                       producer_next_plus_one != node_id {
-                                                        if let Some(producer_addr) = p2p.get_peer_addr_by_id(&producer_next_plus_one) {
-                                                            let tx_msg = NetworkMessage::Transaction { 
-                                                                data: tx_bytes_for_broadcast.clone() 
-                                                            };
-                                                            if let Ok(()) = p2p.send_critical_tx_with_ack(&producer_addr, tx_msg).await {
-                                                                forwarded_to_producer = true;
-                                                                sent_to.push(producer_next_plus_one.clone());
-                                                                if is_info() {
-                                                                    println!("[INFO][GULF-STREAM] BitmapTX ACK_CONFIRMED rotation_producer={}", producer_next_plus_one);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    
-                                                    // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
 
                                                     if is_info() && forwarded_to_producer {
-                                                        println!("[INFO][LIGHT-BITMAP] TX forwarded to producers={:?} next_h={}", sent_to, next_height);
+                                                        println!("[INFO][LIGHT-BITMAP] TX forwarded to producers={:?} fresh_h={}", sent_to, fresh_height);
                                                     }
 
                                                     // Backup gossip (reliability - if producer fails or network issues)
@@ -10639,6 +10641,7 @@ impl BlockchainNode {
                                         }
                                     }
                                 }
+                                } // Close else block for my_start < my_end (shard has nodes)
                                 } // Close else block for total_light_nodes > 0
                             }
                         }
@@ -10688,6 +10691,7 @@ impl BlockchainNode {
                 }
             }
         });
+        }
     }
     
     async fn start_microblock_production(&mut self) {
@@ -20235,40 +20239,48 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("[INFO][CONS] waiting_commits remaining={}", participants.len() - 1);
         
         // PRODUCTION: Active commit processing loop for real inter-node consensus
+        // SCALABILITY: Drains ALL available messages per iteration (batch processing)
+        // instead of 1-per-10ms, critical for 1000-node networks
         let start_time = std::time::Instant::now();
-        let mut processed_messages = 0;
+        let mut processed_messages: u64 = 0;
+        let mut grace_period_active = false;
+        let mut grace_period_start = std::time::Instant::now();
+        const COMMIT_GRACE_PERIOD_SECS: u64 = 3;
+        let mut last_log_time = std::time::Instant::now();
         
         while start_time.elapsed() < commit_timeout {
-            // CRITICAL: Process incoming consensus messages from P2P channel
+            let mut batch_count = 0u32;
+            
             if let Ok(mut consensus_rx_guard) = consensus_rx.try_lock() {
                 if let Some(consensus_rx_ref) = consensus_rx_guard.as_mut() {
-                    // Try to read messages from consensus channel (non-blocking)
-                    match consensus_rx_ref.try_recv() {
-                        Ok(message) => {
-                            let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                            if is_debug() { println!("[DBG][CONS] p2p_msg h={}", current_height); }
-                            
-                            // Brief write lock per message
-                            let (msg_node_id, success, error) = {
-                                let mut engine = consensus.write().await;
-                                Self::process_consensus_message(&mut engine, message, current_height).await
-                            };
-                            
-                            if !success {
-                                if let Some(err) = error {
-                                    if err.contains("InvalidSignature") {
-                                        println!("[SECURITY] invalid_sig node={}", msg_node_id);
-                                        if let Some(ref p2p) = unified_p2p {
-                                            p2p.report_invalid_block(&msg_node_id, current_height, [0u8; 32], "Invalid signature in consensus");
+                    // Drain ALL available messages from channel (batch processing)
+                    const MAX_BATCH: u32 = 200;
+                    while batch_count < MAX_BATCH {
+                        match consensus_rx_ref.try_recv() {
+                            Ok(message) => {
+                                let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                                if is_debug() { println!("[DBG][CONS] p2p_msg h={}", current_height); }
+                                
+                                let (msg_node_id, success, error) = {
+                                    let mut engine = consensus.write().await;
+                                    Self::process_consensus_message(&mut engine, message, current_height).await
+                                };
+                                
+                                if !success {
+                                    if let Some(err) = error {
+                                        if err.contains("InvalidSignature") {
+                                            println!("[SECURITY] invalid_sig node={}", msg_node_id);
+                                            if let Some(ref p2p) = unified_p2p {
+                                                p2p.report_invalid_block(&msg_node_id, current_height, [0u8; 32], "Invalid signature in consensus");
+                                            }
                                         }
                                     }
                                 }
+                                
+                                processed_messages += 1;
+                                batch_count += 1;
                             }
-                            
-                            processed_messages += 1;
-                        }
-                        Err(_) => {
-                            // No message available, continue waiting
+                            Err(_) => break, // Channel empty, exit batch loop
                         }
                     }
                 } else {
@@ -20278,24 +20290,43 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // Only sleep when no messages were available (adaptive polling)
+            if batch_count == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
             
-            // Brief read lock for commit count check
             let current_commits = {
                 let engine = consensus.read().await;
                 engine.get_current_commit_count()
             };
             
-            if processed_messages % 10 == 0 { // Log every 2 seconds
-                println!("[INFO][CONS] commits={} target={}", 
-                         current_commits, (participants.len() * 2 + 2) / 3);
+            if last_log_time.elapsed() >= std::time::Duration::from_secs(2) {
+                println!("[INFO][CONS] commits={}/{} batch={} elapsed={}ms", 
+                         current_commits, (participants.len() * 2 + 2) / 3,
+                         batch_count, start_time.elapsed().as_millis());
+                last_log_time = std::time::Instant::now();
             }
             
-            // Check if we have Byzantine threshold for advancing to reveal phase
+            // All commits collected — exit immediately
+            if current_commits >= participants.len() {
+                println!("[INFO][CONS] all_commits={} -> reveal_phase", current_commits);
+                break;
+            }
+            
             let byzantine_threshold = (participants.len() * 2 + 2) / 3;
             if current_commits >= byzantine_threshold {
-                println!("[INFO][CONS] bft_threshold commits={} -> reveal_phase", current_commits);
-                break;
+                if !grace_period_active {
+                    grace_period_active = true;
+                    grace_period_start = std::time::Instant::now();
+                    println!("[INFO][CONS] bft_threshold commits={} grace_period={}s collecting_remaining", 
+                             current_commits, COMMIT_GRACE_PERIOD_SECS);
+                }
+                if grace_period_start.elapsed() >= std::time::Duration::from_secs(COMMIT_GRACE_PERIOD_SECS) {
+                    println!("[INFO][CONS] grace_period_done commits={} -> reveal_phase", current_commits);
+                    break;
+                }
             }
         }
         
@@ -20497,42 +20528,53 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             };
             std::time::Duration::from_millis(base_timeout * 1000 + additional_time_ms)
         };
-        let mut processed_messages = 0;
+        let mut processed_messages: u64 = 0;
         
         println!("[INFO][CONS] reveal_timeout={}s participants={}", 
                  reveal_timeout.as_secs(), participants.len());
         println!("[INFO][CONS] await_reveals from={}", participants.len() - 1);
         
+        let mut grace_period_active = false;
+        let mut grace_period_start = std::time::Instant::now();
+        const GRACE_PERIOD_SECS: u64 = 3;
+        let mut last_log_time = std::time::Instant::now();
+        
+        // SCALABILITY: Drains ALL available messages per iteration (batch processing)
+        // instead of 1-per-10ms, critical for 1000-node networks
         while start_time.elapsed() < reveal_timeout && received_reveals < (participants.len() - 1) {
-            // CRITICAL: Process incoming reveal messages from P2P channel
+            let mut batch_count = 0u32;
+            
             if let Ok(mut consensus_rx_guard) = consensus_rx.try_lock() {
                 if let Some(consensus_rx_ref) = consensus_rx_guard.as_mut() {
-                    // Try to read messages from consensus channel (non-blocking)
-                    match consensus_rx_ref.try_recv() {
-                        Ok(message) => {
-                            let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                            if is_debug() { println!("[DBG][CONS] p2p_reveal h={}", current_height); }
-                            
-                            // Brief write lock per message
-                            let (msg_node_id, success, error) = {
-                                let mut engine = consensus.write().await;
-                                Self::process_consensus_message(&mut engine, message, current_height).await
-                            };
-                            
-                            if success {
-                                received_reveals += 1;
-                            } else if let Some(err) = error {
-                                if err.contains("InvalidSignature") || err.contains("InvalidReveal") {
-                                    println!("[SECURITY] invalid_reveal node={}", msg_node_id);
-                                    if let Some(ref p2p) = unified_p2p {
-                                        p2p.report_invalid_block(&msg_node_id, current_height, [0u8; 32], "Invalid reveal in consensus");
+                    // Drain ALL available messages from channel (batch processing)
+                    const MAX_BATCH: u32 = 200;
+                    while batch_count < MAX_BATCH {
+                        match consensus_rx_ref.try_recv() {
+                            Ok(message) => {
+                                let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                                if is_debug() { println!("[DBG][CONS] p2p_reveal h={}", current_height); }
+                                
+                                let (msg_node_id, success, error) = {
+                                    let mut engine = consensus.write().await;
+                                    Self::process_consensus_message(&mut engine, message, current_height).await
+                                };
+                                
+                                if success {
+                                    received_reveals += 1;
+                                } else if let Some(err) = error {
+                                    if err.contains("InvalidSignature") || err.contains("InvalidReveal") {
+                                        println!("[SECURITY] invalid_reveal node={}", msg_node_id);
+                                        if let Some(ref p2p) = unified_p2p {
+                                            p2p.report_invalid_block(&msg_node_id, current_height, [0u8; 32], "Invalid reveal in consensus");
+                                        }
                                     }
                                 }
+                                
+                                processed_messages += 1;
+                                batch_count += 1;
                             }
-                            
-                            processed_messages += 1;
+                            Err(_) => break, // Channel empty, exit batch loop
                         }
-                        Err(_) => {}
                     }
                 } else {
                     if processed_messages == 0 {
@@ -20541,24 +20583,43 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // Only sleep when no messages were available (adaptive polling)
+            if batch_count == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
             
-            // Brief read lock for reveal count check
             let current_reveals = {
                 let engine = consensus.read().await;
                 engine.get_current_reveal_count()
             };
             
-            if processed_messages % 6 == 0 { // Log every 3 seconds 
-                println!("[INFO][CONS] reveals={} target={}", 
-                         current_reveals, (participants.len() * 2 + 2) / 3);
+            if last_log_time.elapsed() >= std::time::Duration::from_secs(2) {
+                println!("[INFO][CONS] reveals={}/{} batch={} elapsed={}ms", 
+                         current_reveals, (participants.len() * 2 + 2) / 3,
+                         batch_count, start_time.elapsed().as_millis());
+                last_log_time = std::time::Instant::now();
             }
             
-            // Check if we have enough reveals for Byzantine threshold
+            // All reveals collected — exit immediately, no need to wait
+            if current_reveals >= participants.len() {
+                println!("[INFO][CONS] all_reveals={} -> finalize", current_reveals);
+                break;
+            }
+            
             let byzantine_threshold = (participants.len() * 2 + 2) / 3;
             if current_reveals >= byzantine_threshold {
-                println!("[INFO][CONS] bft_threshold reveals={} -> finalize", current_reveals);
-                break;
+                if !grace_period_active {
+                    grace_period_active = true;
+                    grace_period_start = std::time::Instant::now();
+                    println!("[INFO][CONS] bft_threshold reveals={} grace_period={}s collecting_remaining", 
+                             current_reveals, GRACE_PERIOD_SECS);
+                }
+                if grace_period_start.elapsed() >= std::time::Duration::from_secs(GRACE_PERIOD_SECS) {
+                    println!("[INFO][CONS] grace_period_done reveals={} -> finalize", current_reveals);
+                    break;
+                }
             }
         }
         
