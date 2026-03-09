@@ -11979,65 +11979,44 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::EntropyRequest { block_height, requester_id } => {
-                // PRODUCTION FIX v2.51: Actually respond to entropy requests!
-                // Before: just logged, never responded -> "no_entropy_responses" fallback always
-                // After: calculate entropy hash and send response back
-                
-                // PRODUCTION v2.50: Lock-free storage access
-                let entropy_hash = if let Some(storage) = crate::node::try_get_storage() {
+                // Only respond if we actually have the block — silence is better than a
+                // zero-hash that poisons the requester's cache and blocks consensus.
+                let maybe_hash: Option<[u8; 32]> = if let Some(storage) = crate::node::try_get_storage() {
                     match storage.load_microblock(block_height) {
                         Ok(Some(block_data)) => {
-                            // Calculate entropy hash (same as node.rs get_previous_microblock_hash)
                             use sha3::{Sha3_256, Digest};
                             let mut hasher = Sha3_256::new();
                             hasher.update(&block_data);
                             let result = hasher.finalize();
                             let mut hash = [0u8; 32];
                             hash.copy_from_slice(&result);
-                            hash
+                            Some(hash)
                         },
-                        Ok(None) => {
-                            // Block not found - we don't have it yet (lagging)
-                            [0u8; 32]
-                        },
-                        Err(e) => {
-                            println!("[CONSENSUS] ❌ Error loading block {}: {}", block_height, e);
-                            [0u8; 32]
-                        }
+                        Ok(None) => None,
+                        Err(_) => None,
                     }
                 } else {
-                    // Storage not initialized yet
-                    [0u8; 32]
+                    None
                 };
                 
-                // Send response back to requester
-                let response = NetworkMessage::EntropyResponse {
-                    block_height,
-                    entropy_hash,
-                    responder_id: self.node_id.clone(),
-                };
-                
-                // Find requester address and send response
-                if let Some(requester_addr) = self.get_peer_address(&requester_id) {
-                    self.send_network_message(&requester_addr, response);
+                if let Some(entropy_hash) = maybe_hash {
+                    let response = NetworkMessage::EntropyResponse {
+                        block_height,
+                        entropy_hash,
+                        responder_id: self.node_id.clone(),
+                    };
+                    if let Some(requester_addr) = self.get_peer_address(&requester_id) {
+                        self.send_network_message(&requester_addr, response);
+                    }
                 }
-                // Note: if requester not found, silently skip (peer may have disconnected)
+                // No block → no response; requester will retry on next iteration
             }
             
             NetworkMessage::EntropyResponse { block_height, entropy_hash, responder_id } => {
-                // PRODUCTION FIX v2.51: Actually store entropy responses!
-                // Before: just logged -> never stored -> "no_entropy_responses" fallback
-                // After: store in ENTROPY_RESPONSES for consensus verification
-                
-                // v2.96: Lock-free insert with DashMap - no blocking!
-                crate::node::ENTROPY_RESPONSES.insert((block_height, responder_id.clone()), entropy_hash);
-                
-                // Log only significant responses (not zeros)
+                // Drop zero-hash responses — they mean "I don't have this block yet"
+                // and would poison the requester's cache, blocking consensus forever.
                 if entropy_hash != [0u8; 32] {
-                    println!("[CONSENSUS] 🎯 Entropy response h={} from={}: {:x}", 
-                            block_height, responder_id,
-                            u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
-                                               entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
+                    crate::node::ENTROPY_RESPONSES.insert((block_height, responder_id.clone()), entropy_hash);
                 }
             }
             

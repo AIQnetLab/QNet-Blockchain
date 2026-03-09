@@ -13207,18 +13207,14 @@ impl BlockchainNode {
                                 u64::from_le_bytes([our_entropy[0], our_entropy[1], our_entropy[2], our_entropy[3],
                                                    our_entropy[4], our_entropy[5], our_entropy[6], our_entropy[7]]));
                         
-                        // CRITICAL FIX v2.96: Lock-free entropy response counting with DashMap
+                        // Count only NON-ZERO responses (zero = peer didn't have block yet)
                         let already_have_responses = ENTROPY_RESPONSES.iter()
-                            .filter(|entry| entry.key().0 == entropy_height)
+                            .filter(|entry| entry.key().0 == entropy_height && *entry.value() != [0u8; 32])
                             .count();
                         
-                        // Only send requests if we don't have enough responses
                         if already_have_responses < sample_size {
-                            // Clear old responses for this height only if starting fresh
-                            // v2.96: DashMap.retain is lock-free
-                            if already_have_responses == 0 {
-                                ENTROPY_RESPONSES.retain(|k, _| k.0 != entropy_height);
-                            }
+                            // Evict stale zero-responses so peers that synced up get re-queried
+                            ENTROPY_RESPONSES.retain(|k, v| !(k.0 == entropy_height && *v == [0u8; 32]));
                             
                             // PRODUCTION: Query peers for their entropy via P2P messages (ASYNC, non-blocking)
                             for peer in peers.iter().take(sample_size - already_have_responses) {
@@ -17137,14 +17133,26 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                          current_height, leadership_round, timeout_round, timeout_secondary, fallback_candidates.len());
                             }
                             timeout_secondary.clone()
-                        } else {
-                            // All candidates exhausted (shouldn't happen with N>1) — wrap around
+                        } else if candidates.len() > 1 {
+                            // All excluded — wrap around but skip the original round-0 winner
+                            let original_winner = &excluded[0];
+                            let wrap_pool: Vec<&(String, f64)> = candidates.iter()
+                                .filter(|(id, _)| id != original_winner)
+                                .collect();
                             let fallback_idx = DilithiumVrf::deterministic_fallback(
-                                &slot_input, current_height, leadership_round + timeout_round, candidates.len(),
+                                &slot_input, current_height, leadership_round + timeout_round, wrap_pool.len(),
                             );
-                            let timeout_secondary = &candidates[fallback_idx].0;
+                            let timeout_secondary = &wrap_pool[fallback_idx].0;
                             if is_warn() {
                                 println!("[WARN][VRF] timeout_all_exhausted h={} round={} timeout={} producer={}",
+                                         current_height, leadership_round, timeout_round, timeout_secondary);
+                            }
+                            timeout_secondary.clone()
+                        } else {
+                            // Single candidate — no alternative exists
+                            let timeout_secondary = &candidates[0].0;
+                            if is_warn() {
+                                println!("[WARN][VRF] timeout_all_exhausted h={} round={} timeout={} producer={} single_candidate",
                                          current_height, leadership_round, timeout_round, timeout_secondary);
                             }
                             timeout_secondary.clone()
@@ -23209,7 +23217,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Handle incoming EntropyResponse from peer
     pub fn handle_entropy_response(&self, block_height: u64, entropy_hash: [u8; 32], responder_id: String) {
-        // v2.96: Lock-free insert with DashMap - no blocking, no poison possible
+        if entropy_hash == [0u8; 32] {
+            return;
+        }
         ENTROPY_RESPONSES.insert((block_height, responder_id.clone()), entropy_hash);
         
         if is_debug() {
