@@ -1070,11 +1070,8 @@ const WalletScreen = () => {
         if (activatedNodeType === 'light') {
           loadNodeRewards();
           loadLightNodeStatus();
-        } else {
-          // Only fetch fresh status if we don't have cached data
-          // (cached data was already restored from AsyncStorage on mount)
-          promises.push(loadServerNodeStatus());
         }
+        promises.push(loadServerNodeStatus());
         
         // On-chain verification: only clear if NO burn evidence exists
         // "Has activation code" (from Solana burn) != "Node activated on QNet chain"
@@ -1208,20 +1205,17 @@ const WalletScreen = () => {
   // Load Server node (Super/Genesis) network status
   // This single API call returns ALL info: status, heartbeats, rewards
   const loadServerNodeStatus = async () => {
-    if (activatedNodeType === 'light' || !activationCode) return;
+    if (!activationCode) return;
     
     try {
-      // For Genesis nodes, also pass nodePseudonym as nodeId for better API lookup
-      const nodeId = (activatedNodeType === 'super' && nodePseudonym && nodePseudonym.startsWith('genesis_node_')) 
-        ? nodePseudonym 
-        : null;
+      // For all node types: pass nodePseudonym as nodeId for API lookup
+      // Light nodes use pseudonym (light_mobile_XXX), Genesis use genesis_node_XXX
+      const nodeId = nodePseudonym || null;
       
       const status = await checkServerNodeStatus(activationCode, nodeId);
       
-      // Set status (UI will show appropriate state based on success flag)
       setServerNodeStatus(status);
       
-      // Cache server status for instant restore on next open
       if (status.success) {
         AsyncStorage.setItem('qnet_cached_server_status', JSON.stringify({
           ...status,
@@ -1229,13 +1223,10 @@ const WalletScreen = () => {
         })).catch(() => {});
       }
       
-      // Also load pseudonym for display
-      await loadNodePseudonym(activationCode);
-      
-      // Silent handling - no errors shown to user
-      // If node not found, UI shows "Server nodes require server activation"
+      if (activatedNodeType !== 'light') {
+        await loadNodePseudonym(activationCode);
+      }
     } catch (error) {
-      // Network error - set null status, UI will show activation prompt
       setServerNodeStatus({ success: false, error: 'Network unavailable' });
     }
   };
@@ -2239,13 +2230,14 @@ const WalletScreen = () => {
     try {
       // Get correct wallet address based on activation phase
       const walletAddress = await getWalletAddressForClaim();
-      // Pass serverPendingRewards so claimRewards knows this is a server node claim
+      const actualNodeId = serverNodeStatus?.nodeId || nodePseudonym || null;
       const result = await walletManager.claimRewards(
         activatedNodeType, 
         activationCode, 
         walletAddress, 
         password,
-        pendingRewards  // Server pending rewards
+        pendingRewards,
+        actualNodeId
       );
       
       if (result.success) {
@@ -5795,7 +5787,8 @@ const WalletScreen = () => {
                     if (activatedNodeType === 'light') {
                       await loadNodeRewards();
                       await loadLightNodeStatus();
-                    } else if (activatedNodeType) {
+                    }
+                    if (activatedNodeType) {
                       await loadServerNodeStatus();
                     }
                   } catch (error) {
@@ -6040,15 +6033,15 @@ const WalletScreen = () => {
                     </Text>
                   </View>
                   
-                  {/* LIGHT NODES: Show reward tracking like server nodes */}
-                  {activatedNodeType === 'light' && (
+                  {/* ALL NODES: Unified reward display (light/super/genesis) */}
+                  {serverNodeStatus?.success && (
                     <>
                       <View style={styles.rewardItem}>
                         <Text style={styles.rewardLabel}>Next Rewards:</Text>
                         <Text style={[styles.rewardValue, { color: '#34c759' }]}>
                           {(() => {
                             const EMISSION_INTERVAL = 14400;
-                            const h = currentBlockHeight || lightNodeStatus?.currentBlockHeight || 0;
+                            const h = currentBlockHeight || serverNodeStatus.currentBlockHeight || 0;
                             if (h === 0) return 'Loading...';
                             const blocksUntil = EMISSION_INTERVAL - (h % EMISSION_INTERVAL);
                             const minutes = Math.floor(blocksUntil / 60);
@@ -6062,60 +6055,17 @@ const WalletScreen = () => {
                         </Text>
                       </View>
 
-                      <View style={styles.rewardItem}>
-                        <Text style={styles.rewardLabel}>Pending Rewards:</Text>
-                        <Text style={[styles.rewardValue, {
-                          color: (nodeRewards?.unclaimed || 0) > 0 ? '#34c759' : '#00d4ff'
-                        }]}>
-                          {(() => {
-                            const raw = nodeRewards?.unclaimed || 0;
-                            if (raw === 0) return '0 QNC';
-                            // If value > 1e6 assume nanoQNC, otherwise treat as QNC
-                            const qnc = raw > 1e6 ? raw / 1e9 : raw;
-                            return `${qnc.toFixed(6).replace(/\.?0+$/, '')} QNC`;
-                          })()}
-                        </Text>
-                      </View>
-                    </>
-                  )}
-                  
-                  {/* SERVER NODES (Super/Genesis): Show server-side data */}
-                  {activatedNodeType !== 'light' && serverNodeStatus?.success && (
-                    <>
-                      <View style={styles.rewardItem}>
-                        <Text style={styles.rewardLabel}>Next Rewards:</Text>
-                        <Text style={[styles.rewardValue, { color: '#34c759' }]}>
-                          {(() => {
-                            const EMISSION_INTERVAL = 14400; // 4 hours in blocks
-                            const h = currentBlockHeight || serverNodeStatus.currentBlockHeight || 0;
-                            if (h === 0) return 'Loading...';
-                            const blocksUntil = EMISSION_INTERVAL - (h % EMISSION_INTERVAL);
-                            // Convert to time estimate
-                            const minutes = Math.floor(blocksUntil / 60);
-                            const hours = Math.floor(minutes / 60);
-                            const mins = minutes % 60;
-                            if (hours > 0) {
-                              return `${blocksUntil.toLocaleString()} blocks (~${hours}h ${mins}m)`;
-                            }
-                            return `${blocksUntil.toLocaleString()} blocks (~${mins}m)`;
-                          })()}
-                        </Text>
-                      </View>
-                      
-                      <View style={styles.rewardItem}>
-                        <Text style={styles.rewardLabel}>Reputation:</Text>
-                        <Text style={[styles.rewardValue, {
-                          color: (serverNodeStatus.reputation || 0) >= 70 ? '#34c759' : '#ff9500'
-                        }]}>
-                          {(() => {
-                            const rep = serverNodeStatus.reputation || 0;
-                            // Remove trailing zeros - show as integer if whole number
-                            const formatted = rep.toFixed(1).replace(/\.0+$/, '');
-                            return formatted;
-                          })()}
-                        </Text>
-                      </View>
-                      
+                      {activatedNodeType !== 'light' && serverNodeStatus.reputation != null && (
+                        <View style={styles.rewardItem}>
+                          <Text style={styles.rewardLabel}>Reputation:</Text>
+                          <Text style={[styles.rewardValue, {
+                            color: (serverNodeStatus.reputation || 0) >= 70 ? '#34c759' : '#ff9500'
+                          }]}>
+                            {(serverNodeStatus.reputation || 0).toFixed(1).replace(/\.0+$/, '')}
+                          </Text>
+                        </View>
+                      )}
+
                       <View style={styles.rewardItem}>
                         <Text style={styles.rewardLabel}>Pending Rewards:</Text>
                         <Text style={[styles.rewardValue, {
@@ -6124,37 +6074,15 @@ const WalletScreen = () => {
                           {(() => {
                             const rewards = (serverNodeStatus.pendingRewards || 0) / 1e9;
                             if (rewards === 0) return '0 QNC';
-                            // Round to 5-6 decimal places and remove trailing zeros
-                            const formatted = rewards.toFixed(6).replace(/\.?0+$/, '');
-                            return `${formatted} QNC`;
+                            return `${rewards.toFixed(6).replace(/\.?0+$/, '')} QNC`;
                           })()}
                         </Text>
                       </View>
-                      
                     </>
                   )}
-                  
-                  {/* ALL NODES use Lazy Rewards - owner must claim */}
-                  {/* LIGHT NODES: Use local nodeRewards tracking */}
-                  {activatedNodeType === 'light' && (
-                    <TouchableOpacity 
-                      style={[
-                        styles.button,
-                        (!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || processingValidation) && styles.buttonDisabled
-                      ]}
-                      disabled={Boolean(!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || processingValidation)}
-                      onPress={handleProcessValidation}
-                    >
-                      <Text style={styles.buttonText}>
-                        {processingValidation ? 'Claiming...' : 
-                         !nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 ? 'Claim Rewards' :
-                         `Claim ${nodeRewards.unclaimed} Rewards`}
-                      </Text>
-                    </TouchableOpacity>
-                  )}
-                  
-                  {/* SERVER NODES: Use serverNodeStatus.pendingRewards */}
-                  {activatedNodeType !== 'light' && serverNodeStatus?.success && (
+
+                  {/* ALL NODES: Unified claim button */}
+                  {serverNodeStatus?.success && (
                     <TouchableOpacity 
                       style={[
                         styles.button,
@@ -6168,8 +6096,7 @@ const WalletScreen = () => {
                          (serverNodeStatus.pendingRewards || 0) <= 0 ? 'Claim Rewards' :
                          (() => {
                            const rewards = (serverNodeStatus.pendingRewards || 0) / 1e9;
-                           const formatted = rewards.toFixed(6).replace(/\.?0+$/, '');
-                           return `Claim ${formatted} QNC`;
+                           return `Claim ${rewards.toFixed(6).replace(/\.?0+$/, '')} QNC`;
                          })()}
                       </Text>
                     </TouchableOpacity>

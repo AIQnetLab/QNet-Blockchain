@@ -6014,78 +6014,31 @@ export class WalletManager {
   // Claim accumulated rewards with blockchain integration
   // Works for ALL node types: Light, Full, Super, Genesis
   // Server validates pending rewards - client just sends claim request
-  async claimRewards(nodeType, activationCode, walletAddress, password, serverPendingRewards = null) {
+  async claimRewards(nodeType, activationCode, walletAddress, password, serverPendingRewards = null, actualNodeId = null) {
     try {
-      // For LIGHT nodes: Check local rewards tracking
-      // For SERVER nodes (Super/Genesis): Skip local check, server knows pending rewards
-      if (nodeType === 'light') {
-        const rewards = await this.getNodeRewards(nodeType, activationCode, walletAddress);
-        if (!rewards) {
-          return {
-            success: false,
-            message: 'Unable to fetch rewards data'
-          };
-        }
-        
-        if (!rewards.unclaimed || rewards.unclaimed <= 0) {
-          return {
-            success: false,
-            message: 'No unclaimed rewards'
-          };
-        }
-        
-        // Check if can claim (1h cooldown for lazy rewards)
-        if (rewards.nextClaim && Date.now() < rewards.nextClaim) {
-          const minutesLeft = Math.ceil((rewards.nextClaim - Date.now()) / (60 * 1000));
-          if (minutesLeft > 60) {
-            const hoursLeft = Math.ceil(minutesLeft / 60);
-            return {
-              success: false,
-              message: `Next claim in ${hoursLeft} hours`
-            };
-          } else {
-            return {
-              success: false,
-              message: `Next claim in ${minutesLeft} minutes`
-            };
-          }
-        }
-        
-        // Check minimum claim amount (1 QNC)
-        const MIN_CLAIM_QNC = 1.0;
-        if (rewards.unclaimed < MIN_CLAIM_QNC) {
-          return {
-            success: false,
-            message: `Minimum claim amount is ${MIN_CLAIM_QNC} QNC`
-          };
-        }
-      } else {
-        // SERVER NODES: Just verify there are pending rewards from server status
-        // The actual validation happens on the server
-        if (serverPendingRewards !== null && serverPendingRewards <= 0) {
-          return {
-            success: false,
-            message: 'No pending rewards on server'
-          };
-        }
+      // Unified check for all node types via on-chain pending rewards (nanoQNC)
+      if (serverPendingRewards !== null && serverPendingRewards <= 0) {
+        return { success: false, message: 'No pending rewards' };
+      }
+      if (serverPendingRewards !== null && serverPendingRewards < 1_000_000_000) {
+        return { success: false, message: 'Minimum claim amount is 1 QNC' };
       }
       
       // Get backend URL - use official API endpoints
       // Direct connection to bootstrap node - fully decentralized
       const apiUrl = this.getRandomBootstrapNode();
       
-      // Generate node ID from activation code
-      // GENESIS NODE SUPPORT: Genesis codes map to genesis_node_XXX format
-      // v2.66: Support both 3-digit (001) and 4-digit (0001) formats
       let nodeId;
-      const genesisMatch = activationCode.match(/^QNET-BOOT-0*([1-5])-STRAP$/);
-      if (genesisMatch) {
-        // Genesis node: use predefined node ID format
-        const bootstrapId = genesisMatch[1].padStart(3, '0');
-        nodeId = `genesis_node_${bootstrapId}`;
+      if (actualNodeId) {
+        nodeId = actualNodeId;
       } else {
-        // Regular node: use standard format
-        nodeId = `${nodeType}_${activationCode}`;
+        const genesisMatch = activationCode.match(/^QNET-BOOT-0*([1-5])-STRAP$/);
+        if (genesisMatch) {
+          const bootstrapId = genesisMatch[1].padStart(3, '0');
+          nodeId = `genesis_node_${bootstrapId}`;
+        } else {
+          nodeId = `${nodeType}_${activationCode}`;
+        }
       }
       
       // Load wallet for signing
