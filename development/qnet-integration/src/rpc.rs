@@ -7844,37 +7844,37 @@ async fn handle_server_node_status(
                     "pending_rewards": pending_rewards
                 })));
             }
-        }
-        
-        // Not in active Super/Genesis list — check light_node_registry
-        if target_id.starts_with("light_") {
-            let registry = p2p.get_light_node_registry();
-            if let Some(node) = registry.get(target_id) {
-                let block_height = blockchain.get_height().await;
-                let pending_rewards = {
-                    if let Some(wallet) = blockchain.get_node_wallet(target_id).await {
-                        let state = blockchain.get_state_manager();
-                        let state_guard = state.read().await;
-                        (*state_guard).get_pending_rewards(&wallet)
-                    } else {
-                        0
-                    }
-                };
-                return Ok(warp::reply::json(&json!({
-                    "success": true,
-                    "node_id": target_id,
-                    "node_type": "Light",
-                    "is_online": node.is_active,
-                    "last_seen": node.last_seen,
-                    "last_seen_ago_seconds": now.saturating_sub(node.last_seen),
-                    "heartbeat_count": 0,
-                    "required_heartbeats": 1,
-                    "is_reward_eligible": node.is_active,
-                    "reputation": null,
-                    "current_block_height": block_height,
-                    "needs_attention": !node.is_active,
-                    "pending_rewards": pending_rewards
-                })));
+
+            // Not in active Super/Genesis list — check light_node_registry
+            if target_id.starts_with("light_") {
+                let registry = p2p.get_light_node_registry();
+                if let Some(node) = registry.get(target_id) {
+                    let block_height = blockchain.get_height().await;
+                    let pending_rewards = {
+                        if let Some(wallet) = blockchain.get_node_wallet(target_id).await {
+                            let state = blockchain.get_state_manager();
+                            let state_guard = state.read().await;
+                            (*state_guard).get_pending_rewards(&wallet)
+                        } else {
+                            0
+                        }
+                    };
+                    return Ok(warp::reply::json(&json!({
+                        "success": true,
+                        "node_id": target_id,
+                        "node_type": "Light",
+                        "is_online": node.is_active,
+                        "last_seen": node.last_seen,
+                        "last_seen_ago_seconds": now.saturating_sub(node.last_seen),
+                        "heartbeat_count": 0,
+                        "required_heartbeats": 1,
+                        "is_reward_eligible": node.is_active,
+                        "reputation": null,
+                        "current_block_height": block_height,
+                        "needs_attention": !node.is_active,
+                        "pending_rewards": pending_rewards
+                    })));
+                }
             }
         }
 
