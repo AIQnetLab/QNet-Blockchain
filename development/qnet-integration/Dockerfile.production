@@ -73,14 +73,15 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "⚠️  RUN ON HOST: sudo ufw allow 9876,9877,8001/tcp && sudo ufw allow 10876/udp"\n\
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
 echo ""\n\
+set +e\n\
 echo "🕐 Checking host time synchronization..."\n\
 LOCAL_TIME=$(date +%s)\n\
 NTP_SYNCED=$(timedatectl show 2>/dev/null | grep "NTPSynchronized=yes")\n\
 if [ -n "$NTP_SYNCED" ]; then\n\
   echo "   ✅ Host clock synchronized (systemd-timesyncd active)"\n\
 else\n\
-  REMOTE_TIME=$(curl -s --max-time 5 http://time.google.com/gtimes 2>/dev/null | grep -o "[0-9]\{10\}" | head -1 || echo "0")\n\
-  if [ "$REMOTE_TIME" != "0" ] && [ "$REMOTE_TIME" != "" ]; then\n\
+  REMOTE_TIME=$(curl -s --max-time 5 http://time.google.com/gtimes 2>/dev/null | grep -o "[0-9]\{10\}" | head -1)\n\
+  if [ -n "$REMOTE_TIME" ] && [ "$REMOTE_TIME" != "0" ]; then\n\
     DRIFT=$((LOCAL_TIME > REMOTE_TIME ? LOCAL_TIME - REMOTE_TIME : REMOTE_TIME - LOCAL_TIME))\n\
     if [ "$DRIFT" -gt 30 ]; then\n\
       echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
@@ -96,6 +97,7 @@ else\n\
   fi\n\
 fi\n\
 echo ""\n\
+set -e\n\
 \n\
 if [ "$(id -u)" = "0" ]; then\n\
   echo "Checking data directory: $DATA_DIR"\n\
