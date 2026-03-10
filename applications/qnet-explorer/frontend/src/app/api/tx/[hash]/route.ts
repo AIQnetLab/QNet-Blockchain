@@ -124,9 +124,15 @@ async function fetchTransaction(hash: string): Promise<Record<string, unknown> |
 }
 
 // Fallback: Search in genesis and emission blocks
+// Dynamically builds list up to current network height (every 14400 blocks)
 async function searchInEmissionBlocks(hash: string): Promise<Record<string, unknown> | null> {
-  const emissionBlocks = [0, 14400, 28800, 43200, 57600, 72000];
-  
+  const EPOCH_SIZE = 14400;
+  // Build dynamic list: block 0 + all epoch boundaries up to epoch 20 (covers ~280K blocks)
+  const emissionBlocks: number[] = [0];
+  for (let epoch = 1; epoch <= 20; epoch++) {
+    emissionBlocks.push(epoch * EPOCH_SIZE);
+  }
+
   for (const height of emissionBlocks) {
     try {
       const res = await fetch(`${NODE_RPC_URL}/api/v1/block/${height}`, {
@@ -139,7 +145,6 @@ async function searchInEmissionBlocks(hash: string): Promise<Record<string, unkn
       // Validate response size
       const blockText = await res.text();
       if (blockText.length > 50 * 1024 * 1024) { // 50MB max
-        // console.warn(`[TX] Block ${height} response too large`);
         continue;
       }
       
@@ -155,8 +160,8 @@ async function searchInEmissionBlocks(hash: string): Promise<Record<string, unkn
       for (const tx of transactions) {
         const txObj = tx as Record<string, unknown>;
         if (txObj.hash === hash) {
-          const txTimestamp = height === 0 ? block.timestamp : ((txObj.timestamp as number) || block.timestamp);
-          return { ...txObj, block_height: height, timestamp: txTimestamp };
+          // Always use block.timestamp (authoritative chain time, not tx signing time)
+          return { ...txObj, block_height: height, timestamp: block.timestamp };
         }
       }
     } catch {
@@ -332,35 +337,36 @@ export async function GET(
       }, { status: 404 });
     }
     
-    // Normalize timestamp to ms
-    let rawTs = (tx.timestamp as number) || 0;
+    // Always use block.timestamp (authoritative chain time), not tx.timestamp (signing time)
+    let rawTs = 0;
     const blockHeight = (tx.block_height || tx.block || 0) as number;
-    
-    // Genesis TX: use block timestamp
-    if (rawTs === 0 && blockHeight === 0) {
-      try {
-        const blockRes = await fetch(`${NODE_RPC_URL}/api/v1/block/0`, {
-          cache: 'no-store',
-          signal: AbortSignal.timeout(2000),
-        });
+
+    // Fetch block timestamp from node API
+    try {
+      const blockRes = await fetch(`${NODE_RPC_URL}/api/v1/block/${blockHeight}`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(2000),
+      });
       if (blockRes.ok) {
         const blockText = await blockRes.text();
-        if (blockText.length > 10 * 1024 * 1024) {
-          // console.warn('[TX] Block response too large');
-        } else {
+        if (blockText.length < 10 * 1024 * 1024) {
           try {
             const block = JSON.parse(blockText) as { timestamp?: number };
             rawTs = block.timestamp || 0;
           } catch {
-            // fallback to 0
+            // fallback to tx.timestamp
           }
         }
       }
-      } catch {
-        // fallback to 0
-      }
+    } catch {
+      // fallback to tx.timestamp
     }
-    
+
+    // Fallback to tx.timestamp if block fetch failed
+    if (rawTs === 0) {
+      rawTs = (tx.timestamp as number) || 0;
+    }
+
     const ts = rawTs > 1e12 ? rawTs : rawTs * 1000;
     
     // Determine transaction signature type

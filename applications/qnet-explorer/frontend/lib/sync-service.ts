@@ -1189,10 +1189,25 @@ async function verifyDataIntegrity(): Promise<void> {
           differences: verification.differences
         });
 
+        const blockHeight = ((nodeTx.block_height as number) || (nodeTx.block as number) || (dbTx.block as number) || 0) as number;
+        // Fetch block timestamp from DB (authoritative chain time, not tx signing time)
+        let blockTs = 0;
+        if (blockHeight > 0) {
+          try {
+            const blockRow = await query<{ timestamp: number }>(
+              'SELECT timestamp FROM blocks WHERE height = $1',
+              [blockHeight]
+            );
+            if (blockRow.rows.length > 0) {
+              blockTs = Number(blockRow.rows[0].timestamp) || 0;
+            }
+          } catch { /* fallback to 0 */ }
+        }
+
         const restored = transformTransaction(
           nodeTx as Record<string, unknown>,
-          ((nodeTx.block_height as number) || (nodeTx.block as number) || 0) as number,
-          ((nodeTx.timestamp as number) || 0) as number
+          blockHeight,
+          blockTs
         );
 
         if (restored) {
