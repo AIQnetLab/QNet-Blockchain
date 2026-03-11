@@ -219,6 +219,18 @@ pub struct ConsensusData {
     #[serde(default)]
     pub pool2_total_fees: Option<u64>,
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMMITTEE-BASED BFT (v3.36)
+    // VRF-subsampled committee for scalable MacroBlock consensus (up to 1000+ validators)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Committee members selected for this MacroBlock's BFT consensus
+    /// When total validators > COMMITTEE_THRESHOLD, a VRF-subsampled committee
+    /// of COMMITTEE_SIZE nodes handles commit-reveal. Other nodes accept the result.
+    /// Format: sorted Vec<String> of node_ids
+    #[serde(default)]
+    pub consensus_committee: Option<Vec<String>>,
+
     /// Pool 3: Total activation QNC collected in this emission window (Phase 2 only)
     /// Recorded ONLY in EMISSION MacroBlocks when Phase 2 is active
     /// Distribution: Equal share to ALL eligible nodes (Light + Full + Super)

@@ -489,20 +489,20 @@ static METRIC_LAST_RESET: AtomicU64 = AtomicU64::new(0);          // Timestamp o
 static METRIC_TIMESTAMP_REJECTIONS: AtomicU64 = AtomicU64::new(0); // Blocks rejected due to invalid timestamp
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// v3.12: TIMESTAMP VALIDATION CONSTANTS (Tendermint/Ethereum 2.0 style)
+// v3.12: TIMESTAMP VALIDATION CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 // These constants define acceptable timestamp ranges for incoming blocks.
 // SECURITY: Blocks with timestamps outside these bounds are REJECTED.
 // 
 // WHY THESE VALUES:
-// - FUTURE_TOLERANCE (5s): Allow for network propagation delay + minor clock drift
-//   Ethereum 2.0 uses ~4s, we use 5s for safety margin
-// - PAST_TOLERANCE (30s): Allow for delayed block propagation during network issues
-//   Must be < macroblock interval (90s) to prevent history rewriting
-// - These values are industry-standard for slot-based consensus
+// v3.38: WALL CLOCK TIMESTAMPS (Ethereum-style validation)
+// Only TWO checks — exactly like Ethereum:
+//   1. FUTURE: block.timestamp <= now + 15s
+//   2. MONOTONICITY: block.timestamp > parent.timestamp
+// NO past check — Ethereum doesn't have one either.
+// This ensures ROLLING UPDATE compatibility: new nodes accept old slot-based timestamps.
 // ═══════════════════════════════════════════════════════════════════════════════
-const TIMESTAMP_FUTURE_TOLERANCE: u64 = 5;   // Block can be max 5 seconds in future
-const TIMESTAMP_PAST_TOLERANCE: u64 = 30;    // Block can be max 30 seconds in past
+const TIMESTAMP_FUTURE_TOLERANCE: u64 = 15;  // Block can be max 15 seconds in future (Ethereum standard)
 
 /// Get current failover metrics (for Prometheus/Grafana integration)
 pub fn get_failover_metrics() -> (u64, u64, u64, u64) {
@@ -1795,6 +1795,65 @@ impl BlockchainNode {
         if is_debug() { println!("[DBG][SNAP] consensus_participants={} (NOT heartbeat eligible!)", eligible.len()); }
         eligible
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.36: COMMITTEE-BASED BFT — VRF-subsampled committee for scalable consensus
+    // When validators > COMMITTEE_THRESHOLD, select a random committee of COMMITTEE_SIZE
+    // using deterministic VRF derived from randomness_beacon of MacroBlock N-2.
+    // All nodes compute IDENTICAL committee from same blockchain data.
+    // ═══════════════════════════════════════════════════════════════════════════
+    const CONSENSUS_COMMITTEE_SIZE: usize = 100;
+    const COMMITTEE_THRESHOLD: usize = 120;
+
+    fn select_consensus_committee(
+        all_candidates: &[String],
+        macroblock_index: u64,
+        storage: &Storage,
+    ) -> Vec<String> {
+        if all_candidates.len() <= Self::COMMITTEE_THRESHOLD {
+            return all_candidates.to_vec();
+        }
+
+        let seed: [u8; 32] = if macroblock_index >= 2 {
+            let n_minus_2 = macroblock_index - 2;
+            match storage.get_macroblock_by_height(n_minus_2) {
+                Ok(Some(data)) => {
+                    match bincode::deserialize::<qnet_state::MacroBlock>(&data) {
+                        Ok(mb) => mb.consensus_data.randomness_beacon.unwrap_or([0u8; 32]),
+                        Err(_) => [0u8; 32],
+                    }
+                }
+                _ => [0u8; 32],
+            }
+        } else {
+            [0u8; 32]
+        };
+
+        use sha3::{Sha3_256, Digest};
+
+        let mut scored: Vec<(usize, [u8; 32])> = all_candidates.iter().enumerate().map(|(i, _)| {
+            let mut hasher = Sha3_256::new();
+            hasher.update(b"COMMITTEE_VRF_v3.36");
+            hasher.update(&seed);
+            hasher.update(&macroblock_index.to_le_bytes());
+            hasher.update(&(i as u64).to_le_bytes());
+            let hash: [u8; 32] = hasher.finalize().into();
+            (i, hash)
+        }).collect();
+
+        scored.sort_by(|a, b| a.1.cmp(&b.1));
+        scored.truncate(Self::CONSENSUS_COMMITTEE_SIZE);
+        scored.sort_by_key(|&(idx, _)| idx);
+
+        let committee: Vec<String> = scored.iter().map(|(idx, _)| all_candidates[*idx].clone()).collect();
+
+        println!("[INFO][COMMITTEE] mb={} total={} committee={} seed={}",
+            macroblock_index, all_candidates.len(), committee.len(),
+            hex::encode(&seed[..8]));
+
+        committee
+    }
+
     
     // NOTE: get_eligible_producers_for_height() was REMOVED in v2.46
     // Use calculate_qualified_candidates() instead - it's the SINGLE SOURCE OF TRUTH
@@ -2662,7 +2721,7 @@ impl BlockchainNode {
                         .as_secs();
                     
                     // DECENTRALIZED: No signature needed - all nodes validate emission amount independently
-                    // Bitcoin-style: validation through consensus rules, not cryptographic signature
+                    // validation through consensus rules, not cryptographic signature
                     // v2.65: System TX get MAX priority (u64::MAX) to ensure inclusion in block
                     let mut emission_tx = qnet_state::Transaction {
                         from: "system_emission".to_string(),
@@ -8751,23 +8810,25 @@ impl BlockchainNode {
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // v8.0: TIMESTAMP VALIDATION (Ethereum-style dual-mode)
+        // v8.0: TIMESTAMP VALIDATION
         // ═══════════════════════════════════════════════════════════════════════════
         // TWO MODES:
         //   SYNC MODE (catching up):  Only monotonicity + future check. No past check.
         //     Syncing 100k+ historical blocks means ALL of them are "in the past".
-        //     Rejecting them would deadlock sync (Ethereum, Cosmos skip past-check during sync).
+        //     Rejecting them would deadlock sync.
         //   LIVE MODE (at network edge): Full future + past check for new gossipped blocks.
         //     Active only when local_height >= network_height - SYNC_MODE_THRESHOLD.
         //
-        // SECURITY: Future check always active — prevents clock-ahead attacks regardless of mode.
+        // SECURITY: v3.38 WALL CLOCK VALIDATION
+        // 1. FUTURE CHECK: block.timestamp <= now + 15s (always active)
+        // 2. MONOTONICITY CHECK: block.timestamp > parent.timestamp (live mode only)
+        // During sync, historical blocks are legitimately "old" — skip monotonicity vs now.
+        // Chain signature + hash continuity guarantees integrity of synced blocks.
         // ═══════════════════════════════════════════════════════════════════════════
         {
-            let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
             let local_time = get_timestamp_safe();
             
-            // Skip timestamp validation for genesis block (h=0) or before genesis is set
-            if microblock.height > 0 && genesis_ts > 0 && local_time > 0 {
+            if microblock.height > 0 && local_time > 0 {
                 // FUTURE CHECK: Always active — block cannot be from the future
                 let max_allowed_timestamp = local_time + TIMESTAMP_FUTURE_TOLERANCE;
                 if microblock.timestamp > max_allowed_timestamp {
@@ -8782,38 +8843,49 @@ impl BlockchainNode {
                     ));
                 }
                 
-                // PAST CHECK: Only in LIVE MODE (at network edge).
-                // During sync, all historical blocks are legitimately "old" — rejecting
-                // them would deadlock the node. The chain signature + hash continuity
-                // already guarantees integrity of synced blocks.
+                // MONOTONICITY CHECK: block.timestamp > parent.timestamp
+                // Only in LIVE MODE — during sync, skip (chain hash continuity is sufficient)
                 const SYNC_MODE_THRESHOLD: u64 = 50;
                 let local_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
                 let is_syncing = local_height + SYNC_MODE_THRESHOLD < microblock.height;
                 
                 if !is_syncing {
-                    let expected_time = genesis_ts + microblock.height;
-                    let min_allowed_timestamp = expected_time.saturating_sub(TIMESTAMP_PAST_TOLERANCE);
+                    // MONOTONICITY: block.timestamp > parent.timestamp (Ethereum standard)
+                    let parent_ts = match storage.load_microblock_auto_format(microblock.height - 1) {
+                        Ok(Some(parent)) => parent.timestamp,
+                        _ => 0,
+                    };
                     
-                    if microblock.timestamp < min_allowed_timestamp {
-                        let past_delta = expected_time.saturating_sub(microblock.timestamp);
+                    if parent_ts > 0 && microblock.timestamp <= parent_ts {
                         METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                        if is_warn() {
-                            println!("[WARN][TIMESTAMP] old_block h={} ts={} expected={} delta=-{}s (max={}s)", 
-                                     microblock.height, microblock.timestamp, expected_time, 
-                                     past_delta, TIMESTAMP_PAST_TOLERANCE);
-                        }
+                        eprintln!("[ERR][TIMESTAMP] non_monotonic h={} ts={} parent_ts={}", 
+                                 microblock.height, microblock.timestamp, parent_ts);
                         return Err(format!(
-                            "TIMESTAMP_INVALID:past:h={}:block_ts={}:expected_ts={}:delta=-{}s", 
-                            microblock.height, microblock.timestamp, expected_time, past_delta
+                            "TIMESTAMP_INVALID:non_monotonic:h={}:block_ts={}:parent_ts={}", 
+                            microblock.height, microblock.timestamp, parent_ts
                         ));
+                    }
+                    
+                    // v3.38: NO PAST CHECK — matches Ethereum validation (only future + monotonicity).
+                    // Ethereum rationale: if block is signed by correct producer, has correct prev_hash,
+                    // and satisfies monotonicity — it's valid regardless of how "old" the timestamp is.
+                    // This also ensures ROLLING UPDATE compatibility: new nodes (wall clock) accept
+                    // blocks from old nodes (slot-based timestamps) without rejection.
+                    // Old slot-based timestamps are always <= now, so they pass future check.
+                    // They are strictly monotonic (+1/block), so they pass monotonicity check.
+                    if is_debug() {
+                        let delta = local_time.saturating_sub(microblock.timestamp);
+                        if delta > 60 {
+                            println!("[DBG][TIMESTAMP] old_ts h={} ts={} local={} delta=-{}s (warn_only)", 
+                                     microblock.height, microblock.timestamp, local_time, delta);
+                        }
                     }
                 }
                 
                 if is_debug() && microblock.height % 100 == 0 {
-                    let expected_time = genesis_ts + microblock.height;
-                    let slot_delay = local_time.saturating_sub(expected_time);
-                    println!("[DBG][TIMESTAMP] valid h={} ts={} expected={} delay={}s syncing={}", 
-                             microblock.height, microblock.timestamp, expected_time, slot_delay, is_syncing);
+                    println!("[DBG][TIMESTAMP] valid h={} ts={} local={} delta={}s syncing={}", 
+                             microblock.height, microblock.timestamp, local_time,
+                             local_time.saturating_sub(microblock.timestamp), is_syncing);
                 }
             }
         }
@@ -9329,29 +9401,17 @@ impl BlockchainNode {
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // v3.12: MACROBLOCK TIMESTAMP VALIDATION (same security as microblock)
+        // v3.38: MACROBLOCK WALL CLOCK VALIDATION
         // ═══════════════════════════════════════════════════════════════════════════
-        // Macroblocks aggregate 90 microblocks. Timestamp = last microblock timestamp.
-        // Same three invariants apply:
-        // 1. MONOTONICITY: timestamp > previous macroblock timestamp  
-        // 2. NOT FROM FUTURE: timestamp <= local_time + tolerance
-        // 3. REASONABLE FOR HEIGHT: timestamp ~ genesis_ts + (height * 90)
+        // 1. NOT FROM FUTURE: timestamp <= local_time + tolerance
+        // 2. MONOTONICITY: timestamp > previous macroblock timestamp (live mode)
         // ═══════════════════════════════════════════════════════════════════════════
         {
-            let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
             let local_time = get_timestamp_safe();
             
-            // Skip for first macroblock or before genesis set
-            if macroblock.height > 0 && genesis_ts > 0 && local_time > 0 {
-                // NOTE: MONOTONICITY CHECK REMOVED (v3.12.1)
-                // Macroblock timestamp is derived from last microblock timestamp.
-                // Since microblock timestamps may not be strictly monotonic (due to
-                // producer rotation with different clocks), macroblock timestamps
-                // may also not be strictly monotonic.
-                
-                // 2b. NOT FROM FUTURE: Macroblock cannot be from the future
-                // Use slightly larger tolerance (10s) because macroblock creation involves consensus
-                const MACROBLOCK_FUTURE_TOLERANCE: u64 = 10;
+            if macroblock.height > 0 && local_time > 0 {
+                // FUTURE CHECK: Macroblock cannot be from the future
+                const MACROBLOCK_FUTURE_TOLERANCE: u64 = 15;
                 if macroblock.timestamp > local_time + MACROBLOCK_FUTURE_TOLERANCE {
                     let future_delta = macroblock.timestamp - local_time;
                     METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
@@ -9363,23 +9423,9 @@ impl BlockchainNode {
                     ));
                 }
                 
-                // 2c. REASONABLE FOR HEIGHT: Macroblock height * 90 = expected microblock height
-                // Macroblock timestamp should be close to genesis_ts + (height * 90)
-                let expected_microblock_height = macroblock.height * 90;
-                let expected_time = genesis_ts + expected_microblock_height;
-                const MACROBLOCK_PAST_TOLERANCE: u64 = 120; // 2 minutes for consensus delays
-                
-                if macroblock.timestamp + MACROBLOCK_PAST_TOLERANCE < expected_time {
-                    let past_delta = expected_time.saturating_sub(macroblock.timestamp);
-                    if is_warn() {
-                        println!("[WARN][TIMESTAMP] old_macroblock mb={} ts={} expected={} delta=-{}s", 
-                                 macroblock.height, macroblock.timestamp, expected_time, past_delta);
-                    }
-                    // Warning only - don't reject due to consensus timing variations
-                }
-                
                 if is_debug() && macroblock.height % 10 == 0 {
-                    println!("[DBG][TIMESTAMP] macroblock_valid mb={} ts={}", macroblock.height, macroblock.timestamp);
+                    println!("[DBG][TIMESTAMP] macroblock_valid mb={} ts={} local={}", 
+                             macroblock.height, macroblock.timestamp, local_time);
                 }
             }
         }
@@ -9440,7 +9486,7 @@ impl BlockchainNode {
     pub async fn start(&mut self) -> Result<(), QNetError> {
         println!("[Node] Starting blockchain node...");
         
-        // PRODUCTION v2.57: Log runtime isolation (Solana-style stages)
+        // PRODUCTION v2.57: Log runtime isolation
         let stats = crate::unified_p2p::get_runtime_stats();
         println!("[INFO][RUNTIME] cpus={} stages: BROADCAST({}t) SIGVERIFY({}t) BANKING({}t) REPLAY({}t) total={}t", 
                  stats.cpu_count, stats.broadcast_threads, stats.sigverify_threads,
@@ -10876,6 +10922,8 @@ impl BlockchainNode {
                                     std::sync::atomic::Ordering::Relaxed
                                 );
                                 crate::update_global_pricing_state(0.0, 5, existing_genesis.timestamp);
+                                // v3.36: sync reward_manager genesis_ts from network-synced genesis
+                                reward_manager_for_spawn.write().await.update_genesis_timestamp(existing_genesis.timestamp);
                                 let now = get_timestamp_safe();
                                 LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
                                 LAST_BLOCK_PRODUCED_HEIGHT.store(microblock_height, std::sync::atomic::Ordering::Relaxed);
@@ -11005,6 +11053,8 @@ impl BlockchainNode {
                                                     std::sync::atomic::Ordering::Relaxed
                                                 );
                                                 if is_info() { println!("[INFO][GEN] genesis_ts_set ts={}", genesis_microblock.timestamp); }
+                                                // v3.36: sync reward_manager genesis_ts from freshly created genesis
+                                                reward_manager_for_spawn.write().await.update_genesis_timestamp(genesis_microblock.timestamp);
                                                 
                                                 // CRITICAL FIX v3.15: Initialize LAST_BLOCK_PRODUCED_TIME to NOW
                                                 // This ensures delay calculation starts fresh from Genesis creation
@@ -11299,6 +11349,8 @@ impl BlockchainNode {
                                 
                                 // Also update reward manager with correct genesis timestamp
                                 crate::update_global_pricing_state(0.0, 5, genesis_block.timestamp);
+                                // v3.36: CRITICAL — sync reward_manager genesis_ts from received genesis block
+                                reward_manager_for_spawn.write().await.update_genesis_timestamp(genesis_block.timestamp);
                                 
                                 // CRITICAL FIX: Broadcast certificate AFTER Genesis reception
                                 // This ensures ALL Genesis nodes have certificates for verification
@@ -11420,6 +11472,8 @@ impl BlockchainNode {
                             println!("[INFO][GEN] genesis_ts_synced_from_storage old={} new={}", old_ts, genesis_block.timestamp); 
                         }
                     }
+                    // v3.36: CRITICAL — sync reward_manager genesis_ts so halving calc is correct
+                    reward_manager_for_spawn.write().await.update_genesis_timestamp(genesis_block.timestamp);
                 } else {
                     if is_warn() { println!("[WARN][GEN] failed_to_load_genesis_for_ts_sync"); }
                 }
@@ -12122,7 +12176,7 @@ impl BlockchainNode {
                         //   - NTP drift between nodes caused different timeout_round calculations
                         //   - Different timeout_round → different producer selection → FORK!
                         //
-                        // NEW SOLUTION (like Tendermint/HotStuff/DiemBFT):
+                        // NEW SOLUTION:
                         //   - Each node votes for timeout when it detects stall (local detection)
                         //   - When 2/3+ validators vote → TimeoutCertificate is generated
                         //   - Certificate is deterministic proof that timeout occurred
@@ -12327,7 +12381,7 @@ impl BlockchainNode {
                         // 2. Cached network_height is stale (no new blocks = no updates)
                         // 3. 50-block threshold never triggers because gap appears small
                         // 
-                        // Solution (like Tendermint/Aptos):
+                        // Solution:
                         // - 15s slot delay → aggressive resync (was 120s)
                         // - 5 block gap → trigger sync (was 50)
                         // - Byzantine median height (2f+1 consensus across peers)
@@ -13118,7 +13172,6 @@ impl BlockchainNode {
                 //   4. All nodes compute timeout_round=1 → select NEXT producer DETERMINISTICALLY!
                 //   5. No broadcast needed - pure slot-based failover!
                 //
-                // CRITICAL: This aligns with Ethereum 2.0 / Tendermint approach
                 // ═══════════════════════════════════════════════════════════════════════════
                 if is_my_turn_to_produce && next_block_height > 10 {
                     if let Some(p2p) = &unified_p2p {
@@ -14072,7 +14125,7 @@ impl BlockchainNode {
                     
                     // v2.93: EMISSION TX LOGIC - Industry Standard Architecture
                     // After emission MacroBlock (160, 320, 480...) block producer creates TX
-                    // TX included as FIRST transaction in next microblock (like coinbase)
+                    // TX included as FIRST transaction in next microblock
                     // 
                     // Flow:
                     //   1. MacroBlock 160 finalized → rewards calculated & saved
@@ -14716,55 +14769,29 @@ impl BlockchainNode {
                     // NO SYNC CHECKS, NO NETWORK QUERIES, NO WAITING!
                     
                     // PRODUCTION: Create cryptographically signed microblock
-                    // CRITICAL: Deterministic timestamp calculation for consensus integrity
-                    // Producer sets timestamp based on block height to ensure all nodes agree
+                    // v3.38: WALL CLOCK TIMESTAMP
+                    // Producer sets real wall clock time. Validators verify monotonicity + bounded future.
+                    // Old approach (genesis + height) caused accumulating drift: 20min/8h → days/year.
+                    // Timestamp is part of signed block hash → all nodes see the same value.
                     let deterministic_timestamp = {
-                        // PRODUCTION v2.32: Use GLOBAL_GENESIS_TIMESTAMP (set once at startup)
-                        // This ensures ALL nodes use the SAME genesis timestamp!
-                        let genesis_timestamp = crate::GLOBAL_GENESIS_TIMESTAMP
-                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let now_ts = get_timestamp_safe();
                         
-                        // If not yet set, try to read from storage (one-time init)
-                        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
-                        let genesis_timestamp = if genesis_timestamp == 0 {
-                            match storage.load_microblock_auto_format(0) {
-                                Ok(Some(genesis_block)) => {
-                                    // Update global timestamp
-                                    crate::GLOBAL_GENESIS_TIMESTAMP.store(
-                                        genesis_block.timestamp,
-                                        std::sync::atomic::Ordering::Relaxed
-                                    );
-                                    if is_info() { println!("[INFO][GEN] loaded_ts={}", genesis_block.timestamp); }
-                                    genesis_block.timestamp
-                                }
-                                Ok(None) => {
-                                    eprintln!("[ERR][GEN] no_genesis_block");
-                                    0
-                                }
-                                Err(e) => {
-                                    eprintln!("[ERR][GEN] load_genesis_fail err={}", e);
-                                    0
-                                }
+                        // Monotonicity: timestamp must be > parent block's timestamp
+                        let parent_ts = if next_block_height > 0 {
+                            match storage.load_microblock_auto_format(next_block_height - 1) {
+                                Ok(Some(parent)) => parent.timestamp,
+                                _ => 0,
                             }
                         } else {
-                            genesis_timestamp
+                            0
                         };
                         
-                        // CRITICAL v2.32: Don't produce blocks without valid Genesis timestamp!
-                        if genesis_timestamp == 0 {
-                            println!("[WARN][BLOCK] no_genesis_ts waiting_for_sync");
-                            // v3.4: CRITICAL - Clear broadcast flag before continue
-                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            continue;
+                        // Ensure strict monotonicity
+                        if now_ts > parent_ts {
+                            now_ts
+                        } else {
+                            parent_ts + 1
                         }
-                        
-                        // 1 second per microblock (deterministic interval)
-                        const BLOCK_INTERVAL_SECONDS: u64 = 1;
-                        
-                        // Calculate deterministic timestamp: genesis + (height * interval)
-                        // This ensures ALL nodes calculate the SAME timestamp for the SAME block
-                        genesis_timestamp + (next_block_height * BLOCK_INTERVAL_SECONDS)
                     };
                     
                     // Get previous block hash
@@ -16544,7 +16571,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     ///   - Some nodes had emergency flag, others didn't
     ///   - Different nodes selected different producers → FORK!
     ///
-    /// SOLUTION: VRF election + BFT timeout failover (like Algorand)
+    /// SOLUTION: VRF election + BFT timeout failover
     ///   - Round 0: VRF Secret Leader Election (lowest output wins)
     ///   - Round 1+: Exclude failed producers from previous rounds DETERMINISTICALLY
     ///   - ALL nodes compute SAME excluded list from SAME blockchain data
@@ -18747,7 +18774,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Epoch 3+  (macroblock #3+):    randomness_beacon from MB N-2 (VRF XOR accumulator)
         //
         // WHY randomness_beacon (not block hash):
-        // - Industry standard (Ethereum RANDAO, Solana VRF, Cosmos)
+        // - Industry standard
         // - Unpredictable: each producer contributes VRF output
         // - Manipulation-resistant: cannot predict future beacon values
         // - Format-independent: doesn't depend on block structure changes
@@ -19037,7 +19064,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             
                             let is_validator = qualified.iter().any(|(id, _)| id == &node_id);
                             
-                            if is_validator {
+                            // v3.36: Committee-based BFT — check if this node is in the committee
+                            let all_qualified_ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+                            let committee = Self::select_consensus_committee(&all_qualified_ids, macroblock_index, &storage);
+                            let is_committee_member = committee.iter().any(|id| id == &node_id);
+                            
+                            if is_validator && !is_committee_member {
+                                if is_info() {
+                                    println!("[INFO][COMMITTEE] mb={} node={} NOT_IN_COMMITTEE total={} committee={} → skip_consensus (will receive MB via sync)",
+                                        macroblock_index, &node_id[..node_id.len().min(20)], all_qualified_ids.len(), committee.len());
+                                }
+                            }
+                            
+                            if is_validator && is_committee_member {
                                 // ═══════════════════════════════════════════════════════════════════
                                 // v2.49.1 FIX: PREVENT DUPLICATE CONSENSUS TASKS FOR SAME MB
                                 // Use compare_exchange with CURRENT MB check, not just 0
@@ -20006,6 +20045,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Emergency macroblocks don't include pool data (not emission blocks)
             pool2_total_fees: None,
             pool3_total_activations: None,
+            // v3.36: No committee in emergency mode
+            consensus_committee: None,
             // v3.10: Emergency macroblocks don't modify exclusion list
             excluded_producers_for_next_epoch: None,
         };
@@ -20014,36 +20055,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let microblock_count = microblock_hashes.len();
         
         // Create emergency macroblock
-        // CRITICAL: Deterministic timestamp for macroblock consensus
-        // PRODUCTION v2.32: Use GLOBAL_GENESIS_TIMESTAMP for consistency
-        let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
-        
-        // Get genesis timestamp (from global or storage)
-        let genesis_timestamp = if genesis_ts > 0 {
-            genesis_ts
-        } else {
-            // v3.20: Use load_microblock_auto_format for EfficientMicroBlock support
-            match storage.load_microblock_auto_format(0) {
-                Ok(Some(genesis_block)) => {
-                    crate::GLOBAL_GENESIS_TIMESTAMP.store(genesis_block.timestamp, std::sync::atomic::Ordering::Relaxed);
-                    genesis_block.timestamp
-                }
-                _ => {
+        // Defensive check: genesis must exist for any macroblock creation
+        {
+            let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+            if genesis_ts == 0 {
+                if let Ok(Some(gb)) = storage.load_microblock_auto_format(0) {
+                    crate::GLOBAL_GENESIS_TIMESTAMP.store(gb.timestamp, std::sync::atomic::Ordering::Relaxed);
+                } else {
                     println!("[ERR][MB] No Genesis block - skipping emergency macroblock");
                     return Ok(());
                 }
             }
-        };
-        
-        let deterministic_timestamp = {
-            
-            const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;  // 90 seconds per macroblock (90 microblocks)
-            
-            // Macroblock timestamp = genesis + (macroblock_height * 90 seconds)
-            // CRITICAL FIX: Use same formula as macroblock_index (height / 90)
-            let macroblock_height = height / 90;
-            genesis_timestamp + (macroblock_height * MACROBLOCK_INTERVAL_SECONDS)
-        };
+        }
+        // v3.38: WALL CLOCK TIMESTAMP for emergency macroblock
+        let deterministic_timestamp = get_timestamp_safe();
         
         let macroblock = qnet_state::MacroBlock {
             height: macroblock_index,
@@ -21858,7 +21883,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// PRODUCTION v2.35: Participate in macroblock consensus with ROUND-BASED FAILOVER
     /// 
-    /// ARCHITECTURE (Tendermint-style):
+    /// ARCHITECTURE:
     /// 1. Participate in COMMIT phase (send our commit)
     /// 2. Participate in REVEAL phase (send our reveal)
     /// 3. For each round:
@@ -22098,11 +22123,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let round_id = end_height;
         
         let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type, end_height).await;
-        let mut all_participants: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
-        all_participants.sort();
+        let mut all_qualified: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+        all_qualified.sort();
+
+        // v3.36: Committee-based BFT — subsample committee for scalable consensus
+        let all_participants = Self::select_consensus_committee(&all_qualified, macroblock_index, &storage);
+        let using_committee = all_participants.len() < all_qualified.len();
         
-        if is_info() { println!("[INFO][MB_LEAD] participants={} source=n2_snapshot round={}", 
-                                all_participants.len(), round_id); }
+        if is_info() { 
+            if using_committee {
+                println!("[INFO][MB_LEAD] committee={}/{} source=vrf_subsample round={}", 
+                    all_participants.len(), all_qualified.len(), round_id);
+            } else {
+                println!("[INFO][MB_LEAD] participants={} source=n2_snapshot round={}", 
+                    all_participants.len(), round_id);
+            }
+        }
         
         let network_size = all_participants.len();
         
@@ -22240,7 +22276,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     qnet_consensus::commit_reveal::ConsensusResultData {
                         round_number: end_height / 90,
                         leader_id,
-                        participants: all_participants,
+                        participants: all_participants.clone(),
                     }
                 }
                 Err(e) => {
@@ -22266,7 +22302,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         qnet_consensus::commit_reveal::ConsensusResultData {
                             round_number: end_height / 90,
                             leader_id: fallback_leader,
-                            participants: all_participants,
+                            participants: all_participants.clone(),
                         }
                     } else {
                         return Err(format!("Consensus finalization failed: {}", e));
@@ -22427,24 +22463,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             .unwrap_or([0u8; 32]);
         
         // Create production macroblock with REAL consensus data
-        // CRITICAL: Deterministic timestamp for macroblock consensus
-        // PRODUCTION v2.32: Get genesis timestamp from global or storage
-        let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
-        let genesis_timestamp = if genesis_ts > 0 {
-            genesis_ts
-        } else {
-            // v3.20: Use load_microblock_auto_format for EfficientMicroBlock support
-            match storage.load_microblock_auto_format(0) {
-                Ok(Some(gb)) => {
-                    crate::GLOBAL_GENESIS_TIMESTAMP.store(gb.timestamp, std::sync::atomic::Ordering::Relaxed);
-                    gb.timestamp
-                }
-                _ => 1704067200 // Emergency fallback
-            }
-        };
-        
-        const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;
-        let deterministic_timestamp = genesis_timestamp + (consensus_data.round_number * MACROBLOCK_INTERVAL_SECONDS);
+        // v3.38: WALL CLOCK TIMESTAMP for consensus macroblock (like Ethereum/Solana)
+        let deterministic_timestamp = get_timestamp_safe();
         
         // Capture PoH state from the LAST MICROBLOCK for deterministic consensus
         // CRITICAL: Use blockchain PoH, not local generator (same as microblock producer selection)
@@ -22765,6 +22785,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // Deterministic failover exclusion from blockchain storage
                 // All nodes read SAME list from MacroBlock N-2 → NO FORK!
                 // ═══════════════════════════════════════════════════════════════════
+                // v3.36: Store committee members for verification by non-committee nodes
+                consensus_committee: if using_committee {
+                    Some(all_participants.clone())
+                } else {
+                    None
+                },
                 excluded_producers_for_next_epoch: {
                     // Collect failover events from this epoch (last 90 blocks)
                     let mb_index = consensus_data.round_number;
@@ -23469,7 +23495,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // DECENTRALIZED: System transactions don't need signature
-        // Bitcoin-style: validated through deterministic consensus rules, not crypto signature
+        // validated through deterministic consensus rules, not crypto signature
         // v2.53: Added PingCommitmentWithSampling to system transactions
         // v2.77: Added HeartbeatCommitment to system transactions
         let is_system_transaction = matches!(tx.tx_type, 

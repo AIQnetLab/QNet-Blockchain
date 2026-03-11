@@ -270,14 +270,21 @@ impl PhaseAwareRewardManager {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-            
+
+        // CRITICAL: genesis_timestamp=0 means genesis block not yet received (sentinel).
+        // In that case return 0 (year 0 = no halving = full emission).
+        // Without this guard, unix_epoch(0) as genesis gives ~56 years → 14 halvings → 3 QNC instead of 251k QNC.
+        if self.genesis_timestamp == 0 {
+            return 0;
+        }
+
         if now > self.genesis_timestamp {
             (now - self.genesis_timestamp) / (365 * 24 * 60 * 60)
         } else {
             0
         }
     }
-    
+
     /// Calculate dynamic Pool 1 base emission with sharp drop halving
     fn calculate_pool1_base_emission(&self) -> u64 {
         let years_since_genesis = self.calculate_years_since_genesis();
@@ -575,6 +582,16 @@ impl PhaseAwareRewardManager {
     /// Get genesis timestamp
     pub fn get_genesis_timestamp(&self) -> u64 {
         self.genesis_timestamp
+    }
+
+    /// Update genesis timestamp (called when genesis block is received from network)
+    /// CRITICAL: Must be called whenever GLOBAL_GENESIS_TIMESTAMP is set to non-zero value,
+    /// otherwise calculate_pool1_base_emission() uses unix_epoch as genesis → years=56 → wrong halving
+    pub fn update_genesis_timestamp(&mut self, ts: u64) {
+        if ts > 0 && ts != self.genesis_timestamp {
+            println!("[INFO][REWARDS] genesis_ts_updated old={} new={}", self.genesis_timestamp, ts);
+            self.genesis_timestamp = ts;
+        }
     }
     
     /// Get Pool #2 transaction fees accumulated
