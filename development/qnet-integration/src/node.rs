@@ -4225,18 +4225,37 @@ impl BlockchainNode {
                 }
             }
             _ => {
-                eprintln!("[WARN][REWARDS] no_heartbeats_in_macroblock mb={}", macroblock_index);
                 Vec::new()
             }
         };
         
-        if heartbeat_summaries.is_empty() {
+        // v3.35: Merge Light nodes from reward_light_nodes (unified with receiver/sync path)
+        let mut all_summaries = heartbeat_summaries;
+        if let Some(ref light_data) = macroblock.consensus_data.reward_light_nodes {
+            if let Ok(light_node_rewards) = bincode::deserialize::<std::collections::HashMap<String, u32>>(light_data) {
+                for (light_node_id, _ping_count) in &light_node_rewards {
+                    all_summaries.push(qnet_state::HeartbeatSummary {
+                        node_id: light_node_id.clone(),
+                        node_type: 0,
+                        heartbeat_count: 1,
+                        first_heartbeat: 0,
+                        last_heartbeat: 0,
+                        is_eligible: true,
+                    });
+                }
+                if is_info() {
+                    println!("[INFO][REWARDS] light_nodes_merged mb={} count={}", macroblock_index, light_node_rewards.len());
+                }
+            }
+        }
+        
+        if all_summaries.is_empty() {
             if is_warn() { println!("[WARN][REWARDS] no_eligible_nodes mb={}", macroblock_index); }
             return Ok(0);
         }
         
-        // Convert to HeartbeatSummaryData for reward_manager
-        let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = heartbeat_summaries.iter()
+        // Convert ALL nodes (Light/Super/Genesis) to HeartbeatSummaryData
+        let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = all_summaries.iter()
             .map(|s| qnet_consensus::HeartbeatSummaryData {
                 node_id: s.node_id.clone(),
                 node_type: s.node_type,
@@ -5294,39 +5313,22 @@ impl BlockchainNode {
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
             .unwrap_or(false);
         
-        // CRITICAL v2.32: Genesis timestamp MUST come from Genesis block #0
-        // NO FALLBACK to SystemTime::now() - this caused different nodes to have different timestamps!
-        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
+        // CRITICAL v2.32 / v8.0: Genesis timestamp MUST come from Genesis block #0.
+        // NEVER fallback to SystemTime::now() — that creates a per-node genesis_ts
+        // causing ALL synced blocks to fail TIMESTAMP_INVALID validation.
+        // Sentinel 0 disables timestamp checks until the real genesis block arrives.
         let genesis_timestamp = match storage.load_microblock_auto_format(0) {
             Ok(Some(genesis_block)) => {
                 if is_info() { println!("[INFO][GEN] loaded_ts={}", genesis_block.timestamp); }
                 genesis_block.timestamp
             }
             Ok(None) => {
-                if is_genesis_node {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if is_info() { println!("[INFO][GEN] no_genesis_block fallback_ts={}", now); }
-                    now
-                } else {
-                    if is_info() { println!("[INFO][GEN] waiting_for_sync"); }
-                    0 // Sentinel - will be updated
-                }
+                if is_info() { println!("[INFO][GEN] no_genesis_block sentinel=0 waiting_for_network"); }
+                0 // Sentinel — timestamp validation disabled until genesis synced
             }
             Err(e) => {
-                if is_genesis_node {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    eprintln!("[ERR][GEN] load_fail err={} fallback_ts={}", e, now);
-                    now
-                } else {
-                    if is_info() { println!("[INFO][GEN] waiting_for_sync"); }
-                    0 // Sentinel - will be updated
-                }
+                eprintln!("[ERR][GEN] load_fail err={} sentinel=0 waiting_for_network", e);
+                0 // Sentinel — timestamp validation disabled until genesis synced
             }
         };
         let reward_manager = Arc::new(RwLock::new(
@@ -5386,7 +5388,50 @@ impl BlockchainNode {
                         }
                         if is_info() { println!("[INFO][REWARDS] restored={}", reward_count); }
                     } else {
-                        if is_debug() { println!("[DBG][REWARDS] no_pending_rewards"); }
+                        // v3.35: RECOVERY — RocksDB pending_rewards empty (pre-v3.35 never persisted from creator/receiver paths)
+                        // Recover baseline from state snapshot (which has correct accumulated pending_rewards)
+                        let state_guard = state.read().await;
+                        let mut recovered = 0;
+                        for entry in state_guard.accounts.iter() {
+                            let wallet = entry.key().clone();
+                            let pending = entry.value().pending_rewards;
+                            if pending > 0 {
+                                match storage.get_nodes_by_wallet(&wallet) {
+                                    Ok(nodes) if !nodes.is_empty() => {
+                                        let (node_id, node_type_str, _rep) = &nodes[0];
+                                        let nt = match node_type_str.to_lowercase().as_str() {
+                                            "light" => RewardNodeType::Light,
+                                            "super" | "full" => RewardNodeType::Super,
+                                            _ => RewardNodeType::Light,
+                                        };
+                                        let _ = reward_manager_guard.register_node(node_id.clone(), nt, wallet.clone());
+                                        let reward = qnet_consensus::lazy_rewards::PhaseAwareReward {
+                                            current_phase: qnet_consensus::lazy_rewards::QNetPhase::Phase1,
+                                            pool1_base_emission: pending,
+                                            pool2_transaction_fees: 0,
+                                            pool3_activation_bonus: 0,
+                                            total_reward: pending,
+                                        };
+                                        reward_manager_guard.restore_pending_reward(node_id.clone(), reward);
+                                        if let Some(r) = reward_manager_guard.get_pending_reward(node_id) {
+                                            let _ = storage.save_pending_reward(node_id, r);
+                                        }
+                                        recovered += 1;
+                                        if is_info() {
+                                            println!("[INFO][REWARDS] RECOVERED node={} amt={} QNC from state_snapshot",
+                                                &node_id[..node_id.len().min(20)], pending / 1_000_000_000);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        drop(state_guard);
+                        if recovered > 0 {
+                            println!("[INFO][REWARDS] RECOVERY_COMPLETE restored={} from state_snapshot", recovered);
+                        } else if is_debug() {
+                            println!("[DBG][REWARDS] no_pending_rewards");
+                        }
                     }
                 }
                 Err(e) => {
@@ -8706,20 +8751,16 @@ impl BlockchainNode {
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // v3.12: TIMESTAMP VALIDATION
+        // v8.0: TIMESTAMP VALIDATION (Ethereum-style dual-mode)
         // ═══════════════════════════════════════════════════════════════════════════
-        // SECURITY: This prevents time-based attacks where malicious producers
-        // create blocks with manipulated timestamps.
+        // TWO MODES:
+        //   SYNC MODE (catching up):  Only monotonicity + future check. No past check.
+        //     Syncing 100k+ historical blocks means ALL of them are "in the past".
+        //     Rejecting them would deadlock sync (Ethereum, Cosmos skip past-check during sync).
+        //   LIVE MODE (at network edge): Full future + past check for new gossipped blocks.
+        //     Active only when local_height >= network_height - SYNC_MODE_THRESHOLD.
         //
-        // Three invariants (like Tendermint):
-        // 1. MONOTONICITY: timestamp > previous block timestamp
-        // 2. NOT FROM FUTURE: timestamp <= local_time + FUTURE_TOLERANCE
-        // 3. NOT TOO OLD: timestamp >= expected_time - PAST_TOLERANCE
-        //
-        // WHY THIS MATTERS:
-        // - Prevents "future blocks" attack (producer with clock ahead)
-        // - Prevents "time travel" attack (producer with clock behind)
-        // - Ensures deterministic timeout_round calculation across all nodes
+        // SECURITY: Future check always active — prevents clock-ahead attacks regardless of mode.
         // ═══════════════════════════════════════════════════════════════════════════
         {
             let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
@@ -8727,58 +8768,52 @@ impl BlockchainNode {
             
             // Skip timestamp validation for genesis block (h=0) or before genesis is set
             if microblock.height > 0 && genesis_ts > 0 && local_time > 0 {
-                // NOTE: MONOTONICITY CHECK REMOVED (v3.12.1)
-                // With 30-block producer rotation, different producers may have slightly
-                // different clocks. Strict monotonicity would reject valid blocks when
-                // a new producer's clock is behind the previous producer's clock.
-                // This is expected behavior in distributed systems with multiple producers.
-                
-                // 2b. FUTURE CHECK: Block cannot be from the future (with tolerance)
-                // This prevents producers with fast clocks from creating "future" blocks
-                // that would disrupt timeout_round calculation on other nodes
+                // FUTURE CHECK: Always active — block cannot be from the future
                 let max_allowed_timestamp = local_time + TIMESTAMP_FUTURE_TOLERANCE;
                 if microblock.timestamp > max_allowed_timestamp {
                     let future_delta = microblock.timestamp - local_time;
                     METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                    
-                    // SECURITY: Always log future block attempts (potential attack)
                     eprintln!("[ERR][TIMESTAMP] future_block h={} ts={} local={} delta=+{}s (max={}s)", 
                              microblock.height, microblock.timestamp, local_time, 
                              future_delta, TIMESTAMP_FUTURE_TOLERANCE);
-                    
                     return Err(format!(
                         "TIMESTAMP_INVALID:future:h={}:block_ts={}:local_ts={}:delta=+{}s", 
                         microblock.height, microblock.timestamp, local_time, future_delta
                     ));
                 }
                 
-                // 2c. PAST CHECK: Block cannot be too far in the past
-                // This prevents delayed/replayed blocks from being accepted
-                // Expected time = genesis_ts + height (1 second per block)
-                let expected_time = genesis_ts + microblock.height;
-                let min_allowed_timestamp = expected_time.saturating_sub(TIMESTAMP_PAST_TOLERANCE);
+                // PAST CHECK: Only in LIVE MODE (at network edge).
+                // During sync, all historical blocks are legitimately "old" — rejecting
+                // them would deadlock the node. The chain signature + hash continuity
+                // already guarantees integrity of synced blocks.
+                const SYNC_MODE_THRESHOLD: u64 = 50;
+                let local_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+                let is_syncing = local_height + SYNC_MODE_THRESHOLD < microblock.height;
                 
-                if microblock.timestamp < min_allowed_timestamp {
-                    let past_delta = expected_time.saturating_sub(microblock.timestamp);
-                    METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                if !is_syncing {
+                    let expected_time = genesis_ts + microblock.height;
+                    let min_allowed_timestamp = expected_time.saturating_sub(TIMESTAMP_PAST_TOLERANCE);
                     
-                    if is_warn() {
-                        println!("[WARN][TIMESTAMP] old_block h={} ts={} expected={} delta=-{}s (max={}s)", 
-                                 microblock.height, microblock.timestamp, expected_time, 
-                                 past_delta, TIMESTAMP_PAST_TOLERANCE);
+                    if microblock.timestamp < min_allowed_timestamp {
+                        let past_delta = expected_time.saturating_sub(microblock.timestamp);
+                        METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                        if is_warn() {
+                            println!("[WARN][TIMESTAMP] old_block h={} ts={} expected={} delta=-{}s (max={}s)", 
+                                     microblock.height, microblock.timestamp, expected_time, 
+                                     past_delta, TIMESTAMP_PAST_TOLERANCE);
+                        }
+                        return Err(format!(
+                            "TIMESTAMP_INVALID:past:h={}:block_ts={}:expected_ts={}:delta=-{}s", 
+                            microblock.height, microblock.timestamp, expected_time, past_delta
+                        ));
                     }
-                    
-                    return Err(format!(
-                        "TIMESTAMP_INVALID:past:h={}:block_ts={}:expected_ts={}:delta=-{}s", 
-                        microblock.height, microblock.timestamp, expected_time, past_delta
-                    ));
                 }
                 
-                // DEBUG: Log timestamp validation success at low frequency
                 if is_debug() && microblock.height % 100 == 0 {
+                    let expected_time = genesis_ts + microblock.height;
                     let slot_delay = local_time.saturating_sub(expected_time);
-                    println!("[DBG][TIMESTAMP] valid h={} ts={} expected={} delay={}s", 
-                             microblock.height, microblock.timestamp, expected_time, slot_delay);
+                    println!("[DBG][TIMESTAMP] valid h={} ts={} expected={} delay={}s syncing={}", 
+                             microblock.height, microblock.timestamp, expected_time, slot_delay, is_syncing);
                 }
             }
         }
@@ -22863,7 +22898,27 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
                         if !heartbeats_data.is_empty() {
                             if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
-                                let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = heartbeat_summaries.iter()
+                                // v3.35: Merge Light nodes from reward_light_nodes (unified with receiver/sync path)
+                                let mut all_summaries = heartbeat_summaries.clone();
+                                if let Some(ref light_data) = macroblock.consensus_data.reward_light_nodes {
+                                    if let Ok(light_node_rewards) = bincode::deserialize::<std::collections::HashMap<String, u32>>(light_data) {
+                                        for (light_node_id, _ping_count) in &light_node_rewards {
+                                            all_summaries.push(qnet_state::HeartbeatSummary {
+                                                node_id: light_node_id.clone(),
+                                                node_type: 0,
+                                                heartbeat_count: 1,
+                                                first_heartbeat: 0,
+                                                last_heartbeat: 0,
+                                                is_eligible: true,
+                                            });
+                                        }
+                                        if is_info() {
+                                            println!("[INFO][EMISSION] light_nodes_merged count={}", light_node_rewards.len());
+                                        }
+                                    }
+                                }
+                                
+                                let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = all_summaries.iter()
                                     .map(|s| qnet_consensus::HeartbeatSummaryData {
                                         node_id: s.node_id.clone(),
                                         node_type: s.node_type,
@@ -22928,6 +22983,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 }
                                             }
                                             drop(state);
+                                            
+                                            // v3.35: Persist pending rewards to RocksDB (survive restarts)
+                                            {
+                                                let reward_mgr_rd = reward_manager.read().await;
+                                                for (node_id, _amount) in &pending {
+                                                    if let Some(reward) = reward_mgr_rd.get_pending_reward(node_id) {
+                                                        if let Err(e) = storage.save_pending_reward(node_id, reward) {
+                                                            eprintln!("[WARN][REWARDS] pending_save_fail node={} err={}", node_id, e);
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             
                                             if is_info() && updated_count > 0 {
                                                 println!("[INFO][EMISSION] pending_rewards_updated count={}", updated_count);
@@ -25142,6 +25209,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         }
                                     }
                                     drop(state);
+                                    
+                                    // v3.35: Persist pending rewards to RocksDB (survive restarts)
+                                    {
+                                        let reward_mgr_rd = reward_manager_arc.read().await;
+                                        for (node_id, _amount) in &pending {
+                                            if let Some(reward) = reward_mgr_rd.get_pending_reward(node_id) {
+                                                if let Err(e) = self.storage.save_pending_reward(node_id, reward) {
+                                                    eprintln!("[WARN][REWARDS] pending_save_fail node={} err={}", node_id, e);
+                                                }
+                                            }
+                                        }
+                                    }
                                     
                                     if is_info() && updated_count > 0 {
                                         println!("[INFO][REWARDS] SYNC pending_updated count={}", updated_count);

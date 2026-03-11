@@ -5883,14 +5883,19 @@ export class WalletManager {
         await AsyncStorage.setItem(`node_next_ping_${activationCode}`, registrationResult.next_ping_time.toString());
       }
 
+      const alreadyRegistered = !!(registrationResult && registrationResult.already_registered);
+
       return {
         success: true,
+        alreadyRegistered,
         nodeType,
         pseudonym: (registrationResult && registrationResult.node_id) || systemPseudonym,
         burnTxHash: burnTxHash || null,
-        message: registrationResult
-          ? 'Node successfully activated and registered in blockchain'
-          : 'Node activation saved locally. Network registration will retry automatically.',
+        message: alreadyRegistered
+          ? (registrationResult.message || 'Node already registered. Your existing node has been restored.')
+          : registrationResult
+            ? 'Node successfully activated and registered in blockchain'
+            : 'Node activation saved locally. Network registration will retry automatically.',
         nextPingTime: registrationResult ? registrationResult.next_ping_time : null,
         nextPingWindow: registrationResult ? registrationResult.next_ping_window : null,
         quantumSecured,

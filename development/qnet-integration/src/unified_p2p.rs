@@ -11519,20 +11519,32 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::HealthPing { from, timestamp, height, signature, public_key } => {
-                // v5.0: Verify Dilithium3 signature + timestamp freshness (anti-replay)
+                // v8.0: Separate signature verification from timestamp freshness.
+                // Dilithium signature proves the SENDER actually sent this height.
+                // Timestamp freshness (age_secs) is only anti-replay — it should NOT
+                // block height updates, because clock drift between nodes is common
+                // (especially on fresh/restarted nodes or across cloud regions).
+                //
+                // SECURITY MODEL (Ethereum-style):
+                //   - Signature valid → height is TRUSTED (sender proved it)
+                //   - Age > threshold → stale, but height still valid (clock drift ≠ forgery)
+                //   - No signature → height NOT trusted (legacy/unsigned)
                 let now_ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let age_secs = now_ts.saturating_sub(timestamp);
+                let age_secs = if now_ts >= timestamp { now_ts - timestamp } else { timestamp - now_ts };
 
-                let sig_valid = if !signature.is_empty() && !public_key.is_empty() && age_secs <= 60 {
+                let sig_verified = if !signature.is_empty() && !public_key.is_empty() {
                     Self::verify_health_ping_signature(&from, timestamp, height, &signature, &public_key)
                 } else {
                     false
                 };
 
-                if sig_valid {
+                if sig_verified {
+                    // Signature proves sender identity — ALWAYS update height.
+                    // Clock drift only means the message took a detour, not that
+                    // the height is wrong. This is critical for syncing nodes.
                     self.update_peer_last_seen_with_height(&from, Some(height));
                     if crate::node::is_debug() && height % 100 == 0 {
                         println!("[DBG][P2P] health_ping from={} h={} sig=verified age={}s", from, height, age_secs);
@@ -11546,39 +11558,47 @@ impl SimplifiedP2P {
             }
 
             NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, signature, timestamp } => {
-                // Update last_seen for the peer who sent the commit
                 self.update_peer_last_seen(&node_id);
+
+                // v8.0: Skip consensus processing while syncing.
+                // A node at height 0 receiving consensus for round 104000+ wastes CPU
+                // on signature verification that will always fail (missing certs).
+                // Ethereum: nodes in sync mode don't participate in consensus.
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if round_id > 0 && local_h + 100 < round_id {
+                    // Too far behind — silently drop consensus messages
+                    return;
+                }
+
                 if crate::node::is_debug() { 
                     println!("[DBG][CONS] commit_recv round={} from={}", round_id, node_id); 
                 }
-                
-                // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)
-                // Microblocks use simple producer signatures, NOT Byzantine consensus
                 if self.is_macroblock_consensus_round(round_id) {
                     if crate::node::is_info() { 
                         println!("[INFO][MACRO] commit_process round={}", round_id); 
                     }
                     self.handle_remote_consensus_commit(round_id, node_id, commit_hash, signature, timestamp);
                 }
-                // Silently ignore microblock commits - they don't need consensus
             }
 
             NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp, signature } => {
-                // Update last_seen for the peer who sent the reveal
                 self.update_peer_last_seen(&node_id);
+
+                // v8.0: Skip consensus processing while syncing (see ConsensusCommit above)
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if round_id > 0 && local_h + 100 < round_id {
+                    return;
+                }
+
                 if crate::node::is_debug() { 
                     println!("[DBG][CONS] reveal_recv round={} from={} sig_len={}", round_id, node_id, signature.len()); 
                 }
-                
-                // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)  
-                // Microblocks use simple producer signatures, NOT Byzantine consensus
                 if self.is_macroblock_consensus_round(round_id) {
                     if crate::node::is_info() { 
                         println!("[INFO][MACRO] reveal_process round={}", round_id); 
                     }
                     self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, nonce, timestamp, signature);
                 }
-                // Silently ignore microblock reveals - they don't need consensus
             }
             
             // BFT Timeout Vote - v4.0 deterministic failover
@@ -11587,8 +11607,13 @@ impl SimplifiedP2P {
             // ═══════════════════════════════════════════════════════════════
             NetworkMessage::VrfLeaderClaim { round, node_id, vrf_output, vrf_proof, slot_seed, reputation, timestamp, vrf_public_key, gossip_ttl } => {
                 self.update_peer_last_seen(&node_id);
+
+                // v8.0: Skip VRF claims while syncing (same logic as consensus)
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if round > 0 && local_h + 100 < round {
+                    return;
+                }
                 
-                // Validate sizes
                 if vrf_output.len() != 32 || slot_seed.len() != 32 {
                     if crate::node::is_debug() {
                         println!("[DBG][VRF] claim_invalid node={} out_len={} seed_len={}",
@@ -19607,10 +19632,9 @@ impl SimplifiedP2P {
             
             if !self.verify_consensus_signature(&node_id, &message_hash, &signature) {
                 if crate::node::is_warn() {
-                    println!("[WARN][CONS] reveal_sig_invalid node={} rejecting", node_id);
+                    println!("[WARN][CONS] reveal_sig_invalid node={} round={} rejecting", node_id, round_id);
                 }
-                let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid reveal signature");
+                self.report_invalid_block(&node_id, round_id, [0u8; 32], "Invalid reveal signature");
                 return;
             }
             

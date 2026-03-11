@@ -1768,19 +1768,29 @@ const WalletScreen = () => {
           burnTxHash: result.burnTxHash || 'registered',
           walletAddress: wallet.qnetAddress || wallet.address
         }));
-        
-        // Start automatic ping interval (every 4 hours)
-        // No automatic ping interval
-        
-        showAlert(
-          'Node Activated!',
-          `Your ${result.nodeType || 'light'} node has been successfully activated and registered in the network.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
-          [{ text: 'OK', onPress: () => {
-            setShowActivationInput(false);
-            setActivationInputCode('');
-            loadNodeRewards();
-          }}]
-        );
+
+        if (result.alreadyRegistered) {
+          // Node was already on-chain — just restore it locally, no new TX
+          showAlert(
+            'Node Restored!',
+            `Your existing ${nodeType} node has been successfully restored.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
+            [{ text: 'OK', onPress: () => {
+              setShowActivationInput(false);
+              setActivationInputCode('');
+              loadNodeRewards();
+            }}]
+          );
+        } else {
+          showAlert(
+            'Node Activated!',
+            `Your ${nodeType} node has been successfully activated and registered in the network.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
+            [{ text: 'OK', onPress: () => {
+              setShowActivationInput(false);
+              setActivationInputCode('');
+              loadNodeRewards();
+            }}]
+          );
+        }
       } else {
         throw new Error(result.error || 'Failed to activate node');
       }

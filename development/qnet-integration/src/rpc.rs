@@ -6316,16 +6316,47 @@ async fn handle_light_node_register(
     // Deriving the pseudonym first is O(1) and avoids all heavy Solana/crypto work below.
     {
         let pseudonym = generate_light_node_pseudonym(&register_request.wallet_address);
+
+        // PRIMARY CHECK: blockchain state (accurate on synced nodes)
         let state_mgr = blockchain.get_state_manager();
         let state = state_mgr.read().await;
         if state.is_node_registered(&pseudonym) {
+            let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&pseudonym);
             println!("[INFO][LIGHT] registration_rejected reason=already_registered pseudonym={}", pseudonym);
             return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Node already registered on-chain for this wallet",
+                "success": true,
+                "already_registered": true,
                 "node_id": pseudonym,
-                "hint": "Each wallet can only register one light node"
+                "node_type": "light",
+                "next_ping_time": next_ping_time,
+                "next_ping_window": window_number,
+                "message": "Node already registered. Your existing node has been restored."
             })));
+        }
+        drop(state);
+
+        // SECONDARY CHECK: in-memory gossip-synced registry.
+        // Guards against fresh-restart nodes where blockchain state is empty but the
+        // network has already gossipped the registration. Prevents duplicate registrations
+        // when the requesting node is unsynced (e.g. after a data wipe + restart).
+        {
+            let registry = match LIGHT_NODE_REGISTRY.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if registry.contains_key(&pseudonym) {
+                let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&pseudonym);
+                println!("[INFO][LIGHT] registration_rejected reason=already_in_gossip_registry pseudonym={}", pseudonym);
+                return Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "already_registered": true,
+                    "node_id": pseudonym,
+                    "node_type": "light",
+                    "next_ping_time": next_ping_time,
+                    "next_ping_window": window_number,
+                    "message": "Node already registered. Your existing node has been restored."
+                })));
+            }
         }
     }
 
@@ -10291,7 +10322,45 @@ async fn handle_register_node(
     
     // Generate node ID (deterministic from activation_code — same code = same node_id)
     let node_id = format!("{}_{}", node_type, activation_code);
-    
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // BLOCKCHAIN STATE CHECK — guards against duplicate registration on unsynced nodes.
+    // Storage (RocksDB) may be empty after a data wipe + restart while the blockchain
+    // state (in-memory, populated from synced blocks) already has the registration.
+    //
+    // CHECK 1: Is this exact node_id already on-chain? (same wallet + same code)
+    //   → Return `already_registered: true` so the client can restore without creating a new TX.
+    //
+    // CHECK 2: Does this wallet already own a DIFFERENT node_id in state?
+    //   → Reject: 1 wallet = 1 node rule enforced at the state level as well as storage level.
+    // ═══════════════════════════════════════════════════════════════════════════════
+    {
+        let state_mgr = blockchain.get_state_manager();
+        let state = state_mgr.read().await;
+
+        // CHECK 1 — same code → same node_id → already registered
+        if state.is_node_registered(&node_id) {
+            println!("[INFO][REGISTER] already_registered_in_state type={} node={} wallet={}...",
+                node_type, node_id, &wallet_address[..16.min(wallet_address.len())]);
+            let reg_proof = {
+                let burn_prefix = &activation_code[..16.min(activation_code.len())];
+                let proof_input = format!("activation_{}:{}:{}", burn_prefix, node_id, wallet_address);
+                let h = blake3::hash(proof_input.as_bytes()).to_hex().to_string();
+                h[..32].to_string()
+            };
+            return Ok(warp::reply::json(&json!({
+                "success": true,
+                "already_registered": true,
+                "node_id": node_id,
+                "node_type": node_type,
+                "registration_proof": reg_proof,
+                "tx_required": false,
+                "is_migration": false,
+                "message": format!("{} node already registered. Your existing node has been restored.", node_type)
+            })));
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════════
     // v4.9: MIGRATION / DUPLICATE CHECK — different logic for Light vs Super nodes
     //
