@@ -211,6 +211,12 @@ pub struct PhaseAwareRewardManager {
     /// Reset at each emission, used for blockchain emission TX
     last_epoch_emission: u64,
     
+    /// v7.0: Per-node DELTA accruals for the last emission epoch.
+    /// Keyed by node_id, value is the nanoQNC added in THIS epoch only.
+    /// Used to populate the emission TX data field so all nodes apply
+    /// identical reward accruals through deterministic block execution.
+    last_epoch_accruals: HashMap<String, u64>,
+    
     // ═══════════════════════════════════════════════════════════════════════════
     // v2.90: PREVENT DOUBLE-PROCESSING OF EMISSION MACROBLOCKS
     // CRITICAL BUG FIX: Without this, node restarts cause duplicate rewards!
@@ -248,6 +254,8 @@ impl PhaseAwareRewardManager {
             pool3_remainder: 0,
             // v2.84: Track current epoch emission separately
             last_epoch_emission: 0,
+            // v7.0: Per-node delta accruals for emission TX
+            last_epoch_accruals: HashMap::new(),
             // v2.90: Track processed emission MacroBlocks to prevent duplicates
             processed_emission_macroblocks: HashSet::new(),
         }
@@ -340,9 +348,13 @@ impl PhaseAwareRewardManager {
     pub fn register_node(&mut self, node_id: String, node_type: NodeType, wallet_address: String) -> Result<(), ConsensusError> {
         let window_start = Self::get_current_window_start();
         
-        // Check if we need to start a new reward window
+        // v7.0: BUGFIX — Removed legacy process_reward_window() call.
+        // It called process_macroblock_heartbeats_deterministic(0, ...) which bypassed
+        // dedup (macroblock_index=0 skips the >0 check), causing duplicate reward
+        // accumulation for light nodes only (genesis nodes never re-register here).
+        // Rewards are now processed exclusively through MacroBlock consensus path.
         if window_start > self.current_window_start {
-            self.process_reward_window()?;
+            self.ping_histories.clear();
             self.current_window_start = window_start;
         }
         
@@ -380,41 +392,14 @@ impl PhaseAwareRewardManager {
         Ok(())
     }
     
-    /// Process current reward window and calculate rewards
-    /// v2.51.1: Updated to use unified remainder-aware distribution
+    /// DEPRECATED v7.0: Legacy reward window processing removed.
+    /// Rewards are now processed exclusively via MacroBlock consensus path
+    /// (process_macroblock_heartbeats_deterministic with real macroblock_index > 0).
+    /// This function used macroblock_index=0 which bypassed dedup, causing 13x reward
+    /// inflation for light nodes. Kept as no-op for force_process_window() compat.
     fn process_reward_window(&mut self) -> Result<(), ConsensusError> {
-        // Convert ping histories to HeartbeatSummaryData format
-        let heartbeat_summaries: Vec<HeartbeatSummaryData> = self.ping_histories
-            .iter()
-            .map(|(node_id, history)| {
-                let node_type_u8 = match history.node_type {
-                    NodeType::Light => 0,
-                    NodeType::Super => 1,
-                };
-                
-                HeartbeatSummaryData {
-                    node_id: node_id.clone(),
-                    node_type: node_type_u8,
-                    heartbeat_count: history.attempts.len() as u8,
-                    first_heartbeat: history.attempts.first().map(|a| a.timestamp).unwrap_or(0),
-                    last_heartbeat: history.attempts.last().map(|a| a.timestamp).unwrap_or(0),
-                    is_eligible: history.meets_requirements(),
-                }
-            })
-            .collect();
-        
-        // Clear ping histories before processing (we've converted them)
         self.ping_histories.clear();
-        
-        // Use unified deterministic processing with remainder accumulation
-        // v2.90: macroblock_index=0 means legacy path (not from MacroBlock)
-        // v2.96: Returns bool (was_processed), but legacy path always processes
-        self.process_macroblock_heartbeats_deterministic(
-            0,  // Legacy: not from MacroBlock, use 0 as sentinel
-            &heartbeat_summaries,
-            Some(self.pool2_transaction_fees),
-            Some(self.pool3_activation_pool),
-        ).map(|_| ()) // Convert Result<bool, _> to Result<(), _> for compatibility
+        Ok(())
     }
     
     /// Calculate reward for a single node
@@ -693,6 +678,13 @@ impl PhaseAwareRewardManager {
         self.last_epoch_emission = 0;
     }
     
+    /// v7.0: Get per-node delta accruals for the last processed emission epoch.
+    /// Returns node_id → delta_nanoQNC. Used by block producer to include in
+    /// emission TX data for deterministic block-level application.
+    pub fn get_last_epoch_accruals(&self) -> &HashMap<String, u64> {
+        &self.last_epoch_accruals
+    }
+    
     /// v2.90: Get processed emission MacroBlocks (for persistence to RocksDB)
     pub fn get_processed_emission_macroblocks(&self) -> &HashSet<u64> {
         &self.processed_emission_macroblocks
@@ -894,6 +886,9 @@ impl PhaseAwareRewardManager {
         // v2.84: Track emission for THIS EPOCH ONLY (for RewardDistribution TX)
         let mut epoch_emission: u64 = 0;
         
+        // v7.0: Clear previous epoch accruals — will be populated below
+        self.last_epoch_accruals.clear();
+        
         // Calculate rewards for each eligible node
         for summary in heartbeat_summaries {
             if summary.is_eligible {
@@ -926,17 +921,18 @@ impl PhaseAwareRewardManager {
                 // v2.84: Track emission for THIS EPOCH (before accumulation)
                 epoch_emission += total_reward;
                 
+                // v7.0: Track per-node DELTA for emission TX
+                self.last_epoch_accruals.insert(summary.node_id.clone(), total_reward);
+                
                 // v2.67: CRITICAL FIX - Accumulate rewards instead of overwriting!
                 // This ensures unclaimed rewards from previous epochs are preserved
                 self.pending_rewards
                     .entry(summary.node_id.clone())
                     .and_modify(|existing| {
-                        // Accumulate all pools
                         existing.pool1_base_emission += reward.pool1_base_emission;
                         existing.pool2_transaction_fees += reward.pool2_transaction_fees;
                         existing.pool3_activation_bonus += reward.pool3_activation_bonus;
                         existing.total_reward += reward.total_reward;
-                        // Update phase to current (rewards span multiple phases)
                         existing.current_phase = reward.current_phase.clone();
                         
                         println!("[INFO][REWARDS] accumulated node={} new={} total={}", 

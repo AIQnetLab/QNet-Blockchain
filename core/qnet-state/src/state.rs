@@ -5,12 +5,34 @@
 
 use std::collections::{HashMap, HashSet, BTreeMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use dashmap::DashMap;
 use parking_lot::RwLock as ParkingRwLock;
 use once_cell::sync::Lazy;
 use crate::{Account, Block, Transaction, TransactionType, StateError, StateResult, GAS_METERING_ACTIVATION_HEIGHT};
 use sha3::{Sha3_256, Digest};
 use tracing::{info, debug, warn, error};
+
+/// v7.0: Gate for including pending_rewards in Merkle hash.
+/// Set to true when the first v7.0 emission TX (with `"v":2` accruals) is applied.
+/// Before activation, hash_account() excludes pending_rewards for backward compat
+/// with state_roots computed by pre-v7.0 code.
+static PENDING_REWARDS_IN_MERKLE: AtomicBool = AtomicBool::new(false);
+
+/// v7.0: Activate pending_rewards inclusion in Merkle hash.
+/// Called ONCE when the first v7.0 emission accrual is applied to state.
+/// After this point, all hash_account() calls include pending_rewards.
+pub fn activate_pending_rewards_in_merkle() {
+    if !PENDING_REWARDS_IN_MERKLE.load(Ordering::Relaxed) {
+        PENDING_REWARDS_IN_MERKLE.store(true, Ordering::SeqCst);
+        println!("[INFO][STATE] v7.0 FORK ACTIVATED: pending_rewards now included in Merkle state root");
+    }
+}
+
+/// v7.0: Check if pending_rewards is included in Merkle hash.
+pub fn is_pending_rewards_in_merkle() -> bool {
+    PENDING_REWARDS_IN_MERKLE.load(Ordering::Relaxed)
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.26: ATOMIC FEE CREDITING PROTECTION
@@ -325,9 +347,13 @@ impl StateMerkleTree {
                 hasher.update(account.contract_storage[key].as_bytes());
             }
         }
-        // EXCLUDED from hash (updated out-of-band, not through block TXs):
-        //   - pending_rewards: updated via MacroBlock processing at non-deterministic timing
-        //     reflected in state_root only when claimed via RewardDistribution TX
+        // v7.0: pending_rewards included in hash AFTER fork activation.
+        // Gated by AtomicBool to preserve backward compat with pre-v7.0 state_roots.
+        // Activated when the first v7.0 emission accrual is applied to state.
+        if PENDING_REWARDS_IN_MERKLE.load(Ordering::Relaxed) {
+            hasher.update(&account.pending_rewards.to_le_bytes());
+        }
+        // EXCLUDED from hash (non-deterministic or metadata-only):
         //   - reputation: f64 is non-deterministic across platforms
         //   - is_node, node_type, created_at, updated_at: metadata only
         let result = hasher.finalize();
@@ -1357,6 +1383,32 @@ impl StateManager {
         Ok(())
     }
     
+    /// v7.0: Accrue pending rewards through deterministic block execution.
+    /// Uses ADD semantics (+=) because the delta comes from emission TX data.
+    /// Updates the Merkle tree so pending_rewards is verified by consensus.
+    /// Activates the PENDING_REWARDS_IN_MERKLE fork flag on first call.
+    pub fn accrue_pending_rewards(&self, node_wallet: &str, delta: u64) -> StateResult<()> {
+        // Activate fork: from this point, all hash_account() calls include pending_rewards
+        activate_pending_rewards_in_merkle();
+        
+        let mut account = self.accounts.entry(node_wallet.to_string())
+            .or_insert_with(|| Account::new(node_wallet.to_string()));
+
+        account.pending_rewards = account.pending_rewards.saturating_add(delta);
+
+        {
+            let mut tree = self.merkle_tree.write();
+            tree.insert_lazy(node_wallet, &account);
+        }
+
+        println!("[INFO][STATE] pending_rewards_accrued wallet={}... delta={} total={} QNC",
+                 &node_wallet[..node_wallet.len().min(16)],
+                 delta / 1_000_000_000,
+                 account.pending_rewards / 1_000_000_000);
+
+        Ok(())
+    }
+    
     /// v2.96: Get pending rewards for an account
     pub fn get_pending_rewards(&self, wallet: &str) -> u64 {
         self.accounts.get(wallet)
@@ -1390,11 +1442,19 @@ impl StateManager {
     pub fn restore_accounts(&self, accounts: Vec<(String, Account)>) -> StateResult<()> {
         let count = accounts.len();
         self.accounts.clear();
-        
+
+        // v7.0: Detect if state snapshot was created after fork activation.
+        // If any account has pending_rewards > 0, the fork was already active
+        // when the snapshot was taken, so we must activate it for correct hashing.
+        let has_pending = accounts.iter().any(|(_, acc)| acc.pending_rewards > 0);
+        if has_pending {
+            activate_pending_rewards_in_merkle();
+        }
+
         // v3.22: Rebuild merkle tree with batch inserts
         let mut tree = self.merkle_tree.write();
         *tree = StateMerkleTree::new();
-        
+
         // v3.22: Use insert_lazy for O(1) per account instead of O(n)
         for (address, account) in &accounts {
             tree.insert_lazy(address, account);

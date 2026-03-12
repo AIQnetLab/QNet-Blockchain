@@ -1867,42 +1867,15 @@ const WalletScreen = () => {
   // Get the correct wallet address for claims based on activation phase and node type
   // SECURITY: Different node types use different wallet address formats
   // - Genesis nodes: ALWAYS use QNet address (must match genesis_constants.rs)
-  // - Phase 1 nodes (1DEV burn): Use Solana address
-  // - Phase 2 nodes (QNC transfer): Use QNet address
+  // Server validates EON format ({19}eon{15}{4 checksum}) for ALL reward claims.
+  // Always return wallet.qnetAddress regardless of node type or activation phase.
   const getWalletAddressForClaim = async () => {
-    try {
-      // GENESIS NODES: Always use QNet address (hardcoded in genesis_constants.rs)
-      // Genesis codes format: QNET-BOOT-XXX-STRAP (supports 001-005 or 0001-0005)
-      // v2.66: Support both 3-digit and 4-digit formats
-      if (activationCode && /^QNET-BOOT-0*[1-5]-STRAP$/.test(activationCode)) {
-        const qnetAddr = wallet.qnetAddress;
-        if (!qnetAddr) {
-          throw new Error('QNet address required for Genesis node claims');
-        }
-        console.log('[CLAIM] Genesis node using QNet address:', qnetAddr);
-        return qnetAddr;
-      }
-      
-      // REGULAR NODES: Check activation metadata for phase
-      const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${activatedNodeType}`);
-      if (metaStr) {
-        const meta = JSON.parse(metaStr);
-        if (meta.phase === 2) {
-          // Phase 2: Use QNet address
-          return wallet.qnetAddress || wallet.address;
-        }
-        // If walletAddress was stored during activation, use it
-        if (meta.walletAddress) {
-          return meta.walletAddress;
-        }
-      }
-      // Default: Phase 1 uses Solana address
-      return wallet.solanaAddress || wallet.address;
-    } catch (e) {
-      console.error('[CLAIM] Error getting wallet address:', e);
-      // Fallback to Solana address for non-Genesis nodes
-      return wallet.solanaAddress || wallet.address;
+    const qnetAddr = wallet.qnetAddress;
+    if (!qnetAddr) {
+      throw new Error('QNet EON address required for reward claims');
     }
+    console.log('[CLAIM] Using QNet EON address:', qnetAddr);
+    return qnetAddr;
   };
   
   // Open Send Screen from Assets (click on token) - inline, not modal

@@ -2723,6 +2723,20 @@ impl BlockchainNode {
                     // DECENTRALIZED: No signature needed - all nodes validate emission amount independently
                     // validation through consensus rules, not cryptographic signature
                     // v2.65: System TX get MAX priority (u64::MAX) to ensure inclusion in block
+                    // v7.0: Build wallet→delta accrual map for emission TX
+                    let accrual_wallet_map: std::collections::BTreeMap<String, u64> = {
+                        let accruals = reward_manager.get_last_epoch_accruals();
+                        let mut wmap = std::collections::BTreeMap::new();
+                        for (nid, &amt) in accruals.iter() {
+                            if let Ok(Some((_, wallet, _))) = self.storage.load_node_registration(nid) {
+                                if !wallet.is_empty() {
+                                    *wmap.entry(wallet).or_insert(0) += amt;
+                                }
+                            }
+                        }
+                        wmap
+                    };
+                    
                     let mut emission_tx = qnet_state::Transaction {
                         from: "system_emission".to_string(),
                         to: Some("system_rewards_pool".to_string()),
@@ -2730,20 +2744,20 @@ impl BlockchainNode {
                         tx_type: qnet_state::TransactionType::RewardDistribution,
                         timestamp: current_time,
                         hash: String::new(),
-                        signature: None, // No signature - validated through deterministic rules
-                        public_key: None, // Not needed for system transactions
-                        gas_price: u64::MAX, // MAX priority - system TX MUST be first in block
+                        signature: None,
+                        public_key: None,
+                        gas_price: u64::MAX,
                         gas_limit: 0,
                         nonce: 0,
-                        data: Some(format!("Emission: {} QNC, Window: {}, Total Supply: {} QNC", 
-                                         actual_emission / 1_000_000_000, 
-                                         current_time / (4 * 60 * 60), 
-                                         total_supply / 1_000_000_000)),
-                        dilithium_signature: None,   // System TX - no quantum sig
+                        // v7.0: Per-wallet accruals for deterministic block execution
+                        data: Some(serde_json::json!({
+                            "v": 2,
+                            "accruals": accrual_wallet_map
+                        }).to_string()),
+                        dilithium_signature: None,
                         dilithium_public_key: None,
                     };
                     
-                    // Calculate transaction hash
                     emission_tx.hash = emission_tx.calculate_hash();
                     
                     // Add emission transaction to mempool for blockchain record
@@ -4385,43 +4399,21 @@ impl BlockchainNode {
             }
         };
         
-        // v2.98: CRITICAL - Update pending_rewards in blockchain state (ON-CHAIN)
-        // This ensures API returns correct data and all nodes have same state
-        let state = self.state.read().await;
-        let mut updated_count = 0;
+        // v7.0: update_pending_rewards REMOVED — rewards applied via emission TX in block execution
         
-        for (node_id, amount) in &pending_rewards {
-            // v2.98: CRITICAL SECURITY - Get wallet ONLY from blockchain registration!
-            // NO FALLBACK! If node not registered on-chain, it CANNOT receive rewards!
-            // This prevents reward manipulation and ensures all nodes follow same rules
-            match self.storage.load_node_registration(node_id) {
-                Ok(Some((_, wallet_addr, _))) => {
-                    // Node registered on-chain → update pending_rewards
-                    if let Err(e) = (*state).update_pending_rewards(&wallet_addr, *amount) {
-                        eprintln!("[ERR][REWARDS] blockchain_update_fail node={} err={}", node_id, e);
-                    } else {
-                        updated_count += 1;
+        // v7.0: Build wallet→delta map for emission TX accruals
+        let accrual_wallet_map: std::collections::BTreeMap<String, u64> = {
+            let accruals = reward_manager.get_last_epoch_accruals();
+            let mut wmap = std::collections::BTreeMap::new();
+            for (nid, &amt) in accruals.iter() {
+                if let Ok(Some((_, wallet, _))) = self.storage.load_node_registration(nid) {
+                    if !wallet.is_empty() {
+                        *wmap.entry(wallet).or_insert(0) += amt;
                     }
-                }
-                Ok(None) => {
-                    // Node NOT registered on-chain → NO rewards!
-                    // This is CORRECT behavior - registration TX must be in blockchain first
-                    if is_warn() {
-                        eprintln!("[WARN][REWARDS] node_not_registered node={} skipping_blockchain_update", node_id);
-                        eprintln!("[INFO][REWARDS] hint: NodeRegistration TX must be in block before rewards");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[ERR][REWARDS] registration_load_fail node={} err={}", node_id, e);
                 }
             }
-        }
-        
-        drop(state);
-        
-        if updated_count > 0 {
-            if is_info() { println!("[INFO][REWARDS] blockchain_pending_updated count={}", updated_count); }
-        }
+            wmap
+        };
         
         // Save pending rewards to RocksDB (for persistence)
         for (node_id, _amount) in &pending_rewards {
@@ -4454,13 +4446,14 @@ impl BlockchainNode {
                 hash: String::new(),
                 signature: None,
                 public_key: None,
-                gas_price: u64::MAX, // MAX priority for OLD behavior
+                gas_price: u64::MAX,
                 gas_limit: 0,
                 nonce: 0,
-                data: Some(format!("Emission: {} QNC, Window: {}, Total Supply: {} QNC", 
-                                 actual_emission / 1_000_000_000, 
-                                 current_time / (4 * 60 * 60), 
-                                 total_supply / 1_000_000_000)),
+                // v7.0: Include per-wallet accruals for deterministic block-level application
+                data: Some(serde_json::json!({
+                    "v": 2,
+                    "accruals": accrual_wallet_map
+                }).to_string()),
                 dilithium_signature: None,
                 dilithium_public_key: None,
             };
@@ -7538,6 +7531,8 @@ impl BlockchainNode {
                             let mut deferred_registrations: Vec<(String, String, String)> = Vec::new();
                             let mut deferred_emission_mbs: Vec<u64> = Vec::new();
                             let mut deferred_reward_clears: Vec<(String, u64)> = Vec::new();
+                            // v7.0: Deferred reward accruals from emission TX — applied to state via block execution
+                            let mut deferred_reward_accruals: Vec<(String, u64)> = Vec::new();
 
                             // Apply ALL transactions from block to state
                             for tx in &microblock.transactions {
@@ -7613,6 +7608,26 @@ impl BlockchainNode {
                                             
                                             if emission_mb_index > 0 {
                                                 deferred_emission_mbs.push(emission_mb_index);
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // v7.0: Parse per-wallet accruals from emission TX for deterministic application
+                                if tx.tx_type == qnet_state::TransactionType::RewardDistribution
+                                   && tx.from == "system_emission" {
+                                    if let Some(ref data) = tx.data {
+                                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                                            if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
+                                                if let Some(accruals) = parsed.get("accruals").and_then(|v| v.as_object()) {
+                                                    for (wallet, amount_val) in accruals {
+                                                        if let Some(amount) = amount_val.as_u64() {
+                                                            if amount > 0 {
+                                                                deferred_reward_accruals.push((wallet.clone(), amount));
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -7757,6 +7772,23 @@ impl BlockchainNode {
                                 }
                             }
                             
+                            // v7.0: Apply reward accruals BEFORE finalize_merkle (deterministic, in-block)
+                            if !deferred_reward_accruals.is_empty() {
+                                for (wallet, delta) in &deferred_reward_accruals {
+                                    if let Some(ref mut snap) = block_snapshot {
+                                        snap.record_pre_images(&[wallet.clone()], &state_guard.accounts);
+                                    }
+                                    if let Err(e) = state_guard.accrue_pending_rewards(wallet, *delta) {
+                                        eprintln!("[WARN][REWARDS] sync_accrue_fail wallet={}... err={}", 
+                                                 &wallet[..wallet.len().min(16)], e);
+                                    }
+                                }
+                                if is_info() {
+                                    println!("[INFO][REWARDS] sync_accruals_applied count={} h={}", 
+                                             deferred_reward_accruals.len(), microblock.height);
+                                }
+                            }
+                            
                             // ═══════════════════════════════════════════════════════════════════
                             // v3.27: STATE ROOT VERIFICATION - TOP L1 PATTERN
                             // Finalize Merkle and VERIFY against block's state_root
@@ -7842,6 +7874,7 @@ impl BlockchainNode {
                                                          node_id, amount / 1_000_000_000);
                                             }
                                         }
+                                        // v7.0: Note — reward accruals already applied BEFORE finalize_merkle above
                                         
                                         // v3.33: Broadcast block attestation with real Dilithium signature
                                         if let Some(ref p2p) = unified_p2p {
@@ -14289,8 +14322,6 @@ impl BlockchainNode {
                                                     dilithium_public_key: None,
                                                 };
                                                 
-                                                emission_tx.hash = emission_tx.calculate_hash();
-                                                
                                                 // PRODUCTION v2.78: Process Full/Super + Light node rewards via unified deterministic path
                                                 // Convert Light nodes to HeartbeatSummaryData format to process with Full/Super nodes
                                                 // This ensures ALL nodes (Light/Full/Super) are processed IDENTICALLY on all blockchain nodes
@@ -14336,6 +14367,22 @@ impl BlockchainNode {
                                                     ) {
                                                         eprintln!("[ERR][EMISSION] rewards_process_fail mb={} err={}", prev_macroblock_index, e);
                                                     }
+                                                    
+                                                    let accruals = reward_mgr.get_last_epoch_accruals();
+                                                    let mut wallet_map = std::collections::BTreeMap::<String, u64>::new();
+                                                    for (nid, &amt) in accruals.iter() {
+                                                        if let Ok(Some((_nt, wallet, _rep))) = storage.load_node_registration(nid) {
+                                                            if !wallet.is_empty() {
+                                                                *wallet_map.entry(wallet).or_insert(0) += amt;
+                                                            }
+                                                        }
+                                                    }
+                                                    emission_tx.data = Some(serde_json::json!({
+                                                        "v": 2,
+                                                        "accruals": wallet_map
+                                                    }).to_string());
+                                                    // Recalculate hash — data field changed after initial hash
+                                                    emission_tx.hash = emission_tx.calculate_hash();
                                                 }
                                                 
                                                 // Serialize TX
@@ -15090,12 +15137,10 @@ impl BlockchainNode {
                         let mut state_guard = state.write().await;
                         
                         // 1. Apply all transactions
-                        // v3.33: CRITICAL - Producer must also sync claim state!
-                        // Without this, producer's reward_manager diverges from other nodes
-                        // because synced_claim only runs in the block SYNC path, not PRODUCTION path.
+                        // v7.0: Also collect reward accruals from emission TXs for state application
+                        let mut producer_reward_accruals: Vec<(String, u64)> = Vec::new();
                         for tx in &txs {
                             // v3.33: Handle CLAIM transactions on producer side
-                            // Same logic as sync path (line ~6935) to ensure reward_manager consistency
                             if tx.tx_type == qnet_state::TransactionType::RewardDistribution 
                                && tx.from == "system_rewards_pool" {
                                 if let Some(ref data) = tx.data {
@@ -15103,13 +15148,11 @@ impl BlockchainNode {
                                     if parts.len() >= 2 && parts[0] == "reward_claim" {
                                         let claimed_node_id = parts[1];
                                         
-                                        // Remove from reward_manager (RAM)
                                         {
                                             let mut reward_mgr = reward_manager_for_spawn.write().await;
                                             let _ = reward_mgr.clear_pending_reward(claimed_node_id);
                                         }
                                         
-                                        // Remove from storage (RocksDB)
                                         if let Err(e) = storage.delete_pending_reward(claimed_node_id) {
                                             if is_debug() { println!("[DBG][CLAIM] producer_delete_fail node={} err={}", claimed_node_id, e); }
                                         } else {
@@ -15120,13 +15163,40 @@ impl BlockchainNode {
                                 }
                             }
                             
+                            // v7.0: Parse emission TX accruals for block-level application
+                            if tx.tx_type == qnet_state::TransactionType::RewardDistribution
+                               && tx.from == "system_emission" {
+                                if let Some(ref data) = tx.data {
+                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                                        if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
+                                            if let Some(accruals) = parsed.get("accruals").and_then(|v| v.as_object()) {
+                                                for (wallet, amount_val) in accruals {
+                                                    if let Some(amount) = amount_val.as_u64() {
+                                                        if amount > 0 {
+                                                            producer_reward_accruals.push((wallet.clone(), amount));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
                             if let Err(e) = state_guard.apply_transaction_lazy(tx) {
                                 if is_warn() {
                                     println!("[WARN][STATE] producer_tx_apply_failed hash={} err={}", tx.hash, e);
                                 }
                             } else {
-                                // v3.36: Gas refund — return unused gas to sender (EIP-1559)
                                 let _ = state_guard.apply_gas_refund(tx, next_block_height);
+                            }
+                        }
+                        
+                        // v7.0: Apply reward accruals BEFORE finalize_merkle
+                        for (wallet, delta) in &producer_reward_accruals {
+                            if let Err(e) = state_guard.accrue_pending_rewards(wallet, *delta) {
+                                eprintln!("[WARN][REWARDS] producer_accrue_fail wallet={}... err={}", 
+                                         &wallet[..wallet.len().min(16)], e);
                             }
                         }
                         
@@ -22992,38 +23062,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 drop(state);
                                             }
                                             
-                                            // Update pending_rewards in blockchain state
-                                            let mut reward_mgr = reward_manager.write().await;
-                                            let pending = reward_mgr.get_all_pending_rewards();
-                                            drop(reward_mgr);
-                                            
-                                            let state = state_manager.read().await;
+                                            // v7.0: pending_rewards update removed — now applied via block TX execution
+                                            // Persist pending rewards to RocksDB (survive restarts)
                                             let mut updated_count = 0;
-                                            for (node_id, amount) in &pending {
-                                                if let Ok(Some((_, wallet_addr, _))) = storage.load_node_registration(node_id) {
-                                                    if let Err(e) = (*state).update_pending_rewards(&wallet_addr, *amount) {
-                                                        eprintln!("[WARN][EMISSION] pending_update_fail node={} err={}", node_id, e);
-                                                    } else {
-                                                        updated_count += 1;
-                                                    }
-                                                }
-                                            }
-                                            drop(state);
-                                            
-                                            // v3.35: Persist pending rewards to RocksDB (survive restarts)
                                             {
                                                 let reward_mgr_rd = reward_manager.read().await;
-                                                for (node_id, _amount) in &pending {
+                                                let accrual_node_ids: Vec<String> = reward_mgr_rd.get_last_epoch_accruals().keys().cloned().collect();
+                                                for node_id in &accrual_node_ids {
                                                     if let Some(reward) = reward_mgr_rd.get_pending_reward(node_id) {
                                                         if let Err(e) = storage.save_pending_reward(node_id, reward) {
                                                             eprintln!("[WARN][REWARDS] pending_save_fail node={} err={}", node_id, e);
+                                                        } else {
+                                                            updated_count += 1;
                                                         }
                                                     }
                                                 }
                                             }
                                             
                                             if is_info() && updated_count > 0 {
-                                                println!("[INFO][EMISSION] pending_rewards_updated count={}", updated_count);
+                                                println!("[INFO][EMISSION] pending_rewards_persisted count={}", updated_count);
                                             }
                                             
                             // v2.99: Emission TX is created in production loop (for block 14400)
@@ -25217,39 +25274,26 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         drop(state);
                                     }
                                     
-                                    // Update pending_rewards
+                                    // v7.0: update_pending_rewards REMOVED — now applied via emission TX in block execution
+                                    // Persist pending rewards to RocksDB (survive restarts)
                                     let reward_manager_arc = self.get_reward_manager();
-                                    let mut reward_mgr = reward_manager_arc.write().await;
-                                    let pending = reward_mgr.get_all_pending_rewards();
-                                    drop(reward_mgr);
-                                    
-                                    let state = self.state.read().await;
                                     let mut updated_count = 0;
-                                    for (node_id, amount) in &pending {
-                                        if let Ok(Some((_, wallet_addr, _))) = self.storage.load_node_registration(node_id) {
-                                            if let Err(e) = (*state).update_pending_rewards(&wallet_addr, *amount) {
-                                                eprintln!("[WARN][REWARDS] pending_update_fail node={} err={}", node_id, e);
-                                            } else {
-                                                updated_count += 1;
-                                            }
-                                        }
-                                    }
-                                    drop(state);
-                                    
-                                    // v3.35: Persist pending rewards to RocksDB (survive restarts)
                                     {
                                         let reward_mgr_rd = reward_manager_arc.read().await;
-                                        for (node_id, _amount) in &pending {
+                                        let accrual_node_ids: Vec<String> = reward_mgr_rd.get_last_epoch_accruals().keys().cloned().collect();
+                                        for node_id in &accrual_node_ids {
                                             if let Some(reward) = reward_mgr_rd.get_pending_reward(node_id) {
                                                 if let Err(e) = self.storage.save_pending_reward(node_id, reward) {
                                                     eprintln!("[WARN][REWARDS] pending_save_fail node={} err={}", node_id, e);
+                                                } else {
+                                                    updated_count += 1;
                                                 }
                                             }
                                         }
                                     }
                                     
                                     if is_info() && updated_count > 0 {
-                                        println!("[INFO][REWARDS] SYNC pending_updated count={}", updated_count);
+                                        println!("[INFO][REWARDS] SYNC pending_persisted count={}", updated_count);
                                     }
                                     
                                     // v3.00: Fully async snapshot — DashMap iterate + serialize in spawn_blocking

@@ -4741,39 +4741,19 @@ async fn handle_batch_claim_rewards(
             })));
         }
 
-        use crate::quantum_crypto::DilithiumSignature;
-        let dilithium_struct = DilithiumSignature {
-            signature: request.dilithium_signature.clone(),
-            algorithm: "CRYSTALS-Dilithium3".to_string(),
-            timestamp: request.timestamp,
-            strength: "quantum-resistant".to_string(),
-        };
-        let crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-        match crypto.verify_dilithium_signature(&claim_message, &dilithium_struct, &request.dilithium_public_key).await {
-            Ok(true) => {
-                if crate::node::is_info() {
-                    println!("[INFO][CLAIM] batch_hybrid_verified wallet={}... nodes={}",
-                        &wallet[..16.min(wallet.len())], request.node_ids.len());
-                }
+        if !verify_mobile_dilithium_signature(&claim_message, &request.dilithium_signature, &request.dilithium_public_key) {
+            if crate::node::is_warn() {
+                println!("[WARN][CLAIM] batch_dilithium_invalid wallet={}...",
+                    &wallet[..16.min(wallet.len())]);
             }
-            Ok(false) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][CLAIM] batch_dilithium_invalid wallet={}...",
-                        &wallet[..16.min(wallet.len())]);
-                }
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Invalid Dilithium3 signature for batch reward claim (hybrid v6.1, Part 2)"
-                })));
-            }
-            Err(e) => {
-                println!("[ERR][CLAIM] batch_dilithium_verify_fail wallet={}... err={}",
-                    &wallet[..16.min(wallet.len())], e);
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": format!("Dilithium3 verification error: {}", e)
-                })));
-            }
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Invalid Dilithium3 signature for batch reward claim (hybrid v6.1, Part 2)"
+            })));
+        }
+        if crate::node::is_info() {
+            println!("[INFO][CLAIM] batch_hybrid_verified wallet={}... nodes={}",
+                &wallet[..16.min(wallet.len())], request.node_ids.len());
         }
     }
 
@@ -8870,34 +8850,14 @@ async fn handle_claim_rewards(
             }
         };
 
-        use crate::quantum_crypto::DilithiumSignature;
-        let dilithium_struct = DilithiumSignature {
-            signature: dilithium_sig,
-            algorithm: "CRYSTALS-Dilithium3".to_string(),
-            timestamp: chrono::Utc::now().timestamp() as u64,
-            strength: "quantum-resistant".to_string(),
-        };
-
-        let crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-        match crypto.verify_dilithium_signature(&claim_message, &dilithium_struct, &dilithium_pubkey).await {
-            Ok(true) => {
-                println!("[INFO][CLAIM] dilithium_verified node={} quantum_safe=true", claim_request.node_id);
-            }
-            Ok(false) => {
-                println!("[WARN][CLAIM] dilithium_invalid node={}", claim_request.node_id);
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Invalid Dilithium3 signature for reward claim"
-                })));
-            }
-            Err(e) => {
-                println!("[ERR][CLAIM] dilithium_verify_fail node={} err={}", claim_request.node_id, e);
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": format!("Dilithium3 verification error: {}", e)
-                })));
-            }
+        if !verify_mobile_dilithium_signature(&claim_message, &dilithium_sig, &dilithium_pubkey) {
+            println!("[WARN][CLAIM] dilithium_invalid node={}", claim_request.node_id);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Invalid Dilithium3 signature for reward claim"
+            })));
         }
+        println!("[INFO][CLAIM] dilithium_verified node={} quantum_safe=true", claim_request.node_id);
     }
     
     // v2.71: ON-CHAIN WALLET VERIFICATION
@@ -14568,36 +14528,17 @@ async fn handle_token_deploy(
         })));
     }
     {
-        use crate::quantum_crypto::DilithiumSignature;
-        let dilithium_struct = DilithiumSignature {
-            signature: request.dilithium_signature.clone(),
-            algorithm: "CRYSTALS-Dilithium3".to_string(),
-            timestamp: chrono::Utc::now().timestamp() as u64,
-            strength: "quantum-resistant".to_string(),
-        };
-        let crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-        match crypto.verify_dilithium_signature(&message_to_sign, &dilithium_struct, &request.dilithium_public_key).await {
-            Ok(true) => {
-                if crate::node::is_debug() {
-                    println!("[DBG][TOKEN] dilithium_ok wallet={}...", &request.from[..16.min(request.from.len())]);
-                }
+        if !verify_mobile_dilithium_signature(&message_to_sign, &request.dilithium_signature, &request.dilithium_public_key) {
+            if crate::node::is_warn() {
+                println!("[WARN][TOKEN] dilithium_invalid wallet={}...", &request.from[..16.min(request.from.len())]);
             }
-            Ok(false) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][TOKEN] dilithium_invalid wallet={}...", &request.from[..16.min(request.from.len())]);
-                }
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Invalid Dilithium3 signature for token deploy"
-                })));
-            }
-            Err(e) => {
-                println!("[ERR][TOKEN] dilithium_verify_fail err={}", e);
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": format!("Dilithium3 verification error: {}", e)
-                })));
-            }
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Invalid Dilithium3 signature for token deploy"
+            })));
+        }
+        if crate::node::is_debug() {
+            println!("[DBG][TOKEN] dilithium_ok wallet={}...", &request.from[..16.min(request.from.len())]);
         }
     }
     if crate::node::is_info() {

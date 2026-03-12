@@ -6089,7 +6089,7 @@ export class WalletManager {
       let dilithiumSignature = null;
       let dilithiumPublicKey = null;
       try {
-        const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('./crypto/DilithiumCrypto');
+        const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
         if (isDilithiumAvailable()) {
           const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password);
           dilithiumSignature = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
