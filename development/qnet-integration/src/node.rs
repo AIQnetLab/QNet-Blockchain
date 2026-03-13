@@ -2724,6 +2724,8 @@ impl BlockchainNode {
                     // validation through consensus rules, not cryptographic signature
                     // v2.65: System TX get MAX priority (u64::MAX) to ensure inclusion in block
                     // v7.0: Build wallet→delta accrual map for emission TX
+                    // Source of truth: on-chain NodeRegistration TX cached in RocksDB
+                    // All node types (genesis/light/super) have NodeRegistration TX on-chain
                     let accrual_wallet_map: std::collections::BTreeMap<String, u64> = {
                         let accruals = reward_manager.get_last_epoch_accruals();
                         let mut wmap = std::collections::BTreeMap::new();
@@ -4402,6 +4404,7 @@ impl BlockchainNode {
         // v7.0: update_pending_rewards REMOVED — rewards applied via emission TX in block execution
         
         // v7.0: Build wallet→delta map for emission TX accruals
+        // Source of truth: on-chain NodeRegistration TX cached in RocksDB
         let accrual_wallet_map: std::collections::BTreeMap<String, u64> = {
             let accruals = reward_manager.get_last_epoch_accruals();
             let mut wmap = std::collections::BTreeMap::new();
@@ -14371,7 +14374,7 @@ impl BlockchainNode {
                                                     let accruals = reward_mgr.get_last_epoch_accruals();
                                                     let mut wallet_map = std::collections::BTreeMap::<String, u64>::new();
                                                     for (nid, &amt) in accruals.iter() {
-                                                        if let Ok(Some((_nt, wallet, _rep))) = storage.load_node_registration(nid) {
+                                                        if let Ok(Some((_, wallet, _))) = storage.load_node_registration(nid) {
                                                             if !wallet.is_empty() {
                                                                 *wallet_map.entry(wallet).or_insert(0) += amt;
                                                             }
