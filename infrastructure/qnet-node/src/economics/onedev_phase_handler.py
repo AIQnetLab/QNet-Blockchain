@@ -36,11 +36,11 @@ class OneDEVPhaseHandler:
         # Genesis whitelist - Bootstrap nodes (format: 19+3+15+4=41 chars)
         # v2.66: Updated to Ed25519-based addresses
         self.genesis_whitelist = {
-            "f36ff465a0944fd06cdeonfca0ad004ff9db46743",  # Bootstrap Node 1
-            "0bac6225a082de1f659eond0c96f1706cf19c35eb",  # Bootstrap Node 2
-            "d216bb23fbe7f853636eon3f16b378b91922701a6",  # Bootstrap Node 3
-            "e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e",  # Bootstrap Node 4
-            "02af45d56bd1f5d9002eon0eb1c522f96a2f440b8"   # Bootstrap Node 5
+            "f36ff465a0944fd06cdeonfca0ad004ff9db42e16",  # Bootstrap Node 1
+            "0bac6225a082de1f659eond0c96f1706cf19cc7ab",  # Bootstrap Node 2
+            "d216bb23fbe7f853636eon3f16b378b919227e009",  # Bootstrap Node 3
+            "e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc",  # Bootstrap Node 4
+            "02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb"   # Bootstrap Node 5
         }
         self.genesis_claimed = set()
         

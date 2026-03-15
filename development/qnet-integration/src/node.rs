@@ -12238,12 +12238,16 @@ impl BlockchainNode {
                             round.min(MAX_TIMEOUT_ROUNDS) // Cap at max rounds
                         };
                         
-                        // v4.0: Check for existing timeout certificate (deterministic!)
+                        // v4.2: Timeout votes/certificates keyed by MACROBLOCK INDEX,
+                        // not exact microblock height. This ensures nodes at different
+                        // microblock heights within the same macroblock can still form
+                        // quorum and produce a TimeoutCertificate.
+                        let timeout_mb_index = microblock_height / 90;
+
                         let certified_timeout_round = if let Some(p2p) = &unified_p2p {
-                            // Search for highest certified round for this height
                             let mut highest = 0u64;
                             for round in 1..=MAX_TIMEOUT_ROUNDS {
-                                if p2p.has_timeout_certificate(next_height, round) {
+                                if p2p.has_timeout_certificate(timeout_mb_index, round) {
                                     highest = round;
                                 }
                             }
@@ -12262,8 +12266,8 @@ impl BlockchainNode {
                         // v4.0: If we detect stall, vote for timeout (Byzantine consensus)
                         if proposed_timeout_round > 0 && microblock_height > 0 {
                             if is_info() {
-                                println!("[INFO][TIMEOUT] stall_detected h={} local_delay={}s proposed_round={} certified_round={}", 
-                                         next_height, local_delay, proposed_timeout_round, certified_timeout_round);
+                                println!("[INFO][TIMEOUT] stall_detected h={} mb={} local_delay={}s proposed_round={} certified_round={}", 
+                                         next_height, timeout_mb_index, local_delay, proposed_timeout_round, certified_timeout_round);
                             }
                             
                             // STATE MACHINE: Network stall detected
@@ -12279,16 +12283,16 @@ impl BlockchainNode {
                                     let last_block_hash = storage.get_latest_macroblock_hash()
                                         .unwrap_or([0u8; 32]);
                                     
-                                    // Create vote message for signing
+                                    // v4.2: vote_msg uses macroblock index for consistency
                                     let vote_msg = format!("TIMEOUT:{}:{}:{}", 
-                                        next_height, proposed_timeout_round, hex::encode(&last_block_hash));
+                                        timeout_mb_index, proposed_timeout_round, hex::encode(&last_block_hash));
                                     
                                     // Sign with quantum crypto (Dilithium)
                                     if let Some(crypto) = try_get_quantum_crypto() {
                                         match crypto.create_consensus_signature(&node_id, &vote_msg).await {
                                             Ok(sig) => {
                                                 p2p.broadcast_timeout_vote(
-                                                    next_height, 
+                                                    timeout_mb_index, 
                                                     proposed_timeout_round,
                                                     last_block_hash,
                                                     sig.signature.as_bytes().to_vec()
@@ -14370,12 +14374,32 @@ impl BlockchainNode {
                                                     
                                                     let accruals = reward_mgr.get_last_epoch_accruals();
                                                     let mut wallet_map = std::collections::BTreeMap::<String, u64>::new();
-                                                    for (nid, &amt) in accruals.iter() {
-                                                        if let Ok(Some((_nt, wallet, _rep))) = storage.load_node_registration(nid) {
-                                                            if !wallet.is_empty() {
-                                                                *wallet_map.entry(wallet).or_insert(0) += amt;
+                                                    if !accruals.is_empty() {
+                                                        for (nid, &amt) in accruals.iter() {
+                                                            if let Ok(Some((_nt, wallet, _rep))) = storage.load_node_registration(nid) {
+                                                                if !wallet.is_empty() {
+                                                                    *wallet_map.entry(wallet).or_insert(0) += amt;
+                                                                }
                                                             }
                                                         }
+                                                    } else if total_eligible_count > 0 {
+                                                        // Delayed reward: epoch < 2 skipped reward_manager accumulation,
+                                                        // but emission TX must still distribute to eligible nodes.
+                                                        // Calculate per-node share directly from MacroBlock heartbeat data.
+                                                        let per_node_reward = total_emission / total_eligible_count;
+                                                        if per_node_reward > 0 {
+                                                            for s in &all_summaries {
+                                                                if s.is_eligible {
+                                                                    if let Ok(Some((_, wallet, _))) = storage.load_node_registration(&s.node_id) {
+                                                                        if !wallet.is_empty() {
+                                                                            *wallet_map.entry(wallet).or_insert(0) += per_node_reward;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        println!("[INFO][EMISSION] delayed_reward_accruals: {} wallets, per_node={} nanoQNC from mb={}",
+                                                                 wallet_map.len(), per_node_reward, prev_macroblock_index);
                                                     }
                                                     emission_tx.data = Some(serde_json::json!({
                                                         "v": 2,
@@ -16321,12 +16345,59 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             return;
                                         } else {
                                             // All 8 attempts exhausted. Network HAS the block but we can't get it.
-                                            // This indicates a severe local network issue (not a block missing).
-                                            // DO NOT produce emergency block (would cause fork).
-                                            // Trigger a parallel full-range resync to recover the gap.
-                                            println!("[EMERGENCY][FAILOVER] h={} sync_result=all_failed network_has_block=true action=trigger_parallel_resync", 
-                                                     expected_height_timeout);
-                                            // Request a broader sync range to recover (±5 blocks) in background
+                                            // v4.2: Track consecutive sync failures per height.
+                                            // If stuck on the same height for too long, QUIC connections are likely
+                                            // dead — reconnect them before the next cycle.
+                                            static SYNC_FAIL_HEIGHT: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            static SYNC_FAIL_COUNT: std::sync::atomic::AtomicU32 =
+                                                std::sync::atomic::AtomicU32::new(0);
+                                            static SYNC_FAIL_FIRST_TS: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+
+                                            let prev_fail_height = SYNC_FAIL_HEIGHT.load(Ordering::Relaxed);
+                                            let fail_count = if prev_fail_height == expected_height_timeout {
+                                                SYNC_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1
+                                            } else {
+                                                SYNC_FAIL_HEIGHT.store(expected_height_timeout, Ordering::Relaxed);
+                                                SYNC_FAIL_COUNT.store(1, Ordering::Relaxed);
+                                                let now_ts = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default().as_secs();
+                                                SYNC_FAIL_FIRST_TS.store(now_ts, Ordering::Relaxed);
+                                                1
+                                            };
+
+                                            let first_ts = SYNC_FAIL_FIRST_TS.load(Ordering::Relaxed);
+                                            let now_ts = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default().as_secs();
+                                            let stuck_duration = now_ts.saturating_sub(first_ts);
+
+                                            println!("[EMERGENCY][FAILOVER] h={} sync_result=all_failed network_has_block=true fail_count={} stuck_for={}s",
+                                                     expected_height_timeout, fail_count, stuck_duration);
+
+                                            if fail_count >= 3 {
+                                                // 3+ consecutive failures for the same block:
+                                                // QUIC connections to sync peers are likely dead.
+                                                // Force QUIC reconnect to all bootstrap peers.
+                                                println!("[WARN][FAILOVER] h={} action=force_quic_reconnect (stuck {} rounds)",
+                                                         expected_height_timeout, fail_count);
+                                                p2p_check.reconnect_all_bootstrap_peers().await;
+                                                // Reset counter so we give reconnected peers a chance
+                                                SYNC_FAIL_COUNT.store(0, Ordering::Relaxed);
+                                            }
+
+                                            if stuck_duration > 600 {
+                                                // Stuck for 10+ minutes on the same block despite reconnects.
+                                                // This node is in an unrecoverable local state.
+                                                // Self-restart is the safest recovery: Docker will restart the
+                                                // container with clean QUIC connections and fresh state.
+                                                println!("[CRITICAL][FAILOVER] h={} stuck_for={}s action=self_restart",
+                                                         expected_height_timeout, stuck_duration);
+                                                std::process::exit(1);
+                                            }
+
                                             let resync_from = expected_height_timeout.saturating_sub(5);
                                             let _ = p2p_check.sync_blocks(resync_from, expected_height_timeout).await;
                                             FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);

@@ -937,18 +937,20 @@ static INVALID_CERT_TRACKER: Lazy<Arc<DashMap<String, (std::sync::atomic::Atomic
 // When 2/3+ votes collected, TimeoutCertificate is generated
 // ═══════════════════════════════════════════════════════════════════════════════════════
 
-/// Collected timeout votes per (height, round)
-/// Key: (height, timeout_round), Value: HashMap<voter_id, (signature, last_block_hash)>
+/// Collected timeout votes per (macroblock_index, round)
+/// v4.2: keyed by macroblock index (height/90) so nodes at different microblock
+/// heights within the same macroblock still form quorum.
+/// Key: (macroblock_index, timeout_round), Value: HashMap<voter_id, (signature, last_block_hash)>
 static TIMEOUT_VOTES: Lazy<Arc<DashMap<(u64, u64), HashMap<String, (Vec<u8>, [u8; 32])>>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// Generated timeout certificates (cached for block validation)
-/// Key: (height, timeout_round), Value: TimeoutCertificate
+/// Key: (macroblock_index, timeout_round), Value: TimeoutCertificate
 static TIMEOUT_CERTIFICATES: Lazy<Arc<DashMap<(u64, u64), TimeoutCertificate>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// Track which heights we've already voted for timeout (prevent double-voting)
-/// Key: height, Value: timeout_round we voted for
+/// Track which macroblock indices we've already voted for timeout (prevent double-voting)
+/// Key: macroblock_index, Value: timeout_round we voted for
 static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
 
@@ -2641,6 +2643,29 @@ impl SimplifiedP2P {
         }
     }
     
+    /// v4.2: Force reconnect to all bootstrap peers.
+    /// Called when EMERGENCY SYNC is stuck — drops dead QUIC connections
+    /// and re-establishes them from scratch.
+    pub async fn reconnect_all_bootstrap_peers(&self) {
+        let bootstrap_ips = get_genesis_bootstrap_ips();
+        let bootstrap_addrs: Vec<String> = bootstrap_ips.iter()
+            .map(|ip| format!("{}:8001", ip))
+            .collect();
+
+        if crate::node::is_info() {
+            println!("[INFO][P2P] reconnect_all_bootstrap: dropping dead QUIC + re-adding {} peers",
+                     bootstrap_addrs.len());
+        }
+
+        self.cleanup_quic_idle();
+
+        for addr in &bootstrap_addrs {
+            self.remove_peer_lockfree(addr);
+        }
+
+        self.connect_to_bootstrap_peers(&bootstrap_addrs);
+    }
+
     /// PRODUCTION: Get QUIC connection count for monitoring
     pub async fn get_quic_connection_count(&self) -> usize {
         if let Some(ref quic_transport) = self.quic_transport {
@@ -4316,10 +4341,10 @@ impl SimplifiedP2P {
                 });
                 let invalid_cert_removed = invalid_cert_before.saturating_sub(INVALID_CERT_TRACKER.len());
                 
-                // v4.0: Cleanup TIMEOUT_VOTES, TIMEOUT_CERTIFICATES, TIMEOUT_VOTED_HEIGHTS
-                // Retain only last 100 blocks worth of timeout data
+                // v4.2: Timeout data is now keyed by macroblock index, not microblock height
                 let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                let min_height = current_height.saturating_sub(100);
+                let current_mb_index = current_height / 90;
+                let min_height = current_mb_index.saturating_sub(20);
                 
                 let timeout_votes_before = TIMEOUT_VOTES.len();
                 TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_height);
@@ -20535,19 +20560,14 @@ impl SimplifiedP2P {
     }
     
     /// Clean up old timeout votes and certificates (memory management)
+    /// v4.2: height parameter is now macroblock index (caller should pass height/90)
     pub fn cleanup_old_timeout_data(&self, current_height: u64) {
-        const RETENTION_BLOCKS: u64 = 100;
+        let current_mb_index = current_height / 90;
+        let min_mb = current_mb_index.saturating_sub(20);
         
-        let min_height = current_height.saturating_sub(RETENTION_BLOCKS);
-        
-        // Remove old votes
-        TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_height);
-        
-        // Remove old certificates  
-        TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_height);
-        
-        // Remove old voted heights
-        TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
+        TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_mb);
+        TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_mb);
+        TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_mb);
     }
     
     /// Handle emergency producer change notifications with sender tracking

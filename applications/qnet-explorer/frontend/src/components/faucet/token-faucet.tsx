@@ -12,6 +12,15 @@ interface FaucetResponse {
   balance?: string;
 }
 
+interface ClaimResult {
+  devSuccess: boolean;
+  devTxHash?: string;
+  devError?: string;
+  solSuccess: boolean;
+  solTxHash?: string;
+  solError?: string;
+}
+
 export default function TokenFaucet() {
   const [walletAddress, setWalletAddress] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -20,7 +29,8 @@ export default function TokenFaucet() {
   const [success, setSuccess] = useState<string | null>(null);
   const [isWalletConnected, setIsWalletConnected] = useState(false);
 
-  const FAUCET_AMOUNT = 1500; // 1500 1DEV tokens
+  const FAUCET_AMOUNT = 1500;
+  const SOL_AMOUNT = 0.001;
   const COOLDOWN_HOURS = 24; // 24 hour cooldown
 
   // Check for QNet Wallet on component mount
@@ -122,29 +132,57 @@ export default function TokenFaucet() {
     setIsLoading(true);
 
     try {
-      const requestBody = {
-        walletAddress: walletAddress.trim(),
-        amount: FAUCET_AMOUNT,
-        tokenType: '1DEV'
-      };
-      
-      const response = await fetch('/api/faucet/claim', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(requestBody),
-      });
-      
-      const data: FaucetResponse = await response.json();
+      const address = walletAddress.trim();
 
-      if (data.success && data.txHash) {
-        setSuccess(`Successfully sent ${FAUCET_AMOUNT} 1DEV tokens! Transaction: ${data.txHash}`);
+      // Send 1DEV and 0.001 SOL in parallel
+      const [devResponse, solResponse] = await Promise.all([
+        fetch('/api/faucet/claim', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ walletAddress: address, amount: FAUCET_AMOUNT, tokenType: '1DEV' }),
+        }),
+        fetch('/api/faucet/claim', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ walletAddress: address, amount: SOL_AMOUNT, tokenType: 'SOL' }),
+        }),
+      ]);
+
+      const [devData, solData]: [FaucetResponse, FaucetResponse] = await Promise.all([
+        devResponse.json(),
+        solResponse.json(),
+      ]);
+
+      const result: ClaimResult = {
+        devSuccess: devData.success,
+        devTxHash: devData.txHash,
+        devError: devData.error,
+        solSuccess: solData.success,
+        solTxHash: solData.txHash,
+        solError: solData.error,
+      };
+
+      if (result.devSuccess || result.solSuccess) {
+        const lines: string[] = [];
+        if (result.devSuccess) {
+          lines.push(`✅ ${FAUCET_AMOUNT} 1DEV sent — TX: ${result.devTxHash}`);
+        } else {
+          lines.push(`⚠️ 1DEV failed: ${result.devError}`);
+        }
+        if (result.solSuccess) {
+          lines.push(`✅ ${SOL_AMOUNT} SOL sent — TX: ${result.solTxHash}`);
+        } else {
+          lines.push(`⚠️ SOL failed: ${result.solError}`);
+        }
+        setSuccess(lines.join('\n'));
         setLastClaim(new Date().toISOString());
         setWalletAddress('');
         localStorage.setItem('qnet_faucet_last_claim', new Date().toISOString());
       } else {
-        setError(data.error || 'Failed to send tokens. Please try again.');
+        setError(
+          [result.devError, result.solError].filter(Boolean).join(' | ') ||
+          'Failed to send tokens. Please try again.',
+        );
       }
     } catch (err) {
       setError('Network error. Please check your connection and try again.');
@@ -207,10 +245,10 @@ export default function TokenFaucet() {
       <Card className="quantum-card p-8">
         <div className="text-center mb-8">
           <h2 className="text-3xl font-bold quantum-text-gradient mb-4">
-            🚰 1DEV Token Faucet
+            🚰 Testnet Faucet
           </h2>
           <p className="text-gray-300 mb-2">
-            Get {FAUCET_AMOUNT} 1DEV tokens for QNet node activation testing
+            Get {FAUCET_AMOUNT} 1DEV tokens + {SOL_AMOUNT} SOL for QNet node activation testing
           </p>
           <p className="text-sm text-gray-400">
             Cooldown: {COOLDOWN_HOURS} hours between claims
@@ -279,7 +317,7 @@ export default function TokenFaucet() {
                   Sending...
                 </div>
               ) : (
-                `Claim ${FAUCET_AMOUNT} 1DEV Tokens`
+                `Claim ${FAUCET_AMOUNT} 1DEV + ${SOL_AMOUNT} SOL`
               )}
             </Button>
 
@@ -308,7 +346,7 @@ export default function TokenFaucet() {
             <div>
               <h4 className="font-medium text-white mb-1">Get Test Tokens</h4>
               <p className="text-sm text-gray-400">
-                Enter your Solana wallet address and claim 1,500 1DEV tokens for testing
+                Enter your Solana wallet address and claim 1,500 1DEV tokens + 0.001 SOL for transaction fees
               </p>
             </div>
           </div>
@@ -342,31 +380,43 @@ export default function TokenFaucet() {
       {/* Token Info Card */}
       <Card className="quantum-card p-6">
         <h3 className="text-xl font-semibold quantum-text-gradient mb-4">
-          1DEV Token Information
+          Token Information
         </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm">
+          {/* 1DEV */}
           <div className="space-y-2">
+            <p className="text-purple-400 font-semibold mb-1">1DEV (SPL Token)</p>
             <div className="flex justify-between">
               <span className="text-gray-400">Network:</span>
               <span className="text-white">Solana Devnet</span>
             </div>
             <div className="flex justify-between">
-              <span className="text-gray-400">Symbol:</span>
-              <span className="text-white">1DEV</span>
-            </div>
-            <div className="flex justify-between">
               <span className="text-gray-400">Decimals:</span>
               <span className="text-white">6</span>
-            </div>
-          </div>
-          <div className="space-y-2">
-            <div className="flex justify-between">
-              <span className="text-gray-400">Total Supply:</span>
-              <span className="text-white">1,000,000,000</span>
             </div>
             <div className="flex justify-between">
               <span className="text-gray-400">Faucet Amount:</span>
               <span className="text-white">1,500 1DEV</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">Purpose:</span>
+              <span className="text-white">Node activation burn</span>
+            </div>
+          </div>
+          {/* SOL */}
+          <div className="space-y-2">
+            <p className="text-cyan-400 font-semibold mb-1">SOL (Devnet)</p>
+            <div className="flex justify-between">
+              <span className="text-gray-400">Network:</span>
+              <span className="text-white">Solana Devnet</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">Faucet Amount:</span>
+              <span className="text-white">0.001 SOL</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">Purpose:</span>
+              <span className="text-white">Transaction fees</span>
             </div>
             <div className="flex justify-between">
               <span className="text-gray-400">Cooldown:</span>

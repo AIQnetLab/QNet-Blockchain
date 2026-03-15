@@ -9,7 +9,8 @@ export default function TestnetPage() {
   const [showSuccessAlert, setShowSuccessAlert] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
-  const [txHash, setTxHash] = useState('');
+  const [devTxHash, setDevTxHash] = useState('');
+  const [solTxHash, setSolTxHash] = useState('');
 
   const handleFaucetClaim = async () => {
     if (!faucetAddress.trim()) {
@@ -18,7 +19,7 @@ export default function TestnetPage() {
     }
 
     const now = Date.now();
-    const cooldownPeriod = 24 * 60 * 60 * 1000; // 24 hours
+    const cooldownPeriod = 24 * 60 * 60 * 1000;
 
     if (lastFaucetClaim && (now - lastFaucetClaim) < cooldownPeriod) {
       setShowFaucetAlert(true);
@@ -29,34 +30,37 @@ export default function TestnetPage() {
     setErrorMessage('');
 
     try {
-      const requestBody = {
-        walletAddress: faucetAddress.trim(),
-        amount: 1500,
-        tokenType: '1DEV'
-      };
-      
-      const response = await fetch('/api/faucet/claim', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(requestBody),
-      });
-      
-      const data = await response.json();
+      const address = faucetAddress.trim();
 
-      if (data.success && data.txHash) {
+      const [devResponse, solResponse] = await Promise.all([
+        fetch('/api/faucet/claim', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ walletAddress: address, amount: 1500, tokenType: '1DEV' }),
+        }),
+        fetch('/api/faucet/claim', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ walletAddress: address, amount: 0.001, tokenType: 'SOL' }),
+        }),
+      ]);
+
+      const [devData, solData] = await Promise.all([devResponse.json(), solResponse.json()]);
+
+      if (devData.success || solData.success) {
         setLastFaucetClaim(now);
-        setTxHash(data.txHash);
+        setDevTxHash(devData.txHash || '');
+        setSolTxHash(solData.txHash || '');
         setShowSuccessAlert(true);
         setFaucetAddress('');
+        if (!devData.success) setErrorMessage('1DEV: ' + (devData.error || 'failed'));
+        if (!solData.success) setErrorMessage('SOL: ' + (solData.error || 'failed'));
       } else {
-        setErrorMessage(data.error || 'Failed to send tokens. Please try again.');
-        alert('Error: ' + (data.error || 'Failed to send tokens'));
+        const err = [devData.error, solData.error].filter(Boolean).join(' | ') || 'Failed to send tokens. Please try again.';
+        setErrorMessage(err);
       }
     } catch (error) {
       setErrorMessage('Network error. Please check your connection.');
-      alert('Network error: ' + (error as Error).message);
     } finally {
       setIsLoading(false);
     }
@@ -77,7 +81,7 @@ export default function TestnetPage() {
             <div className="card-header" style={{ marginBottom: '2rem', textAlign: 'center' }}>
               <h3 style={{ fontSize: '1.8rem', marginBottom: '1rem' }}>Token Faucet</h3>
               <div className="faucet-heading" style={{ fontSize: '1.1rem', color: '#e5e5e5', lineHeight: '1.5' }}>
-                Get 1,500 test 1DEV tokens for development and testing on QNet testnet
+                Get 1,500 1DEV tokens + 0.001 SOL for QNet node activation testing
               </div>
             </div>
 
@@ -182,48 +186,60 @@ export default function TestnetPage() {
               maxWidth: '500px',
               textAlign: 'center'
             }}>
-              <h3 style={{ color: '#00ffff', marginBottom: '1rem' }}>✅ Success!</h3>
+              <h3 style={{ color: '#00ffff', marginBottom: '1rem' }}>Tokens sent!</h3>
               <p style={{ color: '#e5e5e5', marginBottom: '1rem' }}>
-                1,500 test 1DEV tokens have been sent to your address successfully!
+                1,500 1DEV + 0.001 SOL have been sent to your address
               </p>
-              {txHash && (
+              {devTxHash && (
                 <div style={{
                   background: 'rgba(0, 255, 255, 0.1)',
                   border: '1px solid rgba(0, 255, 255, 0.3)',
                   borderRadius: '8px',
                   padding: '1rem',
-                  marginBottom: '1rem'
+                  marginBottom: '0.75rem'
                 }}>
-                  <p style={{ color: '#888', fontSize: '0.8rem', marginBottom: '0.5rem' }}>Transaction Hash:</p>
-                  <p style={{ 
-                    color: '#00ffff', 
-                    fontSize: '0.9rem', 
-                    fontFamily: 'monospace',
-                    wordBreak: 'break-all'
-                  }}>
-                    {txHash}
+                  <p style={{ color: '#888', fontSize: '0.8rem', marginBottom: '0.5rem' }}>1DEV Transaction:</p>
+                  <p style={{ color: '#00ffff', fontSize: '0.85rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                    {devTxHash}
                   </p>
-                  <a 
-                    href={`https://explorer.solana.com/tx/${txHash}?cluster=devnet`}
+                  <a
+                    href={`https://explorer.solana.com/tx/${devTxHash}?cluster=devnet`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    style={{
-                      color: '#00ffff',
-                      fontSize: '0.85rem',
-                      textDecoration: 'underline',
-                      marginTop: '0.5rem',
-                      display: 'inline-block'
-                    }}
+                    style={{ color: '#00ffff', fontSize: '0.8rem', textDecoration: 'underline', marginTop: '0.4rem', display: 'inline-block' }}
                   >
                     View on Solana Explorer →
                   </a>
                 </div>
               )}
-              <button 
+              {solTxHash && (
+                <div style={{
+                  background: 'rgba(0, 255, 180, 0.08)',
+                  border: '1px solid rgba(0, 255, 180, 0.3)',
+                  borderRadius: '8px',
+                  padding: '1rem',
+                  marginBottom: '1rem'
+                }}>
+                  <p style={{ color: '#888', fontSize: '0.8rem', marginBottom: '0.5rem' }}>SOL Transaction:</p>
+                  <p style={{ color: '#00ffb4', fontSize: '0.85rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                    {solTxHash}
+                  </p>
+                  <a
+                    href={`https://explorer.solana.com/tx/${solTxHash}?cluster=devnet`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ color: '#00ffb4', fontSize: '0.8rem', textDecoration: 'underline', marginTop: '0.4rem', display: 'inline-block' }}
+                  >
+                    View on Solana Explorer →
+                  </a>
+                </div>
+              )}
+              <button
                 className="qnet-button"
                 onClick={() => {
                   setShowSuccessAlert(false);
-                  setTxHash('');
+                  setDevTxHash('');
+                  setSolTxHash('');
                 }}
                 style={{ fontSize: '1rem', padding: '0.75rem 1.5rem' }}
               >

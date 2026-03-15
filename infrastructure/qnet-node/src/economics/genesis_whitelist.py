@@ -63,31 +63,31 @@ class GenesisWhitelist:
         # v2.66: Updated to Ed25519-based addresses
         genesis_validators = [
             {
-                "address": "f36ff465a0944fd06cdeonfca0ad004ff9db46743",
+                "address": "f36ff465a0944fd06cdeonfca0ad004ff9db42e16",
                 "description": "Genesis Bootstrap Node 1 - Primary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "0bac6225a082de1f659eond0c96f1706cf19c35eb", 
+                "address": "0bac6225a082de1f659eond0c96f1706cf19cc7ab", 
                 "description": "Genesis Bootstrap Node 2 - Secondary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "d216bb23fbe7f853636eon3f16b378b91922701a6",
+                "address": "d216bb23fbe7f853636eon3f16b378b919227e009",
                 "description": "Genesis Bootstrap Node 3 - Tertiary", 
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e",
+                "address": "e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc",
                 "description": "Genesis Bootstrap Node 4 - Quaternary", 
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "02af45d56bd1f5d9002eon0eb1c522f96a2f440b8",
+                "address": "02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb",
                 "description": "Genesis Bootstrap Node 5 - Quinary",
                 "free_activations": 1,
                 "priority_access": True

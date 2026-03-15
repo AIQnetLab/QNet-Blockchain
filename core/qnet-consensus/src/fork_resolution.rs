@@ -221,11 +221,11 @@ impl SecurityValidator {
         // Bootstrap validators (format: 19+3+15+4=41 chars)
         // v2.66: Updated to Ed25519-based addresses
         matches!(validator,
-            "f36ff465a0944fd06cdeonfca0ad004ff9db46743" |
-            "0bac6225a082de1f659eond0c96f1706cf19c35eb" |
-            "d216bb23fbe7f853636eon3f16b378b91922701a6" |
-            "e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e" |
-            "02af45d56bd1f5d9002eon0eb1c522f96a2f440b8"
+            "f36ff465a0944fd06cdeonfca0ad004ff9db42e16" |
+            "0bac6225a082de1f659eond0c96f1706cf19cc7ab" |
+            "d216bb23fbe7f853636eon3f16b378b919227e009" |
+            "e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc" |
+            "02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb"
         )
     }
 }

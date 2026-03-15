@@ -1348,11 +1348,11 @@ const WalletScreen = () => {
         if (!activatedNodeType && wallet) {
           // v2.66: Updated to Ed25519-based addresses
           const GENESIS_WALLETS = {
-            '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db46743',
-            '002': '0bac6225a082de1f659eond0c96f1706cf19c35eb',
-            '003': 'd216bb23fbe7f853636eon3f16b378b91922701a6',
-            '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e',
-            '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f440b8',
+            '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db42e16',
+            '002': '0bac6225a082de1f659eond0c96f1706cf19cc7ab',
+            '003': 'd216bb23fbe7f853636eon3f16b378b919227e009',
+            '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc',
+            '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb',
           };
           
           const userQNetAddress = (wallet.qnetAddress || wallet.address || '').toLowerCase();
@@ -1624,11 +1624,11 @@ const WalletScreen = () => {
         // PRODUCTION: Genesis wallet addresses (format: 19+3+15+4=41 chars)
         // v2.66: Updated to Ed25519-based addresses
         const GENESIS_WALLETS = {
-          '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db46743',
-          '002': '0bac6225a082de1f659eond0c96f1706cf19c35eb',
-          '003': 'd216bb23fbe7f853636eon3f16b378b91922701a6',
-          '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e',
-          '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f440b8',
+          '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db42e16',
+          '002': '0bac6225a082de1f659eond0c96f1706cf19cc7ab',
+          '003': 'd216bb23fbe7f853636eon3f16b378b919227e009',
+          '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc',
+          '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb',
         };
         
         const expectedWallet = GENESIS_WALLETS[bootstrapId];
@@ -1658,7 +1658,7 @@ const WalletScreen = () => {
         if (normalizedUser !== normalizedExpected) {
           // Check if formats are different but base parts match
           // Format: 19 hex + "eon" + 15 hex + 4 checksum = 41 chars
-          // Example: f36ff465a0944fd06cdeonfca0ad004ff9db46743
+          // Example: f36ff465a0944fd06cdeonfca0ad004ff9db42e16
           const userPart1 = normalizedUser.substring(0, 19);
           const userEon = normalizedUser.substring(19, 22);
           const expectedPart1 = normalizedExpected.substring(0, 19);

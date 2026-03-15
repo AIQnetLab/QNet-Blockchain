@@ -193,37 +193,78 @@ async function send1DEVTokens(
 }
 
 // ---------------------------------------------------------------------------
-// SOL airdrop (Solana devnet, plain HTTP)
+// SOL transfer — sends from faucet wallet (same key as 1DEV)
 // ---------------------------------------------------------------------------
 async function sendSOLTokens(
   address: string,
   amount: number,
-  environment: 'testnet' | 'mainnet',
 ): Promise<{ success: boolean; txHash?: string; error?: string }> {
-  if (environment !== 'testnet') {
-    return { success: false, error: 'Production SOL faucet not available' };
-  }
-
   try {
-    const response = await fetch('https://api.devnet.solana.com', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'requestAirdrop',
-        params: [address, amount * 1e9],
-      }),
-      signal: AbortSignal.timeout(15000),
+    const { Connection, Keypair, PublicKey, Transaction, SystemProgram, ComputeBudgetProgram } =
+      await import('@solana/web3.js');
+
+    const connection = new Connection('https://api.devnet.solana.com', {
+      commitment: 'processed',
+      confirmTransactionInitialTimeout: 3000,
     });
 
-    const data = await response.json();
-    if (data.result) {
-      return { success: true, txHash: data.result };
+    // Load faucet private key (same wallet as 1DEV)
+    let faucetPrivateKey: number[] | undefined;
+    const faucetPrivateKeyEnv = process.env.FAUCET_PRIVATE_KEY;
+    if (faucetPrivateKeyEnv) {
+      faucetPrivateKey = JSON.parse(faucetPrivateKeyEnv);
+    } else {
+      const path = await import('path');
+      const fs = await import('fs');
+      const candidates = [
+        path.join(process.cwd(), '..', '..', '..', 'infrastructure', 'config', 'faucet-config-testnet.json'),
+        '/var/qnet-fresh/infrastructure/config/faucet-config-testnet.json',
+      ];
+      for (const p of candidates) {
+        if (fs.existsSync(p)) {
+          const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+          faucetPrivateKey = cfg.wallet?.secretKey;
+          break;
+        }
+      }
     }
-    return { success: false, error: data.error?.message || 'Airdrop failed' };
-  } catch {
-    return { success: false, error: 'Solana airdrop service unavailable' };
+
+    if (!faucetPrivateKey) {
+      return { success: false, error: 'Faucet configuration error - private key not found' };
+    }
+
+    const faucetWallet = Keypair.fromSecretKey(new Uint8Array(faucetPrivateKey));
+    const recipientPubkey = new PublicKey(address);
+    const lamports = Math.round(amount * 1e9);
+
+    const { blockhash } = await connection.getLatestBlockhash('processed');
+    const transaction = new Transaction();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = faucetWallet.publicKey;
+
+    transaction.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }));
+    transaction.add(
+      SystemProgram.transfer({
+        fromPubkey: faucetWallet.publicKey,
+        toPubkey: recipientPubkey,
+        lamports,
+      }),
+    );
+
+    const signature = await connection.sendTransaction(transaction, [faucetWallet], {
+      skipPreflight: true,
+      preflightCommitment: 'processed',
+      maxRetries: 0,
+    });
+
+    setTimeout(async () => {
+      try { await connection.confirmTransaction(signature, 'processed'); } catch { /* non-critical */ }
+    }, 100);
+
+    return { success: true, txHash: signature };
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : 'Failed to send SOL';
+    return { success: false, error: msg };
   }
 }
 
@@ -276,7 +317,7 @@ async function sendTokens(
     case '1DEV':
       return send1DEVTokens(address, amount);
     case 'SOL':
-      return sendSOLTokens(address, amount, environment);
+      return sendSOLTokens(address, amount);
     case 'QNC':
       return sendQNCTokens(address, amount);
     default:
