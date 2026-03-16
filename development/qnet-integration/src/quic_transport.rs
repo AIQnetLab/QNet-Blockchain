@@ -37,11 +37,10 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use quinn::{Endpoint, ServerConfig, ClientConfig, Connection, VarInt, RecvStream, SendStream};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 
-use crate::p2p_transport::*;
-use crate::unified_p2p::{NetworkMessage, PeerInfo, get_privacy_id_for_addr};
+use crate::unified_p2p::{NetworkMessage, get_privacy_id_for_addr};
 use crate::node::{is_info, is_debug};
 
 // ============================================================================
@@ -61,8 +60,6 @@ const RETRY_DELAY_MS: u64 = 50;
 /// Maximum delay between retries (v2.45: reduced from 2000ms to 500ms)
 const MAX_RETRY_DELAY_MS: u64 = 500;
 
-/// Health check interval for proactive reconnection
-const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
 
 // ============================================================================
 // CONSTANTS - ALIGNED WITH HTTP VALUES
@@ -191,8 +188,6 @@ pub struct QuicTransport {
     cert_serial: String,
     /// Node type string
     node_type: String,
-    /// QUIC port
-    quic_port: u16,
     /// Active connections (peer_addr -> connection)
     connections: Arc<DashMap<SocketAddr, Arc<QuicConnection>>>,
     /// Server running flag
@@ -204,13 +199,12 @@ pub struct QuicTransport {
 }
 
 impl QuicTransport {
-    pub fn new(node_id: String, node_type: String, quic_port: u16) -> Self {
+    pub fn new(node_id: String, node_type: String, _quic_port: u16) -> Self {
         Self {
             endpoint: None,
             node_id,
             cert_serial: String::new(),
             node_type,
-            quic_port,
             connections: Arc::new(DashMap::new()),
             server_running: Arc::new(AtomicBool::new(false)),
             message_handler: None,

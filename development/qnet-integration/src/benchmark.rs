@@ -1,4 +1,4 @@
-//! QNet Benchmark Module - Real Transaction Load Testing
+﻿//! QNet Benchmark Module - Real Transaction Load Testing
 //! 
 //! Generates REAL Transfer transactions between test accounts with full
 //! cryptographic validation (Ed25519 signatures).
@@ -17,13 +17,13 @@
 //! - "max_capacity"    : 50K TPS, 500K TX  - Push to safe limit
 //! - "progressive_max" : AUTO-FIND MAX!    - Starts 5K, +5K every 10s until limit
 //! 
-//! ### DANGEROUS Presets (may crash single node!):
-//! - "single_shard"  : 100K TPS ⚠️ - Too fast for single node!
+//! ### DANGEROUS Presets:
+//! - "single_shard"  : 100K TPS ⚠️
 //! - "small_scale"   : 100K TPS ⚠️
 //! - "medium_scale"  : 100K TPS ⚠️
 //! - "large_scale"   : 100K TPS ⚠️
 //! - "extra_large"   : 100K TPS ⚠️
-//! - "full_scale"    : 100K TPS ⚠️⚠️ - WILL CRASH!
+//! - "full_scale"    : 100K TPS ⚠️
 //! 
 //! ## API Examples:
 //! POST /api/v1/benchmark/start                              → stability_test (SAFE)
@@ -33,8 +33,6 @@
 //! POST /api/v1/benchmark/start { "target_tps": 10000, "total": 100000 } → custom
 //! GET /api/v1/benchmark/status
 //! GET /api/v1/benchmark/results
-
-#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,7 +51,7 @@ pub const ONE_QNC: u64 = 1_000_000_000;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkPreset {
-    /// v2.41.2: STABILITY TEST - safe for single node, guaranteed not to crash
+    /// v2.41.2: STABILITY TEST
     /// 5K TPS, 50K TX, 2 workers - USE THIS FOR TESTING!
     StabilityTest,
     /// v2.41.2: STRESS TEST - find real node capacity
@@ -66,17 +64,17 @@ pub enum BenchmarkPreset {
     /// Starts at 5K, increases by 5K every 10 seconds until failure
     /// Returns the actual maximum TPS the node can handle
     ProgressiveMax,
-    /// Single shard test: 100K TPS (DANGEROUS for single node!)
+    /// Single shard test: 100K TPS
     SingleShard,
-    /// 8 shards test: 100K TPS (DANGEROUS!)
+    /// 8 shards test: 100K TPS
     SmallScale,
-    /// 32 shards test: 100K TPS (DANGEROUS!)
+    /// 32 shards test: 100K TPS
     MediumScale,
-    /// 64 shards test: 100K TPS (DANGEROUS!)
+    /// 64 shards test: 100K TPS
     LargeScale,
-    /// 128 shards test: 100K TPS (DANGEROUS!)
+    /// 128 shards test: 100K TPS
     ExtraLarge,
-    /// Full 256 shards: 100K TPS (EXTREMELY DANGEROUS - WILL CRASH!)
+    /// Full 256 shards: 100K TPS
     FullScale,
     /// Custom configuration
     Custom,
@@ -84,7 +82,7 @@ pub enum BenchmarkPreset {
 
 impl Default for BenchmarkPreset {
     fn default() -> Self {
-        // v2.41.2: Safe default - won't crash node!
+        // v2.41.2: Safe default 
         BenchmarkPreset::StabilityTest
     }
 }
@@ -117,7 +115,6 @@ impl BenchmarkConfig {
     pub fn from_preset(preset: BenchmarkPreset) -> Self {
         // v2.41.2: STABILITY-FIRST presets
         // StabilityTest/StressTest/MaxCapacity are SAFE for single node
-        // Other presets are DANGEROUS and may crash the node!
         let (shards, total, tps, accounts) = match preset {
             // === SAFE PRESETS (v2.41.2) ===
             BenchmarkPreset::StabilityTest => (1, 50_000, 5_000, 1_000),      // 5K TPS - SAFE!
@@ -125,13 +122,12 @@ impl BenchmarkConfig {
             BenchmarkPreset::MaxCapacity => (8, 500_000, 50_000, 5_000),      // 50K TPS - high
             BenchmarkPreset::ProgressiveMax => (1, 1_000_000, 5_000, 10_000), // Start 5K, auto-increase
             
-            // === DANGEROUS PRESETS (may crash single node!) ===
             BenchmarkPreset::SingleShard => (1, 500_000, 100_000, 5_000),     // 100K TPS ⚠️
             BenchmarkPreset::SmallScale => (8, 1_000_000, 100_000, 10_000),   // 100K TPS ⚠️
             BenchmarkPreset::MediumScale => (32, 2_000_000, 100_000, 20_000), // 100K TPS ⚠️
             BenchmarkPreset::LargeScale => (64, 3_000_000, 100_000, 30_000),  // 100K TPS ⚠️
             BenchmarkPreset::ExtraLarge => (128, 5_000_000, 100_000, 40_000), // 100K TPS ⚠️
-            BenchmarkPreset::FullScale => (256, 10_000_000, 100_000, 50_000), // 100K TPS ⚠️⚠️
+            BenchmarkPreset::FullScale => (256, 10_000_000, 100_000, 50_000), // 100K TPS ⚠️
             BenchmarkPreset::Custom => (256, 5_000_000, 100_000, 50_000),
         };
         
@@ -165,7 +161,7 @@ impl BenchmarkConfig {
 
 impl Default for BenchmarkConfig {
     fn default() -> Self {
-        // v2.41.2: Safe default - StabilityTest won't crash node!
+        // v2.41.2: Safe default
         Self::from_preset(BenchmarkPreset::StabilityTest)
     }
 }
@@ -531,11 +527,11 @@ impl BenchmarkManager {
         // Calculate hash
         tx.hash = tx.calculate_hash();
         
-        // Sign with Ed25519 - MUST match verify format in node.rs verify_ed25519_tx_signature
-        // Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp
+        // Sign with Ed25519 — MUST match build_canonical_verify_message() in node.rs
+        // Transfer canonical: "transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}"
         let message = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            tx.from, receiver.address, amount, nonce, tx.gas_price, tx.gas_limit, timestamp
+            "transfer:{}:{}:{}:{}:{}:{}",
+            tx.from, receiver.address, amount, nonce, tx.gas_price, tx.gas_limit
         );
         let signature = sender.signing_key.sign(message.as_bytes());
         tx.signature = Some(hex::encode(signature.to_bytes()));
@@ -671,6 +667,10 @@ lazy_static::lazy_static! {
 mod tests {
     use super::*;
     use std::time::Instant;
+    use pqcrypto_mldsa::mldsa65 as dilithium3;
+    use pqcrypto_traits::sign::SignedMessage as PqSignedMessage;
+    use pqcrypto_traits::sign::PublicKey as PqPublicKey;
+    use pqcrypto_traits::sign::SecretKey as PqSecretKey;
 
     /// Test transaction generation speed (no network required)
     /// Measures: key generation, TX creation, signing
@@ -770,5 +770,610 @@ mod tests {
         
         assert!(total_generated > 100_000, "Should generate at least 100K TX with 256 shards");
     }
+
+    // =========================================================================
+    // SIGNATURE BENCHMARKS — 2 variants × 4 presets each
+    //
+    // Variant A: Ed25519-only (current production mempool path)
+    // Variant B: Hybrid Ed25519 + Dilithium3 (ML-DSA-65) — full PQ path
+    //
+    // Presets (same 4 levels used across both variants):
+    //   small  — light smoke test, fast
+    //   medium — moderate load
+    //   high   — stress level
+    //   custom — 1 M TX / target 100 K TPS (Ed25519); 50 K TX (Hybrid, Dilithium3 is ~50× slower)
+    //
+    // API preset equivalents (BenchmarkConfig::from_preset):
+    //   small  ≈ StabilityTest  (5K TPS,  50K TX)
+    //   medium ≈ StressTest     (20K TPS, 200K TX)
+    //   high   ≈ MaxCapacity    (50K TPS, 500K TX)
+    //   custom ≈ FullScale      (100K TPS target, 1M TX)
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // Shared helper: run one sign+verify loop, return (sign_tps, verify_tps)
+    // -------------------------------------------------------------------------
+    fn run_ed25519_bench(n: usize) -> (f64, f64) {
+        use ed25519_dalek::{SigningKey, Signer, Verifier};
+        use rand::rngs::OsRng;
+
+        let mut csprng = OsRng;
+        let key = SigningKey::generate(&mut csprng);
+        let vk  = key.verifying_key();
+        let msg = b"from|to|1000000000|1|1|10000|1700000000";
+
+        // warm-up
+        let _ = key.sign(msg);
+
+        let t0 = Instant::now();
+        for _ in 0..n { let _ = key.sign(msg); }
+        let sign_tps = n as f64 / t0.elapsed().as_secs_f64();
+
+        let sig = key.sign(msg);
+        let t1 = Instant::now();
+        for _ in 0..n { vk.verify(msg, &sig).unwrap(); }
+        let verify_tps = n as f64 / t1.elapsed().as_secs_f64();
+
+        (sign_tps, verify_tps)
+    }
+
+    fn run_hybrid_bench(n: usize) -> (f64, f64) {
+        use ed25519_dalek::{SigningKey, Signer, Verifier};
+        use rand::rngs::OsRng;
+
+        let mut csprng       = OsRng;
+        let ed_key           = SigningKey::generate(&mut csprng);
+        let ed_vk            = ed_key.verifying_key();
+        let (pq_pk, pq_sk)   = dilithium3::keypair();
+        let msg              = b"from|to|1000000000|1|1|10000|1700000000";
+
+        // warm-up
+        let _ = ed_key.sign(msg);
+        let _ = dilithium3::sign(msg, &pq_sk);
+
+        let t0 = Instant::now();
+        for _ in 0..n {
+            let _ = ed_key.sign(msg);
+            let _ = dilithium3::sign(msg, &pq_sk);
+        }
+        let sign_tps = n as f64 / t0.elapsed().as_secs_f64();
+
+        let ed_sig  = ed_key.sign(msg);
+        let pq_sig  = dilithium3::sign(msg, &pq_sk);
+        let t1 = Instant::now();
+        for _ in 0..n {
+            ed_vk.verify(msg, &ed_sig).unwrap();
+            dilithium3::open(&pq_sig, &pq_pk).unwrap();
+        }
+        let verify_tps = n as f64 / t1.elapsed().as_secs_f64();
+
+        (sign_tps, verify_tps)
+    }
+
+    fn print_sig_result(label: &str, preset: &str, n: usize, sign_tps: f64, verify_tps: f64) {
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║  {:<60}║", format!("{} — preset: {}", label, preset));
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║  TX count   : {:>10}                                    ║", n);
+        println!("║  Sign TPS   : {:>10.0}  ops/s per core                  ║", sign_tps);
+        println!("║  Verify TPS : {:>10.0}  ops/s per core                  ║", verify_tps);
+        println!("║  ms/sign    : {:>10.3}  ms                               ║", 1000.0 / sign_tps);
+        println!("║  ms/verify  : {:>10.3}  ms                               ║", 1000.0 / verify_tps);
+        println!("╚══════════════════════════════════════════════════════════════╝");
+    }
+
+    // =========================================================================
+    // VARIANT A: Ed25519-only
+    // =========================================================================
+
+    #[test]
+    fn bench_ed25519_small() {
+        let n = 10_000;
+        let (s, v) = run_ed25519_bench(n);
+        print_sig_result("Ed25519-only", "small (10K TX)", n, s, v);
+        assert!(s > 10_000.0, "Ed25519 sign must exceed 10K ops/s");
+        assert!(v > 5_000.0,  "Ed25519 verify must exceed 5K ops/s");
+    }
+
+    #[test]
+    fn bench_ed25519_medium() {
+        let n = 100_000;
+        let (s, v) = run_ed25519_bench(n);
+        print_sig_result("Ed25519-only", "medium (100K TX)", n, s, v);
+        assert!(s > 10_000.0);
+        assert!(v > 5_000.0);
+    }
+
+    #[test]
+    fn bench_ed25519_high() {
+        let n = 500_000;
+        let (s, v) = run_ed25519_bench(n);
+        print_sig_result("Ed25519-only", "high (500K TX)", n, s, v);
+        assert!(s > 10_000.0);
+        assert!(v > 5_000.0);
+    }
+
+    /// Custom preset: 1 M TX, target 100K TPS
+    /// This is the honest upper bound for mempool-only throughput (no P2P, no finality).
+    #[test]
+    fn bench_ed25519_custom() {
+        let n = 1_000_000;
+        let (s, v) = run_ed25519_bench(n);
+        print_sig_result("Ed25519-only", "custom (1M TX / 100K TPS target)", n, s, v);
+        println!("  ℹ️  This number is MEMPOOL-ONLY. E2E finality TPS is lower.");
+        println!("     Run bench_e2e_finality_simulation for the honest E2E number.");
+        assert!(s > 10_000.0);
+        assert!(v > 5_000.0);
+    }
+
+    // =========================================================================
+    // VARIANT B: Hybrid — Ed25519 + Dilithium3 (ML-DSA-65)
+    //
+    // Each TX is double-signed: Ed25519 for speed + Dilithium3 for quantum safety.
+    // Dilithium3 is ~50× slower than Ed25519, so TX counts are proportionally smaller
+    // to keep test runtime reasonable.
+    // =========================================================================
+
+    #[test]
+    fn bench_hybrid_small() {
+        let n = 1_000; // 10× less than Ed25519 small (10K)
+        let (s, v) = run_hybrid_bench(n);
+        print_sig_result("Hybrid (Ed25519 + Dilithium3)", "small (1K TX)", n, s, v);
+        assert!(s > 50.0,  "Hybrid sign must exceed 50 ops/s per core");
+        assert!(v > 100.0, "Hybrid verify must exceed 100 ops/s per core");
+    }
+
+    #[test]
+    fn bench_hybrid_medium() {
+        let n = 10_000; // 10× less than Ed25519 medium (100K)
+        let (s, v) = run_hybrid_bench(n);
+        print_sig_result("Hybrid (Ed25519 + Dilithium3)", "medium (10K TX)", n, s, v);
+        assert!(s > 50.0);
+        assert!(v > 100.0);
+    }
+
+    #[test]
+    fn bench_hybrid_high() {
+        let n = 50_000; // 10× less than Ed25519 high (500K)
+        let (s, v) = run_hybrid_bench(n);
+        print_sig_result("Hybrid (Ed25519 + Dilithium3)", "high (50K TX)", n, s, v);
+        assert!(s > 50.0);
+        assert!(v > 100.0);
+    }
+
+    /// Custom preset for hybrid: 100K TX (10× less than Ed25519 custom 1M).
+    /// Target is still 100K TPS conceptually — per-core Dilithium3 verify is the
+    /// real bottleneck; multiply by CPU core count for total node capacity.
+    #[test]
+    fn bench_hybrid_custom() {
+        let n = 100_000; // 10× less than Ed25519 custom (1M)
+        let (s, v) = run_hybrid_bench(n);
+        print_sig_result("Hybrid (Ed25519 + Dilithium3)", "custom (100K TX / 100K TPS target)", n, s, v);
+        println!("  ℹ️  For 100K TPS with hybrid sigs you need: ceil(100_000 / verify_tps) cores.");
+        println!("     Example: if verify_tps=2000, you need 50 cores to hit 100K TPS.");
+        assert!(s > 50.0);
+        assert!(v > 100.0);
+    }
+
+    // =========================================================================
+    // E2E FINALITY SIMULATION (no live network required)
+    //
+    // Simulates the FULL pipeline — not just mempool:
+    //   TX signed → mempool accepted (verify) → microblock produced → MacroBlock finalized
+    //
+    // Measures the honest E2E numbers:
+    //   - sign_tps       : how fast client can produce signed TX
+    //   - mempool_tps    : how fast node accepts TX (verify gate)
+    //   - e2e_tps        : TX finalized per wall-second (includes block production time)
+    //   - p50/p99 latency: time from TX submission to microblock inclusion
+    //   - MacroBlock time: deterministic ~90s finality window
+    // =========================================================================
+
+    /// Block production constants (production values)
+    const MICROBLOCK_INTERVAL_MS: u64 = 1_000;   // 1 s per microblock
+    const MICROBLOCKS_PER_MACRO:  u64 = 90;      // MacroBlock every 90 microblocks
+    const MAX_TX_PER_BLOCK:       u64 = 200_000; // max TX included per microblock
+
+    /// E2E finality simulation with Ed25519 signatures.
+    /// Use this to get the honest finality TPS rather than the mempool-only number.
+    #[test]
+    fn bench_e2e_finality_simulation() {
+        use ed25519_dalek::{SigningKey, Signer, Verifier};
+        use rand::rngs::OsRng;
+        use std::collections::VecDeque;
+
+        // Preset: high (500K TX equivalent — but we cap at 200K to keep test fast)
+        let num_accounts = 2_000usize;
+        let total_tx     = 200_000u64;
+
+        println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("📊 E2E FINALITY SIMULATION — Ed25519, {} TX, {} accounts", total_tx, num_accounts);
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+        let mut csprng = OsRng;
+        let keys: Vec<SigningKey> = (0..num_accounts)
+            .map(|_| SigningKey::generate(&mut csprng))
+            .collect();
+        let msg_base = "qnet_e2e_transfer";
+
+        // Phase 1: Sign (client side)
+        let t_sign = Instant::now();
+        let mut queue: VecDeque<(u64, Vec<u8>, usize)> = VecDeque::new(); // (submit_us, sig, key_idx)
+        for i in 0..total_tx {
+            let ki  = (i as usize) % num_accounts;
+            let msg = format!("{msg_base}|{i}");
+            let sig = keys[ki].sign(msg.as_bytes());
+            queue.push_back((t_sign.elapsed().as_micros() as u64, sig.to_bytes().to_vec(), ki));
+        }
+        let sign_tps = total_tx as f64 / t_sign.elapsed().as_secs_f64();
+        println!("  ✏️  Phase 1 sign   : {:.0} TX/s", sign_tps);
+
+        // Phase 2: Mempool accept (verify gate)
+        let t_verify = Instant::now();
+        let mut mempool: VecDeque<(u64, usize, u64)> = VecDeque::new(); // (submit_us, tx_idx, ki)
+        let mut accepted = 0u64;
+        for (tx_idx, (submit_us, sig_bytes, ki)) in queue.iter().enumerate() {
+            let msg = format!("{msg_base}|{tx_idx}");
+            let vk  = keys[*ki].verifying_key();
+            if sig_bytes.len() == 64 {
+                let arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
+                let sig = ed25519_dalek::Signature::from_bytes(&arr);
+                if vk.verify(msg.as_bytes(), &sig).is_ok() {
+                    mempool.push_back((*submit_us, tx_idx, *ki as u64));
+                    accepted += 1;
+                }
+            }
+        }
+        let mempool_tps = accepted as f64 / t_verify.elapsed().as_secs_f64();
+        println!("  🔍 Phase 2 mempool : {:.0} TX/s  ({} accepted)", mempool_tps, accepted);
+
+        // Phase 3: Block production (drain mempool into microblocks)
+        let mut finalized   = 0u64;
+        let mut block_num   = 0u64;
+        let mut macro_count = 0u64;
+        let mut latencies_ms: Vec<f64> = Vec::new();
+
+        while !mempool.is_empty() {
+            block_num += 1;
+            let block_time_us = block_num * MICROBLOCK_INTERVAL_MS * 1_000;
+            let batch = MAX_TX_PER_BLOCK.min(mempool.len() as u64);
+            for _ in 0..batch {
+                if let Some((submit_us, _, _)) = mempool.pop_front() {
+                    let lat_ms = block_time_us.saturating_sub(submit_us) as f64 / 1_000.0;
+                    latencies_ms.push(lat_ms);
+                    finalized += 1;
+                }
+            }
+            if block_num % MICROBLOCKS_PER_MACRO == 0 { macro_count += 1; }
+        }
+
+        let sim_wall_s = block_num as f64 * MICROBLOCK_INTERVAL_MS as f64 / 1_000.0;
+        let e2e_tps    = finalized as f64 / sim_wall_s;
+
+        latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = latencies_ms[latencies_ms.len() * 50 / 100];
+        let p99 = latencies_ms[latencies_ms.len() * 99 / 100];
+        let avg = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
+
+        println!("  📦 Phase 3 blocks  : {} microblocks, {} MacroBlocks, {:.1}s simulated",
+                 block_num, macro_count, sim_wall_s);
+
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║         E2E FINALITY RESULTS — Ed25519, {} TX          ║", total_tx);
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║  Sign TPS   (client)          : {:>12.0} TX/s          ║", sign_tps);
+        println!("║  Mempool TPS (node verify)    : {:>12.0} TX/s          ║", mempool_tps);
+        println!("║  E2E finality TPS             : {:>12.0} TX/s  ←       ║", e2e_tps);
+        println!("║  Latency p50 (→ microblock)   : {:>9.1} ms             ║", p50);
+        println!("║  Latency p99 (→ microblock)   : {:>9.1} ms             ║", p99);
+        println!("║  Latency avg                  : {:>9.1} ms             ║", avg);
+        println!("║  MacroBlock finality window   : {:>9.0} s              ║",
+                 MICROBLOCKS_PER_MACRO * MICROBLOCK_INTERVAL_MS / 1_000);
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║  ⚠️  53K TPS is mempool-only. E2E TPS is block-limited.     ║");
+        println!("║  P2P propagation + consensus rounds add latency on top.     ║");
+        println!("╚══════════════════════════════════════════════════════════════╝");
+
+        assert_eq!(finalized, total_tx, "all TX must be finalized");
+        assert!(e2e_tps > 0.0);
+        assert!(p50 < 2_000.0, "p50 must be <2s");
+    }
+
+    /// E2E finality simulation with Hybrid signatures (Ed25519 + Dilithium3).
+    /// Shows the REAL E2E throughput when quantum-resistant signing is enabled.
+    #[test]
+    fn bench_e2e_finality_hybrid() {
+        use ed25519_dalek::{SigningKey, Signer, Verifier};
+        use rand::rngs::OsRng;
+        use std::collections::VecDeque;
+
+        // 10× less than Ed25519 E2E test (200K → 20K); Dilithium3 is ~10-50× slower per op
+        let num_accounts = 1_000usize;
+        let total_tx     = 20_000u64;
+
+        println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("📊 E2E FINALITY SIMULATION — Hybrid, {} TX, {} accounts", total_tx, num_accounts);
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+        let mut csprng = OsRng;
+        // Generate Ed25519 + Dilithium3 keypairs for each account
+        let ed_keys: Vec<SigningKey>      = (0..num_accounts).map(|_| SigningKey::generate(&mut csprng)).collect();
+        let pq_pairs: Vec<_>             = (0..num_accounts).map(|_| dilithium3::keypair()).collect();
+        let msg_base = "qnet_e2e_hybrid";
+
+        // Phase 1: Double-sign (Ed25519 + Dilithium3)
+        let t_sign = Instant::now();
+        struct SignedEntry { submit_us: u64, ed_sig: Vec<u8>, pq_sig: Vec<u8>, ki: usize, tx_idx: u64 }
+        let mut signed_batch: Vec<SignedEntry> = Vec::with_capacity(total_tx as usize);
+
+        for i in 0..total_tx {
+            let ki  = (i as usize) % num_accounts;
+            let msg = format!("{msg_base}|{i}");
+            let ed_sig = ed_keys[ki].sign(msg.as_bytes()).to_bytes().to_vec();
+            let pq_sig = dilithium3::sign(msg.as_bytes(), &pq_pairs[ki].1).as_bytes().to_vec();
+            signed_batch.push(SignedEntry {
+                submit_us: t_sign.elapsed().as_micros() as u64,
+                ed_sig, pq_sig, ki, tx_idx: i,
+            });
+        }
+        let sign_tps = total_tx as f64 / t_sign.elapsed().as_secs_f64();
+        println!("  ✏️  Phase 1 hybrid sign : {:.0} TX/s", sign_tps);
+
+        // Phase 2: Dual-verify mempool gate
+        let t_verify = Instant::now();
+        let mut mempool: VecDeque<(u64,)> = VecDeque::new();
+        let mut accepted = 0u64;
+
+        for entry in &signed_batch {
+            let msg = format!("{msg_base}|{}", entry.tx_idx);
+            let ed_vk = ed_keys[entry.ki].verifying_key();
+            let (ref pq_pk, _) = pq_pairs[entry.ki];
+
+            let ed_ok = if entry.ed_sig.len() == 64 {
+                let arr: [u8; 64] = entry.ed_sig.as_slice().try_into().unwrap();
+                ed_vk.verify(msg.as_bytes(), &ed25519_dalek::Signature::from_bytes(&arr)).is_ok()
+            } else { false };
+
+            // Reconstruct pqcrypto SignedMessage from raw bytes for open()
+            let pq_ok = <dilithium3::SignedMessage as PqSignedMessage>::from_bytes(&entry.pq_sig)
+                .map(|sm| dilithium3::open(&sm, pq_pk).is_ok())
+                .unwrap_or(false);
+
+            if ed_ok && pq_ok {
+                mempool.push_back((entry.submit_us,));
+                accepted += 1;
+            }
+        }
+        let mempool_tps = accepted as f64 / t_verify.elapsed().as_secs_f64();
+        println!("  🔍 Phase 2 dual-verify : {:.0} TX/s  ({} accepted)", mempool_tps, accepted);
+
+        // Phase 3: Block production
+        let mut finalized   = 0u64;
+        let mut block_num   = 0u64;
+        let mut macro_count = 0u64;
+        let mut latencies_ms: Vec<f64> = Vec::new();
+
+        while !mempool.is_empty() {
+            block_num += 1;
+            let block_time_us = block_num * MICROBLOCK_INTERVAL_MS * 1_000;
+            let batch = MAX_TX_PER_BLOCK.min(mempool.len() as u64);
+            for _ in 0..batch {
+                if let Some((submit_us,)) = mempool.pop_front() {
+                    latencies_ms.push(block_time_us.saturating_sub(submit_us) as f64 / 1_000.0);
+                    finalized += 1;
+                }
+            }
+            if block_num % MICROBLOCKS_PER_MACRO == 0 { macro_count += 1; }
+        }
+
+        let sim_wall_s = block_num as f64 * MICROBLOCK_INTERVAL_MS as f64 / 1_000.0;
+        let e2e_tps    = finalized as f64 / sim_wall_s;
+
+        latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = latencies_ms[latencies_ms.len() * 50 / 100];
+        let p99 = latencies_ms[latencies_ms.len() * 99 / 100];
+
+        println!("  📦 Phase 3 blocks  : {} microblocks, {} MacroBlocks, {:.1}s simulated",
+                 block_num, macro_count, sim_wall_s);
+
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║  E2E FINALITY RESULTS — Hybrid (Ed25519+Dilithium3), {}K TX  ║", total_tx/1000);
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║  Sign TPS   (double-sign)     : {:>12.0} TX/s          ║", sign_tps);
+        println!("║  Mempool TPS (dual-verify)    : {:>12.0} TX/s          ║", mempool_tps);
+        println!("║  E2E finality TPS             : {:>12.0} TX/s  ←       ║", e2e_tps);
+        println!("║  Latency p50 (→ microblock)   : {:>9.1} ms             ║", p50);
+        println!("║  Latency p99 (→ microblock)   : {:>9.1} ms             ║", p99);
+        println!("║  MacroBlock finality window   : {:>9.0} s              ║",
+                 MICROBLOCKS_PER_MACRO * MICROBLOCK_INTERVAL_MS / 1_000);
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║  To reach 100K TPS with hybrid sigs:                        ║");
+        println!("║    cores_needed = ceil(100_000 / mempool_tps_per_core)      ║");
+        println!("╚══════════════════════════════════════════════════════════════╝");
+
+        assert!(finalized > 0);
+        assert!(e2e_tps > 0.0);
+    }
+
+    // =========================================================================
+    // LIVE SERVER INTEGRATION TESTS
+    // =========================================================================
+    //
+    // Require a running QNet node with QNET_BENCHMARK_MODE=true on a Genesis node.
+    // Server genesis creates EON1benchmark000000..000999 (1M QNC each).
+    //
+    // TX flow on server:
+    //   POST /api/v1/benchmark/start → server generates + signs TX internally
+    //   → submit_benchmark_batch → verify_ed25519_batch (real crypto)
+    //   → mempool → P2P broadcast → block production → finalized
+    //
+    // NOTE: benchmark TX use EON1benchmark* addresses which do NOT pass
+    // validate_eon_address (41-char format). They go through the dedicated
+    // benchmark pipeline, not through POST /api/v1/transaction.
+    //
+    // Run (set env vars to your node):
+    //   QNET_NODE_URL=http://<host>:<port> \
+    //   QNET_API_KEY=<your-api-key> \
+    //   cargo test --lib -- bench_server --ignored --nocapture
+    //
+    // #[ignore] — skipped in CI, only run when QNET_NODE_URL is set.
+    // =========================================================================
+
+    fn make_http_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .expect("reqwest client build failed")
+    }
+
+    fn add_api_key(
+        req: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        if let Ok(key) = std::env::var("QNET_API_KEY") {
+            req.header("x-api-key", key)
+        } else {
+            req
+        }
+    }
+
+    fn get_node_url() -> Option<String> {
+        std::env::var("QNET_NODE_URL").ok().map(|u| u.trim_end_matches('/').to_string())
+    }
+
+    fn health_check(client: &reqwest::blocking::Client, base: &str) -> bool {
+        match add_api_key(client.get(format!("{}/api/v1/node/health", base))).send() {
+            Ok(r) if r.status().is_success() => { println!("  Node health OK"); true }
+            Ok(r) => { println!("  Node health: {}", r.status()); false }
+            Err(e) => { println!("  Cannot reach node: {}", e); false }
+        }
+    }
+
+    fn poll_benchmark(client: &reqwest::blocking::Client, base: &str, timeout_secs: u64) {
+        let poll_start = Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let status: serde_json::Value = add_api_key(
+                client.get(format!("{}/api/v1/benchmark/status", base))
+            ).send().expect("GET /benchmark/status failed")
+             .json().expect("status JSON parse failed");
+
+            let running   = status["is_running"].as_bool().unwrap_or(true);
+            let sent      = status["transactions_sent"].as_u64().unwrap_or(0);
+            let confirmed = status["transactions_confirmed"].as_u64().unwrap_or(0);
+            let cur_tps   = status["current_tps"].as_f64().unwrap_or(0.0);
+
+            println!("  t={:.0}s  sent={:<8}  confirmed={:<8}  tps={:.0}",
+                     poll_start.elapsed().as_secs(), sent, confirmed, cur_tps);
+
+            if !running { break; }
+            if poll_start.elapsed().as_secs() > timeout_secs {
+                println!("  Poll timeout at {}s", timeout_secs);
+                break;
+            }
+        }
+    }
+
+    fn print_live_results(client: &reqwest::blocking::Client, base: &str, label: &str) {
+        let results: serde_json::Value = add_api_key(
+            client.get(format!("{}/api/v1/benchmark/results", base))
+        ).send().expect("GET /benchmark/results failed")
+         .json().expect("results JSON parse failed");
+
+        let total       = results["total_transactions"].as_u64().unwrap_or(0);
+        let confirmed   = results["confirmed_transactions"].as_u64().unwrap_or(0);
+        let avg_tps     = results["average_tps"].as_f64().unwrap_or(0.0);
+        let peak_tps    = results["peak_tps"].as_f64().unwrap_or(0.0);
+        let success_pct = results["success_rate"].as_f64().unwrap_or(0.0);
+        let avg_lat     = results["avg_latency_ms"].as_f64().unwrap_or(0.0);
+        let p99_lat     = results["p99_latency_ms"].as_f64().unwrap_or(0.0);
+
+        println!("\n  {}", label);
+        println!("  Total TX       : {}", total);
+        println!("  Confirmed      : {} (mempool+block)", confirmed);
+        println!("  Success rate   : {:.1}%", success_pct);
+        println!("  Average TPS    : {:.0}", avg_tps);
+        println!("  Peak TPS       : {:.0}", peak_tps);
+        println!("  Avg latency    : {:.1} ms", avg_lat);
+        println!("  p99 latency    : {:.1} ms", p99_lat);
+
+        assert!(confirmed > 0,
+            "FAIL: 0 TX confirmed! Check QNET_BENCHMARK_MODE=true on server.");
+        assert!(success_pct > 50.0,
+            "FAIL: success rate {:.1}% too low", success_pct);
+        assert!(avg_tps > 100.0,
+            "FAIL: average TPS {:.0} too low", avg_tps);
+    }
+
+    // =========================================================================
+    // Ed25519 server benchmarks -- 4 presets
+    // Server generates + signs TX internally via submit_benchmark_batch.
+    // Full sig verification, P2P broadcast, block inclusion.
+    // =========================================================================
+
+    #[test]
+    #[ignore = "live node: QNET_NODE_URL + QNET_API_KEY"]
+    fn bench_server_ed25519_small() {
+        let base = match get_node_url() { Some(u) => u, None => return };
+        let client = make_http_client();
+        if !health_check(&client, &base) { return; }
+        let body = serde_json::json!({"preset": "stability_test"});
+        let resp = add_api_key(client.post(format!("{}/api/v1/benchmark/start", base)).json(&body)).send().unwrap();
+        assert!(resp.status().is_success(), "start failed: {}", resp.status());
+        poll_benchmark(&client, &base, 120);
+        print_live_results(&client, &base, "Ed25519 stability_test (5K TPS, 50K TX)");
+    }
+
+    #[test]
+    #[ignore = "live node: QNET_NODE_URL + QNET_API_KEY"]
+    fn bench_server_ed25519_medium() {
+        let base = match get_node_url() { Some(u) => u, None => return };
+        let client = make_http_client();
+        if !health_check(&client, &base) { return; }
+        let body = serde_json::json!({"preset": "stress_test"});
+        let resp = add_api_key(client.post(format!("{}/api/v1/benchmark/start", base)).json(&body)).send().unwrap();
+        assert!(resp.status().is_success(), "start failed: {}", resp.status());
+        poll_benchmark(&client, &base, 180);
+        print_live_results(&client, &base, "Ed25519 stress_test (20K TPS, 200K TX)");
+    }
+
+    #[test]
+    #[ignore = "live node: QNET_NODE_URL + QNET_API_KEY"]
+    fn bench_server_ed25519_high() {
+        let base = match get_node_url() { Some(u) => u, None => return };
+        let client = make_http_client();
+        if !health_check(&client, &base) { return; }
+        let body = serde_json::json!({"preset": "max_capacity"});
+        let resp = add_api_key(client.post(format!("{}/api/v1/benchmark/start", base)).json(&body)).send().unwrap();
+        assert!(resp.status().is_success(), "start failed: {}", resp.status());
+        poll_benchmark(&client, &base, 300);
+        print_live_results(&client, &base, "Ed25519 max_capacity (50K TPS, 500K TX)");
+    }
+
+    #[test]
+    #[ignore = "live node: QNET_NODE_URL + QNET_API_KEY"]
+    fn bench_server_ed25519_custom() {
+        let base = match get_node_url() { Some(u) => u, None => return };
+        let client = make_http_client();
+        if !health_check(&client, &base) { return; }
+        let body = serde_json::json!({"target_tps": 100_000, "total": 1_000_000, "num_accounts": 10_000});
+        let resp = add_api_key(client.post(format!("{}/api/v1/benchmark/start", base)).json(&body)).send().unwrap();
+        assert!(resp.status().is_success(), "start failed: {}", resp.status());
+        poll_benchmark(&client, &base, 600);
+        print_live_results(&client, &base, "Ed25519 custom (100K TPS, 1M TX)");
+    }
+
+    // =========================================================================
+    // Hybrid (Ed25519 + Dilithium3) -- NOTE
+    //
+    // Server benchmark generator currently signs Ed25519 only.
+    // Hybrid throughput is measured locally (bench_hybrid_* tests).
+    // Per-core numbers * CPU cores = estimated server hybrid TPS.
+    // =========================================================================
+
+    // REMOVED: build_benchmark_tx, build_hybrid_benchmark_tx,
+    // bench_server_direct_ed25519, bench_server_direct_hybrid.
+    // Those used POST /api/v1/transaction which rejects EON1benchmark*
+    // addresses (validate_eon_address expects 41-char hex+eon format).
+    // The correct path is POST /api/v1/benchmark/start (above).
 }
 

@@ -162,6 +162,7 @@ struct RewardPoolsCache {
     pool2_fees: u64,
     pool3_activations: u64,
     epoch: u64,
+    #[allow(dead_code)]
     blocks_in_epoch: u64,
 }
 
@@ -399,6 +400,7 @@ impl ApiRateLimiter {
     }
     
     /// Get remaining requests for an IP/endpoint
+    #[allow(dead_code)]
     fn get_remaining(&self, ip: IpAddr, endpoint_type: &str) -> u32 {
         let config = self.configs.get(endpoint_type)
             .unwrap_or_else(|| self.configs.get("general").expect("General config must exist"));
@@ -562,6 +564,7 @@ const ALLOWED_ORIGINS: &[&str] = &[
 ];
 
 /// Check if origin is allowed
+#[allow(dead_code)]
 fn is_origin_allowed(origin: &str) -> bool {
     // In development mode, allow all origins
     if std::env::var("QNET_DEV_MODE").is_ok() {
@@ -673,6 +676,7 @@ fn validate_eon_address_with_error(address: &str) -> Result<(), String> {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct RpcRequest {
     jsonrpc: String,
     method: String,
@@ -767,6 +771,7 @@ struct NodeRegistrationClientRequest {
     dilithium_public_key: Option<String>,
     /// Public API endpoint (Super nodes only; Light nodes always empty for privacy)
     #[serde(default)]
+    #[allow(dead_code)]
     api_endpoint: Option<String>,
 }
 
@@ -1410,7 +1415,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::get())
         .and(warp::header::headers_cloned())
         .and(blockchain_filter.clone())
-        .and_then(|headers: warp::http::HeaderMap, blockchain: Arc<BlockchainNode>| async move {
+        .and_then(|_headers: warp::http::HeaderMap, blockchain: Arc<BlockchainNode>| async move {
             // FIX v2.92: REMOVED auto-registration of API clients as peers
             // PROBLEM: Any browser/explorer making API request was added as P2P peer
             // This caused nodes to endlessly try connecting to non-node IPs (node_80e2b6c2 bug)
@@ -4232,7 +4237,7 @@ async fn handle_transaction_submit(
     // PRODUCTION v2.77: Use BLAKE3 via calculate_hash() for consistency
     // This ensures client receives the SAME hash as stored in blockchain
     match bincode::serialize(&tx) {
-        Ok(tx_bytes) => {
+        Ok(_tx_bytes) => {
             let tx_hash = tx.calculate_hash();
             
             // Add to mempool using public method
@@ -5503,7 +5508,6 @@ async fn verify_dilithium_client_signature(
 /// PRODUCTION v2.78: Verify Dilithium signature (for registration/reactivation)
 /// ARCHITECTURE: Pure Dilithium verification using quantum crypto system
 async fn verify_dilithium_signature(node_id: &str, message: &str, signature: &str) -> bool {
-    use crate::quantum_crypto::QNetQuantumCrypto;
     use crate::node::try_get_quantum_crypto;
     
     // Basic validation
@@ -5848,10 +5852,9 @@ async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
 // PRODUCTION: Light Node Registry (persistent storage with in-memory cache)
 use std::sync::Mutex;
 
-use fcm::{Client, MessageBuilder, NotificationBuilder};
 
 // Import lazy rewards system
-use qnet_consensus::lazy_rewards::{PhaseAwareRewardManager, NodeType as RewardNodeType};
+use qnet_consensus::lazy_rewards::NodeType as RewardNodeType;
 
 /// Pending challenge for polling-based Light nodes
 #[derive(Debug, Clone)]
@@ -6921,7 +6924,7 @@ async fn handle_light_node_register(
 
 /// SECURE: Handle node info with activation code for authenticated wallet extensions
 async fn handle_node_secure_info(
-    params: HashMap<String, String>,
+    _params: HashMap<String, String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     // Get basic node info first
@@ -7535,6 +7538,7 @@ fn validate_unified_push_endpoint(endpoint: &str) -> Result<(), String> {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 struct ReactivateRequest {
     node_id: String,
     wallet_address: String,
@@ -8181,6 +8185,7 @@ impl FCMPushService {
 }
 
 // Calculate deterministic ping slot for Light node (0-239)
+#[allow(dead_code)]
 fn calculate_ping_slot(node_id: &str) -> u32 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -8194,6 +8199,7 @@ fn calculate_ping_slot(node_id: &str) -> u32 {
 }
 
 // Calculate next ping time for any node type (PRODUCTION: Unified for all node types)
+#[allow(dead_code)]
 fn calculate_next_ping_time(node_id: &str) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     
@@ -8213,6 +8219,7 @@ fn calculate_next_ping_time(node_id: &str) -> u64 {
 }
 
 // Calculate all ping times for Full/Super nodes (10 pings per 4h window)
+#[allow(dead_code)]
 fn calculate_full_super_ping_times(node_id: &str) -> Vec<u64> {
     use std::time::{SystemTime, UNIX_EPOCH};
     
@@ -8252,7 +8259,7 @@ fn calculate_full_super_ping_times(node_id: &str) -> Vec<u64> {
 pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
     use tokio::sync::Semaphore;
     use futures::stream::{FuturesUnordered, StreamExt};
-    use crate::unified_p2p::{SimplifiedP2P, PingerRole, LightNodeAttestation};
+    use crate::unified_p2p::{SimplifiedP2P, PingerRole};
     
     // v2.89: GENESIS-ONLY PINGING
     // Genesis nodes need higher concurrency for 2M Light nodes each
@@ -8321,7 +8328,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
         loop {
             check_interval.tick().await;
             
-            let now = std::time::SystemTime::now()
+            let _now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
@@ -8401,7 +8408,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                         let blockchain = blockchain_for_pings.clone();
                         let challenge = generate_quantum_challenge();
                         let delay = p2p.get_ping_delay(role);
-                        let our_node_id = blockchain.get_node_id();
+                        let _our_node_id = blockchain.get_node_id();
                         
                         futures.push(async move {
                             // BACKUP DELAY: Wait for primary to attempt first
@@ -9335,7 +9342,7 @@ async fn handle_get_reward_pools(
     let pending_reward = reward_manager.get_pending_reward(&node_id).cloned();
     drop(reward_manager);
     
-    let (pool1, pool2, pool3, total, phase_str) = if let Some(ref reward) = pending_reward {
+    let (pool1, pool2, pool3, total, _phase_str) = if let Some(ref reward) = pending_reward {
         (
             reward.pool1_base_emission,
             reward.pool2_transaction_fees,
@@ -9712,7 +9719,7 @@ async fn handle_get_reward_network_stats(
     // Get reward manager stats
     let reward_manager_arc = blockchain.get_reward_manager();
     let reward_manager = reward_manager_arc.read().await;
-    let total_registered_nodes = reward_manager.get_nodes_by_owner("").len(); // Empty returns 0, but we count all
+    let _total_registered_nodes = reward_manager.get_nodes_by_owner("").len(); // Empty returns 0, but we count all
     drop(reward_manager);
     
     // Scan storage for claim history
@@ -10649,9 +10656,6 @@ async fn handle_auth_challenge(
     request: AuthChallengeRequest,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    use sha3::{Sha3_256, Digest};
-    use rand::RngCore;
-    
     // Validate protocol version
     if request.protocol_version != "qnet-v1.0" {
         return Ok(warp::reply::json(&json!({
@@ -11120,7 +11124,7 @@ async fn handle_activations_by_wallet(
 async fn handle_generate_activation_code(
     request: GenerateActivationCodeRequest,
     remote_addr: Option<std::net::SocketAddr>,
-    blockchain: Arc<BlockchainNode>,
+    _blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     // SECURITY: Strict rate limiting for activation code generation (expensive operation)
     if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "activation") {
@@ -11476,6 +11480,7 @@ async fn handle_verify_activation_onchain(
 // PRODUCTION: Macroblock Consensus Handlers
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ConsensusCommitRequest {
     round: u64,
     node_id: String,
@@ -11484,6 +11489,7 @@ struct ConsensusCommitRequest {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ConsensusRevealRequest {
     round: u64,
     node_id: String,
@@ -11954,6 +11960,7 @@ async fn lookup_peer_pseudonym(raw_ip: &str) -> String {
 }
 
 /// PRODUCTION: Extract peer IP address from HTTP request
+#[allow(dead_code)]
 fn extract_peer_ip_from_request() -> Option<String> {
     // In full warp implementation, this would access request headers:
     // 1. X-Forwarded-For header (for proxied connections)
@@ -12063,6 +12070,7 @@ fn is_macroblock_consensus_round(round_id: u64) -> bool {
 }
 
 /// Extract peer IP from HTTP headers (PRODUCTION ready)
+#[allow(dead_code)]
 fn extract_peer_ip_from_headers(headers: &warp::http::HeaderMap) -> Option<String> {
     // Priority 1: X-Forwarded-For (handles proxy chains)
     if let Some(forwarded) = headers.get("x-forwarded-for") {
@@ -12553,7 +12561,7 @@ async fn handle_public_stats(
 /// GET /api/v1/activation/price?type=super
 async fn handle_activation_price(
     params: HashMap<String, String>,
-    blockchain: Arc<BlockchainNode>,
+    _blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     let node_type = params.get("type").map(|s| s.as_str()).unwrap_or("light");
     
@@ -12713,7 +12721,7 @@ async fn handle_producer_status(
     let blocks_until_rotation = next_rotation.saturating_sub(current_height);
     
     // CRITICAL FIX: Get current producer for next block (already calculated above)
-    let mut current_producer = if let Some(p2p) = blockchain.get_unified_p2p() {
+    let current_producer = if let Some(p2p) = blockchain.get_unified_p2p() {
         // Use the same logic as in node.rs to determine current producer
         crate::node::BlockchainNode::select_microblock_producer(
             next_height,
@@ -14014,7 +14022,7 @@ async fn handle_contract_state(
 /// Handle gas estimation for contract operations
 async fn handle_contract_estimate_gas(
     request: Value,
-    blockchain: Arc<BlockchainNode>,
+    _blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     let operation = request.get("operation")
         .and_then(|v| v.as_str())
@@ -14134,6 +14142,7 @@ fn event_matches_channels(event: &WsEvent, channels: &[WsChannel]) -> bool {
 }
 
 /// Handle WebSocket connection
+#[allow(dead_code)]
 async fn handle_ws_connection(
     ws: WebSocket,
     query: WsSubscribeQuery,

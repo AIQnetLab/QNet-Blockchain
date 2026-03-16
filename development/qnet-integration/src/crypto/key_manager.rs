@@ -4,7 +4,6 @@ use std::sync::{Arc, RwLock, OnceLock};
 use anyhow::{Result, anyhow};
 use pqcrypto_mldsa::mldsa65 as dilithium3;
 use pqcrypto_traits::sign::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait, SignedMessage as SignedMessageTrait};
-use serde::{Serialize, Deserialize};
 use sha3::{Sha3_256, Digest};
 
 // ═══════════════════════════════════════════════════════════════════════════════

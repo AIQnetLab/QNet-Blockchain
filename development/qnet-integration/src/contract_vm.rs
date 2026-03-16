@@ -77,10 +77,6 @@ pub struct TokenBalance {
 pub struct ContractVM {
     /// Storage reference
     storage: Arc<Storage>,
-    /// Gas price (nanoQNC per gas unit)
-    gas_price: u64,
-    /// Maximum gas per call
-    max_gas: u64,
 }
 
 impl ContractVM {
@@ -89,8 +85,6 @@ impl ContractVM {
     pub fn new(storage: Arc<Storage>) -> Self {
         Self {
             storage,
-            gas_price: 1000, // 1000 nanoQNC per gas
-            max_gas: 10_000_000, // 10M gas limit
         }
     }
     

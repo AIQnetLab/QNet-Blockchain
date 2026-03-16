@@ -1,10 +1,9 @@
-﻿//! QNet Network Configuration
+//! QNet Network Configuration
 //! Centralized configuration for testnet/mainnet separation
 //! 
 //! This replaces all hardcoded URLs and provides network-specific endpoints
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Network environment type
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -17,11 +17,10 @@ use serde_json;
 use base64::Engine;
 use sha3::{Sha3_256, Digest};
 use reed_solomon_erasure::galois_8::ReedSolomon;
-use futures::{future, stream, StreamExt};
+use futures::future;
 
 // Import QNet consensus components for proper peer validation
 use qnet_consensus::reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
-use qnet_consensus::{commit_reveal::{Commit, Reveal}, ConsensusEngine};
 
 // ============================================================================
 // PRODUCTION CONSTANTS: Capacity limits for scalability
@@ -37,10 +36,12 @@ const MAX_ATTESTATIONS_SIZE: usize = 100_000;
 
 /// Max heartbeat records in RAM (24h window, auto-cleanup)
 /// 100K records × ~200 bytes = ~20MB RAM
+#[allow(dead_code)]
 const MAX_HEARTBEATS_SIZE: usize = 100_000;
 
 /// Max active Full/Super nodes tracked
 /// 10K nodes × ~150 bytes = ~1.5MB RAM
+#[allow(dead_code)]
 const MAX_ACTIVE_NODES_SIZE: usize = 10_000;
 
 /// Max connected peers (Full/Super nodes) to prevent phantom peer accumulation
@@ -49,6 +50,7 @@ const MAX_ACTIVE_NODES_SIZE: usize = 10_000;
 const MAX_CONNECTED_PEERS: usize = 1000;
 
 /// Stale node timeout (15 minutes without heartbeat/announcement)
+#[allow(dead_code)]
 const STALE_NODE_TIMEOUT_SECS: u64 = 15 * 60;
 
 /// Attestation/Heartbeat retention (24 hours)
@@ -137,6 +139,7 @@ static CACHED_PEERS: Lazy<Arc<Mutex<(Vec<PeerInfo>, Instant, String)>>> =
     Lazy::new(|| Arc::new(Mutex::new((Vec::new(), Instant::now(), String::new()))));
 
 // SYNC FIX: Track blocks currently being downloaded to prevent race conditions
+#[allow(dead_code)]
 static DOWNLOADING_BLOCKS: Lazy<Arc<RwLock<HashSet<u64>>>> = 
     Lazy::new(|| Arc::new(RwLock::new(HashSet::new())));
 
@@ -1026,6 +1029,7 @@ pub fn get_quic_fallback_metrics() -> (u64, u64, u64) {
 // Cooldown constants
 const PEER_COOLDOWN_BASE_SECS: u64 = 2;    // Base cooldown: 2 seconds
 const PEER_COOLDOWN_MAX_SECS: u64 = 30;    // Max cooldown: 30 seconds
+#[allow(dead_code)]
 const PEER_COOLDOWN_RESET_SECS: u64 = 60;  // Reset retry count after 60s of success
 
 /// SYNC: Blacklist reason categories (Soft vs Hard)
@@ -1387,6 +1391,7 @@ pub struct SimplifiedP2P {
     is_running: Arc<Mutex<bool>>,
     
     /// Leadership tracking for failover detection
+    #[allow(dead_code)]
     previous_leader: Arc<Mutex<Option<String>>>,
     
     /// Reputation system for consensus (public for ping service access)
@@ -1935,7 +1940,9 @@ const KADEMLIA_K: usize = 20;        // K-bucket size
 const KADEMLIA_ALPHA: usize = 3;     // Concurrent queries
 const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 const KADEMLIA_REFRESH_INTERVAL_SECS: u64 = 600; // Refresh stale buckets every 10 min
+#[allow(dead_code)]
 const KADEMLIA_LOOKUP_TIMEOUT_MS: u64 = 5000;    // Single lookup round timeout
+#[allow(dead_code)]
 const KADEMLIA_MAX_HOPS: u8 = 5;                 // Max iterative lookup rounds
 
 /// Production Kademlia DHT routing table with 256 k-buckets.
@@ -2096,6 +2103,7 @@ const SHRED_PROTOCOL_MAX_CHUNKS: usize = 170;         // Max data chunks (170 + 
 const SHRED_CHUNK_TIMEOUT_SECS: u64 = 5;            // Timeout before requesting missing chunks (v2.31: increased from 3s for reliability)
 const SHRED_CHUNK_CACHE_SIZE: usize = 100;          // Cache last N blocks' chunks for retransmit (v2.21.3)
 const SHRED_CHUNK_MAX_RETRIES: u8 = 4;              // Max retransmit attempts per block (v2.31: increased from 2 for reliability)
+#[allow(dead_code)]
 const MAX_CONCURRENT_CHUNK_SENDS: usize = 20;       // Max concurrent QUIC streams for chunk sends (v2.21.4)
                                                      // Prevents receiver overload from burst of 72+ streams
 
@@ -2152,6 +2160,7 @@ pub struct ProducerCertificate {
 
 /// ShredProtocol block assembly state
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ShredProtocolBlockAssembly {
     height: u64,
     chunks_received: Vec<Option<Vec<u8>>>,
@@ -2170,6 +2179,7 @@ struct ShredProtocolBlockAssembly {
 /// PRODUCTION v2.21.3: Cache entry for chunk retransmit
 /// Stores chunks from successfully received blocks for responding to RequestMissingChunks
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ShredChunkCacheEntry {
     chunks: Vec<Option<Vec<u8>>>,       // Data chunks
     parity_chunks: Vec<Option<Vec<u8>>>, // Parity chunks
@@ -2450,7 +2460,7 @@ impl SimplifiedP2P {
     /// - Persistent connections with multiplexing (100 streams)
     /// - Server accepts incoming connections
     /// - NO HTTP fallback (pure QUIC)
-    pub async fn init_quic(&mut self, external_ip: &str, cert_serial: &str) -> Result<(), String> {
+    pub async fn init_quic(&mut self, _external_ip: &str, cert_serial: &str) -> Result<(), String> {
         use crate::quic_transport::{QuicTransport, QUIC_PORT, MessageHandler};
         use std::net::SocketAddr;
         
@@ -2530,8 +2540,7 @@ impl SimplifiedP2P {
     /// 
     /// Uses binary protocol (bincode) for efficient serialization
     pub async fn send_message_quic(&self, peer_addr: &str, message: &NetworkMessage) -> Result<Option<NetworkMessage>, String> {
-        use crate::p2p_transport::P2PTransport;
-        use std::net::SocketAddr;
+                use std::net::SocketAddr;
         
         if !self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("QUIC not enabled".into());
@@ -2896,6 +2905,7 @@ impl SimplifiedP2P {
     }
     
     /// Calculate XOR distance between two node IDs for Kademlia DHT
+    #[allow(dead_code)]
     fn calculate_xor_distance(id1: &[u8], id2: &[u8]) -> Vec<u8> {
         id1.iter().zip(id2.iter()).map(|(a, b)| a ^ b).collect()
     }
@@ -3757,13 +3767,13 @@ impl SimplifiedP2P {
             }
         };
         
-        let node_id = self.node_id.clone();
+        let _node_id = self.node_id.clone();
         let region = self.region.clone();
         let regional_peers = self.regional_peers.clone();
         let connected_peers = self.connected_peers_lockfree.clone();
-        let port = self.port;
-        let node_type = self.node_type.clone();
-        let reputation_system = self.reputation_system.clone();  // Clone for async block
+        let _port = self.port;
+        let _node_type = self.node_type.clone();
+        let _reputation_system = self.reputation_system.clone();  // Clone for async block
         
         handle.spawn(async move {
             println!("[INFO][P2P] Searching for QNet peers with cryptographic verification...");
@@ -3997,7 +4007,7 @@ impl SimplifiedP2P {
             // Initial delay to let network form
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             
-            let mut last_cleanup = std::time::Instant::now();
+            let _last_cleanup = std::time::Instant::now();
             
             loop {
                 // SCALABILITY: Adaptive sync intervals based on node type and network phase
@@ -4078,7 +4088,7 @@ impl SimplifiedP2P {
         
         // v2.51: Clone references for async task
         let connected_peers_lockfree = self.connected_peers_lockfree.clone();
-        let connected_peers = self.connected_peers_lockfree.clone();
+        let _connected_peers = self.connected_peers_lockfree.clone();
         let peer_id_to_addr = self.peer_id_to_addr.clone();
         let peer_shards = self.peer_shards.clone();
         let quic_transport = self.quic_transport.clone();
@@ -4405,7 +4415,7 @@ impl SimplifiedP2P {
     /// ═══════════════════════════════════════════════════════════════════════════
     fn start_background_repair_task(&self) {
         let shred_protocol_assemblies = self.shred_protocol_assemblies.clone();
-        let shred_chunk_cache = self.shred_chunk_cache.clone();
+        let _shred_chunk_cache = self.shred_chunk_cache.clone();
         let connected_peers_lockfree = self.connected_peers_lockfree.clone();
         let quic_transport = self.quic_transport.clone();
         let quic_enabled = self.quic_enabled.clone();
@@ -4844,6 +4854,7 @@ impl SimplifiedP2P {
     }
 
     /// Start multicast discovery for QNet nodes
+    #[allow(dead_code)]
     fn start_multicast_discovery(&self) {
         // SAFE: Check if Tokio runtime is available to prevent panic
         let handle = match tokio::runtime::Handle::try_current() {
@@ -4856,7 +4867,7 @@ impl SimplifiedP2P {
         
         let node_id = self.node_id.clone();
         let region = self.region.clone();
-        let connected_peers = self.connected_peers_lockfree.clone();
+        let _connected_peers = self.connected_peers_lockfree.clone();
         let port = self.port;
         
         handle.spawn(async move {
@@ -4888,7 +4899,7 @@ impl SimplifiedP2P {
     pub async fn broadcast_block(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
         use std::sync::Arc;
         use futures::future::join_all;
-        use crate::p2p_transport::{P2PTransport, QUIC_PORT_OFFSET};
+        use crate::p2p_transport::QUIC_PORT_OFFSET;
         
         // Get validated active peers
         let mut validated_peers = self.get_validated_active_peers();
@@ -5059,8 +5070,7 @@ impl SimplifiedP2P {
     /// PRODUCTION v2.19.21: Broadcast Genesis block via QUIC (async)
     /// Genesis is critical and must be delivered reliably to all peers
     pub async fn broadcast_genesis_block(&self, block_data: Vec<u8>) -> Result<(), String> {
-        use futures::future::join_all;
-        use crate::p2p_transport::P2PTransport;
+        
         
         let validated_peers = self.get_validated_active_peers();
         
@@ -5080,7 +5090,7 @@ impl SimplifiedP2P {
         
         // Filter peers
         let filtered_peers: Vec<PeerInfo> = validated_peers.iter()
-            .filter(|peer| !matches!(self.node_type, NodeType::Light))
+            .filter(|_peer| !matches!(self.node_type, NodeType::Light))
             .cloned()
             .collect();
         
@@ -5162,8 +5172,7 @@ impl SimplifiedP2P {
     /// Supports both microblocks and macroblocks with correct type tagging
     /// v2.26: Certificate is now included in chunk #0 to eliminate race condition
     pub async fn broadcast_block_shred_protocol_typed(&self, height: u64, block_data: Vec<u8>, is_macroblock: bool) -> Result<(), String> {
-        use futures::future::join_all;
-        use crate::p2p_transport::P2PTransport;
+        
         
         let max_shred_size = SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE;
         
@@ -6045,7 +6054,7 @@ impl SimplifiedP2P {
         }
         
         // SAFE: Check if Tokio runtime is available to prevent panic
-        let handle = match tokio::runtime::Handle::try_current() {
+        let _handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
                 println!("[WARN][P2P] No Tokio runtime - operation skipped");
@@ -6547,7 +6556,7 @@ impl SimplifiedP2P {
                                     QUIC_FALLBACK_SUCCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     
                                     if crate::node::is_info() {
-                                        let (succ, total, rate) = get_quic_fallback_metrics();
+                                        let (_succ, _total, rate) = get_quic_fallback_metrics();
                                         println!("[INFO][EMERGENCY] quic_fallback_success h={} elapsed={}ms success_rate={}.{}%", 
                                                  block_height, start.elapsed().as_millis(), rate / 10, rate % 10);
                                     }
@@ -6780,7 +6789,7 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION v2.21.3: Handle incoming request for missing chunks
-    fn handle_missing_chunks_request(&self, from_peer: &str, block_height: u64, missing_indices: Vec<usize>, requester_id: String) {
+    fn handle_missing_chunks_request(&self, from_peer: &str, block_height: u64, missing_indices: Vec<usize>, _requester_id: String) {
         // SAFE: Check if Tokio runtime is available to prevent panic
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
@@ -6877,8 +6886,8 @@ impl SimplifiedP2P {
         &self,
         block_height: u64,
         chunks: Vec<(usize, Vec<u8>, bool)>,
-        original_block_size: usize,
-        is_macroblock: bool,
+        _original_block_size: usize,
+        _is_macroblock: bool,
         sender_id: &str,
     ) {
         if self.processed_shred_blocks.contains(&block_height) {
@@ -7548,6 +7557,7 @@ impl SimplifiedP2P {
     
     /// Query individual peer for blockchain height via HTTP API
     /// PRODUCTION v2.19.21: Now async using global HTTP_CLIENT (fixes runtime deadlock)
+    #[allow(dead_code)]
     async fn query_peer_height(&self, peer_addr: &str) -> Result<u64, String> {
         // Extract IP and port from peer address
         let parts: Vec<&str> = peer_addr.split(':').collect();
@@ -7575,6 +7585,7 @@ impl SimplifiedP2P {
     
     /// Query peer height via HTTP with timeout and error handling
     /// PRODUCTION v2.19.21: Now async using global HTTP_CLIENT (fixes runtime deadlock)
+    #[allow(dead_code)]
     async fn query_peer_height_http(&self, endpoint: &str) -> Result<u64, String> {
         // Use global async HTTP client with connection pooling
         match HTTP_CLIENT.get(endpoint).send().await {
@@ -7626,6 +7637,7 @@ impl SimplifiedP2P {
     }
     
     /// DYNAMIC: Estimate peer height using network-based heuristics (no timestamp dependency)
+    #[allow(dead_code)]
     fn estimate_peer_height_from_genesis(&self) -> Result<u64, String> {
         // ROBUST: Use network size and node type to estimate reasonable height
         let active_peers = self.get_peer_count();
@@ -7700,7 +7712,7 @@ impl SimplifiedP2P {
         }
         
         // Check if this node can participate based on network connectivity
-        let my_ip = self.extract_node_ip(node_id);
+        let _my_ip = self.extract_node_ip(node_id);
         
         // Production QNet: Genesis nodes determined by BOOTSTRAP_ID, not hardcoded IPs
         let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
@@ -7783,6 +7795,7 @@ impl SimplifiedP2P {
     }
     
     /// Generate quantum-resistant challenge for peer authentication
+    #[allow(dead_code)]
     fn generate_quantum_challenge() -> [u8; 32] {
         use rand::RngCore;
         use rand::rngs::OsRng;
@@ -7867,6 +7880,7 @@ impl SimplifiedP2P {
 
     
     /// Filter Genesis nodes by connectivity (PRODUCTION failover with enhanced security)
+    #[allow(dead_code)]
     fn filter_working_genesis_nodes(&self, nodes: Vec<String>) -> Vec<String> {
         Self::filter_working_genesis_nodes_static(nodes)
     }
@@ -7879,7 +7893,7 @@ impl SimplifiedP2P {
     pub fn filter_working_genesis_nodes_static(nodes: Vec<String>) -> Vec<String> {
         use std::net::{TcpStream, SocketAddr};
         use std::time::Duration;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Mutex;
         use std::collections::HashMap;
         
         // Cache connectivity results to prevent repeated probes
@@ -8020,6 +8034,7 @@ impl SimplifiedP2P {
     }
     
     /// Load Genesis IPs from config file
+    #[allow(dead_code)]
     fn load_genesis_ips_from_config(&self) -> Result<Vec<String>, String> {
         use std::fs;
         
@@ -8051,6 +8066,7 @@ impl SimplifiedP2P {
     }
     
     /// Check if a specific peer IP is online
+    #[allow(dead_code)]
     fn is_peer_online(&self, target_ip: &str, connected: &std::sync::MutexGuard<Vec<PeerInfo>>) -> bool {
         connected.iter().any(|peer| peer.addr.contains(target_ip))
     }
@@ -8077,6 +8093,7 @@ impl SimplifiedP2P {
     }
     
     /// Load genesis nodes from environment or config file (PRODUCTION FIX)
+    #[allow(dead_code)]
     fn load_genesis_nodes_config(&self) -> Vec<String> {
         // Priority 1: Environment variable (for easy VDS changes)
         if let Ok(env_nodes) = std::env::var("QNET_GENESIS_LEADERS") {
@@ -8127,6 +8144,7 @@ impl SimplifiedP2P {
     }
     
     /// Load genesis nodes from config file
+    #[allow(dead_code)]
     fn load_genesis_from_config_file(&self) -> Result<Vec<String>, String> {
         use std::fs;
         
@@ -8547,7 +8565,7 @@ impl SimplifiedP2P {
             let working_genesis_ips = Self::filter_working_genesis_nodes_static(get_genesis_bootstrap_ips());
             
             for (ip, id) in GENESIS_NODE_IPS {
-                let addr = format!("{}:8001", ip);
+                let _addr = format!("{}:8001", ip);
                 let node_id = format!("genesis_node_{}", id);
                 
                 // Skip self - check if our node_id ends with this id
@@ -8644,7 +8662,7 @@ impl SimplifiedP2P {
         let mut broadcast_count = 0;
         
         // Serialize message once for all peers
-        let message_json = match serde_json::to_value(&message) {
+        let _message_json = match serde_json::to_value(&message) {
             Ok(json) => json,
             Err(e) => {
                 return Err(format!("Failed to serialize certificate message: {}", e));
@@ -8792,7 +8810,7 @@ impl SimplifiedP2P {
             // OPTIMIZATION v2.50: Check peer cooldown before sending
             // Prevents retry storms to unresponsive/"not ready" peers
             if let Some(entry) = PEER_RETRY_COOLDOWN.get(&peer_addr) {
-                let (retry_count, cooldown_until) = entry.value();
+                let (_retry_count, cooldown_until) = entry.value();
                 if std::time::Instant::now() < *cooldown_until {
                     // Peer is in cooldown - skip this round
                     skipped_peers += 1;
@@ -8800,7 +8818,7 @@ impl SimplifiedP2P {
                 }
             }
             
-            let message_json_clone = Arc::clone(&message_json);
+            let _message_json_clone = Arc::clone(&message_json);
             let success_count_clone = Arc::clone(&success_count);
             let cert_serial_clone = cert_serial.clone();
             let peer_addr_for_cooldown = peer_addr.clone();
@@ -9678,8 +9696,8 @@ impl SimplifiedP2P {
         
         // PRODUCTION: Strict Byzantine consensus - NO relaxed validation for offline peers
         // Genesis phase requires REAL connectivity for Byzantine fault tolerance
-        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-        let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
+        let _is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        let _is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
         let use_relaxed_validation = false; // PRODUCTION: Always use strict validation for Byzantine safety
         
         // PRODUCTION: Remove debug logs from hot path for scalability (millions of nodes)
@@ -9710,6 +9728,7 @@ impl SimplifiedP2P {
     }
     
     /// STATIC VERSION: Test peer connectivity via QUIC port (async-safe)
+    #[allow(dead_code)]
     fn test_quic_port_static(peer_addr: &str) -> bool {
         use std::net::TcpStream;
         use std::time::Duration;
@@ -9887,7 +9906,7 @@ impl SimplifiedP2P {
         }
         
         // v2.51: Lock-free overloaded peer removal
-        let initial_count = self.connected_peers_lockfree.len();
+        let _initial_count = self.connected_peers_lockfree.len();
         let to_remove: Vec<String> = self.connected_peers_lockfree.iter()
             .filter(|entry| {
                 let peer = entry.value();
@@ -9921,7 +9940,7 @@ impl SimplifiedP2P {
         let is_running = self.is_running.clone();
         let last_check = self.last_health_check.clone();
         let connected_peers = self.connected_peers_lockfree.clone();
-        let regional_metrics = self.regional_metrics.clone();
+        let _regional_metrics = self.regional_metrics.clone();
         
         thread::spawn(move || {
             while *match is_running.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
@@ -9950,7 +9969,7 @@ impl SimplifiedP2P {
     /// Start regional rebalancer
     fn start_regional_rebalancer(&self) {
         let is_running = self.is_running.clone();
-        let node_id = self.node_id.clone();
+        let _node_id = self.node_id.clone();
         
         thread::spawn(move || {
             while *match is_running.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
@@ -10019,6 +10038,7 @@ impl SimplifiedP2P {
     /// v4.2 CRITICAL FIX: Removed all blocking retries and thread::sleep calls.
     /// Previous version blocked tokio threads for up to 24 seconds per offline Genesis peer,
     /// causing network-wide API deadlock cascade.
+    #[allow(dead_code)]
     fn check_api_readiness_static(ip: &str) -> bool {
         use std::time::Duration;
         
@@ -10060,9 +10080,9 @@ impl SimplifiedP2P {
             }
         };
         
-        let node_id = self.node_id.clone();
+        let _node_id = self.node_id.clone();
         let region = self.region.clone();
-        let regional_peers = self.regional_peers.clone();
+        let _regional_peers = self.regional_peers.clone();
         let connected_peers = self.connected_peers_lockfree.clone();
         let is_running = self.is_running.clone();
         
@@ -10087,7 +10107,7 @@ impl SimplifiedP2P {
                     println!("[INFO][P2P] Looking for more peers in region: {:?}", region);
                     
                     // Get dynamic IP for regional peer discovery
-                    let external_ip = match Self::get_our_ip_address().await {
+                    let _external_ip = match Self::get_our_ip_address().await {
                         Ok(ip) => ip,
                         Err(e) => {
                             println!("[WARN][P2P] Failed to get external IP for regional clustering: {}", e);
@@ -10107,6 +10127,7 @@ impl SimplifiedP2P {
     }
     
     /// Validate activation codes for discovered peers
+    #[allow(dead_code)]
     fn validate_activation_codes(&self, peers: &[PeerInfo]) -> Vec<PeerInfo> {
         Self::validate_activation_codes_static(peers)
     }
@@ -10286,6 +10307,7 @@ impl SimplifiedP2P {
     }
 
     /// Get local IP address for network scanning
+    #[allow(dead_code)]
     async fn get_local_ip_address() -> Result<String, Box<dyn std::error::Error>> {
         // Try to get local IP by connecting to a remote address
         if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -12083,7 +12105,7 @@ impl SimplifiedP2P {
             }
             
             // PRODUCTION: Certificate management for compact signatures
-            NetworkMessage::CertificateAnnounce { node_id, cert_serial, certificate, timestamp } => {
+            NetworkMessage::CertificateAnnounce { node_id, cert_serial, certificate, timestamp: _timestamp } => {
                 // SAFE: Get Tokio handle early to prevent panic in async verification
                 let handle = match tokio::runtime::Handle::try_current() {
                     Ok(h) => h,
@@ -12436,7 +12458,7 @@ impl SimplifiedP2P {
                 }
             }
             
-            NetworkMessage::CertificateResponse { node_id, cert_serial, certificate, timestamp } => {
+            NetworkMessage::CertificateResponse { node_id, cert_serial, certificate, timestamp: _timestamp } => {
                 self.update_peer_last_seen(&node_id);
                 println!("[INFO][P2P] Certificate response from {} (serial: {})", node_id, cert_serial);
                 
@@ -12607,134 +12629,12 @@ impl SimplifiedP2P {
             // DEPRECATED v2.77: NodeHeartbeat gossip messages are NO LONGER USED for rewards
             // Heartbeats are now LOCAL ONLY and committed via HeartbeatCommitment TX
             // This handler is kept for backward compatibility but does nothing
-            NetworkMessage::NodeHeartbeat {
-                node_id, node_type, timestamp, block_height, signature, heartbeat_index, gossip_hop
-            } => {
-                // v2.77: Early return - gossip heartbeats not used for rewards anymore
-                // Rewards are calculated from HeartbeatCommitment TXs in blockchain
+            NetworkMessage::NodeHeartbeat { node_id, .. } => {
+                // v2.77: NodeHeartbeat gossip messages are NO LONGER USED for rewards
+                // Heartbeats are now LOCAL ONLY and committed via HeartbeatCommitment TX
                 if crate::node::is_debug() {
                     println!("[HEARTBEAT] 📭 Ignoring gossip heartbeat from {} (v2.77: using HeartbeatCommitment TX instead)", node_id);
                 }
-                return;
-                
-                // LEGACY CODE BELOW (not executed) - kept for reference
-                #[allow(unreachable_code)]
-                {
-                // GOSSIP TTL: Max 3 hops
-                if gossip_hop >= 3 {
-                    return;
-                }
-                
-                // TIMESTAMP VALIDATION: Must be within ±5 minutes
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                if timestamp > now + 300 || timestamp < now.saturating_sub(300) {
-                    println!("[HEARTBEAT] ❌ Invalid timestamp for {} (drift: {}s)", node_id, 
-                             now as i64 - timestamp as i64);
-                    return;
-                }
-                
-                // DEDUPE: Check if already received this heartbeat
-                let heartbeat_key = format!("{}:{}", node_id, heartbeat_index);
-                {
-                    let heartbeats = match self.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
-                    if let Some(existing) = heartbeats.get(&heartbeat_key) {
-                        // Same 4h window? Skip
-                        let current_4h_window = now - (now % (4 * 60 * 60));
-                        let existing_4h_window = existing.timestamp - (existing.timestamp % (4 * 60 * 60));
-                        if current_4h_window == existing_4h_window {
-                            return; // Already have this heartbeat for current window
-                        }
-                    }
-                }
-                
-                // CRITICAL FIX v2.21.1: Check sender reputation >= MIN_CONSENSUS_REPUTATION for QNC rewards!
-                // Reject heartbeats from nodes with low reputation (v2.21.5: blockchain source)
-                use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
-                let sender_reputation = self.get_node_reputation_from_blockchain(&node_id);
-                if sender_reputation < MIN_CONSENSUS_REPUTATION {
-                    println!("[HEARTBEAT] ⚠️ Rejecting heartbeat from {}: reputation {:.1}% < {:.0}%", 
-                             node_id, sender_reputation, MIN_CONSENSUS_REPUTATION);
-                    return;
-                }
-                
-                // SECURITY v2.23: FULL HYBRID verification for heartbeats (NIST/Cisco compliant)
-                // CRITICAL: Dilithium verification is now MANDATORY for quantum resistance
-                // - Ephemeral Ed25519 key for fast classical verification
-                // - Dilithium signs (ephemeral_key || message_hash || timestamp) for quantum protection
-                // - CPU cost: ~5ms per heartbeat (acceptable for 10 heartbeats per 4 hours)
-                
-                // VERIFY: Node must be registered (first registration uses Dilithium)
-                // v2.51: Lock-free check
-                let is_known_node = self.active_full_super_nodes.contains_key(&node_id);
-                
-                // For Genesis nodes, always accept (hardcoded IPs)
-                let is_genesis = node_id.starts_with("genesis_node_");
-                
-                if !is_known_node && !is_genesis {
-                    println!("[HEARTBEAT] ❌ Unknown node {} - not in active registry", node_id);
-                    return;
-                }
-                
-                // SECURITY v2.23: Verify HYBRID signature (Ed25519 + Dilithium)
-                // Expected format: "hybrid_p2p:{json}" with CompactHybridSignature
-                let expected_msg = format!("{}:{}:{}:{}", node_id, timestamp, block_height, heartbeat_index);
-                let signature_valid = self.verify_dilithium_heartbeat_signature(&expected_msg, &signature, &node_id);
-                
-                if !signature_valid {
-                    println!("[HEARTBEAT] ❌ HYBRID signature verification FAILED for {} heartbeat #{}", node_id, heartbeat_index);
-                    return;
-                }
-                
-                println!("[HEARTBEAT] ✅ HYBRID signature verified for {} (quantum-resistant)", node_id);
-                
-                // Store heartbeat in RAM
-                // v2.59: Include block_height for reliable epoch-based filtering
-                {
-                    let mut heartbeats = match self.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
-                    heartbeats.insert(heartbeat_key, HeartbeatRecord {
-                        node_id: node_id.clone(),
-                        timestamp,
-                        heartbeat_index,
-                        signature: signature.clone(),
-                        verified: true,
-                        block_height, // v2.59: From NetworkMessage for epoch filtering
-                    });
-                }
-                
-                // NOTE: NO reputation change for heartbeats!
-                // Reward eligibility is determined by heartbeat count (8/10 or 9/10)
-                // Adding +1 rep per heartbeat would cause inflation (10 heartbeats × N receivers)
-                // Rewards are sufficient incentive
-                
-                // Update active nodes list (proves node is online)
-                self.update_active_nodes_from_heartbeat(&node_id, &node_type, timestamp);
-                
-                // NOTE: NodeHeartbeat is ONLY for REWARD eligibility tracking!
-                // Peer heights are updated by NetworkMessage::Block (~10s interval) - sufficient for emergency logic
-                
-                if crate::node::is_info() && heartbeat_index == 0 {
-                    // Log only first heartbeat of each 4h window to reduce spam
-                    println!("[INFO][HB] verified node={} type={} idx={}", node_id, node_type, heartbeat_index);
-                } else if crate::node::is_debug() {
-                    println!("[DBG][HB] verified node={} idx={} h={}", node_id, heartbeat_index, block_height);
-                }
-                
-                // RE-GOSSIP using Kademlia K-neighbors (v2.19.19)
-                // More efficient than random gossip for DHT-based networks
-                let forward_msg = NetworkMessage::NodeHeartbeat {
-                    node_id,
-                    node_type,
-                    timestamp,
-                    block_height,
-                    signature,
-                    heartbeat_index,
-                    gossip_hop: gossip_hop + 1,
-                };
-                self.gossip_to_k_neighbors(forward_msg, 3);
-                } // End of unreachable legacy code
             }
             
             // PRODUCTION: Light Node registry sync request
@@ -13110,7 +13010,7 @@ impl SimplifiedP2P {
             }
             
             // PRODUCTION: Handle system events (reorg, emergency, etc.)
-            NetworkMessage::SystemEvent { event_type, data, timestamp, from_node } => {
+            NetworkMessage::SystemEvent { event_type, data, timestamp: _timestamp, from_node } => {
                 self.update_peer_last_seen(from_peer);
                 println!("[P2P] 📢 System event '{}' from {}", event_type, from_node);
                 
@@ -13380,6 +13280,7 @@ impl SimplifiedP2P {
     }
 
     /// Verify Ed25519 signature for Light node registration
+    #[allow(dead_code)]
     fn verify_ed25519_signature(&self, message: &str, signature_hex: &str, wallet_address: &str) -> bool {
         use ed25519_dalek::{Signature, VerifyingKey, Verifier};
         
@@ -13501,10 +13402,8 @@ impl SimplifiedP2P {
     /// Verify signature for heartbeat (ASYNC version)
     /// PRODUCTION: Supports BOTH hybrid (NIST/Cisco) and legacy Dilithium formats
     pub async fn verify_dilithium_heartbeat_signature_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
-        use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-        
-        // Check for empty/invalid signatures
+        use crate::quantum_crypto::DilithiumSignature;
+                // Check for empty/invalid signatures
         if signature.is_empty() || signature.len() < 100 {
             println!("[HEARTBEAT] ❌ Invalid signature format: too short ({} chars, need 100+)", signature.len());
             return false;
@@ -13581,8 +13480,7 @@ impl SimplifiedP2P {
     async fn verify_hybrid_p2p_binary_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
         use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
         use crate::quantum_crypto::DilithiumSignature;
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-        use sha3::{Sha3_256, Digest};
+                use sha3::{Sha3_256, Digest};
         use base64::engine::general_purpose;
         use base64::Engine;
         
@@ -13693,8 +13591,7 @@ impl SimplifiedP2P {
     async fn verify_hybrid_p2p_signature_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
         use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
         use crate::quantum_crypto::DilithiumSignature;
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-        use sha3::{Sha3_256, Digest};
+                use sha3::{Sha3_256, Digest};
         
         // Parse hybrid_p2p signature
         let json_str = &signature[11..]; // Skip "hybrid_p2p:" prefix
@@ -13795,7 +13692,7 @@ impl SimplifiedP2P {
     /// SAFE: Uses std::thread::spawn to isolate runtime, avoiding nested runtime panic
     /// Supports BOTH hybrid (NIST/Cisco) and legacy Dilithium formats
     pub fn verify_dilithium_heartbeat_signature(&self, message: &str, signature: &str, node_id: &str) -> bool {
-        use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
+        use crate::quantum_crypto::DilithiumSignature;
         
         // Check for empty/invalid signatures
         if signature.is_empty() || signature.len() < 100 {
@@ -14260,7 +14157,7 @@ impl SimplifiedP2P {
     fn verify_hybrid_p2p_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
         let message = message.to_string();
         let signature = signature.to_string();
-        let node_id = node_id.to_string();
+        let _node_id = node_id.to_string();
         
         // Use std::thread::spawn to isolate runtime
         let handle = std::thread::spawn(move || {
@@ -15396,7 +15293,7 @@ impl SimplifiedP2P {
 
     /// Request Light Node registry sync from peers
     pub fn request_light_node_registry_sync(&self) {
-        let now = std::time::SystemTime::now()
+        let _now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
@@ -15524,7 +15421,7 @@ impl SimplifiedP2P {
     /// Get next ping time for a Light node (for polling fallback)
     /// Returns (timestamp, window_number) for the next scheduled ping
     pub fn get_next_ping_time(light_node_id: &str) -> (u64, u64) {
-        let now = std::time::SystemTime::now()
+        let _now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
@@ -16054,6 +15951,7 @@ impl SimplifiedP2P {
     }
     
     /// Update active nodes from heartbeat (proves node is online)
+    #[allow(dead_code)]
     fn update_active_nodes_from_heartbeat(&self, node_id: &str, node_type: &str, timestamp: u64) {
         // Get current reputation
         // Get reputation from blockchain (v2.21.5)
@@ -16153,7 +16051,7 @@ impl SimplifiedP2P {
             .unwrap_or_default()
             .as_secs();
         
-        let current_4h_window = now - (now % (4 * 60 * 60));
+        let _current_4h_window = now - (now % (4 * 60 * 60));
         let window_start_slot = 0u64;
         let window_end_slot = 239u64;
         
@@ -17362,7 +17260,7 @@ impl SimplifiedP2P {
     /// For REQUESTING we use parallel requests to multiple peers - first response wins
     pub async fn request_specific_block(&self, height: u64) -> Result<(), String> {
         use futures::future::join_all;
-        use crate::p2p_transport::{P2PTransport, QUIC_PORT_OFFSET};
+        use crate::p2p_transport::QUIC_PORT_OFFSET;
         use crate::node::is_info;
         use crate::node::is_debug;
         
@@ -17568,6 +17466,7 @@ fn is_genesis_node_ip(ip: &str) -> bool {
 }
 
 /// Helper function to get Genesis region by index (0-4)
+#[allow(dead_code)]
 fn get_genesis_region_by_index(index: usize) -> Region {
     // EXISTING: Map Genesis node indices to their regions from genesis_constants.rs
     match index {
@@ -17602,6 +17501,7 @@ fn get_genesis_region_by_index(index: usize) -> Region {
 
 
 /// QUANTUM: Discover Genesis nodes via DHT protocol
+#[allow(dead_code)]
 fn discover_genesis_nodes_via_dht() -> Vec<String> {
     // CRITICAL FIX: During cold start (empty blockchain), use hardcoded Genesis IPs as fallback
     // This is REQUIRED for initial Genesis node bootstrap when blockchain registry is empty
@@ -17661,9 +17561,9 @@ impl SimplifiedP2P {
         
         let connected_peers = self.connected_peers_lockfree.clone();
         let node_id = self.node_id.clone();
-        let node_type = self.node_type.clone();  // EXISTING: Need for peer addition
-        let region = self.region.clone();          // EXISTING: Need for peer addition
-        let port = self.port;                      // EXISTING: Need for peer addition
+        let _node_type = self.node_type.clone();
+        let _region = self.region.clone();
+        let _port = self.port;
         
         handle.spawn(async move {
             let mut interval = tokio::time::interval(exchange_interval);
@@ -18000,7 +17900,7 @@ impl SimplifiedP2P {
     pub fn set_node_reputation(&self, node_id: &str, reputation: f64) {
         // CRITICAL: Light nodes have fixed reputation of INITIAL_REPUTATION
         use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
-        let final_reputation = if node_id.starts_with("light_") {
+        let _final_reputation = if node_id.starts_with("light_") {
             INITIAL_REPUTATION // Light nodes: always INITIAL_REPUTATION, ignore requested value
         } else {
             reputation
@@ -18499,7 +18399,7 @@ impl SimplifiedP2P {
                  severity, current_reputation, attempted_reputation);
         
         // Apply severe penalties based on tampering severity
-        let penalty = match severity {
+        let _penalty = match severity {
             "CRITICAL" => {
                 // CRITICAL: Attempted to fake high reputation
                 // Penalty: Set to 0% and ban from network
@@ -19497,7 +19397,7 @@ impl SimplifiedP2P {
             // Try QUIC first if enabled
             if quic_enabled {
                 if let Some(ref quic_transport) = quic_transport {
-                    use crate::p2p_transport::{P2PTransport, QUIC_PORT_OFFSET};
+                    use crate::p2p_transport::QUIC_PORT_OFFSET;
                     
                     let parts: Vec<&str> = resolved_addr.split(':').collect();
                     if parts.len() == 2 {
@@ -20393,7 +20293,7 @@ impl SimplifiedP2P {
     
     /// Handle request for timeout proofs (for syncing nodes)
     fn handle_timeout_proof_request(&self, from_height: u64, to_height: u64, 
-                                     requester_id: &str, requester_addr: &str) {
+                                     _requester_id: &str, requester_addr: &str) {
         let mut certificates = Vec::new();
         
         // Collect all proofs in range
@@ -20571,6 +20471,7 @@ impl SimplifiedP2P {
     }
     
     /// Handle emergency producer change notifications with sender tracking
+    #[allow(dead_code)]
     fn handle_emergency_producer_change_with_sender(
         &self, 
         failed_producer: String, 
@@ -20588,6 +20489,7 @@ impl SimplifiedP2P {
     }
     
     /// Handle emergency producer change notifications (backward compatibility)
+    #[allow(dead_code)]
     fn handle_emergency_producer_change(
         &self, 
         failed_producer: String, 
@@ -20605,6 +20507,7 @@ impl SimplifiedP2P {
     
     /// Internal handler for emergency producer change with optional sender tracking
     /// DEPRECATED v4.0: Use BFT Timeout Protocol instead
+    #[allow(dead_code)]
     fn handle_emergency_producer_change_internal(
         &self,
         _failed_producer: String,
@@ -20992,9 +20895,9 @@ impl SimplifiedP2P {
         
         // Clone values for logging (async part will check consensus)
         let failed_producer_log = failed_producer.clone();
-        let new_producer_log = new_producer.clone();
+        let _new_producer_log = new_producer.clone();
         let block_height_log = block_height;
-        let sender_log = sender_addr.clone();
+        let _sender_log = sender_addr.clone();
         
         // Schedule async verification without self reference
         handle.spawn(async move {
@@ -21080,6 +20983,7 @@ impl SimplifiedP2P {
     /// - All nodes compute same result from same blocks
     /// ═══════════════════════════════════════════════════════════════════════════
     #[allow(unused_variables)]
+    #[allow(dead_code)]
     fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, jail_updates: Vec<(String, u64, u32, String)>, timestamp: u64, signature: Vec<u8>) {
         // DISABLED: This entire function is deprecated
         // Reputation sync via P2P is a security vulnerability
@@ -21132,6 +21036,7 @@ impl SimplifiedP2P {
     /// See verify_reputation_signature_async for details on why this is disabled
     #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
     #[allow(unused_variables)]
+    #[allow(dead_code)]
     fn verify_reputation_signature(&self, node_id: &str, updates: &[(String, f64)], timestamp: u64, signature: &[u8]) -> bool {
         // DISABLED: Always returns false
         false
@@ -21299,8 +21204,8 @@ impl SimplifiedP2P {
         let reputation_system = self.reputation_system.clone();
         let connected_peers = self.connected_peers_lockfree.clone();
         let connected_peers_lockfree = self.connected_peers_lockfree.clone();
-        let peer_id_to_addr = self.peer_id_to_addr.clone();
-        let peer_shards = self.peer_shards.clone();
+        let _peer_id_to_addr = self.peer_id_to_addr.clone();
+        let _peer_shards = self.peer_shards.clone();
         
         thread::spawn(move || {
             // PRIVACY: Use pseudonym for logging
@@ -21371,7 +21276,7 @@ impl SimplifiedP2P {
                 };
                 
                 // Serialize message
-                let message_json = match serde_json::to_string(&sync_msg) {
+                let _message_json = match serde_json::to_string(&sync_msg) {
                     Ok(json) => json,
                     Err(e) => {
                         println!("[REPUTATION] ❌ Failed to serialize sync message: {}", e);
@@ -21441,12 +21346,12 @@ impl SimplifiedP2P {
                 
                 let mut successful = 0;
                 
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                if let Ok(_rt) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build() {
                     for peer in gossip_targets {
                         let peer_addr_str = peer.addr.clone();
-                        let sync_msg_clone = sync_msg.clone();
+                        let _sync_msg_clone = sync_msg.clone();
                         
                         // Parse peer address to QUIC port
                         let parts: Vec<&str> = peer_addr_str.split(':').collect();
@@ -21700,6 +21605,7 @@ impl SimplifiedP2P {
         Ok(())
     }
     
+    #[allow(dead_code)]
     fn select_emergency_producer_excluding(&self, exclude: &str, height: u64) -> String {
         // v2.92: Use N-2 epoch-based snapshot for deterministic selection (SAME as node.rs!)
         // This ensures all nodes agree on emergency producer even for critical attacks
@@ -22028,7 +21934,7 @@ mod tests {
     #[test]
     fn test_compact_signature_p2p_parsing() {
         use crate::crypto::CompactHybridSignature;
-        use base64::{Engine as _, engine::general_purpose};
+        use base64::Engine as _;
         
         // Create valid base64 for 32-byte array (ephemeral_public_key)
         let ephemeral_pk = [42u8; 32];

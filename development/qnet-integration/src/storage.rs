@@ -1,7 +1,7 @@
 //! Persistent storage implementation for QNet blockchain
 
-use rocksdb::{DB, Options, ColumnFamily, ColumnFamilyDescriptor, WriteBatch, BoundColumnFamily};
-use qnet_state::{Block, Account, Transaction};
+use rocksdb::{DB, Options, ColumnFamily, ColumnFamilyDescriptor, WriteBatch};
+use qnet_state::Transaction;
 use crate::errors::{IntegrationError, IntegrationResult};
 use std::path::Path;
 use std::collections::HashMap;
@@ -9,10 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hex;
-use sha3::{Sha3_256, Digest};
+use sha3::Digest;
 use bincode;
-use futures;
-use serde_json::{json, Value};
+use serde_json::json;
 use serde::{Serialize, Deserialize};
 use chrono;
 
@@ -1620,7 +1619,7 @@ impl PersistentStorage {
         let server_ip = Self::get_server_ip();
         
         // Create new state key for migrated device
-        let state_key = Self::derive_state_key(code, &migration_identity)?;
+        let _state_key = Self::derive_state_key(code, &migration_identity)?;
         
         // PRODUCTION: Save with AES-256-GCM (same as save_activation_code)
         let activation_data = format!("{}:{}:{}:{}:{}", 
@@ -1667,6 +1666,7 @@ impl PersistentStorage {
     }
     
     /// Generate cryptographic node identity from activation code (universal device support)
+    #[allow(dead_code)]
     fn generate_node_identity(code: &str, node_type: u8, timestamp: u64) -> IntegrationResult<String> {
         use sha3::{Sha3_256, Digest};
         
@@ -2735,7 +2735,7 @@ impl Storage {
         // NOTE: Shard count is calculated ONCE at startup and remains fixed during operation
         // This ensures storage consistency. Recalculation happens on node restart/update.
         // Production workflow: Rolling restart updates shard count across network.
-        let active_shards = if let Ok(manual_shards) = std::env::var("QNET_ACTIVE_SHARDS") {
+        let _active_shards = if let Ok(manual_shards) = std::env::var("QNET_ACTIVE_SHARDS") {
             // Manual override for testing or specific deployment needs
             manual_shards.parse::<u64>().unwrap_or_else(|_| {
                 let network_size = Self::estimate_network_size_from_storage(&persistent);
@@ -2919,7 +2919,7 @@ impl Storage {
         // They will be re-requested after rollback completes.
         // =====================================================================
         if !can_save_block(height) {
-            let (in_progress, target) = get_rollback_status();
+            let (_in_progress, target) = get_rollback_status();
             println!("[WARN][STORAGE] block_save_blocked h={} rollback_target={}", height, target);
             return Ok(()); // Silently skip - will be re-synced
         }
@@ -3287,7 +3287,6 @@ impl Storage {
         if let Ok(state_data) = bincode::serialize(&macroblock) {
             // SECURITY: Verify state root is correctly calculated from microblocks
             // state_root MUST be XOR of all microblock hashes in this macroblock
-            use sha3::{Sha3_256, Digest};
             let mut computed_state_root = [0u8; 32];
             
             // Recalculate state root from the microblock hashes stored in macroblock
@@ -3414,6 +3413,7 @@ impl Storage {
     
     /// Remove microblocks that have been finalized by a macroblock
     /// This dramatically reduces storage as we only keep macroblocks + state
+    #[allow(dead_code)]
     async fn prune_finalized_microblocks(&self, macroblock: &qnet_state::MacroBlock) -> IntegrationResult<()> {
         // Only prune if enabled (safety check)
         if std::env::var("QNET_PRUNE_FINALIZED_MICROS").unwrap_or_else(|_| "1".to_string()) != "1" {
@@ -6068,24 +6068,24 @@ impl Storage {
         
         // 2. Collect changed accounts since base height
         // In production, track changes via state diffs
-        let accounts_cf = self.persistent.db.cf_handle("accounts")
+        let _accounts_cf = self.persistent.db.cf_handle("accounts")
             .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
         
-        let metadata_cf = self.persistent.db.cf_handle("metadata")
+        let _metadata_cf = self.persistent.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         
         // For now, include accounts modified in last 1000 blocks (simplified)
         // PRODUCTION: Would use change tracking from StateManager
-        let mut change_count = 0u32;
+        let change_count = 0u32;
         delta_data.extend_from_slice(&change_count.to_le_bytes()); // Placeholder for count
-        let count_position = delta_data.len() - 4;
+        let _count_position = delta_data.len() - 4;
         
         // Collect recent transaction data to identify changed accounts
         // This is a simplified approach - production would track actual state changes
         let microblocks_cf = self.persistent.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
         
-        let mut changed_accounts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let _changed_accounts: std::collections::HashSet<String> = std::collections::HashSet::new();
         for block_height in (base_height.saturating_add(1))..=height {
             let block_key = format!("microblock_{}", block_height);
             if let Ok(Some(_block_data)) = self.persistent.db.get_cf(&microblocks_cf, block_key.as_bytes()) {
@@ -6666,7 +6666,7 @@ impl Storage {
         }; // RocksDB handle is dropped here
         
         // PRODUCTION: Create IPFS-compatible metadata
-        let metadata = json!({
+        let _metadata = json!({
             "version": crate::node::PROTOCOL_VERSION,
             "height": height,
             "timestamp": chrono::Utc::now().timestamp(),
@@ -6853,7 +6853,7 @@ impl Storage {
         println!("[INFO][STORAGE] snapshot_announcing height={} cid={}", height, cid);
         
         // Create announcement message
-        let announcement = json!({
+        let _announcement = json!({
             "type": "snapshot_available",
             "height": height,
             "ipfs_cid": cid,
@@ -7102,7 +7102,7 @@ impl Storage {
     }
     
     /// Check if block is within retention window
-    pub fn is_block_retained(&self, height: u64) -> bool {
+    pub fn is_block_retained(&self, _height: u64) -> bool {
         match self.storage_mode {
             StorageMode::Super => true,  // Super nodes keep everything (archival)
             StorageMode::Light => false, // Light nodes don't store blocks (API client)
@@ -7428,6 +7428,7 @@ impl Storage {
     }
 
     /// Download snapshot — tries chunked first, falls back to legacy
+    #[allow(dead_code)]
     async fn download_snapshot_from_peer(&self, peer_addr: &str, height: u64) -> IntegrationResult<()> {
         self.download_snapshot_chunked(&[peer_addr.to_string()], height).await
     }
@@ -7617,7 +7618,7 @@ impl Storage {
     /// Get all jail statuses (for loading on startup)
     pub fn get_all_jail_statuses(&self) -> IntegrationResult<Vec<(String, u64, u32, String)>> {
         // Scan for all jail: prefixed keys
-        let mut result = Vec::new();
+        let result = Vec::new();
         
         // Use iterator if available, otherwise return empty
         // Note: This is a simplified implementation - in production you'd use RocksDB iterator

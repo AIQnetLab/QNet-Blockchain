@@ -2,8 +2,8 @@
 // Speculative transaction execution for future leaders
 
 use std::sync::Arc;
-use std::collections::{HashMap, VecDeque};
-use tokio::sync::{RwLock, Mutex};
+use std::collections::HashMap;
+use tokio::sync::RwLock;
 use qnet_state::{Transaction, TransactionType};
 use std::time::{Duration, Instant};
 
@@ -55,8 +55,6 @@ pub struct PreExecutionManager {
     config: PreExecutionConfig,
     /// Pre-executed transactions cache
     cache: Arc<RwLock<HashMap<String, PreExecutedTx>>>,
-    /// Execution queue
-    queue: Arc<Mutex<VecDeque<Transaction>>>,
     /// Current leader schedule
     leader_schedule: Arc<RwLock<Vec<String>>>,
     /// Metrics
@@ -78,7 +76,6 @@ impl PreExecutionManager {
         Self {
             config,
             cache: Arc::new(RwLock::new(HashMap::new())),
-            queue: Arc::new(Mutex::new(VecDeque::new())),
             leader_schedule: Arc::new(RwLock::new(Vec::new())),
             metrics: Arc::new(RwLock::new(PreExecutionMetrics::default())),
         }

@@ -3,15 +3,10 @@
 
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet, VecDeque};
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::RwLock;
 use qnet_state::{Transaction, TransactionType};
 use qnet_sharding::{ShardCoordinator, ParallelValidator, CrossShardTx};
-use sha3::{Sha3_256, Digest};
-use rayon::prelude::*;
 use hex;
-
-/// Maximum transactions to process in parallel (v4.1: increased for 200K TX/block)
-const MAX_PARALLEL_TX: usize = 200000;
 
 /// Number of pipeline stages (including Dilithium signature stage)
 const PIPELINE_STAGES: usize = 5;
@@ -19,8 +14,6 @@ const PIPELINE_STAGES: usize = 5;
 /// Dependency graph for transaction ordering
 #[derive(Debug, Clone)]
 pub struct DependencyGraph {
-    /// Map from account to transactions that read/write it
-    account_dependencies: HashMap<String, Vec<usize>>,
     /// Transaction execution order
     execution_order: Vec<Vec<usize>>,
 }
@@ -234,7 +227,6 @@ impl ParallelExecutor {
         let execution_order = self.compute_execution_order(&contexts)?;
         
         Ok(DependencyGraph {
-            account_dependencies,
             execution_order,
         })
     }
@@ -338,7 +330,7 @@ impl ParallelExecutor {
         
         for stage_idx in 0..PIPELINE_STAGES {
             // Drain current stage
-            while let Some(mut ctx) = stages[stage_idx].transactions.pop_front() {
+            while let Some(ctx) = stages[stage_idx].transactions.pop_front() {
                 // Process based on stage
                 match stage_idx {
                     0 | 1 | 2 => {

@@ -4,9 +4,8 @@ use crate::{
     errors::QNetError,
     storage::Storage,
     // validator::Validator, // disabled for compilation
-    unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, ConsensusMessage, NetworkMessage, ReputationEvent, BlockExistenceResult},
+    unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, ConsensusMessage, NetworkMessage, BlockExistenceResult},
 };
-use once_cell::sync::Lazy;
 
 // PROTOCOL VERSION for compatibility checks
 pub const PROTOCOL_VERSION: u32 = 1;  // Increment when breaking changes are made
@@ -14,8 +13,10 @@ pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 
 // PRODUCTION CONSTANTS - No hardcoded magic numbers!
 const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
+#[allow(dead_code)]
 const MIN_BYZANTINE_NODES: usize = 4; // 3f+1 where f=1
 const FAST_SYNC_THRESHOLD: u64 = 10; // Trigger fast sync if behind by 10+ blocks (lowered from 50 for faster detection)  
+#[allow(dead_code)]
 const FAST_SYNC_TIMEOUT_SECS: u64 = 60; // Fast sync timeout
 const BACKGROUND_SYNC_TIMEOUT_SECS: u64 = 30; // Background sync timeout
 const SYNC_DEADLOCK_TIMEOUT_SECS: u64 = 60; // Timeout for detecting stuck sync operations
@@ -92,18 +93,15 @@ mod producer_cache {
 static GLOBAL_VRF_INSTANCE: std::sync::Mutex<Option<Arc<crate::crypto::vrf::DilithiumVrf>>> =
     std::sync::Mutex::new(None);
 
-use qnet_state::{State as StateManager, Account, Transaction, Block, BlockType, MicroBlock, MacroBlock, LightMicroBlock, ConsensusData};
-use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
-use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId, CommitRevealConsensus, ConsensusError};
+use qnet_state::{State as StateManager, MicroBlock};
+use qnet_mempool::SimpleMempool;
 use qnet_consensus::lazy_rewards::{PhaseAwareRewardManager, NodeType as RewardNodeType};
-use qnet_consensus::reputation::{Evidence, MaliciousBehavior};
+use qnet_consensus::reputation::Evidence;
 // ARCHITECTURE v2.21: Deterministic reputation from blockchain
 use qnet_consensus::deterministic_reputation::{
-    DeterministicReputationState, BlockData, MacroBlockData,
-    INITIAL_REPUTATION, MIN_CONSENSUS_REPUTATION,
+    DeterministicReputationState, BlockData,
 };
-use qnet_sharding::{ShardCoordinator, ParallelValidator, MAX_SHARDS, CrossShardProof};
-use crate::quantum_poh::QuantumPoH;
+use qnet_sharding::MAX_SHARDS;
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -136,7 +134,9 @@ use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as StdOrdering};
 use parking_lot::RwLock as ParkingRwLock;
 
 // DEPRECATED: Kept for backward compatibility, always returns None
+#[allow(dead_code)]
 static EMERGENCY_PRODUCER_HEIGHT: StdAtomicU64 = StdAtomicU64::new(0);
+#[allow(dead_code)]
 static EMERGENCY_PRODUCER_END_HEIGHT: StdAtomicU64 = StdAtomicU64::new(0);
 lazy_static::lazy_static! {
     static ref EMERGENCY_PRODUCER_ID: ParkingRwLock<String> = ParkingRwLock::new(String::new());
@@ -922,7 +922,6 @@ lazy_static::lazy_static! {
 use sha3::{Sha3_256, Digest};
 use serde_json;
 use bincode;
-use flate2;
 use serde::{Serialize, Deserialize};
 
 /// Generate proper EON address from any string identifier
@@ -1101,7 +1100,7 @@ impl SignedBlockTracker {
         let entries = blocks.entry(height).or_insert_with(Vec::new);
         
         // Check for existing signature from same producer
-        for (existing_hash, existing_producer, timestamp) in entries.iter() {
+        for (existing_hash, existing_producer, _timestamp) in entries.iter() {
             if existing_producer == producer && existing_hash != block_hash {
                 // Double-sign detected!
                 eprintln!("[ERR][SEC] DOUBLE_SIGN producer={} h={}", producer, height);
@@ -1312,6 +1311,7 @@ pub struct BlockchainNode {
     
     // Verifiable Time Sequence (VTS) for time synchronization
     quantum_poh: Option<Arc<crate::quantum_poh::QuantumPoH>>,
+    #[allow(dead_code)]
     quantum_poh_receiver: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::quantum_poh::PoHEntry>>>>,
     
     // Parallel Executor for parallel transaction execution
@@ -1366,7 +1366,7 @@ impl BlockchainNode {
     /// Derives deterministic wallet address from seed (SHA3-256)
     fn initialize_wallet_identity(&mut self, wallet_seed: &str) -> Result<(), String> {
         use crate::crypto::key_manager::DilithiumKeyManager;
-        use crate::crypto::vrf::{WalletIdentity, DilithiumVrf};
+        use crate::crypto::vrf::WalletIdentity;
         use pqcrypto_traits::sign::{PublicKey as PkTrait, SecretKey as SkTrait};
 
         // Load or generate persistent Dilithium3 keypair
@@ -2162,6 +2162,7 @@ impl BlockchainNode {
     }
     
     /// Get cached node registration (RocksDB only, no DashMap)
+    #[allow(dead_code)]
     async fn get_cached_node_registration(&self, node_id: &str) -> Option<(qnet_state::NodeType, String)> {
         match self.storage.load_node_registration(node_id) {
             Ok(Some((type_str, wallet, _))) => {
@@ -2640,7 +2641,7 @@ impl BlockchainNode {
         // v2.65: System TX get MAX priority to ensure inclusion
         if total_pings > 0 {
             let ping_epoch = window_start_height / EMISSION_INTERVAL_BLOCKS;
-            let mut commitment_tx = qnet_state::Transaction {
+            let commitment_tx = qnet_state::Transaction {
                 from: "system_ping_commitment".to_string(),
                 to: None,
                 amount: 0,
@@ -2802,6 +2803,7 @@ impl BlockchainNode {
     /// - current_epoch: Epoch number (e.g., 1 for blocks 0-14399)
     /// 
     /// Returns: Ok(()) if TX created and added to mempool
+    #[allow(dead_code)]
     async fn create_heartbeat_commitment_tx(&self, current_epoch: u64) -> Result<(), QNetError> {
         const EMISSION_BLOCK_INTERVAL: u64 = 14400;
         
@@ -2859,7 +2861,7 @@ impl BlockchainNode {
                 continue;
             }
             
-            let (index, timestamp, block_height, signature, hash) = &heartbeat_data[sample_idx];
+            let (index, timestamp, block_height, signature, _hash) = &heartbeat_data[sample_idx];
             
             // Generate Merkle proof
             let hashes: Vec<String> = heartbeat_data.iter().map(|(_, _, _, _, h)| h.clone()).collect();
@@ -2941,6 +2943,7 @@ impl BlockchainNode {
     /// 
     /// SCALABILITY: Light nodes deduplicated in MacroBlock (HashMap)
     /// Returns: Number of successful pings
+    #[allow(dead_code)]
     async fn ping_all_light_nodes_for_epoch(&self) -> Result<u32, QNetError> {
         // PRODUCTION v2.78: Verify continuous pinging system created attestations for ALL Light nodes
         // 
@@ -3018,7 +3021,7 @@ impl BlockchainNode {
     /// Returns Transaction ready to be added to mempool
     async fn create_heartbeat_commitment_tx_static(
         storage: &Arc<Storage>,
-        p2p: &Arc<SimplifiedP2P>,
+        _p2p: &Arc<SimplifiedP2P>,
         node_id: &str,
         current_epoch: u64,
     ) -> Result<qnet_state::Transaction, QNetError> {
@@ -3199,8 +3202,9 @@ impl BlockchainNode {
     
     /// Used by commitment TX loop (runs in parallel with block production)
     /// Returns Transaction ready to be added to mempool
+    #[allow(dead_code)]
     async fn create_ping_commitment_tx_static(
-        storage: &Arc<Storage>,
+        _storage: &Arc<Storage>,
         p2p: &Arc<SimplifiedP2P>,
         node_id: &str,
         current_epoch: u64,
@@ -3392,6 +3396,7 @@ impl BlockchainNode {
     /// - current_epoch: Epoch number (e.g., 0 for blocks 0-14399)
     /// 
     /// Returns: Ok(()) if TX created and added to mempool
+    #[allow(dead_code)]
     async fn create_ping_commitment_tx(&self, current_epoch: u64) -> Result<(), QNetError> {
         const EMISSION_BLOCK_INTERVAL: u64 = 14400;
         
@@ -3664,7 +3669,6 @@ impl BlockchainNode {
         window_end_height: u64,
         use_shards: bool,
     ) -> Result<(Vec<qnet_state::HeartbeatSummary>, Vec<qnet_state::ShardHeartbeatSummary>), QNetError> {
-        use sha3::{Sha3_256, Digest};
         use std::collections::HashMap;
         
         if is_info() {
@@ -3691,7 +3695,7 @@ impl BlockchainNode {
                             node_id, 
                             heartbeat_samples,
                             merkle_root,
-                            heartbeat_count,
+                            heartbeat_count: _heartbeat_count,
                             window_start_height: tx_window_start,
                             window_end_height: tx_window_end,
                             ..
@@ -4434,7 +4438,7 @@ impl BlockchainNode {
                 .as_secs();
             
             let state = self.state.read().await;
-            let total_supply = (*state).get_total_supply();
+            let _total_supply = (*state).get_total_supply();
             drop(state);
             
             let mut emission_tx = qnet_state::Transaction {
@@ -4476,7 +4480,7 @@ impl BlockchainNode {
         &self, 
         reward_manager: &mut PhaseAwareRewardManager,
         window_start: u64,
-        current_height: u64
+        _current_height: u64
     ) -> Result<(), QNetError> {
         if is_warn() { println!("[WARN][REWARDS] local_storage_fallback"); }
         
@@ -5012,7 +5016,7 @@ impl BlockchainNode {
         };
         
         // Create REAL Byzantine consensus engine with commit-reveal protocol
-        let mut consensus_engine = qnet_consensus::CommitRevealConsensus::new(node_id.clone(), consensus_config);
+        let consensus_engine = qnet_consensus::CommitRevealConsensus::new(node_id.clone(), consensus_config);
         
         // PERSISTENCE: Load consensus state if exists
         if let Ok(latest_round) = storage.get_latest_consensus_round() {
@@ -5361,7 +5365,7 @@ impl BlockchainNode {
         if is_debug() { println!("[DBG][NODE] rewards_system_init"); }
         
         // Check if this is a Genesis bootstrap node (local check)
-        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+        let _is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
             .unwrap_or(false);
         
@@ -7497,7 +7501,7 @@ impl BlockchainNode {
                             
                             // CRITICAL FIX v2.76.1: Take WRITE lock ONCE before loop, not on every iteration!
                             // Taking lock inside loop caused timeouts and blocked block saving
-                            let mut state_guard = state.write().await;
+                            let state_guard = state.write().await;
                             
                             // ═══════════════════════════════════════════════════════════════════
                             // v3.39: BLOCK-LEVEL SNAPSHOT for full rollback on state_root mismatch
@@ -8569,7 +8573,7 @@ impl BlockchainNode {
                 // FIX: Certificate race condition can leave blocks stuck in buffer
                 // This ensures blocks are retried when certificate becomes available
                 let heights_to_retry: Vec<u64> = pending_blocks.iter()
-                    .filter_map(|(height, (_, retry_count, timestamp))| {
+                    .filter_map(|(height, (_, _retry_count, timestamp))| {
                         let elapsed_secs = timestamp.elapsed().as_secs();
                         // FIX v2.28: Keep blocks in buffer for 120 seconds
                         // retry_count is for LOGGING only, not for dropping blocks
@@ -9494,7 +9498,7 @@ impl BlockchainNode {
             // Get stored macro hash to detect forks
             let stored_macro_hash = storage.get_latest_macroblock_hash();
             
-            if let Ok(stored_hash) = stored_macro_hash {
+            if let Ok(_stored_hash) = stored_macro_hash {
                 // If we have a stored hash and this is the next macroblock
                 // Check continuity (this already done in step 3, but double-check for safety)
                 use sha3::{Sha3_256, Digest};
@@ -9503,7 +9507,7 @@ impl BlockchainNode {
                 // This detects database substitution attacks
                 let mut block_hasher = Sha3_256::new();
                 block_hasher.update(&block.data);
-                let block_hash = block_hasher.finalize();
+                let _block_hash = block_hasher.finalize();
                 
                 // Log for monitoring
                 println!("[VALIDATION] 🔍 Checking macroblock #{} integrity", macroblock.height);
@@ -9920,7 +9924,7 @@ impl BlockchainNode {
         
         // PRODUCTION: All nodes participate in P2P network and microblock production
         // Byzantine consensus participation is determined dynamically during macroblock rounds
-        if let Some(unified_p2p) = &self.unified_p2p {
+        if let Some(_unified_p2p) = &self.unified_p2p {
             println!("[INFO][NODE] Node ready for P2P networking and microblock production");
             println!("[INFO][NODE] Byzantine consensus will activate during macroblock rounds only");
         }
@@ -10840,8 +10844,8 @@ impl BlockchainNode {
         let parallel_validator = self.parallel_validator.clone();
         let node_type = self.node_type;
         let consensus = self.consensus.clone();
-        let consensus_nonce_storage = self.consensus_nonce_storage.clone();
-        let last_block_attempt = self.last_block_attempt.clone();
+        let _consensus_nonce_storage = self.consensus_nonce_storage.clone();
+        let _last_block_attempt = self.last_block_attempt.clone();
         let perf_config = self.perf_config.clone();
         let rotation_tracker = self.rotation_tracker.clone();
         let quantum_poh_for_spawn = self.quantum_poh.clone();
@@ -10855,7 +10859,7 @@ impl BlockchainNode {
         
         // CRITICAL FIX: Take consensus_rx ownership for MACROBLOCK consensus phases
         // Macroblock commit/reveal phases NEED exclusive access to process P2P messages  
-        let mut consensus_rx = self.consensus_rx.take();
+        let consensus_rx = self.consensus_rx.take();
         let consensus_rx = Arc::new(tokio::sync::Mutex::new(consensus_rx));
         
         // CRITICAL FIX: Start macroblock consensus listener for ALL potential validators
@@ -11019,7 +11023,7 @@ impl BlockchainNode {
                             // State must be consistent across all nodes
                             // ═══════════════════════════════════════════════════════════════════
                             {
-                                let mut state_guard = state.write().await;
+                                let state_guard = state.write().await;
                                 // Use genesis_microblock.transactions (all_genesis_txs was moved there)
                                 let applied = state_guard.apply_block_batch(&genesis_microblock.transactions);
                                 match applied {
@@ -13323,8 +13327,8 @@ impl BlockchainNode {
                             _ => std::cmp::min(peers.len(), 100),            // Large: 10% of 1000 producers
                         };
                         
-                        let mut entropy_matches = 0;
-                        let mut entropy_mismatches = 0;
+                        let _entropy_matches = 0;
+                        let _entropy_mismatches = 0;
                         
                         // Log our entropy once
                         println!("[DBG][CONS] entropy_block={} hash={:x}", 
@@ -14832,7 +14836,7 @@ impl BlockchainNode {
                         if is_info() { println!("[INFO][BLOCK] h={} peers={} txs={} tps={:.0}", next_block_height, peer_count, txs.len(), tps); }
                     }
                     
-                    let consensus_result: Option<u64> = None; // NO consensus for microblocks - Byzantine consensus ONLY for macroblocks
+                    let _consensus_result: Option<u64> = None; // NO consensus for microblocks - Byzantine consensus ONLY for macroblocks
                     
                     // CRITICAL: Producer NEVER waits for network!
                     // The producer's job is to CREATE blocks based on LOCAL state
@@ -15158,7 +15162,7 @@ impl BlockchainNode {
                     // Order: apply_tx → credit_fees → finalize_merkle → get state_root
                     // ═══════════════════════════════════════════════════════════════════════════
                     {
-                        let mut state_guard = state.write().await;
+                        let state_guard = state.write().await;
                         
                         // 1. Apply all transactions
                         // v7.0: Also collect reward accruals from emission TXs for state application
@@ -15362,7 +15366,7 @@ impl BlockchainNode {
                     // Apply local finalization for small transactions (< 100 QNC)
                     // 100 QNC = 100 * 10^9 nanoQNC = 100_000_000_000
                     const LOCAL_FINALITY_THRESHOLD: u64 = 100_000_000_000; // 100 QNC
-                    let locally_finalized_count = txs.iter()
+                    let _locally_finalized_count = txs.iter()
                         .filter(|tx| {
                             match &tx.tx_type {
                                 qnet_state::TransactionType::Transfer { amount, .. } => *amount < LOCAL_FINALITY_THRESHOLD,
@@ -15387,7 +15391,7 @@ impl BlockchainNode {
                         // Real parallel validation of transaction batches
                         let mut validation_futures = Vec::new();
                         for batch in tx_batches {
-                            let validator_clone = validator.clone();
+                            let _validator_clone = validator.clone();
                             validation_futures.push(tokio::spawn(async move {
                                 // Validate each transaction in parallel
                                 for tx in batch {
@@ -16188,13 +16192,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             let current_producer_timeout = current_producer.clone();
                             let storage_timeout = storage.clone();
                             let p2p_timeout = p2p.clone();
-                            let node_id_timeout = node_id.clone();
-                            let node_type_timeout = node_type;
+                            let _node_id_timeout = node_id.clone();
+                            let _node_type_timeout = node_type;
                             
                             // Calculate block properties for logging
                             let blocks_since_last_macro = expected_height_timeout % 90;
-                            let is_consensus_period = blocks_since_last_macro >= 61 && blocks_since_last_macro <= 90;
-                            let is_rotation_boundary = expected_height_timeout > 1 && ((expected_height_timeout - 1) % ROTATION_INTERVAL_BLOCKS) == 0;
+                            let _is_consensus_period = blocks_since_last_macro >= 61 && blocks_since_last_macro <= 90;
+                            let _is_rotation_boundary = expected_height_timeout > 1 && ((expected_height_timeout - 1) % ROTATION_INTERVAL_BLOCKS) == 0;
                             
                             // CRITICAL FIX v2.19.18: Prevent multiple failover tasks for same block height
                             // Without this, each main loop iteration spawns a NEW failover task
@@ -16625,6 +16629,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// PRODUCTION: Get consistent Genesis node ID from BOOTSTRAP_ID or IP mapping
     /// Unifies all Genesis node ID detection across the codebase
+    #[allow(dead_code)]
     fn get_genesis_node_id(node_identifier: &str) -> Option<String> {
         // Method 1: Direct BOOTSTRAP_ID environment variable (for local node only)
         if node_identifier.is_empty() {
@@ -16741,7 +16746,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         own_node_id: &str,
         own_node_type: NodeType,
         storage: Option<&Arc<Storage>>,
-        quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>,
+        _quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>,
         timeout_round: u64,
     ) -> String {
         // PRODUCTION v4.0: Dilithium3-VRF Secret Leader Election
@@ -17441,6 +17446,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// If 66%+ agree → use that producer
     /// If no consensus → use plurality (like LMD-GHOST fork choice)
     /// ═══════════════════════════════════════════════════════════════════════════
+    #[allow(dead_code)]
     async fn producer_vote_consensus(
         block_height: u64,
         our_selection: &str,
@@ -17643,6 +17649,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Helper: Get count of recent producer failures for deterministic exclusion
     /// ARCHITECTURE: Uses actual failover history from blockchain storage
+    #[allow(dead_code)]
     async fn get_recent_producer_failures(
         node_id: &str,
         current_height: u64,
@@ -18105,6 +18112,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// PRODUCTION: Validate producer readiness before block creation (Enterprise-grade checks)
+    #[allow(dead_code)]
     async fn validate_producer_readiness(
         node_id: &str,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
@@ -18138,7 +18146,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // Check 3: Recent block timing validation (prevent rapid-fire production)
-        let time_since_epoch = std::time::SystemTime::now()
+        let _time_since_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
@@ -18162,6 +18170,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// PRODUCTION: Monitor network health for informational purposes (NON-CONSENSUS)
+    #[allow(dead_code)]
     async fn monitor_network_health(unified_p2p: &Option<Arc<SimplifiedP2P>>) -> String {
         if let Some(p2p) = unified_p2p {
             let active_peers = p2p.get_peer_count(); // EXISTING: Fast peer count, no expensive validation
@@ -18196,7 +18205,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     async fn calculate_qualified_candidates(
         p2p: &Arc<SimplifiedP2P>,
         own_node_id: &str,
-        own_node_type: NodeType,
+        _own_node_type: NodeType,
         target_height: u64,  // v3.16: CRITICAL FIX - use explicit height, not LOCAL_BLOCKCHAIN_HEIGHT!
     ) -> Vec<(String, f64)> {
         // v3.16: Use target_height parameter for DETERMINISTIC epoch calculation
@@ -18663,7 +18672,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // PRODUCTION: Get real reputation from local calculation
             // Own node's reputation is calculated from blocks produced/validated
             let own_rep = {
-                let current_ts = std::time::SystemTime::now()
+                let _current_ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
@@ -19296,7 +19305,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 let mb_idx = macroblock_index;
                                 let reward_manager_cons = reward_manager_outer.clone();
                                 let state_manager_cons = state_manager_outer.clone();
-                                let mempool_cons = mempool_outer.clone();
+                                let _mempool_cons = mempool_outer.clone();
                                 
                                 tokio::spawn(async move {
                                     let cons_start = std::time::Instant::now();
@@ -19666,6 +19675,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// CRITICAL: Progressive Finalization Protocol activation
+    #[allow(dead_code)]
     async fn activate_progressive_finalization(
         storage: Arc<Storage>,
         consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
@@ -19756,7 +19766,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let p2p_finalize = p2p.clone();
             
             // Get own node_id for leader selection
-            let own_node_id = p2p.get_node_id();
+            let _own_node_id = p2p.get_node_id();
             
             let pfp_target_macroblock = expected_macroblock; // v3.30: capture gap-filled value
             tokio::spawn(async move {
@@ -20242,6 +20252,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// DEPRECATED: Old emergency function - redirects to PFP
+    #[allow(dead_code)]
     async fn trigger_emergency_macroblock_consensus(
         storage: Arc<Storage>,
         consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
@@ -20438,8 +20449,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("[INFO][CONS] waiting_commits from={} participants", participants.len() - 1);
         
         // PRODUCTION: Process incoming consensus messages during commit phase
-        let mut received_commits = 0;
-        let start_time = std::time::Instant::now();
+        let _received_commits = 0;
+        let _start_time = std::time::Instant::now();
         
         // CRITICAL: Adaptive timeout based on number of participants for scalability
         // CONSTRAINT: Total consensus must fit in blocks 61-90 (30 seconds)
@@ -20603,7 +20614,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         if is_debug() { println!("[DBG][CONS] round_check {}%90={}", round_id, round_id % 90); }
         use qnet_consensus::commit_reveal::Reveal;
-        use sha3::{Sha3_256, Digest};
         
         // PRODUCTION: REAL reveal phase - each node reveals only OWN data
         // CRITICAL: Use the validated node_id passed from startup
@@ -20874,6 +20884,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Check node reputation for consensus participation using EXISTING P2P system
+    #[allow(dead_code)]
     async fn check_node_reputation(
         node_id: &str,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
@@ -20986,6 +20997,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Update node reputation based on consensus behavior
+    #[allow(dead_code)]
     fn update_consensus_reputation(
         node_id: &str,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
@@ -21125,7 +21137,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // PRODUCTION: Broadcast certificate to peers for compact signature verification
             if let Some(cert) = hybrid.get_current_certificate() {
                 // Serialize certificate for broadcast
-                if let Ok(cert_bytes) = bincode::serialize(&cert) {
+                if let Ok(_cert_bytes) = bincode::serialize(&cert) {
                     println!("[INFO][CONS] broadcast_cert serial={}", cert.serial_number);
                     // Note: P2P broadcast happens asynchronously through the node's P2P instance
                     // The actual broadcast is handled by the node's main loop
@@ -21333,7 +21345,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     // ═══════════════════════════════════════════════════════════════════
     async fn sign_microblock_with_dilithium(
         microblock: &qnet_state::MicroBlock,
-        node_id: &str,
+        _node_id: &str,
         _unified_p2p: Option<&Arc<SimplifiedP2P>>
     ) -> Result<Vec<u8>, String> {
         use sha3::{Sha3_256, Digest};
@@ -21388,6 +21400,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// v4.0: Kept for compatibility — delegates to sign_microblock_with_dilithium
+    #[allow(dead_code)]
     async fn sign_microblock_with_pure_dilithium(microblock: &qnet_state::MicroBlock, node_id: &str) -> Result<Vec<u8>, String> {
         Self::sign_microblock_with_dilithium(microblock, node_id, None).await
     }
@@ -21395,7 +21408,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// PRODUCTION: Verify HYBRID signature for received microblock (supports compact)
     async fn verify_microblock_signature(
         microblock: &qnet_state::MicroBlock, 
-        producer_pubkey: &str,
+        _producer_pubkey: &str,
         p2p: Option<&Arc<SimplifiedP2P>>
     ) -> Result<bool, String> {
         use sha3::{Sha3_256, Digest};
@@ -21573,7 +21586,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // STEP 2: Verify Ed25519 signature with certificate
         // For decentralized post-quantum blockchain, we need BOTH signatures valid
         use crate::hybrid_crypto::{HybridCrypto, HybridCertificate};
-        use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey, Verifier};
+        use ed25519_dalek::Signature as Ed25519Signature;
         
         // Get certificate from P2P cache
         // v2.96: CRITICAL FIX - minimize lock holding time!
@@ -21683,7 +21696,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // Verified against producer's registered VRF public key
                 // ═══════════════════════════════════════════════════════════════════
                 
-                let cert_from_vrf_proof: Option<crate::hybrid_crypto::HybridCertificate> = {
+                let _cert_from_vrf_proof: Option<crate::hybrid_crypto::HybridCertificate> = {
                     // v4.0: Verify VRF proof using Dilithium3 (no HybridCrypto)
                     match Self::verify_block_vrf_proof(microblock) {
                         Ok(true) => {
@@ -23298,6 +23311,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
+    #[allow(dead_code)]
     async fn start_consensus_loop(&self) {
         let is_running = self.is_running.clone();
         let height = self.height.clone();
@@ -23922,6 +23936,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// LEGACY sync wrapper
+    #[allow(dead_code)]
     fn verify_ed25519_tx_signature(
         tx: &qnet_state::Transaction,
         signature_hex: &str,
@@ -24282,6 +24297,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// LEGACY sync wrapper
+    #[allow(dead_code)]
     fn verify_dilithium_tx_signature(tx: &qnet_state::Transaction) -> Result<bool, QNetError> {
         use crate::quantum_crypto::DilithiumSignature;
         
@@ -24748,7 +24764,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if is_info() { println!("[INFO][SYNC] sync_check_start"); }
         
         // Set a flag that we're syncing (prevents producing blocks)
-        let is_syncing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _is_syncing = Arc::new(std::sync::atomic::AtomicBool::new(true));
         
         // PRODUCTION: Try to load from snapshot first for fast sync
         if let Ok(latest_snapshot) = self.storage.get_latest_snapshot_height() {
@@ -24782,7 +24798,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // Check if we have pending sync from previous run
-        if let Ok(Some((from, to, current))) = self.storage.load_sync_progress() {
+        if let Ok(Some((_from, to, current))) = self.storage.load_sync_progress() {
             if is_info() { println!("[INFO][SYNC] resume from={} to={}", current, to); }
             
             if let Some(ref p2p) = self.unified_p2p {
@@ -25475,16 +25491,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     fn start_sync_health_monitor() {
         // PRODUCTION: Health check runs in background to detect and clear stuck sync flags
         tokio::spawn(async move {
-            use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+            use std::sync::atomic::AtomicU64;
             
             // Track timestamps when flags were set
+            #[allow(dead_code)]
             static FAST_SYNC_SET_AT: AtomicU64 = AtomicU64::new(0);
+            #[allow(dead_code)]
             static NORMAL_SYNC_SET_AT: AtomicU64 = AtomicU64::new(0);
             
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 
-                let now = std::time::SystemTime::now()
+                let _now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
@@ -26106,7 +26124,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     pub async fn load_activation_code(&self) -> Result<Option<(String, NodeType)>, QNetError> {
         match self.storage.load_activation_code()
             .map_err(|e| QNetError::StorageError(e.to_string()))? {
-            Some((code, node_type_id, timestamp)) => {
+            Some((code, node_type_id, _timestamp)) => {
                 // v3.18: Full node type removed - map old Full (1) to Super
                 let node_type = match node_type_id {
                     0 => NodeType::Light,
@@ -26159,6 +26177,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Validate activation code (delegated to centralized ActivationValidator)
+    #[allow(dead_code)]
     async fn validate_activation_code_uniqueness(&self, code: &str) -> Result<(), String> {
         // Production activation code validation
         if code.is_empty() {
@@ -26186,6 +26205,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Generate unique node signature for security
+    #[allow(dead_code)]
     async fn generate_node_signature(&self) -> Result<String, String> {
         use sha3::{Sha3_256, Digest};
         
@@ -26370,6 +26390,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Get public IP region using IP geolocation service
+    #[allow(dead_code)]
     async fn get_public_ip_region() -> Result<Region, String> {
         // Use a simple IP geolocation service with better error handling
         let response = match tokio::process::Command::new("curl")
@@ -26732,6 +26753,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     // Regional IP detection functions (same as main binary)
+    #[allow(dead_code)]
     fn is_north_america_ip(ip: &std::net::Ipv4Addr) -> bool {
         let ip_u32 = u32::from(*ip);
         let first_octet = (ip_u32 >> 24) as u8;
@@ -26743,6 +26765,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
+    #[allow(dead_code)]
     fn is_europe_ip(ip: &std::net::Ipv4Addr) -> bool {
         let ip_u32 = u32::from(*ip);
         let first_octet = (ip_u32 >> 24) as u8;
@@ -26753,6 +26776,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
+    #[allow(dead_code)]
     fn is_asia_ip(ip: &std::net::Ipv4Addr) -> bool {
         let ip_u32 = u32::from(*ip);
         let first_octet = (ip_u32 >> 24) as u8;
@@ -26763,6 +26787,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
+    #[allow(dead_code)]
     fn is_south_america_ip(ip: &std::net::Ipv4Addr) -> bool {
         let ip_u32 = u32::from(*ip);
         let first_octet = (ip_u32 >> 24) as u8;
@@ -26772,6 +26797,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
+    #[allow(dead_code)]
     fn is_africa_ip(ip: &std::net::Ipv4Addr) -> bool {
         let ip_u32 = u32::from(*ip);
         let first_octet = (ip_u32 >> 24) as u8;
@@ -26782,6 +26808,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
+    #[allow(dead_code)]
     fn is_oceania_ip(ip: &std::net::Ipv4Addr) -> bool {
         let ip_u32 = u32::from(*ip);
         let first_octet = (ip_u32 >> 24) as u8;
@@ -27225,7 +27252,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // FAST MODE: Check environment IP first (no blocking calls)
             if let Ok(env_ip) = std::env::var("QNET_EXTERNAL_IP") {
                 use crate::genesis_constants::GENESIS_NODE_IPS;
-                for (i, (genesis_ip, genesis_id)) in GENESIS_NODE_IPS.iter().enumerate() {
+                for (_i, (genesis_ip, genesis_id)) in GENESIS_NODE_IPS.iter().enumerate() {
                     if env_ip == *genesis_ip {
                         println!("[NODE_ID] 🔐 Genesis node detected by env IP: {}", genesis_id);
                         println!("[DIAGNOSTIC] ✅ Priority 3: Env IP matched, using genesis_node_{}", genesis_id);
@@ -27335,7 +27362,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// Get IP from network interface (production servers)
     async fn get_network_interface_ip() -> Result<String, String> {
         // Simple method to get local IP that can reach internet
-        use std::net::{TcpStream, SocketAddr};
         
         match std::net::UdpSocket::bind("0.0.0.0:0") {
             Ok(socket) => {
@@ -27356,6 +27382,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Query external IP service as fallback
+    #[allow(dead_code)]
     async fn query_external_ip_service() -> Result<String, String> {
         use std::time::Duration;
         
@@ -27457,6 +27484,7 @@ pub enum ConfirmationLevel {
 
 /// PRODUCTION: Cryptographic verification of genesis node certificates
 /// Prevents impersonation attacks by validating node identity
+#[allow(dead_code)]
 fn verify_genesis_node_certificate(node_id: &str) -> bool {
     use sha3::{Sha3_256, Digest};
     use std::env;
@@ -27626,7 +27654,7 @@ mod tests {
         
         // Create valid base64 for 32-byte array (ephemeral_public_key)
         let ephemeral_pk = [0u8; 32];
-        let ephemeral_b64 = general_purpose::STANDARD.encode(&ephemeral_pk);
+        let _ephemeral_b64 = general_purpose::STANDARD.encode(&ephemeral_pk);
         
         // Create valid base64 for 64-byte array (message_signature)
         let msg_sig = [0u8; 64];

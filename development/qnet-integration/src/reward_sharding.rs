@@ -10,7 +10,7 @@ use crate::{
 use qnet_consensus::lazy_rewards::{PhaseAwareReward, PhaseAwareRewardManager};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use futures::future::join_all;
 use serde::{Serialize, Deserialize};
 
@@ -32,13 +32,10 @@ pub struct RewardShard {
     pub last_processed: u64,
 }
 
-/// Node type counts for proper Pool #2 distribution
+/// Node type counts for reward distribution
 #[derive(Clone)]
 struct NodeTypeCounts {
     total: usize,
-    super_nodes: usize,
-    full_nodes: usize,
-    light_nodes: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -140,39 +137,23 @@ impl ShardedRewardManager {
         
         // FIRST PASS: Count eligible nodes BY TYPE across all shards
         let mut total_eligible_nodes = 0usize;
-        let mut eligible_super_nodes = 0usize;
-        let mut eligible_full_nodes = 0usize;
-        let mut eligible_light_nodes = 0usize;
-        
         for shard in &shards {
             for node_id in &shard.node_ids {
-                // Check if node is eligible based on type
                 if let Some((node_type, _, reputation)) = self.storage.load_node_registration(node_id)? {
-                    // Light nodes: ANY reputation (mobile-friendly)
-                    // Super/Genesis: reputation >= 70 (maintain network quality)
-                    // v3.18: Full nodes removed
                     use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
                     let eligible = match node_type.to_lowercase().as_str() {
-                        "light" => true, // Light nodes always eligible (just need to answer pings)
+                        "light" => true,
                         "super" => reputation >= MIN_CONSENSUS_REPUTATION,
-                        _ => false, // Ignore "full" and unknown types
+                        _ => false,
                     };
-                    
                     if eligible {
                         total_eligible_nodes += 1;
-                        // v3.18: Full nodes removed
-                        match node_type.to_lowercase().as_str() {
-                            "super" => eligible_super_nodes += 1,
-                            "light" => eligible_light_nodes += 1,
-                            _ => {} // Ignore "full" and unknown types
-                        }
                     }
                 }
             }
         }
         
-        println!("[SHARDING] Eligible nodes - Total: {}, Super: {}, Full: {}, Light: {}", 
-                 total_eligible_nodes, eligible_super_nodes, eligible_full_nodes, eligible_light_nodes);
+        println!("[SHARDING] Eligible nodes: {}", total_eligible_nodes);
         
         // SECOND PASS: Process shards with correct reward amount
         for shard in shards {
@@ -181,9 +162,6 @@ impl ShardedRewardManager {
             let reward_manager = reward_manager.clone();
             let node_counts = NodeTypeCounts {
                 total: total_eligible_nodes,
-                super_nodes: eligible_super_nodes,
-                full_nodes: eligible_full_nodes,
-                light_nodes: eligible_light_nodes,
             };
             
             futures.push(tokio::spawn(async move {
@@ -239,16 +217,6 @@ impl ShardedRewardManager {
         Self::process_shard_internal(shard, storage, reward_manager, Some(node_counts)).await
     }
     
-    /// Process a single shard (legacy, without count)
-    async fn process_shard(
-        shard: RewardShard,
-        storage: Arc<Storage>,
-        reward_manager: Arc<RwLock<PhaseAwareRewardManager>>
-    ) -> IntegrationResult<u64> {
-        // Use legacy processing without known count
-        Self::process_shard_internal(shard, storage, reward_manager, None).await
-    }
-    
     /// Internal shard processing with optional eligible node counts
     async fn process_shard_internal(
         mut shard: RewardShard,
@@ -295,7 +263,7 @@ impl ShardedRewardManager {
                 };
                 
                 // Load node registration
-                if let Some((node_type, wallet, reputation)) = storage.load_node_registration(&node_id)? {
+                if let Some((node_type, _wallet, reputation)) = storage.load_node_registration(&node_id)? {
                     // Check eligibility based on ping requirements
                     let meets_ping_requirements = match node_type.to_lowercase().as_str() {
                         "light" => {

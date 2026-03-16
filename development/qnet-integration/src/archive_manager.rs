@@ -8,14 +8,12 @@
 //! - Compliance enforcement maintains network fault tolerance
 //! - Background monitoring ensures archival obligations are met
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::errors::{IntegrationError, IntegrationResult};
 use crate::node::NodeType;
-use sha3::{Sha3_256, Digest};
-use bincode;
 use serde::{Serialize, Deserialize};
 
 /// Archive chunk containing compressed blockchain data
@@ -74,8 +72,6 @@ pub struct ArchiveReplicationManager {
     min_replicas: u8,
     /// Maximum replicas per chunk (adaptive based on network size)
     max_replicas: u8,
-    /// Health check interval
-    health_check_interval: Duration,
     /// Grace period for new nodes (24 hours)
     grace_period_hours: u32,
     /// Network size adaptive scaling
@@ -91,7 +87,6 @@ impl ArchiveReplicationManager {
             chunk_assignments: Arc::new(RwLock::new(HashMap::new())),
             min_replicas: 3,        // Adaptive minimum based on network size
             max_replicas: 7,        // Adaptive maximum based on network size
-            health_check_interval: Duration::from_secs(4 * 3600), // 4 hours
             grace_period_hours: 24, // 24 hours for new nodes to comply
             adaptive_scaling: true, // Enable adaptive scaling for small networks
         }
@@ -370,7 +365,7 @@ impl ArchiveReplicationManager {
         let total_nodes = archive_nodes.len();
         
         // Count nodes by type
-        let genesis_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Super)).count(); // Genesis treated as Super for now
+        let _genesis_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Super)).count(); // Genesis treated as Super for now
         let super_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Super)).count();
         let full_count = 0; // v3.18: Always 0 (Full node type removed)
         let light_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Light)).count();

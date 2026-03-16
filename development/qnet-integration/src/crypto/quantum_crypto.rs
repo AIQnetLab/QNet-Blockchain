@@ -3,20 +3,14 @@
 //! Server-side activation code decryption and validation
 
 use sha3::{Sha3_256, Digest};
-// Crystals-Dilithium will be used through key_manager
-use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit};
-use aes_gcm::aead::{Aead, AeadCore, OsRng};
 use serde::{Serialize, Deserialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose};
 use anyhow::{Result, anyhow};
 use crate::node::NodeType;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;  // For performance_stats (non-async)
 use blake3;
-use chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChachaNonce, KeyInit as ChachaKeyInit};
-use tokio::time::Duration;
 use dashmap::DashMap;
 
 /// Safe string preview utility to prevent index out of bounds errors
@@ -93,6 +87,7 @@ impl BlockchainPhaseState {
 
 /// Cached activation data for zero-copy operations
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CachedActivationData {
     payload: ActivationPayload,
     created_at: u64,
@@ -101,6 +96,7 @@ struct CachedActivationData {
 
 /// Cached signature for fast validation
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CachedSignature {
     is_valid: bool,
     cached_at: u64,
@@ -180,6 +176,7 @@ pub struct QuantumAlgorithms {
 
 /// Compatible activation data structure for integration with existing economic logic
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CompatibleActivationData {
     pub node_type: NodeType,
     pub qnc_amount: u64,
@@ -198,6 +195,7 @@ pub struct QNetQuantumCrypto {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct PerformanceStats {
     total_operations: u64,
     cache_hits: u64,
@@ -545,6 +543,7 @@ impl QNetQuantumCrypto {
     }
 
     /// Constant-time comparison to prevent timing attacks
+    #[allow(dead_code)]
     fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
         if a.len() != b.len() {
             return false;
@@ -721,6 +720,7 @@ impl QNetQuantumCrypto {
 
 
     /// Decode activation code using existing economic logic (quantum-enhanced)
+    #[allow(dead_code)]
     fn decode_activation_code_compatible(&self, code: &str) -> Result<CompatibleActivationData> {
         // Use existing logic from the original decode_activation_code function
         
@@ -961,6 +961,7 @@ impl QNetQuantumCrypto {
     // All Dilithium signing now goes through create_consensus_signature() which uses sign_full()
 
     /// Extract node type from activation code segments
+    #[allow(dead_code)]
     fn extract_node_type_from_code(&self, code_segments: &str) -> Result<String> {
         if code_segments.is_empty() {
             return Err(anyhow!("Empty code segments"));
@@ -989,6 +990,7 @@ impl QNetQuantumCrypto {
     }
 
     /// Validate activation payload structure (route.ts compatible - simplified)
+    #[allow(dead_code)]
     fn validate_payload_structure(&self, payload: &ActivationPayload) -> Result<()> {
         if payload.burn_tx.is_empty() {
             return Err(anyhow!("Invalid burn transaction"));
@@ -1148,6 +1150,7 @@ impl QNetQuantumCrypto {
     }
 
     /// Hash activation code for blockchain storage
+    #[allow(dead_code)]
     fn hash_activation_code(&self, code: &str) -> Result<String> {
         let mut hasher = Sha3_256::new();
         hasher.update(code.as_bytes());
@@ -1157,7 +1160,7 @@ impl QNetQuantumCrypto {
     /// Store node connection info in device signature for replacement system
     pub async fn store_node_connection_info(
         &self,
-        activation_code: &str,
+        _activation_code: &str,
         external_ip: &str,
         api_port: u16,
     ) -> Result<()> {
@@ -1220,7 +1223,7 @@ impl QNetQuantumCrypto {
     ///           (2) blockchain activation registry,
     ///           (3) genesis bootstrap codes — hardcoded sentinel values.
     /// Non-genesis codes with no env vars and no registry entry → hard error (no silent fallback).
-    async fn get_burn_tx_and_amount_from_blockchain(&self, activation_code: &str, node_type: &str) -> Result<(String, u64)> {
+    async fn get_burn_tx_and_amount_from_blockchain(&self, activation_code: &str, _node_type: &str) -> Result<(String, u64)> {
         // Genesis bootstrap codes don't use XOR encryption — skip all checks.
         if activation_code.starts_with("QNET-BOOT") {
             return Ok(("genesis_bootstrap".to_string(), 0));
@@ -1277,6 +1280,7 @@ impl QNetQuantumCrypto {
     /// 
     /// Phase 1 Formula: price = max(300, 1500 - (burn_percentage / 10) * 150)
     /// Phase 2 Formula: price = base_price[node_type] * network_multiplier(total_nodes)
+    #[allow(dead_code)]
     async fn get_dynamic_burn_amount(&self, _activation_code: &str, node_type: &str) -> Result<u64> {
         // PRODUCTION: Query real blockchain state
         let blockchain_state = self.get_blockchain_phase_state().await?;
@@ -1327,6 +1331,7 @@ impl QNetQuantumCrypto {
     /// 
     /// PRODUCTION: This queries REAL blockchain state from storage.
     /// NO FALLBACKS - if data unavailable, return error.
+    #[allow(dead_code)]
     async fn get_blockchain_phase_state(&self) -> Result<BlockchainPhaseState> {
         let current_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1383,6 +1388,7 @@ impl QNetQuantumCrypto {
     /// | ≤300K nodes  | 1.0x       | 10,000 QNC       |
     /// | ≤1M nodes    | 2.0x       | 20,000 QNC       |
     /// | >1M nodes    | 3.0x       | 30,000 QNC (max) |
+    #[allow(dead_code)]
     fn calculate_network_multiplier(&self, total_nodes: u64) -> f64 {
         match total_nodes {
             0..=100_000 => 0.5,          // ≤100K: Early adopter discount

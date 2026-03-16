@@ -1,8 +1,7 @@
 //! Genesis block creation
 
-use qnet_state::{Block, Transaction, TransactionType, ConsensusProof};
+use qnet_state::{Block, Transaction, TransactionType};
 use crate::errors::IntegrationResult;
-use chrono::Utc;
 
 /// Genesis configuration
 pub struct GenesisConfig {

@@ -71,11 +71,11 @@
 
 use anyhow::{Result, anyhow};
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
-use rand::{rngs::OsRng, Rng};
+use rand::rngs::OsRng;
 use serde::{Serialize, Deserialize};
 use sha3::{Sha3_256, Digest};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use base64::{Engine as _, engine::general_purpose};
 
@@ -110,6 +110,7 @@ pub static GLOBAL_HYBRID_INSTANCES: tokio::sync::OnceCell<Arc<tokio::sync::Mutex
     tokio::sync::OnceCell::const_new();
 
 /// Helper module for serializing [u8; 64] arrays with serde
+#[allow(dead_code)]
 mod base64_bytes {
     use serde::{Serialize, Deserialize, Serializer, Deserializer};
     use base64::{Engine as _, engine::general_purpose};
@@ -141,6 +142,7 @@ mod base64_bytes {
 }
 
 /// Helper module for serializing [u8; 32] arrays with serde
+#[allow(dead_code)]
 mod base64_bytes_32 {
     use serde::{Serialize, Deserialize, Serializer, Deserializer};
     use base64::{Engine as _, engine::general_purpose};
@@ -178,8 +180,6 @@ mod base64_bytes_32 {
 /// - Network overhead: ~231 KB/s (320 rotations/day)
 const CERTIFICATE_LIFETIME_SECS: u64 = 270;
 
-/// Maximum cached certificates
-const MAX_CACHE_SIZE: usize = 10000;
 
 /// Hybrid Certificate containing Ed25519 key signed by Dilithium
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,6 +353,7 @@ impl CompactHybridSignature {
 
 /// Certificate cache entry
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CachedCertificate {
     certificate: HybridCertificate,
     verified_at: u64,
@@ -385,6 +386,7 @@ pub struct HybridCrypto {
     node_id: String,
     
     /// Certificate rotation interval
+    #[allow(dead_code)]
     rotation_interval: Duration,
     
     /// Certificate cache for O(1) verification (v2.51: uses global DashMap)
@@ -547,7 +549,7 @@ impl HybridCrypto {
         let mut hasher = Sha3_256::new();
         hasher.update(message);
         let message_hash = hasher.finalize();
-        let message_hash_hex = hex::encode(message_hash);
+        let _message_hash_hex = hex::encode(message_hash);
         
         // Step 5: Create encapsulated_data = ephemeral_public_key || message_hash || timestamp
         let signed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -846,7 +848,6 @@ impl HybridCrypto {
             return Ok(false);
         }
         
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
         use crate::quantum_crypto::DilithiumSignature;
         
         // PRODUCTION v2.50: Lock-free quantum crypto

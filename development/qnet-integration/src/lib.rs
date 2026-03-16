@@ -1,7 +1,6 @@
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(dead_code)]
-#![allow(unused_mut)]
+// Blanket suppression directives removed.
+// Remaining targeted #[allow(dead_code)] annotations are placed on specific
+// items intentionally kept for future use or backwards-compatibility.
 #![recursion_limit = "256"]
 
 //! QNet Integration - Full blockchain system
@@ -29,7 +28,8 @@ pub mod quic_transport;    // PRODUCTION v2.19.21: QUIC transport layer
 pub mod p2p_transport;     // PRODUCTION v2.19.21: P2P transport abstraction + binary protocol
 pub mod preflight_checks;  // PRODUCTION v2.19.22: Pre-flight port/connectivity validation
 pub mod benchmark;         // PRODUCTION v2.19.25: Real transaction benchmark system
-pub mod tests;             // PRODUCTION v2.19.25: Complete test suite (API, Stress, Network, Chaos)
+#[cfg(test)]
+mod tests;                 // PRODUCTION v2.19.25: Complete test suite (API, Stress, Network, Chaos)
 
 // ============================================================================
 // CRYPTOGRAPHY MODULE (isolated for external audit)
@@ -49,7 +49,6 @@ pub use crypto::key_manager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, error};
-use sha3::{Sha3_256, Digest};
 
 // Core imports with correct paths
 // v3.22: Use State (not StateManager) - State has optimized Merkle methods
@@ -122,9 +121,11 @@ pub struct QNetBlockchain {
     running: Arc<AtomicBool>,
     
     /// Shard coordinator
+    #[allow(dead_code)]
     shard_coordinator: Option<Arc<ShardCoordinator>>,
     
     /// Parallel validator
+    #[allow(dead_code)]
     parallel_validator: Option<Arc<ParallelValidator>>,
 }
 
@@ -230,6 +231,9 @@ impl QNetBlockchain {
     }
     
     /// Start consensus rounds
+    /// NOTE: Intentionally unused — QNet uses macroblock-triggered consensus,
+    /// not continuous rounds. Kept for future configurable-mode support.
+    #[allow(dead_code)]
     async fn start_consensus_rounds(&self) -> IntegrationResult<()> {
         let consensus = self.consensus.clone();
         let mempool = self.mempool.clone();
@@ -253,10 +257,11 @@ impl QNetBlockchain {
         Ok(())
     }
     
-    /// Run single consensus round
+    /// Run single consensus round (companion to start_consensus_rounds)
+    #[allow(dead_code)]
     async fn run_consensus_round(
-        consensus: &ConsensusEngine,
-        mempool: &SimpleMempool,
+        _consensus: &ConsensusEngine,
+        _mempool: &SimpleMempool,
         round: u64
     ) -> IntegrationResult<()> {
         info!("Starting consensus round {}", round);
@@ -325,12 +330,13 @@ impl QNetBlockchain {
         Ok(())
     }
     
-    /// Handle network message
+    /// Handle network message (called from network event loop)
+    #[allow(dead_code)]
     async fn handle_network_message(&self, peer_id: String, message: NetworkMessage) -> IntegrationResult<()> {
         info!("Received message from {}: {:?}", peer_id, message);
         
         match message {
-            NetworkMessage::Block { height, data, block_type } => {
+            NetworkMessage::Block { height, data: _data, block_type } => {
                 // Process new block
                 info!("Received block at height {}: {:?}", height, block_type);
                 // For now, just log
@@ -358,8 +364,6 @@ impl QNetBlockchain {
 
 /// Feature flags for testing
 pub mod feature_flags {
-    use crate::node::{NodeType, Region};
-    
     /// Performance configuration
     pub struct PerformanceConfig {
         pub enable_sharding: bool,
@@ -382,8 +386,6 @@ pub mod feature_flags {
     }
 }
 
-// Add serde_json dependency for serialization
-use serde_json;
 use hex;
 
 // Re-export commonly used types

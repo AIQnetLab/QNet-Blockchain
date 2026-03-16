@@ -347,8 +347,9 @@ impl BlockValidator {
     }
     
     /// Verify pure Dilithium signature
+    #[allow(dead_code)]
     fn verify_dilithium_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
-        use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
+        use crate::quantum_crypto::DilithiumSignature;
         
         // Create message to verify
         let message = self.create_signing_message(tx)?;

@@ -4,7 +4,6 @@ use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use sha3::{Sha3_256, Digest};
 use crate::errors::IntegrationError;
-use base64::{Engine as _, engine::general_purpose};
 // blake3 removed - using SHA3-256 for NIST FIPS 202 compliance
 use hex;
 use serde_json;
@@ -22,6 +21,7 @@ fn safe_preview(s: &str, len: usize) -> &str {
 
 /// Network statistics for dynamic pricing calculations
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct NetworkStats {
     total_nodes: u64,
     light_nodes: u64,
@@ -710,6 +710,7 @@ impl BlockchainActivationRegistry {
     }
     
     /// Check code uniqueness through blockchain consensus
+    #[allow(dead_code)]
     async fn consensus_check_code_uniqueness(&self, code: &str) -> Result<bool, String> {
         // Query blockchain state for activation code usage
         // Use SHA3-256 for consistency with hash_activation_code_for_blockchain
@@ -1033,7 +1034,7 @@ impl BlockchainActivationRegistry {
     }
     
     /// Direct consensus engine query for migration count
-    async fn consensus_query_migration_count(&self, code_hash: &str, since_timestamp: u64) -> Result<u32, String> {
+    async fn consensus_query_migration_count(&self, code_hash: &str, _since_timestamp: u64) -> Result<u32, String> {
         // Query migration transactions from blockchain state
         // This would use the node's own consensus engine to read blockchain
         
@@ -1050,7 +1051,7 @@ impl BlockchainActivationRegistry {
     }
     
     /// P2P network consensus query for migration verification
-    async fn p2p_consensus_migration_query(&self, code_hash: &str, since_timestamp: u64) -> Result<u32, String> {
+    async fn p2p_consensus_migration_query(&self, _code_hash: &str, _since_timestamp: u64) -> Result<u32, String> {
         // Query multiple peers in P2P network for consensus on migration count
         // Majority consensus determines the result
         
@@ -1199,7 +1200,7 @@ impl BlockchainActivationRegistry {
     }
     
     /// Broadcast migration transaction to P2P network
-    async fn p2p_broadcast_migration_transaction(&self, tx_hash: &str, record: &BlockchainMigrationRecord) -> Result<(), String> {
+    async fn p2p_broadcast_migration_transaction(&self, tx_hash: &str, _record: &BlockchainMigrationRecord) -> Result<(), String> {
         // Broadcast transaction to P2P network for validation and inclusion
         println!("🌐 Broadcasting migration transaction to P2P network: {}", tx_hash);
         
@@ -1210,14 +1211,14 @@ impl BlockchainActivationRegistry {
     }
 
     /// Simple device update for Light nodes (no rate limiting)
-    async fn update_light_node_device(&self, code: &str, new_device_signature: &str) -> Result<(), IntegrationError> {
+    async fn update_light_node_device(&self, code: &str, _new_device_signature: &str) -> Result<(), IntegrationError> {
         // Light nodes: simple device signature update
         // No complex migration record needed - just update the signature
         // Auto-cleanup of inactive devices handles device management automatically
         
         {
             let mut activation_records = self.activation_records.write().await;
-            if let Some(record) = activation_records.get_mut(code) {
+            if let Some(_record) = activation_records.get_mut(code) {
                 // No migration record for Light nodes - just note the update
                 println!("📱 Updated Light node device signature (automatic device management)");
             }
@@ -1519,7 +1520,7 @@ impl BlockchainActivationRegistry {
             }
         } else {
             // Check for periodic refresh from blockchain
-            let node_count = active_nodes_read.len();
+            let _node_count = active_nodes_read.len();
             drop(active_nodes_read);
             
             // CONSENSUS FIX: Use block-based cache invalidation (every 30 blocks)
@@ -1862,7 +1863,7 @@ impl BlockchainActivationRegistry {
         // PRODUCTION: Create and submit activation transaction to QNet blockchain
         
         // Create activation transaction
-        let activation_tx = QNetActivationTransaction {
+        let _activation_tx = QNetActivationTransaction {
             tx_type: "node_activation".to_string(),
             code_hash: record.code_hash.clone(), // Use hash for secure blockchain storage
             node_type: record.node_type.clone(),
@@ -2016,7 +2017,7 @@ impl BlockchainActivationRegistry {
     }
     
     /// Broadcast activation transaction to P2P network
-    async fn p2p_broadcast_activation(&self, tx_hash: &str, record: &ActivationRecord) -> Result<(), String> {
+    async fn p2p_broadcast_activation(&self, tx_hash: &str, _record: &ActivationRecord) -> Result<(), String> {
         // PRODUCTION: Broadcast activation transaction to P2P network
         
         println!("🌐 Broadcasting activation to P2P network: {}", tx_hash);
@@ -2460,12 +2461,8 @@ impl BlockchainActivationRegistry {
     }
 
     /// Get current device signature for code
-    async fn get_current_device_signature(&self, code: &str) -> Result<String, IntegrationError> {
-        Ok("current_device".to_string())
-    }
-
     /// Generate wallet signature
-    async fn generate_wallet_signature(&self, wallet_address: &str, code: &str) -> Result<String, IntegrationError> {
+    async fn generate_wallet_signature(&self, _wallet_address: &str, _code: &str) -> Result<String, IntegrationError> {
         Ok("wallet_signature".to_string())
     }
 
@@ -2911,7 +2908,6 @@ impl BlockchainActivationRegistry {
         
         // Count by type
         let mut light_count = 0u64;
-        let mut full_count = 0u64;
         let mut super_count = 0u64;
         
         for node in active_nodes.values() {
