@@ -117,15 +117,15 @@ class ErrorBoundary extends React.Component {
               The app encountered an unexpected error. You can try to continue or clear the cache if the problem persists.
             </Text>
 
-            {__DEV__ && this.state.error && (
+            {this.state.error && (
               <View style={styles.errorDetails}>
-                <Text style={styles.errorTitle}>Error Details (Dev Mode):</Text>
+                <Text style={styles.errorTitle}>Error Details:</Text>
                 <Text style={styles.errorText}>
                   {this.state.error.toString()}
                 </Text>
                 {this.state.error.stack && (
                   <Text style={styles.errorStack}>
-                    {this.state.error.stack.slice(0, 500)}...
+                    {this.state.error.stack.slice(0, 800)}
                   </Text>
                 )}
               </View>

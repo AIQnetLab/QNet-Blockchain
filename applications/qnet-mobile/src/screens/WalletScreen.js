@@ -31,7 +31,6 @@ import {
   refreshFcmTokenOnServer,
   isTokenRefreshNeeded,
 } from '../services/PushService';
-import logger from '../utils/logger';
 import { getRandomGenesisNode } from '../config/nodes';
 
 // 1DEV Burn Tracker Contract (same as browser extension)
@@ -2831,6 +2830,8 @@ const WalletScreen = () => {
     // app before storeWallet completes, the vault is never written to AsyncStorage
     // and the wallet disappears on next launch ("seed phrase reset" bug).
     setLoading(true);
+    const savedWallet = { ...tempWallet };
+    delete savedWallet.password;
     try {
       await walletManager.storeWallet(tempWallet, tempWallet.password);
     } catch (error) {
@@ -2838,12 +2839,12 @@ const WalletScreen = () => {
       showAlert('Error', 'Failed to save wallet: ' + (error.message || 'Unknown error'));
       return;
     }
-    setLoading(false);
-    setTempWallet(null);
 
-    setWallet(tempWallet);
-    setHasWallet(true);
     setShowSeedConfirm(false);
+    setTempWallet(null);
+    setLoading(false);
+    setWallet(savedWallet);
+    setHasWallet(true);
     setConfirmPassword('');
     setSeedConfirmWords({});
     setActivatedNodeType(null);
@@ -2859,10 +2860,10 @@ const WalletScreen = () => {
     AsyncStorage.removeItem('qnet_activation_meta_full');
     AsyncStorage.removeItem('qnet_activation_meta_super');
     AsyncStorage.removeItem('qnet_last_activated_node');
-    AsyncStorage.removeItem(`blockchain_check_${tempWallet.publicKey}`);
+    AsyncStorage.removeItem(`blockchain_check_${savedWallet.publicKey}`);
 
     setActiveTab('assets');
-    loadBalance(tempWallet.publicKey);
+    loadBalance(savedWallet.publicKey);
   };
 
   const _startLockoutCountdown = (remainingMs) => {
@@ -3909,7 +3910,7 @@ const WalletScreen = () => {
   }
 
   // Seed phrase confirmation screen
-  if (showSeedConfirm && tempWallet) {
+  if (showSeedConfirm && tempWallet && tempWallet.mnemonic) {
     const words = tempWallet.mnemonic.split(' ');
     const positions = Object.keys(seedConfirmWords).map(Number).sort((a, b) => a - b);
     

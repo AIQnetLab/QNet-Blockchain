@@ -222,6 +222,77 @@ fn slip10_derive_path(seed: &[u8; 64], path: &[u32]) -> Result<[u8; 32], String>
 }
 
 // =========================================================================
+// QNet Ed25519 Key Derivation (BIP44 m/44'/9999'/0'/0'/0')
+// =========================================================================
+
+/// Derive QNet Ed25519 signing key from BIP39 mnemonic.
+/// Path: m/44'/9999'/0'/0'/0' — same as mobile WalletManager.js generateQNetKeypair().
+pub fn derive_qnet_signing_key_from_mnemonic(mnemonic: &str) -> Result<ed25519_dalek::SigningKey, String> {
+    let mnemonic = mnemonic.trim();
+    if mnemonic.is_empty() {
+        return Err("Empty mnemonic".to_string());
+    }
+
+    let seed = bip39_mnemonic_to_seed(mnemonic);
+    let derived_key = slip10_derive_path(&seed, &[44, 9999, 0, 0, 0])
+        .map_err(|e| format!("SLIP-10 QNet derivation failed: {}", e))?;
+
+    Ok(ed25519_dalek::SigningKey::from_bytes(&derived_key))
+}
+
+// =========================================================================
+// QNet Address Derivation (BIP44 m/44'/9999'/0'/0'/0', matches mobile app)
+// =========================================================================
+
+/// Derive QNet EON wallet address from BIP39 mnemonic phrase.
+///
+/// Replicates WalletManager.js generateQNetAddress() exactly:
+///   1. BIP39: mnemonic → seed (PBKDF2-HMAC-SHA512)
+///   2. SLIP-10: seed → m/44'/9999'/0'/0'/0'
+///   3. Ed25519: derived_key → 32-byte public key (nacl.sign.keyPair.fromSeed)
+///   4. SHA-512(pubkey) → hex
+///   5. Format: {19hex}eon{15hex}{4hex SHA3-256 checksum}
+pub fn derive_qnet_address_from_mnemonic(mnemonic: &str) -> Result<String, String> {
+    use sha2::{Sha512, Digest as Sha2Digest};
+    use sha3::{Sha3_256, Digest};
+
+    let mnemonic = mnemonic.trim();
+    if mnemonic.is_empty() {
+        return Err("Empty mnemonic".to_string());
+    }
+
+    // Step 1: BIP39 mnemonic → 64-byte seed
+    let seed = bip39_mnemonic_to_seed(mnemonic);
+
+    // Step 2: SLIP-10 HD derivation at m/44'/9999'/0'/0'/0'
+    // QNet coin type = 9999 (0x270F), matches mobile BIP44 path
+    let derived_key = slip10_derive_path(&seed, &[44, 9999, 0, 0, 0])
+        .map_err(|e| format!("SLIP-10 QNet derivation failed: {}", e))?;
+
+    // Step 3: Ed25519 keypair from 32-byte seed (matches nacl.sign.keyPair.fromSeed)
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&derived_key);
+    let verifying_key = signing_key.verifying_key();
+    let pubkey_bytes = verifying_key.as_bytes();
+
+    // Step 4: SHA-512 of public key → hex string (matches CryptoJS.SHA512)
+    let mut sha512_hasher = Sha512::new();
+    sha512_hasher.update(pubkey_bytes);
+    let full_hash = hex::encode(sha512_hasher.finalize());
+
+    // Step 5: Address format: 19 chars + "eon" + 15 chars + 4-char SHA3-256 checksum
+    let part1 = full_hash[..19].to_lowercase();
+    let part2 = full_hash[19..34].to_lowercase();
+    let body = format!("{}eon{}", part1, part2);
+
+    let mut sha3_hasher = Sha3_256::new();
+    sha3_hasher.update(body.as_bytes());
+    let checksum_hex = hex::encode(sha3_hasher.finalize());
+    let checksum = &checksum_hex[..4];
+
+    Ok(format!("{}eon{}{}", part1, part2, checksum))
+}
+
+// =========================================================================
 // Tests
 // =========================================================================
 

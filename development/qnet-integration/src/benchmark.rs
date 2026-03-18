@@ -1,4 +1,4 @@
-﻿//! QNet Benchmark Module - Real Transaction Load Testing
+//! QNet Benchmark Module - Real Transaction Load Testing
 //! 
 //! Generates REAL Transfer transactions between test accounts with full
 //! cryptographic validation (Ed25519 signatures).
@@ -41,6 +41,8 @@ use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use ed25519_dalek::{SigningKey, Signer, VerifyingKey};
 use rand::rngs::OsRng;
+use pqcrypto_mldsa::mldsa65 as dilithium3;
+use pqcrypto_traits::sign::{SecretKey as PqSecretKey, PublicKey as PqPublicKey, SignedMessage as PqSignedMessage};
 
 /// QNC decimals: 1 QNC = 10^9 nanoQNC (from core/qnet-state)
 pub const QNC_DECIMALS: u32 = 9;
@@ -105,6 +107,11 @@ pub struct BenchmarkConfig {
     pub num_accounts: usize,
     /// Initial balance for each test account (in nanoQNC)
     pub initial_balance: u64,
+    /// Use hybrid signatures: Ed25519 + Dilithium3 (ML-DSA-65) post-quantum signing.
+    /// When true, every TX is double-signed — realistic PQ throughput measurement.
+    /// Dilithium3 is ~50× slower than Ed25519; expect ~1-2K TPS per core.
+    #[serde(default)]
+    pub use_hybrid_sig: bool,
 }
 
 fn default_shards() -> usize { 256 }
@@ -138,6 +145,7 @@ impl BenchmarkConfig {
             target_tps: tps,
             num_accounts: accounts,
             initial_balance: 1_000_000 * ONE_QNC,
+            use_hybrid_sig: false,
         }
     }
     
@@ -235,12 +243,128 @@ impl BenchmarkAccount {
     }
 }
 
+/// Hybrid test account: Ed25519 + Dilithium3 (ML-DSA-65) keypair.
+/// Used when `BenchmarkConfig::use_hybrid_sig = true`.
+pub struct HybridBenchmarkAccount {
+    pub address: String,
+    pub ed_signing_key: SigningKey,
+    pub ed_verifying_key: VerifyingKey,
+    pub pq_pk: dilithium3::PublicKey,
+    pub pq_sk: dilithium3::SecretKey,
+    pub nonce: AtomicU64,
+}
+
+impl Clone for HybridBenchmarkAccount {
+    fn clone(&self) -> Self {
+        Self {
+            address: self.address.clone(),
+            ed_signing_key: self.ed_signing_key.clone(),
+            ed_verifying_key: self.ed_verifying_key.clone(),
+            pq_pk: dilithium3::PublicKey::from_bytes(self.pq_pk.as_bytes()).unwrap(),
+            pq_sk: dilithium3::SecretKey::from_bytes(self.pq_sk.as_bytes()).unwrap(),
+            nonce: AtomicU64::new(self.nonce.load(Ordering::SeqCst)),
+        }
+    }
+}
+
+impl HybridBenchmarkAccount {
+    pub fn new(index: usize) -> Self {
+        let mut csprng = OsRng;
+        let ed_signing_key = SigningKey::generate(&mut csprng);
+        let ed_verifying_key = ed_signing_key.verifying_key();
+        let (pq_pk, pq_sk) = dilithium3::keypair();
+        Self {
+            address: format!("EON1benchmark{:06}", index),
+            ed_signing_key,
+            ed_verifying_key,
+            pq_pk,
+            pq_sk,
+            nonce: AtomicU64::new(0),
+        }
+    }
+
+    pub fn get_next_nonce(&self) -> u64 {
+        self.nonce.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+/// Generate a hybrid-signed transaction from a pre-cloned snapshot (NO LOCK).
+/// Both Ed25519 and Dilithium3 signatures are computed and embedded in the TX.
+pub fn generate_hybrid_transaction_from_snapshot(
+    accounts: &[HybridBenchmarkAccount],
+) -> Option<qnet_state::Transaction> {
+    if accounts.len() < 2 {
+        return None;
+    }
+
+    let sender_idx = rand::random::<usize>() % accounts.len();
+    let mut receiver_idx = rand::random::<usize>() % accounts.len();
+    while receiver_idx == sender_idx {
+        receiver_idx = rand::random::<usize>() % accounts.len();
+    }
+
+    let sender   = &accounts[sender_idx];
+    let receiver = &accounts[receiver_idx];
+    let nonce    = sender.get_next_nonce();
+    let amount   = ONE_QNC;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    const GAS_LIMIT_TRANSFER: u64 = 10_000;
+    const GAS_PRICE_STANDARD: u64 = 1;
+
+    let mut tx = qnet_state::Transaction {
+        hash: String::new(),
+        from: sender.address.clone(),
+        to: Some(receiver.address.clone()),
+        amount,
+        nonce,
+        timestamp,
+        gas_price: GAS_PRICE_STANDARD,
+        gas_limit: GAS_LIMIT_TRANSFER,
+        data: None,
+        signature: None,
+        public_key: Some(hex::encode(sender.ed_verifying_key.as_bytes())),
+        tx_type: qnet_state::TransactionType::Transfer {
+            from: sender.address.clone(),
+            to: receiver.address.clone(),
+            amount,
+        },
+        dilithium_signature: None,
+        dilithium_public_key: None,
+    };
+
+    tx.hash = tx.calculate_hash();
+
+    // Canonical message — same format as Ed25519 production path
+    let message = format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        tx.from, receiver.address, amount, nonce, tx.gas_price, tx.gas_limit, timestamp
+    );
+    let msg_bytes = message.as_bytes();
+
+    // Ed25519 signature
+    let ed_sig = sender.ed_signing_key.sign(msg_bytes);
+    tx.signature = Some(hex::encode(ed_sig.to_bytes()));
+
+    // Dilithium3 (ML-DSA-65) signature
+    let pq_signed = dilithium3::sign(msg_bytes, &sender.pq_sk);
+    tx.dilithium_signature  = Some(hex::encode(pq_signed.as_bytes()));
+    tx.dilithium_public_key = Some(hex::encode(sender.pq_pk.as_bytes()));
+
+    Some(tx)
+}
+
 /// Benchmark manager
 pub struct BenchmarkManager {
     /// Configuration
     config: RwLock<BenchmarkConfig>,
-    /// Test accounts
+    /// Ed25519-only test accounts
     accounts: RwLock<Vec<BenchmarkAccount>>,
+    /// Hybrid (Ed25519 + Dilithium3) accounts — populated when use_hybrid_sig=true
+    hybrid_accounts: RwLock<Vec<HybridBenchmarkAccount>>,
     /// Running state
     is_running: AtomicBool,
     /// Transactions sent (pub for direct update from benchmark generator)
@@ -268,6 +392,7 @@ impl BenchmarkManager {
         Self {
             config: RwLock::new(BenchmarkConfig::default()),
             accounts: RwLock::new(Vec::new()),
+            hybrid_accounts: RwLock::new(Vec::new()),
             is_running: AtomicBool::new(false),
             transactions_sent: AtomicU64::new(0),
             transactions_confirmed: AtomicU64::new(0),
@@ -281,7 +406,7 @@ impl BenchmarkManager {
         }
     }
     
-    /// Initialize benchmark accounts
+    /// Initialize benchmark accounts (Ed25519-only)
     pub async fn initialize(&self, num_accounts: usize) {
         let mut accounts = self.accounts.write().await;
         accounts.clear();
@@ -292,7 +417,31 @@ impl BenchmarkManager {
             accounts.push(BenchmarkAccount::new(i));
         }
         
-        println!("[BENCHMARK] ✅ Test accounts ready");
+        println!("[BENCHMARK] ✅ Ed25519 accounts ready");
+    }
+
+    /// Initialize hybrid accounts (Ed25519 + Dilithium3 / ML-DSA-65).
+    /// Dilithium3 keygen is ~50× slower than Ed25519, so we log progress every 100 accounts.
+    pub async fn initialize_hybrid(&self, num_accounts: usize) {
+        let mut hybrid = self.hybrid_accounts.write().await;
+        hybrid.clear();
+
+        println!("[BENCHMARK] 🔑 Generating {} hybrid (Ed25519 + Dilithium3) accounts...", num_accounts);
+        println!("[BENCHMARK] ⚠️  Dilithium3 keygen is slow (~50× vs Ed25519). Please wait...");
+
+        for i in 0..num_accounts {
+            hybrid.push(HybridBenchmarkAccount::new(i));
+            if (i + 1) % 100 == 0 {
+                println!("[BENCHMARK] 🔐 Hybrid keygen: {}/{}", i + 1, num_accounts);
+            }
+        }
+
+        println!("[BENCHMARK] ✅ Hybrid accounts ready ({} accounts)", num_accounts);
+    }
+
+    /// Get hybrid accounts snapshot for lock-free generation in workers
+    pub async fn get_hybrid_accounts_snapshot(&self) -> Vec<HybridBenchmarkAccount> {
+        self.hybrid_accounts.read().await.clone()
     }
     
     /// Start benchmark
@@ -313,9 +462,16 @@ impl BenchmarkManager {
         self.last_tx_count.store(0, Ordering::SeqCst);
         
         // Initialize accounts if needed
-        let accounts_count = self.accounts.read().await.len();
-        if accounts_count < config.num_accounts {
-            self.initialize(config.num_accounts).await;
+        if config.use_hybrid_sig {
+            let hybrid_count = self.hybrid_accounts.read().await.len();
+            if hybrid_count < config.num_accounts {
+                self.initialize_hybrid(config.num_accounts).await;
+            }
+        } else {
+            let accounts_count = self.accounts.read().await.len();
+            if accounts_count < config.num_accounts {
+                self.initialize(config.num_accounts).await;
+            }
         }
         
         // Store config

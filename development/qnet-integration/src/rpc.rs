@@ -14802,7 +14802,8 @@ async fn handle_tokens_for_address(
 /// Request body for benchmark start
 #[derive(Debug, Clone, serde::Deserialize)]
 struct BenchmarkStartRequest {
-    /// Preset configuration (single_shard, small_scale, medium_scale, large_scale, extra_large, full_scale)
+    /// Preset configuration (stability_test, stress_test, max_capacity, progressive_max,
+    /// single_shard, small_scale, medium_scale, large_scale, extra_large, full_scale)
     #[serde(default)]
     preset: Option<crate::benchmark::BenchmarkPreset>,
     /// Number of shards to simulate (1-256)
@@ -14817,6 +14818,11 @@ struct BenchmarkStartRequest {
     /// Number of test accounts
     #[serde(default)]
     num_accounts: Option<usize>,
+    /// Enable hybrid signing: Ed25519 + Dilithium3 (ML-DSA-65).
+    /// Each TX is double-signed — real post-quantum throughput measurement.
+    /// Note: Dilithium3 is ~50× slower than Ed25519; expect ~1-2K TPS per core.
+    #[serde(default)]
+    use_hybrid: Option<bool>,
 }
 
 /// Handle POST /api/v1/benchmark/start
@@ -14839,17 +14845,16 @@ async fn handle_benchmark_start(
     }
     
     // Build config from preset or custom values
+    let use_hybrid = request.use_hybrid.unwrap_or(false);
     let config = if let Some(preset) = request.preset {
-        // Use preset configuration
         let mut cfg = BenchmarkConfig::from_preset(preset);
-        // Override with any custom values provided
         if let Some(shards) = request.shards { cfg.shards = shards.min(256).max(1); }
         if let Some(total) = request.total { cfg.total_transactions = total; }
         if let Some(tps) = request.target_tps { cfg.target_tps = tps; }
         if let Some(accounts) = request.num_accounts { cfg.num_accounts = accounts; }
+        cfg.use_hybrid_sig = use_hybrid;
         cfg
     } else if request.shards.is_some() || request.total.is_some() || request.target_tps.is_some() {
-        // Custom configuration
         let shards = request.shards.unwrap_or(256).min(256).max(1);
         let tps_per_shard = 100_000u64;
         BenchmarkConfig {
@@ -14859,10 +14864,12 @@ async fn handle_benchmark_start(
             target_tps: request.target_tps.unwrap_or(shards as u64 * tps_per_shard),
             num_accounts: request.num_accounts.unwrap_or(shards * 40),
             initial_balance: 1_000_000 * crate::benchmark::ONE_QNC,
+            use_hybrid_sig: use_hybrid,
         }
     } else {
-        // Default: Full scale (256 shards, 12.8M TPS)
-        BenchmarkConfig::default()
+        let mut cfg = BenchmarkConfig::default();
+        cfg.use_hybrid_sig = use_hybrid;
+        cfg
     };
     
     println!("[BENCHMARK] 🔐 Genesis node authorized. Starting {:?} benchmark...", config.preset);
@@ -14876,21 +14883,26 @@ async fn handle_benchmark_start(
             let target_tps = config.target_tps;
             
             let is_progressive = config.is_progressive();
+            let is_hybrid = config.use_hybrid_sig;
             tokio::spawn(async move {
                 if is_progressive {
                     run_progressive_benchmark(blockchain_clone, total).await;
+                } else if is_hybrid {
+                    run_hybrid_benchmark_generator(blockchain_clone, total, target_tps).await;
                 } else {
                     run_benchmark_generator(blockchain_clone, total, target_tps).await;
                 }
             });
-            
+
             Ok(warp::reply::json(&json!({
                 "success": true,
                 "message": "Benchmark started",
                 "config": {
                     "total_transactions": config.total_transactions,
                     "target_tps": config.target_tps,
-                    "num_accounts": config.num_accounts
+                    "num_accounts": config.num_accounts,
+                    "use_hybrid_sig": config.use_hybrid_sig,
+                    "sig_type": if config.use_hybrid_sig { "Ed25519 + Dilithium3 (ML-DSA-65)" } else { "Ed25519" }
                 }
             })))
         }
@@ -15202,6 +15214,155 @@ async fn run_benchmark_generator(
     println!("[BENCHMARK] ⏱️  Duration:        {:.2}s", elapsed);
     println!("[BENCHMARK] 🚀 ACTUAL TPS:      {:.0}", final_tps);
     println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+}
+
+/// HYBRID BENCHMARK GENERATOR — Ed25519 + Dilithium3 (ML-DSA-65) dual signing.
+///
+/// Every TX is double-signed on the generator side and dual-verified on the node side.
+/// This measures REAL post-quantum throughput — no shortcuts.
+///
+/// Design mirrors run_benchmark_generator but:
+///   - Uses HybridBenchmarkAccount (Ed25519 + Dilithium3 keypairs)
+///   - Calls generate_hybrid_transaction_from_snapshot() for each TX
+///   - Submits via submit_benchmark_batch_hybrid() (dual-verify gate)
+///
+/// Scale horizontally across cores with multiple worker tasks.
+async fn run_hybrid_benchmark_generator(
+    blockchain: Arc<BlockchainNode>,
+    total_transactions: u64,
+    target_tps: u64,
+) {
+    use crate::benchmark::{BENCHMARK_MANAGER, generate_hybrid_transaction_from_snapshot};
+    use std::time::Instant;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc as StdArc;
+
+    // Dilithium3 is ~50× slower → fewer workers and smaller batches are more efficient
+    let num_workers = match target_tps {
+        0..=2_000  => 2,
+        2_001..=5_000 => 4,
+        _ => 8,
+    };
+    let batch_size = 100usize; // Small batches — Dilithium3 verify is expensive
+    let batch_delay = std::time::Duration::from_millis(10);
+
+    println!("[BENCHMARK-HYBRID] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK-HYBRID] 🔐 Ed25519 + Dilithium3 (ML-DSA-65) dual-sign mode");
+    println!("[BENCHMARK-HYBRID] ⚙️  Workers: {}, Batch: {}, Target TPS: {}", num_workers, batch_size, target_tps);
+    println!("[BENCHMARK-HYBRID] ⚠️  ~50× slower than Ed25519-only — real PQ overhead");
+    println!("[BENCHMARK-HYBRID] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    let accounts_snapshot = BENCHMARK_MANAGER.get_hybrid_accounts_snapshot().await;
+    if accounts_snapshot.len() < 2 {
+        println!("[BENCHMARK-HYBRID] ❌ Not enough hybrid accounts! Aborting.");
+        BENCHMARK_MANAGER.stop().await;
+        return;
+    }
+    println!("[BENCHMARK-HYBRID] 📋 {} hybrid accounts cloned for workers", accounts_snapshot.len());
+
+    let start = Instant::now();
+    let global_sent      = StdArc::new(AtomicU64::new(0));
+    let global_confirmed = StdArc::new(AtomicU64::new(0));
+    let global_errors    = StdArc::new(AtomicU64::new(0));
+
+    let tx_per_worker = total_transactions / num_workers as u64;
+    let mut handles = Vec::with_capacity(num_workers);
+
+    for worker_id in 0..num_workers {
+        let blockchain_clone    = blockchain.clone();
+        let sent_counter        = global_sent.clone();
+        let confirmed_counter   = global_confirmed.clone();
+        let error_counter       = global_errors.clone();
+
+        // Partition accounts to avoid nonce collision between workers
+        let accounts_per_worker = accounts_snapshot.len() / num_workers;
+        let start_idx = worker_id * accounts_per_worker;
+        let end_idx = if worker_id == num_workers - 1 {
+            accounts_snapshot.len()
+        } else {
+            start_idx + accounts_per_worker
+        };
+        let worker_accounts: Vec<_> = accounts_snapshot[start_idx..end_idx].to_vec();
+
+        let handle = tokio::spawn(async move {
+            let mut local_sent = 0u64;
+
+            while local_sent < tx_per_worker && BENCHMARK_MANAGER.is_running() {
+                let mut batch = Vec::with_capacity(batch_size);
+
+                for _ in 0..batch_size {
+                    if local_sent >= tx_per_worker || !BENCHMARK_MANAGER.is_running() {
+                        break;
+                    }
+                    // Dilithium3 sign happens inside generate_hybrid_transaction_from_snapshot
+                    if let Some(tx) = generate_hybrid_transaction_from_snapshot(&worker_accounts) {
+                        batch.push(tx);
+                        local_sent += 1;
+                    }
+                    // Yield more often — Dilithium3 is CPU-heavy
+                    tokio::task::yield_now().await;
+                }
+
+                if batch.is_empty() {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+
+                let batch_len = batch.len();
+                // Dual-verify gate: Ed25519 + Dilithium3
+                match blockchain_clone.submit_benchmark_batch_hybrid(batch).await {
+                    Ok(confirmed) => {
+                        sent_counter.fetch_add(batch_len as u64, Ordering::SeqCst);
+                        confirmed_counter.fetch_add(confirmed as u64, Ordering::SeqCst);
+                        for _ in 0..batch_len { BENCHMARK_MANAGER.record_sent(); }
+                        for _ in 0..confirmed { BENCHMARK_MANAGER.record_confirmed(); }
+                    }
+                    Err(_) => {
+                        error_counter.fetch_add(batch_len as u64, Ordering::SeqCst);
+                        for _ in 0..batch_len { BENCHMARK_MANAGER.record_error(); }
+                    }
+                }
+
+                tokio::time::sleep(batch_delay).await;
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let final_sent      = global_sent.load(Ordering::SeqCst);
+    let final_confirmed = global_confirmed.load(Ordering::SeqCst);
+    let final_errors    = global_errors.load(Ordering::SeqCst);
+    let final_tps       = final_sent as f64 / elapsed.max(0.001);
+
+    // Final sync with BENCHMARK_MANAGER (same pattern as Ed25519 generator)
+    let current_stats = BENCHMARK_MANAGER.get_status().await;
+    let remaining_sent = final_sent.saturating_sub(current_stats.transactions_sent);
+    let remaining_confirmed = final_confirmed.saturating_sub(current_stats.transactions_confirmed);
+    for _ in 0..remaining_sent { BENCHMARK_MANAGER.record_sent(); }
+    for _ in 0..remaining_confirmed { BENCHMARK_MANAGER.record_confirmed(); }
+    for _ in 0..final_errors { BENCHMARK_MANAGER.record_error(); }
+
+    // Update peak TPS
+    {
+        let mut peak = BENCHMARK_MANAGER.peak_tps.write().await;
+        if final_tps > *peak { *peak = final_tps; }
+    }
+
+    println!("[BENCHMARK-HYBRID] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK-HYBRID] 🏁 HYBRID BENCHMARK COMPLETED");
+    println!("[BENCHMARK-HYBRID] 📦 Sent:      {}", final_sent);
+    println!("[BENCHMARK-HYBRID] ✅ Confirmed: {} (dual Ed25519+Dilithium3 verified)", final_confirmed);
+    println!("[BENCHMARK-HYBRID] ❌ Errors:    {}", final_errors);
+    println!("[BENCHMARK-HYBRID] ⏱️  Duration:  {:.2}s", elapsed);
+    println!("[BENCHMARK-HYBRID] ⚡ Actual TPS: {:.0} (PQ-honest)", final_tps);
+    println!("[BENCHMARK-HYBRID] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    BENCHMARK_MANAGER.stop().await;
 }
 
 /// v2.41.2: PROGRESSIVE BENCHMARK - automatically find node's maximum TPS!

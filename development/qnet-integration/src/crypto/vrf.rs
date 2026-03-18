@@ -13,6 +13,7 @@ use pqcrypto_traits::sign::{
     PublicKey as PkTrait,
     SecretKey as SkTrait,
     DetachedSignature as SigTrait,
+    SignedMessage as SmTrait,
 };
 use sha3::{Sha3_256, Digest};
 
@@ -220,22 +221,35 @@ impl DilithiumVrf {
             .map(|(id, v)| (id.clone(), v.clone()))
     }
 
-    /// Deterministic secondary leader — fallback when VRF produces 0 claims.
-    /// SHA3-256(domain ++ slot_seed ++ height ++ round) -> candidate index.
-    /// Predictable but guaranteed — ensures liveness under any conditions.
-    pub fn deterministic_fallback(
-        slot_seed: &[u8; 32], height: u64, round: u64, num_candidates: usize,
+    /// v4.5: PRIMARY deterministic leader selection (Ethereum/Solana model).
+    ///
+    /// All inputs are on-chain → all nodes compute identical result.
+    /// Zero P2P dependency. Mathematically impossible to disagree.
+    ///
+    /// `timeout_round`: 0 = normal, 1+ = BFT-certified failover round.
+    /// Different timeout_round values produce different leaders (different hash).
+    pub fn deterministic_leader(
+        slot_seed: &[u8; 32], height: u64, leadership_round: u64,
+        timeout_round: u64, num_candidates: usize,
     ) -> usize {
         if num_candidates == 0 { return 0; }
         let mut h = Sha3_256::new();
-        h.update(b"QNET_SECONDARY_V1");
+        h.update(b"QNET_LEADER_V4.5");
         h.update(slot_seed);
         h.update(&height.to_le_bytes());
-        h.update(&round.to_le_bytes());
+        h.update(&leadership_round.to_le_bytes());
+        h.update(&timeout_round.to_le_bytes());
         let result = h.finalize();
         let idx_bytes: [u8; 8] = result[..8].try_into().unwrap_or([0u8; 8]);
         let idx = u64::from_le_bytes(idx_bytes);
         (idx % num_candidates as u64) as usize
+    }
+
+    /// Legacy deterministic fallback — kept for backward compatibility.
+    pub fn deterministic_fallback(
+        slot_seed: &[u8; 32], height: u64, round: u64, num_candidates: usize,
+    ) -> usize {
+        Self::deterministic_leader(slot_seed, height, round, 0, num_candidates)
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
@@ -292,16 +306,24 @@ impl WalletIdentity {
         Ok(Self { wallet_address, dilithium_pk: pk, dilithium_sk: sk, seed_fingerprint: fp })
     }
 
-    /// Derive EON wallet address from seed
-    /// Format: {19hex}eon{15hex}{4hex checksum} = 41 chars
+    /// Derive EON wallet address from mnemonic seed phrase.
+    /// Uses BIP44 m/44'/9999'/0'/0'/0' to match mobile app WalletManager.js exactly.
+    /// Format: {19hex}eon{15hex}{4hex SHA3-256 checksum} = 41 chars
     pub fn derive_wallet_address(seed: &str) -> String {
-        let hash = Sha3_256::digest(format!("QNet_Wallet_v1{}", seed).as_bytes());
-        let hex_str = hex::encode(&hash);
-        let p1 = &hex_str[..19];
-        let p2 = &hex_str[19..34];
-        let body = format!("{}eon{}", p1, p2);
-        let ck = hex::encode(&Sha3_256::digest(body.as_bytes())[..2]);
-        format!("{}eon{}{}", p1, p2, ck)
+        // Try BIP44 derivation first (matches mobile app)
+        match crate::crypto::solana_derivation::derive_qnet_address_from_mnemonic(seed) {
+            Ok(addr) => addr,
+            Err(_) => {
+                // Fallback: legacy derivation for non-mnemonic seeds (e.g. raw hex strings in tests)
+                let hash = Sha3_256::digest(format!("QNet_Wallet_v1{}", seed).as_bytes());
+                let hex_str = hex::encode(&hash);
+                let p1 = &hex_str[..19];
+                let p2 = &hex_str[19..34];
+                let body = format!("{}eon{}", p1, p2);
+                let ck = hex::encode(&Sha3_256::digest(body.as_bytes())[..2]);
+                format!("{}eon{}{}", p1, p2, ck)
+            }
+        }
     }
 
     /// Sign data with Dilithium3 (detached)
@@ -309,6 +331,27 @@ impl WalletIdentity {
         let sk = dilithium3::SecretKey::from_bytes(&self.dilithium_sk)
             .map_err(|e| format!("[ERR][WALLET] sk_parse err={:?}", e))?;
         Ok(SigTrait::as_bytes(&dilithium3::detached_sign(data, &sk)).to_vec())
+    }
+
+    /// Sign data and produce consensus-compatible signature string.
+    /// Format: "dilithium_sig_{node_id}_{base64([sm_len(4)]+[SignedMessage]+[pk_len(4)]+[pk(1952)])}"
+    pub fn sign_consensus(&self, node_id: &str, data: &[u8]) -> Result<String, String> {
+        use base64::engine::general_purpose;
+        use base64::Engine;
+
+        let sk = dilithium3::SecretKey::from_bytes(&self.dilithium_sk)
+            .map_err(|e| format!("[ERR][WALLET] sk_parse err={:?}", e))?;
+        let signed_msg = dilithium3::sign(data, &sk);
+        let sm_bytes = SmTrait::as_bytes(&signed_msg);
+
+        let mut combined = Vec::with_capacity(4 + sm_bytes.len() + 4 + self.dilithium_pk.len());
+        combined.extend_from_slice(&(sm_bytes.len() as u32).to_le_bytes());
+        combined.extend_from_slice(sm_bytes);
+        combined.extend_from_slice(&(self.dilithium_pk.len() as u32).to_le_bytes());
+        combined.extend_from_slice(&self.dilithium_pk);
+
+        let b64 = general_purpose::STANDARD.encode(&combined);
+        Ok(format!("dilithium_sig_{}_{}", node_id, b64))
     }
 
     /// Create VRF instance from this identity

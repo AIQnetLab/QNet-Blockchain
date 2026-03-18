@@ -3573,59 +3573,89 @@ async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
 
 async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: f64) -> Result<bool, String> {
     println!("📡 Querying Solana devnet for burn transaction...");
-    
-    // PRODUCTION: Use network-aware RPC configuration  
+
     let network_config = qnet_integration::network_config::get_network_config();
     let solana_rpc = &network_config.solana.rpc_url;
-    
-    // Build RPC request to check burn transactions
-    let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getSignaturesForAddress",
-        "params": [
-            wallet_address,
-            {
-                "limit": 100,
-                "commitment": "confirmed"
-            }
-        ]
-    });
-    
-    // Make HTTP request to Solana RPC
+    let onedev_mint = &network_config.solana.onedev_mint;
+    let required_amount_decimals = (required_amount * 1_000_000.0) as u64;
+
+    // Priority: if QNET_BURN_TX_HASH is set, verify that specific TX directly
+    let specific_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
+    let signatures_to_check: Vec<String> = if !specific_tx.is_empty() {
+        vec![specific_tx]
+    } else {
+        // Fallback: scan recent signatures for the wallet
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [wallet_address, {"limit": 100, "commitment": "confirmed"}]
+        });
+        let client = reqwest::Client::new();
+        let response = client.post(solana_rpc).json(&request_body).send().await
+            .map_err(|e| format!("Solana RPC request failed: {}", e))?;
+        let rpc_response: serde_json::Value = response.json().await
+            .map_err(|e| format!("Failed to parse Solana RPC response: {}", e))?;
+        rpc_response["result"].as_array()
+            .map(|txs| txs.iter().filter_map(|tx| tx["signature"].as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    };
+
     let client = reqwest::Client::new();
-    let response = client
-        .post(solana_rpc)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("Solana devnet RPC request failed: {}", e))?;
-    
-    if !response.status().is_success() {
-        return Err(format!("Solana devnet RPC returned error: {}", response.status()));
-    }
-    
-    let rpc_response: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Solana devnet RPC response: {}", e))?;
-    
-    // Check if any transactions are burn transactions
-    if let Some(transactions) = rpc_response["result"].as_array() {
-        for tx in transactions {
-            if let Some(signature) = tx["signature"].as_str() {
-                // Check if this transaction is a burn transaction
-                if is_burn_transaction(signature).await? {
-                    let burned_amount = get_burned_amount(signature).await?;
-                    if burned_amount >= required_amount {
-                        println!("✅ Found valid burn transaction: {} (burned {} 1DEV)", signature, burned_amount);
-                        return Ok(true);
+    for signature in &signatures_to_check {
+        let tx_request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTransaction",
+            "params": [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}]
+        });
+        if let Ok(tx_resp) = client.post(solana_rpc).json(&tx_request).send().await {
+            if let Ok(tx_data) = tx_resp.json::<serde_json::Value>().await {
+                // Method A: check SPL Token instructions (burn or burnChecked)
+                if let Some(instructions) = tx_data["result"]["transaction"]["message"]["instructions"].as_array() {
+                    for ix in instructions {
+                        if ix["program"].as_str() != Some("spl-token") { continue; }
+                        let ix_type = ix["parsed"]["type"].as_str().unwrap_or("");
+                        if ix_type != "burn" && ix_type != "burnChecked" { continue; }
+                        let info = &ix["parsed"]["info"];
+                        let mint_ok = info["mint"].as_str() == Some(onedev_mint.as_str());
+                        let amount_ok = info["amount"].as_str()
+                            .and_then(|a| a.parse::<u64>().ok())
+                            .map(|a| a >= required_amount_decimals)
+                            .unwrap_or(false);
+                        if mint_ok && amount_ok {
+                            let burned = info["amount"].as_str()
+                                .and_then(|a| a.parse::<u64>().ok())
+                                .unwrap_or(0);
+                            println!("✅ Found valid SPL Token burn: {} (burned {} 1DEV)", &signature[..16], burned / 1_000_000);
+                            return Ok(true);
+                        }
+                    }
+                }
+
+                // Method B: pre/post token balance comparison (fallback for any burn mechanism)
+                let pre = tx_data["result"]["meta"]["preTokenBalances"].as_array();
+                let post = tx_data["result"]["meta"]["postTokenBalances"].as_array();
+                if let (Some(pre_balances), Some(post_balances)) = (pre, post) {
+                    for pre_b in pre_balances {
+                        if pre_b["mint"].as_str() != Some(onedev_mint.as_str()) { continue; }
+                        let pre_amount = pre_b["uiTokenAmount"]["amount"].as_str()
+                            .and_then(|a| a.parse::<u64>().ok()).unwrap_or(0);
+                        let acct_index = pre_b["accountIndex"].as_u64();
+                        let post_amount = post_balances.iter()
+                            .find(|pb| pb["accountIndex"].as_u64() == acct_index && pb["mint"].as_str() == Some(onedev_mint.as_str()))
+                            .and_then(|pb| pb["uiTokenAmount"]["amount"].as_str())
+                            .and_then(|a| a.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        if pre_amount > post_amount && (pre_amount - post_amount) >= required_amount_decimals {
+                            println!("✅ Found valid burn via balance diff: {} (burned {} 1DEV)",
+                                &signature[..16], (pre_amount - post_amount) / 1_000_000);
+                            return Ok(true);
+                        }
                     }
                 }
             }
         }
     }
-    
+
     println!("❌ No valid burn transaction found for required amount: {} 1DEV", required_amount);
     Ok(false)
 }
@@ -3708,7 +3738,10 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
                                             for instruction in instructions {
                                                 if instruction.get("program").and_then(|p| p.as_str()) == Some("spl-token") {
                                                     if let Some(parsed) = instruction.get("parsed") {
-                                                        if parsed.get("type").and_then(|t| t.as_str()) == Some("transfer") {
+                                                        let ix_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                                                        // Method 1: SPL Token transfer to incinerator address
+                                                        if ix_type == "transfer" || ix_type == "transferChecked" {
                                                             if let Some(info) = parsed.get("info") {
                                                                 let mint_match = info.get("mint").and_then(|m| m.as_str()) == Some(onedev_mint);
                                                                 let dest_match = info.get("destination").and_then(|d| d.as_str()) == Some(burn_address);
@@ -3717,18 +3750,47 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
                                                                     .and_then(|a| a.parse::<u64>().ok())
                                                                     .map(|a| a >= required_amount_decimals)
                                                                     .unwrap_or(false);
-                                                                
+
                                                                 if mint_match && dest_match && amount_match {
                                                                     let burned_amount = info.get("amount")
                                                                         .and_then(|a| a.as_str())
                                                                         .and_then(|a| a.parse::<u64>().ok())
                                                                         .unwrap_or(0);
-                                                                    
-                                                                    println!("✅ VERIFIED: Valid burn transaction found!");
+
+                                                                    println!("✅ VERIFIED: Valid burn transaction found (transfer to incinerator)!");
                                                                     println!("   TX: {}", &signature[..16]);
                                                                     println!("   Burned: {} 1DEV (required: {})", burned_amount / 1_000_000, required_amount);
                                                                     println!("   Token: {} (1DEV mint)", onedev_mint);
                                                                     println!("   Destination: {} (official incinerator)", burn_address);
+                                                                    return Ok(true);
+                                                                }
+                                                            }
+                                                        }
+
+                                                        // Method 2: SPL Token burn instruction (directly destroys supply)
+                                                        // Mobile app uses this: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA Burn instruction
+                                                        if ix_type == "burn" || ix_type == "burnChecked" {
+                                                            if let Some(info) = parsed.get("info") {
+                                                                let mint_match = info.get("mint").and_then(|m| m.as_str()) == Some(onedev_mint);
+                                                                let amount_match = info.get("amount")
+                                                                    .and_then(|a| a.as_str())
+                                                                    .and_then(|a| a.parse::<u64>().ok())
+                                                                    .map(|a| a >= required_amount_decimals)
+                                                                    .unwrap_or(false);
+
+                                                                if mint_match && amount_match {
+                                                                    let burned_amount = info.get("amount")
+                                                                        .and_then(|a| a.as_str())
+                                                                        .and_then(|a| a.parse::<u64>().ok())
+                                                                        .unwrap_or(0);
+                                                                    let authority = info.get("authority").and_then(|a| a.as_str()).unwrap_or("unknown");
+
+                                                                    println!("✅ VERIFIED: Valid burn transaction found (SPL Token burn)!");
+                                                                    println!("   TX: {}", &signature[..16]);
+                                                                    println!("   Burned: {} 1DEV (required: {})", burned_amount / 1_000_000, required_amount);
+                                                                    println!("   Token: {} (1DEV mint)", onedev_mint);
+                                                                    println!("   Authority (burner): {}", authority);
+                                                                    println!("   Method: SPL Token burn (direct supply reduction)");
                                                                     return Ok(true);
                                                                 }
                                                             }
@@ -3747,8 +3809,8 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
         }
     }
 
-    println!("❌ VERIFICATION FAILED: No valid burn transaction found for {} 1DEV to incinerator", required_amount);
-    println!("   Required: {} 1DEV burned to {}", required_amount, burn_address);
+    println!("❌ VERIFICATION FAILED: No valid burn transaction found for {} 1DEV", required_amount);
+    println!("   Checked: transfer to incinerator ({}) AND SPL Token burn instruction", burn_address);
     println!("   Token: {} (1DEV mint)", onedev_mint);
     Ok(false)
 }
@@ -3868,19 +3930,12 @@ fn is_transfer_to_burn_address(instruction: &serde_json::Value) -> bool {
     false
 }
 
-fn extract_wallet_from_activation_code(activation_code: &str) -> Result<String, String> {
-    // Extract wallet address from activation code
-    // In production: decode activation code to get wallet address
-    if activation_code.is_empty() {
-        return Err("No activation code provided".to_string());
-    }
-    
-    // For now, derive wallet address from activation code
-    // In production: proper cryptographic derivation
-    let wallet_hash = blake3::hash(activation_code.as_bytes());
-    let wallet_address = bs58::encode(wallet_hash.as_bytes()).into_string();
-    
-    Ok(wallet_address)
+fn extract_wallet_from_activation_code(_activation_code: &str) -> Result<String, String> {
+    // Derive the real Solana wallet address from QNET_WALLET_SEED (BIP39 → SLIP-10 → Ed25519)
+    // This matches the mobile app derivation and is required for Solana RPC queries.
+    let seed = std::env::var("QNET_WALLET_SEED")
+        .map_err(|_| "QNET_WALLET_SEED not set — cannot derive Solana wallet address for burn verification".to_string())?;
+    qnet_integration::crypto::solana_derivation::derive_solana_address_from_mnemonic(&seed)
 }
 
 async fn start_metrics_server(port: u16) {

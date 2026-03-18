@@ -2905,7 +2905,6 @@ impl SimplifiedP2P {
     }
     
     /// Calculate XOR distance between two node IDs for Kademlia DHT
-    #[allow(dead_code)]
     fn calculate_xor_distance(id1: &[u8], id2: &[u8]) -> Vec<u8> {
         id1.iter().zip(id2.iter()).map(|(a, b)| a ^ b).collect()
     }
@@ -4854,7 +4853,6 @@ impl SimplifiedP2P {
     }
 
     /// Start multicast discovery for QNet nodes
-    #[allow(dead_code)]
     fn start_multicast_discovery(&self) {
         // SAFE: Check if Tokio runtime is available to prevent panic
         let handle = match tokio::runtime::Handle::try_current() {
@@ -7557,7 +7555,6 @@ impl SimplifiedP2P {
     
     /// Query individual peer for blockchain height via HTTP API
     /// PRODUCTION v2.19.21: Now async using global HTTP_CLIENT (fixes runtime deadlock)
-    #[allow(dead_code)]
     async fn query_peer_height(&self, peer_addr: &str) -> Result<u64, String> {
         // Extract IP and port from peer address
         let parts: Vec<&str> = peer_addr.split(':').collect();
@@ -7585,7 +7582,6 @@ impl SimplifiedP2P {
     
     /// Query peer height via HTTP with timeout and error handling
     /// PRODUCTION v2.19.21: Now async using global HTTP_CLIENT (fixes runtime deadlock)
-    #[allow(dead_code)]
     async fn query_peer_height_http(&self, endpoint: &str) -> Result<u64, String> {
         // Use global async HTTP client with connection pooling
         match HTTP_CLIENT.get(endpoint).send().await {
@@ -7637,7 +7633,6 @@ impl SimplifiedP2P {
     }
     
     /// DYNAMIC: Estimate peer height using network-based heuristics (no timestamp dependency)
-    #[allow(dead_code)]
     fn estimate_peer_height_from_genesis(&self) -> Result<u64, String> {
         // ROBUST: Use network size and node type to estimate reasonable height
         let active_peers = self.get_peer_count();
@@ -7795,7 +7790,6 @@ impl SimplifiedP2P {
     }
     
     /// Generate quantum-resistant challenge for peer authentication
-    #[allow(dead_code)]
     fn generate_quantum_challenge() -> [u8; 32] {
         use rand::RngCore;
         use rand::rngs::OsRng;
@@ -7880,7 +7874,6 @@ impl SimplifiedP2P {
 
     
     /// Filter Genesis nodes by connectivity (PRODUCTION failover with enhanced security)
-    #[allow(dead_code)]
     fn filter_working_genesis_nodes(&self, nodes: Vec<String>) -> Vec<String> {
         Self::filter_working_genesis_nodes_static(nodes)
     }
@@ -8034,7 +8027,6 @@ impl SimplifiedP2P {
     }
     
     /// Load Genesis IPs from config file
-    #[allow(dead_code)]
     fn load_genesis_ips_from_config(&self) -> Result<Vec<String>, String> {
         use std::fs;
         
@@ -8066,7 +8058,6 @@ impl SimplifiedP2P {
     }
     
     /// Check if a specific peer IP is online
-    #[allow(dead_code)]
     fn is_peer_online(&self, target_ip: &str, connected: &std::sync::MutexGuard<Vec<PeerInfo>>) -> bool {
         connected.iter().any(|peer| peer.addr.contains(target_ip))
     }
@@ -8093,7 +8084,6 @@ impl SimplifiedP2P {
     }
     
     /// Load genesis nodes from environment or config file (PRODUCTION FIX)
-    #[allow(dead_code)]
     fn load_genesis_nodes_config(&self) -> Vec<String> {
         // Priority 1: Environment variable (for easy VDS changes)
         if let Ok(env_nodes) = std::env::var("QNET_GENESIS_LEADERS") {
@@ -8144,7 +8134,6 @@ impl SimplifiedP2P {
     }
     
     /// Load genesis nodes from config file
-    #[allow(dead_code)]
     fn load_genesis_from_config_file(&self) -> Result<Vec<String>, String> {
         use std::fs;
         
@@ -9728,7 +9717,6 @@ impl SimplifiedP2P {
     }
     
     /// STATIC VERSION: Test peer connectivity via QUIC port (async-safe)
-    #[allow(dead_code)]
     fn test_quic_port_static(peer_addr: &str) -> bool {
         use std::net::TcpStream;
         use std::time::Duration;
@@ -10038,7 +10026,6 @@ impl SimplifiedP2P {
     /// v4.2 CRITICAL FIX: Removed all blocking retries and thread::sleep calls.
     /// Previous version blocked tokio threads for up to 24 seconds per offline Genesis peer,
     /// causing network-wide API deadlock cascade.
-    #[allow(dead_code)]
     fn check_api_readiness_static(ip: &str) -> bool {
         use std::time::Duration;
         
@@ -10127,7 +10114,6 @@ impl SimplifiedP2P {
     }
     
     /// Validate activation codes for discovered peers
-    #[allow(dead_code)]
     fn validate_activation_codes(&self, peers: &[PeerInfo]) -> Vec<PeerInfo> {
         Self::validate_activation_codes_static(peers)
     }
@@ -10307,7 +10293,6 @@ impl SimplifiedP2P {
     }
 
     /// Get local IP address for network scanning
-    #[allow(dead_code)]
     async fn get_local_ip_address() -> Result<String, Box<dyn std::error::Error>> {
         // Try to get local IP by connecting to a remote address
         if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -10548,29 +10533,27 @@ impl SimplifiedP2P {
         // v2.24.3: Request blocks via QUIC (response comes async via handle_blocks_batch)
         // Strategy: Send RequestBlocks to best peer, then poll storage for arrival
         
-        let mut consecutive_failures = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 30;  // Increased for QUIC async response
-        const POLL_INTERVAL_MS: u64 = 100;  // Check storage every 100ms
-        // v2.24.3: Increased timeout to handle batch validation latency
-        // Worst case: 100 blocks × 100ms validation = 10s + network latency
-        const REQUEST_TIMEOUT_SECS: u64 = 30;  // Max wait for QUIC response + validation
+        let mut consecutive_failures = 0u32;
+        let mut total_failures = 0u32;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 30;
+        const MAX_TOTAL_FAILURES: u32 = 150;
+        const POLL_INTERVAL_MS: u64 = 100;
+        const REQUEST_TIMEOUT_SECS: u64 = 30;
         
-        // v2.24.3: Send initial QUIC RequestBlocks for entire range
-        // This triggers async response via handle_blocks_batch → block_tx → storage
         Self::send_quic_block_request_static(peers, start_height, end_height).await;
         
         let mut height = start_height;
         let mut last_request_time = std::time::Instant::now();
+        let mut backoff_secs: u64 = 5;
         
         while height <= end_height {
-            // Check if block already exists in storage
             if storage.load_microblock(height).unwrap_or(None).is_some() {
                 consecutive_failures = 0;
                 height += 1;
+                backoff_secs = 5;
                 continue;
             }
             
-            // v2.24.3: Poll storage for block arrival (QUIC response is async)
             let poll_start = std::time::Instant::now();
             let mut block_received = false;
             
@@ -10587,21 +10570,30 @@ impl SimplifiedP2P {
             if block_received {
                 consecutive_failures = 0;
                 height += 1;
+                backoff_secs = 5;
                 continue;
             }
             
-            // Block not received after timeout - retry request
             consecutive_failures += 1;
+            total_failures += 1;
             
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                println!("[SYNC] ⚠️ Range {}-{} hit {} failures at block {} - waiting 5s", 
-                         start_height, end_height, MAX_CONSECUTIVE_FAILURES, height);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                consecutive_failures = 0;
+            // v4.4: Abort after MAX_TOTAL_FAILURES to prevent infinite resource burn.
+            // Caller (main sync loop) will retry the entire range later.
+            if total_failures >= MAX_TOTAL_FAILURES {
+                println!("[ERR][SYNC] Range {}-{} exceeded {} total failures at block {} — aborting sync range",
+                         start_height, end_height, MAX_TOTAL_FAILURES, height);
+                return;
             }
             
-            // v2.24.3: Re-send QUIC request for remaining blocks (adaptive retry)
-            // Only re-request if enough time passed since last request
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                println!("[SYNC] ⚠️ Range {}-{} hit {} failures at block {} - backoff {}s (total_fails={})",
+                         start_height, end_height, MAX_CONSECUTIVE_FAILURES, height, backoff_secs, total_failures);
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                consecutive_failures = 0;
+                // v4.4: Exponential backoff capped at 60s
+                backoff_secs = (backoff_secs * 2).min(60);
+            }
+            
             if last_request_time.elapsed().as_secs() >= 3 {
                 println!("[SYNC] 🔄 Re-requesting blocks {}-{} via QUIC", height, end_height);
                 Self::send_quic_block_request_static(peers, height, end_height).await;
@@ -20983,7 +20975,6 @@ impl SimplifiedP2P {
     /// - All nodes compute same result from same blocks
     /// ═══════════════════════════════════════════════════════════════════════════
     #[allow(unused_variables)]
-    #[allow(dead_code)]
     fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, jail_updates: Vec<(String, u64, u32, String)>, timestamp: u64, signature: Vec<u8>) {
         // DISABLED: This entire function is deprecated
         // Reputation sync via P2P is a security vulnerability
@@ -21036,7 +21027,6 @@ impl SimplifiedP2P {
     /// See verify_reputation_signature_async for details on why this is disabled
     #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
     #[allow(unused_variables)]
-    #[allow(dead_code)]
     fn verify_reputation_signature(&self, node_id: &str, updates: &[(String, f64)], timestamp: u64, signature: &[u8]) -> bool {
         // DISABLED: Always returns false
         false
@@ -21605,7 +21595,6 @@ impl SimplifiedP2P {
         Ok(())
     }
     
-    #[allow(dead_code)]
     fn select_emergency_producer_excluding(&self, exclude: &str, height: u64) -> String {
         // v2.92: Use N-2 epoch-based snapshot for deterministic selection (SAME as node.rs!)
         // This ensures all nodes agree on emergency producer even for critical attacks
