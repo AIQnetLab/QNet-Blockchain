@@ -22858,15 +22858,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             Ok(_) => {
                 // v4.4: Update finality only if all constituent microblocks are present (defense-in-depth)
                 let round = macroblock.height * 90;
-                let cons_mb_start = if mb_index == 1 { 1 } else { (mb_index - 1) * 90 + 1 };
-                let cons_mb_end = mb_index * 90;
+                let cons_mb_height = macroblock.height;
+                let cons_mb_start = if cons_mb_height == 1 { 1 } else { (cons_mb_height - 1) * 90 + 1 };
+                let cons_mb_end = cons_mb_height * 90;
                 let cons_all_present = (cons_mb_start..=cons_mb_end)
                     .all(|h| storage.load_microblock(h).unwrap_or(None).is_some());
                 if cons_all_present {
                     LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
                     LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
                 } else {
-                    println!("[WARN][MB] skip_finality_update mb={} round={} — microblocks incomplete", mb_index, round);
+                    println!("[WARN][MB] skip_finality_update mb={} round={} — microblocks incomplete", cons_mb_height, round);
                 }
                 
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

@@ -254,7 +254,7 @@ pub fn derive_qnet_signing_key_from_mnemonic(mnemonic: &str) -> Result<ed25519_d
 ///   5. Format: {19hex}eon{15hex}{4hex SHA3-256 checksum}
 pub fn derive_qnet_address_from_mnemonic(mnemonic: &str) -> Result<String, String> {
     use sha2::{Sha512, Digest as Sha2Digest};
-    use sha3::{Sha3_256, Digest};
+    use sha3::Sha3_256;
 
     let mnemonic = mnemonic.trim();
     if mnemonic.is_empty() {
