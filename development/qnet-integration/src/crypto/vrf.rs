@@ -371,6 +371,9 @@ impl WalletIdentity {
     }
 
     pub fn pk_hex(&self) -> String { hex::encode(&self.dilithium_pk) }
+
+    /// Return raw secret key bytes for VRF key announce broadcast.
+    pub fn sk_bytes(&self) -> &[u8] { &self.dilithium_sk }
 }
 
 impl Drop for WalletIdentity {

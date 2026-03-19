@@ -440,6 +440,9 @@ pub fn try_get_storage() -> Option<&'static Arc<Storage>> {
 pub static LAST_BLOCK_PRODUCED_TIME: AtomicU64 = AtomicU64::new(0);
 pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
+/// v4.6: Track last height at which VRF key was announced to peers
+static LAST_VRF_KEY_ANNOUNCE_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
 // CRITICAL FIX v2.48: Track ACTUALLY FINALIZED consensus round
 // Updated ONLY when MacroBlock is SAVED in storage (not at spawn!)
 // This prevents round mismatch between nodes
@@ -1346,6 +1349,7 @@ pub struct BlockchainNode {
     vrf_instance: Option<Arc<crate::crypto::vrf::DilithiumVrf>>,
 }
 
+#[allow(dead_code)]
 impl BlockchainNode {
     /// Get reward manager for RPC integration
     pub fn get_reward_manager(&self) -> Arc<RwLock<PhaseAwareRewardManager>> {
@@ -1444,12 +1448,12 @@ impl BlockchainNode {
         let pk = match crate::genesis_constants::get_vrf_public_key(&microblock.producer) {
             Some(pk) => pk,
             None => {
-                // Producer not in VRF registry — accept during migration
-                if microblock.height % 100 == 0 {
-                    println!("[INFO][VRF] no_pk_registered producer={} h={} (migration)",
+                // v4.6: Hard reject — VRF key MUST be registered (exchanged via VrfKeyAnnounce or on-chain NodeRegistration TX)
+                if crate::node::is_warn() {
+                    println!("[WARN][VRF] no_pk_registered producer={} h={} — block REJECTED",
                              microblock.producer, microblock.height);
                 }
-                return Ok(true);
+                return Ok(false);
             }
         };
 
@@ -2161,7 +2165,7 @@ impl BlockchainNode {
         let _ = self.storage.save_node_registration(node_id, type_str, &wallet, 1.0);
     }
     
-    /// Get cached node registration (RocksDB only, no DashMap)
+    #[allow(dead_code)]
     async fn get_cached_node_registration(&self, node_id: &str) -> Option<(qnet_state::NodeType, String)> {
         match self.storage.load_node_registration(node_id) {
             Ok(Some((type_str, wallet, _))) => {
@@ -2208,6 +2212,22 @@ impl BlockchainNode {
                     } else if is_info() {
                         println!("[INFO][REG] cached_from_produced_block node={} wallet={}...", 
                                  node_id, &wallet_address[..wallet_address.len().min(16)]);
+                    }
+
+                    // v4.6: Extract VRF public key from on-chain TX (non-genesis nodes)
+                    if let Some(ref pk_hex) = tx.dilithium_public_key {
+                        if pk_hex.len() == crate::crypto::vrf::D3_PK_BYTES * 2 {
+                            if !crate::genesis_constants::has_vrf_key(node_id) {
+                                if let Ok(pk_bytes) = hex::decode(pk_hex) {
+                                    crate::genesis_constants::register_vrf_public_key(node_id, &pk_bytes);
+                                    let _ = storage.save_vrf_public_key(node_id, pk_hex);
+                                    if is_info() {
+                                        println!("[INFO][VRF-KEY] on_chain_registered node={} pk_hash={}",
+                                                 node_id, &pk_hex[..16]);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 qnet_state::TransactionType::NodeActivation { node_type, phase, .. } => {
@@ -2802,6 +2822,7 @@ impl BlockchainNode {
     /// - current_epoch: Epoch number (e.g., 1 for blocks 0-14399)
     /// 
     /// Returns: Ok(()) if TX created and added to mempool
+    #[allow(dead_code)]
     async fn create_heartbeat_commitment_tx(&self, current_epoch: u64) -> Result<(), QNetError> {
         const EMISSION_BLOCK_INTERVAL: u64 = 14400;
         
@@ -2941,6 +2962,7 @@ impl BlockchainNode {
     /// 
     /// SCALABILITY: Light nodes deduplicated in MacroBlock (HashMap)
     /// Returns: Number of successful pings
+    #[allow(dead_code)]
     async fn ping_all_light_nodes_for_epoch(&self) -> Result<u32, QNetError> {
         // PRODUCTION v2.78: Verify continuous pinging system created attestations for ALL Light nodes
         // 
@@ -3199,6 +3221,7 @@ impl BlockchainNode {
     
     /// Used by commitment TX loop (runs in parallel with block production)
     /// Returns Transaction ready to be added to mempool
+    #[allow(dead_code)]
     async fn create_ping_commitment_tx_static(
         _storage: &Arc<Storage>,
         p2p: &Arc<SimplifiedP2P>,
@@ -3392,6 +3415,7 @@ impl BlockchainNode {
     /// - current_epoch: Epoch number (e.g., 0 for blocks 0-14399)
     /// 
     /// Returns: Ok(()) if TX created and added to mempool
+    #[allow(dead_code)]
     async fn create_ping_commitment_tx(&self, current_epoch: u64) -> Result<(), QNetError> {
         const EMISSION_BLOCK_INTERVAL: u64 = 14400;
         
@@ -5821,6 +5845,15 @@ impl BlockchainNode {
         // v5.0: Share wallet identity with P2P layer for Dilithium3-signed HealthPing
         if let (Some(ref identity), Some(ref p2p)) = (&blockchain.wallet_identity, &blockchain.unified_p2p) {
             p2p.set_wallet_identity(identity.clone());
+        }
+
+        // v4.6: Delayed VRF key announce — wait for QUIC connections to establish
+        if let Some(ref p2p) = blockchain.unified_p2p {
+            let p2p_clone = p2p.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                p2p_clone.broadcast_vrf_key_announce();
+            });
         }
 
         // v5.1: Start Kademlia DHT routing table refresh task
@@ -13177,6 +13210,20 @@ impl BlockchainNode {
                     }
                 }
                 
+                // v4.6: Periodically announce VRF public key to peers (startup + every 90 blocks)
+                {
+                    let last_announced = LAST_VRF_KEY_ANNOUNCE_HEIGHT.load(Ordering::Relaxed);
+                    let should_announce = last_announced == 0
+                        || next_block_height >= last_announced + 90
+                        || (next_block_height <= 5 && last_announced == 0);
+                    if should_announce {
+                        if let Some(ref p2p) = unified_p2p {
+                            p2p.broadcast_vrf_key_announce();
+                            LAST_VRF_KEY_ANNOUNCE_HEIGHT.store(next_block_height, Ordering::Relaxed);
+                        }
+                    }
+                }
+
                 // v3.14: Get timeout_round for DETERMINISTIC failover
                 // This is computed from real delay (current_time - last_block_time) above
                 // Using LAST_BLOCK_PRODUCED_TIME ensures all synced nodes compute SAME delay!
@@ -16652,6 +16699,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// PRODUCTION: Get consistent Genesis node ID from BOOTSTRAP_ID or IP mapping
     /// Unifies all Genesis node ID detection across the codebase
+    #[allow(dead_code)]
     fn get_genesis_node_id(node_identifier: &str) -> Option<String> {
         // Method 1: Direct BOOTSTRAP_ID environment variable (for local node only)
         if node_identifier.is_empty() {
@@ -17170,24 +17218,29 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // we scan forward to find a different candidate.
                 // ═══════════════════════════════════════════════════════════════
 
+                // v4.6 FIX: Use ROUND START HEIGHT (deterministic, identical on all nodes)
+                // instead of current_height which varies depending on when cache miss occurs.
+                // Round 0 → height 1, round 1 → height 31, round N → N*30+1
+                let round_start_height = if leadership_round == 0 { 1u64 } else { leadership_round * 30 + 1 };
+
                 let selected_idx = if timeout_round == 0 {
                     DilithiumVrf::deterministic_leader(
-                        &slot_input, current_height, leadership_round, 0, candidates.len(),
+                        &slot_input, round_start_height, leadership_round, 0, candidates.len(),
                     )
                 } else {
                     let round0_idx = DilithiumVrf::deterministic_leader(
-                        &slot_input, current_height, leadership_round, 0, candidates.len(),
+                        &slot_input, round_start_height, leadership_round, 0, candidates.len(),
                     );
                     let mut excluded = std::collections::HashSet::new();
                     excluded.insert(round0_idx);
                     for prev in 1..timeout_round {
                         let idx = DilithiumVrf::deterministic_leader(
-                            &slot_input, current_height, leadership_round, prev, candidates.len(),
+                            &slot_input, round_start_height, leadership_round, prev, candidates.len(),
                         );
                         excluded.insert(idx);
                     }
                     let preferred = DilithiumVrf::deterministic_leader(
-                        &slot_input, current_height, leadership_round, timeout_round, candidates.len(),
+                        &slot_input, round_start_height, leadership_round, timeout_round, candidates.len(),
                     );
                     if !excluded.contains(&preferred) {
                         preferred
@@ -17273,162 +17326,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("[INFO][CACHE] producer_cache_invalidated entries_cleared={}", old_size);
     }
     
-    /// v3.16: Byzantine 66% consensus on producer selection
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// ARCHITECTURE: ONLY qualified candidates (from MacroBlock N-2) participate in voting
-    /// This ensures:
-    ///   1. SCALABILITY: Only ~1000 producers vote, not millions of nodes
-    ///   2. SYBIL RESISTANCE: Only blockchain-verified producers can vote
-    ///   3. DETERMINISM: Same candidate list on all nodes = same voting pool
-    ///
-    /// If 66%+ agree → use that producer
-    /// If no consensus → use plurality (like LMD-GHOST fork choice)
-    /// ═══════════════════════════════════════════════════════════════════════════
-    async fn producer_vote_consensus(
-        block_height: u64,
-        our_selection: &str,
-        own_node_id: &str,
-        timeout_round: u64,
-        p2p: &Arc<SimplifiedP2P>,
-        candidates: &[(String, f64)],
-    ) -> String {
-        use std::collections::HashMap;
-        
-        // ═══════════════════════════════════════════════════════════════════════════
-        // SCALABILITY CHECK: Only CANDIDATES (qualified producers) can vote!
-        // Non-candidates observe but don't participate in voting
-        // ═══════════════════════════════════════════════════════════════════════════
-        let we_are_candidate = candidates.iter().any(|(id, _)| id == own_node_id);
-        
-        if !we_are_candidate {
-            // Not a candidate - just use local selection, don't participate in voting
-            if is_debug() { 
-                println!("[DBG][VOTE] not_candidate h={} using_local={}", block_height, our_selection); 
-            }
-            return our_selection.to_string();
-        }
-        
-        // Step 1: Clear old votes for this height
-        PRODUCER_VOTES.retain(|k, _| k.0 != block_height);
-        
-        // Step 2: Add our own vote (we are a candidate)
-        PRODUCER_VOTES.insert((block_height, own_node_id.to_string()), our_selection.to_string());
-        
-        // Step 3: Broadcast vote ONLY to other candidates (SCALABLE!)
-        // Get peer addresses for candidates only
-        let peers = p2p.get_validated_active_peers();
-        let vote_message = crate::unified_p2p::NetworkMessage::ProducerVote {
-            block_height,
-            voted_producer: our_selection.to_string(),
-            voter_id: own_node_id.to_string(),
-            timeout_round,
-        };
-        
-        // Filter peers to only candidates (O(candidates) not O(all_peers))
-        let mut broadcast_count = 0;
-        for (candidate_id, _) in candidates.iter() {
-            if candidate_id == own_node_id {
-                continue; // Skip self
-            }
-            // Find peer address for this candidate
-            if let Some(peer) = peers.iter().find(|p| &p.id == candidate_id) {
-                p2p.send_network_message(&peer.addr, vote_message.clone());
-                broadcast_count += 1;
-            }
-        }
-        
-        if is_info() {
-            println!("[INFO][VOTE] broadcast h={} vote={} candidates={}/{}", 
-                     block_height, our_selection, broadcast_count, candidates.len());
-        }
-        
-        // Step 4: Wait for responses with adaptive timeout
-        // Byzantine threshold: 66% of candidates (Sybil-resistant)
-        let total_candidates = candidates.len();
-        let byzantine_threshold = (total_candidates * 2 + 2) / 3; // Ceiling division for 66%
-        
-        let consensus_start = std::time::Instant::now();
-        let max_wait = tokio::time::Duration::from_millis(1500); // 1.5 seconds max
-        
-        let mut consensus_producer: Option<String> = None;
-        
-        loop {
-            // Count votes (only from candidates - Sybil protection)
-            let mut vote_counts: HashMap<String, usize> = HashMap::new();
-            
-            for entry in PRODUCER_VOTES.iter() {
-                let (height, voter) = entry.key();
-                let voted_producer = entry.value();
-                
-                if *height == block_height {
-                    // CRITICAL: Only count votes from qualified candidates
-                    let voter_is_candidate = candidates.iter().any(|(id, _)| id == voter);
-                    if voter_is_candidate {
-                        *vote_counts.entry(voted_producer.clone()).or_insert(0) += 1;
-                    }
-                }
-            }
-            
-            // Check for 66% consensus
-            for (producer, count) in &vote_counts {
-                if *count >= byzantine_threshold {
-                    consensus_producer = Some(producer.clone());
-                    if is_info() {
-                        println!("[INFO][VOTE] consensus h={} producer={} votes={}/{} threshold={}", 
-                                 block_height, producer, count, total_candidates, byzantine_threshold);
-                    }
-                    break;
-                }
-            }
-            
-            if consensus_producer.is_some() {
-                break;
-            }
-            
-            // Check timeout
-            if consensus_start.elapsed() >= max_wait {
-                // No 66% consensus - check if we have minimum votes (40%)
-                // v3.10 BUG 2 FIX: Do NOT produce with insufficient consensus!
-                if let Some((best_producer, best_count)) = vote_counts.iter()
-                    .max_by_key(|(_, count)| *count) 
-                {
-                    // Calculate minimum required votes (40% of total candidates)
-                    let min_required = (total_candidates as u64 * MIN_CONSENSUS_VOTES_PERCENT / 100).max(2) as usize;
-                    
-                    if *best_count >= min_required {
-                        // Plurality with minimum threshold met
-                        if is_warn() {
-                            println!("[WARN][VOTE] no_66_consensus h={} plurality={} votes={}/{} min={}", 
-                                     block_height, best_producer, best_count, total_candidates, min_required);
-                        }
-                        consensus_producer = Some(best_producer.clone());
-                    } else {
-                        // v3.10 BUG 2 FIX: Insufficient votes - DO NOT SELECT PRODUCER!
-                        // This prevents node from producing blocks without network agreement
-                        // Emergency failover will handle this case
-                        println!("[ERR][VOTE] insufficient_consensus h={} best={} votes={}/{} min_required={}", 
-                                 block_height, best_producer, best_count, total_candidates, min_required);
-                        println!("[INFO][VOTE] triggering_emergency reason=insufficient_votes");
-                        // Return None - let emergency handler take over
-                        consensus_producer = None;
-                    }
-                }
-                break;
-            }
-            
-            // Wait 100ms before checking again
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-        
-        // Return consensus producer or fallback to our selection
-        consensus_producer.unwrap_or_else(|| {
-            if is_warn() { 
-                println!("[WARN][VOTE] no_votes h={} fallback={}", block_height, our_selection); 
-            }
-            our_selection.to_string()
-        })
-    }
-    
     /// Get reputation score for a node
     /// ═══════════════════════════════════════════════════════════════════════════
     /// ARCHITECTURE v2.21: TRANSITIONAL - Uses legacy NodeReputation
@@ -17486,6 +17383,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Helper: Get count of recent producer failures for deterministic exclusion
     /// ARCHITECTURE: Uses actual failover history from blockchain storage
+    #[allow(dead_code)]
     async fn get_recent_producer_failures(
         node_id: &str,
         current_height: u64,
@@ -17948,6 +17846,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// PRODUCTION: Validate producer readiness before block creation (Enterprise-grade checks)
+    #[allow(dead_code)]
     async fn validate_producer_readiness(
         node_id: &str,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
@@ -18005,6 +17904,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// PRODUCTION: Monitor network health for informational purposes (NON-CONSENSUS)
+    #[allow(dead_code)]
     async fn monitor_network_health(unified_p2p: &Option<Arc<SimplifiedP2P>>) -> String {
         if let Some(p2p) = unified_p2p {
             let active_peers = p2p.get_peer_count(); // EXISTING: Fast peer count, no expensive validation
@@ -19518,6 +19418,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// CRITICAL: Progressive Finalization Protocol activation
+    #[allow(dead_code)]
     async fn activate_progressive_finalization(
         storage: Arc<Storage>,
         consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
@@ -20103,6 +20004,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// DEPRECATED: Old emergency function - redirects to PFP
+    #[allow(dead_code)]
     async fn trigger_emergency_macroblock_consensus(
         storage: Arc<Storage>,
         consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
@@ -20734,6 +20636,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Check node reputation for consensus participation using EXISTING P2P system
+    #[allow(dead_code)]
     async fn check_node_reputation(
         node_id: &str,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
@@ -20846,6 +20749,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Update node reputation based on consensus behavior
+    #[allow(dead_code)]
     fn update_consensus_reputation(
         node_id: &str,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
@@ -21247,11 +21151,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         Ok(prefixed.as_bytes().to_vec())
     }
     
-    /// v4.0: Kept for compatibility — delegates to sign_microblock_with_dilithium
-    async fn sign_microblock_with_pure_dilithium(microblock: &qnet_state::MicroBlock, node_id: &str) -> Result<Vec<u8>, String> {
-        Self::sign_microblock_with_dilithium(microblock, node_id, None).await
-    }
-    
     /// PRODUCTION: Verify HYBRID signature for received microblock (supports compact)
     async fn verify_microblock_signature(
         microblock: &qnet_state::MicroBlock, 
@@ -21310,10 +21209,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let pk = match crate::genesis_constants::get_vrf_public_key(&microblock.producer) {
                 Some(pk) => pk,
                 None => {
-                    println!("[WARN][SIGN] no_pk_registered producer={} h={}", 
+                    // v4.6: Hard reject — Dilithium3 key MUST be registered
+                    println!("[WARN][SIGN] no_pk_registered producer={} h={} — block REJECTED",
                              microblock.producer, microblock.height);
-                    // During migration: accept blocks from unregistered producers
-                    return Ok(true);
+                    return Ok(false);
                 }
             };
 
@@ -23166,39 +23065,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             println!("              🚀 HIGH PERFORMANCE MODE ACTIVE");
         }
     }
-    
-    async fn start_consensus_loop(&self) {
-        let is_running = self.is_running.clone();
-        let height = self.height.clone();
-        let unified_p2p = self.unified_p2p.clone();
-        
-        tokio::spawn(async move {
-            let mut tick = 0u64;
-            
-            while *is_running.read().await {
-                tick += 1;
-                
-                // Peer monitoring
-                let peer_count = if let Some(p2p) = &unified_p2p {
-                    p2p.get_peer_count()
-                } else {
-                    0
-                };
-                
-                // Returning cached peer count
-                
-                if tick % 30 == 0 {
-                    let current_height = *height.read().await;
-                    println!("Checking {} connected peers...", peer_count);
-                    println!("[PERFORMANCE] Tick #{}, Leader: true, Height: {}, Peers: {}", 
-                             tick, current_height, peer_count);
-                }
-                
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-    }
-    
     pub async fn get_height(&self) -> u64 {
         *self.height.read().await
     }
@@ -23790,47 +23656,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
-    /// LEGACY sync wrapper
-    fn verify_ed25519_tx_signature(
-        tx: &qnet_state::Transaction,
-        signature_hex: &str,
-        public_key_hex: &str
-    ) -> Result<bool, QNetError> {
-        use ed25519_dalek::{Signature, VerifyingKey, Verifier};
-        
-        // CRITICAL FIX v3.31: Use type-aware canonical message
-        let message = Self::build_canonical_verify_message(tx);
-        let message_bytes = message.as_bytes();
-        
-        let sig_bytes = hex::decode(signature_hex)
-            .map_err(|e| QNetError::ValidationError(format!("Invalid signature hex: {}", e)))?;
-        if sig_bytes.len() != 64 {
-            return Err(QNetError::ValidationError(format!(
-                "Invalid signature length: expected 64, got {}", sig_bytes.len()
-            )));
-        }
-        let sig_array: [u8; 64] = sig_bytes.try_into()
-            .map_err(|_| QNetError::ValidationError("Signature conversion failed".to_string()))?;
-        let signature = Signature::from_bytes(&sig_array);
-        
-        let pk_bytes = hex::decode(public_key_hex)
-            .map_err(|e| QNetError::ValidationError(format!("Invalid public_key hex: {}", e)))?;
-        if pk_bytes.len() != 32 {
-            return Err(QNetError::ValidationError(format!(
-                "Invalid public_key length: expected 32, got {}", pk_bytes.len()
-            )));
-        }
-        let pk_array: [u8; 32] = pk_bytes.try_into()
-            .map_err(|_| QNetError::ValidationError("Public key conversion failed".to_string()))?;
-        let verifying_key = VerifyingKey::from_bytes(&pk_array)
-            .map_err(|e| QNetError::ValidationError(format!("Invalid public key: {}", e)))?;
-        
-        match verifying_key.verify(message_bytes, &signature) {
-            Ok(()) => Ok(true),
-            Err(_) => Ok(false),
-        }
-    }
-    
     /// PRODUCTION v2.25.2: Batch verify Ed25519 signatures for high TPS
     /// Uses ed25519_dalek::verify_batch for 2-3x faster verification
     /// Returns indices of valid transactions
@@ -24148,56 +23973,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             Ok(Err(e)) => Err(QNetError::ValidationError(e)),
             Err(e) => Err(QNetError::ValidationError(format!("Runtime error: {}", e))),
         }
-    }
-    
-    /// LEGACY sync wrapper
-    fn verify_dilithium_tx_signature(tx: &qnet_state::Transaction) -> Result<bool, QNetError> {
-        use crate::quantum_crypto::DilithiumSignature;
-        
-        let dilithium_sig = match &tx.dilithium_signature {
-            Some(sig) if !sig.is_empty() => sig.clone(),
-            _ => return Ok(true),
-        };
-        
-        // v5.1: Mirror async version — use node_id for client-signed NodeRegistration.
-        let signer_id = match &tx.tx_type {
-            qnet_state::TransactionType::NodeRegistration { node_id, .. }
-                if tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:") =>
-            {
-                node_id.clone()
-            }
-            _ => match &tx.dilithium_public_key {
-                Some(pk) if !pk.is_empty() => pk.clone(),
-                _ => return Err(QNetError::ValidationError(
-                    "dilithium_public_key required when dilithium_signature is present".to_string()
-                )),
-            }
-        };
-        
-        let message = Self::build_canonical_verify_message(tx);
-        let sig_struct = DilithiumSignature {
-            signature: dilithium_sig,
-            algorithm: "CRYSTALS-Dilithium3".to_string(),
-            timestamp: tx.timestamp,
-            strength: "quantum-resistant".to_string(),
-        };
-        
-        let result = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            rt.block_on(async {
-                let crypto = match try_get_quantum_crypto() {
-                    Some(c) => c,
-                    None => return Err(QNetError::ValidationError("Quantum crypto not initialized".to_string())),
-                };
-                
-                match crypto.verify_dilithium_signature(&message, &sig_struct, &signer_id).await {
-                    Ok(valid) => Ok(valid),
-                    Err(e) => Err(QNetError::ValidationError(format!("Dilithium error: {}", e))),
-                }
-            })
-        }).join().map_err(|_| QNetError::ValidationError("Thread panic".to_string()))?;
-        
-        result
     }
     
     /// PRODUCTION v2.19.25: Validate and add transaction received from P2P network
@@ -26053,7 +25828,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     match identity.sign_consensus(&self.node_id, canonical_msg.as_bytes()) {
                         Ok(consensus_sig) => {
                             registration_tx.dilithium_signature = Some(consensus_sig);
-                            registration_tx.dilithium_public_key = Some(self.node_id.clone());
+                            registration_tx.dilithium_public_key = Some(hex::encode(&identity.dilithium_pk));
                         }
                         Err(e) => {
                             eprintln!("[WARN][REG] dilithium3_sign_failed: {}", e);
@@ -26196,6 +25971,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Validate activation code (delegated to centralized ActivationValidator)
+    #[allow(dead_code)]
     async fn validate_activation_code_uniqueness(&self, code: &str) -> Result<(), String> {
         // Production activation code validation
         if code.is_empty() {
@@ -26223,6 +25999,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// Generate unique node signature for security
+    #[allow(dead_code)]
     async fn generate_node_signature(&self) -> Result<String, String> {
         use sha3::{Sha3_256, Digest};
         
@@ -26406,45 +26183,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         std::process::exit(0);
     }
     
-    /// Get public IP region using IP geolocation service
-    async fn get_public_ip_region() -> Result<Region, String> {
-        // Use a simple IP geolocation service with better error handling
-        let response = match tokio::process::Command::new("curl")
-            .arg("-s")
-            .arg("--max-time")
-            .arg("3")
-            .arg("--connect-timeout")
-            .arg("3")
-            .arg("https://ip-api.com/json/?fields=continent")
-            .output()
-            .await
-        {
-            Ok(output) => {
-                if !output.status.success() {
-                    return Err("Curl command failed".to_string());
-                }
-                String::from_utf8_lossy(&output.stdout).to_string()
-            },
-            Err(_) => return Err("Failed to execute curl command".to_string()),
-        };
-        
-        if response.contains("\"continent\":\"North America\"") {
-            Ok(Region::NorthAmerica)
-        } else if response.contains("\"continent\":\"Europe\"") {
-            Ok(Region::Europe)
-        } else if response.contains("\"continent\":\"Asia\"") {
-            Ok(Region::Asia)
-        } else if response.contains("\"continent\":\"South America\"") {
-            Ok(Region::SouthAmerica)
-        } else if response.contains("\"continent\":\"Africa\"") {
-            Ok(Region::Africa)
-        } else if response.contains("\"continent\":\"Oceania\"") {
-            Ok(Region::Oceania)
-        } else {
-            Err("Unknown continent in response".to_string())
-        }
-    }
-
     pub async fn get_connected_peers(&self) -> Result<Vec<PeerInfo>, QNetError> {
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -26768,66 +26506,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
-    // Regional IP detection functions (same as main binary)
-    fn is_north_america_ip(ip: &std::net::Ipv4Addr) -> bool {
-        let ip_u32 = u32::from(*ip);
-        let first_octet = (ip_u32 >> 24) as u8;
-        match first_octet {
-            3..=9 | 11..=24 | 26 | 28..=30 | 32..=35 | 38 | 40 | 44..=45 | 47..=48 | 50 | 52 | 54..=56 | 
-            63 | 68..=76 | 96..=100 | 104 | 107..=108 | 154 | 173..=174 | 184 | 199 | 208..=209 | 216 => true,
-            64..=67 => ip_u32 >= 0x40000000 && ip_u32 <= 0x43FFFFFF,
-            _ => false
-        }
-    }
-    
-    fn is_europe_ip(ip: &std::net::Ipv4Addr) -> bool {
-        let ip_u32 = u32::from(*ip);
-        let first_octet = (ip_u32 >> 24) as u8;
-        match first_octet {
-            2 | 5 | 25 | 31 | 37 | 46 | 53 | 62 | 77..=95 | 109 | 128 | 130..=141 | 145..=149 | 151 |
-            176 | 178 | 185 | 188 | 193..=195 | 212..=213 | 217 => true,
-            _ => false
-        }
-    }
-    
-    fn is_asia_ip(ip: &std::net::Ipv4Addr) -> bool {
-        let ip_u32 = u32::from(*ip);
-        let first_octet = (ip_u32 >> 24) as u8;
-        match first_octet {
-            1 | 14 | 27 | 36 | 39 | 42..=43 | 49 | 58..=61 | 101 | 103 | 106 | 110..=126 | 150 | 152..=153 |
-            163 | 175 | 180 | 182..=183 | 202..=203 | 210..=211 | 218..=223 => true,
-            _ => false
-        }
-    }
-    
-    fn is_south_america_ip(ip: &std::net::Ipv4Addr) -> bool {
-        let ip_u32 = u32::from(*ip);
-        let first_octet = (ip_u32 >> 24) as u8;
-        match first_octet {
-            177 | 179 | 181 | 186..=187 | 189..=191 | 200..=201 => true,
-            _ => false
-        }
-    }
-    
-    fn is_africa_ip(ip: &std::net::Ipv4Addr) -> bool {
-        let ip_u32 = u32::from(*ip);
-        let first_octet = (ip_u32 >> 24) as u8;
-        match first_octet {
-            // NOTE: 154.0.0.0/8 is NOT AFRINIC - it's North American (OVH hosting)
-            41 | 102 | 105 | 155..=156 | 160..=162 | 164..=165 | 196..=197 => true,
-            _ => false
-        }
-    }
-    
-    fn is_oceania_ip(ip: &std::net::Ipv4Addr) -> bool {
-        let ip_u32 = u32::from(*ip);
-        let first_octet = (ip_u32 >> 24) as u8;
-        match first_octet {
-            1 | 27 | 58..=59 | 101 | 103 | 110 | 115..=116 | 118..=119 | 124..=125 | 150 | 202..=203 | 210 => true,
-            _ => false
-        }
-    }
-
     pub fn load_microblock_bytes(&self, height: u64) -> Result<Option<Vec<u8>>, QNetError> {
         self.storage.load_microblock(height).map_err(|e| QNetError::StorageError(e.to_string()))
     }
@@ -27391,41 +27069,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         Err("No network interface found".to_string())
     }
     
-    /// Query external IP service as fallback
-    async fn query_external_ip_service() -> Result<String, String> {
-        use std::time::Duration;
-        
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(3)) // FAST MODE: Quick timeout to avoid blocking startup
-            .connect_timeout(Duration::from_secs(2)) // Fast connection timeout
-            .build() {
-            Ok(client) => client,
-            Err(e) => return Err(format!("HTTP client error: {}", e)),
-        };
-        
-        // Try multiple IP detection services
-        let services = [
-            "https://api.ipify.org",
-            "https://ipinfo.io/ip",
-            "https://icanhazip.com",
-        ];
-        
-        for service in &services {
-            match client.get(*service).send().await {
-                Ok(response) if response.status().is_success() => {
-                    if let Ok(ip) = response.text().await {
-                        let clean_ip = ip.trim().to_string();
-                        if !clean_ip.is_empty() {
-                            return Ok(clean_ip);
-                        }
-                    }
-                }
-                _ => continue,
-            }
-        }
-        
-        Err("Failed to detect external IP".to_string())
-    }
 }
 
 /// Peer information for RPC responses

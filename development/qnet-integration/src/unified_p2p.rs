@@ -2188,6 +2188,7 @@ struct ShredChunkCacheEntry {
     cached_at: Instant,
 }
 
+#[allow(dead_code)]
 impl SimplifiedP2P {
     /// Create new simplified P2P network with load balancing and Kademlia DHT
     pub fn new(
@@ -2902,11 +2903,6 @@ impl SimplifiedP2P {
         println!("[WARN][P2P] UPnP not available, manual port forwarding may be required");
         println!("[INFO][P2P] For Docker: Use -p {}:{} or DOCKER_HOST_IP env var", port, port);
         Err("UPnP not available".to_string())
-    }
-    
-    /// Calculate XOR distance between two node IDs for Kademlia DHT
-    fn calculate_xor_distance(id1: &[u8], id2: &[u8]) -> Vec<u8> {
-        id1.iter().zip(id2.iter()).map(|(a, b)| a ^ b).collect()
     }
     
     /// Get K-bucket index for a peer based on XOR distance
@@ -4852,40 +4848,6 @@ impl SimplifiedP2P {
         });
     }
 
-    /// Start multicast discovery for QNet nodes
-    fn start_multicast_discovery(&self) {
-        // SAFE: Check if Tokio runtime is available to prevent panic
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => {
-                println!("[WARN][P2P] No Tokio runtime - multicast discovery deferred");
-                return;
-            }
-        };
-        
-        let node_id = self.node_id.clone();
-        let region = self.region.clone();
-        let _connected_peers = self.connected_peers_lockfree.clone();
-        let port = self.port;
-        
-        handle.spawn(async move {
-            println!("[INFO][P2P] Starting multicast discovery...");
-            
-            // Announce our presence via multicast
-            for _ in 0..5 {
-                let announcement = format!("QNET_NODE:{}:{}:{:?}", node_id, port, region);
-                
-                // PRODUCTION: Use HTTP-based peer discovery instead of UDP multicast  
-                // for better NAT traversal and firewall compatibility
-                println!("[INFO][P2P] HTTP-based peer discovery: {}", announcement);
-                
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            
-            println!("[INFO][P2P] Multicast discovery completed");
-        });
-    }
-    
     // REMOVED: start_kademlia_peer_discovery was a stub, now using Kademlia fields directly in PeerInfo
     
     /// PRODUCTION v2.19.21: Broadcast block via QUIC (async, binary protocol)
@@ -7553,115 +7515,6 @@ impl SimplifiedP2P {
         Ok(consensus_height)
     }
     
-    /// Query individual peer for blockchain height via HTTP API
-    /// PRODUCTION v2.19.21: Now async using global HTTP_CLIENT (fixes runtime deadlock)
-    async fn query_peer_height(&self, peer_addr: &str) -> Result<u64, String> {
-        // Extract IP and port from peer address
-        let parts: Vec<&str> = peer_addr.split(':').collect();
-        if parts.len() != 2 {
-            return Err("Invalid peer address format".to_string());
-        }
-        
-        let peer_ip = parts[0];
-        let _peer_port = parts[1].parse::<u16>()
-            .map_err(|_| "Invalid port in peer address".to_string())?;
-        
-        // PRODUCTION: Real HTTP request to peer's API endpoint
-        // GENESIS PERIOD FIX: Only try port 8001 to avoid connection confusion
-        // All Genesis nodes run unified API server on port 8001
-        let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
-        
-        match self.query_peer_height_http(&endpoint).await {
-            Ok(height) => Ok(height),
-            Err(e) => {
-                println!("[SYNC] Failed to query peer {}: {}", peer_ip, e);
-                Err(format!("All HTTP endpoints failed for {}", peer_ip))
-            }
-        }
-    }
-    
-    /// Query peer height via HTTP with timeout and error handling
-    /// PRODUCTION v2.19.21: Now async using global HTTP_CLIENT (fixes runtime deadlock)
-    async fn query_peer_height_http(&self, endpoint: &str) -> Result<u64, String> {
-        // Use global async HTTP client with connection pooling
-        match HTTP_CLIENT.get(endpoint).send().await {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<serde_json::Value>().await {
-                    Ok(json) => {
-                        if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
-                            Ok(height)
-                        } else {
-                            Err("Invalid height format in response".to_string())
-                        }
-                    }
-                    Err(e) => Err(format!("JSON parse error: {}", e)),
-                }
-            }
-            Ok(response) => Err(format!("HTTP error: {}", response.status())),
-            Err(e) => {
-                // CRITICAL FIX: Add Genesis leniency consistent with check_api_readiness_static
-                // Extract IP from endpoint for Genesis peer check
-                let ip = endpoint.split("://").nth(1)
-                    .and_then(|s| s.split(':').next())
-                    .unwrap_or("");
-                
-                let is_genesis_peer = is_genesis_node_ip(ip);
-                if is_genesis_peer {
-                    // IMPROVED: Smart Genesis leniency with time-based grace period
-                    let startup_time = std::env::var("QNET_NODE_START_TIME")
-                        .ok()
-                        .and_then(|t| t.parse::<i64>().ok())
-                        .unwrap_or_else(|| chrono::Utc::now().timestamp() - 30);
-                    let elapsed = chrono::Utc::now().timestamp() - startup_time;
-                        
-                    // BYZANTINE FIX: Reduced grace period to 10 seconds for Byzantine safety
-                    // Long grace periods allow phantom peers to participate in consensus!
-                    if elapsed < 10 {
-                        // PRIVACY: Use pseudonym in logs
-                        println!("[SYNC] 🔧 Genesis peer height query: Node startup grace period (uptime: {}s, grace: 10s) for {}", elapsed, get_privacy_id_for_addr(ip));
-                        return Ok(0); // Return 0 during reduced grace period
-                    } else {
-                        // PRIVACY: Use pseudonym in logs
-                        println!("[SYNC] ⚠️ Genesis peer {} not responding after 10s grace period (uptime: {}s) - treating as offline", get_privacy_id_for_addr(ip), elapsed);
-                        // After grace period, treat as real error to avoid infinite loops
-                    }
-                }
-                
-                Err(format!("Request failed: {}", e))
-            }
-        }
-    }
-    
-    /// DYNAMIC: Estimate peer height using network-based heuristics (no timestamp dependency)
-    fn estimate_peer_height_from_genesis(&self) -> Result<u64, String> {
-        // ROBUST: Use network size and node type to estimate reasonable height
-        let active_peers = self.get_peer_count();
-        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-        
-        // Heuristic height estimation based on network conditions
-        let estimated_height = if is_bootstrap_node && active_peers < 5 {
-            // Early network formation - very low height
-            0
-        } else if active_peers < 20 {
-            // Small network - low height range
-            active_peers as u64 * 10 // ~10-200 blocks
-        } else if active_peers < 100 {
-            // Medium network - moderate height
-            active_peers as u64 * 50 // ~1000-5000 blocks  
-        } else {
-            // Large network - higher height estimate
-            active_peers as u64 * 100 // 10000+ blocks
-        };
-        
-        // Cap at reasonable maximum to prevent overflow
-        const MAX_REASONABLE_HEIGHT: u64 = 365 * 24 * 60 * 60; // 1 year of blocks
-        let capped_height = std::cmp::min(estimated_height, MAX_REASONABLE_HEIGHT);
-        
-        println!("[CONSENSUS] 📊 Estimated network height from peers: {} (peers: {}, bootstrap: {})", 
-                capped_height, active_peers, is_bootstrap_node);
-        Ok(capped_height)
-    }
-    
     /// Determine if node can participate in consensus validation (replaces single leader model)
     /// QNet uses CommitReveal Byzantine consensus with multiple validators, not single leader
     pub fn should_be_leader(&self, node_id: &str) -> bool {
@@ -7789,15 +7642,6 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Generate quantum-resistant challenge for peer authentication
-    fn generate_quantum_challenge() -> [u8; 32] {
-        use rand::RngCore;
-        use rand::rngs::OsRng;
-        let mut challenge = [0u8; 32];
-        OsRng.fill_bytes(&mut challenge);
-        challenge
-    }
-    
     /// Create secure HTTP client for peer communication
     fn create_secure_http_client() -> Result<reqwest::Client, String> {
         reqwest::Client::builder()
@@ -7872,11 +7716,6 @@ impl SimplifiedP2P {
     }
     
 
-    
-    /// Filter Genesis nodes by connectivity (PRODUCTION failover with enhanced security)
-    fn filter_working_genesis_nodes(&self, nodes: Vec<String>) -> Vec<String> {
-        Self::filter_working_genesis_nodes_static(nodes)
-    }
     
     /// Static version for use in async contexts
     /// v4.2 CRITICAL FIX: Non-blocking connectivity check
@@ -8026,42 +7865,6 @@ impl SimplifiedP2P {
         working_nodes
     }
     
-    /// Load Genesis IPs from config file
-    fn load_genesis_ips_from_config(&self) -> Result<Vec<String>, String> {
-        use std::fs;
-        
-        let config_paths = vec![
-            "genesis-nodes.json",
-            "config/genesis-nodes.json",
-            "/etc/qnet/genesis-nodes.json",
-            "~/.qnet/genesis-nodes.json"
-        ];
-        
-        for path in config_paths {
-            if let Ok(content) = fs::read_to_string(path) {
-                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(nodes) = config["genesis_nodes"].as_array() {
-                        let node_ips: Vec<String> = nodes.iter()
-                            .filter_map(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .collect();
-                        
-                        if !node_ips.is_empty() {
-                            return Ok(node_ips);
-                        }
-                    }
-                }
-            }
-        }
-        
-        Err("No Genesis config file found".to_string())
-    }
-    
-    /// Check if a specific peer IP is online
-    fn is_peer_online(&self, target_ip: &str, connected: &std::sync::MutexGuard<Vec<PeerInfo>>) -> bool {
-        connected.iter().any(|peer| peer.addr.contains(target_ip))
-    }
-    
     /// Get primary validator for consensus round (replaces single leader concept)
     /// In production QNet, consensus uses multiple validators, not single leader
     pub fn get_current_leader(&self) -> Option<String> {
@@ -8081,87 +7884,6 @@ impl SimplifiedP2P {
         
         // If no genesis validators, return first connected validator
         self.connected_peers_lockfree.iter().next().map(|e| format!("validator_{}", e.value().addr))
-    }
-    
-    /// Load genesis nodes from environment or config file (PRODUCTION FIX)
-    fn load_genesis_nodes_config(&self) -> Vec<String> {
-        // Priority 1: Environment variable (for easy VDS changes)
-        if let Ok(env_nodes) = std::env::var("QNET_GENESIS_LEADERS") {
-            let nodes: Vec<String> = env_nodes.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            
-            if !nodes.is_empty() {
-                println!("[LEADERSHIP] 🔧 Using environment genesis nodes: {:?}", nodes);
-                return nodes;
-            }
-        }
-        
-        // Priority 2: Config file (persistent configuration)
-        if let Ok(config_nodes) = self.load_genesis_from_config_file() {
-            if !config_nodes.is_empty() {
-                println!("[LEADERSHIP] 📄 Using config file genesis nodes: {:?}", config_nodes);
-                return config_nodes;
-            }
-        }
-        
-        // Fallback: Get from EXISTING bootstrap nodes constant  
-        // EXISTING: Use genesis_constants::GENESIS_NODE_IPS to avoid duplication
-        use crate::genesis_constants::GENESIS_NODE_IPS;
-        let default_nodes = GENESIS_NODE_IPS.iter()
-            .map(|(ip, _)| ip.to_string())
-            .collect();
-        
-        // Only log this message once every 5 minutes to reduce spam
-        static LAST_LOG_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_else(|_| {
-                println!("[P2P] ⚠️ System time error, using fallback timestamp");
-                std::time::Duration::from_secs(1640000000) // Fallback to 2021
-            })
-            .as_secs();
-        let last_time = LAST_LOG_TIME.load(std::sync::atomic::Ordering::Relaxed);
-        
-        if current_time - last_time > 300 { // 5 minutes
-            println!("[LEADERSHIP] ⚠️ Using default genesis nodes: {:?}", default_nodes);
-            println!("[LEADERSHIP] 🔧 To change: Set QNET_GENESIS_LEADERS env var or update genesis-nodes.json");
-            LAST_LOG_TIME.store(current_time, std::sync::atomic::Ordering::Relaxed);
-        }
-        
-        default_nodes
-    }
-    
-    /// Load genesis nodes from config file
-    fn load_genesis_from_config_file(&self) -> Result<Vec<String>, String> {
-        use std::fs;
-        
-        let config_paths = vec![
-            "genesis-nodes.json",
-            "node_data/genesis-nodes.json", 
-            "/etc/qnet/genesis-nodes.json",
-            "~/.qnet/genesis-nodes.json"
-        ];
-        
-        for path in config_paths {
-            if let Ok(content) = fs::read_to_string(path) {
-                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(nodes) = config["genesis_nodes"].as_array() {
-                        let node_ips: Vec<String> = nodes.iter()
-                            .filter_map(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .collect();
-                        
-                        if !node_ips.is_empty() {
-                            return Ok(node_ips);
-                        }
-                    }
-                }
-            }
-        }
-        
-        Err("No config file found".to_string())
     }
     
     /// GULF STREAM v2.25: Broadcast transaction with producer forwarding
@@ -9716,33 +9438,6 @@ impl SimplifiedP2P {
         }
     }
     
-    /// STATIC VERSION: Test peer connectivity via QUIC port (async-safe)
-    fn test_quic_port_static(peer_addr: &str) -> bool {
-        use std::net::TcpStream;
-        use std::time::Duration;
-        
-        let parts: Vec<&str> = peer_addr.split(':').collect();
-        if parts.len() != 2 {
-            return false;
-        }
-        
-        let ip = parts[0];
-        let p2p_port: u16 = match parts[1].parse() {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        
-        // Check QUIC port (P2P port + 1000)
-        let quic_port = p2p_port.saturating_add(crate::quic_transport::QUIC_PORT_OFFSET);
-        let quic_addr = format!("{}:{}", ip, quic_port);
-        
-        // v4.2: Reduced to 2s to prevent tokio thread starvation
-        TcpStream::connect_timeout(
-            &quic_addr.parse().unwrap_or_else(|_| std::net::SocketAddr::from(([0,0,0,0], 0))),
-            Duration::from_secs(2)
-        ).is_ok()
-    }
-    
     /// Intelligent peer selection with load balancing
     pub fn select_optimal_peers(&self, required_count: usize) -> Vec<PeerInfo> {
         let regional_peers = match self.regional_peers.lock() {
@@ -10022,22 +9717,6 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Check if API server is ready (lightweight TCP port check)
-    /// v4.2 CRITICAL FIX: Removed all blocking retries and thread::sleep calls.
-    /// Previous version blocked tokio threads for up to 24 seconds per offline Genesis peer,
-    /// causing network-wide API deadlock cascade.
-    fn check_api_readiness_static(ip: &str) -> bool {
-        use std::time::Duration;
-        
-        let api_port_check = format!("{}:{}", ip, 8001);
-        if let Ok(addr) = api_port_check.parse::<std::net::SocketAddr>() {
-            // v4.2: Single attempt, 2-second timeout. No retries, no thread::sleep.
-            std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
-        } else {
-            false
-        }
-    }
-    
     /// Query peer metrics - now returns placeholder as metrics come from QUIC stats
     fn query_peer_metrics(_peer_addr: &str) -> Result<PeerMetrics, String> {
         // PRODUCTION v2.19.22: Metrics are collected from QUIC connection stats
@@ -10111,11 +9790,6 @@ impl SimplifiedP2P {
                 println!("[INFO][P2P] Regional distribution: {:?}", regional_counts);
             }
         });
-    }
-    
-    /// Validate activation codes for discovered peers
-    fn validate_activation_codes(&self, peers: &[PeerInfo]) -> Vec<PeerInfo> {
-        Self::validate_activation_codes_static(peers)
     }
     
     /// Static method for activation code validation (SYNC version)
@@ -10290,24 +9964,6 @@ impl SimplifiedP2P {
         }
         
         Err("Could not determine IP address".into())
-    }
-
-    /// Get local IP address for network scanning
-    async fn get_local_ip_address() -> Result<String, Box<dyn std::error::Error>> {
-        // Try to get local IP by connecting to a remote address
-        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-            if socket.connect("8.8.8.8:53").is_ok() {
-                if let Ok(local_addr) = socket.local_addr() {
-                    let ip = local_addr.ip().to_string();
-                    if !ip.starts_with("127.") {
-                        return Ok(ip);
-                    }
-                }
-            }
-        }
-        
-        // Fallback to localhost
-        Ok("127.0.0.1".to_string())
     }
 
     /// Download missing microblocks in parallel for faster synchronization
@@ -11207,6 +10863,17 @@ pub enum NetworkMessage {
         signature: Vec<u8>,        // Dilithium3 signature over "QNET_ATTEST:{height}:{hash}"
         timestamp: u64,
     },
+
+    /// v4.6: VRF Public Key Announcement — exchange Dilithium3 VRF keys between nodes.
+    /// Broadcast on startup and at every macroblock boundary.
+    /// Receiver verifies self-signature (proves ownership of secret key).
+    /// Without this, block/attestation signature verification fails (no_pk_registered).
+    VrfKeyAnnounce {
+        node_id: String,
+        vrf_public_key: Vec<u8>,   // 1952-byte ML-DSA-65 public key
+        self_signature: Vec<u8>,   // Dilithium3 detached signature over "QNET_VRF_KEY_v1:{node_id}"
+        timestamp: u64,
+    },
 }
 
 /// PRODUCTION: Active node info for gossip sync
@@ -11985,6 +11652,42 @@ impl SimplifiedP2P {
                 // ═══════════════════════════════════════════════════════════════
                 println!("[REPUTATION] ⚠️ IGNORED ReputationSync from {} - use blockchain-based reputation", 
                          if node_id.starts_with("genesis_node_") { node_id.clone() } else { get_privacy_id_for_addr(&node_id) });
+            }
+
+            // v4.6: VRF Key Announcement — register peer's VRF public key
+            NetworkMessage::VrfKeyAnnounce { node_id, vrf_public_key, self_signature, timestamp: _ } => {
+                self.update_peer_last_seen(from_peer);
+
+                if vrf_public_key.len() != crate::crypto::vrf::D3_PK_BYTES {
+                    if crate::node::is_debug() {
+                        println!("[DBG][VRF-KEY] bad_pk_size node={} len={}", node_id, vrf_public_key.len());
+                    }
+                    return;
+                }
+
+                if crate::genesis_constants::has_vrf_key(&node_id) {
+                    return;
+                }
+
+                // Verify self-signature: proves sender owns the secret key
+                use pqcrypto_mldsa::mldsa65 as dil3;
+                use pqcrypto_traits::sign::{PublicKey as PkT, DetachedSignature as SigT};
+                let announce_msg = format!("QNET_VRF_KEY_v1:{}", node_id);
+                let sig_ok = match (dil3::PublicKey::from_bytes(&vrf_public_key), dil3::DetachedSignature::from_bytes(&self_signature)) {
+                    (Ok(pk), Ok(sig)) => dil3::verify_detached_signature(&sig, announce_msg.as_bytes(), &pk).is_ok(),
+                    _ => false,
+                };
+
+                if sig_ok {
+                    crate::genesis_constants::register_vrf_public_key(&node_id, &vrf_public_key);
+                    if let Some(ref storage) = self.storage {
+                        let pk_hex = hex::encode(&vrf_public_key);
+                        let _ = storage.save_vrf_public_key(&node_id, &pk_hex);
+                    }
+                    println!("[INFO][VRF-KEY] registered node={} pk_hash={}", node_id, hex::encode(&vrf_public_key[..8]));
+                } else if crate::node::is_warn() {
+                    println!("[WARN][VRF-KEY] bad_self_sig node={}", node_id);
+                }
             }
             
             NetworkMessage::RequestBlocks { from_height, to_height, requester_id } => {
@@ -17518,6 +17221,7 @@ fn discover_genesis_nodes_via_dht() -> Vec<String> {
     Vec::new()
 }
 
+#[allow(dead_code)]
 impl SimplifiedP2P {
     /// Start peer exchange protocol for decentralized network growth - SCALABLE (INSTANCE METHOD)
     pub fn start_peer_exchange_protocol(&self, initial_peers: Vec<PeerInfo>) {
@@ -19941,6 +19645,69 @@ impl SimplifiedP2P {
     //
     // BANDWIDTH: ~20 claims × 5.3 KB × 3 hops × 32 fanout ≈ 10 MB/round
     // ═══════════════════════════════════════════════════════════════════
+    /// v4.6: Broadcast own VRF public key to all peers.
+    /// Called on startup and at every macroblock boundary.
+    /// Uses stored wallet_identity (set via set_wallet_identity()).
+    pub fn broadcast_vrf_key_announce(&self) {
+        use pqcrypto_mldsa::mldsa65 as dil3;
+        use pqcrypto_traits::sign::SecretKey as SkT;
+
+        let identity = match self.wallet_identity.read().clone() {
+            Some(id) => id,
+            None => return,
+        };
+
+        let vrf_pk = &identity.dilithium_pk;
+        let vrf_sk = identity.sk_bytes();
+
+        let announce_msg = format!("QNET_VRF_KEY_v1:{}", self.node_id);
+        let sk = match dil3::SecretKey::from_bytes(vrf_sk) {
+            Ok(sk) => sk,
+            Err(_) => { println!("[WARN][VRF-KEY] bad_sk_len={}", vrf_sk.len()); return; }
+        };
+        let sig = dil3::detached_sign(announce_msg.as_bytes(), &sk);
+        use pqcrypto_traits::sign::DetachedSignature as SigT;
+        let sig_bytes = sig.as_bytes().to_vec();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let msg = NetworkMessage::VrfKeyAnnounce {
+            node_id: self.node_id.clone(),
+            vrf_public_key: vrf_pk.to_vec(),
+            self_signature: sig_bytes,
+            timestamp: now,
+        };
+
+        println!("[INFO][VRF-KEY] announcing pk_hash={} to peers", hex::encode(&vrf_pk[..8]));
+
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        let peers = self.get_all_validator_addresses();
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+
+        handle.spawn(async move {
+            if quic_enabled {
+                if let Some(ref qt_lock) = quic_transport {
+                    let qt = qt_lock.read().await;
+                    for peer_str in &peers {
+                        let ip = peer_str.split(':').next().unwrap_or(peer_str);
+                        let quic_addr_str = format!("{}:10876", ip);
+                        if let Ok(peer_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
+                            let _ = qt.broadcast_to(peer_addr, &msg).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Initial TTL for VRF claim gossip (number of relay hops)
     const VRF_CLAIM_GOSSIP_TTL: u8 = 4;
     
@@ -20974,7 +20741,7 @@ impl SimplifiedP2P {
     /// - Slashing requires cryptographic proof in MacroBlock
     /// - All nodes compute same result from same blocks
     /// ═══════════════════════════════════════════════════════════════════════════
-    #[allow(unused_variables)]
+    #[allow(dead_code, unused_variables)]
     fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, jail_updates: Vec<(String, u64, u32, String)>, timestamp: u64, signature: Vec<u8>) {
         // DISABLED: This entire function is deprecated
         // Reputation sync via P2P is a security vulnerability
@@ -21023,14 +20790,6 @@ impl SimplifiedP2P {
         false
     }
     
-    /// DEPRECATED: P2P reputation signature verification (SYNC) - DISABLED
-    /// See verify_reputation_signature_async for details on why this is disabled
-    #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
-    #[allow(unused_variables)]
-    fn verify_reputation_signature(&self, node_id: &str, updates: &[(String, f64)], timestamp: u64, signature: &[u8]) -> bool {
-        // DISABLED: Always returns false
-        false
-    }
     
     /// DEPRECATED: P2P reputation broadcast - DISABLED for security
     /// ═══════════════════════════════════════════════════════════════════════════
@@ -21595,6 +21354,7 @@ impl SimplifiedP2P {
         Ok(())
     }
     
+    #[allow(dead_code)]
     fn select_emergency_producer_excluding(&self, exclude: &str, height: u64) -> String {
         // v2.92: Use N-2 epoch-based snapshot for deterministic selection (SAME as node.rs!)
         // This ensures all nodes agree on emergency producer even for critical attacks
