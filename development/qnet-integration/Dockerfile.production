@@ -102,6 +102,10 @@ set -e\n\
 if [ "$(id -u)" = "0" ]; then\n\
   echo "Checking data directory: $DATA_DIR"\n\
   \n\
+  # v8.1: Remove stale LOCK file left by unclean shutdown (docker stop → SIGKILL).\n\
+  # RocksDB recreates LOCK on open — safe to remove before startup.\n\
+  rm -f "$DATA_DIR/LOCK"\n\
+  \n\
   # Check for corrupted RocksDB (missing MANIFEST files)\n\
   if [ -d "$DATA_DIR" ] && [ "$(ls -A $DATA_DIR 2>/dev/null)" ]; then\n\
     if ls "$DATA_DIR"/MANIFEST-* >/dev/null 2>&1; then\n\

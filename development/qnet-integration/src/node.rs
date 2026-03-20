@@ -6581,6 +6581,23 @@ impl BlockchainNode {
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                             
+                            // v8.1: Sync RAM height with RocksDB after wave completion.
+                            // parallel_download_microblocks saves blocks to storage (chain_height updated),
+                            // but RAM height may lag if process_received_blocks hasn't processed all yet.
+                            {
+                                let stored_h = blockchain_for_sync.storage.get_chain_height().unwrap_or(0);
+                                let ram_h = *blockchain_for_sync.height.read().await;
+                                if stored_h > ram_h {
+                                    *blockchain_for_sync.height.write().await = stored_h;
+                                    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                        stored_h, std::sync::atomic::Ordering::Relaxed
+                                    );
+                                    if is_info() {
+                                        println!("[INFO][SYNC] ram_height_synced ram={}->{} source=rocksdb", ram_h, stored_h);
+                                    }
+                                }
+                            }
+                            
                             if is_info() { println!("[INFO][SYNC] microblock_sync_complete"); }
                             
                             // PRODUCTION v2.19.12: Sync macroblocks after microblocks
@@ -6996,12 +7013,23 @@ impl BlockchainNode {
                         // CRITICAL FIX: Check if error is due to CERTIFICATE RACE CONDITION
                         // Block arrives before certificate → buffer for retry when certificate arrives
                         if e.contains("Invalid signature") && e.contains("from producer") {
-                            // This is likely a certificate race condition
                             let retry_count = pending_blocks.get(&received_block.height)
                                 .map(|(_, count, _)| count + 1)
                                 .unwrap_or(0);
                             
-                            if retry_count < 5 { // Max 5 retries for certificate race (more than missing block)
+                            // v8.1: During sync, allow more retries — VRF keys arrive via heartbeat
+                            // which may take 10-30s after connection is established.
+                            // Live mode: 5 retries (cert race is short-lived)
+                            // Sync mode: 30 retries (need to wait for heartbeat with VRF pubkey)
+                            let is_sync_mode = FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+                                || SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+                                || {
+                                    let local_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+                                    local_h + 50 < received_block.height
+                                };
+                            let max_cert_retries: u8 = if is_sync_mode { 30 } else { 5 };
+                            
+                            if retry_count < max_cert_retries {
                                 if is_debug() { println!("[DBG][BLOCK] buffer h={} retry={} wait_cert={}", 
                                          received_block.height, retry_count, received_block.from_peer); }
                                 
@@ -7030,15 +7058,13 @@ impl BlockchainNode {
                                     RETRY_CERT_RACE.fetch_add(1, Ordering::Relaxed);
                                 }
                                 
-                                // Certificate will arrive via periodic broadcast (every 10s during first 2 minutes)
-                                // No need to request - adaptive re-broadcast will provide it
-                                if is_debug() { println!("[DBG][BLOCK] cert_pending via_rebroadcast"); }
-                                continue; // Skip error logging, this is expected race condition
+                                // VRF keys arrive via heartbeat broadcast (every 10-30s)
+                                if is_debug() { println!("[DBG][BLOCK] cert_pending retry={}/{} sync={}", retry_count, max_cert_retries, is_sync_mode); }
+                                continue;
                             } else {
-                                // v2.105: CRITICAL - Clear from pending when cert retries exhausted
                                 crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                                eprintln!("[ERR][BLOCK] rejected h={} cert_retries={}", 
-                                         received_block.height, retry_count);
+                                if is_warn() { println!("[WARN][BLOCK] cert_exhausted h={} retries={} sync={}", 
+                                         received_block.height, retry_count, is_sync_mode); }
                             }
                         }
                         // CRITICAL FIX: Check if error is due to missing previous block

@@ -807,8 +807,8 @@ impl PersistentStorage {
         
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
-        let blocks_cf = self.db.cf_handle("blocks")
-            .ok_or_else(|| IntegrationError::StorageError("blocks column family not found".to_string()))?;
+        let microblocks_cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
         
         // Get metadata height with read lock (atomic read)
         let metadata_height = match self.db.get_cf(&metadata_cf, b"chain_height")? {
@@ -825,7 +825,7 @@ impl PersistentStorage {
         
         // SECURITY: Find max CONTINUOUS height (no gaps > 10 blocks allowed)
         // This prevents accepting blocks from fork/attack with gaps
-        let mut result = self.find_max_continuous_height(&blocks_cf, metadata_height)?;
+        let mut result = self.find_max_continuous_height(&microblocks_cf, metadata_height)?;
         
         // v3.0: CRITICAL FIX - If metadata_height is low (0-10) and no continuous blocks found,
         // scan for FIRST existing block and use that as starting point
@@ -836,7 +836,7 @@ impl PersistentStorage {
             }
             
             // Find first existing block using RocksDB iterator
-            if let Some(first_block_height) = self.find_first_existing_block(&blocks_cf)? {
+            if let Some(first_block_height) = self.find_first_existing_block(&microblocks_cf)? {
                 if first_block_height > metadata_height {
                     if is_warn() {
                         println!("[WARN][STORAGE] found_first_block_at={} metadata_was={}", 
@@ -844,7 +844,7 @@ impl PersistentStorage {
                     }
                     
                     // Now scan from first found block to find max continuous
-                    result = self.find_max_continuous_height(&blocks_cf, first_block_height.saturating_sub(1))?;
+                    result = self.find_max_continuous_height(&microblocks_cf, first_block_height.saturating_sub(1))?;
                     
                     if let Some((max_height, _)) = result {
                         if is_warn() {
@@ -952,7 +952,7 @@ impl PersistentStorage {
         for h in (start + 1)..=(start.saturating_add(MAX_SCAN_BLOCKS)) {
             key_buffer.clear();
             use std::fmt::Write;
-            write!(&mut key_buffer, "block_{}", h).unwrap();
+            write!(&mut key_buffer, "microblock_{}", h).unwrap();
             
             if self.db.get_cf(blocks_cf, key_buffer.as_bytes())?.is_some() {
                 max_found = h;
@@ -987,21 +987,18 @@ impl PersistentStorage {
     /// Used for recovery when metadata is corrupted but blocks exist
     /// 
     /// PERFORMANCE: Uses prefix iterator, typically finds block in O(1)
-    fn find_first_existing_block(&self, blocks_cf: &ColumnFamily) -> IntegrationResult<Option<u64>> {
+    fn find_first_existing_block(&self, microblocks_cf: &ColumnFamily) -> IntegrationResult<Option<u64>> {
         use rocksdb::IteratorMode;
         use crate::node::is_debug;
         
-        // RocksDB keys are "block_N" where N is the height
-        // Iterator will scan in lexicographic order
-        let iter = self.db.iterator_cf(blocks_cf, IteratorMode::Start);
+        let iter = self.db.iterator_cf(microblocks_cf, IteratorMode::Start);
         
         for item in iter {
             match item {
                 Ok((key, _)) => {
-                    // Parse "block_N" format
                     if let Ok(key_str) = std::str::from_utf8(&key) {
-                        if key_str.starts_with("block_") {
-                            if let Ok(height) = key_str[6..].parse::<u64>() {
+                        if key_str.starts_with("microblock_") {
+                            if let Ok(height) = key_str["microblock_".len()..].parse::<u64>() {
                                 if is_debug() {
                                     println!("[DBG][STORAGE] found_first_block h={}", height);
                                 }
@@ -1065,40 +1062,54 @@ impl PersistentStorage {
     /// Keeps only recent blocks for sync, deletes old ones to save disk
     /// SAFE: Only prunes microblocks, not macroblocks (which contain finality data)
     pub fn prune_old_microblocks(&self, current_height: u64, retention_blocks: u64) -> IntegrationResult<usize> {
+        use crate::node::is_info;
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks CF not found".to_string()))?;
         
         if current_height <= retention_blocks {
-            return Ok(0); // Nothing to prune yet
+            return Ok(0);
         }
         
         let prune_below = current_height - retention_blocks;
-        let mut deleted = 0;
-        
-        // Delete microblocks older than prune_below
+        let mut deleted: usize = 0;
         let mut batch = WriteBatch::default();
         
-        for height in 0..prune_below {
-            let key = height.to_be_bytes();
-            batch.delete_cf(&microblocks_cf, &key);
-            deleted += 1;
-            
-            // Commit in batches of 1000 to avoid memory issues
-            if deleted % 1000 == 0 {
-                self.db.write(batch)?;
-                batch = WriteBatch::default();
+        let iter = self.db.iterator_cf(&microblocks_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            match item {
+                Ok((key, _)) => {
+                    if let Ok(key_str) = std::str::from_utf8(&key) {
+                        if let Some(h_str) = key_str.strip_prefix("microblock_") {
+                            if let Ok(h) = h_str.parse::<u64>() {
+                                if h >= prune_below {
+                                    break;
+                                }
+                                batch.delete_cf(&microblocks_cf, &key);
+                                deleted += 1;
+                                if deleted % 1000 == 0 {
+                                    self.db.write(batch)?;
+                                    batch = WriteBatch::default();
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
             }
         }
         
-        // Write remaining deletes
         if deleted % 1000 != 0 {
             self.db.write(batch)?;
         }
         
-        // Trigger compaction to reclaim space
-        self.db.compact_range_cf(&microblocks_cf, None::<&[u8]>, None::<&[u8]>);
+        if deleted > 0 {
+            self.db.compact_range_cf(&microblocks_cf, None::<&[u8]>, None::<&[u8]>);
+        }
         
-        println!("[STORAGE] v3.19: Pruned {} old microblocks (kept last {})", deleted, retention_blocks);
+        if is_info() {
+            println!("[INFO][STORAGE] pruned_microblocks deleted={} retention={} prune_below={}",
+                     deleted, retention_blocks, prune_below);
+        }
         Ok(deleted)
     }
     
@@ -1144,8 +1155,8 @@ impl PersistentStorage {
         // Trigger compaction
         self.db.compact_range_cf(&heartbeats_cf, None::<&[u8]>, None::<&[u8]>);
         
-        if deleted > 0 {
-            println!("[STORAGE] v3.19: Pruned {} old heartbeats (kept last {}s)", deleted, retention_seconds);
+        if deleted > 0 && crate::node::is_info() {
+            println!("[INFO][STORAGE] pruned_heartbeats deleted={} retention={}s", deleted, retention_seconds);
         }
         Ok(deleted)
     }
@@ -1154,23 +1165,24 @@ impl PersistentStorage {
     /// retention_blocks: How many microblocks to keep (e.g., 86400 = ~1 day at 1 block/sec)
     /// heartbeat_retention_secs: How long to keep heartbeats (e.g., 86400 = 1 day)
     pub fn run_pruning_cycle(&self, current_height: u64, retention_blocks: u64, heartbeat_retention_secs: u64) -> IntegrationResult<()> {
-        println!("[STORAGE] v3.19: Starting pruning cycle (retention: {} blocks, {} sec heartbeats)", 
-                 retention_blocks, heartbeat_retention_secs);
+        use crate::node::is_info;
+        if is_info() {
+            println!("[INFO][STORAGE] pruning_cycle_start retention_blocks={} heartbeat_retention={}s",
+                     retention_blocks, heartbeat_retention_secs);
+        }
         
         let start = std::time::Instant::now();
         
-        // Prune microblocks
         let microblocks_deleted = self.prune_old_microblocks(current_height, retention_blocks)?;
-        
-        // Prune heartbeats  
         let heartbeats_deleted = self.prune_old_heartbeats(heartbeat_retention_secs)?;
         
-        // Force compaction on all CFs
         self.compact_all()?;
         
         let elapsed = start.elapsed();
-        println!("[STORAGE] v3.19: Pruning complete in {:?} (microblocks: {}, heartbeats: {})", 
-                 elapsed, microblocks_deleted, heartbeats_deleted);
+        if is_info() {
+            println!("[INFO][STORAGE] pruning_cycle_done elapsed={:?} microblocks={} heartbeats={}",
+                     elapsed, microblocks_deleted, heartbeats_deleted);
+        }
         
         Ok(())
     }
@@ -1399,13 +1411,12 @@ impl PersistentStorage {
     }
     
     pub fn save_microblock(&self, height: u64, data: &[u8]) -> IntegrationResult<()> {
-        // v3.23: Check rollback protection before saving
-        // This prevents race condition where parallel block receive overwrites rollback
         if !can_save_block(height) {
-            let (in_progress, target) = get_rollback_status();
-            println!("[WARN][STORAGE] block_save_blocked h={} rollback_in_progress={} target={}", 
-                     height, in_progress, target);
-            // Return Ok to avoid error propagation - block will be re-requested after rollback
+            if crate::node::is_warn() {
+                let (in_progress, target) = get_rollback_status();
+                println!("[WARN][STORAGE] block_save_blocked h={} rollback={} target={}", 
+                         height, in_progress, target);
+            }
             return Ok(());
         }
         
@@ -1416,15 +1427,9 @@ impl PersistentStorage {
         
         let key = format!("microblock_{}", height);
         
-        // Use batch write to update both microblock and chain height atomically
         let mut batch = WriteBatch::default();
         batch.put_cf(&microblocks_cf, key.as_bytes(), data);
-        
-        // Update chain height - but only if not in rollback or height <= target
-        // Double-check protection in case of race between check and write
-        if can_save_block(height) {
-            batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
-        }
+        batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
         
         self.db.write(batch)?;
         Ok(())

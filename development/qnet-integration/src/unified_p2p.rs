@@ -1,4 +1,4 @@
-//! Simplified Regional P2P Network
+﻿//! Simplified Regional P2P Network
 //! 
 //! Simple and efficient P2P with basic regional clustering.
 //! No complex intelligent switching - just regional awareness with failover.
@@ -657,7 +657,7 @@ static BROADCAST_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
         .map(|env_val| env_val.max(1).min(cpu_count))
         .unwrap_or(default_threads);
     
-    println!("[INFO][BROADCAST] runtime_init cpus={} threads={}", cpu_count, broadcast_threads);
+    if crate::node::is_info() { println!("[INFO][BROADCAST] runtime_init cpus={} threads={}", cpu_count, broadcast_threads); }
     
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(broadcast_threads)
@@ -691,7 +691,7 @@ static SIGVERIFY_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
         .map(|v| v.max(1).min(cpu_count))
         .unwrap_or(default_threads);
     
-    println!("[INFO][SIGVERIFY] runtime_init cpus={} threads={}", cpu_count, sigverify_threads);
+    if crate::node::is_info() { println!("[INFO][SIGVERIFY] runtime_init cpus={} threads={}", cpu_count, sigverify_threads); }
     
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(sigverify_threads)
@@ -722,7 +722,7 @@ static BANKING_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
         .map(|v| v.max(1).min(cpu_count))
         .unwrap_or(default_threads);
     
-    println!("[INFO][BANKING] runtime_init cpus={} threads={}", cpu_count, banking_threads);
+    if crate::node::is_info() { println!("[INFO][BANKING] runtime_init cpus={} threads={}", cpu_count, banking_threads); }
     
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(banking_threads)
@@ -753,7 +753,7 @@ static REPLAY_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
         .map(|v| v.max(1).min(cpu_count))
         .unwrap_or(default_threads);
     
-    println!("[INFO][REPLAY] runtime_init cpus={} threads={}", cpu_count, replay_threads);
+    if crate::node::is_info() { println!("[INFO][REPLAY] runtime_init cpus={} threads={}", cpu_count, replay_threads); }
     
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(replay_threads)
@@ -1570,9 +1570,9 @@ impl CertificateManager {
         };
         
         if max_cache_size == 0 {
-            println!("[CERTIFICATE] 📱 Light node: Certificate caching DISABLED (consensus not required)");
+            if crate::node::is_info() { println!("[CERTIFICATE] 📱 Light node: Certificate caching DISABLED (consensus not required)"); }
         } else {
-            println!("[CERTIFICATE] 📊 {:?} node: Certificate cache size: {}", node_type, max_cache_size);
+            if crate::node::is_info() { println!("[CERTIFICATE] 📊 {:?} node: Certificate cache size: {}", node_type, max_cache_size); }
         }
         
         Self {
@@ -1601,7 +1601,7 @@ impl CertificateManager {
     pub fn store_remote_certificate(&mut self, cert_serial: String, certificate: Vec<u8>) {
         // CRITICAL: Light nodes should NEVER store certificates
         if self.max_cache_size == 0 {
-            println!("[CERTIFICATE] 📱 Light node: Rejecting certificate storage (consensus disabled)");
+            if crate::node::is_info() { println!("[CERTIFICATE] 📱 Light node: Rejecting certificate storage (consensus disabled)"); }
             return;
         }
         
@@ -1616,8 +1616,8 @@ impl CertificateManager {
         let original_size = certificate.len();
         let compressed_size = compressed_cert.len();
         if compressed_size < original_size {
-            println!("[CERTIFICATE] 📦 Compressed certificate: {} -> {} bytes ({}% reduction)", 
-                     original_size, compressed_size, (100 - (compressed_size * 100 / original_size)));
+            if crate::node::is_info() { println!("[CERTIFICATE] 📦 Compressed certificate: {} -> {} bytes ({}% reduction)", 
+                     original_size, compressed_size, (100 - (compressed_size * 100 / original_size))); }
         }
         
         // PRODUCTION: Enforce configurable cache limit for scalability
@@ -1659,8 +1659,8 @@ impl CertificateManager {
                 self.recently_used.remove(&evicted_serial);
                 
                 let usage = self.usage_count.get(&evicted_serial).unwrap_or(&0);
-                println!("[CERTIFICATE] 🗑️ Evicted: {} (usage: {}, cache: {}/{})", 
-                         evicted_serial, usage, self.remote_certificates.len(), self.max_cache_size);
+                if crate::node::is_warn() { println!("[CERTIFICATE] 🗑️ Evicted: {} (usage: {}, cache: {}/{})", 
+                         evicted_serial, usage, self.remote_certificates.len(), self.max_cache_size); }
             }
         }
         
@@ -1679,8 +1679,8 @@ impl CertificateManager {
         
         // Add monitoring for cache size
         if self.recently_used.len() > 1400 {
-            println!("[CERTIFICATE] ⚠️ recently_used approaching limit: {}/1500", 
-                     self.recently_used.len());
+            if crate::node::is_warn() { println!("[CERTIFICATE] ⚠️ recently_used approaching limit: {}/1500",
+                     self.recently_used.len()); }
         }
         
         if self.recently_used.len() > MAX_RECENTLY_USED {
@@ -1705,8 +1705,8 @@ impl CertificateManager {
                 .map(|(serial, _)| serial.clone())
                 .collect();
             
-            println!("[CERTIFICATE] 🗑️ Cleaning recently_used: removing {} least-used entries (keeping 1400 most active)", 
-                     to_remove.len());
+            if crate::node::is_warn() { println!("[CERTIFICATE] 🗑️ Cleaning recently_used: removing {} least-used entries (keeping 1400 most active)", 
+                     to_remove.len()); }
             
             for serial in to_remove {
                 self.recently_used.remove(&serial);
@@ -1754,12 +1754,12 @@ impl CertificateManager {
                 // OPTIMIZATION: Decompress certificate before returning
                 match lz4_flex::decompress_size_prepended(compressed_cert) {
                     Ok(decompressed) => {
-                        println!("[CERTIFICATE] ✅ Using verified certificate {}", cert_serial);
+                        if crate::node::is_info() { println!("[CERTIFICATE] ✅ Using verified certificate {}", cert_serial); }
                         // NOTE: Caller must call mark_as_used() separately due to &self immutability
                         return Some(decompressed);
                     }
                     Err(e) => {
-                        println!("[CERTIFICATE] ❌ Failed to decompress certificate {}: {}", cert_serial, e);
+                        if crate::node::is_warn() { println!("[CERTIFICATE] ❌ Failed to decompress certificate {}: {}", cert_serial, e); }
                         // Fall back to returning as-is (might be uncompressed legacy data)
                         return Some(compressed_cert.clone());
                     }
@@ -1776,8 +1776,8 @@ impl CertificateManager {
             
             // Check TTL even for pending
             if now - timestamp <= self.certificate_ttl.as_secs() {
-                println!("[CERTIFICATE] ⚠️ Using PENDING certificate {} from {} (verification in progress)", 
-                         cert_serial, node_id);
+                if crate::node::is_warn() { println!("[CERTIFICATE] ⚠️ Using PENDING certificate {} from {} (verification in progress)", 
+                         cert_serial, node_id); }
                 // Decompress pending certificate
                 match lz4_flex::decompress_size_prepended(compressed_cert) {
                     Ok(decompressed) => {
@@ -1786,14 +1786,14 @@ impl CertificateManager {
                         return Some(decompressed);
                     }
                     Err(e) => {
-                        println!("[CERTIFICATE] ❌ Failed to decompress pending certificate {}: {}", cert_serial, e);
+                        if crate::node::is_warn() { println!("[CERTIFICATE] ❌ Failed to decompress pending certificate {}: {}", cert_serial, e); }
                         return None;
                     }
                 }
             }
         }
         
-        println!("[CERTIFICATE] ❌ Certificate {} not found in any cache", cert_serial);
+        if crate::node::is_warn() { println!("[CERTIFICATE] ❌ Certificate {} not found in any cache", cert_serial); }
         None
     }
     
@@ -1836,7 +1836,7 @@ impl CertificateManager {
         };
         
         if max_persist_certs == 0 {
-            println!("[CERTIFICATE] 📱 Light node: Skipping certificate persistence");
+            if crate::node::is_info() { println!("[CERTIFICATE] 📱 Light node: Skipping certificate persistence"); }
             return Ok(());
         }
         
@@ -1864,7 +1864,7 @@ impl CertificateManager {
             }
         }
         
-        println!("[CERTIFICATE] 💾 Persisted {} critical certificates to disk", saved_count);
+        if crate::node::is_info() { println!("[CERTIFICATE] 💾 Persisted {} critical certificates to disk", saved_count); }
         
         // v3.50: certificate_history persistence removed — Dilithium-only verification
         // Legacy certificate_history.bin file will be ignored on next restart
@@ -1927,7 +1927,7 @@ impl CertificateManager {
             }
         }
         
-        println!("[CERTIFICATE] 📂 Loaded {} certificates from disk ({} expired)", loaded_count, expired_count);
+        if crate::node::is_info() { println!("[CERTIFICATE] 📂 Loaded {} certificates from disk ({} expired)", loaded_count, expired_count); }
         
         // v3.50: certificate_history loading removed — Dilithium-only verification
         
@@ -2272,7 +2272,7 @@ impl SimplifiedP2P {
                                 let genesis_id = format!("genesis_node_{:03}", i);
                                 reputation_sys.set_reputation(&genesis_id, INITIAL_REPUTATION);
                             }
-                            println!("[INFO][P2P] Genesis node {} initialized - all Genesis nodes set to {:.0}% reputation", bootstrap_id, INITIAL_REPUTATION);
+                            if crate::node::is_info() { println!("[INFO][P2P] Genesis node {} initialized - all Genesis nodes set to {:.0}% reputation", bootstrap_id, INITIAL_REPUTATION); }
                         }
                         _ => {}
                     }
@@ -2289,7 +2289,7 @@ impl SimplifiedP2P {
                     } else {
                         get_privacy_id_for_addr(&node_id)
                     };
-                    println!("[INFO][P2P] Legacy Genesis node {} detected - reputation will be initialized by consensus system", display_id);
+                    if crate::node::is_info() { println!("[INFO][P2P] Legacy Genesis node {} detected - reputation will be initialized by consensus system", display_id); }
                 } else {
                     // Check activation code for Genesis codes
                     if let Ok(activation_code) = std::env::var("QNET_ACTIVATION_CODE") {
@@ -2298,7 +2298,7 @@ impl SimplifiedP2P {
                         for genesis_code in GENESIS_BOOTSTRAP_CODES {
                             if activation_code == *genesis_code {
                                 // PRIVACY: Don't show node_id even in local logs
-                                println!("[INFO][P2P] Genesis activation code {} detected - reputation will be initialized by consensus system", genesis_code);
+                                if crate::node::is_info() { println!("[INFO][P2P] Genesis activation code {} detected - reputation will be initialized by consensus system", genesis_code); }
                                 break;
                             }
                         }
@@ -2365,7 +2365,7 @@ impl SimplifiedP2P {
     /// PRODUCTION: Set consensus message channel for real integration
     pub fn set_consensus_channel(&mut self, consensus_tx: tokio::sync::mpsc::UnboundedSender<ConsensusMessage>) {
         self.consensus_tx = Some(consensus_tx);
-        println!("[INFO][P2P] Consensus integration channel established");
+        if crate::node::is_info() { println!("[INFO][P2P] Consensus integration channel established"); }
     }
     
     /// PRODUCTION: Set block processing channel for storage integration
@@ -2375,7 +2375,7 @@ impl SimplifiedP2P {
             Err(p) => p.into_inner()
         };
         *guard = Some(block_tx);
-        println!("[INFO][P2P] Block processing channel established");
+        if crate::node::is_info() { println!("[INFO][P2P] Block processing channel established"); }
     }
     
     /// PRODUCTION: Set macroblock processing channel for storage integration (v2.19.12)
@@ -2385,7 +2385,7 @@ impl SimplifiedP2P {
             Err(p) => p.into_inner()
         };
         *guard = Some(macroblock_tx);
-        println!("[INFO][P2P] Macroblock processing channel established");
+        if crate::node::is_info() { println!("[INFO][P2P] Macroblock processing channel established"); }
     }
     
     /// PRODUCTION v2.19.25: Set transaction processing channel for mempool integration
@@ -2396,7 +2396,7 @@ impl SimplifiedP2P {
             Err(p) => p.into_inner()
         };
         *guard = Some(tx_channel);
-        println!("[INFO][P2P] Transaction processing channel established");
+        if crate::node::is_info() { println!("[INFO][P2P] Transaction processing channel established"); }
     }
     
     /// GULF STREAM v2.25: Set current block producer for TX forwarding
@@ -2434,7 +2434,7 @@ impl SimplifiedP2P {
     /// PRODUCTION: Set macroblock sync request channel (v2.19.12)
     pub fn set_macroblock_sync_channel(&mut self, sync_tx: tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>) {
         self.macroblock_sync_request_tx = Some(sync_tx);
-        println!("[INFO][P2P] Macroblock sync request channel established");
+        if crate::node::is_info() { println!("[INFO][P2P] Macroblock sync request channel established"); }
     }
     
     /// Set sync request channel for handling block requests
@@ -2450,7 +2450,7 @@ impl SimplifiedP2P {
             Err(p) => p.into_inner()
         };
         *guard = Some(quic_message_tx);
-        println!("[QUIC] ✅ Message processing channel established");
+        if crate::node::is_info() { println!("[QUIC] ✅ Message processing channel established"); }
     }
     
     /// PRODUCTION v2.19.21: Initialize QUIC transport for high-performance P2P
@@ -2496,16 +2496,16 @@ impl SimplifiedP2P {
             if let Ok(tx_guard) = quic_message_tx.lock() {
                 if let Some(ref tx) = *tx_guard {
                     if let Err(e) = tx.send((peer_str.clone(), msg)) {
-                        println!("[QUIC] ⚠️ Failed to queue message from {}: {}", peer_str, e);
+                        if crate::node::is_warn() { println!("[QUIC] ⚠️ Failed to queue message from {}: {}", peer_str, e); }
                     }
                 } else {
                     // Channel not set yet - this is a CRITICAL startup race condition!
                     // Log this as it means messages are being lost
-                    println!("[QUIC] ⚠️ Message from {} dropped - channel not initialized yet!", peer_str);
+                    if crate::node::is_warn() { println!("[QUIC] ⚠️ Message from {} dropped - channel not initialized yet!", peer_str); }
                 }
             } else {
                 // Mutex poisoned - log error
-                println!("[QUIC] ❌ Failed to acquire quic_message_tx lock - message dropped!");
+                if crate::node::is_warn() { println!("[QUIC] ❌ Failed to acquire quic_message_tx lock - message dropped!"); }
             }
         });
         
@@ -2523,7 +2523,7 @@ impl SimplifiedP2P {
         // This enables QUIC-based block sync without passing &self
         if let Ok(mut guard) = GLOBAL_QUIC_TRANSPORT.write() {
             *guard = Some(quic_arc);
-            println!("[QUIC] 📦 Global QUIC transport registered for sync");
+            if crate::node::is_info() { println!("[QUIC] 📦 Global QUIC transport registered for sync"); }
         }
         
         // v2.24.3: Set global node ID for sync requests
@@ -2531,9 +2531,9 @@ impl SimplifiedP2P {
             *guard = self.node_id.clone();
         }
         
-        println!("[QUIC] ✅ Transport + Server initialized on port {}", quic_port);
-        println!("[QUIC] 📊 Timeouts: connect=3s, idle=90s, keepalive=30s (aligned with HTTP)");
-        println!("[QUIC] 📦 Binary protocol (bincode), TLS 1.3, 100 streams/conn");
+        if crate::node::is_info() { println!("[QUIC] ✅ Transport + Server initialized on port {}", quic_port); }
+        if crate::node::is_info() { println!("[QUIC] 📊 Timeouts: connect=3s, idle=90s, keepalive=30s (aligned with HTTP)"); }
+        if crate::node::is_info() { println!("[QUIC] 📦 Binary protocol (bincode), TLS 1.3, 100 streams/conn"); }
         Ok(())
     }
     
@@ -2710,7 +2710,7 @@ impl SimplifiedP2P {
         if let Some(ref quic_transport) = self.quic_transport {
             let transport = quic_transport.read().await;
             transport.stop();
-            println!("[QUIC] 🛑 QUIC transport stopped gracefully");
+            if crate::node::is_warn() { println!("[QUIC] 🛑 QUIC transport stopped gracefully"); }
         }
     }
     
@@ -2733,16 +2733,16 @@ impl SimplifiedP2P {
             };
             
             if jailed_until == u64::MAX {
-                println!("[JAIL] 📂 Restored PERMANENT BAN for {} from blockchain", display_id);
+                if crate::node::is_info() { println!("[JAIL] 📂 Restored PERMANENT BAN for {} from blockchain", display_id); }
             } else {
-                println!("[JAIL] 📂 Restored jail for {} (offense #{}) from blockchain", display_id, jail_count);
+                if crate::node::is_info() { println!("[JAIL] 📂 Restored jail for {} (offense #{}) from blockchain", display_id, jail_count); }
             }
         }
     }
     
     /// Start simplified P2P network with load balancing
     pub fn start(&self) {
-        println!("[INFO][P2P] Starting P2P network with intelligent load balancing");
+        if crate::node::is_info() { println!("[INFO][P2P] Starting P2P network with intelligent load balancing"); }
         
         // CRITICAL: Load jail statuses from persistent storage FIRST
         // This ensures banned nodes stay banned across restarts
@@ -2755,8 +2755,8 @@ impl SimplifiedP2P {
             get_privacy_id_for_addr(&self.node_id)
         };
         
-        println!("[P2P] Node: {} | Type: {:?} | Region: {:?}", 
-                 display_id, self.node_type, self.region);
+        if crate::node::is_info() { println!("[P2P] Node: {} | Type: {:?} | Region: {:?}", 
+                 display_id, self.node_type, self.region); }
         
         // Check channel states at startup (logging removed for performance)
         match &self.consensus_tx {
@@ -2776,7 +2776,7 @@ impl SimplifiedP2P {
         match self.is_running.lock() {
             Ok(mut running) => *running = true,
             Err(poisoned) => {
-                println!("[WARN][P2P] Mutex poisoned, recovering...");
+                if crate::node::is_warn() { println!("[WARN][P2P] Mutex poisoned, recovering..."); }
                 *poisoned.into_inner() = true;
             }
         }
@@ -2798,12 +2798,12 @@ impl SimplifiedP2P {
             match self.node_type {
                 NodeType::Light => {
                     // Light nodes don't need aggressive peer exchange
-                    println!("[INFO][P2P] Light node: Minimal peer exchange (bandwidth optimization)");
+                    if crate::node::is_info() { println!("[INFO][P2P] Light node: Minimal peer exchange (bandwidth optimization)"); }
                 }
                 _ => {
                     self.start_peer_exchange_protocol(initial_peers);
                     // v3.18: Full nodes removed
-                    println!("[INFO][P2P] Started peer exchange protocol for Super node");
+                    if crate::node::is_info() { println!("[INFO][P2P] Started peer exchange protocol for Super node"); }
                 }
             }
         }
@@ -2814,13 +2814,13 @@ impl SimplifiedP2P {
             || std::path::Path::new("/.dockerenv").exists();
         
         if is_docker {
-            println!("[INFO][P2P] Docker detected - skipping UPnP (ports forwarded via -p)");
+            if crate::node::is_info() { println!("[INFO][P2P] Docker detected - skipping UPnP (ports forwarded via -p)"); }
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let port = self.port;
             let _node_id = self.node_id.clone();
             handle.spawn(async move {
                 if let Err(e) = Self::setup_upnp_port_forwarding(port).await {
-                    println!("[WARN][P2P] UPnP setup failed: {}", e);
+                    if crate::node::is_warn() { println!("[WARN][P2P] UPnP setup failed: {}", e); }
                 }
             });
         }
@@ -2828,7 +2828,7 @@ impl SimplifiedP2P {
         // QUANTUM OPTIMIZATION: Start performance monitor
         self.start_performance_optimizer();
         
-        println!("[INFO][P2P] P2P network with load balancing started");
+        if crate::node::is_info() { println!("[INFO][P2P] P2P network with load balancing started"); }
     }
     
     /// QUANTUM OPTIMIZATION: Monitor and adapt to network growth
@@ -2862,7 +2862,7 @@ impl SimplifiedP2P {
     async fn setup_upnp_port_forwarding(port: u16) -> Result<(), String> {
         use std::process::Command;
         
-        println!("[INFO][P2P] Attempting UPnP port forwarding for port {}", port);
+        if crate::node::is_info() { println!("[INFO][P2P] Attempting UPnP port forwarding for port {}", port); }
         
         // Check if upnpc is available (miniupnpc package)
         if let Ok(output) = Command::new("which").arg("upnpc").output() {
@@ -2877,7 +2877,7 @@ impl SimplifiedP2P {
                     
                 if let Ok(output) = result {
                     if output.status.success() {
-                        println!("[INFO][P2P] UPnP port forwarding successful for port {}", port);
+                        if crate::node::is_info() { println!("[INFO][P2P] UPnP port forwarding successful for port {}", port); }
                         return Ok(());
                     }
                 }
@@ -2894,14 +2894,14 @@ impl SimplifiedP2P {
                        "connectaddress=127.0.0.1"])
                 .output() {
                 if output.status.success() {
-                    println!("[INFO][P2P] Windows port forwarding configured");
+                    if crate::node::is_info() { println!("[INFO][P2P] Windows port forwarding configured"); }
                     return Ok(());
                 }
             }
         }
         
-        println!("[WARN][P2P] UPnP not available, manual port forwarding may be required");
-        println!("[INFO][P2P] For Docker: Use -p {}:{} or DOCKER_HOST_IP env var", port, port);
+        if crate::node::is_warn() { println!("[WARN][P2P] UPnP not available, manual port forwarding may be required"); }
+        if crate::node::is_info() { println!("[INFO][P2P] For Docker: Use -p {}:{} or DOCKER_HOST_IP env var", port, port); }
         Err("UPnP not available".to_string())
     }
     
@@ -3180,7 +3180,7 @@ impl SimplifiedP2P {
             
             if let Some(addr) = oldest_addr {
                 self.connected_peers_lockfree.remove(&addr);
-                println!("[INFO][P2P] LRU eviction: removed oldest peer to add new one");
+                if crate::node::is_info() { println!("[INFO][P2P] LRU eviction: removed oldest peer to add new one"); }
             }
         }
         
@@ -3233,8 +3233,8 @@ impl SimplifiedP2P {
         
         // Add peer using existing safe method
         if self.add_peer_safe(peer_info) {
-            println!("[INFO][P2P] AUTO-ADDED peer {} ({}) - received message proves connectivity", 
-                     peer_id, peer_addr);
+            if crate::node::is_info() { println!("[INFO][P2P] AUTO-ADDED peer {} ({}) - received message proves connectivity", 
+                     peer_id, peer_addr); }
             
             // Invalidate cache to include new peer
             self.invalidate_peer_cache();
@@ -3362,8 +3362,8 @@ impl SimplifiedP2P {
         };
         
         if peer_info.id == self.node_id || is_self_by_ip {
-            println!("[INFO][P2P] add_peer_lockfree: Rejecting self-connection {}", 
-                     get_privacy_id_for_addr(&peer_info.addr));
+            if crate::node::is_info() { println!("[INFO][P2P] add_peer_lockfree: Rejecting self-connection {}", 
+                     get_privacy_id_for_addr(&peer_info.addr)); }
             return false;
         }
         
@@ -3393,9 +3393,9 @@ impl SimplifiedP2P {
                 if peer_info.combined_reputation() > *worst_rep {
                     // Remove worst peer to make room
                     self.remove_peer_lockfree(worst_addr);
-                    println!("[INFO][P2P] K-bucket {}: Replaced {} (rep: {:.2}) with {} (rep: {:.2})",
+                    if crate::node::is_info() { println!("[INFO][P2P] K-bucket {}: Replaced {} (rep: {:.2}) with {} (rep: {:.2})",
                             peer_info.bucket_index, worst_addr, *worst_rep, 
-                            peer_info.id, peer_info.combined_reputation());
+                            peer_info.id, peer_info.combined_reputation()); }
                 } else {
                     // New peer has lower reputation, don't add
                     return false;
@@ -3429,7 +3429,7 @@ impl SimplifiedP2P {
     /// Connect to bootstrap peers OR use internet-wide peer discovery
     pub fn connect_to_bootstrap_peers(&self, peers: &[String]) {
         if peers.is_empty() {
-            println!("[INFO][P2P] No bootstrap peers provided - using internet-wide peer discovery");
+            if crate::node::is_info() { println!("[INFO][P2P] No bootstrap peers provided - using internet-wide peer discovery"); }
             self.start_internet_peer_discovery();
             return;
         }
@@ -3440,7 +3440,7 @@ impl SimplifiedP2P {
             Err(poisoned) => poisoned.into_inner().clone(),
         };
         
-        println!("[INFO][P2P] Connecting to {} bootstrap peers (filtering self: {:?})", peers.len(), our_ip);
+        if crate::node::is_info() { println!("[INFO][P2P] Connecting to {} bootstrap peers (filtering self: {:?})", peers.len(), our_ip); }
         
         let mut successful_parses = 0;
         let mut skipped_self = 0;
@@ -3449,7 +3449,7 @@ impl SimplifiedP2P {
             let peer_ip = peer_addr.split(':').next().unwrap_or("");
             if let Some(ref own_ip) = our_ip {
                 if peer_ip == own_ip {
-                    println!("[INFO][P2P] Skipping self-address: {}", get_privacy_id_for_addr(peer_addr));
+                    if crate::node::is_info() { println!("[INFO][P2P] Skipping self-address: {}", get_privacy_id_for_addr(peer_addr)); }
                     skipped_self += 1;
                     continue;
                 }
@@ -3459,24 +3459,24 @@ impl SimplifiedP2P {
                 Ok(peer_info) => {
                     // Also check by node_id
                     if peer_info.id == self.node_id {
-                        println!("[INFO][P2P] Skipping self by node_id: {}", peer_info.id);
+                        if crate::node::is_info() { println!("[INFO][P2P] Skipping self by node_id: {}", peer_info.id); }
                         skipped_self += 1;
                         continue;
                     }
                     // PRIVACY: Use pseudonym in logs
-                    println!("[INFO][P2P] Successfully parsed peer: {} ({})", get_privacy_id_for_addr(peer_addr), region_string(&peer_info.region));
+                    if crate::node::is_info() { println!("[INFO][P2P] Successfully parsed peer: {} ({})", get_privacy_id_for_addr(peer_addr), region_string(&peer_info.region)); }
                     self.add_peer_to_region(peer_info);
                     successful_parses += 1;
                 }
                 Err(e) => {
                     // PRIVACY: Use pseudonym in logs
-                    println!("[WARN][P2P] Failed to parse peer {}: {}", get_privacy_id_for_addr(peer_addr), e);
+                    if crate::node::is_warn() { println!("[WARN][P2P] Failed to parse peer {}: {}", get_privacy_id_for_addr(peer_addr), e); }
                 }
             }
         }
         
-        println!("[INFO][P2P] Successfully parsed {}/{} bootstrap peers (skipped {} self)", 
-                 successful_parses, peers.len(), skipped_self);
+        if crate::node::is_info() { println!("[INFO][P2P] Successfully parsed {}/{} bootstrap peers (skipped {} self)", 
+                 successful_parses, peers.len(), skipped_self); }
         
         // STARTUP FIX: Establish connections asynchronously to prevent blocking startup
         self.start_regional_connection_establishment();
@@ -3488,7 +3488,7 @@ impl SimplifiedP2P {
             return;
         }
         
-        println!("[P2P] 🔗 Adding {} discovered peers to running P2P system", peer_addresses.len());
+        if crate::node::is_info() { println!("[P2P] 🔗 Adding {} discovered peers to running P2P system", peer_addresses.len()); }
         
         let mut new_connections = 0;
         for peer_addr in peer_addresses {
@@ -3497,7 +3497,7 @@ impl SimplifiedP2P {
             if ip.starts_with("172.17.") || ip.starts_with("172.18.") 
                 || ip.starts_with("10.") || ip.starts_with("192.168.") 
                 || ip.starts_with("127.") || ip == "localhost" {
-                println!("[INFO][P2P] Skipping private/internal IP: {}", get_privacy_id_for_addr(peer_addr));
+                if crate::node::is_info() { println!("[INFO][P2P] Skipping private/internal IP: {}", get_privacy_id_for_addr(peer_addr)); }
                 continue;
             }
             
@@ -3533,7 +3533,7 @@ impl SimplifiedP2P {
                         // v4.2: Genesis peers added unconditionally (no blocking TCP check).
                         // Previous version blocked tokio workers for 2s per peer with no effect
                         // (both branches returned true). Safety guaranteed by Dilithium signatures.
-                        println!("[INFO][P2P] Genesis peer: adding {} with bootstrap trust", get_privacy_id_for_addr(&peer_info.addr));
+                        if crate::node::is_info() { println!("[INFO][P2P] Genesis peer: adding {} with bootstrap trust", get_privacy_id_for_addr(&peer_info.addr)); }
                         true
                     } else {
                         self.is_peer_actually_connected(&peer_info.addr)
@@ -3558,7 +3558,7 @@ impl SimplifiedP2P {
                                 // CACHE FIX: Invalidate peer cache when topology changes
                                 self.invalidate_peer_cache();
                             } else {
-                                println!("[INFO][P2P] Peer {} already connected, skipping duplicate", get_privacy_id_for_addr(&peer_info.addr));
+                                if crate::node::is_info() { println!("[INFO][P2P] Peer {} already connected, skipping duplicate", get_privacy_id_for_addr(&peer_info.addr)); }
                     }
                     
                             // ARCHITECTURE FIX: Peer discovery is P2P task, NOT blockchain task!
@@ -3567,10 +3567,10 @@ impl SimplifiedP2P {
                             // Blocks are empty (consensus only, no TX processing in Phase 1)
                             
                             let peer_type = if is_genesis_peer { "GENESIS" } else { "QUANTUM" };
-                            println!("[INFO][P2P] {}: Added verified peer: {}", peer_type, get_privacy_id_for_addr(&peer_info.addr));
+                            if crate::node::is_info() { println!("[INFO][P2P] {}: Added verified peer: {}", peer_type, get_privacy_id_for_addr(&peer_info.addr)); }
                         }
                     } else {
-                        println!("[INFO][P2P] Peer {} is not reachable, skipping", get_privacy_id_for_addr(&peer_info.addr));
+                        if crate::node::is_info() { println!("[INFO][P2P] Peer {} is not reachable, skipping", get_privacy_id_for_addr(&peer_info.addr)); }
                     }
                 }
             }
@@ -3583,7 +3583,7 @@ impl SimplifiedP2P {
         }
         
         if new_connections > 0 {
-            println!("[INFO][P2P] Successfully added {} new peers to P2P network", new_connections);
+            if crate::node::is_info() { println!("[INFO][P2P] Successfully added {} new peers to P2P network", new_connections); }
             // CACHE FIX: Invalidate peer cache after adding discovered peers
             self.invalidate_peer_cache();
             
@@ -3610,16 +3610,16 @@ impl SimplifiedP2P {
                             if existing_peer.addr != peer_info.addr { // Don't broadcast to self
                                 self.send_network_message(&existing_peer.addr, peer_discovery_msg.clone());
                                 // PRIVACY: Use pseudonym in logs, not raw IP
-                                println!("[INFO][P2P] REAL-TIME: Announced new peer {} to {}", 
+                                if crate::node::is_info() { println!("[INFO][P2P] REAL-TIME: Announced new peer {} to {}", 
                                          get_privacy_id_for_addr(&peer_info.addr), 
-                                         get_privacy_id_for_addr(&existing_peer.addr));
+                                         get_privacy_id_for_addr(&existing_peer.addr)); }
                             }
                         }
                     } else {
                         // PRIVACY: Non-Genesis peers are NOT announced via PeerDiscovery
                         // They are discovered via DHT/Kademlia without exposing IPs
-                        println!("[INFO][P2P] PRIVACY: Peer {} added locally only (no broadcast)", 
-                                 get_privacy_id_for_addr(&peer_info.addr));
+                        if crate::node::is_info() { println!("[INFO][P2P] PRIVACY: Peer {} added locally only (no broadcast)", 
+                                 get_privacy_id_for_addr(&peer_info.addr)); }
                     }
                 }
             }
@@ -3634,7 +3634,7 @@ impl SimplifiedP2P {
     
     /// Start internet-wide peer discovery using external IP and peer registry
     fn start_internet_peer_discovery(&self) {
-        println!("[INFO][P2P] Starting internet-wide peer discovery...");
+        if crate::node::is_info() { println!("[INFO][P2P] Starting internet-wide peer discovery..."); }
         
         // Announce our node to the internet
         self.announce_node_to_internet();
@@ -3657,7 +3657,7 @@ impl SimplifiedP2P {
         // Start regional peer clustering
         self.start_regional_clustering();
         
-        println!("[INFO][P2P] Internet-wide peer discovery started");
+        if crate::node::is_info() { println!("[INFO][P2P] Internet-wide peer discovery started"); }
     }
     
     /// Announce our node to the internet for peer discovery
@@ -3666,7 +3666,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[WARN][P2P] No Tokio runtime - node announcement deferred");
+                if crate::node::is_warn() { println!("[WARN][P2P] No Tokio runtime - node announcement deferred"); }
                 return;
             }
         };
@@ -3678,7 +3678,7 @@ impl SimplifiedP2P {
         let external_ip_store = self.external_ip.clone();
         
         handle.spawn(async move {
-            println!("[INFO][P2P] Announcing node to internet...");
+            if crate::node::is_info() { println!("[INFO][P2P] Announcing node to internet..."); }
             
             // Get our external IP address
             let external_ip = match Self::get_our_ip_address().await {
@@ -3692,14 +3692,14 @@ impl SimplifiedP2P {
                     ip
                 },
                 Err(e) => {
-                    println!("[WARN][P2P] Could not get external IP: {}", e);
+                    if crate::node::is_warn() { println!("[WARN][P2P] Could not get external IP: {}", e); }
                     return;
                 }
             };
             
             // PRIVACY: Use pseudonym for own IP in logs
-            println!("[INFO][P2P] External IP: {}", get_privacy_id_for_addr(&external_ip));
-            println!("[INFO][P2P] Node announcement: {} in {:?}", get_privacy_id_for_addr(&external_ip), region);
+            if crate::node::is_info() { println!("[INFO][P2P] External IP: {}", get_privacy_id_for_addr(&external_ip)); }
+            if crate::node::is_info() { println!("[INFO][P2P] Node announcement: {} in {:?}", get_privacy_id_for_addr(&external_ip), region); }
             
             // PRIVACY: Use display name for public P2P announcement (preserves consensus ID)
             let public_display_name = {
@@ -3744,10 +3744,10 @@ impl SimplifiedP2P {
                 "version": "1.0.0"
             });
             
-            println!("[INFO][P2P] Node announced: {}", announcement);
+            if crate::node::is_info() { println!("[INFO][P2P] Node announced: {}", announcement); }
             
             // PRODUCTION: Save to distributed registry via HTTP API calls
-            println!("[INFO][P2P] Node announcement completed for distributed registry");
+            if crate::node::is_info() { println!("[INFO][P2P] Node announcement completed for distributed registry"); }
         });
     }
     
@@ -3757,7 +3757,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[WARN][P2P] No Tokio runtime - peer search deferred");
+                if crate::node::is_warn() { println!("[WARN][P2P] No Tokio runtime - peer search deferred"); }
                 return;
             }
         };
@@ -3771,7 +3771,7 @@ impl SimplifiedP2P {
         let _reputation_system = self.reputation_system.clone();  // Clone for async block
         
         handle.spawn(async move {
-            println!("[INFO][P2P] Searching for QNet peers with cryptographic verification...");
+            if crate::node::is_info() { println!("[INFO][P2P] Searching for QNet peers with cryptographic verification..."); }
             
             let mut discovered_peers = Vec::new();
             
@@ -3793,7 +3793,7 @@ impl SimplifiedP2P {
                  let region_name = get_genesis_region_by_ip(&ip)
                      .unwrap_or("Unknown");
                  // PRIVACY: Genesis IPs are public, but use pseudonym for consistency
-                 println!("[INFO][P2P] Working Genesis bootstrap node: {} ({})", get_privacy_id_for_addr(&ip), region_name);
+                 if crate::node::is_info() { println!("[INFO][P2P] Working Genesis bootstrap node: {} ({})", get_privacy_id_for_addr(&ip), region_name); }
              }
              
              // PRIORITY 2: Add environment variable peers (additional nodes)
@@ -3803,12 +3803,12 @@ impl SimplifiedP2P {
                      if !ip.is_empty() && !known_node_ips.contains(&ip.to_string()) {
                          known_node_ips.push(ip.to_string());
                          // PRIVACY: Use pseudonym in logs
-                         println!("[INFO][P2P] Additional peer IP: {}", get_privacy_id_for_addr(ip));
+                         if crate::node::is_info() { println!("[INFO][P2P] Additional peer IP: {}", get_privacy_id_for_addr(ip)); }
                      }
                  }
              }
              
-             println!("[INFO][P2P] Quantum network bootstrap: {} total nodes configured", known_node_ips.len());
+             if crate::node::is_info() { println!("[INFO][P2P] Quantum network bootstrap: {} total nodes configured", known_node_ips.len()); }
             
             // EXISTING: Use existing Genesis constants to avoid code duplication
             let our_external_ip = if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
@@ -3823,31 +3823,31 @@ impl SimplifiedP2P {
             };
             
             // PRIVACY: Show privacy ID instead of raw IP
-            println!("[DBG][P2P] Our external node: {}", get_privacy_id_for_addr(&our_external_ip));
+            if crate::node::is_debug() { println!("[DBG][P2P] Our external node: {}", get_privacy_id_for_addr(&our_external_ip)); }
             // PRIVACY: Don't print raw IPs, just count
-            println!("[DBG][P2P] Known node IPs count: {}", known_node_ips.len());
+            if crate::node::is_debug() { println!("[DBG][P2P] Known node IPs count: {}", known_node_ips.len()); }
             
             // Search on known server IPs with proper regional ports
             for ip in known_node_ips {
                 // PRIVACY: Use pseudonym in logs
-                println!("[DBG][P2P] Processing peer: {}", get_privacy_id_for_addr(&ip));
+                if crate::node::is_debug() { println!("[DBG][P2P] Processing peer: {}", get_privacy_id_for_addr(&ip)); }
                 
                 // CRITICAL: Skip our own IP to prevent self-connection
                 if ip == our_external_ip {
                     // PRIVACY: Don't show raw IP  
-                    println!("[INFO][P2P] Skipping self-connection to own node: {}", get_privacy_id_for_addr(&ip));
+                    if crate::node::is_info() { println!("[INFO][P2P] Skipping self-connection to own node: {}", get_privacy_id_for_addr(&ip)); }
                     continue;
                 }
                 
                 // ADDITIONAL CHECK: Skip if IP matches any of our listening addresses
                 if ip == "127.0.0.1" || ip == "0.0.0.0" || ip == "localhost" {
                     // PRIVACY: Even local addresses shouldn't be shown
-                    println!("[INFO][P2P] Skipping local address: {}", get_privacy_id_for_addr(&ip));
+                    if crate::node::is_info() { println!("[INFO][P2P] Skipping local address: {}", get_privacy_id_for_addr(&ip)); }
                     continue;
                 }
                 
                 // PRIVACY: Show privacy ID for peer connections
-                println!("[INFO][P2P] Attempting to connect to peer: {}", get_privacy_id_for_addr(&ip));
+                if crate::node::is_info() { println!("[INFO][P2P] Attempting to connect to peer: {}", get_privacy_id_for_addr(&ip)); }
                 // GENESIS PERIOD FIX: All nodes use unified API on port 8001
                 // Simplified connection strategy - all Genesis nodes listen on 8001
                 let target_ports = vec![8001];  // All nodes connect via unified API port only
@@ -3855,14 +3855,14 @@ impl SimplifiedP2P {
                 for target_port in target_ports {
                     let target_addr = format!("{}:{}", ip, target_port);
                     
-                    println!("[DBG][P2P] Attempting peer verification for {}", target_addr);
+                    if crate::node::is_debug() { println!("[DBG][P2P] Attempting peer verification for {}", target_addr); }
                     
                     // Try to connect with timeout
                     // PRODUCTION: Use cryptographic peer verification instead of simple TCP test
                     match Self::verify_peer_authenticity(&target_addr).await {
                         Ok(peer_pubkey) => {
-                            println!("[INFO][P2P] Quantum-secured peer verified: {} | Dilithium signature validated | Key: {}...", 
-                                   target_addr, &peer_pubkey[..peer_pubkey.len().min(16)]);
+                            if crate::node::is_info() { println!("[INFO][P2P] Quantum-secured peer verified: {} | Dilithium signature validated | Key: {}...", 
+                                   target_addr, &peer_pubkey[..peer_pubkey.len().min(16)]); }
                             
                             // EXISTING: Use get_genesis_region_by_ip() to get correct Genesis peer region
                             use crate::genesis_constants::get_genesis_region_by_ip;
@@ -3917,8 +3917,8 @@ impl SimplifiedP2P {
                         }
                         Err(e) => {
                             // PRIVACY: Use pseudonym in logs
-                            println!("[INFO][P2P] Peer verification failed for {}: {}", get_privacy_id_for_addr(&target_addr), e);
-                            println!("[DBG][P2P] Trying next port for peer {}", get_privacy_id_for_addr(&ip));
+                            if crate::node::is_info() { println!("[INFO][P2P] Peer verification failed for {}: {}", get_privacy_id_for_addr(&target_addr), e); }
+                            if crate::node::is_debug() { println!("[DBG][P2P] Trying next port for peer {}", get_privacy_id_for_addr(&ip)); }
                         }
                     }
                 }
@@ -3927,22 +3927,22 @@ impl SimplifiedP2P {
             // If no direct connections found, load cached peers from previous sessions
             if discovered_peers.is_empty() {
                 // QUANTUM DECENTRALIZED: No file cache loading - use real-time DHT discovery only
-                println!("[INFO][P2P] QUANTUM: No direct connections found - using cryptographic DHT discovery");
+                if crate::node::is_info() { println!("[INFO][P2P] QUANTUM: No direct connections found - using cryptographic DHT discovery"); }
                 
                 // QUANTUM DECENTRALIZED: File caching disabled for quantum security and decentralization
                 // Peers are discovered exclusively through real-time cryptographic DHT network protocols
                 
                 if discovered_peers.is_empty() {
-                    println!("[P2P] 🌐 Network discovery: Waiting for peer announcements...");
-                    println!("[P2P] 💡 New nodes will find this network through genesis bootstrap");
+                    if crate::node::is_info() { println!("[P2P] 🌐 Network discovery: Waiting for peer announcements..."); }
+                    if crate::node::is_info() { println!("[P2P] 💡 New nodes will find this network through genesis bootstrap"); }
                 }
             }
             
-            println!("🌐 [P2P] Quantum network discovery: {} nodes found | 🛡️  All connections post-quantum secured", discovered_peers.len());
+            if crate::node::is_info() { println!("🌐 [P2P] Quantum network discovery: {} nodes found | 🛡️  All connections post-quantum secured", discovered_peers.len()); }
             
             // CRITICAL: Validate activation codes before adding peers
             let validated_peers = Self::validate_activation_codes_static(&discovered_peers);
-            println!("[P2P] ✅ Activation validation: {}/{} peers passed", validated_peers.len(), discovered_peers.len());
+            if crate::node::is_info() { println!("[P2P] ✅ Activation validation: {}/{} peers passed", validated_peers.len(), discovered_peers.len()); }
             
             // Add validated peers to regional map
             {
@@ -3977,7 +3977,7 @@ impl SimplifiedP2P {
             }
 
             if connected_peers.is_empty() {
-                println!("[INFO][P2P] Running in genesis mode - accepting new peer connections");
+                if crate::node::is_info() { println!("[INFO][P2P] Running in genesis mode - accepting new peer connections"); }
             }
         });
     }
@@ -3988,7 +3988,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[SYNC] ⚠️ No Tokio runtime - background sync deferred");
+                if crate::node::is_warn() { println!("[SYNC] ⚠️ No Tokio runtime - background sync deferred"); }
                 return;
             }
         };
@@ -3997,7 +3997,7 @@ impl SimplifiedP2P {
         let connected_peers = self.connected_peers_lockfree.clone();
         
         handle.spawn(async move {
-            println!("[SYNC] 🔄 Starting background height synchronization...");
+            if crate::node::is_info() { println!("[SYNC] 🔄 Starting background height synchronization..."); }
             
             // Initial delay to let network form
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -4041,7 +4041,7 @@ impl SimplifiedP2P {
                     
                     // Update both cache systems
                     if consensus_height > 0 {
-                        println!("[SYNC] 📊 Background: network height {} (from {} peers)", consensus_height, peer_heights.len());
+                        if crate::node::is_info() { println!("[SYNC] 📊 Background: network height {} (from {} peers)", consensus_height, peer_heights.len()); }
                         
                         // Update new cache actor
                         let epoch = CACHE_ACTOR.increment_epoch();
@@ -4062,7 +4062,7 @@ impl SimplifiedP2P {
                         }
                     }
                 } else {
-                    println!("[SYNC] ⚠️ Background: No peer responses - cache not updated");
+                    if crate::node::is_warn() { println!("[SYNC] ⚠️ Background: No peer responses - cache not updated"); }
                 }
                 
                 tokio::time::sleep(std::time::Duration::from_secs(sync_interval)).await;
@@ -4076,7 +4076,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[WARN][P2P] No Tokio runtime - peer cleanup task deferred");
+                if crate::node::is_warn() { println!("[WARN][P2P] No Tokio runtime - peer cleanup task deferred"); }
                 return;
             }
         };
@@ -4089,7 +4089,7 @@ impl SimplifiedP2P {
         let quic_transport = self.quic_transport.clone();
         
         handle.spawn(async move {
-            println!("[INFO][P2P] Starting periodic peer cleanup task (every 5 minutes)...");
+            if crate::node::is_info() { println!("[INFO][P2P] Starting periodic peer cleanup task (every 5 minutes)..."); }
             
             // Initial delay to let network stabilize
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -4132,8 +4132,8 @@ impl SimplifiedP2P {
                         shard_peers.retain(|addr| addr != peer_addr);
                     }
                     
-                    println!("[INFO][P2P] peer_removed peer={} id={} reason=inactive threshold={}s", 
-                            peer_addr, peer_id, PEER_INACTIVE_TIMEOUT_SECS);
+                    if crate::node::is_info() { println!("[INFO][P2P] peer_removed peer={} id={} reason=inactive threshold={}s", 
+                            peer_addr, peer_id, PEER_INACTIVE_TIMEOUT_SECS); }
                 }
                 
                 // v2.51: All cleanup done via lockfree DashMap above
@@ -4152,8 +4152,8 @@ impl SimplifiedP2P {
                     transport.cleanup_idle();
                     
                     if removed > 0 || alive < 4 {
-                        println!("[INFO][QUIC] health_check alive={} removed={} action=reconnect", 
-                                 alive, removed);
+                        if crate::node::is_info() { println!("[INFO][QUIC] health_check alive={} removed={} action=reconnect", 
+                                 alive, removed); }
                     }
                 }
             }
@@ -4195,7 +4195,7 @@ impl SimplifiedP2P {
                 let count = seen_tx_hashes.len();
                 if count > 0 {
                     seen_tx_hashes.clear();
-                    println!("[ANTI-STORM] 🧹 Cleared {} TX hashes from dedup cache", count);
+                    if crate::node::is_info() { println!("[ANTI-STORM] 🧹 Cleared {} TX hashes from dedup cache", count); }
                 }
             }
         });
@@ -4268,21 +4268,21 @@ impl SimplifiedP2P {
                 
                 // Log cleanup stats
                 if rate_entries_removed > 0 || nonce_entries_removed > 0 || unblocked_count > 0 {
-                    println!("[INFO][RATE_LIMIT] cleanup removed_rate={} removed_nonce={} unblocked={} cleaned_reqs={}",
-                             rate_entries_removed, nonce_entries_removed, unblocked_count, cleaned_requests);
+                    if crate::node::is_info() { println!("[INFO][RATE_LIMIT] cleanup removed_rate={} removed_nonce={} unblocked={} cleaned_reqs={}",
+                             rate_entries_removed, nonce_entries_removed, unblocked_count, cleaned_requests); }
                 }
                 
                 // Log current state for monitoring
                 let blocked_count: usize = rate_limiter.iter()
                     .filter(|e| e.value().blocked_until > current_time)
                     .count();
-                if blocked_count > 0 {
+                if blocked_count > 0 && crate::node::is_warn() {
                     println!("[WARN][RATE_LIMIT] currently_blocked={}", blocked_count);
                 }
             }
         });
         
-        println!("[INFO][RATE_LIMIT] cleanup_task_started interval=300s");
+        if crate::node::is_info() { println!("[INFO][RATE_LIMIT] cleanup_task_started interval=300s"); }
     }
     
     /// v3.1: CRITICAL - Cleanup static DashMaps WITHOUT existing cleanup to prevent memory leak
@@ -4368,8 +4368,8 @@ impl SimplifiedP2P {
                 // Log if anything was cleaned
                 let total_removed = retry_removed + fallback_removed + pending_sync_removed + pending_macro_removed + empty_response_removed + invalid_cert_removed + timeout_total_removed;
                 if total_removed > 0 {
-                    println!("[INFO][CACHE_CLEANUP] peer_retry={} quic_fallback={} pending_sync={} pending_macro={} empty_resp={} invalid_cert={} timeout={}", 
-                             retry_removed, fallback_removed, pending_sync_removed, pending_macro_removed, empty_response_removed, invalid_cert_removed, timeout_total_removed);
+                    if crate::node::is_info() { println!("[INFO][CACHE_CLEANUP] peer_retry={} quic_fallback={} pending_sync={} pending_macro={} empty_resp={} invalid_cert={} timeout={}", 
+                             retry_removed, fallback_removed, pending_sync_removed, pending_macro_removed, empty_response_removed, invalid_cert_removed, timeout_total_removed); }
                 }
                 
                 // Log current sizes for monitoring (only if significant)
@@ -4378,15 +4378,15 @@ impl SimplifiedP2P {
                                  EMPTY_RESPONSE_TRACKER.len() + INVALID_CERT_TRACKER.len() +
                                  TIMEOUT_VOTES.len() + TIMEOUT_CERTIFICATES.len() + TIMEOUT_VOTED_HEIGHTS.len();
                 if total_size > 100 {
-                    println!("[WARN][CACHE_SIZE] peer_retry={} quic_fallback={} pending_sync={} pending_macro={} timeout_votes={} timeout_certs={}", 
+                    if crate::node::is_warn() { println!("[WARN][CACHE_SIZE] peer_retry={} quic_fallback={} pending_sync={} pending_macro={} timeout_votes={} timeout_certs={}", 
                              PEER_RETRY_COOLDOWN.len(), QUIC_FALLBACK_RATE_LIMITER.len(), 
                              PENDING_SYNC_BLOCKS.len(), PENDING_SYNC_MACROBLOCKS.len(),
-                             TIMEOUT_VOTES.len(), TIMEOUT_CERTIFICATES.len());
+                             TIMEOUT_VOTES.len(), TIMEOUT_CERTIFICATES.len()); }
                 }
             }
         });
         
-        println!("[INFO][CACHE_CLEANUP] static_cache_cleanup_started interval=600s");
+        if crate::node::is_info() { println!("[INFO][CACHE_CLEANUP] static_cache_cleanup_started interval=600s"); }
         
         // v3.0: Separate more frequent cleanup for PENDING_SYNC_BLOCKS
         // TTL = 60 seconds, so check every 30 seconds to ensure timely cleanup
@@ -4501,9 +4501,11 @@ impl SimplifiedP2P {
                     }
                     
                     let missing_count = missing_indices.len();
-                    println!("[INFO][REPAIR] background_request h={} missing={} received={}/{} attempt={}",
-                        height, missing_count, received, required,
-                        shred_protocol_assemblies.get(&height).map(|a| a.retransmit_attempts).unwrap_or(0));
+                    if crate::node::is_info() {
+                        println!("[INFO][REPAIR] background_request h={} missing={} received={}/{} attempt={}",
+                            height, missing_count, received, required,
+                            shred_protocol_assemblies.get(&height).map(|a| a.retransmit_attempts).unwrap_or(0));
+                    }
                     
                     // Find peers who might have the chunks (from cache or producers)
                     let repair_targets: Vec<String> = connected_peers_lockfree.iter()
@@ -4513,7 +4515,7 @@ impl SimplifiedP2P {
                         .collect();
                     
                     if repair_targets.is_empty() {
-                        println!("[WARN][REPAIR] no_qualified_peers h={}", height);
+                        if crate::node::is_warn() { println!("[WARN][REPAIR] no_qualified_peers h={}", height); }
                         continue;
                     }
                     
@@ -4546,8 +4548,8 @@ impl SimplifiedP2P {
                                 }
                             }
                             
-                            println!("[INFO][REPAIR] requests_sent h={} peers={} chunks={}",
-                                height, repair_targets.len(), missing_count);
+                            if crate::node::is_info() { println!("[INFO][REPAIR] requests_sent h={} peers={} chunks={}",
+                                height, repair_targets.len(), missing_count); }
                         }
                     }
                 }
@@ -4556,7 +4558,7 @@ impl SimplifiedP2P {
                 if repair_stats_log_counter % 120 == 0 {
                     let active_assemblies = shred_protocol_assemblies.len();
                     if active_assemblies > 0 {
-                        println!("[INFO][REPAIR] background_stats active_assemblies={}", active_assemblies);
+                        if crate::node::is_info() { println!("[INFO][REPAIR] background_stats active_assemblies={}", active_assemblies); }
                     }
                 }
                 
@@ -4573,7 +4575,7 @@ impl SimplifiedP2P {
             }
         });
         
-        println!("[INFO][REPAIR] background_task_started interval=500ms runtime=broadcast");
+        if crate::node::is_info() { println!("[INFO][REPAIR] background_task_started interval=500ms runtime=broadcast"); }
     }
     
     /// v2.24.2: Frequent QUIC health check with ACTIVE HealthPing probing
@@ -4584,7 +4586,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[QUIC] ⚠️ No Tokio runtime - health check task deferred");
+                if crate::node::is_warn() { println!("[QUIC] ⚠️ No Tokio runtime - health check task deferred"); }
                 return;
             }
         };
@@ -4595,7 +4597,7 @@ impl SimplifiedP2P {
         let wallet_identity = self.wallet_identity.clone();
         
         handle.spawn(async move {
-            println!("[INFO][QUIC] health_check_task_started interval=15s signing=Dilithium3");
+            if crate::node::is_info() { println!("[INFO][QUIC] health_check_task_started interval=15s signing=Dilithium3"); }
             
             // Initial delay to let network stabilize
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -4650,14 +4652,14 @@ impl SimplifiedP2P {
                             Err(_e) => {
                                 // Connection is zombie - will be removed by retry logic
                                 zombie_count += 1;
-                                println!("[QUIC] 💀 Zombie connection detected to {} via HealthPing", 
-                                         get_privacy_id_for_addr(&peer_id));
+                                if crate::node::is_warn() { println!("[QUIC] 💀 Zombie connection detected to {} via HealthPing", 
+                                         get_privacy_id_for_addr(&peer_id)); }
                             }
                         }
                     }
                     
                     // Log health status periodically
-                    if removed > 0 || zombie_count > 0 {
+                    if (removed > 0 || zombie_count > 0) && crate::node::is_info() {
                         println!("[QUIC] 🏥 Health check: {} alive, {} removed (passive), {} zombie (active)", 
                                  alive, removed, zombie_count);
                     }
@@ -4683,7 +4685,7 @@ impl SimplifiedP2P {
                         // Without this, a node that loses ALL connections can NEVER rejoin the network!
                         // Genesis nodes are always available as bootstrap points for recovery.
                         if peers_to_try.is_empty() {
-                            println!("[CRIT][P2P] no_known_peers action=genesis_fallback");
+                            if crate::node::is_warn() { println!("[CRIT][P2P] no_known_peers action=genesis_fallback"); }
                             
                             // Use Genesis IPs as recovery bootstrap
                             let genesis_ips = crate::genesis_constants::GENESIS_NODE_IPS;
@@ -4693,8 +4695,8 @@ impl SimplifiedP2P {
                         }
                         
                         if !peers_to_try.is_empty() {
-                            println!("[QUIC] 🔄 Low connections ({}/{}), attempting reconnect to {} peers...", 
-                                     effective_alive, min_connections, peers_to_try.len());
+                            if crate::node::is_warn() { println!("[QUIC] 🔄 Low connections ({}/{}), attempting reconnect to {} peers...", 
+                                     effective_alive, min_connections, peers_to_try.len()); }
                             
                             for peer_addr_str in peers_to_try {
                                 if let Ok(addr) = peer_addr_str.parse::<std::net::SocketAddr>() {
@@ -4725,7 +4727,7 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ No Tokio runtime - reputation validation deferred");
+                if crate::node::is_warn() { println!("[P2P] ⚠️ No Tokio runtime - reputation validation deferred"); }
                 return;
             }
         };
@@ -4762,7 +4764,7 @@ impl SimplifiedP2P {
                 // ═══════════════════════════════════════════════════════════════════════════
                 // Without this fix, a node that loses all connections can NEVER rejoin!
                 if all_peers.is_empty() {
-                    println!("[CRIT][P2P] no_peers_connected action=genesis_recovery");
+                    if crate::node::is_warn() { println!("[CRIT][P2P] no_peers_connected action=genesis_recovery"); }
                     
                     // Try to reconnect to Genesis nodes
                     for (i, ip) in genesis_ips.iter().enumerate() {
@@ -4869,14 +4871,14 @@ impl SimplifiedP2P {
         
         if validated_peers.is_empty() {
             if height % 10 == 0 {
-                println!("[WARN][P2P] No validated peers available - block #{} not broadcasted", height);
+                if crate::node::is_warn() { println!("[WARN][P2P] No validated peers available - block #{} not broadcasted", height); }
             }
             return Ok(());
         }
         
         // Log broadcast only every 10 blocks
         if height % 10 == 0 {
-            println!("[QUIC] 📡 Broadcasting block #{} to {} validated peers (binary protocol)", height, validated_peers.len());
+            if crate::node::is_info() { println!("[QUIC] 📡 Broadcasting block #{} to {} validated peers (binary protocol)", height, validated_peers.len()); }
         }
         
         // Create NetworkMessage for block
@@ -4986,7 +4988,9 @@ impl SimplifiedP2P {
                             .collect()
                     }
                     Err(_) => {
-                        println!("[WARN][BROADCAST] h={} global_timeout=10s", height);
+                        if crate::node::is_warn() {
+                            println!("[WARN][BROADCAST] h={} global_timeout=10s", height);
+                        }
                         Vec::new()
                     }
                 };
@@ -5002,18 +5006,24 @@ impl SimplifiedP2P {
                             .sum::<u64>()
                             .checked_div(success_count as u64)
                             .unwrap_or(0);
-                        println!("[QUIC] ✅ Block #{} sent to {}/{} peers (avg RTT: {}ms)", 
-                            height, success_count, total, avg_rtt);
+                        if crate::node::is_info() {
+                            println!("[QUIC] ✅ Block #{} sent to {}/{} peers (avg RTT: {}ms)", 
+                                height, success_count, total, avg_rtt);
+                        }
                     } else if total > 0 {
-                        println!("[QUIC] ⚠️ Failed to send block #{} to any peer", height);
+                        if crate::node::is_info() {
+                            println!("[QUIC] ⚠️ Failed to send block #{} to any peer", height);
+                        }
                     }
                 }
                 
                 // Log failures for debugging
                 for result in results.iter().filter(|r| !r.success) {
                     if height <= 5 {
-                        println!("[QUIC] ⚠️ Failed to send block #{} to {}: {:?}", 
-                            height, get_privacy_id_for_addr(&result.peer_addr), result.error);
+                        if crate::node::is_info() {
+                            println!("[QUIC] ⚠️ Failed to send block #{} to {}: {:?}", 
+                                height, get_privacy_id_for_addr(&result.peer_addr), result.error);
+                        }
                     }
                 }
                 
@@ -5022,8 +5032,12 @@ impl SimplifiedP2P {
         }
         
         // NO HTTP FALLBACK - QUIC only mode
-        println!("[QUIC] ❌ QUIC not initialized - block #{} cannot be sent", height);
-        println!("[QUIC] ℹ️ Ensure init_quic() was called during startup");
+        if crate::node::is_info() {
+            println!("[QUIC] ❌ QUIC not initialized - block #{} cannot be sent", height);
+        }
+        if crate::node::is_info() {
+            println!("[QUIC] ℹ️ Ensure init_quic() was called during startup");
+        }
         Err("QUIC transport not initialized".into())
     }
     
@@ -5035,11 +5049,15 @@ impl SimplifiedP2P {
         let validated_peers = self.get_validated_active_peers();
         
         if validated_peers.is_empty() {
-            println!("[WARN][P2P] No validated peers available - Genesis block not broadcasted");
+            if crate::node::is_warn() {
+                println!("[WARN][P2P] No validated peers available - Genesis block not broadcasted");
+            }
             return Ok(());
         }
         
-        println!("[QUIC] 📡 Broadcasting Genesis block to {} validated peers (binary protocol)", validated_peers.len());
+        if crate::node::is_info() {
+            println!("[QUIC] 📡 Broadcasting Genesis block to {} validated peers (binary protocol)", validated_peers.len());
+        }
         
         // Create Genesis block message
         let genesis_msg = NetworkMessage::Block {
@@ -5097,16 +5115,22 @@ impl SimplifiedP2P {
                 
                 for result in &results {
                     if result.success {
-                        println!("[QUIC] ✅ Genesis sent to {} (RTT: {:?}ms)", 
-                            get_privacy_id_for_addr(&result.peer_addr), result.rtt_ms);
+                        if crate::node::is_info() {
+                            println!("[QUIC] ✅ Genesis sent to {} (RTT: {:?}ms)", 
+                                get_privacy_id_for_addr(&result.peer_addr), result.rtt_ms);
+                        }
                     } else {
-                        println!("[QUIC] ⚠️ Failed to send Genesis to {}: {:?}", 
-                            get_privacy_id_for_addr(&result.peer_addr), result.error);
+                        if crate::node::is_info() {
+                            println!("[QUIC] ⚠️ Failed to send Genesis to {}: {:?}", 
+                                get_privacy_id_for_addr(&result.peer_addr), result.error);
+                        }
                     }
                 }
                 
                 if success_count > 0 {
-                    println!("[QUIC] ✅ Genesis block sent to {}/{} peers", success_count, total);
+                    if crate::node::is_info() {
+                        println!("[QUIC] ✅ Genesis block sent to {}/{} peers", success_count, total);
+                    }
                     return Ok(());
                 } else if total > 0 {
                     return Err("Failed to send Genesis block to any peer via QUIC".into());
@@ -5116,8 +5140,12 @@ impl SimplifiedP2P {
         }
         
         // NO HTTP FALLBACK - QUIC only mode
-        println!("[QUIC] ❌ QUIC not initialized - Genesis block cannot be sent");
-        println!("[QUIC] ℹ️ Ensure init_quic() was called during startup");
+        if crate::node::is_info() {
+            println!("[QUIC] ❌ QUIC not initialized - Genesis block cannot be sent");
+        }
+        if crate::node::is_info() {
+            println!("[QUIC] ℹ️ Ensure init_quic() was called during startup");
+        }
         Err("QUIC transport not initialized".into())
     }
     
@@ -5142,10 +5170,12 @@ impl SimplifiedP2P {
         // With Level 1 (80MB block size limit at creation) and Level 2 (87MB ShredProtocol max),
         // blocks should NEVER exceed the limit. If they do, log error and reject.
         if block_data.len() > max_shred_size {
-            println!("[ERR][SHRED] block_rejected h={} size_mb={:.2} max_mb={:.2} reason=exceeds_shred_limit",
-                     height, 
-                     block_data.len() as f64 / 1_000_000.0,
-                     max_shred_size as f64 / 1_000_000.0);
+            if crate::node::is_warn() {
+                println!("[ERR][SHRED] block_rejected h={} size_mb={:.2} max_mb={:.2} reason=exceeds_shred_limit",
+                         height, 
+                         block_data.len() as f64 / 1_000_000.0,
+                         max_shred_size as f64 / 1_000_000.0);
+            }
             return Err(format!("Block {} exceeds ShredProtocol limit: {:.2}MB > {:.2}MB. This should never happen with Level 1 protection.",
                               height, block_data.len() as f64 / 1_000_000.0, max_shred_size as f64 / 1_000_000.0));
         }
@@ -5155,7 +5185,9 @@ impl SimplifiedP2P {
         
         if validated_peers.is_empty() {
             if height % 10 == 0 {
-                println!("[SHRED_PROTOCOL] ⚠️ No validated peers available - block #{} not broadcasted", height);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] ⚠️ No validated peers available - block #{} not broadcasted", height);
+                }
             }
             return Ok(());
         }
@@ -5177,7 +5209,9 @@ impl SimplifiedP2P {
             } else {
                 // No certificate yet - this can happen during genesis
                 if height > 0 {
-                    println!("[SHRED_PROTOCOL] ⚠️ No producer certificate for block #{} - peers may need to request it", height);
+                    if crate::node::is_info() {
+                        println!("[SHRED_PROTOCOL] ⚠️ No producer certificate for block #{} - peers may need to request it", height);
+                    }
                 }
                 None
             }
@@ -5235,8 +5269,10 @@ impl SimplifiedP2P {
         );
         
         if height <= 100 || height % 50 == 0 {
-            println!("[INFO][CACHE] producer_cache h={} data={} parity={} redundancy={:.1}x", 
-                     height, total_chunks, parity_count, adaptive_redundancy);
+            if crate::node::is_info() {
+                println!("[INFO][CACHE] producer_cache h={} data={} parity={} redundancy={:.1}x", 
+                         height, total_chunks, parity_count, adaptive_redundancy);
+            }
         }
         
         // ADAPTIVE FANOUT: Calculate optimal fanout based on network size and latency
@@ -5246,8 +5282,10 @@ impl SimplifiedP2P {
         if height <= 500 || height % 10 == 0 {
             let avg_latency = self.get_average_peer_latency();
             let producers = self.get_qualified_producers_count();
-            println!("[SHRED_PROTOCOL/QUIC] 🚀 Broadcasting block #{} as {} chunks + {} parity to {} peers (fanout={}, producers={}, latency={}ms)", 
-                     height, total_chunks, parity_count, validated_peers.len(), shred_protocol_fanout, producers, avg_latency);
+            if crate::node::is_info() {
+                println!("[SHRED_PROTOCOL/QUIC] 🚀 Broadcasting block #{} as {} chunks + {} parity to {} peers (fanout={}, producers={}, latency={}ms)", 
+                         height, total_chunks, parity_count, validated_peers.len(), shred_protocol_fanout, producers, avg_latency);
+            }
         }
         
         // Build Kademlia-based routing tree for each chunk
@@ -5334,8 +5372,10 @@ impl SimplifiedP2P {
                     let unique_peers: std::collections::HashSet<String> = peers_for_broadcast.iter()
                         .map(|p| p.id.clone())
                         .collect();
-                    println!("[SHRED_PROTOCOL] 🚦 Rate limit: {}/{} sends to {} unique peers", 
-                        max_concurrent, total_sends, unique_peers.len());
+                    if crate::node::is_info() {
+                        println!("[SHRED_PROTOCOL] 🚦 Rate limit: {}/{} sends to {} unique peers", 
+                            max_concurrent, total_sends, unique_peers.len());
+                    }
                 }
                 
                 // Build list of (quic_addr, msg) tuples for PACED sending
@@ -5457,10 +5497,14 @@ impl SimplifiedP2P {
                     
                     if height_for_log <= 100 || height_for_log % 50 == 0 || chunk0_timeout {
                         if chunk0_timeout {
-                            println!("[WARN][SHRED] chunk0_timeout block={} (continuing)", height_for_log);
+                            if crate::node::is_warn() {
+                                println!("[WARN][SHRED] chunk0_timeout block={} (continuing)", height_for_log);
+                            }
                         } else {
-                            println!("[INFO][SHRED] chunk0_sent block={} ok={}/{}", 
-                                height_for_log, chunk0_success, chunk0_sends.len());
+                            if crate::node::is_info() {
+                                println!("[INFO][SHRED] chunk0_sent block={} ok={}/{}", 
+                                    height_for_log, chunk0_success, chunk0_sends.len());
+                            }
                         }
                     }
                     
@@ -5544,14 +5588,18 @@ impl SimplifiedP2P {
                 
                 // Log async broadcast dispatch
                 if height_for_log <= 100 || height_for_log % 50 == 0 {
-                    println!("[INFO][SHRED] broadcast h={} sends={} batches={}", 
-                        height_for_log, sends_count, num_batches);
+                    if crate::node::is_info() {
+                        println!("[INFO][SHRED] broadcast h={} sends={} batches={}", 
+                            height_for_log, sends_count, num_batches);
+                    }
                 }
                 
                 let total_sends = chunk0_sends.len() + other_sends.len();
                 if height_for_log <= 500 || height_for_log % 10 == 0 {
-                    println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} delivered: {}/{} (chunk0_first, batch={}, delay={}ms, fail_rate={:.1}%)", 
-                        height_for_log, total_success, total_sends, batch_size, delay_ms, failure_rate * 100.0);
+                    if crate::node::is_info() {
+                        println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} delivered: {}/{} (chunk0_first, batch={}, delay={}ms, fail_rate={:.1}%)", 
+                            height_for_log, total_success, total_sends, batch_size, delay_ms, failure_rate * 100.0);
+                    }
                 }
                 
                 return Ok(());
@@ -5559,8 +5607,12 @@ impl SimplifiedP2P {
         }
         
         // NO HTTP FALLBACK - QUIC only mode
-        println!("[SHRED_PROTOCOL] ❌ QUIC not initialized - block #{} cannot be sent", height);
-        println!("[SHRED_PROTOCOL] ℹ️ Ensure init_quic() was called during startup");
+        if crate::node::is_info() {
+            println!("[SHRED_PROTOCOL] ❌ QUIC not initialized - block #{} cannot be sent", height);
+        }
+        if crate::node::is_info() {
+            println!("[SHRED_PROTOCOL] ℹ️ Ensure init_quic() was called during startup");
+        }
         Err("QUIC transport not initialized".into())
     }
     
@@ -5580,7 +5632,9 @@ impl SimplifiedP2P {
         let rs = match ReedSolomon::new(data_count, parity_count) {
             Ok(rs) => rs,
             Err(e) => {
-                println!("[SHRED_PROTOCOL] ⚠️ Reed-Solomon initialization failed: {:?}, falling back to replication", e);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] ⚠️ Reed-Solomon initialization failed: {:?}, falling back to replication", e);
+                }
                 // Fallback: replicate first chunks as parity
                 return data_chunks.iter()
                     .take(parity_count)
@@ -5611,7 +5665,9 @@ impl SimplifiedP2P {
         
         // Generate parity shards
         if let Err(e) = rs.encode(&mut shards) {
-            println!("[SHRED_PROTOCOL] ⚠️ Reed-Solomon encoding failed: {:?}", e);
+            if crate::node::is_info() {
+                println!("[SHRED_PROTOCOL] ⚠️ Reed-Solomon encoding failed: {:?}", e);
+            }
             // Fallback to simple XOR
             let mut parity = vec![vec![0u8; chunk_size]; parity_count];
             for chunk in data_chunks {
@@ -5697,14 +5753,18 @@ impl SimplifiedP2P {
                 PENDING_GAP_SYNC.store(from_height, std::sync::atomic::Ordering::Relaxed);
                 PENDING_GAP_SYNC_TO.store(to_height, std::sync::atomic::Ordering::Relaxed);
                 
-                println!("[INFO][GAP] detected local={} incoming={} gap={} pending_sync={}-{}", 
-                        local_height, height, gap, from_height, to_height);
+                if crate::node::is_info() {
+                    println!("[INFO][GAP] detected local={} incoming={} gap={} pending_sync={}-{}", 
+                            local_height, height, gap, from_height, to_height);
+                }
             }
         } else if gap > 50 {
             // Large gap - log warning, regular sync will handle
             if height % 10 == 0 {
-                println!("[WARN][GAP] large_gap local={} incoming={} gap={} (regular_sync)", 
-                        local_height, height, gap);
+                if crate::node::is_warn() {
+                    println!("[WARN][GAP] large_gap local={} incoming={} gap={} (regular_sync)", 
+                            local_height, height, gap);
+                }
             }
         }
         
@@ -5718,9 +5778,11 @@ impl SimplifiedP2P {
         // DEBUG: Log chunk reception for first 500 blocks or every 10th
         // CRITICAL: Extended logging for initial network debugging
         if height <= 500 || height % 10 == 0 {
-            println!("[SHRED_PROTOCOL] 📥 Chunk {}/{} for block #{} from {} (parity: {})", 
-                chunk.chunk_index + 1, chunk.total_chunks, height, 
-                get_privacy_id_for_addr(from_peer), chunk.is_parity);
+            if crate::node::is_info() {
+                println!("[SHRED_PROTOCOL] 📥 Chunk {}/{} for block #{} from {} (parity: {})", 
+                    chunk.chunk_index + 1, chunk.total_chunks, height, 
+                    get_privacy_id_for_addr(from_peer), chunk.is_parity);
+            }
         }
         
         // CRITICAL FIX: Track state OUTSIDE DashMap lock to prevent deadlock
@@ -5750,8 +5812,10 @@ impl SimplifiedP2P {
             if !chunk.is_parity && chunk.chunk_index == 0 {
                 if let Some(ref cert) = chunk.certificate {
                     if assembly.certificate.is_none() {
-                        println!("[SHRED_PROTOCOL] 🔐 Certificate received in chunk #0 for block #{}: {} ({})", 
-                                 height, cert.serial_number, cert.node_id);
+                        if crate::node::is_info() {
+                            println!("[SHRED_PROTOCOL] 🔐 Certificate received in chunk #0 for block #{}: {} ({})", 
+                                     height, cert.serial_number, cert.node_id);
+                        }
                         assembly.certificate = Some(cert.clone());
                         
                         // CRITICAL: Store certificate in certificate_manager immediately!
@@ -5762,8 +5826,10 @@ impl SimplifiedP2P {
                                 cert.serial_number.clone(), 
                                 cert.certificate_bytes.clone()
                             );
-                            println!("[SHRED_PROTOCOL] ✅ Certificate {} stored in manager (block #{})", 
-                                     cert.serial_number, height);
+                            if crate::node::is_info() {
+                                println!("[SHRED_PROTOCOL] ✅ Certificate {} stored in manager (block #{})", 
+                                         cert.serial_number, height);
+                            }
                         }
                     }
                 }
@@ -5810,8 +5876,10 @@ impl SimplifiedP2P {
             
             // DEBUG: Log assembly progress for first 5 blocks
             if height <= 5 {
-                println!("[SHRED_PROTOCOL] 📊 Block #{}: {}/{} data + {}/{} parity chunks received", 
-                    height, chunks_count, total_chunks, parity_count, assembly.parity_count);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] 📊 Block #{}: {}/{} data + {}/{} parity chunks received", 
+                        height, chunks_count, total_chunks, parity_count, assembly.parity_count);
+                }
             }
         } // DashMap lock released here!
         
@@ -5881,9 +5949,11 @@ impl SimplifiedP2P {
             // Can reconstruct from parity but missing chunk #0 - DON'T mark as processed!
             // Keep waiting for chunk #0 to arrive with certificate
             if height <= 500 || height % 100 == 0 {
-                println!("[SHRED_PROTOCOL] ⏳ Block #{} can reconstruct ({}/{} + {}/{} parity) but WAITING for chunk #0 (certificate)", 
-                    height, chunks_count, total_chunks, parity_count, 
-                    ((total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] ⏳ Block #{} can reconstruct ({}/{} + {}/{} parity) but WAITING for chunk #0 (certificate)", 
+                        height, chunks_count, total_chunks, parity_count, 
+                        ((total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize);
+                }
             }
         }
         
@@ -5917,8 +5987,10 @@ impl SimplifiedP2P {
                     assembly.retransmit_requested_at = Some(Instant::now());
                     drop(assembly);
                     
-                    println!("[INFO][REPAIR] priority_chunk0_request h={} elapsed={}ms can_reconstruct={}", 
-                             height, elapsed_ms, should_reconstruct_parity);
+                    if crate::node::is_info() {
+                        println!("[INFO][REPAIR] priority_chunk0_request h={} elapsed={}ms can_reconstruct={}", 
+                                 height, elapsed_ms, should_reconstruct_parity);
+                    }
                     self.request_missing_chunks(height, vec![0], from_peer);
                 }
             }
@@ -5963,8 +6035,10 @@ impl SimplifiedP2P {
                         let attempt = self.shred_protocol_assemblies.get(&height)
                             .map(|a| a.retransmit_attempts)
                             .unwrap_or(0);
-                        println!("[INFO][REPAIR] chunk_request h={} missing={} attempt={}", 
-                                 height, total_missing, attempt);
+                        if crate::node::is_info() {
+                            println!("[INFO][REPAIR] chunk_request h={} missing={} attempt={}", 
+                                     height, total_missing, attempt);
+                        }
                     
                         self.request_missing_chunks(height, missing_indices, from_peer);
                     }
@@ -5980,15 +6054,19 @@ impl SimplifiedP2P {
         } else if should_reconstruct_parity && chunk0_received {
             // Enough chunks + parity to reconstruct AND have chunk #0 with certificate
             if height % 10 == 0 {
-                println!("[SHRED_PROTOCOL] 🔧 Reconstructing block #{} from {} data + {} parity chunks (chunk #0 ✅)", 
-                         height, chunks_count, parity_count);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] 🔧 Reconstructing block #{} from {} data + {} parity chunks (chunk #0 ✅)", 
+                             height, chunks_count, parity_count);
+                }
             }
             self.reconstruct_block_with_parity(height);
         } else if (should_reconstruct_all || should_reconstruct_parity) && !chunk0_received {
             // Can reconstruct but missing chunk #0 - DON'T reconstruct yet!
             // Wait for chunk #0 to arrive (it was requested via priority retry above)
             if height <= 500 || height % 100 == 0 {
-                println!("[SHRED_PROTOCOL] ⏳ Block #{} ready to reconstruct but waiting for chunk #0 (certificate)", height);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] ⏳ Block #{} ready to reconstruct but waiting for chunk #0 (certificate)", height);
+                }
             }
         }
         
@@ -6017,7 +6095,9 @@ impl SimplifiedP2P {
         let _handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[WARN][P2P] No Tokio runtime - operation skipped");
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] No Tokio runtime - operation skipped");
+                }
                 return;
             }
         };
@@ -6074,8 +6154,10 @@ impl SimplifiedP2P {
         
         // Log every forward (critical for debugging large block issues)
         if forward_count > 0 && (height <= 100 || height % 100 == 0 || forward_count > 2) {
-            println!("[INFO][FORWARD] h={} chunk={} parity={} targets={}", 
-                     height, chunk_idx, is_parity, forward_count);
+            if crate::node::is_info() {
+                println!("[INFO][FORWARD] h={} chunk={} parity={} targets={}", 
+                         height, chunk_idx, is_parity, forward_count);
+            }
         }
         
         for peer in forward_targets {
@@ -6106,7 +6188,9 @@ impl SimplifiedP2P {
                                     Err(e) => {
                                         // Log forward failures for production debugging
                                         if height <= 100 {
-                                            println!("[WARN][FORWARD] failed h={} to={} err={}", height, peer_id, e);
+                                            if crate::node::is_warn() {
+                                                println!("[WARN][FORWARD] failed h={} to={} err={}", height, peer_id, e);
+                                            }
                                         }
                                     }
                                 }
@@ -6137,7 +6221,9 @@ impl SimplifiedP2P {
         let validated_peers = self.get_validated_active_peers();
         
         if validated_peers.is_empty() {
-            println!("[WARN][MB-P2P] no peers for broadcast idx={}", index);
+            if crate::node::is_warn() {
+                println!("[WARN][MB-P2P] no peers for broadcast idx={}", index);
+            }
             return Ok(());
         }
         
@@ -6149,15 +6235,19 @@ impl SimplifiedP2P {
         };
         
         let peer_count = validated_peers.len();
-        println!("[INFO][MB-P2P] → broadcast idx={} epoch={} peers={} bytes={}", 
-                 index, epoch, peer_count, compressed_data.len());
+        if crate::node::is_info() {
+            println!("[INFO][MB-P2P] → broadcast idx={} epoch={} peers={} bytes={}", 
+                     index, epoch, peer_count, compressed_data.len());
+        }
         
         // PRODUCTION: QUIC-only broadcast with retries (same as consensus commits)
         let quic_transport = self.quic_transport.clone();
         let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
         
         if !quic_enabled {
-            println!("[ERR][MB-P2P] QUIC not enabled - cannot broadcast idx={}", index);
+            if crate::node::is_warn() {
+                println!("[ERR][MB-P2P] QUIC not enabled - cannot broadcast idx={}", index);
+            }
             return Err("QUIC transport required for MacroBlock broadcast".to_string());
         }
         
@@ -6192,7 +6282,9 @@ impl SimplifiedP2P {
         let failed = results.iter().filter(|(_, ok)| !*ok).count();
         
         if failed > 0 {
-            println!("[WARN][MB-P2P] broadcast idx={}: ok={} fail={}", index, successful, failed);
+            if crate::node::is_warn() {
+                println!("[WARN][MB-P2P] broadcast idx={}: ok={} fail={}", index, successful, failed);
+            }
             
             // RETRY: Second wave for failed peers (same as consensus)
             let failed_peers: Vec<_> = results.iter()
@@ -6222,10 +6314,14 @@ impl SimplifiedP2P {
                     .await;
                 
                 let retry_success = retry_results.iter().filter(|ok| **ok).count();
-                println!("[INFO][MB-P2P] retry idx={}: +{} recovered", index, retry_success);
+                if crate::node::is_info() {
+                    println!("[INFO][MB-P2P] retry idx={}: +{} recovered", index, retry_success);
+                }
             }
         } else {
-            println!("[INFO][MB-P2P] broadcast idx={} complete: {} peers", index, successful);
+            if crate::node::is_info() {
+                println!("[INFO][MB-P2P] broadcast idx={} complete: {} peers", index, successful);
+            }
         }
         
         Ok(())
@@ -6290,7 +6386,9 @@ impl SimplifiedP2P {
         
         // No peers to check
         if total_peers == 0 {
-            println!("[EMERGENCY][BLOCK_CHECK] h={} check=cache result=no_peers", block_height);
+            if crate::node::is_info() {
+                println!("[EMERGENCY][BLOCK_CHECK] h={} check=cache result=no_peers", block_height);
+            }
             return BlockExistenceResult::NoPeers;
         }
         
@@ -6298,16 +6396,20 @@ impl SimplifiedP2P {
         
         // FAST PATH SUCCESS: 2/3+ majority has block per cache
         if peers_with_block * 3 >= total_peers * 2 {
-            println!("[EMERGENCY][BLOCK_CHECK] h={} check=cache result=majority peers={}/{} ratio={}%", 
-                     block_height, peers_with_block, total_peers, cache_ratio);
+            if crate::node::is_info() {
+                println!("[EMERGENCY][BLOCK_CHECK] h={} check=cache result=majority peers={}/{} ratio={}%", 
+                         block_height, peers_with_block, total_peers, cache_ratio);
+            }
             return BlockExistenceResult::MajorityHas { 
                 peers_with: peers_with_block, 
                 total_peers 
             };
         }
         
-        println!("[EMERGENCY][BLOCK_CHECK] h={} check=cache result=uncertain peers={}/{} ratio={}% http_verify=starting", 
-                 block_height, peers_with_block, total_peers, cache_ratio);
+        if crate::node::is_info() {
+            println!("[EMERGENCY][BLOCK_CHECK] h={} check=cache result=uncertain peers={}/{} ratio={}% http_verify=starting", 
+                     block_height, peers_with_block, total_peers, cache_ratio);
+        }
         
         // ═══════════════════════════════════════════════════════════════════════════
         // OPTIMIZATION: Collect peer addresses ONLY if HTTP verify needed
@@ -6322,8 +6424,10 @@ impl SimplifiedP2P {
             .collect();
         
         if candidate_peers.is_empty() {
-            println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=no_candidates status=uncertain", 
-                     block_height);
+            if crate::node::is_info() {
+                println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=no_candidates status=uncertain", 
+                         block_height);
+            }
             return BlockExistenceResult::Uncertain { 
                 cache_peers_with: peers_with_block, 
                 cache_total: total_peers 
@@ -6345,8 +6449,10 @@ impl SimplifiedP2P {
             std::cmp::min(7, candidate_peers.len()) // Large network: max Sybil resistance
         };
         
-        println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify strategy=dynamic_scaling total_peers={} query_count={} timeout=5s_total", 
-                 block_height, total_peers, num_peers_to_query);
+        if crate::node::is_info() {
+            println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify strategy=dynamic_scaling total_peers={} query_count={} timeout=5s_total", 
+                     block_height, total_peers, num_peers_to_query);
+        }
         
         // Select random peers efficiently (no full shuffle, partial shuffle only if needed)
         use rand::seq::SliceRandom;
@@ -6372,8 +6478,10 @@ impl SimplifiedP2P {
         ).await {
             Ok(results) => results,
             Err(_) => {
-                println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=global_timeout status=uncertain", 
-                         block_height);
+                if crate::node::is_info() {
+                    println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=global_timeout status=uncertain", 
+                             block_height);
+                }
                 return BlockExistenceResult::Uncertain { 
                     cache_peers_with: peers_with_block, 
                     cache_total: total_peers 
@@ -6398,30 +6506,40 @@ impl SimplifiedP2P {
                     if verified_peer.is_none() {
                         verified_peer = Some(peer_addr.clone());
                     }
-                    println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=exists", 
-                             block_height, peer_display);
+                    if crate::node::is_info() {
+                        println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=exists", 
+                                 block_height, peer_display);
+                    }
                 },
                 Ok(false) => {
                     not_found_count += 1;
-                    println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=not_found", 
-                             block_height, peer_display);
+                    if crate::node::is_info() {
+                        println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=not_found", 
+                                 block_height, peer_display);
+                    }
                 },
                 Err(e) => {
                     error_count += 1;
-                    println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=error error={}", 
-                             block_height, peer_display, e);
+                    if crate::node::is_info() {
+                        println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify peer={} result=error error={}", 
+                                 block_height, peer_display, e);
+                    }
                 }
             }
         }
         
         let total_responses = results.len();
-        println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify summary exists={} not_found={} errors={} total={}", 
-                 block_height, exists_count, not_found_count, error_count, total_responses);
+        if crate::node::is_info() {
+            println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify summary exists={} not_found={} errors={} total={}", 
+                     block_height, exists_count, not_found_count, error_count, total_responses);
+        }
         
         // 2/3+ consensus: block exists
         if exists_count * 3 >= total_responses * 2 {
-            println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=consensus_exists ratio={}/{}", 
-                     block_height, exists_count, total_responses);
+            if crate::node::is_info() {
+                println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=consensus_exists ratio={}/{}", 
+                         block_height, exists_count, total_responses);
+            }
             return BlockExistenceResult::VerifiedExists { 
                 peer_addr: verified_peer.unwrap_or_else(|| "unknown".to_string())
             };
@@ -6517,8 +6635,10 @@ impl SimplifiedP2P {
                                     
                                     if crate::node::is_info() {
                                         let (_succ, _total, rate) = get_quic_fallback_metrics();
-                                        println!("[INFO][EMERGENCY] quic_fallback_success h={} elapsed={}ms success_rate={}.{}%", 
-                                                 block_height, start.elapsed().as_millis(), rate / 10, rate % 10);
+                                        if crate::node::is_info() {
+                                            println!("[INFO][EMERGENCY] quic_fallback_success h={} elapsed={}ms success_rate={}.{}%", 
+                                                     block_height, start.elapsed().as_millis(), rate / 10, rate % 10);
+                                        }
                                     }
                                     return BlockExistenceResult::VerifiedExists {
                                         peer_addr: "quic_fallback".to_string()
@@ -6541,8 +6661,10 @@ impl SimplifiedP2P {
         }
         
         // All failed or majority says "not found"
-        println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=no_consensus status=uncertain", 
-                 block_height);
+        if crate::node::is_info() {
+            println!("[EMERGENCY][BLOCK_CHECK] h={} check=http_verify result=no_consensus status=uncertain", 
+                     block_height);
+        }
         
         BlockExistenceResult::Uncertain { 
             cache_peers_with: peers_with_block, 
@@ -6642,22 +6764,28 @@ impl SimplifiedP2P {
             missing_indices.extend(parity_missing);
             
             if missing_indices.is_empty() {
-                println!("[INFO][REPAIR] trigger_repair h={} no_missing_chunks", block_height);
+                if crate::node::is_info() {
+                    println!("[INFO][REPAIR] trigger_repair h={} no_missing_chunks", block_height);
+                }
                 return;
             }
             
             let received = assembly.chunks_received.iter().filter(|c| c.is_some()).count()
                 + assembly.parity_chunks.iter().filter(|c| c.is_some()).count();
             
-            println!("[INFO][REPAIR] trigger_repair h={} missing={} received={}", 
-                     block_height, missing_indices.len(), received);
+            if crate::node::is_info() {
+                println!("[INFO][REPAIR] trigger_repair h={} missing={} received={}", 
+                         block_height, missing_indices.len(), received);
+            }
             
             drop(assembly); // Release lock before calling request
             
             // Request missing chunks from multiple peers (parallel)
             self.request_missing_chunks(block_height, missing_indices, "");
         } else {
-            println!("[WARN][REPAIR] trigger_repair h={} no_assembly_found", block_height);
+            if crate::node::is_warn() {
+                println!("[WARN][REPAIR] trigger_repair h={} no_assembly_found", block_height);
+            }
         }
     }
     
@@ -6668,7 +6796,9 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[WARN][P2P] No Tokio runtime - operation skipped");
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] No Tokio runtime - operation skipped");
+                }
                 return;
             }
         };
@@ -6754,7 +6884,9 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[WARN][P2P] No Tokio runtime - operation skipped");
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] No Tokio runtime - operation skipped");
+                }
                 return;
             }
         };
@@ -6794,8 +6926,10 @@ impl SimplifiedP2P {
                 let total_chunks = chunks_to_send.len();
                 let num_batches = (total_chunks + REPAIR_BATCH_SIZE - 1) / REPAIR_BATCH_SIZE;
                 
-                println!("[SHRED_PROTOCOL] 📤 Sending {} cached chunks for block #{} to {} in {} batches", 
-                         total_chunks, block_height, get_privacy_id_for_addr(from_peer), num_batches);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] 📤 Sending {} cached chunks for block #{} to {} in {} batches", 
+                             total_chunks, block_height, get_privacy_id_for_addr(from_peer), num_batches);
+                }
                 
                 // Send response via QUIC in batches
                 let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
@@ -6967,8 +7101,10 @@ impl SimplifiedP2P {
         
         let elapsed = assembly.started_at.elapsed();
         if height % 10 == 0 {
-            println!("[SHRED_PROTOCOL] ✅ Block #{} reconstructed from {} chunks in {:?} (producer: {})", 
-                     height, assembly.total_chunks, elapsed, producer_id);
+            if crate::node::is_info() {
+                println!("[SHRED_PROTOCOL] ✅ Block #{} reconstructed from {} chunks in {:?} (producer: {})", 
+                         height, assembly.total_chunks, elapsed, producer_id);
+            }
         }
         
         // Send reconstructed block through normal block channel
@@ -7006,7 +7142,9 @@ impl SimplifiedP2P {
             }
         } else {
             // block_tx not initialized - remove from processed for retry
-            println!("[SHRED_PROTOCOL] ⚠️ Block #{} reconstructed but block_tx not ready, will retry", height);
+            if crate::node::is_info() {
+                println!("[SHRED_PROTOCOL] ⚠️ Block #{} reconstructed but block_tx not ready, will retry", height);
+            }
             self.processed_shred_blocks.remove(&height);
         }
     }
@@ -7043,7 +7181,9 @@ impl SimplifiedP2P {
             let rs = match ReedSolomon::new(data_count, parity_count) {
                 Ok(rs) => rs,
                 Err(e) => {
-                    println!("[SHRED_PROTOCOL] ❌ Reed-Solomon init failed for reconstruction: {:?}", e);
+                    if crate::node::is_info() {
+                        println!("[SHRED_PROTOCOL] ❌ Reed-Solomon init failed for reconstruction: {:?}", e);
+                    }
                     // CRITICAL: Remove from processed so new chunks can retry
                     self.processed_shred_blocks.remove(&height);
                     return;
@@ -7085,8 +7225,10 @@ impl SimplifiedP2P {
             // Count available shards
             let available_count = shards.iter().filter(|s| s.is_some()).count();
             if available_count < data_count {
-                println!("[SHRED_PROTOCOL] ❌ Not enough shards for reconstruction: {}/{} needed", 
-                         available_count, data_count);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] ❌ Not enough shards for reconstruction: {}/{} needed", 
+                             available_count, data_count);
+                }
                 // CRITICAL: Remove from processed so new chunks can retry
                 self.processed_shred_blocks.remove(&height);
                 return;
@@ -7099,7 +7241,9 @@ impl SimplifiedP2P {
             
             // Reconstruct missing shards
             if let Err(e) = rs.reconstruct(&mut rs_shards) {
-                println!("[SHRED_PROTOCOL] ❌ Reed-Solomon reconstruction failed: {:?}", e);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] ❌ Reed-Solomon reconstruction failed: {:?}", e);
+                }
                 // CRITICAL: Remove from processed so new chunks can retry
                 self.processed_shred_blocks.remove(&height);
                 return;
@@ -7126,17 +7270,23 @@ impl SimplifiedP2P {
             block_data.truncate(original_size);
             
             let elapsed = assembly.started_at.elapsed();
-            println!("[SHRED_PROTOCOL] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
+            if crate::node::is_info() {
+                println!("[SHRED_PROTOCOL] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
+            }
             
             // v2.26: Check if certificate was received (chunk #0 might have been lost)
             // If no certificate, the block validation in node.rs will use fallback mechanism
             // But we can log this for debugging
             if assembly.certificate.is_none() {
-                println!("[SHRED_PROTOCOL] ⚠️ Block #{} reconstructed WITHOUT certificate (chunk #0 lost) - fallback will be used", height);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] ⚠️ Block #{} reconstructed WITHOUT certificate (chunk #0 lost) - fallback will be used", height);
+                }
                 // NOTE: Don't panic - node.rs has retry mechanism for missing certificates
                 // The block will be buffered and certificate requested via broadcast_certificate_announce
             } else {
-                println!("[SHRED_PROTOCOL] ✅ Block #{} has certificate from chunk #0", height);
+                if crate::node::is_info() {
+                    println!("[SHRED_PROTOCOL] ✅ Block #{} has certificate from chunk #0", height);
+                }
             }
             
             // PRODUCTION: Use correct block_type based on chunk metadata
@@ -7200,9 +7350,11 @@ impl SimplifiedP2P {
         
         // Check size limit
         if block_size > SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE {
-            println!("[ERR][SHRED_SYNC] block_too_large h={} size_mb={} max_mb={}", 
-                     height, block_size / 1024 / 1024, 
-                     SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE / 1024 / 1024);
+            if crate::node::is_warn() {
+                println!("[ERR][SHRED_SYNC] block_too_large h={} size_mb={} max_mb={}", 
+                         height, block_size / 1024 / 1024, 
+                         SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE / 1024 / 1024);
+            }
             return;
         }
         
@@ -7414,8 +7566,10 @@ impl SimplifiedP2P {
                 };
                 
                 if age.as_secs() < cache_duration {
-                    println!("[SYNC] 🔧 Using actor cache height: {} (epoch: {}, age: {}s)", 
-                            cached_data.data, cached_data.epoch, age.as_secs());
+                    if crate::node::is_info() {
+                        println!("[SYNC] 🔧 Using actor cache height: {} (epoch: {}, age: {}s)", 
+                                cached_data.data, cached_data.epoch, age.as_secs());
+                    }
                     return Ok(cached_data.data);
                 }
             }
@@ -7441,7 +7595,9 @@ impl SimplifiedP2P {
             if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
                std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
                 // Genesis nodes trust their own height during bootstrap
-                println!("[SYNC] 🚀 Genesis bootstrap mode - using local height as network consensus");
+                if crate::node::is_info() {
+                    println!("[SYNC] 🚀 Genesis bootstrap mode - using local height as network consensus");
+                }
                 // Return a special marker that indicates bootstrap mode
                 return Err("BOOTSTRAP_MODE".to_string());
             }
@@ -7463,12 +7619,16 @@ impl SimplifiedP2P {
         
         // Log peer heights for debugging
         for peer in validated_peers.iter().filter(|p| p.last_block_height > 0) {
-            println!("[SYNC] Peer {} reports height: {} (cached)", peer.id, peer.last_block_height);
+            if crate::node::is_info() {
+                println!("[SYNC] Peer {} reports height: {} (cached)", peer.id, peer.last_block_height);
+            }
         }
         
         if peer_heights.is_empty() {
             // Fallback: all peers have height 0 (network just started)
-            println!("[SYNC] ⚠️ No cached peer heights available - waiting for heartbeats");
+            if crate::node::is_info() {
+                println!("[SYNC] ⚠️ No cached peer heights available - waiting for heartbeats");
+            }
             return Ok(0);
         }
         
@@ -7484,7 +7644,9 @@ impl SimplifiedP2P {
         
         // SAFETY: Never cache u64::MAX or absurdly large heights.
         let consensus_height = if consensus_height == u64::MAX || consensus_height > 2_000_000_000 {
-            println!("[WARN][SYNC] consensus_height_invalid={} — falling back to local_height", consensus_height);
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] consensus_height_invalid={} — falling back to local_height", consensus_height);
+            }
             // Return local height so the node doesn't freeze; it will retry next cycle.
             let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             return Ok(local_h);
@@ -7492,7 +7654,9 @@ impl SimplifiedP2P {
             consensus_height
         };
         
-        println!("[INFO][SYNC] Consensus blockchain height: {}", consensus_height);
+        if crate::node::is_info() {
+            println!("[INFO][SYNC] Consensus blockchain height: {}", consensus_height);
+        }
         
         // RACE CONDITION FIX: Update cached height
         // IMPROVED: Update both cache systems for smooth transition
@@ -7538,11 +7702,17 @@ impl SimplifiedP2P {
             let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 5); // EXISTING: Add self, max 5 Genesis
             
             if total_network_nodes >= 4 {
-                println!("🏛️ [CONSENSUS] Genesis node with {} total nodes - Byzantine consensus enabled", total_network_nodes);
+                if crate::node::is_info() {
+                    println!("🏛️ [CONSENSUS] Genesis node with {} total nodes - Byzantine consensus enabled", total_network_nodes);
+                }
                 // Continue to normal Byzantine checks below
             } else {
-                println!("⚠️ [CONSENSUS] Genesis bootstrap - insufficient nodes for Byzantine safety: {}/4", total_network_nodes);
-                println!("🔄 [CONSENSUS] Waiting for more Genesis nodes to join network...");
+                if crate::node::is_info() {
+                    println!("⚠️ [CONSENSUS] Genesis bootstrap - insufficient nodes for Byzantine safety: {}/4", total_network_nodes);
+                }
+                if crate::node::is_info() {
+                    println!("🔄 [CONSENSUS] Waiting for more Genesis nodes to join network...");
+                }
                 return false; // Even Genesis needs Byzantine safety
             }
         }
@@ -7553,9 +7723,13 @@ impl SimplifiedP2P {
         let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 1000); // EXISTING: Scale to network size
         
         if total_network_nodes < min_nodes_for_consensus {
-            println!("⚠️ [CONSENSUS] Insufficient nodes for Byzantine consensus: {}/{}", 
-                    total_network_nodes, min_nodes_for_consensus);
-            println!("🔒 [CONSENSUS] Byzantine fault tolerance requires minimum {} nodes", min_nodes_for_consensus);
+            if crate::node::is_info() {
+                println!("⚠️ [CONSENSUS] Insufficient nodes for Byzantine consensus: {}/{}", 
+                        total_network_nodes, min_nodes_for_consensus);
+            }
+            if crate::node::is_info() {
+                println!("🔒 [CONSENSUS] Byzantine fault tolerance requires minimum {} nodes", min_nodes_for_consensus);
+            }
             return false; // Non-genesis nodes need sufficient peers
         }
         
@@ -7605,7 +7779,9 @@ impl SimplifiedP2P {
                 .send()
         ).await {
             Ok(Ok(response)) => {
-                println!("[DBG][P2P] HTTP response status: {}", response.status());
+                if crate::node::is_debug() {
+                    println!("[DBG][P2P] HTTP response status: {}", response.status());
+                }
                 if response.status().is_success() {
                     match response.json::<serde_json::Value>().await {
                         Ok(auth_response) => {
@@ -7619,7 +7795,9 @@ impl SimplifiedP2P {
                             let challenge_bytes = hex::decode(&challenge)
                                 .map_err(|e| format!("Failed to decode challenge hex: {}", e))?;
                             if Self::verify_dilithium_signature(&challenge_bytes, signature, pubkey).await? {
-                                println!("[INFO][P2P] Peer {} authenticated with post-quantum signature", get_privacy_id_for_addr(&peer_addr));
+                                if crate::node::is_info() {
+                                    println!("[INFO][P2P] Peer {} authenticated with post-quantum signature", get_privacy_id_for_addr(&peer_addr));
+                                }
                                 Ok(pubkey.to_string())
                             } else {
                                 Err("Invalid signature verification".to_string())
@@ -7632,11 +7810,15 @@ impl SimplifiedP2P {
                 }
             },
             Ok(Err(e)) => {
-                println!("[DBG][P2P] Connection error details: {}", e);
+                if crate::node::is_debug() {
+                    println!("[DBG][P2P] Connection error details: {}", e);
+                }
                 Err(format!("Connection error: {}", e))
             },
             Err(_) => {
-                println!("[DBG][P2P] Timeout during peer authentication (5 seconds)");
+                if crate::node::is_debug() {
+                    println!("[DBG][P2P] Timeout during peer authentication (5 seconds)");
+                }
                 Err("Timeout during peer authentication".to_string())
             },
         }
@@ -7693,9 +7875,13 @@ impl SimplifiedP2P {
             ).await {
                 Ok(is_valid) => {
         if is_valid {
-            println!("[CRYPTO] ✅ Dilithium signature verified successfully");
+            if crate::node::is_info() {
+                println!("[CRYPTO] ✅ Dilithium signature verified successfully");
+            }
         } else {
-            println!("[CRYPTO] ❌ Dilithium signature verification failed");
+            if crate::node::is_info() {
+                println!("[CRYPTO] ❌ Dilithium signature verification failed");
+            }
         }
         Ok(is_valid)
                 },
@@ -7829,11 +8015,15 @@ impl SimplifiedP2P {
         // Minimum peer requirement
         let min_required_nodes = 2;
         if working_nodes.len() < min_required_nodes {
-            println!("[WARN][CONNECTIVITY] low_peers reachable={} min_required={}", 
-                     working_nodes.len(), min_required_nodes);
+            if crate::node::is_warn() {
+                println!("[WARN][CONNECTIVITY] low_peers reachable={} min_required={}", 
+                         working_nodes.len(), min_required_nodes);
+            }
             
             if working_nodes.is_empty() {
-                println!("[WARN][CONNECTIVITY] no_peers_reachable fallback=all_configured");
+                if crate::node::is_warn() {
+                    println!("[WARN][CONNECTIVITY] no_peers_reachable fallback=all_configured");
+                }
                 if let Ok(mut cache) = connectivity_cache.lock() {
                     cache.insert(cache_key, (nodes.clone(), current_time));
                 }
@@ -8209,9 +8399,13 @@ impl SimplifiedP2P {
                 }).await.unwrap_or(false);
                 if is_reachable {
                     connected_count += 1;
-                    println!("[P2P] ✅ Genesis {} reachable via TCP (not yet in peers list)", node_id);
+                    if crate::node::is_info() {
+                        println!("[P2P] ✅ Genesis {} reachable via TCP (not yet in peers list)", node_id);
+                    }
                 } else {
-                    println!("[P2P] ⏳ Genesis {} not connected yet", node_id);
+                    if crate::node::is_info() {
+                        println!("[P2P] ⏳ Genesis {} not connected yet", node_id);
+                    }
                 }
             }
         }
@@ -8220,9 +8414,13 @@ impl SimplifiedP2P {
         let all_connected = connected_count == total_other_nodes;
         
         if all_connected {
-            println!("[P2P] ✅ All {} Genesis nodes verified connected", total_other_nodes);
+            if crate::node::is_info() {
+                println!("[P2P] ✅ All {} Genesis nodes verified connected", total_other_nodes);
+            }
         } else {
-            println!("[P2P] ⏳ Genesis connectivity: {}/{} nodes", connected_count, total_other_nodes);
+            if crate::node::is_info() {
+                println!("[P2P] ⏳ Genesis connectivity: {}/{} nodes", connected_count, total_other_nodes);
+            }
         }
         
         all_connected
@@ -8300,7 +8498,9 @@ impl SimplifiedP2P {
                             None => {
                                 // PRODUCTION: Peer not in P2P state = not really connected
                                 // Log but don't add phantom peer with fake data
-                                println!("[WARN][P2P] Genesis peer {} not in P2P state - skipping (no fake data)", node_id);
+                                if crate::node::is_warn() {
+                                    println!("[WARN][P2P] Genesis peer {} not in P2P state - skipping (no fake data)", node_id);
+                                }
                             }
                         }
                     }
@@ -8308,8 +8508,10 @@ impl SimplifiedP2P {
             }
             
             // PRODUCTION: Only return REAL connected peers with REAL reputation
-            println!("[INFO][P2P] Genesis mode: returning {} REAL connected peers (no phantoms, no fake reputation)", 
-                     genesis_peers.len());
+            if crate::node::is_info() {
+                println!("[INFO][P2P] Genesis mode: returning {} REAL connected peers (no phantoms, no fake reputation)", 
+                         genesis_peers.len());
+            }
             genesis_peers
         } else {
             // Normal phase: Use all connected peers (v2.51: lock-free)
@@ -8331,7 +8533,9 @@ impl SimplifiedP2P {
         // Clear actor cache
         if let Ok(mut peers_cache) = CACHE_ACTOR.peers_cache.write() {
             *peers_cache = None;
-            println!("[INFO][P2P] Peer cache invalidated (epoch: {})", new_epoch);
+            if crate::node::is_info() {
+                println!("[INFO][P2P] Peer cache invalidated (epoch: {})", new_epoch);
+            }
         }
         
         // Legacy cache for backward compatibility
@@ -8389,7 +8593,9 @@ impl SimplifiedP2P {
             
             // Send certificate announcement (async in production)
             // PRIVACY: Use pseudonym for peer address
-            println!("[INFO][P2P] Sending certificate {} to peer {}", cert_serial, get_privacy_id_for_addr(&peer_addr));
+            if crate::node::is_info() {
+                println!("[INFO][P2P] Sending certificate {} to peer {}", cert_serial, get_privacy_id_for_addr(&peer_addr));
+            }
             broadcast_count += 1;
             
             // PRODUCTION v2.19.22: Send certificate via QUIC (binary, fast)
@@ -8410,8 +8616,10 @@ impl SimplifiedP2P {
                                 
                                 let transport_guard = transport.read().await;
                                 if let Err(e) = transport_guard.broadcast_to(quic_addr, &message_clone).await {
-                                    println!("[QUIC] ⚠️ Certificate send failed to {}: {}", 
-                                        get_privacy_id_for_addr(&peer_addr_clone), e);
+                                    if crate::node::is_info() {
+                                        println!("[QUIC] ⚠️ Certificate send failed to {}: {}", 
+                                            get_privacy_id_for_addr(&peer_addr_clone), e);
+                                    }
                                 }
                             }
                         }
@@ -8420,7 +8628,9 @@ impl SimplifiedP2P {
             });
         }
         
-        println!("[INFO][P2P] Certificate {} broadcast to {} peers", cert_serial, broadcast_count);
+        if crate::node::is_info() {
+            println!("[INFO][P2P] Certificate {} broadcast to {} peers", cert_serial, broadcast_count);
+        }
         Ok(())
     }
     
@@ -8441,10 +8651,14 @@ impl SimplifiedP2P {
         // Find peer address for target node
         if let Some(addr) = self.peer_id_to_addr.get(target_node_id) {
             self.send_network_message(&addr, message);
-            println!("[INFO][P2P] Sent certificate request for {} to {}", cert_serial, target_node_id);
+            if crate::node::is_info() {
+                println!("[INFO][P2P] Sent certificate request for {} to {}", cert_serial, target_node_id);
+            }
         } else {
             // Broadcast request to all peers if we don't know the target
-            println!("[WARN][P2P] Target node {} not found, broadcasting certificate request", target_node_id);
+            if crate::node::is_warn() {
+                println!("[WARN][P2P] Target node {} not found, broadcasting certificate request", target_node_id);
+            }
             let peers: Vec<_> = self.connected_peers_lockfree
                 .iter()
                 .map(|r| r.value().clone())
@@ -8479,15 +8693,19 @@ impl SimplifiedP2P {
         let peers = self.get_validated_active_peers();
         
         if peers.is_empty() {
-            println!("[WARN][P2P] No peers available for tracked certificate broadcast");
+            if crate::node::is_warn() {
+                println!("[WARN][P2P] No peers available for tracked certificate broadcast");
+            }
             return Ok(()); // No peers is OK (single node network)
         }
         
         let total_peers = peers.len();
         let byzantine_threshold = (total_peers * 2 + 2) / 3; // Ceiling of 2/3
         
-        println!("[INFO][P2P] TRACKED broadcast of certificate {} to {} peers (need {}/{})", 
-                 cert_serial, total_peers, byzantine_threshold, total_peers);
+        if crate::node::is_info() {
+            println!("[INFO][P2P] TRACKED broadcast of certificate {} to {} peers (need {}/{})", 
+                     cert_serial, total_peers, byzantine_threshold, total_peers);
+        }
         
         // Prepare message once
         let message = NetworkMessage::CertificateAnnounce {
@@ -8553,14 +8771,18 @@ impl SimplifiedP2P {
                                     Ok(_) => {
                                         success_count_clone.fetch_add(1, Ordering::SeqCst);
                                         // PRIVACY: Use pseudonym for peer address
-                                        println!("[QUIC] ✅ Certificate {} delivered to {}", cert_serial_clone, get_privacy_id_for_addr(&peer_addr));
+                                        if crate::node::is_info() {
+                                            println!("[QUIC] ✅ Certificate {} delivered to {}", cert_serial_clone, get_privacy_id_for_addr(&peer_addr));
+                                        }
                                         
                                         // SUCCESS: Reset cooldown for this peer
                                         PEER_RETRY_COOLDOWN.remove(&peer_addr_for_cooldown);
                                     }
                                     Err(e) => {
-                                        println!("[QUIC] ⚠️ Certificate {} failed to {}: {}", 
-                                                 cert_serial_clone, peer_addr, e);
+                                        if crate::node::is_info() {
+                                            println!("[QUIC] ⚠️ Certificate {} failed to {}: {}", 
+                                                     cert_serial_clone, peer_addr, e);
+                                        }
                                         
                                         // FAILURE: Apply exponential backoff cooldown
                                         let (retry_count, _) = PEER_RETRY_COOLDOWN
@@ -8593,7 +8815,9 @@ impl SimplifiedP2P {
         
         // Log skipped peers if any
         if skipped_peers > 0 {
-            println!("[INFO][P2P] Skipped {} peers in cooldown", skipped_peers);
+            if crate::node::is_info() {
+                println!("[INFO][P2P] Skipped {} peers in cooldown", skipped_peers);
+            }
         }
         
         // CRITICAL: Recalculate effective peers and threshold after cooldown filtering
@@ -8625,22 +8849,28 @@ impl SimplifiedP2P {
                 let delivery_time = broadcast_start.elapsed();
                 let successful = success_count.load(Ordering::SeqCst);
                 
-                println!("[INFO][P2P] Certificate {} delivery: {}/{} effective peers ({:.1}%) in {:?}", 
-                         cert_serial, successful, effective_peers, 
-                         if effective_peers > 0 { (successful as f64 / effective_peers as f64) * 100.0 } else { 0.0 },
-                         delivery_time);
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Certificate {} delivery: {}/{} effective peers ({:.1}%) in {:?}", 
+                             cert_serial, successful, effective_peers, 
+                             if effective_peers > 0 { (successful as f64 / effective_peers as f64) * 100.0 } else { 0.0 },
+                             delivery_time);
+                }
                 
                 // Check Byzantine threshold (based on effective peers, not total)
                 if successful >= effective_threshold {
-                    println!("[INFO][P2P] Byzantine threshold reached: {}/{} ≥ 2/3 (effective)", 
-                             successful, effective_peers);
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] Byzantine threshold reached: {}/{} ≥ 2/3 (effective)", 
+                                 successful, effective_peers);
+                    }
                     Ok(())
                 } else {
                     let err = format!(
                         "Byzantine threshold NOT reached: {}/{} < 2/3 (need {}, {} in cooldown)",
                         successful, effective_peers, effective_threshold, skipped_peers
                     );
-                    println!("[WARN][P2P] {}", err);
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] {}", err);
+                    }
                     Err(err)
                 }
             }
@@ -8660,7 +8890,9 @@ impl SimplifiedP2P {
         // Only Full and Super nodes need validated peers for consensus/emergency producer selection
         match self.node_type {
             NodeType::Light => {
-                println!("[INFO][P2P] Light node: no consensus participation, returning empty peer list");
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Light node: no consensus participation, returning empty peer list");
+                }
                 return Vec::new(); // Light nodes don't participate in consensus
             },
             _ => {} // Continue with Full/Super node logic
@@ -8781,8 +9013,10 @@ impl SimplifiedP2P {
                 // Check topology hash for cache validity  
                 let topology_hash = CacheActor::get_topology_hash(&peer_addrs);
                 if age < validation_interval && cached_data.topology_hash == topology_hash {
-                    println!("[INFO][P2P] Using actor cached peer list ({} peers, epoch: {}, age: {}s)", 
-                             cached_data.data.len(), cached_data.epoch, age.as_secs());
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] Using actor cached peer list ({} peers, epoch: {}, age: {}s)", 
+                                 cached_data.data.len(), cached_data.epoch, age.as_secs());
+                    }
                     return cached_data.data.clone();
                 }
             }
@@ -8792,8 +9026,10 @@ impl SimplifiedP2P {
                 let now = Instant::now();
                 
             if now.duration_since(cached.1) < validation_interval && cached.2 == cache_key {
-                    println!("[INFO][P2P] Using legacy cached peer list ({} peers, age: {}s)", 
-                         cached.0.len(), now.duration_since(cached.1).as_secs());
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] Using legacy cached peer list ({} peers, age: {}s)", 
+                             cached.0.len(), now.duration_since(cached.1).as_secs());
+                    }
                 return cached.0.clone();
                 }
             }
@@ -8807,7 +9043,9 @@ impl SimplifiedP2P {
             if let Ok(cached) = CACHED_PEERS.lock() {
                 let now = Instant::now();
                 if now.duration_since(cached.1) < validation_interval && cached.2 == cache_key {
-                    println!("[INFO][P2P] Cache refreshed by another thread ({} peers)", cached.0.len());
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] Cache refreshed by another thread ({} peers)", cached.0.len());
+                    }
                     return cached.0.clone();
                 }
             }
@@ -8833,7 +9071,9 @@ impl SimplifiedP2P {
             *cached = (fresh_peers.clone(), now, cache_key);
                 }
                 
-                println!("[INFO][P2P] Refreshed both peer caches ({} peers, epoch: {})", fresh_peers.len(), epoch);
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Refreshed both peer caches ({} peers, epoch: {})", fresh_peers.len(), epoch);
+                }
             }
             
             return fresh_peers;
@@ -8957,7 +9197,9 @@ impl SimplifiedP2P {
     pub fn force_peer_cache_refresh(&self) {
         if let Ok(mut cached) = CACHED_PEERS.lock() {
             *cached = (Vec::new(), Instant::now(), String::new());
-            println!("[INFO][P2P] FORCED: Peer cache cleared for fresh validation");
+            if crate::node::is_info() {
+                println!("[INFO][P2P] FORCED: Peer cache cleared for fresh validation");
+            }
         }
     }
     
@@ -9119,11 +9361,15 @@ impl SimplifiedP2P {
         match self.is_running.lock() {
             Ok(mut running) => *running = false,
             Err(poisoned) => {
-                println!("[WARN][P2P] Mutex poisoned during shutdown, forcing stop...");
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] Mutex poisoned during shutdown, forcing stop...");
+                }
                 *poisoned.into_inner() = false;
             }
         }
-        println!("[INFO][P2P] Simplified P2P network stopped");
+        if crate::node::is_info() {
+            println!("[INFO][P2P] Simplified P2P network stopped");
+        }
     }
     
     // === PRIVATE METHODS ===
@@ -9161,7 +9407,9 @@ impl SimplifiedP2P {
         // This allows network growth and peer exchange to work properly
         let discovery_peers = self.get_discovery_peers();
         
-        println!("[INFO][P2P] Providing {} peers for DHT/API discovery", discovery_peers.len());
+        if crate::node::is_info() {
+            println!("[INFO][P2P] Providing {} peers for DHT/API discovery", discovery_peers.len());
+        }
         discovery_peers
     }
     
@@ -9172,7 +9420,9 @@ impl SimplifiedP2P {
             // Might be a pseudonym - try to resolve
             // CRITICAL FIX: Skip pseudonym resolution in sync context to avoid runtime panic
             // PRIVACY: Don't log raw address
-            println!("[WARN][P2P] Pseudonym resolution not available in sync context");
+            if crate::node::is_warn() {
+                println!("[WARN][P2P] Pseudonym resolution not available in sync context");
+            }
             return Err("Cannot resolve pseudonym in sync context".to_string());
         }
         
@@ -9269,7 +9519,9 @@ impl SimplifiedP2P {
         let mut regional_peers = match self.regional_peers.lock() {
             Ok(peers) => peers,
             Err(poisoned) => {
-                println!("[WARN][P2P] Regional peers mutex poisoned during peer addition");
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] Regional peers mutex poisoned during peer addition");
+                }
                 poisoned.into_inner()
             }
         };
@@ -9285,7 +9537,9 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[WARN][P2P] No Tokio runtime - regional connection deferred");
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] No Tokio runtime - regional connection deferred");
+                }
                 return;
             }
         };
@@ -9299,12 +9553,16 @@ impl SimplifiedP2P {
         
         // EXISTING PATTERN: Use handle.spawn for non-blocking startup
         handle.spawn(async move {
-            println!("[INFO][P2P] Starting regional connection establishment (background)...");
+            if crate::node::is_info() {
+                println!("[INFO][P2P] Starting regional connection establishment (background)...");
+            }
             
             let regional_peers_data = match regional_peers.lock() {
                 Ok(peers) => peers.clone(), // Clone the data to avoid lifetime issues
                 Err(poisoned) => {
-                    println!("[WARN][P2P] Regional peers mutex poisoned during connection establishment");
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] Regional peers mutex poisoned during connection establishment");
+                    }
                     poisoned.into_inner().clone()
                 }
             };
@@ -9392,11 +9650,15 @@ impl SimplifiedP2P {
             
             // v2.51: No need to copy back - already using DashMap directly
             {
-                println!("[WARN][P2P] Failed to update connected_peers after establishment");
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] Failed to update connected_peers after establishment");
+                }
             }
         });
         
-        println!("[INFO][P2P] Regional connection establishment started (non-blocking startup)");
+        if crate::node::is_info() {
+            println!("[INFO][P2P] Regional connection establishment started (non-blocking startup)");
+        }
     }
     
     /// STATIC VERSION: Check if peer is actually connected (async-safe)
@@ -9420,14 +9682,20 @@ impl SimplifiedP2P {
             
             if is_connected {
                 // PRIVACY: Use pseudonym for peer address
-                println!("[INFO][P2P] Genesis peer {} - FAST TCP connection verified", get_privacy_id_for_addr(peer_addr));
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Genesis peer {} - FAST TCP connection verified", get_privacy_id_for_addr(peer_addr));
+                }
                 true
             } else {
                 if use_relaxed_validation {
-                    println!("[INFO][P2P] Genesis peer {} - using relaxed validation for network formation", get_privacy_id_for_addr(peer_addr));
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] Genesis peer {} - using relaxed validation for network formation", get_privacy_id_for_addr(peer_addr));
+                    }
                     true // Allow for bootstrap/small networks
                 } else {
-                    println!("[WARN][P2P] Genesis peer {} - TCP connection failed, excluding from consensus", get_privacy_id_for_addr(peer_addr));
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] Genesis peer {} - TCP connection failed, excluding from consensus", get_privacy_id_for_addr(peer_addr));
+                    }
                     false
                 }
             }
@@ -9495,7 +9763,9 @@ impl SimplifiedP2P {
             }
         }
         
-        println!("[INFO][P2P] Selected {} optimal peers using load balancing", selected_peers.len());
+        if crate::node::is_info() {
+            println!("[INFO][P2P] Selected {} optimal peers using load balancing", selected_peers.len());
+        }
         selected_peers
     }
     
@@ -9568,7 +9838,9 @@ impl SimplifiedP2P {
         *last_rebalance = now;
         drop(last_rebalance);
         
-        println!("[INFO][P2P] Starting connection rebalancing");
+        if crate::node::is_info() {
+            println!("[INFO][P2P] Starting connection rebalancing");
+        }
         
         // Get current load metrics
         let metrics = match self.regional_metrics.lock() {
@@ -9584,7 +9856,9 @@ impl SimplifiedP2P {
             .collect();
         
         if overloaded_regions.is_empty() {
-            println!("[INFO][P2P] All regions operating within thresholds");
+            if crate::node::is_info() {
+                println!("[INFO][P2P] All regions operating within thresholds");
+            }
             return false;
         }
         
@@ -9611,7 +9885,9 @@ impl SimplifiedP2P {
                 self.connected_peers_lockfree.insert(peer.addr.clone(), peer);
             }
             
-            println!("[INFO][P2P] Rebalancing complete: dropped {}, reconnected to optimal peers", dropped_count);
+            if crate::node::is_info() {
+                println!("[INFO][P2P] Rebalancing complete: dropped {}, reconnected to optimal peers", dropped_count);
+            }
             true
         } else {
             false
@@ -9741,7 +10017,9 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[WARN][P2P] No Tokio runtime - regional clustering deferred");
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] No Tokio runtime - regional clustering deferred");
+                }
                 return;
             }
         };
@@ -9753,7 +10031,9 @@ impl SimplifiedP2P {
         let is_running = self.is_running.clone();
         
         handle.spawn(async move {
-            println!("[INFO][P2P] Starting regional clustering for region: {:?}", region);
+            if crate::node::is_info() {
+                println!("[INFO][P2P] Starting regional clustering for region: {:?}", region);
+            }
             
             // Regional clustering logic
             while *match is_running.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
@@ -9770,24 +10050,34 @@ impl SimplifiedP2P {
                 // Ensure we have peers in our region
                 let our_region_count = regional_counts.get(&region).unwrap_or(&0);
                 if *our_region_count < 2 {
-                    println!("[INFO][P2P] Looking for more peers in region: {:?}", region);
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] Looking for more peers in region: {:?}", region);
+                    }
                     
                     // Get dynamic IP for regional peer discovery
                     let _external_ip = match Self::get_our_ip_address().await {
                         Ok(ip) => ip,
                         Err(e) => {
-                            println!("[WARN][P2P] Failed to get external IP for regional clustering: {}", e);
+                            if crate::node::is_warn() {
+                                println!("[WARN][P2P] Failed to get external IP for regional clustering: {}", e);
+                            }
                             continue;
                         }
                     };
                     
                     // PRODUCTION: Regional clustering uses only real discovered peers
-                    println!("[INFO][P2P] Region {} needs more peers - expanding discovery range", region_string(&region));
-                    println!("[INFO][P2P] Initiating wider peer discovery for better regional coverage");
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] Region {} needs more peers - expanding discovery range", region_string(&region));
+                    }
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] Initiating wider peer discovery for better regional coverage");
+                    }
                 }
                 
                 // Report regional distribution
-                println!("[INFO][P2P] Regional distribution: {:?}", regional_counts);
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Regional distribution: {:?}", regional_counts);
+                }
             }
         });
     }
@@ -9818,19 +10108,27 @@ impl SimplifiedP2P {
                                    peer.id.starts_with("node_");
             
             let is_valid = if is_blacklisted {
-                println!("[ERR][P2P] Peer {} rejected: blacklisted", peer.id);
+                if crate::node::is_warn() {
+                    println!("[ERR][P2P] Peer {} rejected: blacklisted", peer.id);
+                }
                 false
             } else if is_genesis {
                 // Genesis/bootstrap nodes are always valid
-                println!("[INFO][P2P] Peer {} validated: Genesis bootstrap node", peer.id);
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Peer {} validated: Genesis bootstrap node", peer.id);
+                }
                 true
             } else if has_valid_format {
                 // Regular nodes with valid format
-                println!("[INFO][P2P] Peer {} validated: valid node format", peer.id);
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Peer {} validated: valid node format", peer.id);
+                }
                 true
             } else {
                 // Unknown format - log but allow for flexibility
-                println!("[WARN][P2P] Peer {} has unknown format, allowing", peer.id);
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] Peer {} has unknown format, allowing", peer.id);
+                }
                 true
             };
             
@@ -9851,23 +10149,31 @@ impl SimplifiedP2P {
         
         // IMPROVED: Check if we're in Docker and need special handling
         if std::path::Path::new("/.dockerenv").exists() {
-            println!("[INFO][P2P] Docker environment detected, using enhanced NAT traversal");
+            if crate::node::is_info() {
+                println!("[INFO][P2P] Docker environment detected, using enhanced NAT traversal");
+            }
             
             // CRITICAL: Try environment variables first (user can set QNET_EXTERNAL_IP)
             if let Ok(external_ip) = std::env::var("QNET_EXTERNAL_IP") {
-                println!("[INFO][P2P] Using configured external IP: {}", get_privacy_id_for_addr(&external_ip));
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Using configured external IP: {}", get_privacy_id_for_addr(&external_ip));
+                }
                 return Ok(external_ip);
             }
             
             // Try Docker host IP from environment
             if let Ok(docker_host) = std::env::var("DOCKER_HOST_IP") {
-                println!("[INFO][P2P] Using Docker host IP: {}", get_privacy_id_for_addr(&docker_host));
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Using Docker host IP: {}", get_privacy_id_for_addr(&docker_host));
+                }
                 return Ok(docker_host);
             }
             
             // CRITICAL: Force STUN for Docker to get real external IP
             // Docker containers always have 172.17.x.x internally, must use STUN
-            println!("[INFO][P2P] Docker detected: forcing STUN NAT traversal for external IP");
+            if crate::node::is_info() {
+                println!("[INFO][P2P] Docker detected: forcing STUN NAT traversal for external IP");
+            }
         }
         
         // IMPROVED: Try STUN server for NAT traversal (Google's public STUN)
@@ -9908,8 +10214,10 @@ impl SimplifiedP2P {
                                             buf[i+8] ^ 0x21, buf[i+9] ^ 0x12,
                                             buf[i+10] ^ 0xA4, buf[i+11] ^ 0x42);
                                         // PRIVACY: Show privacy ID in logs, but return real IP for internal use
-                                        println!("[INFO][P2P] STUN resolved external IP: {} (port: {})", 
-                                                get_privacy_id_for_addr(&ip), port);
+                                        if crate::node::is_info() {
+                                            println!("[INFO][P2P] STUN resolved external IP: {} (port: {})", 
+                                                    get_privacy_id_for_addr(&ip), port);
+                                        }
                                         return Ok(ip);
                                     }
                                 }
@@ -9979,8 +10287,10 @@ impl SimplifiedP2P {
         }
         
         if missing_blocks.is_empty() {
-            println!("[SYNC] ✅ All blocks {}-{} already present, skipping download", 
-                     current_height + 1, target_height);
+            if crate::node::is_info() {
+                println!("[SYNC] ✅ All blocks {}-{} already present, skipping download", 
+                         current_height + 1, target_height);
+            }
             return;
         }
         
@@ -10011,7 +10321,9 @@ impl SimplifiedP2P {
             },
             _ => {
                 // FALLBACK: Unknown type defaults to Full node parameters
-                println!("[SYNC] ⚠️ Unknown node type '{}', using Full node parameters", node_type);
+                if crate::node::is_info() {
+                    println!("[SYNC] ⚠️ Unknown node type '{}', using Full node parameters", node_type);
+                }
                 (10, 100)
             }
         };
@@ -10036,16 +10348,20 @@ impl SimplifiedP2P {
                 .copied()
                 .collect();
             
-            println!("[SYNC] 🌊 Wave sync: {} blocks now, {} deferred to next cycle", 
-                     blocks_in_wave.len(), missing_blocks.len() - blocks_in_wave.len());
+            if crate::node::is_info() {
+                println!("[SYNC] 🌊 Wave sync: {} blocks now, {} deferred to next cycle", 
+                         blocks_in_wave.len(), missing_blocks.len() - blocks_in_wave.len());
+            }
             
             (wave_target, blocks_in_wave)
         };
         
         let missing_blocks = blocks_this_sync;  // Update to sync size
         
-        println!("[SYNC] ⚡ Starting parallel sync: {} blocks (target: {}) with {} workers", 
-                 missing_blocks.len(), actual_target, parallel_workers);
+        if crate::node::is_info() {
+            println!("[SYNC] ⚡ Starting parallel sync: {} blocks (target: {}) with {} workers", 
+                     missing_blocks.len(), actual_target, parallel_workers);
+        }
         
         // Split MISSING blocks into chunks for parallel processing
         let mut chunks = Vec::new();
@@ -10077,7 +10393,9 @@ impl SimplifiedP2P {
             .collect();
         
         if peers.is_empty() {
-            println!("[SYNC] ⚠️ No suitable sync peers available (blacklist/reputation filtered)");
+            if crate::node::is_info() {
+                println!("[SYNC] ⚠️ No suitable sync peers available (blacklist/reputation filtered)");
+            }
             return;
         }
         
@@ -10092,15 +10410,19 @@ impl SimplifiedP2P {
                     Err(_) => { println!("[SYNC] ⚠️ Semaphore closed"); return; }
                 };
                 
-                println!("[SYNC] 🔄 Worker started for blocks {}-{}", chunk_start, chunk_end);
+                if crate::node::is_info() {
+                    println!("[SYNC] 🔄 Worker started for blocks {}-{}", chunk_start, chunk_end);
+                }
                 let start_time = std::time::Instant::now();
                 
                 // Download blocks in this chunk directly without self reference
                 Self::download_block_range_static(&peers_clone, &**storage_clone, chunk_start, chunk_end).await;
                 
                 let duration = start_time.elapsed();
-                println!("[SYNC] ✅ Worker completed blocks {}-{} in {:.2}s", 
-                         chunk_start, chunk_end, duration.as_secs_f64());
+                if crate::node::is_info() {
+                    println!("[SYNC] ✅ Worker completed blocks {}-{} in {:.2}s", 
+                             chunk_start, chunk_end, duration.as_secs_f64());
+                }
             });
             
             tasks.push(task);
@@ -10119,8 +10441,10 @@ impl SimplifiedP2P {
             0.0
         };
         
-        println!("[SYNC] 🎯 Parallel sync complete: {} blocks in {:.2}s ({:.1} blocks/sec)", 
-                 blocks_synced, duration.as_secs_f64(), blocks_per_sec);
+        if crate::node::is_info() {
+            println!("[SYNC] 🎯 Parallel sync complete: {} blocks in {:.2}s ({:.1} blocks/sec)", 
+                     blocks_synced, duration.as_secs_f64(), blocks_per_sec);
+        }
         
         // CRITICAL: Verify chain integrity after parallel download
         // Check for missing blocks that could cause consensus issues
@@ -10133,12 +10457,18 @@ impl SimplifiedP2P {
         }
         
         if !missing_blocks.is_empty() {
-            println!("[SYNC] ⚠️ Chain integrity check failed: {} blocks missing", missing_blocks.len());
-            println!("[SYNC] ⚠️ Missing blocks: {:?}", &missing_blocks[..missing_blocks.len().min(10)]);
+            if crate::node::is_info() {
+                println!("[SYNC] ⚠️ Chain integrity check failed: {} blocks missing", missing_blocks.len());
+            }
+            if crate::node::is_info() {
+                println!("[SYNC] ⚠️ Missing blocks: {:?}", &missing_blocks[..missing_blocks.len().min(10)]);
+            }
             
             // PRODUCTION: Request missing blocks sequentially to ensure chain continuity
             for height in missing_blocks {
-                println!("[SYNC] 🔄 Requesting missing block #{}", height);
+                if crate::node::is_info() {
+                    println!("[SYNC] 🔄 Requesting missing block #{}", height);
+                }
                 // Use existing download method for single blocks
                 Self::download_block_range_static(&peers, storage, height, height).await;
             }
@@ -10157,16 +10487,24 @@ impl SimplifiedP2P {
             }
             
             if !still_missing.is_empty() {
-                println!("[SYNC] ❌ Chain integrity failed: {} blocks still missing after retry", still_missing.len());
-                println!("[SYNC] ❌ Missing blocks: {:?}", &still_missing[..still_missing.len().min(10)]);
+                if crate::node::is_info() {
+                    println!("[SYNC] ❌ Chain integrity failed: {} blocks still missing after retry", still_missing.len());
+                }
+                if crate::node::is_info() {
+                    println!("[SYNC] ❌ Missing blocks: {:?}", &still_missing[..still_missing.len().min(10)]);
+                }
                 // PRODUCTION: Mark node as not synchronized if chain is broken
                 use crate::node::NODE_IS_SYNCHRONIZED;
                 NODE_IS_SYNCHRONIZED.store(false, std::sync::atomic::Ordering::Relaxed);
             } else {
-                println!("[SYNC] ✅ Chain integrity restored: all blocks present");
+                if crate::node::is_info() {
+                    println!("[SYNC] ✅ Chain integrity restored: all blocks present");
+                }
             }
         } else {
-            println!("[SYNC] ✅ Chain integrity verified: all {} blocks present", blocks_synced);
+            if crate::node::is_info() {
+                println!("[SYNC] ✅ Chain integrity verified: all {} blocks present", blocks_synced);
+            }
         }
     }
     
@@ -10236,14 +10574,18 @@ impl SimplifiedP2P {
             // v4.4: Abort after MAX_TOTAL_FAILURES to prevent infinite resource burn.
             // Caller (main sync loop) will retry the entire range later.
             if total_failures >= MAX_TOTAL_FAILURES {
-                println!("[ERR][SYNC] Range {}-{} exceeded {} total failures at block {} — aborting sync range",
-                         start_height, end_height, MAX_TOTAL_FAILURES, height);
+                if crate::node::is_warn() {
+                    println!("[ERR][SYNC] Range {}-{} exceeded {} total failures at block {} — aborting sync range",
+                             start_height, end_height, MAX_TOTAL_FAILURES, height);
+                }
                 return;
             }
             
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                println!("[SYNC] ⚠️ Range {}-{} hit {} failures at block {} - backoff {}s (total_fails={})",
-                         start_height, end_height, MAX_CONSECUTIVE_FAILURES, height, backoff_secs, total_failures);
+                if crate::node::is_info() {
+                    println!("[SYNC] ⚠️ Range {}-{} hit {} failures at block {} - backoff {}s (total_fails={})",
+                             start_height, end_height, MAX_CONSECUTIVE_FAILURES, height, backoff_secs, total_failures);
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                 consecutive_failures = 0;
                 // v4.4: Exponential backoff capped at 60s
@@ -10251,7 +10593,9 @@ impl SimplifiedP2P {
             }
             
             if last_request_time.elapsed().as_secs() >= 3 {
-                println!("[SYNC] 🔄 Re-requesting blocks {}-{} via QUIC", height, end_height);
+                if crate::node::is_info() {
+                    println!("[SYNC] 🔄 Re-requesting blocks {}-{} via QUIC", height, end_height);
+                }
                 Self::send_quic_block_request_static(peers, height, end_height).await;
                 last_request_time = std::time::Instant::now();
             }
@@ -10307,16 +10651,22 @@ impl SimplifiedP2P {
                     }
                     Err(e) => {
                         // Try next peer
-                        println!("[SYNC] ⚠️ QUIC request to {} failed: {}", 
-                                 get_privacy_id_for_addr(peer_addr), e);
+                        if crate::node::is_info() {
+                            println!("[SYNC] ⚠️ QUIC request to {} failed: {}", 
+                                     get_privacy_id_for_addr(peer_addr), e);
+                        }
                     }
                 }
             }
             
-            println!("[SYNC] ⚠️ Failed to send QUIC RequestBlocks to any peer");
+            if crate::node::is_info() {
+                println!("[SYNC] ⚠️ Failed to send QUIC RequestBlocks to any peer");
+            }
         } else {
             // Fallback: No QUIC transport available
-            println!("[SYNC] ⚠️ QUIC transport not available for sync request");
+            if crate::node::is_info() {
+                println!("[SYNC] ⚠️ QUIC transport not available for sync request");
+            }
         }
     }
 }
@@ -10988,8 +11338,10 @@ impl SimplifiedP2P {
                 
                 // Log only every 10th block
                 if height % 10 == 0 {
-                println!("[INFO][P2P] Received {} block #{} from {} ({} bytes)", 
-                         block_type, height, from_peer, data.len());
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Received {} block #{} from {} ({} bytes)", 
+                             block_type, height, from_peer, data.len());
+                }
                 }
                 
                 // ARCHITECTURE: Unified block validation for ALL blocks (no special "genesis phase")
@@ -11010,11 +11362,17 @@ impl SimplifiedP2P {
                         let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
                         
                         if is_bootstrap_node && height > 0 {
-                            println!("[SECURITY] ⚠️ ACCEPTING macroblock #{} for sync - bootstrap mode with {} nodes", height, network_node_count);
+                            if crate::node::is_info() {
+                                println!("[SECURITY] ⚠️ ACCEPTING macroblock #{} for sync - bootstrap mode with {} nodes", height, network_node_count);
+                            }
                             // Continue to process block for synchronization
                         } else {
-                            println!("[SECURITY] ⚠️ REJECTING macroblock #{} - Byzantine consensus required: {} nodes < 4", height, network_node_count);
-                            println!("[SECURITY] 🔒 Block from {} discarded - network must have 4+ validated nodes", from_peer);
+                            if crate::node::is_info() {
+                                println!("[SECURITY] ⚠️ REJECTING macroblock #{} - Byzantine consensus required: {} nodes < 4", height, network_node_count);
+                            }
+                            if crate::node::is_info() {
+                                println!("[SECURITY] 🔒 Block from {} discarded - network must have 4+ validated nodes", from_peer);
+                            }
                             return; // Reject block without processing
                         }
                     }
@@ -11059,7 +11417,9 @@ impl SimplifiedP2P {
                     
                     match block_tx.send(received_block.clone()) {
                         Ok(_) => {
-                            println!("[INFO][P2P] {} block #{} queued for processing", block_type, height);
+                            if crate::node::is_info() {
+                                println!("[INFO][P2P] {} block #{} queued for processing", block_type, height);
+                            }
                             
                             // GOSSIP RE-BROADCAST v2.19.18: Forward received blocks to other peers
                             // This improves block propagation reliability across the network
@@ -11078,21 +11438,29 @@ impl SimplifiedP2P {
                                 self.gossip_to_random_peers(gossip_msg, 2);
                                 
                                 if height % 30 == 0 {
-                                    println!("[GOSSIP] 🔄 Re-broadcasted block #{} to 2 random peers", height);
+                                    if crate::node::is_info() {
+                                        println!("[GOSSIP] 🔄 Re-broadcasted block #{} to 2 random peers", height);
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
                             // v3.0: Clear pending on error so block can be retried
                             clear_block_pending_sync(height);
-                            println!("[ERR][P2P] Failed to queue {} block #{}: {}", block_type, height, e);
+                            if crate::node::is_warn() {
+                                println!("[ERR][P2P] Failed to queue {} block #{}: {}", block_type, height, e);
+                            }
                         }
                     }
                 } else {
                     // v3.0: Clear pending - channel not available
                     clear_block_pending_sync(height);
-                    println!("[WARN][P2P] Block processing channel not available - block #{} discarded", height);
-                    println!("[DIAGNOSTIC] 💥 CRITICAL: Block channel was LOST after setup!");
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] Block processing channel not available - block #{} discarded", height);
+                    }
+                    if crate::node::is_info() {
+                        println!("[DIAGNOSTIC] 💥 CRITICAL: Block channel was LOST after setup!");
+                    }
                 }
                 drop(block_tx_guard); // Explicitly drop the lock
             }
@@ -11135,15 +11503,21 @@ impl SimplifiedP2P {
                     // Send to node for validation and mempool addition
                     match tx_sender.send(received_tx) {
                         Ok(_) => {
-                            println!("[INFO][P2P] Transaction {} from {} queued for processing", 
-                                     &tx_hash[..tx_hash.len().min(16)], from_peer);
+                            if crate::node::is_info() {
+                                println!("[INFO][P2P] Transaction {} from {} queued for processing", 
+                                         &tx_hash[..tx_hash.len().min(16)], from_peer);
+                            }
                         }
                         Err(e) => {
-                            println!("[ERR][P2P] Failed to queue transaction: {}", e);
+                            if crate::node::is_warn() {
+                                println!("[ERR][P2P] Failed to queue transaction: {}", e);
+                            }
                         }
                     }
                 } else {
-                    println!("[WARN][P2P] Transaction channel not available - tx from {} discarded", from_peer);
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] Transaction channel not available - tx from {} discarded", from_peer);
+                    }
                 }
                 drop(tx_guard);
                 
@@ -11199,8 +11573,10 @@ impl SimplifiedP2P {
                     }
                     
                     if processed > 0 {
-                        println!("[INFO][P2P] Transaction batch: {}/{} new TXs from {} queued", 
-                                 processed, new_txs.len(), from_peer);
+                        if crate::node::is_info() {
+                            println!("[INFO][P2P] Transaction batch: {}/{} new TXs from {} queued", 
+                                     processed, new_txs.len(), from_peer);
+                        }
                     }
                 }
                 drop(tx_guard);
@@ -11219,8 +11595,10 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::PeerDiscovery { requesting_node } => {
-                println!("[INFO][P2P] Peer discovery from {} in {:?}", 
-                         requesting_node.id, requesting_node.region);
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Peer discovery from {} in {:?}", 
+                             requesting_node.id, requesting_node.region);
+                }
                 self.add_peer_to_region(requesting_node);
             }
             
@@ -11505,14 +11883,18 @@ impl SimplifiedP2P {
             
             // PRODUCTION v2.37: Handle dedicated MacroBlock broadcast (NOT ShredProtocol!)
             NetworkMessage::MacroBlockBroadcast { index, data, sender_id, epoch } => {
-                println!("[INFO][MB-RX] ← received idx={} epoch={} sender={} bytes={}", 
-                         index, epoch, get_privacy_id_for_addr(&sender_id), data.len());
+                if crate::node::is_info() {
+                    println!("[INFO][MB-RX] ← received idx={} epoch={} sender={} bytes={}", 
+                             index, epoch, get_privacy_id_for_addr(&sender_id), data.len());
+                }
                 
                 // Decompress macroblock data
                 let macroblock_data = match zstd::decode_all(&data[..]) {
                     Ok(decompressed) => decompressed,
                     Err(e) => {
-                        println!("[ERR][MB-RX] decompress failed idx={}: {}", index, e);
+                        if crate::node::is_warn() {
+                            println!("[ERR][MB-RX] decompress failed idx={}: {}", index, e);
+                        }
                         return;
                     }
                 };
@@ -11541,12 +11923,18 @@ impl SimplifiedP2P {
                     
                     if let Err(e) = macroblock_tx.send(received_macroblock) {
                         clear_macroblock_pending_sync(index); // Clear on error
-                        println!("[ERR][MB-RX] queue failed idx={}: {}", index, e);
+                        if crate::node::is_warn() {
+                            println!("[ERR][MB-RX] queue failed idx={}: {}", index, e);
+                        }
                     } else {
-                        println!("[INFO][MB-RX] queued idx={} for processing", index);
+                        if crate::node::is_info() {
+                            println!("[INFO][MB-RX] queued idx={} for processing", index);
+                        }
                     }
                 } else {
-                    println!("[WARN][MB-RX] no macroblock channel idx={}", index);
+                    if crate::node::is_warn() {
+                        println!("[WARN][MB-RX] no macroblock channel idx={}", index);
+                    }
                 }
             }
 
@@ -11650,8 +12038,10 @@ impl SimplifiedP2P {
                 // - Slashing requires cryptographic proof in MacroBlock
                 // - Jail is automatic when missing N consecutive blocks
                 // ═══════════════════════════════════════════════════════════════
-                println!("[REPUTATION] ⚠️ IGNORED ReputationSync from {} - use blockchain-based reputation", 
-                         if node_id.starts_with("genesis_node_") { node_id.clone() } else { get_privacy_id_for_addr(&node_id) });
+                if crate::node::is_info() {
+                    println!("[REPUTATION] ⚠️ IGNORED ReputationSync from {} - use blockchain-based reputation", 
+                             if node_id.starts_with("genesis_node_") { node_id.clone() } else { get_privacy_id_for_addr(&node_id) });
+                }
             }
 
             // v4.6: VRF Key Announcement — register peer's VRF public key
@@ -11684,7 +12074,9 @@ impl SimplifiedP2P {
                         let pk_hex = hex::encode(&vrf_public_key);
                         let _ = storage.save_vrf_public_key(&node_id, &pk_hex);
                     }
-                    println!("[INFO][VRF-KEY] registered node={} pk_hash={}", node_id, hex::encode(&vrf_public_key[..8]));
+                    if crate::node::is_info() {
+                        println!("[INFO][VRF-KEY] registered node={} pk_hash={}", node_id, hex::encode(&vrf_public_key[..8]));
+                    }
                 } else if crate::node::is_warn() {
                     println!("[WARN][VRF-KEY] bad_self_sig node={}", node_id);
                 }
@@ -11692,55 +12084,71 @@ impl SimplifiedP2P {
             
             NetworkMessage::RequestBlocks { from_height, to_height, requester_id } => {
                 // Handle block request for sync
-                println!("[SYNC] 📥 Received block request from {} for heights {}-{}", 
-                         requester_id, from_height, to_height);
+                if crate::node::is_info() {
+                    println!("[SYNC] 📥 Received block request from {} for heights {}-{}", 
+                             requester_id, from_height, to_height);
+                }
                 self.handle_block_request(from_peer, from_height, to_height, requester_id);
             }
             
             NetworkMessage::BlocksBatch { blocks, from_height, to_height, sender_id } => {
                 // Handle batch of blocks for sync
-                println!("[SYNC] 📦 Received {} blocks from {} (heights {}-{})", 
-                         blocks.len(), sender_id, from_height, to_height);
+                if crate::node::is_info() {
+                    println!("[SYNC] 📦 Received {} blocks from {} (heights {}-{})", 
+                             blocks.len(), sender_id, from_height, to_height);
+                }
                 self.handle_blocks_batch(blocks, from_height, to_height, sender_id);
             }
             
             NetworkMessage::SyncStatus { current_height, target_height, syncing, node_id } => {
                 // Handle sync status update
                 if syncing {
-                    println!("[SYNC] 📊 Peer {} syncing: {} / {}", node_id, current_height, target_height);
+                    if crate::node::is_info() {
+                        println!("[SYNC] 📊 Peer {} syncing: {} / {}", node_id, current_height, target_height);
+                    }
                 }
                 self.handle_sync_status(node_id, current_height, target_height, syncing);
             }
             
             NetworkMessage::RequestMacroblocks { from_index, to_index, requester_id } => {
                 // PRODUCTION: Handle macroblock request for sync
-                println!("[MACROBLOCK-SYNC] 📥 Received macroblock request from {} for indices {}-{}", 
-                         requester_id, from_index, to_index);
+                if crate::node::is_info() {
+                    println!("[MACROBLOCK-SYNC] 📥 Received macroblock request from {} for indices {}-{}", 
+                             requester_id, from_index, to_index);
+                }
                 self.handle_macroblock_request(from_peer, from_index, to_index, requester_id);
             }
             
             NetworkMessage::MacroblocksBatch { macroblocks, from_index, to_index, sender_id } => {
                 // PRODUCTION: Handle batch of macroblocks for sync
-                println!("[MACROBLOCK-SYNC] 📦 Received {} macroblocks from {} (indices {}-{})", 
-                         macroblocks.len(), sender_id, from_index, to_index);
+                if crate::node::is_info() {
+                    println!("[MACROBLOCK-SYNC] 📦 Received {} macroblocks from {} (indices {}-{})", 
+                             macroblocks.len(), sender_id, from_index, to_index);
+                }
                 self.handle_macroblocks_batch(macroblocks, from_index, to_index, sender_id);
             }
             
             NetworkMessage::RequestConsensusState { round, requester_id } => {
                 // Handle consensus state request
-                println!("[CONSENSUS] 📥 Consensus state request for round {} from {}", round, requester_id);
+                if crate::node::is_info() {
+                    println!("[CONSENSUS] 📥 Consensus state request for round {} from {}", round, requester_id);
+                }
                 self.handle_consensus_state_request(from_peer, round, requester_id);
             }
             
             NetworkMessage::ConsensusState { round, state_data, sender_id } => {
                 // Handle consensus state response
-                println!("[CONSENSUS] 📦 Received consensus state for round {} from {}", round, sender_id);
+                if crate::node::is_info() {
+                    println!("[CONSENSUS] 📦 Received consensus state for round {} from {}", round, sender_id);
+                }
                 self.handle_consensus_state(round, state_data, sender_id);
             }
             
             NetworkMessage::StateSnapshot { height, ipfs_cid, sender_id } => {
                 // Handle state snapshot announcement
-                println!("[SNAPSHOT] 📸 Received snapshot announcement for height {} with CID {} from {}", height, ipfs_cid, sender_id);
+                if crate::node::is_info() {
+                    println!("[SNAPSHOT] 📸 Received snapshot announcement for height {} with CID {} from {}", height, ipfs_cid, sender_id);
+                }
                 // In production: Store CID for potential snapshot download
                 // For now, just log the announcement
             }
@@ -11805,7 +12213,9 @@ impl SimplifiedP2P {
                 let handle = match tokio::runtime::Handle::try_current() {
                     Ok(h) => h,
                     Err(_) => {
-                        println!("[WARN][P2P] No Tokio runtime - certificate verification skipped");
+                        if crate::node::is_warn() {
+                            println!("[WARN][P2P] No Tokio runtime - certificate verification skipped");
+                        }
                         return;
                     }
                 };
@@ -11814,11 +12224,15 @@ impl SimplifiedP2P {
                 
                 // SCALABILITY: Light nodes don't participate in consensus, skip certificate processing
                 if matches!(self.node_type, NodeType::Light) {
-                    println!("[INFO][P2P] Light node: Ignoring certificate announcement (consensus not required)");
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] Light node: Ignoring certificate announcement (consensus not required)");
+                    }
                     return;
                 }
                 
-                println!("[INFO][P2P] Certificate announcement from {} (serial: {})", node_id, cert_serial);
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Certificate announcement from {} (serial: {})", node_id, cert_serial);
+                }
                 
                 // SECURITY: Rate limiting to prevent certificate flooding attacks
                 // Maximum 10 certificate announcements per minute per peer (40 for Genesis nodes)
@@ -11841,8 +12255,10 @@ impl SimplifiedP2P {
                     
                     // Check if currently blocked
                     if rate_limit.blocked_until > now {
-                        println!("[ERR][P2P] Rate limit: {} blocked from sending certificates for {} more seconds", 
-                                 node_id, rate_limit.blocked_until - now);
+                        if crate::node::is_warn() {
+                            println!("[ERR][P2P] Rate limit: {} blocked from sending certificates for {} more seconds", 
+                                     node_id, rate_limit.blocked_until - now);
+                        }
                         true
                     } else {
                         // Clean old requests outside window
@@ -11852,9 +12268,13 @@ impl SimplifiedP2P {
                         // Check if limit exceeded
                         if rate_limit.requests.len() >= rate_limit.max_requests {
                             rate_limit.blocked_until = now + 300; // Block for 5 minutes (stricter for certificates)
-                            println!("[P2P] ⛔ Certificate rate limit exceeded for {} ({}+ certificates/minute)", 
-                                     node_id, rate_limit.max_requests);
-                            println!("[P2P]    Blocking certificate announcements for 5 minutes");
+                            if crate::node::is_info() {
+                                println!("[P2P] ⛔ Certificate rate limit exceeded for {} ({}+ certificates/minute)", 
+                                         node_id, rate_limit.max_requests);
+                            }
+                            if crate::node::is_info() {
+                                println!("[P2P]    Blocking certificate announcements for 5 minutes");
+                            }
                             true
                         } else {
                             // Add this request
@@ -11865,7 +12285,9 @@ impl SimplifiedP2P {
                 };
                 
                 if rate_limited {
-                    println!("[P2P] 🚫 Certificate announcement rejected due to rate limiting");
+                    if crate::node::is_info() {
+                        println!("[P2P] 🚫 Certificate announcement rejected due to rate limiting");
+                    }
                     // SECURITY: Rate limiting violation indicates potential DoS attack
                     self.update_peer_reputation(&node_id, ReputationEvent::ConnectionFailure);
                     self.track_invalid_certificate(&node_id, "RATE_LIMIT_EXCEEDED");
@@ -11877,7 +12299,9 @@ impl SimplifiedP2P {
                 let cert: crate::hybrid_crypto::HybridCertificate = match bincode::deserialize(&certificate) {
                     Ok(c) => c,
                     Err(e) => {
-                        println!("[P2P] ❌ Invalid certificate format from {}: {}", node_id, e);
+                        if crate::node::is_info() {
+                            println!("[P2P] ❌ Invalid certificate format from {}: {}", node_id, e);
+                        }
                         // v2.21.5: Create SlashingEvent for invalid certificate attack
                         let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                         self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid certificate format");
@@ -11888,13 +12312,21 @@ impl SimplifiedP2P {
                 
                 // CRITICAL SECURITY: Verify node_id matches certificate owner to prevent spoofing
                 if cert.node_id != node_id {
-                    println!("[P2P] 🚨 SECURITY: Certificate spoofing attempt detected!");
-                    println!("[P2P]    Sender claims to be: {}", node_id);
-                    println!("[P2P]    Certificate owner is: {}", cert.node_id);
+                    if crate::node::is_info() {
+                        println!("[P2P] 🚨 SECURITY: Certificate spoofing attempt detected!");
+                    }
+                    if crate::node::is_info() {
+                        println!("[P2P]    Sender claims to be: {}", node_id);
+                    }
+                    if crate::node::is_info() {
+                        println!("[P2P]    Certificate owner is: {}", cert.node_id);
+                    }
                     
                     // CRITICAL: Certificate spoofing is a CRITICAL ATTACK
                     // Penalty will be applied via SlashingEvent in MacroBlock
-                    println!("[SECURITY] 🚨 Certificate spoofing from {} - will be slashed in MacroBlock", node_id);
+                    if crate::node::is_info() {
+                        println!("[SECURITY] 🚨 Certificate spoofing from {} - will be slashed in MacroBlock", node_id);
+                    }
                     self.track_invalid_certificate(&node_id, "CERTIFICATE_SPOOFING");
                     
                     if !self.is_genesis_node(&node_id) {
@@ -11917,9 +12349,15 @@ impl SimplifiedP2P {
                 // SECURITY: Prevents replay attacks while allowing propagation time
                 const MAX_CERT_AGE: u64 = 540; // 9 minutes (2× certificate lifetime)
                 if cert_age > MAX_CERT_AGE {
-                    println!("[P2P] ❌ Certificate too old (possible replay attack)");
-                    println!("[P2P]    Certificate age: {} seconds", cert_age);
-                    println!("[P2P]    Maximum allowed: {} seconds", MAX_CERT_AGE);
+                    if crate::node::is_info() {
+                        println!("[P2P] ❌ Certificate too old (possible replay attack)");
+                    }
+                    if crate::node::is_info() {
+                        println!("[P2P]    Certificate age: {} seconds", cert_age);
+                    }
+                    if crate::node::is_info() {
+                        println!("[P2P]    Maximum allowed: {} seconds", MAX_CERT_AGE);
+                    }
                     return;
                 }
                 
@@ -11927,17 +12365,25 @@ impl SimplifiedP2P {
                 // v2.64: 60 second grace period for network propagation delays
                 const CERTIFICATE_GRACE_PERIOD_SECS: u64 = 60;
                 if now > cert.expires_at + CERTIFICATE_GRACE_PERIOD_SECS {
-                    println!("[P2P] ❌ Certificate expired at {}, current time: {} (beyond {}s grace)", 
-                             cert.expires_at, now, CERTIFICATE_GRACE_PERIOD_SECS);
+                    if crate::node::is_info() {
+                        println!("[P2P] ❌ Certificate expired at {}, current time: {} (beyond {}s grace)", 
+                                 cert.expires_at, now, CERTIFICATE_GRACE_PERIOD_SECS);
+                    }
                     return;
                 }
                 
                 // SECURITY: Check certificate is not from the future (clock skew tolerance: 60 seconds)
                 const MAX_CLOCK_SKEW: u64 = 60; // 60 seconds clock skew tolerance
                 if cert.issued_at > now + MAX_CLOCK_SKEW {
-                    println!("[P2P] ❌ Certificate from the future (clock skew issue)");
-                    println!("[P2P]    Certificate issued at: {}", cert.issued_at);
-                    println!("[P2P]    Current time: {}", now);
+                    if crate::node::is_info() {
+                        println!("[P2P] ❌ Certificate from the future (clock skew issue)");
+                    }
+                    if crate::node::is_info() {
+                        println!("[P2P]    Certificate issued at: {}", cert.issued_at);
+                    }
+                    if crate::node::is_info() {
+                        println!("[P2P]    Current time: {}", now);
+                    }
                     return;
                 }
                 
@@ -11950,7 +12396,9 @@ impl SimplifiedP2P {
                     // Check if already in pending or verified
                     if cert_manager.remote_certificates.contains_key(&cert_serial) ||
                        cert_manager.pending_certificates.contains_key(&cert_serial) {
-                        println!("[P2P] ⏭️  Certificate {} already cached, skipping", cert_serial);
+                        if crate::node::is_info() {
+                            println!("[P2P] ⏭️  Certificate {} already cached, skipping", cert_serial);
+                        }
                         return;
                     }
                     
@@ -11963,7 +12411,9 @@ impl SimplifiedP2P {
                             .min_by_key(|(_, (_, timestamp, _))| timestamp)
                             .map(|(k, v)| (k.clone(), v.clone())) {
                             cert_manager.pending_certificates.remove(&oldest_serial);
-                            println!("[P2P] ⚠️ Pending cache full, evicted oldest: {}", oldest_serial);
+                            if crate::node::is_info() {
+                                println!("[P2P] ⚠️ Pending cache full, evicted oldest: {}", oldest_serial);
+                            }
                         }
                     }
                     
@@ -11973,7 +12423,9 @@ impl SimplifiedP2P {
                         cert_serial.clone(),
                         (compressed, now, node_id.clone())
                     );
-                    println!("[P2P] ⏳ Certificate {} stored in PENDING cache for immediate use", cert_serial);
+                    if crate::node::is_info() {
+                        println!("[P2P] ⏳ Certificate {} stored in PENDING cache for immediate use", cert_serial);
+                    }
                 }
                 
                 // Clone values needed for async verification
@@ -12013,7 +12465,9 @@ impl SimplifiedP2P {
                     // Perform cryptographic verification
                     match quantum_crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_sig, &cert.node_id).await {
                         Ok(true) => {
-                            println!("[INFO][CERT] verified serial={} node={}", cert_serial_clone, cert.node_id);
+                            if crate::node::is_info() {
+                                println!("[INFO][CERT] verified serial={} node={}", cert_serial_clone, cert.node_id);
+                            }
                             
                             // ═══════════════════════════════════════════════════════════════════
                             // v3.50: DILITHIUM-ONLY CERTIFICATE ACCEPTANCE
@@ -12040,7 +12494,9 @@ impl SimplifiedP2P {
                                 // This prevents race condition where cert is in neither cache
                                 cert_manager.store_remote_certificate(cert_serial_clone.clone(), certificate_clone);
                                 cert_manager.pending_certificates.remove(&cert_serial_clone);
-                                println!("[INFO][CERT] stored serial={} node={} status=dilithium_verified", cert_serial_clone, cert.node_id);
+                                if crate::node::is_info() {
+                                    println!("[INFO][CERT] stored serial={} node={} status=dilithium_verified", cert_serial_clone, cert.node_id);
+                                }
                                 
                                 // FIX v2.28: Signal retry loop that new certificate is available
                                 // This triggers immediate retry of buffered blocks
@@ -12048,13 +12504,19 @@ impl SimplifiedP2P {
                             }
                         }
                         Ok(false) => {
-                            println!("[WARN][CERT] invalid_signature serial={} from={}", cert_serial_clone, node_id_clone);
-                            println!("[WARN][SECURITY] potential_attack type=invalid_cert from={}", node_id_clone);
+                            if crate::node::is_warn() {
+                                println!("[WARN][CERT] invalid_signature serial={} from={}", cert_serial_clone, node_id_clone);
+                            }
+                            if crate::node::is_warn() {
+                                println!("[WARN][SECURITY] potential_attack type=invalid_cert from={}", node_id_clone);
+                            }
                             
                             // CRITICAL: Remove invalid certificate from pending cache
                             let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             cert_manager.pending_certificates.remove(&cert_serial_clone);
-                            println!("[INFO][CERT] removed serial={} reason=invalid", cert_serial_clone);
+                            if crate::node::is_info() {
+                                println!("[INFO][CERT] removed serial={} reason=invalid", cert_serial_clone);
+                            }
                             
                             // Apply reputation penalty
                             if let Ok(mut rep) = reputation_system_clone.lock() {
@@ -12062,12 +12524,16 @@ impl SimplifiedP2P {
                             }
                         }
                         Err(e) => {
-                            println!("[ERR][CERT] verification_error serial={} err={}", cert_serial_clone, e);
+                            if crate::node::is_warn() {
+                                println!("[ERR][CERT] verification_error serial={} err={}", cert_serial_clone, e);
+                            }
                             
                             // Remove failed certificate from pending cache
                             let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             cert_manager.pending_certificates.remove(&cert_serial_clone);
-                            println!("[INFO][CERT] removed serial={} reason=verification_failed", cert_serial_clone);
+                            if crate::node::is_info() {
+                                println!("[INFO][CERT] removed serial={} reason=verification_failed", cert_serial_clone);
+                            }
                         }
                     }
                     
@@ -12081,7 +12547,9 @@ impl SimplifiedP2P {
                         cert_manager.pending_certificates.retain(|_, (_, timestamp, _)| {
                             now - *timestamp < 300 // Remove pending certs older than 5 minutes
                         });
-                        println!("[INFO][CERT] cleanup_expired pending_ttl=300s");
+                        if crate::node::is_info() {
+                            println!("[INFO][CERT] cleanup_expired pending_ttl=300s");
+                        }
                     }
                 });
             }
@@ -12091,13 +12559,17 @@ impl SimplifiedP2P {
                 let handle = match tokio::runtime::Handle::try_current() {
                     Ok(h) => h,
                     Err(_) => {
-                        println!("[WARN][CERT] no_runtime action=skip_request");
+                        if crate::node::is_warn() {
+                            println!("[WARN][CERT] no_runtime action=skip_request");
+                        }
                         return;
                     }
                 };
 
                 self.update_peer_last_seen(&requester_id);
-                println!("[DBG][CERT] request_received from={} serial={}", requester_id, cert_serial);
+                if crate::node::is_debug() {
+                    println!("[DBG][CERT] request_received from={} serial={}", requester_id, cert_serial);
+                }
                 
                 // Check if we have the certificate and send response
                 // MUST use write lock to track usage_count for proper LRU
@@ -12105,7 +12577,9 @@ impl SimplifiedP2P {
                 if let Some(certificate) = cert_manager.get_and_mark_used(&cert_serial) {
                     drop(cert_manager); // Release lock before network operations
                     
-                    println!("[INFO][CERT] sending serial={} to={}", cert_serial, requester_id);
+                    if crate::node::is_info() {
+                        println!("[INFO][CERT] sending serial={} to={}", cert_serial, requester_id);
+                    }
                     
                     // PRODUCTION: Send response back via network
                     let response = NetworkMessage::CertificateResponse {
@@ -12135,10 +12609,14 @@ impl SimplifiedP2P {
                                             
                                             let transport_guard = transport.read().await;
                                             if let Err(e) = transport_guard.broadcast_to(quic_addr, &response_clone).await {
-                                                println!("[QUIC] ❌ Certificate response failed to {}: {}", 
-                                                    get_privacy_id_for_addr(&peer_addr_clone), e);
+                                                if crate::node::is_info() {
+                                                    println!("[QUIC] ❌ Certificate response failed to {}: {}", 
+                                                        get_privacy_id_for_addr(&peer_addr_clone), e);
+                                                }
                                             } else {
-                                                println!("[QUIC] 📤 Certificate response sent to {}", requester_id_clone);
+                                                if crate::node::is_info() {
+                                                    println!("[QUIC] 📤 Certificate response sent to {}", requester_id_clone);
+                                                }
                                             }
                                         }
                                     }
@@ -12146,21 +12624,29 @@ impl SimplifiedP2P {
                             }
                         });
                     } else {
-                        println!("[WARN][P2P] Cannot find address for requester {}", requester_id);
+                        if crate::node::is_warn() {
+                            println!("[WARN][P2P] Cannot find address for requester {}", requester_id);
+                        }
                     }
                 } else {
-                    println!("[ERR][P2P] Certificate {} not found in cache", cert_serial);
+                    if crate::node::is_warn() {
+                        println!("[ERR][P2P] Certificate {} not found in cache", cert_serial);
+                    }
                 }
             }
             
             NetworkMessage::CertificateResponse { node_id, cert_serial, certificate, timestamp: _timestamp } => {
                 self.update_peer_last_seen(&node_id);
-                println!("[INFO][P2P] Certificate response from {} (serial: {})", node_id, cert_serial);
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Certificate response from {} (serial: {})", node_id, cert_serial);
+                }
                 
                 // Store received certificate
                 let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
                 cert_manager.store_remote_certificate(cert_serial.clone(), certificate);
-                println!("[INFO][P2P] Received certificate {} cached", cert_serial);
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] Received certificate {} cached", cert_serial);
+                }
                 
                 // FIX v2.28: Signal retry loop that new certificate is available
                 crate::node::NEW_CERTIFICATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12273,7 +12759,9 @@ impl SimplifiedP2P {
                         for (key, _) in entries.into_iter().take(evict_count) {
                             registry.remove(&key);
                         }
-                        println!("[REGISTRY] 🧹 LRU evicted {} oldest Light nodes", evict_count);
+                        if crate::node::is_info() {
+                            println!("[REGISTRY] 🧹 LRU evicted {} oldest Light nodes", evict_count);
+                        }
                     }
                     
                     registry.insert(node_id.clone(), LightNodeRegistrationData {
@@ -12335,7 +12823,9 @@ impl SimplifiedP2P {
             // PRODUCTION: Light Node registry sync request
             NetworkMessage::LightNodeRegistryRequest { requester_id, last_sync_timestamp } => {
                 self.update_peer_last_seen(from_peer);
-                println!("[SYNC] 📥 Light node registry request from {} (since {})", requester_id, last_sync_timestamp);
+                if crate::node::is_info() {
+                    println!("[SYNC] 📥 Light node registry request from {} (since {})", requester_id, last_sync_timestamp);
+                }
                 
                 // Collect registrations newer than or equal to last_sync_timestamp
                 // FIX: Use >= to include nodes registered at exactly last_sync_timestamp
@@ -12367,8 +12857,10 @@ impl SimplifiedP2P {
             // PRODUCTION: Light Node registry sync response
             NetworkMessage::LightNodeRegistryResponse { sender_id, registrations, total_count } => {
                 self.update_peer_last_seen(from_peer);
-                println!("[SYNC] 📥 Light node registry response from {} ({} nodes, {} total)", 
-                         sender_id, registrations.len(), total_count);
+                if crate::node::is_info() {
+                    println!("[SYNC] 📥 Light node registry response from {} ({} nodes, {} total)", 
+                             sender_id, registrations.len(), total_count);
+                }
                 
                 // Merge into local registry
                 let mut added = 0;
@@ -12382,7 +12874,9 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                println!("[SYNC] ✅ Added {} new Light nodes to registry", added);
+                if crate::node::is_info() {
+                    println!("[SYNC] ✅ Added {} new Light nodes to registry", added);
+                }
             }
             
             // PRODUCTION: Light Node attestation - proof of ping response
@@ -12413,15 +12907,19 @@ impl SimplifiedP2P {
                     .unwrap_or_default()
                     .as_secs();
                 if timestamp > now + 300 || timestamp < now.saturating_sub(300) {
-                    println!("[ATTESTATION] ❌ Invalid timestamp for {} (drift: {}s)", 
-                             light_node_id, now as i64 - timestamp as i64);
+                    if crate::node::is_info() {
+                        println!("[ATTESTATION] ❌ Invalid timestamp for {} (drift: {}s)", 
+                                 light_node_id, now as i64 - timestamp as i64);
+                    }
                     return;
                 }
                 
                 // VERIFY: Pinger must be in active Full/Super nodes list
                 // v2.51: Lock-free check
                 if !self.active_full_super_nodes.contains_key(&pinger_id) && !pinger_id.starts_with("genesis_node_") {
-                    println!("[ATTESTATION] ❌ Unknown pinger {} for Light node {}", pinger_id, light_node_id);
+                    if crate::node::is_info() {
+                        println!("[ATTESTATION] ❌ Unknown pinger {} for Light node {}", pinger_id, light_node_id);
+                    }
                     return;
                 }
                 
@@ -12429,7 +12927,9 @@ impl SimplifiedP2P {
                 {
                     let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     if !registry.contains_key(&light_node_id) {
-                        println!("[ATTESTATION] ❌ Unknown Light node {}", light_node_id);
+                        if crate::node::is_info() {
+                            println!("[ATTESTATION] ❌ Unknown Light node {}", light_node_id);
+                        }
                         return;
                     }
                 }
@@ -12438,7 +12938,9 @@ impl SimplifiedP2P {
                 let attestation_data = format!("attestation:{}:{}:{}:{}", 
                     light_node_id, slot, timestamp, challenge);
                 if !self.verify_dilithium_heartbeat_signature(&attestation_data, &pinger_signature, &pinger_id) {
-                    println!("[ATTESTATION] ❌ Invalid pinger signature for {}", light_node_id);
+                    if crate::node::is_info() {
+                        println!("[ATTESTATION] ❌ Invalid pinger signature for {}", light_node_id);
+                    }
                     return;
                 }
                 
@@ -12453,7 +12955,9 @@ impl SimplifiedP2P {
                         attestations.retain(|_, v| v.timestamp > cutoff);
                         let removed = before - attestations.len();
                         if removed > 0 {
-                            println!("[ATTESTATION] 🧹 Cleaned up {} old attestations", removed);
+                            if crate::node::is_info() {
+                                println!("[ATTESTATION] 🧹 Cleaned up {} old attestations", removed);
+                            }
                         }
                     }
                     
@@ -12472,8 +12976,10 @@ impl SimplifiedP2P {
                 // WHITEPAPER: Light nodes have FIXED reputation of 70
                 // NO reputation changes for Light nodes - they are always eligible if attested
                 
-                println!("[ATTESTATION] ✅ Light node {} attested by {} in slot {} height={}", 
-                         light_node_id, pinger_id, slot, block_height);
+                if crate::node::is_info() {
+                    println!("[ATTESTATION] ✅ Light node {} attested by {} in slot {} height={}", 
+                             light_node_id, pinger_id, slot, block_height);
+                }
                 
                 // RE-GOSSIP
                 let forward_msg = NetworkMessage::LightNodeAttestation {
@@ -12664,16 +13170,22 @@ impl SimplifiedP2P {
                         (entry.0, entry.1)
                     };
                     
-                    println!("[SECURITY] ⚠️ Empty active nodes response from {} (count: {}, since: {}s ago)", 
-                             sender_id, count, now - first_empty);
+                    if crate::node::is_info() {
+                        println!("[SECURITY] ⚠️ Empty active nodes response from {} (count: {}, since: {}s ago)", 
+                                 sender_id, count, now - first_empty);
+                    }
                     
                     // After 5 empty responses in 10 minutes, apply reputation penalty
                     if count >= 5 && (now - first_empty) < 600 {
-                        println!("[SECURITY] 🚨 {} returned 5+ empty responses - possible attack or corrupted state", sender_id);
+                        if crate::node::is_info() {
+                            println!("[SECURITY] 🚨 {} returned 5+ empty responses - possible attack or corrupted state", sender_id);
+                        }
                         
                         // v2.21.5: Penalties now via slashing events in macroblock
                         // Report as minor offense
-                        println!("[SECURITY] ⚠️ {} flagged for repeated empty responses - will be penalized in next macroblock", sender_id);
+                        if crate::node::is_info() {
+                            println!("[SECURITY] ⚠️ {} flagged for repeated empty responses - will be penalized in next macroblock", sender_id);
+                        }
                         
                         // Reset counter
                         EMPTY_RESPONSE_TRACKER.remove(&sender_id);
@@ -12707,19 +13219,29 @@ impl SimplifiedP2P {
             // PRODUCTION: Handle system events (reorg, emergency, etc.)
             NetworkMessage::SystemEvent { event_type, data, timestamp: _timestamp, from_node } => {
                 self.update_peer_last_seen(from_peer);
-                println!("[P2P] 📢 System event '{}' from {}", event_type, from_node);
+                if crate::node::is_info() {
+                    println!("[P2P] 📢 System event '{}' from {}", event_type, from_node);
+                }
                 
                 // Log event details for monitoring
                 match event_type.as_str() {
                     "chain_reorg" => {
-                        println!("[P2P] ⚠️ Chain reorganization detected from peer {}", from_node);
-                        println!("[P2P] 📊 Reorg data: {}", data);
+                        if crate::node::is_info() {
+                            println!("[P2P] ⚠️ Chain reorganization detected from peer {}", from_node);
+                        }
+                        if crate::node::is_info() {
+                            println!("[P2P] 📊 Reorg data: {}", data);
+                        }
                     }
                     "emergency_shutdown" => {
-                        println!("[P2P] 🚨 Emergency shutdown notification from {}", from_node);
+                        if crate::node::is_info() {
+                            println!("[P2P] 🚨 Emergency shutdown notification from {}", from_node);
+                        }
                     }
                     _ => {
-                        println!("[P2P] ℹ️ Unknown system event: {}", event_type);
+                        if crate::node::is_info() {
+                            println!("[P2P] ℹ️ Unknown system event: {}", event_type);
+                        }
                     }
                 }
             }
@@ -12949,8 +13471,10 @@ impl SimplifiedP2P {
             }
         });
 
-        println!("[INFO][DHT] Kademlia routing table refresh task started (interval={}s)",
-                 KADEMLIA_REFRESH_INTERVAL_SECS);
+        if crate::node::is_info() {
+            println!("[INFO][DHT] Kademlia routing table refresh task started (interval={}s)",
+                     KADEMLIA_REFRESH_INTERVAL_SECS);
+        }
     }
 
     /// Get the Kademlia routing table (for external access/monitoring)
@@ -13100,7 +13624,9 @@ impl SimplifiedP2P {
         use crate::quantum_crypto::DilithiumSignature;
                 // Check for empty/invalid signatures
         if signature.is_empty() || signature.len() < 100 {
-            println!("[HEARTBEAT] ❌ Invalid signature format: too short ({} chars, need 100+)", signature.len());
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] ❌ Invalid signature format: too short ({} chars, need 100+)", signature.len());
+            }
             return false;
         }
         
@@ -13126,8 +13652,10 @@ impl SimplifiedP2P {
         
         // LEGACY FORMAT: Pure Dilithium signature (for backward compatibility)
         if !signature.starts_with("dilithium_sig_") {
-            println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix (got: {}...)", 
-                     &signature[..signature.len().min(20)]);
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix (got: {}...)", 
+                         &signature[..signature.len().min(20)]);
+            }
             return false;
         }
         
@@ -13158,14 +13686,20 @@ impl SimplifiedP2P {
         match crypto.verify_dilithium_signature(message, &dilithium_sig, node_id).await {
             Ok(valid) => {
                 if valid {
-                    println!("[HEARTBEAT] ✅ Dilithium signature verified for {}", node_id);
+                    if crate::node::is_info() {
+                        println!("[HEARTBEAT] ✅ Dilithium signature verified for {}", node_id);
+                    }
                 } else {
-                    println!("[HEARTBEAT] ❌ Invalid Dilithium signature for {}", node_id);
+                    if crate::node::is_info() {
+                        println!("[HEARTBEAT] ❌ Invalid Dilithium signature for {}", node_id);
+                    }
                 }
                 valid
             }
             Err(e) => {
-                println!("[HEARTBEAT] ❌ Dilithium verification error for {}: {}", node_id, e);
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Dilithium verification error for {}: {}", node_id, e);
+                }
                 false  // NO FALLBACK - reject invalid signatures
             }
         }
@@ -13184,7 +13718,9 @@ impl SimplifiedP2P {
         let binary_data = match general_purpose::STANDARD.decode(base64_data) {
             Ok(data) => data,
             Err(e) => {
-                println!("[HEARTBEAT] ❌ Failed to decode base64: {}", e);
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Failed to decode base64: {}", e);
+                }
                 return false;
             }
         };
@@ -13192,20 +13728,26 @@ impl SimplifiedP2P {
         let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
             Ok(sig) => sig,
             Err(e) => {
-                println!("[HEARTBEAT] ❌ Failed to parse binary signature: {}", e);
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Failed to parse binary signature: {}", e);
+                }
                 return false;
             }
         };
         
         // v2.24: Direct node_id comparison
         if compact_sig.node_id != node_id {
-            println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
+            }
             return false;
         }
         
         // Step 1: Verify ephemeral key is present
         if compact_sig.ephemeral_public_key.iter().all(|&b| b == 0) {
-            println!("[HEARTBEAT] ❌ Ephemeral public key is all zeros!");
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] ❌ Ephemeral public key is all zeros!");
+            }
             return false;
         }
         
@@ -13221,18 +13763,24 @@ impl SimplifiedP2P {
         ) {
             Ok(true) => {} // OK
             Ok(false) => {
-                println!("[HEARTBEAT] ❌ Ed25519 signature INVALID!");
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Ed25519 signature INVALID!");
+                }
                 return false;
             }
             Err(e) => {
-                println!("[HEARTBEAT] ❌ Ed25519 verification error: {}", e);
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Ed25519 verification error: {}", e);
+                }
                 return false;
             }
         }
         
         // Step 3: Verify Dilithium signature
         if compact_sig.dilithium_key_signature.is_empty() {
-            println!("[HEARTBEAT] ❌ REJECTED: No Dilithium key signature!");
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] ❌ REJECTED: No Dilithium key signature!");
+            }
             return false;
         }
         
@@ -13268,15 +13816,21 @@ impl SimplifiedP2P {
         
         match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
             Ok(true) => {
-                println!("[HEARTBEAT] ✅ Binary signature verified (v2.24)");
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ✅ Binary signature verified (v2.24)");
+                }
                 true
             }
             Ok(false) => {
-                println!("[HEARTBEAT] ❌ Dilithium signature INVALID!");
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Dilithium signature INVALID!");
+                }
                 false
             }
             Err(e) => {
-                println!("[HEARTBEAT] ❌ Dilithium verification error: {}", e);
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Dilithium verification error: {}", e);
+                }
                 false
             }
         }
@@ -13293,20 +13847,26 @@ impl SimplifiedP2P {
         let compact_sig: CompactHybridSignature = match serde_json::from_str(json_str) {
             Ok(sig) => sig,
             Err(e) => {
-                println!("[HEARTBEAT] ❌ Failed to parse hybrid signature: {}", e);
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Failed to parse hybrid signature: {}", e);
+                }
                 return false;
             }
         };
         
         // v2.24: Direct node_id comparison
         if compact_sig.node_id != node_id {
-            println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
+            }
             return false;
         }
         
         // Step 1: Verify ephemeral key is present
         if compact_sig.ephemeral_public_key.iter().all(|&b| b == 0) {
-            println!("[HEARTBEAT] ❌ Ephemeral public key is all zeros!");
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] ❌ Ephemeral public key is all zeros!");
+            }
             return false;
         }
         
@@ -13322,18 +13882,24 @@ impl SimplifiedP2P {
         ) {
             Ok(true) => println!("[HEARTBEAT] ✅ Ed25519 signature verified with ephemeral key"),
             Ok(false) => {
-                println!("[HEARTBEAT] ❌ Ed25519 signature INVALID!");
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Ed25519 signature INVALID!");
+                }
                 return false;
             }
             Err(e) => {
-                println!("[HEARTBEAT] ❌ Ed25519 verification error: {}", e);
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Ed25519 verification error: {}", e);
+                }
                 return false;
             }
         }
         
         // OPTIMIZED v2.23: RAW bytes, single Dilithium signature (includes message_hash)
         if compact_sig.dilithium_key_signature.is_empty() {
-            println!("[HEARTBEAT] ❌ REJECTED: No Dilithium key signature!");
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] ❌ REJECTED: No Dilithium key signature!");
+            }
             return false;
         }
         
@@ -13369,15 +13935,21 @@ impl SimplifiedP2P {
         
         match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
             Ok(true) => {
-                println!("[HEARTBEAT] ✅ Signature verified (NIST/Cisco hybrid)");
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ✅ Signature verified (NIST/Cisco hybrid)");
+                }
                 true
             }
             Ok(false) => {
-                println!("[HEARTBEAT] ❌ Dilithium signature INVALID!");
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Dilithium signature INVALID!");
+                }
                 false
             }
             Err(e) => {
-                println!("[HEARTBEAT] ❌ Dilithium verification error: {}", e);
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Dilithium verification error: {}", e);
+                }
                 false
             }
         }
@@ -13391,7 +13963,9 @@ impl SimplifiedP2P {
         
         // Check for empty/invalid signatures
         if signature.is_empty() || signature.len() < 100 {
-            println!("[HEARTBEAT] ❌ Invalid signature format: too short ({} chars, need 100+)", signature.len());
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] ❌ Invalid signature format: too short ({} chars, need 100+)", signature.len());
+            }
             return false;
         }
         
@@ -13419,8 +13993,10 @@ impl SimplifiedP2P {
         
         // LEGACY FORMAT: Pure Dilithium signature
         if !signature.starts_with("dilithium_sig_") {
-            println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix (got: {}...)", 
-                     &signature[..signature.len().min(20)]);
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] ❌ Invalid signature format: unknown prefix (got: {}...)", 
+                         &signature[..signature.len().min(20)]);
+            }
             return false;
         }
         
@@ -13466,21 +14042,29 @@ impl SimplifiedP2P {
                         match crypto.verify_dilithium_signature(&message, &dilithium_sig, &node_id).await {
                             Ok(valid) => {
                                 if valid {
-                                    println!("[HEARTBEAT] ✅ Dilithium signature verified for {}", node_id);
+                                    if crate::node::is_info() {
+                                        println!("[HEARTBEAT] ✅ Dilithium signature verified for {}", node_id);
+                                    }
                                 } else {
-                                    println!("[HEARTBEAT] ❌ Invalid Dilithium signature for {}", node_id);
+                                    if crate::node::is_info() {
+                                        println!("[HEARTBEAT] ❌ Invalid Dilithium signature for {}", node_id);
+                                    }
                                 }
                                 valid
                             }
                             Err(e) => {
-                                println!("[HEARTBEAT] ❌ Dilithium verification error for {}: {}", node_id, e);
+                                if crate::node::is_info() {
+                                    println!("[HEARTBEAT] ❌ Dilithium verification error for {}: {}", node_id, e);
+                                }
                                 false  // NO FALLBACK - reject invalid signatures
                             }
                         }
                     })
                 }
                 Err(e) => {
-                    println!("[HEARTBEAT] ❌ Cannot create runtime for verification: {}", e);
+                    if crate::node::is_info() {
+                        println!("[HEARTBEAT] ❌ Cannot create runtime for verification: {}", e);
+                    }
                     false
                 }
             }
@@ -13490,7 +14074,9 @@ impl SimplifiedP2P {
         match handle.join() {
             Ok(result) => result,
             Err(_) => {
-                println!("[HEARTBEAT] ❌ Verification thread panicked");
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Verification thread panicked");
+                }
                 false
             }
         }
@@ -13522,7 +14108,9 @@ impl SimplifiedP2P {
             let binary_data = match general_purpose::STANDARD.decode(base64_data) {
                 Ok(data) => data,
                 Err(e) => {
-                    println!("[HEARTBEAT] ❌ Failed to decode base64 (sync): {}", e);
+                    if crate::node::is_info() {
+                        println!("[HEARTBEAT] ❌ Failed to decode base64 (sync): {}", e);
+                    }
                     return false;
                 }
             };
@@ -13530,14 +14118,18 @@ impl SimplifiedP2P {
             let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
                 Ok(sig) => sig,
                 Err(e) => {
-                    println!("[HEARTBEAT] ❌ Failed to parse binary signature (sync): {}", e);
+                    if crate::node::is_info() {
+                        println!("[HEARTBEAT] ❌ Failed to parse binary signature (sync): {}", e);
+                    }
                     return false;
                 }
             };
             
             // v2.24: Direct node_id comparison
             if compact_sig.node_id != node_id {
-                println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
+                }
                 return false;
             }
             
@@ -13553,7 +14145,9 @@ impl SimplifiedP2P {
             ) {
                 Ok(true) => {} // OK
                 _ => {
-                    println!("[HEARTBEAT] ❌ Ed25519 signature INVALID (sync)!");
+                    if crate::node::is_info() {
+                        println!("[HEARTBEAT] ❌ Ed25519 signature INVALID (sync)!");
+                    }
                     return false;
                 }
             }
@@ -13587,7 +14181,9 @@ impl SimplifiedP2P {
                         
                         match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
                             Ok(true) => {
-                                println!("[HEARTBEAT] ✅ Binary signature verified (sync v2.24)");
+                                if crate::node::is_info() {
+                                    println!("[HEARTBEAT] ✅ Binary signature verified (sync v2.24)");
+                                }
                                 true
                             }
                             _ => false
@@ -13868,20 +14464,26 @@ impl SimplifiedP2P {
                         let compact_sig: CompactHybridSignature = match serde_json::from_str(json_str) {
                             Ok(sig) => sig,
                             Err(e) => {
-                                println!("[HEARTBEAT] ❌ Failed to parse hybrid signature: {}", e);
+                                if crate::node::is_info() {
+                                    println!("[HEARTBEAT] ❌ Failed to parse hybrid signature: {}", e);
+                                }
                                 return false;
                             }
                         };
                         
                         // Verify ephemeral key present
                         if compact_sig.ephemeral_public_key.iter().all(|&b| b == 0) {
-                            println!("[HEARTBEAT] ❌ Ephemeral public key is all zeros!");
+                            if crate::node::is_info() {
+                                println!("[HEARTBEAT] ❌ Ephemeral public key is all zeros!");
+                            }
                             return false;
                         }
                         
                         // OPTIMIZED v2.23: RAW bytes, only key signature required
                         if compact_sig.dilithium_key_signature.is_empty() {
-                            println!("[HEARTBEAT] ❌ Missing Dilithium key signature!");
+                            if crate::node::is_info() {
+                                println!("[HEARTBEAT] ❌ Missing Dilithium key signature!");
+                            }
                             return false;
                         }
                         
@@ -13898,7 +14500,9 @@ impl SimplifiedP2P {
                         ) {
                             Ok(true) => {}
                             _ => {
-                                println!("[HEARTBEAT] ❌ Ed25519 signature INVALID!");
+                                if crate::node::is_info() {
+                                    println!("[HEARTBEAT] ❌ Ed25519 signature INVALID!");
+                                }
                                 return false;
                             }
                         }
@@ -13931,18 +14535,24 @@ impl SimplifiedP2P {
                         // OPTIMIZED v2.23: Single Dilithium signature verification
                         match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
                             Ok(true) => {
-                                println!("[HEARTBEAT] ✅ HYBRID signature verified (NIST/Cisco)");
+                                if crate::node::is_info() {
+                                    println!("[HEARTBEAT] ✅ HYBRID signature verified (NIST/Cisco)");
+                                }
                                 true
                             }
                             _ => {
-                                println!("[HEARTBEAT] ❌ Dilithium signature INVALID!");
+                                if crate::node::is_info() {
+                                    println!("[HEARTBEAT] ❌ Dilithium signature INVALID!");
+                                }
                                 false
                             }
                         }
                     })
                 }
                 Err(e) => {
-                    println!("[HEARTBEAT] ❌ Cannot create runtime: {}", e);
+                    if crate::node::is_info() {
+                        println!("[HEARTBEAT] ❌ Cannot create runtime: {}", e);
+                    }
                     false
                 }
             }
@@ -13951,7 +14561,9 @@ impl SimplifiedP2P {
         match handle.join() {
             Ok(result) => result,
             Err(_) => {
-                println!("[HEARTBEAT] ❌ Hybrid verification thread panicked");
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ Hybrid verification thread panicked");
+                }
                 false
             }
         }
@@ -14022,7 +14634,9 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[HEARTBEAT] ❌ No tokio runtime available - heartbeat service NOT started!");
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] ❌ No tokio runtime available - heartbeat service NOT started!");
+                }
                 return;
             }
         };
@@ -14268,8 +14882,10 @@ impl SimplifiedP2P {
                 
                 if sleep_seconds >= 30 && crate::node::is_info() {
                     if let Some(target) = heartbeat_heights.iter().find(|&&h| h > block_height) {
-                        println!("[INFO][HEARTBEAT] idle node={} height={} next_target={} sleep={}s", 
-                                 node_id, block_height, target, sleep_seconds);
+                        if crate::node::is_info() {
+                            println!("[INFO][HEARTBEAT] idle node={} height={} next_target={} sleep={}s", 
+                                     node_id, block_height, target, sleep_seconds);
+                        }
                     }
                 }
                 
@@ -14308,7 +14924,9 @@ impl SimplifiedP2P {
         if !instances_guard.contains_key(&normalized_node_id) {
             let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
             if let Err(e) = hybrid.initialize().await {
-                println!("[CRYPTO] 🔴 CRITICAL: Hybrid crypto init failed: {} - SKIPPING OPERATION", e);
+                if crate::node::is_info() {
+                    println!("[CRYPTO] 🔴 CRITICAL: Hybrid crypto init failed: {} - SKIPPING OPERATION", e);
+                }
                 return None;
             }
             instances_guard.insert(normalized_node_id.clone(), hybrid);
@@ -14322,7 +14940,9 @@ impl SimplifiedP2P {
         // Check certificate rotation
         if hybrid.needs_rotation() {
             if let Err(e) = hybrid.rotate_certificate().await {
-                println!("[CRYPTO] ⚠️ Certificate rotation failed: {}", e);
+                if crate::node::is_info() {
+                    println!("[CRYPTO] ⚠️ Certificate rotation failed: {}", e);
+                }
             }
         }
 
@@ -14337,18 +14957,26 @@ impl SimplifiedP2P {
                     Ok(binary_data) => {
                         let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
                         let sig_with_prefix = format!("hybrid_p2p_bin:{}", base64_data);
-                        println!("[CRYPTO] ✅ HYBRID P2P signature created (bincode v2.24)");
-                        println!("[CRYPTO]    Size: {} bytes (optimized)", binary_data.len());
+                        if crate::node::is_info() {
+                            println!("[CRYPTO] ✅ HYBRID P2P signature created (bincode v2.24)");
+                        }
+                        if crate::node::is_info() {
+                            println!("[CRYPTO]    Size: {} bytes (optimized)", binary_data.len());
+                        }
                         Some(sig_with_prefix)
                     }
                     Err(e) => {
-                        println!("[CRYPTO] 🔴 Failed to serialize hybrid signature: {}", e);
+                        if crate::node::is_info() {
+                            println!("[CRYPTO] 🔴 Failed to serialize hybrid signature: {}", e);
+                        }
                         None
                     }
                 }
             }
             Err(e) => {
-                println!("[CRYPTO] 🔴 CRITICAL: Hybrid signing failed: {} - SKIPPING OPERATION", e);
+                if crate::node::is_info() {
+                    println!("[CRYPTO] 🔴 CRITICAL: Hybrid signing failed: {} - SKIPPING OPERATION", e);
+                }
                 None
             }
         }
@@ -14384,7 +15012,9 @@ impl SimplifiedP2P {
                     if !instances_guard.contains_key(&normalized_node_id) {
                         let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
                         if let Err(e) = hybrid.initialize().await {
-                            println!("[HEARTBEAT] 🔴 Hybrid crypto init failed: {}", e);
+                            if crate::node::is_info() {
+                                println!("[HEARTBEAT] 🔴 Hybrid crypto init failed: {}", e);
+                            }
                             return Err(anyhow::anyhow!("Hybrid init failed: {}", e));
                         }
                         instances_guard.insert(normalized_node_id.clone(), hybrid);
@@ -14416,13 +15046,17 @@ impl SimplifiedP2P {
                         }
                     }
                     Err(e) => {
-                        println!("[HEARTBEAT] 🔴 CRITICAL: Hybrid signing failed: {} - SKIPPING HEARTBEAT", e);
+                        if crate::node::is_info() {
+                            println!("[HEARTBEAT] 🔴 CRITICAL: Hybrid signing failed: {} - SKIPPING HEARTBEAT", e);
+                        }
                         None
                     }
                 }
             }
             Err(e) => {
-                println!("[HEARTBEAT] 🔴 CRITICAL: Runtime creation failed: {} - SKIPPING HEARTBEAT", e);
+                if crate::node::is_info() {
+                    println!("[HEARTBEAT] 🔴 CRITICAL: Runtime creation failed: {} - SKIPPING HEARTBEAT", e);
+                }
                 None
             }
         }
@@ -14460,7 +15094,9 @@ impl SimplifiedP2P {
         }
         
         if removed > 0 {
-            println!("[HEARTBEAT] 🧹 Cleaned up {} old heartbeat records", removed);
+            if crate::node::is_info() {
+                println!("[HEARTBEAT] 🧹 Cleaned up {} old heartbeat records", removed);
+            }
         }
     }
     
@@ -14495,8 +15131,10 @@ impl SimplifiedP2P {
         let window_end_height = epoch_number * BLOCKS_PER_EPOCH;  // 14400, 28800, etc.
         let window_start_height = window_end_height.saturating_sub(BLOCKS_PER_EPOCH);  // 0, 14400, etc.
         
-        println!("[INFO][HEARTBEAT] epoch_window epoch={} blocks={}-{} input_h={} (v2.65 fix)", 
-                 epoch_number, window_start_height, window_end_height, consensus_start_height);
+        if crate::node::is_info() {
+            println!("[INFO][HEARTBEAT] epoch_window epoch={} blocks={}-{} input_h={} (v2.65 fix)", 
+                     epoch_number, window_start_height, window_end_height, consensus_start_height);
+        }
         
         // Group heartbeats by node_id
         let mut node_heartbeats: std::collections::HashMap<String, Vec<&HeartbeatRecord>> = 
@@ -14533,9 +15171,11 @@ impl SimplifiedP2P {
         
         // Log heartbeat collection stats
         let total_heartbeats: usize = node_heartbeats.values().map(|v| v.len()).sum();
-        println!("[INFO][HEARTBEAT] collected nodes={} heartbeats={} epoch={} range={}-{}", 
-                 node_heartbeats.len(), total_heartbeats, epoch_number,
-                 window_start_height, window_end_height);
+        if crate::node::is_info() {
+            println!("[INFO][HEARTBEAT] collected nodes={} heartbeats={} epoch={} range={}-{}", 
+                     node_heartbeats.len(), total_heartbeats, epoch_number,
+                     window_start_height, window_end_height);
+        }
         
         // Create summaries
         let mut summaries = Vec::new();
@@ -14555,12 +15195,16 @@ impl SimplifiedP2P {
                 Some(2) // Super node - full validator
             } else if node_id.starts_with("full_") {
                 // v3.18: Full nodes removed - reject old format
-                println!("[WARN][HEARTBEAT] rejected_full_node_format id={} action=skip_rewards", node_id);
+                if crate::node::is_warn() {
+                    println!("[WARN][HEARTBEAT] rejected_full_node_format id={} action=skip_rewards", node_id);
+                }
                 None // Skip this node - Full node type removed
             } else {
                 // PRODUCTION: Unknown format - REJECT, don't guess!
                 // Node must re-register with correct ID format
-                println!("[WARN][HEARTBEAT] rejected_unknown_format id={} action=skip_rewards", node_id);
+                if crate::node::is_warn() {
+                    println!("[WARN][HEARTBEAT] rejected_unknown_format id={} action=skip_rewards", node_id);
+                }
                 None // Skip this node - invalid format
             };
             
@@ -14655,16 +15299,20 @@ impl SimplifiedP2P {
             
             let light_count = summaries.iter().filter(|s| s.node_type == 0).count();
             if light_count > 0 {
-                println!("[INFO][HEARTBEAT] light_nodes_collected count={} for_epoch={}", 
-                         light_count, epoch_number);
+                if crate::node::is_info() {
+                    println!("[INFO][HEARTBEAT] light_nodes_collected count={} for_epoch={}", 
+                             light_count, epoch_number);
+                }
             }
         }
         
-        println!("[INFO][HEARTBEAT] collected_for_macroblock total={} eligible={} (full_super={} light={})", 
-                 summaries.len(),
-                 summaries.iter().filter(|s| s.is_eligible).count(),
-                 summaries.iter().filter(|s| s.node_type != 0).count(),
-                 summaries.iter().filter(|s| s.node_type == 0).count());
+        if crate::node::is_info() {
+            println!("[INFO][HEARTBEAT] collected_for_macroblock total={} eligible={} (full_super={} light={})", 
+                     summaries.len(),
+                     summaries.iter().filter(|s| s.is_eligible).count(),
+                     summaries.iter().filter(|s| s.node_type != 0).count(),
+                     summaries.iter().filter(|s| s.node_type == 0).count());
+        }
         
         summaries
     }
@@ -14822,8 +15470,10 @@ impl SimplifiedP2P {
         
         sample_indices.sort();
         
-        println!("[INFO][HEARTBEAT-COMMITMENT] computed_merkle node={} hb_count={} samples={} root={}",
-                 node_id, heartbeat_data.len(), sample_indices.len(), &merkle_root[..16]);
+        if crate::node::is_info() {
+            println!("[INFO][HEARTBEAT-COMMITMENT] computed_merkle node={} hb_count={} samples={} root={}",
+                     node_id, heartbeat_data.len(), sample_indices.len(), &merkle_root[..16]);
+        }
         
         Ok((merkle_root, heartbeat_data, sample_indices))
     }
@@ -14907,7 +15557,9 @@ impl SimplifiedP2P {
         };
         
         self.gossip_to_random_peers(msg, 5);
-        println!("[GOSSIP] 📡 Light node registration gossiped to network");
+        if crate::node::is_info() {
+            println!("[GOSSIP] 📡 Light node registration gossiped to network");
+        }
     }
     
     /// v4.3: Restore light node registry from blockchain storage (RocksDB) on startup.
@@ -14944,7 +15596,9 @@ impl SimplifiedP2P {
         }
         
         if added > 0 {
-            println!("[INFO][P2P] restored_from_storage light_nodes={} total_registry={}", added, registry.len());
+            if crate::node::is_info() {
+                println!("[INFO][P2P] restored_from_storage light_nodes={} total_registry={}", added, registry.len());
+            }
         }
         
         added
@@ -14981,8 +15635,10 @@ impl SimplifiedP2P {
         }
 
         if updated > 0 {
-            println!("[INFO][P2P] fcm_tokens_restored from_rocksdb count={} total_registry={}",
-                     updated, registry.len());
+            if crate::node::is_info() {
+                println!("[INFO][P2P] fcm_tokens_restored from_rocksdb count={} total_registry={}",
+                         updated, registry.len());
+            }
         }
     }
 
@@ -15009,7 +15665,9 @@ impl SimplifiedP2P {
         
         // Request from 3 random peers
         self.gossip_to_random_peers(request, 3);
-        println!("[SYNC] 📡 Requested Light node registry sync (since {})", last_sync);
+        if crate::node::is_info() {
+            println!("[SYNC] 📡 Requested Light node registry sync (since {})", last_sync);
+        }
     }
     
     /// Check heartbeat eligibility for reward calculation
@@ -15365,8 +16023,10 @@ impl SimplifiedP2P {
             
             if node.consecutive_failures >= 5 {
                 node.is_active = false;
-                println!("[LIGHT] ⚠️ Node {} marked inactive after {} consecutive failures", 
-                         node_id, node.consecutive_failures);
+                if crate::node::is_info() {
+                    println!("[LIGHT] ⚠️ Node {} marked inactive after {} consecutive failures", 
+                             node_id, node.consecutive_failures);
+                }
             }
         }
     }
@@ -15401,7 +16061,9 @@ impl SimplifiedP2P {
             node.is_active = true;
             
             if was_inactive {
-                println!("[LIGHT] ✅ Node {} reactivated after successful ping", node_id);
+                if crate::node::is_info() {
+                    println!("[LIGHT] ✅ Node {} reactivated after successful ping", node_id);
+                }
             }
         }
     }
@@ -15685,7 +16347,9 @@ impl SimplifiedP2P {
         let removed = before - self.active_full_super_nodes.len();
         
         if removed > 0 {
-            println!("[CLEANUP] 🧹 Removed {} stale active nodes (>15min)", removed);
+            if crate::node::is_info() {
+                println!("[CLEANUP] 🧹 Removed {} stale active nodes (>15min)", removed);
+            }
         }
     }
     
@@ -15735,7 +16399,9 @@ impl SimplifiedP2P {
         let removed = before - attestations.len();
         
         if removed > 0 {
-            println!("[CLEANUP] 🧹 Removed {} old attestations (>24h)", removed);
+            if crate::node::is_info() {
+                println!("[CLEANUP] 🧹 Removed {} old attestations (>24h)", removed);
+            }
         }
     }
     
@@ -15872,8 +16538,10 @@ impl SimplifiedP2P {
             .map(|h| (h.node_id.clone(), h.heartbeat_index, h.timestamp, h.block_height))
             .collect();
         
-        println!("[INFO][HEARTBEAT] block_range_filter start={} end={} found={}", 
-                 start_height, end_height, result.len());
+        if crate::node::is_info() {
+            println!("[INFO][HEARTBEAT] block_range_filter start={} end={} found={}", 
+                     start_height, end_height, result.len());
+        }
         
         result
     }
@@ -15901,15 +16569,19 @@ impl SimplifiedP2P {
                 } else if node_id.starts_with("genesis_node_") {
                     "super".to_string()
                 } else {
-                    println!("[WARN][REWARDS] unknown_node id={} skipping", node_id);
+                    if crate::node::is_warn() {
+                        println!("[WARN][REWARDS] unknown_node id={} skipping", node_id);
+                    }
                     return None;
                 };
                 
                 // Check reputation
                 let reputation = self.get_node_reputation_from_blockchain(&node_id);
                 if reputation < MIN_CONSENSUS_REPUTATION {
-                    println!("[WARN][REWARDS] low_rep node={} rep={:.1}% min={:.0}%", 
-                             node_id, reputation, MIN_CONSENSUS_REPUTATION);
+                    if crate::node::is_warn() {
+                        println!("[WARN][REWARDS] low_rep node={} rep={:.1}% min={:.0}%", 
+                                 node_id, reputation, MIN_CONSENSUS_REPUTATION);
+                    }
                     return None;
                 }
                 
@@ -15923,8 +16595,10 @@ impl SimplifiedP2P {
                 if count >= required {
                     Some((node_id, node_type, count))
                 } else {
-                    println!("[INFO][REWARDS] not_eligible node={} count={} required={}", 
-                             node_id, count, required);
+                    if crate::node::is_info() {
+                        println!("[INFO][REWARDS] not_eligible node={} count={} required={}", 
+                                 node_id, count, required);
+                    }
                     None
                 }
             })
@@ -15969,8 +16643,10 @@ impl SimplifiedP2P {
             }
         }
         
-        println!("[INFO][LIGHT_ELIGIBILITY] block_range h={}-{} eligible={}", 
-                 start_height, end_height, eligible.len());
+        if crate::node::is_info() {
+            println!("[INFO][LIGHT_ELIGIBILITY] block_range h={}-{} eligible={}", 
+                     start_height, end_height, eligible.len());
+        }
         
         eligible
     }
@@ -16004,7 +16680,9 @@ impl SimplifiedP2P {
                     "super".to_string()
                 } else {
                     // Unknown node - REJECT (shouldn't happen if heartbeat validation works)
-                    println!("[REWARDS] ⚠️ Unknown node {} in heartbeat history - skipping", node_id);
+                    if crate::node::is_info() {
+                        println!("[REWARDS] ⚠️ Unknown node {} in heartbeat history - skipping", node_id);
+                    }
                     return None;
                 };
                 Some((node_id, node_type, count))
@@ -16015,8 +16693,10 @@ impl SimplifiedP2P {
                 use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
                 let reputation = self.get_node_reputation_from_blockchain(node_id);
                 if reputation < MIN_CONSENSUS_REPUTATION {
-                    println!("[REWARDS] ⚠️ Node {} excluded from rewards: reputation {:.1}% < {:.0}%", 
-                             node_id, reputation, MIN_CONSENSUS_REPUTATION);
+                    if crate::node::is_info() {
+                        println!("[REWARDS] ⚠️ Node {} excluded from rewards: reputation {:.1}% < {:.0}%", 
+                                 node_id, reputation, MIN_CONSENSUS_REPUTATION);
+                    }
                     return false;
                 }
                 
@@ -16141,7 +16821,9 @@ impl SimplifiedP2P {
                 false // Genesis nodes always allowed
             // CRITICAL: No rate limit for nodes catching up (>5 blocks behind)
             } else if blocks_behind > 5 {
-                println!("[INFO][SYNC] priority_sync peer={} blocks_behind={}", from_peer, blocks_behind);
+                if crate::node::is_info() {
+                    println!("[INFO][SYNC] priority_sync peer={} blocks_behind={}", from_peer, blocks_behind);
+                }
                 false // No rate limit for catching up
             } else {
                 // Normal rate limiting for synchronized nodes
@@ -16157,8 +16839,10 @@ impl SimplifiedP2P {
                 
                 // Check if currently blocked
                 if rate_limit.blocked_until > current_time {
-                    println!("[WARN][SYNC] rate_limited peer={} blocked_for={}s", 
-                             from_peer, rate_limit.blocked_until - current_time);
+                    if crate::node::is_warn() {
+                        println!("[WARN][SYNC] rate_limited peer={} blocked_for={}s", 
+                                 from_peer, rate_limit.blocked_until - current_time);
+                    }
                     return;
                 }
                 
@@ -16169,8 +16853,10 @@ impl SimplifiedP2P {
                 // Check if limit exceeded
                 if rate_limit.requests.len() >= rate_limit.max_requests {
                     rate_limit.blocked_until = current_time + 60; // Block for 1 minute
-                    println!("[WARN][SYNC] rate_limit_exceeded peer={} requests={}", 
-                             from_peer, rate_limit.max_requests);
+                    if crate::node::is_warn() {
+                        println!("[WARN][SYNC] rate_limit_exceeded peer={} requests={}", 
+                                 from_peer, rate_limit.max_requests);
+                    }
                     true
                 } else {
                     // Add this request
@@ -16192,17 +16878,25 @@ impl SimplifiedP2P {
             to_height
         };
         
-        println!("[SYNC] 📤 Preparing blocks {}-{} for {}", from_height, actual_to, requester_id);
+        if crate::node::is_info() {
+            println!("[SYNC] 📤 Preparing blocks {}-{} for {}", from_height, actual_to, requester_id);
+        }
         
         // CRITICAL FIX: Send sync request to node.rs where storage is available
         if let Some(ref sync_tx) = self.sync_request_tx {
             if let Err(e) = sync_tx.send((from_height, actual_to, requester_id.clone())) {
-                println!("[SYNC] ❌ Failed to send sync request to node: {}", e);
+                if crate::node::is_info() {
+                    println!("[SYNC] ❌ Failed to send sync request to node: {}", e);
+                }
             } else {
-                println!("[SYNC] ✅ Sync request forwarded to node for processing");
+                if crate::node::is_info() {
+                    println!("[SYNC] ✅ Sync request forwarded to node for processing");
+                }
             }
         } else {
-            println!("[SYNC] ⚠️ Sync request channel not available - sending empty response");
+            if crate::node::is_info() {
+                println!("[SYNC] ⚠️ Sync request channel not available - sending empty response");
+            }
             
             // Fallback: send empty batch to prevent timeout
             let response = NetworkMessage::BlocksBatch {
@@ -16215,13 +16909,17 @@ impl SimplifiedP2P {
             // SCALABILITY FIX: Use O(1) lookup instead of O(n) find
             if let Some(peer_addr) = self.peer_id_to_addr.get(&requester_id) {
                 self.send_network_message(&peer_addr.clone(), response);
-                println!("[SYNC] 📤 Sent empty response to {}", requester_id);
+                if crate::node::is_info() {
+                    println!("[SYNC] 📤 Sent empty response to {}", requester_id);
+                }
             } else {
                 // Fallback for Genesis nodes not in index
                 let peers = self.get_validated_active_peers();
                 if let Some(peer) = peers.iter().find(|p| p.id == requester_id) {
                     self.send_network_message(&peer.addr, response);
-                    println!("[SYNC] 📤 Sent empty response to {} (Genesis fallback)", requester_id);
+                    if crate::node::is_info() {
+                        println!("[SYNC] 📤 Sent empty response to {} (Genesis fallback)", requester_id);
+                    }
                 }
             }
         }
@@ -16383,8 +17081,10 @@ impl SimplifiedP2P {
                 
                 // Check if currently blocked
                 if rate_limit.blocked_until > current_time {
-                    println!("[WARN][MB_SYNC] rate_limited peer={} blocked_for={}s", 
-                             from_peer, rate_limit.blocked_until - current_time);
+                    if crate::node::is_warn() {
+                        println!("[WARN][MB_SYNC] rate_limited peer={} blocked_for={}s", 
+                                 from_peer, rate_limit.blocked_until - current_time);
+                    }
                     return;
                 }
                 
@@ -16395,8 +17095,10 @@ impl SimplifiedP2P {
                 // Check if limit exceeded
                 if rate_limit.requests.len() >= rate_limit.max_requests {
                     rate_limit.blocked_until = current_time + 120; // Block for 2 minutes (stricter)
-                    println!("[WARN][MB_SYNC] rate_limit_exceeded peer={} requests={}", 
-                             from_peer, rate_limit.max_requests);
+                    if crate::node::is_warn() {
+                        println!("[WARN][MB_SYNC] rate_limit_exceeded peer={} requests={}", 
+                                 from_peer, rate_limit.max_requests);
+                    }
                     true
                 } else {
                     rate_limit.requests.push(current_time);
@@ -16417,17 +17119,25 @@ impl SimplifiedP2P {
             to_index
         };
         
-        println!("[MACROBLOCK-SYNC] 📤 Preparing macroblocks {}-{} for {}", from_index, actual_to, requester_id);
+        if crate::node::is_info() {
+            println!("[MACROBLOCK-SYNC] 📤 Preparing macroblocks {}-{} for {}", from_index, actual_to, requester_id);
+        }
         
         // CRITICAL: Send macroblock sync request to node.rs where storage is available
         if let Some(ref sync_tx) = self.macroblock_sync_request_tx {
             if let Err(e) = sync_tx.send((from_index, actual_to, requester_id.clone())) {
-                println!("[MACROBLOCK-SYNC] ❌ Failed to send sync request to node: {}", e);
+                if crate::node::is_info() {
+                    println!("[MACROBLOCK-SYNC] ❌ Failed to send sync request to node: {}", e);
+                }
             } else {
-                println!("[MACROBLOCK-SYNC] ✅ Sync request forwarded to node for processing");
+                if crate::node::is_info() {
+                    println!("[MACROBLOCK-SYNC] ✅ Sync request forwarded to node for processing");
+                }
             }
         } else {
-            println!("[MACROBLOCK-SYNC] ⚠️ Macroblock sync channel not available - sending empty response");
+            if crate::node::is_info() {
+                println!("[MACROBLOCK-SYNC] ⚠️ Macroblock sync channel not available - sending empty response");
+            }
             
             // Fallback: send empty batch to prevent timeout
             let response = NetworkMessage::MacroblocksBatch {
@@ -16447,8 +17157,10 @@ impl SimplifiedP2P {
     /// Handle macroblocks batch received for sync
     /// PRODUCTION: Process and save received macroblocks
     pub fn handle_macroblocks_batch(&self, macroblocks: Vec<(u64, Vec<u8>)>, from_index: u64, to_index: u64, sender_id: String) {
-        println!("[MACROBLOCK-SYNC] ✅ Processing {} macroblocks from {} (indices {}-{})", 
-                 macroblocks.len(), sender_id, from_index, to_index);
+        if crate::node::is_info() {
+            println!("[MACROBLOCK-SYNC] ✅ Processing {} macroblocks from {} (indices {}-{})", 
+                     macroblocks.len(), sender_id, from_index, to_index);
+        }
         
         // Update last_seen for sender
         self.update_peer_last_seen(&sender_id);
@@ -16480,7 +17192,9 @@ impl SimplifiedP2P {
                 // Send to macroblock processor
                 if let Err(e) = macroblock_tx.send(received_macroblock) {
                     clear_macroblock_pending_sync(index); // Clear on error
-                    println!("[MACROBLOCK-SYNC] ❌ Failed to queue macroblock {} for processing: {}", index, e);
+                    if crate::node::is_info() {
+                        println!("[MACROBLOCK-SYNC] ❌ Failed to queue macroblock {} for processing: {}", index, e);
+                    }
                 } else {
                     queued += 1;
                 }
@@ -16490,7 +17204,9 @@ impl SimplifiedP2P {
                 println!("[INFO][MB-SYNC] batch from={} queued={} dup_skipped={}", sender_id, queued, skipped_dup);
             }
         } else {
-            println!("[MACROBLOCK-SYNC] ⚠️ Macroblock processor not available, cannot save synced macroblocks!");
+            if crate::node::is_info() {
+                println!("[MACROBLOCK-SYNC] ⚠️ Macroblock processor not available, cannot save synced macroblocks!");
+            }
         }
     }
     
@@ -16689,8 +17405,10 @@ impl SimplifiedP2P {
             
             // Check if currently blocked
             if rate_limit.blocked_until > current_time {
-                println!("[CONSENSUS] ⛔ Rate limit: {} blocked for {} more seconds", 
-                         from_peer, rate_limit.blocked_until - current_time);
+                if crate::node::is_info() {
+                    println!("[CONSENSUS] ⛔ Rate limit: {} blocked for {} more seconds", 
+                             from_peer, rate_limit.blocked_until - current_time);
+                }
                 return;
             }
             
@@ -16701,8 +17419,10 @@ impl SimplifiedP2P {
             // Check if limit exceeded
             if rate_limit.requests.len() >= rate_limit.max_requests {
                 rate_limit.blocked_until = current_time + 120; // Block for 2 minutes (stricter)
-                println!("[CONSENSUS] ⛔ Rate limit exceeded for {} ({}+ requests/minute)", 
-                         from_peer, rate_limit.max_requests);
+                if crate::node::is_info() {
+                    println!("[CONSENSUS] ⛔ Rate limit exceeded for {} ({}+ requests/minute)", 
+                             from_peer, rate_limit.max_requests);
+                }
                 true
             } else {
                 rate_limit.requests.push(current_time);
@@ -16714,7 +17434,9 @@ impl SimplifiedP2P {
             return;
         }
         
-        println!("[CONSENSUS] 📤 Preparing consensus state for round {} for {}", round, requester_id);
+        if crate::node::is_info() {
+            println!("[CONSENSUS] 📤 Preparing consensus state for round {} for {}", round, requester_id);
+        }
         
         // This will be connected to consensus storage when node.rs implements it
     }
@@ -16724,8 +17446,10 @@ impl SimplifiedP2P {
         // Update last_seen for sender
         self.update_peer_last_seen(&sender_id);
         
-        println!("[CONSENSUS] ✅ Processing consensus state for round {} from {} ({} bytes)", 
-                 round, sender_id, state_data.len());
+        if crate::node::is_info() {
+            println!("[CONSENSUS] ✅ Processing consensus state for round {} from {} ({} bytes)", 
+                     round, sender_id, state_data.len());
+        }
         
         // This will be connected to consensus recovery when node.rs implements it
     }
@@ -16913,7 +17637,9 @@ impl SimplifiedP2P {
     /// Used by anti-fork protection to get missing blocks before producing
     /// ═══════════════════════════════════════════════════════════════════════════
     pub async fn request_block_repair(&self, height: u64) -> Result<(), String> {
-        println!("[REPAIR] 🔧 Requesting repair for block #{}", height);
+        if crate::node::is_info() {
+            println!("[REPAIR] 🔧 Requesting repair for block #{}", height);
+        }
         
         let peers = self.get_validated_active_peers();
         if peers.is_empty() {
@@ -16941,7 +17667,9 @@ impl SimplifiedP2P {
         }
         
         if sent > 0 {
-            println!("[REPAIR] 📡 Requested block #{} from {} peers", height, sent);
+            if crate::node::is_info() {
+                println!("[REPAIR] 📡 Requested block #{} from {} peers", height, sent);
+            }
             Ok(())
         } else {
             Err("No peers to request from".to_string())
@@ -16967,7 +17695,9 @@ impl SimplifiedP2P {
         let validated_peers = self.get_validated_active_peers();
         
         if validated_peers.is_empty() {
-            println!("[WARN][CONS] no_validated_peers h={}", height);
+            if crate::node::is_warn() {
+                println!("[WARN][CONS] no_validated_peers h={}", height);
+            }
             return Err("No validated peers available".to_string());
         }
         
@@ -17035,7 +17765,9 @@ impl SimplifiedP2P {
                 }
                 Ok(())
             } else {
-                println!("[WARN][CONS] all_quic_requests_failed h={}", height);
+                if crate::node::is_warn() {
+                    println!("[WARN][CONS] all_quic_requests_failed h={}", height);
+                }
                 // Fallback to legacy method
                 self.request_block_repair(height).await
             }
@@ -17050,15 +17782,19 @@ impl SimplifiedP2P {
     
     /// Batch sync for catch-up - request blocks in batches
     pub async fn batch_sync(&self, from_height: u64, to_height: u64, batch_size: u64) -> Result<(), String> {
-        println!("[SYNC] 🚀 Starting batch sync from {} to {} (batch size: {})", 
-                 from_height, to_height, batch_size);
+        if crate::node::is_info() {
+            println!("[SYNC] 🚀 Starting batch sync from {} to {} (batch size: {})", 
+                     from_height, to_height, batch_size);
+        }
         
         let mut current = from_height;
         
         while current <= to_height {
             let batch_to = std::cmp::min(current + batch_size - 1, to_height);
             
-            println!("[SYNC] 📦 Syncing batch {}-{}", current, batch_to);
+            if crate::node::is_info() {
+                println!("[SYNC] 📦 Syncing batch {}-{}", current, batch_to);
+            }
             self.sync_blocks(current, batch_to).await?;
             
             // Wait a bit between batches to avoid overwhelming the network
@@ -17067,13 +17803,17 @@ impl SimplifiedP2P {
             current = batch_to + 1;
         }
         
-        println!("[SYNC] ✅ Batch sync complete!");
+        if crate::node::is_info() {
+            println!("[SYNC] ✅ Batch sync complete!");
+        }
         Ok(())
     }
     
     /// Request consensus state from peers for recovery
     pub async fn sync_consensus_state(&self, round: u64) -> Result<(), String> {
-        println!("[INFO][CONS] Requesting consensus state for round {}", round);
+        if crate::node::is_info() {
+            println!("[INFO][CONS] Requesting consensus state for round {}", round);
+        }
         
         let peers = self.get_validated_active_peers();
         if peers.is_empty() {
@@ -17085,8 +17825,10 @@ impl SimplifiedP2P {
             .max_by(|a, b| a.reputation().partial_cmp(&b.reputation()).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for consensus sync")?;
         
-        println!("[INFO][CONS] Requesting from peer {} (network_quality: {:.1}%)",
-                 best_peer.id, best_peer.network_score);
+        if crate::node::is_info() {
+            println!("[INFO][CONS] Requesting from peer {} (network_quality: {:.1}%)",
+                     best_peer.id, best_peer.network_score);
+        }
         
         // Create request message
         let request = NetworkMessage::RequestConsensusState {
@@ -17212,8 +17954,12 @@ fn discover_genesis_nodes_via_dht() -> Vec<String> {
             .map(|(ip, _)| ip.to_string())
             .collect::<Vec<String>>();
         
-        println!("[DHT] 🚨 COLD START: Using hardcoded Genesis IPs for initial bootstrap");
-        println!("[DHT] 🔗 Once registered in blockchain, will use quantum discovery");
+        if crate::node::is_info() {
+            println!("[DHT] 🚨 COLD START: Using hardcoded Genesis IPs for initial bootstrap");
+        }
+        if crate::node::is_info() {
+            println!("[DHT] 🔗 Once registered in blockchain, will use quantum discovery");
+        }
         return genesis_fallback_ips;
     }
     
@@ -17225,7 +17971,9 @@ fn discover_genesis_nodes_via_dht() -> Vec<String> {
 impl SimplifiedP2P {
     /// Start peer exchange protocol for decentralized network growth - SCALABLE (INSTANCE METHOD)
     pub fn start_peer_exchange_protocol(&self, initial_peers: Vec<PeerInfo>) {
-        println!("[P2P] 🔄 Starting peer exchange protocol for network growth...");
+        if crate::node::is_info() {
+            println!("[P2P] 🔄 Starting peer exchange protocol for network growth...");
+        }
         
         // SCALABILITY FIX: Phase-aware peer exchange intervals
         let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
@@ -17243,14 +17991,18 @@ impl SimplifiedP2P {
             std::time::Duration::from_secs(300) // 5 minutes for scale - EXISTING system value
         };
         
-        println!("[P2P] 📊 Peer exchange interval: {}s (Genesis node: {})", 
-                exchange_interval.as_secs(), is_genesis_node);
+        if crate::node::is_info() {
+            println!("[P2P] 📊 Peer exchange interval: {}s (Genesis node: {})", 
+                    exchange_interval.as_secs(), is_genesis_node);
+        }
         
         // SAFE: Check if Tokio runtime is available to prevent panic
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[P2P] ⚠️ No Tokio runtime - peer exchange deferred");
+                if crate::node::is_info() {
+                    println!("[P2P] ⚠️ No Tokio runtime - peer exchange deferred");
+                }
                 return;
             }
         };
@@ -17274,13 +18026,17 @@ impl SimplifiedP2P {
                 std::cmp::min(initial_peers.len(), 3) // Normal: max 3 peers per cycle
             };
             
-            println!("[P2P] 📡 Starting peer exchange cycle with {} of {} peers", 
-                    max_exchange_peers, initial_peers.len());
+            if crate::node::is_info() {
+                println!("[P2P] 📡 Starting peer exchange cycle with {} of {} peers", 
+                        max_exchange_peers, initial_peers.len());
+            }
             
             // Request peer lists from limited set of connected nodes
             for peer in initial_peers.iter().take(max_exchange_peers) {
                 if let Ok(new_peers) = Self::request_peer_list_from_node(&peer.addr).await {
-                    println!("[P2P] 📡 Received {} new peers from {}", new_peers.len(), get_privacy_id_for_addr(&peer.addr));
+                    if crate::node::is_info() {
+                        println!("[P2P] 📡 Received {} new peers from {}", new_peers.len(), get_privacy_id_for_addr(&peer.addr));
+                    }
                     
                     // CRITICAL FIX v2.21.3: Validate peers before adding - NO PHANTOM PEERS!
                     if !new_peers.is_empty() {
@@ -17360,7 +18116,9 @@ impl SimplifiedP2P {
                             }
                         }
                         
-                        println!("[P2P] 🔥 PEER EXCHANGE: {} new peers added to connected_peers", added_count);
+                        if crate::node::is_info() {
+                            println!("[P2P] 🔥 PEER EXCHANGE: {} new peers added to connected_peers", added_count);
+                        }
                         
                         let _ = validated_count; // tracked but not aggregated further
                         // CACHE FIX: Invalidate cache after adding peers through exchange
@@ -17369,14 +18127,18 @@ impl SimplifiedP2P {
                             // Directly invalidate the cache here
                             if let Ok(mut cached) = CACHED_PEERS.lock() {
                                 *cached = (Vec::new(), Instant::now() - Duration::from_secs(3600), String::new());
-                                println!("[P2P] 🔄 Peer cache invalidated after exchange (added {} peers)", added_count);
+                                if crate::node::is_info() {
+                                    println!("[P2P] 🔄 Peer cache invalidated after exchange (added {} peers)", added_count);
+                                }
                             }
                         }
                     }
                 }
             }
             
-            println!("[P2P] 🌐 Peer exchange cycle completed - network continues to grow");
+            if crate::node::is_info() {
+                println!("[P2P] 🌐 Peer exchange cycle completed - network continues to grow");
+            }
         }
         });
     }
@@ -17391,7 +18153,9 @@ impl SimplifiedP2P {
         let ip = node_addr.split(':').next().unwrap_or(node_addr);
         let endpoint = format!("http://{}:8001/api/v1/peers", ip);
         
-        println!("[P2P] 📞 Requesting peer list from {}", get_privacy_id_for_addr(&ip));
+        if crate::node::is_info() {
+            println!("[P2P] 📞 Requesting peer list from {}", get_privacy_id_for_addr(&ip));
+        }
         
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -17407,7 +18171,9 @@ impl SimplifiedP2P {
             Ok(response) if response.status().is_success() => {
                 match response.text().await {
                     Ok(text) => {
-                        println!("[P2P] ✅ Received peer data from {}: {} bytes", get_privacy_id_for_addr(node_addr), text.len());
+                        if crate::node::is_info() {
+                            println!("[P2P] ✅ Received peer data from {}: {} bytes", get_privacy_id_for_addr(node_addr), text.len());
+                        }
                         
                         // Parse JSON response from /api/v1/peers endpoint
                         if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -17426,29 +18192,41 @@ impl SimplifiedP2P {
                                     }
                                 }
                                 
-                                println!("[P2P] 📡 Parsed {} peers from {}", peer_list.len(), get_privacy_id_for_addr(node_addr));
+                                if crate::node::is_info() {
+                                    println!("[P2P] 📡 Parsed {} peers from {}", peer_list.len(), get_privacy_id_for_addr(node_addr));
+                                }
                                 Ok(peer_list)
                             } else {
-                                println!("[P2P] ⚠️ No 'peers' array in response from {}", get_privacy_id_for_addr(node_addr));
+                                if crate::node::is_info() {
+                                    println!("[P2P] ⚠️ No 'peers' array in response from {}", get_privacy_id_for_addr(node_addr));
+                                }
                                 Ok(Vec::new())
                             }
                         } else {
-                            println!("[P2P] ⚠️ Failed to parse JSON response from {}", get_privacy_id_for_addr(node_addr));
+                            if crate::node::is_info() {
+                                println!("[P2P] ⚠️ Failed to parse JSON response from {}", get_privacy_id_for_addr(node_addr));
+                            }
                             Ok(Vec::new())
                         }
                     }
                     Err(e) => {
-                        println!("[P2P] ❌ Failed to read response from {}: {}", get_privacy_id_for_addr(node_addr), e);
+                        if crate::node::is_info() {
+                            println!("[P2P] ❌ Failed to read response from {}: {}", get_privacy_id_for_addr(node_addr), e);
+                        }
                         Err(format!("Response read error: {}", e))
                     }
                 }
             }
             Ok(response) => {
-                println!("[P2P] ❌ HTTP error from {}: {}", get_privacy_id_for_addr(node_addr), response.status());
+                if crate::node::is_info() {
+                    println!("[P2P] ❌ HTTP error from {}: {}", get_privacy_id_for_addr(node_addr), response.status());
+                }
                 Err(format!("HTTP error: {}", response.status()))
             }
             Err(e) => {
-                println!("[P2P] ❌ Request failed to {}: {}", get_privacy_id_for_addr(node_addr), e);
+                if crate::node::is_info() {
+                    println!("[P2P] ❌ Request failed to {}: {}", get_privacy_id_for_addr(node_addr), e);
+                }
                 Err(format!("Request failed: {}", e))
             }
         }
@@ -17497,7 +18275,9 @@ impl SimplifiedP2P {
     pub fn set_deterministic_reputation(&self, state: Arc<parking_lot::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>) {
         let mut guard = self.deterministic_reputation.write();
         *guard = Some(state);
-        println!("[P2P] Deterministic reputation state linked (blockchain-based)");
+        if crate::node::is_info() {
+            println!("[P2P] Deterministic reputation state linked (blockchain-based)");
+        }
     }
     
     /// v2.76: Set storage reference for persistent heartbeat storage (scalability)
@@ -17505,7 +18285,9 @@ impl SimplifiedP2P {
     /// SCALABILITY: Enables millions of nodes by storing heartbeats in RocksDB instead of RAM
     pub fn set_storage(&mut self, storage: Arc<crate::storage::Storage>) {
         self.storage = Some(storage);
-        println!("[P2P] 💾 Storage reference set for scalable heartbeat persistence");
+        if crate::node::is_info() {
+            println!("[P2P] 💾 Storage reference set for scalable heartbeat persistence");
+        }
     }
 
     /// v5.0: Set wallet identity for Dilithium3-signed HealthPing messages
@@ -17513,7 +18295,9 @@ impl SimplifiedP2P {
     pub fn set_wallet_identity(&self, identity: Arc<crate::crypto::vrf::WalletIdentity>) {
         let mut guard = self.wallet_identity.write();
         *guard = Some(identity);
-        println!("[INFO][P2P] wallet_identity_linked signing=Dilithium3");
+        if crate::node::is_info() {
+            println!("[INFO][P2P] wallet_identity_linked signing=Dilithium3");
+        }
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -17528,7 +18312,9 @@ impl SimplifiedP2P {
     pub fn report_invalid_block(&self, offender: &str, height: u64, block_hash: [u8; 32], reason: &str) {
         // v2.38: Only log for monitoring - NO slashing action!
         // Slashing determined on-chain in MacroBlock creation
-        println!("[WARN][MONITOR] invalid_block offender={} h={} reason={}", offender, height, reason);
+        if crate::node::is_warn() {
+            println!("[WARN][MONITOR] invalid_block offender={} h={} reason={}", offender, height, reason);
+        }
     }
     
     /// DEPRECATED: Update node reputation via P2P
@@ -17562,8 +18348,10 @@ impl SimplifiedP2P {
                     } else {
                         get_privacy_id_for_addr(node_id)
                     };
-                    println!("[REPUTATION] ⚠️ Deprecated event {:?} for {} - use blockchain", 
-                             event, display_id);
+                    if crate::node::is_info() {
+                        println!("[REPUTATION] ⚠️ Deprecated event {:?} for {} - use blockchain", 
+                                 event, display_id);
+                    }
                 }
             }
             
@@ -17609,7 +18397,9 @@ impl SimplifiedP2P {
         } else {
             get_privacy_id_for_addr(node_id)
         };
-        println!("[P2P] ⚠️ set_node_reputation() deprecated - {} reputation managed via blockchain", display_id);
+        if crate::node::is_info() {
+            println!("[P2P] ⚠️ set_node_reputation() deprecated - {} reputation managed via blockchain", display_id);
+        }
     }
     
     /// Get reputation score for a node (ONLY consensus_score - synced via blocks)
@@ -17688,7 +18478,9 @@ impl SimplifiedP2P {
         
         if !dir_created {
             // All locations failed - use in-memory only (graceful degradation)
-            println!("[REPUTATION] ⚠️ Could not create reputation directory - using memory-only mode");
+            if crate::node::is_info() {
+                println!("[REPUTATION] ⚠️ Could not create reputation directory - using memory-only mode");
+            }
             // Store in memory but don't persist - this is fine for production
             // The reputation will rebuild from blockchain events
             return;
@@ -17766,22 +18558,30 @@ impl SimplifiedP2P {
                         match std::fs::write(&batch_file, compressed) {
                             Ok(_) => {
                                 if batch_data.len() % 100 == 0 { // Log every 100 nodes
-                                    println!("[REPUTATION] 📦 Batch {} updated: {} nodes (compressed)", 
-                                            batch_num, batch_data.len());
+                                    if crate::node::is_info() {
+                                        println!("[REPUTATION] 📦 Batch {} updated: {} nodes (compressed)", 
+                                                batch_num, batch_data.len());
+                                    }
                                 }
                             },
                             Err(e) => {
-                                println!("[REPUTATION] ⚠️ Failed to write batch file: {}", e);
+                                if crate::node::is_info() {
+                                    println!("[REPUTATION] ⚠️ Failed to write batch file: {}", e);
+                                }
                             }
                         }
                     },
                     Err(e) => {
-                        println!("[REPUTATION] ⚠️ Failed to compress reputation batch: {}", e);
+                        if crate::node::is_info() {
+                            println!("[REPUTATION] ⚠️ Failed to compress reputation batch: {}", e);
+                        }
                     }
                 }
             },
             Err(e) => {
-                println!("[REPUTATION] ⚠️ Failed to serialize reputation batch: {}", e);
+                if crate::node::is_info() {
+                    println!("[REPUTATION] ⚠️ Failed to serialize reputation batch: {}", e);
+                }
             }
         }
     }
@@ -17798,7 +18598,9 @@ impl SimplifiedP2P {
         // Use same directory structure as reputation
         let jail_dir = "./data/jail";
         if std::fs::create_dir_all(jail_dir).is_err() {
-            println!("[JAIL] ⚠️ Could not create jail directory");
+            if crate::node::is_info() {
+                println!("[JAIL] ⚠️ Could not create jail directory");
+            }
             return;
         }
         
@@ -17850,10 +18652,14 @@ impl SimplifiedP2P {
         if let Ok(serialized) = serde_json::to_vec(&batch_data) {
             if let Ok(compressed) = zstd::encode_all(&serialized[..], 10) {
                 if let Err(e) = std::fs::write(&batch_file, compressed) {
-                    println!("[JAIL] ⚠️ Failed to save jail status: {}", e);
+                    if crate::node::is_info() {
+                        println!("[JAIL] ⚠️ Failed to save jail status: {}", e);
+                    }
                 } else {
-                    println!("[JAIL] 💾 Saved jail status for {} (batch {}, integrity: {}...)", 
-                            node_id, batch_num, &integrity_hash[..integrity_hash.len().min(8)]);
+                    if crate::node::is_info() {
+                        println!("[JAIL] 💾 Saved jail status for {} (batch {}, integrity: {}...)", 
+                                node_id, batch_num, &integrity_hash[..integrity_hash.len().min(8)]);
+                    }
                 }
             }
         }
@@ -17902,7 +18708,9 @@ impl SimplifiedP2P {
                                         let computed_hash = hex::encode(integrity_hasher.finalize());
                                         
                                         if computed_hash != stored_integrity {
-                                            println!("[JAIL] 🚨 INTEGRITY VIOLATION for {} - file may be tampered!", node_id);
+                                            if crate::node::is_info() {
+                                                println!("[JAIL] 🚨 INTEGRITY VIOLATION for {} - file may be tampered!", node_id);
+                                            }
                                             continue; // Skip tampered entries
                                         }
                                         
@@ -17920,7 +18728,9 @@ impl SimplifiedP2P {
         }
         
         if !result.is_empty() {
-            println!("[JAIL] 📂 Loaded {} active jail statuses from storage (integrity verified)", result.len());
+            if crate::node::is_info() {
+                println!("[JAIL] 📂 Loaded {} active jail statuses from storage (integrity verified)", result.len());
+            }
         }
         
         result
@@ -17955,7 +18765,9 @@ impl SimplifiedP2P {
                         if let Ok(serialized) = serde_json::to_vec(&batch_data) {
                             if let Ok(recompressed) = zstd::encode_all(&serialized[..], 10) {
                                 let _ = std::fs::write(&batch_file, recompressed);
-                                println!("[JAIL] 🗑️ Removed jail status for {} from storage", node_id);
+                                if crate::node::is_info() {
+                                    println!("[JAIL] 🗑️ Removed jail status for {} from storage", node_id);
+                                }
                             }
                         }
                     }
@@ -17996,7 +18808,9 @@ impl SimplifiedP2P {
                 if let Ok(content) = std::fs::read_to_string(&legacy_file) {
                     if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
                         if let Some(rep) = data["reputation"].as_f64() {
-                            println!("[REPUTATION] 📂 Migrating legacy reputation for {}: {:.1}", node_id, rep);
+                            if crate::node::is_info() {
+                                println!("[REPUTATION] 📂 Migrating legacy reputation for {}: {:.1}", node_id, rep);
+                            }
                             // Save in new format
                             self.save_reputation_to_storage(node_id, rep);
                             // Delete old file
@@ -18046,7 +18860,9 @@ impl SimplifiedP2P {
             let computed_hash = hex::encode(hasher.finalize());
             
             if computed_hash != stored_hash {
-                println!("[REPUTATION] 🚨 INTEGRITY CHECK FAILED! Reputation may be tampered!");
+                if crate::node::is_info() {
+                    println!("[REPUTATION] 🚨 INTEGRITY CHECK FAILED! Reputation may be tampered!");
+                }
                 
                 // CRITICAL: Report reputation tampering as malicious behavior
                 self.report_reputation_tampering(node_id, reputation);
@@ -18062,7 +18878,9 @@ impl SimplifiedP2P {
             
             let age_days = (current_time - timestamp) / 86400;
             if age_days > 30 {
-                println!("[REPUTATION] ⚠️ Reputation data is {} days old - resetting", age_days);
+                if crate::node::is_info() {
+                    println!("[REPUTATION] ⚠️ Reputation data is {} days old - resetting", age_days);
+                }
                 return None;
             }
             
@@ -18074,8 +18892,12 @@ impl SimplifiedP2P {
     
     /// CRITICAL: Report and punish reputation tampering attempts
     fn report_reputation_tampering(&self, node_id: &str, attempted_reputation: f64) {
-        println!("[SECURITY] 🚨🚨🚨 REPUTATION TAMPERING DETECTED! 🚨🚨🚨");
-        println!("[SECURITY] Node: {} attempted to set reputation to {:.1}%", node_id, attempted_reputation);
+        if crate::node::is_info() {
+            println!("[SECURITY] 🚨🚨🚨 REPUTATION TAMPERING DETECTED! 🚨🚨🚨");
+        }
+        if crate::node::is_info() {
+            println!("[SECURITY] Node: {} attempted to set reputation to {:.1}%", node_id, attempted_reputation);
+        }
         
         // Get current legitimate reputation from blockchain (v2.21.5)
         let current_reputation = self.get_node_reputation_from_blockchain(node_id);
@@ -18091,15 +18913,19 @@ impl SimplifiedP2P {
             "MEDIUM"
         };
         
-        println!("[SECURITY] Tampering severity: {} (current: {:.1}%, attempted: {:.1}%)", 
-                 severity, current_reputation, attempted_reputation);
+        if crate::node::is_info() {
+            println!("[SECURITY] Tampering severity: {} (current: {:.1}%, attempted: {:.1}%)", 
+                     severity, current_reputation, attempted_reputation);
+        }
         
         // Apply severe penalties based on tampering severity
         let _penalty = match severity {
             "CRITICAL" => {
                 // CRITICAL: Attempted to fake high reputation
                 // Penalty: Set to 0% and ban from network
-                println!("[PENALTY] 💀 CRITICAL TAMPERING - Setting reputation to 0% and marking for BAN");
+                if crate::node::is_info() {
+                    println!("[PENALTY] 💀 CRITICAL TAMPERING - Setting reputation to 0% and marking for BAN");
+                }
                 
                 // Mark node as malicious in storage
                 self.mark_node_as_malicious(node_id, "REPUTATION_TAMPERING_CRITICAL");
@@ -18109,7 +18935,9 @@ impl SimplifiedP2P {
             "HIGH" => {
                 // HIGH: Significant tampering
                 // Penalty: -50% reputation
-                println!("[PENALTY] ⚠️ HIGH TAMPERING - Applying -50% reputation penalty");
+                if crate::node::is_info() {
+                    println!("[PENALTY] ⚠️ HIGH TAMPERING - Applying -50% reputation penalty");
+                }
                 
                 self.mark_node_as_malicious(node_id, "REPUTATION_TAMPERING_HIGH");
                 
@@ -18118,7 +18946,9 @@ impl SimplifiedP2P {
             _ => {
                 // MEDIUM: Minor tampering
                 // Penalty: -30% reputation
-                println!("[PENALTY] ⚠️ MEDIUM TAMPERING - Applying -30% reputation penalty");
+                if crate::node::is_info() {
+                    println!("[PENALTY] ⚠️ MEDIUM TAMPERING - Applying -30% reputation penalty");
+                }
                 
                 self.mark_node_as_malicious(node_id, "REPUTATION_TAMPERING_MEDIUM");
                 
@@ -18174,7 +19004,9 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[SECURITY] ⚠️ WARN: No Tokio runtime - tampering alert skipped");
+                if crate::node::is_info() {
+                    println!("[SECURITY] ⚠️ WARN: No Tokio runtime - tampering alert skipped");
+                }
                 return;
             }
         };
@@ -18232,10 +19064,14 @@ impl SimplifiedP2P {
                             .send()
                             .await {
                             Ok(_) => {
-                                println!("[SECURITY] ✅ Alert sent to {}", peer_id_clone);
+                                if crate::node::is_info() {
+                                    println!("[SECURITY] ✅ Alert sent to {}", peer_id_clone);
+                                }
                             },
                             Err(e) => {
-                                println!("[SECURITY] ⚠️ Failed to send alert to {}: {}", peer_id_clone, e);
+                                if crate::node::is_info() {
+                                    println!("[SECURITY] ⚠️ Failed to send alert to {}: {}", peer_id_clone, e);
+                                }
                             }
                         }
                     }
@@ -18271,10 +19107,14 @@ impl SimplifiedP2P {
                         .send()
                         .await {
                         Ok(_) => {
-                            println!("[SECURITY] ✅ Alert sent to {}", peer_id_clone);
+                            if crate::node::is_info() {
+                                println!("[SECURITY] ✅ Alert sent to {}", peer_id_clone);
+                            }
                         },
                         Err(e) => {
-                            println!("[SECURITY] ⚠️ Failed to send alert to {}: {}", peer_id_clone, e);
+                            if crate::node::is_info() {
+                                println!("[SECURITY] ⚠️ Failed to send alert to {}: {}", peer_id_clone, e);
+                            }
                         }
                     }
                 }
@@ -18283,8 +19123,10 @@ impl SimplifiedP2P {
             broadcasted += 1;
         }
         
-        println!("[SECURITY] 📢 Alert sent to {} Super nodes + {} sampled peers (total broadcasted: {})", 
-                 super_nodes.len(), sampled_peers.len(), broadcasted);
+        if crate::node::is_info() {
+            println!("[SECURITY] 📢 Alert sent to {} Super nodes + {} sampled peers (total broadcasted: {})", 
+                     super_nodes.len(), sampled_peers.len(), broadcasted);
+        }
     }
     
     /// Log security incident with cryptographic chain for tamper-proof audit trail
@@ -18294,7 +19136,9 @@ impl SimplifiedP2P {
         
         // Ensure data directory exists
         if let Err(e) = std::fs::create_dir_all(&storage_path) {
-            println!("[AUDIT] ⚠️ Failed to create data directory {}: {}", storage_path, e);
+            if crate::node::is_info() {
+                println!("[AUDIT] ⚠️ Failed to create data directory {}: {}", storage_path, e);
+            }
             return; // Don't block on file system errors
         }
         
@@ -18356,7 +19200,9 @@ impl SimplifiedP2P {
             // Update index with latest hash
             self.update_audit_index(&audit_index_file, &entry_hash);
             
-            println!("[AUDIT] 🔐 Security incident logged with hash: {}", &entry_hash[..entry_hash.len().min(16)]);
+            if crate::node::is_info() {
+                println!("[AUDIT] 🔐 Security incident logged with hash: {}", &entry_hash[..entry_hash.len().min(16)]);
+            }
         }
         
         // CRITICAL: Also broadcast to network for distributed audit
@@ -18426,7 +19272,9 @@ impl SimplifiedP2P {
         if !instances_guard.contains_key(&normalized_node_id) {
             let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
             if let Err(e) = hybrid.initialize().await {
-                println!("[AUDIT] ❌ Hybrid crypto init failed: {}", e);
+                if crate::node::is_info() {
+                    println!("[AUDIT] ❌ Hybrid crypto init failed: {}", e);
+                }
                 return String::from("UNSIGNED_NO_HYBRID_SIG");
             }
             instances_guard.insert(normalized_node_id.clone(), hybrid);
@@ -18449,17 +19297,23 @@ impl SimplifiedP2P {
                 match compact_sig.to_binary_compressed() {
                     Ok(binary_data) => {
                         let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
-                        println!("[AUDIT] ✅ Generated HYBRID signature for audit entry (bincode v2.24)");
+                        if crate::node::is_info() {
+                            println!("[AUDIT] ✅ Generated HYBRID signature for audit entry (bincode v2.24)");
+                        }
                         format!("compact_bin:{}", base64_data)  // CompactHybridSignature uses compact_bin
                     }
                     Err(e) => {
-                        println!("[AUDIT] ❌ Failed to serialize hybrid signature: {}", e);
+                        if crate::node::is_info() {
+                            println!("[AUDIT] ❌ Failed to serialize hybrid signature: {}", e);
+                        }
                         String::from("UNSIGNED_SERIALIZE_FAILED")
                     }
                 }
             }
             Err(e) => {
-                println!("[AUDIT] ❌ Failed to generate hybrid signature: {}", e);
+                if crate::node::is_info() {
+                    println!("[AUDIT] ❌ Failed to generate hybrid signature: {}", e);
+                }
                 String::from("UNSIGNED_NO_HYBRID_SIG")
             }
         }
@@ -18532,12 +19386,16 @@ impl SimplifiedP2P {
         match handle.join() {
             Ok(sig) => {
                 if sig.starts_with("hybrid_bin:") || sig.starts_with("hybrid:") {
-                    println!("[AUDIT] ✅ Generated HYBRID signature for audit entry");
+                    if crate::node::is_info() {
+                        println!("[AUDIT] ✅ Generated HYBRID signature for audit entry");
+                    }
                 }
                 sig
             }
             Err(_) => {
-                println!("[AUDIT] ❌ Audit signature thread panicked");
+                if crate::node::is_info() {
+                    println!("[AUDIT] ❌ Audit signature thread panicked");
+                }
                 String::from("THREAD_PANIC_NO_SIG")
             }
         }
@@ -18549,7 +19407,9 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[AUDIT] ⚠️ WARN: No Tokio runtime - audit broadcast skipped");
+                if crate::node::is_info() {
+                    println!("[AUDIT] ⚠️ WARN: No Tokio runtime - audit broadcast skipped");
+                }
                 return;
             }
         };
@@ -18587,7 +19447,9 @@ impl SimplifiedP2P {
             }
         }
         
-        println!("[AUDIT] 📤 Audit entry distributed to network for redundancy");
+        if crate::node::is_info() {
+            println!("[AUDIT] 📤 Audit entry distributed to network for redundancy");
+        }
     }
     
     /// PRIVACY: Get public display name for P2P announcements (preserves consensus node_id)
@@ -18648,7 +19510,9 @@ impl SimplifiedP2P {
     pub fn apply_reputation_decay(&self) {
         // v2.21.5: No-op - reputation managed via blockchain
         // Passive recovery replaces decay for low-rep nodes
-        println!("[P2P] ⏰ Reputation decay skipped - managed via blockchain");
+        if crate::node::is_info() {
+            println!("[P2P] ⏰ Reputation decay skipped - managed via blockchain");
+        }
     }
 
     /// PRODUCTION: Broadcast consensus commit to consensus participants only
@@ -18667,7 +19531,9 @@ impl SimplifiedP2P {
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         if round_id == 0 || (round_id % 90 != 0) {
-            println!("[P2P] ⏭️ BLOCKING broadcast commit for microblock round {} - no consensus needed", round_id);
+            if crate::node::is_info() {
+                println!("[P2P] ⏭️ BLOCKING broadcast commit for microblock round {} - no consensus needed", round_id);
+            }
             return Ok(());
         }
         
@@ -18676,8 +19542,10 @@ impl SimplifiedP2P {
         let total_participants = participants.len();
         let byzantine_threshold = (total_participants * 2 + 2) / 3;
         
-        println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {} to {} participants (need {} for Byzantine)", 
-                 round_id, total_participants, byzantine_threshold);
+        if crate::node::is_info() {
+            println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {} to {} participants (need {} for Byzantine)", 
+                     round_id, total_participants, byzantine_threshold);
+        }
         
         // SCALABILITY: Collect all peer addresses first (O(n) scan)
         // Then send in batched async tasks for millions of nodes
@@ -18696,7 +19564,9 @@ impl SimplifiedP2P {
                 match Self::resolve_genesis_node_address(participant_id) {
                     Some(addr) => addr,
                     None => {
-                        println!("[P2P] ⚠️ Invalid Genesis node ID: {}", participant_id);
+                        if crate::node::is_info() {
+                            println!("[P2P] ⚠️ Invalid Genesis node ID: {}", participant_id);
+                        }
                         continue;
                     }
                 }
@@ -18706,7 +19576,9 @@ impl SimplifiedP2P {
                 match peer_info {
                     Some(p) => p.addr,
                     None => {
-                        println!("[P2P] ⚠️ Consensus participant {} not found in peers", participant_id);
+                        if crate::node::is_info() {
+                            println!("[P2P] ⚠️ Consensus participant {} not found in peers", participant_id);
+                        }
                         continue;
                     }
                 }
@@ -18763,13 +19635,19 @@ impl SimplifiedP2P {
             
             // PRODUCTION: Check Byzantine threshold
             if delivered >= threshold {
-                println!("[QUIC] ✅ Consensus commit Byzantine threshold reached: {}/{} (need {})", 
-                         delivered, total + 1, threshold);
+                if crate::node::is_info() {
+                    println!("[QUIC] ✅ Consensus commit Byzantine threshold reached: {}/{} (need {})", 
+                             delivered, total + 1, threshold);
+                }
             } else {
                 // WARNING: Threshold not reached - consensus may fail!
-                println!("[QUIC] ⚠️ Consensus commit below threshold: {}/{} (need {})", 
-                         delivered, total + 1, threshold);
-                println!("[QUIC] 🔄 Attempting retry for failed peers...");
+                if crate::node::is_info() {
+                    println!("[QUIC] ⚠️ Consensus commit below threshold: {}/{} (need {})", 
+                             delivered, total + 1, threshold);
+                }
+                if crate::node::is_info() {
+                    println!("[QUIC] 🔄 Attempting retry for failed peers...");
+                }
                 
                 // RETRY: Second wave for failed peers with longer timeout
                 let failed_peers: Vec<_> = results.iter()
@@ -18803,11 +19681,15 @@ impl SimplifiedP2P {
                     let final_delivered = delivered + retry_success;
                     
                     if final_delivered >= threshold {
-                        println!("[QUIC] ✅ Retry successful: {}/{} (threshold {})", 
-                                 final_delivered, total + 1, threshold);
+                        if crate::node::is_info() {
+                            println!("[QUIC] ✅ Retry successful: {}/{} (threshold {})", 
+                                     final_delivered, total + 1, threshold);
+                        }
                     } else {
-                        println!("[QUIC] ❌ CRITICAL: Byzantine threshold NOT reached after retry: {}/{}", 
-                                 final_delivered, threshold);
+                        if crate::node::is_info() {
+                            println!("[QUIC] ❌ CRITICAL: Byzantine threshold NOT reached after retry: {}/{}", 
+                                     final_delivered, threshold);
+                        }
                     }
                 }
             }
@@ -18830,7 +19712,9 @@ impl SimplifiedP2P {
         
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         if round_id == 0 || (round_id % 90 != 0) {
-            println!("[P2P] ⏭️ BLOCKING broadcast reveal for non-macroblock round {} - no consensus needed", round_id);
+            if crate::node::is_info() {
+                println!("[P2P] ⏭️ BLOCKING broadcast reveal for non-macroblock round {} - no consensus needed", round_id);
+            }
             return Ok(());
         }
         
@@ -18838,8 +19722,10 @@ impl SimplifiedP2P {
         let total_participants = participants.len();
         let byzantine_threshold = (total_participants * 2 + 2) / 3;
         
-        println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {} to {} participants (need {} for Byzantine)", 
-                 round_id, total_participants, byzantine_threshold);
+        if crate::node::is_info() {
+            println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {} to {} participants (need {} for Byzantine)", 
+                     round_id, total_participants, byzantine_threshold);
+        }
         
         // SCALABILITY: Collect all peer addresses first (O(n) scan)
         let mut peer_addresses = Vec::with_capacity(participants.len());
@@ -18853,7 +19739,9 @@ impl SimplifiedP2P {
                 match Self::resolve_genesis_node_address(participant_id) {
                     Some(addr) => addr,
                     None => {
-                        println!("[P2P] ⚠️ Invalid Genesis node ID: {}", participant_id);
+                        if crate::node::is_info() {
+                            println!("[P2P] ⚠️ Invalid Genesis node ID: {}", participant_id);
+                        }
                         continue;
                     }
                 }
@@ -18862,7 +19750,9 @@ impl SimplifiedP2P {
                 match peer_info {
                     Some(p) => p.addr,
                     None => {
-                        println!("[P2P] ⚠️ Consensus participant {} not found in peers", participant_id);
+                        if crate::node::is_info() {
+                            println!("[P2P] ⚠️ Consensus participant {} not found in peers", participant_id);
+                        }
                         continue;
                     }
                 }
@@ -18915,12 +19805,18 @@ impl SimplifiedP2P {
             
             // PRODUCTION: Check Byzantine threshold - reveals are CRITICAL
             if delivered >= threshold {
-                println!("[QUIC] ✅ Consensus reveal Byzantine threshold reached: {}/{} (need {})", 
-                         delivered, total + 1, threshold);
+                if crate::node::is_info() {
+                    println!("[QUIC] ✅ Consensus reveal Byzantine threshold reached: {}/{} (need {})", 
+                             delivered, total + 1, threshold);
+                }
             } else {
-                println!("[QUIC] ⚠️ Consensus reveal below threshold: {}/{} (need {})", 
-                         delivered, total + 1, threshold);
-                println!("[QUIC] 🔄 CRITICAL: Attempting aggressive retry for reveals...");
+                if crate::node::is_info() {
+                    println!("[QUIC] ⚠️ Consensus reveal below threshold: {}/{} (need {})", 
+                             delivered, total + 1, threshold);
+                }
+                if crate::node::is_info() {
+                    println!("[QUIC] 🔄 CRITICAL: Attempting aggressive retry for reveals...");
+                }
                 
                 // AGGRESSIVE RETRY for reveals - they're more critical than commits
                 let failed_peers: Vec<_> = results.iter()
@@ -18953,12 +19849,16 @@ impl SimplifiedP2P {
                     let current_delivered = delivered + retry_success;
                     
                     if current_delivered >= threshold {
-                        println!("[QUIC] ✅ Reveal retry {} successful: {}/{} (threshold {})", 
-                                 retry_round, current_delivered, total + 1, threshold);
+                        if crate::node::is_info() {
+                            println!("[QUIC] ✅ Reveal retry {} successful: {}/{} (threshold {})", 
+                                     retry_round, current_delivered, total + 1, threshold);
+                        }
                         break;
                     } else {
-                        println!("[QUIC] ⚠️ Reveal retry {}: {}/{} still below threshold", 
-                                 retry_round, current_delivered, total + 1);
+                        if crate::node::is_info() {
+                            println!("[QUIC] ⚠️ Reveal retry {}: {}/{} still below threshold", 
+                                     retry_round, current_delivered, total + 1);
+                        }
                     }
                 }
             }
@@ -18987,8 +19887,10 @@ impl SimplifiedP2P {
                         match transport_guard.broadcast_to(quic_addr, message).await {
                             Ok(_) => return true,
                             Err(e) => {
-                                println!("[QUIC] ⚠️ Consensus failed to {}: {}", 
-                                    get_privacy_id_for_addr(peer_addr), e);
+                                if crate::node::is_info() {
+                                    println!("[QUIC] ⚠️ Consensus failed to {}: {}", 
+                                        get_privacy_id_for_addr(peer_addr), e);
+                                }
                             }
                         }
                     }
@@ -19064,17 +19966,21 @@ impl SimplifiedP2P {
                 _ => "Message".to_string(),
             };
             // PRIVACY: Use pseudonym in logs
-            println!("[P2P] → Sending {} to {} via {}", 
-                message_type, 
-                get_privacy_id_for_addr(&peer_addr),
-                if quic_enabled { "QUIC" } else { "HTTP" });
+            if crate::node::is_info() {
+                println!("[P2P] → Sending {} to {} via {}", 
+                    message_type, 
+                    get_privacy_id_for_addr(&peer_addr),
+                    if quic_enabled { "QUIC" } else { "HTTP" });
+            }
         }
         
         // ARCHITECTURE FIX: Peer addresses must be IP:port format
         let resolved_addr = if peer_addr.contains(':') {
             peer_addr.clone()
         } else {
-            println!("[P2P] ❌ Invalid peer address format (must be IP:port): {}", get_privacy_id_for_addr(&peer_addr));
+            if crate::node::is_info() {
+                println!("[P2P] ❌ Invalid peer address format (must be IP:port): {}", get_privacy_id_for_addr(&peer_addr));
+            }
             return;
         };
         
@@ -19084,7 +19990,9 @@ impl SimplifiedP2P {
             Err(_) => {
                 // No Tokio runtime available - skip sending (avoid panic)
                 if should_log {
-                    println!("[P2P] ⚠️ No async runtime - message queued for later");
+                    if crate::node::is_info() {
+                        println!("[P2P] ⚠️ No async runtime - message queued for later");
+                    }
                 }
                 return;
             }
@@ -19105,13 +20013,17 @@ impl SimplifiedP2P {
                             match transport.send_message(quic_addr, &message_clone).await {
                                 Ok(_) => {
                                     if should_log {
-                                        println!("[QUIC] ✅ Message sent to {} (binary)", get_privacy_id_for_addr(&resolved_addr));
+                                        if crate::node::is_info() {
+                                            println!("[QUIC] ✅ Message sent to {} (binary)", get_privacy_id_for_addr(&resolved_addr));
+                                        }
                                     }
                                     return; // Success, no need for HTTP fallback
                                 }
                                 Err(e) => {
                                     if should_log {
-                                        println!("[QUIC] ⚠️ QUIC failed to {}: {}", get_privacy_id_for_addr(&resolved_addr), e);
+                                        if crate::node::is_info() {
+                                            println!("[QUIC] ⚠️ QUIC failed to {}: {}", get_privacy_id_for_addr(&resolved_addr), e);
+                                        }
                                     }
                                     // Fall through to HTTP
                                 }
@@ -19123,7 +20035,9 @@ impl SimplifiedP2P {
             
             // NO HTTP FALLBACK - QUIC only mode
             if should_log {
-                println!("[QUIC] ❌ QUIC not available for {}", get_privacy_id_for_addr(&resolved_addr));
+                if crate::node::is_info() {
+                    println!("[QUIC] ❌ QUIC not available for {}", get_privacy_id_for_addr(&resolved_addr));
+                }
             }
         });
     }
@@ -19213,12 +20127,18 @@ impl SimplifiedP2P {
             };
             
             if let Err(e) = consensus_tx.send(consensus_msg) {
-                println!("[CONSENSUS] ❌ Failed to forward commit to consensus engine: {}", e);
+                if crate::node::is_info() {
+                    println!("[CONSENSUS] ❌ Failed to forward commit to consensus engine: {}", e);
+                }
             } else {
-                println!("[CONSENSUS] ✅ Commit forwarded to consensus engine");
+                if crate::node::is_info() {
+                    println!("[CONSENSUS] ✅ Commit forwarded to consensus engine");
+                }
             }
         } else {
-            println!("[CONSENSUS] ⚠️ No consensus channel established - commit not processed");
+            if crate::node::is_info() {
+                println!("[CONSENSUS] ⚠️ No consensus channel established - commit not processed");
+            }
         }
         
         // Note: +reputation for participation is applied AFTER consensus engine validates
@@ -19275,8 +20195,10 @@ impl SimplifiedP2P {
         const MAX_TIMESTAMP_DRIFT: u64 = 300; // 5 minutes
         
         if timestamp > now + MAX_TIMESTAMP_DRIFT {
-            println!("[CONSENSUS] ❌ Rejecting reveal with FUTURE timestamp from {}: {} > {} + {}", 
-                     node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
+            if crate::node::is_info() {
+                println!("[CONSENSUS] ❌ Rejecting reveal with FUTURE timestamp from {}: {} > {} + {}", 
+                         node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
+            }
             // Report future timestamp attack
             let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             self.report_invalid_block(&node_id, current_height, [0u8; 32], "Future timestamp in reveal");
@@ -19284,8 +20206,10 @@ impl SimplifiedP2P {
         }
         
         if timestamp < now.saturating_sub(MAX_TIMESTAMP_DRIFT) {
-            println!("[CONSENSUS] ❌ Rejecting reveal with STALE timestamp from {}: {} < {} - {}", 
-                     node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
+            if crate::node::is_info() {
+                println!("[CONSENSUS] ❌ Rejecting reveal with STALE timestamp from {}: {} < {} - {}", 
+                         node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
+            }
             return;
         }
         
@@ -19295,8 +20219,10 @@ impl SimplifiedP2P {
         let reputation_score = self.get_node_reputation_from_blockchain(&node_id) / 100.0;
         
         if reputation_score < 0.70 {
-            println!("[CONSENSUS] ❌ Rejecting reveal from jailed node: {} (reputation: {:.1}%)", 
-                     node_id, reputation_score * 100.0);
+            if crate::node::is_info() {
+                println!("[CONSENSUS] ❌ Rejecting reveal from jailed node: {} (reputation: {:.1}%)", 
+                         node_id, reputation_score * 100.0);
+            }
             return;
         }
         
@@ -19304,8 +20230,10 @@ impl SimplifiedP2P {
         // SECURITY: Basic data format validation
         // ═══════════════════════════════════════════════════════════════════════════
         if reveal_data.is_empty() || nonce.is_empty() {
-            println!("[CONSENSUS] ❌ Rejecting reveal with empty data from {}: reveal_len={}, nonce_len={}", 
-                     node_id, reveal_data.len(), nonce.len());
+            if crate::node::is_info() {
+                println!("[CONSENSUS] ❌ Rejecting reveal with empty data from {}: reveal_len={}, nonce_len={}", 
+                         node_id, reveal_data.len(), nonce.len());
+            }
             // Report empty reveal data
             let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             self.report_invalid_block(&node_id, current_height, [0u8; 32], "Empty reveal data");
@@ -19314,16 +20242,20 @@ impl SimplifiedP2P {
         
         // Nonce should be 32 bytes (64 hex chars)
         if nonce.len() != 64 {
-            println!("[CONSENSUS] ❌ Rejecting reveal with invalid nonce length from {}: {} (expected 64)", 
-                     node_id, nonce.len());
+            if crate::node::is_info() {
+                println!("[CONSENSUS] ❌ Rejecting reveal with invalid nonce length from {}: {} (expected 64)", 
+                         node_id, nonce.len());
+            }
             // Report invalid nonce
             let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid nonce length");
             return;
         }
         
-        println!("[CONSENSUS] ✅ Pre-validation passed: {} (rep: {:.1}%, ts: valid, data: {}B)", 
-                 node_id, reputation_score * 100.0, reveal_data.len());
+        if crate::node::is_info() {
+            println!("[CONSENSUS] ✅ Pre-validation passed: {} (rep: {:.1}%, ts: valid, data: {}B)", 
+                     node_id, reputation_score * 100.0, reveal_data.len());
+        }
         
         // PRODUCTION: Send to consensus engine through channel
         if let Some(ref consensus_tx) = self.consensus_tx {
@@ -19337,12 +20269,18 @@ impl SimplifiedP2P {
             };
             
             if let Err(e) = consensus_tx.send(consensus_msg) {
-                println!("[CONSENSUS] ❌ Failed to forward reveal to consensus engine: {}", e);
+                if crate::node::is_info() {
+                    println!("[CONSENSUS] ❌ Failed to forward reveal to consensus engine: {}", e);
+                }
             } else {
-                println!("[CONSENSUS] ✅ Reveal forwarded to consensus engine");
+                if crate::node::is_info() {
+                    println!("[CONSENSUS] ✅ Reveal forwarded to consensus engine");
+                }
             }
         } else {
-            println!("[CONSENSUS] ⚠️ No consensus channel established - reveal not processed");
+            if crate::node::is_info() {
+                println!("[CONSENSUS] ⚠️ No consensus channel established - reveal not processed");
+            }
         }
         
         // Note: +reputation for participation is applied AFTER consensus engine validates
@@ -19681,7 +20619,9 @@ impl SimplifiedP2P {
             timestamp: now,
         };
 
-        println!("[INFO][VRF-KEY] announcing pk_hash={} to peers", hex::encode(&vrf_pk[..8]));
+        if crate::node::is_info() {
+            println!("[INFO][VRF-KEY] announcing pk_hash={} to peers", hex::encode(&vrf_pk[..8]));
+        }
 
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
@@ -20300,7 +21240,9 @@ impl SimplifiedP2P {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                println!("[FAILOVER] WARN: No Tokio runtime - emergency handler skipped");
+                if crate::node::is_info() {
+                    println!("[FAILOVER] WARN: No Tokio runtime - emergency handler skipped");
+                }
                 return;
             }
         };
@@ -20324,8 +21266,12 @@ impl SimplifiedP2P {
         // Macroblocks are separate consensus process and should NOT stop microblock production
         // Only microblock failovers should trigger production changes
         if change_type == "macroblock" {
-            println!("[FAILOVER] ℹ️ Macroblock failover at block #{} - ignoring (microblock production continues)", block_height);
-            println!("[FAILOVER] 💡 Macroblocks are separate Byzantine consensus, no impact on microblocks");
+            if crate::node::is_info() {
+                println!("[FAILOVER] ℹ️ Macroblock failover at block #{} - ignoring (microblock production continues)", block_height);
+            }
+            if crate::node::is_info() {
+                println!("[FAILOVER] 💡 Macroblocks are separate Byzantine consensus, no impact on microblocks");
+            }
             return;
         }
         
@@ -20342,7 +21288,9 @@ impl SimplifiedP2P {
         let last_height = LAST_EMERGENCY_HEIGHT.load(Ordering::Relaxed);
         
         if last_height == block_height && failed_producer == self.node_id {
-            println!("[FAILOVER] ⚠️ Duplicate emergency message for block #{} - ignoring", block_height);
+            if crate::node::is_info() {
+                println!("[FAILOVER] ⚠️ Duplicate emergency message for block #{} - ignoring", block_height);
+            }
             return;
         }
         
@@ -20357,8 +21305,10 @@ impl SimplifiedP2P {
         
         // VALIDATION #1: Ignore failover for blocks too far in the future
         if block_height > local_height + 10 {
-            println!("[FAILOVER] ⚠️ Ignoring emergency for block #{} - too far ahead (local: {})", 
-                     block_height, local_height);
+            if crate::node::is_info() {
+                println!("[FAILOVER] ⚠️ Ignoring emergency for block #{} - too far ahead (local: {})", 
+                         block_height, local_height);
+            }
             return;
         }
         
@@ -20369,8 +21319,10 @@ impl SimplifiedP2P {
             // We already have this block - check if it exists in storage
             // Use external storage check via static method (no self reference needed)
             // ARCHITECTURE: Emergency messages should only be trusted if we're also missing the block
-            println!("[FAILOVER] ✅ Block #{} already processed (local height: {}) - ignoring emergency", 
-                     block_height, local_height);
+            if crate::node::is_info() {
+                println!("[FAILOVER] ✅ Block #{} already processed (local height: {}) - ignoring emergency", 
+                         block_height, local_height);
+            }
             return;
         }
         
@@ -20380,11 +21332,15 @@ impl SimplifiedP2P {
         // SCALABILITY: DashSet provides lock-free concurrent access for millions of nodes
         if !PROCESSED_FAILOVERS.insert(failover_key.clone()) {
             // Already processed this exact failover event (insert returns false if already exists)
-            println!("[FAILOVER] ⚠️ Duplicate emergency for block #{} - ignoring", block_height);
+            if crate::node::is_info() {
+                println!("[FAILOVER] ⚠️ Duplicate emergency for block #{} - ignoring", block_height);
+            }
             
             // SECURITY: Track duplicate emergency from sender as potential spam
             if let Some(sender) = &sender_addr {
-                println!("[SECURITY] ⚠️ Duplicate emergency from {} for block #{}", sender, block_height);
+                if crate::node::is_info() {
+                    println!("[SECURITY] ⚠️ Duplicate emergency from {} for block #{}", sender, block_height);
+                }
                 // Could apply penalty for spam in future
             }
             return;
@@ -20397,7 +21353,9 @@ impl SimplifiedP2P {
             PROCESSED_FAILOVERS.retain(|(h, _, _)| *h >= min_height);
         }
         
-        println!("[FAILOVER] 📨 Processing emergency {} producer change notification", change_type);
+        if crate::node::is_info() {
+            println!("[FAILOVER] 📨 Processing emergency {} producer change notification", change_type);
+        }
         
         // CHECK FOR CRITICAL ATTACKS
         let is_critical_attack = change_type.contains("CRITICAL") || 
@@ -20406,10 +21364,18 @@ impl SimplifiedP2P {
                                   change_type == "CHAIN_FORK";
         
         if is_critical_attack {
-            println!("[SECURITY] 🚨🚨🚨 CRITICAL ATTACK DETECTED! 🚨🚨🚨");
-            println!("[SECURITY] 🚨 Producer: {} committed CRITICAL violation!", failed_producer);
-            println!("[SECURITY] 🚨 Attack type: {} at block #{}", change_type, block_height);
-            println!("[SECURITY] 🚨 APPLYING INSTANT MAXIMUM BAN (1 YEAR)!");
+            if crate::node::is_info() {
+                println!("[SECURITY] 🚨🚨🚨 CRITICAL ATTACK DETECTED! 🚨🚨🚨");
+            }
+            if crate::node::is_info() {
+                println!("[SECURITY] 🚨 Producer: {} committed CRITICAL violation!", failed_producer);
+            }
+            if crate::node::is_info() {
+                println!("[SECURITY] 🚨 Attack type: {} at block #{}", change_type, block_height);
+            }
+            if crate::node::is_info() {
+                println!("[SECURITY] 🚨 APPLYING INSTANT MAXIMUM BAN (1 YEAR)!");
+            }
             
             // Report Byzantine attack as slashing event
             self.report_invalid_block(
@@ -20421,8 +21387,10 @@ impl SimplifiedP2P {
             
             // v2.21.5: Jails now via slashing events in macroblock
             // Report as storage manipulation offense for next macroblock
-            println!("[FAILOVER] ⚠️ {} flagged for {} - will be jailed in next macroblock via slashing event", 
-                     failed_producer, change_type);
+            if crate::node::is_info() {
+                println!("[FAILOVER] ⚠️ {} flagged for {} - will be jailed in next macroblock via slashing event", 
+                         failed_producer, change_type);
+            }
             
             // PRIVACY: Use pseudonym for logging
             let display_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
@@ -20430,7 +21398,9 @@ impl SimplifiedP2P {
             } else {
                 get_privacy_id_for_addr(&failed_producer)
             };
-            println!("[SECURITY] ✅ Node {} banned for 1 year, reputation destroyed", display_id);
+            if crate::node::is_info() {
+                println!("[SECURITY] ✅ Node {} banned for 1 year, reputation destroyed", display_id);
+            }
             return;
         }
         
@@ -20447,8 +21417,12 @@ impl SimplifiedP2P {
             get_privacy_id_for_addr(&new_producer)
         };
         
-        println!("[FAILOVER] 💀 Failed producer: {} at block #{}", failed_display, block_height);
-        println!("[FAILOVER] 🆘 New producer: {} (emergency activation)", new_display);
+        if crate::node::is_info() {
+            println!("[FAILOVER] 💀 Failed producer: {} at block #{}", failed_display, block_height);
+        }
+        if crate::node::is_info() {
+            println!("[FAILOVER] 🆘 New producer: {} (emergency activation)", new_display);
+        }
         
         // CRITICAL: If WE are the failed producer, VERIFY before stopping
         // Protection against false failover claims
@@ -20480,22 +21454,38 @@ impl SimplifiedP2P {
                     // - Normal: 5 seconds timeout (allows for 1-2 missed blocks)
                     // - Startup: 10 seconds timeout (allows for Genesis sync delays)
                     if recently_produced || startup_protection {
-                        println!("[FAILOVER] ⚠️ FALSE FAILOVER DETECTED!");
+                        if crate::node::is_info() {
+                            println!("[FAILOVER] ⚠️ FALSE FAILOVER DETECTED!");
+                        }
                         
                         if recently_produced {
-                            println!("[FAILOVER] 📊 We produced block #{} just {}s ago", 
-                                    last_produced_height, time_since_last_production);
-                            println!("[FAILOVER] ✅ Ignoring false failover - we ARE actively producing!");
+                            if crate::node::is_info() {
+                                println!("[FAILOVER] 📊 We produced block #{} just {}s ago", 
+                                        last_produced_height, time_since_last_production);
+                            }
+                            if crate::node::is_info() {
+                                println!("[FAILOVER] ✅ Ignoring false failover - we ARE actively producing!");
+                            }
                         } else if startup_protection {
-                            println!("[FAILOVER] 🌱 Genesis phase protection: Block #{} (startup phase)", block_height);
-                            println!("[FAILOVER] ⏰ Node initialized {}s ago - too early for legitimate failover", 
-                                    time_since_last_production);
-                            println!("[FAILOVER] ✅ Ignoring false failover - network still initializing!");
+                            if crate::node::is_info() {
+                                println!("[FAILOVER] 🌱 Genesis phase protection: Block #{} (startup phase)", block_height);
+                            }
+                            if crate::node::is_info() {
+                                println!("[FAILOVER] ⏰ Node initialized {}s ago - too early for legitimate failover", 
+                                        time_since_last_production);
+                            }
+                            if crate::node::is_info() {
+                                println!("[FAILOVER] ✅ Ignoring false failover - network still initializing!");
+                            }
                         }
                         
                         // Track false failovers from this peer
-                        println!("[FAILOVER] ⚠️ False failover claiming new producer: {}", new_producer);
-                        println!("[FAILOVER] 💡 This may indicate race condition or network delay");
+                        if crate::node::is_info() {
+                            println!("[FAILOVER] ⚠️ False failover claiming new producer: {}", new_producer);
+                        }
+                        if crate::node::is_info() {
+                            println!("[FAILOVER] 💡 This may indicate race condition or network delay");
+                        }
                         // Could track reputation penalty for false failovers here in future
                         
                         // DO NOT STOP - continue producing blocks
@@ -20513,9 +21503,13 @@ impl SimplifiedP2P {
                     }
                     
                     // We haven't produced recently - accept the failover
-                    println!("[FAILOVER] 🛑 Accepting failover - last production was {}s ago", 
-                            time_since_last_production);
-                    println!("[FAILOVER] 🛑 STOPPING block production");
+                    if crate::node::is_info() {
+                        println!("[FAILOVER] 🛑 Accepting failover - last production was {}s ago", 
+                                time_since_last_production);
+                    }
+                    if crate::node::is_info() {
+                        println!("[FAILOVER] 🛑 STOPPING block production");
+                    }
                     
                     EMERGENCY_STOP_PRODUCTION.store(true, Ordering::Relaxed);
                     // CRITICAL: Only set stop height if not already set (prevent reset by multiple messages)
@@ -20530,17 +21524,23 @@ impl SimplifiedP2P {
                         let cycle_end = (current_cycle + 1) * rotation_interval;
                         let remaining_in_cycle = cycle_end.saturating_sub(block_height);
                         
-                        println!("[INFO][RECOVERY] stop_until_rotation h={} cycle_end={} remaining={}", 
-                                 block_height, cycle_end, remaining_in_cycle);
+                        if crate::node::is_info() {
+                            println!("[INFO][RECOVERY] stop_until_rotation h={} cycle_end={} remaining={}", 
+                                     block_height, cycle_end, remaining_in_cycle);
+                        }
                     } else {
-                        println!("[INFO][RECOVERY] already_stopped at_h={}", current_stop_height);
+                        if crate::node::is_info() {
+                            println!("[INFO][RECOVERY] already_stopped at_h={}", current_stop_height);
+                        }
                     }
                     // Main loop will check this flag and stop producing blocks
                     // This prevents fork creation when emergency failover happens
                 },
                 NodeType::Light => {
                     // Light nodes don't produce blocks, so no need to stop
-                    println!("[FAILOVER] 📱 Light node marked as failed producer (ignored - we don't produce blocks)");
+                    if crate::node::is_info() {
+                        println!("[FAILOVER] 📱 Light node marked as failed producer (ignored - we don't produce blocks)");
+                    }
                 }
             }
         }
@@ -20565,9 +21565,11 @@ impl SimplifiedP2P {
             let seconds_passed = if current_time > stop_time { current_time - stop_time } else { 0 };
             
             if stop_height > 0 && (block_height >= cycle_end || seconds_passed >= 60) {
-                println!("[INFO][RECOVERY] stop_cleared h={} cycle_end={} reason={}", 
-                        block_height, cycle_end,
-                        if block_height >= cycle_end { "rotation_complete" } else { "timeout_60s" });
+                if crate::node::is_info() {
+                    println!("[INFO][RECOVERY] stop_cleared h={} cycle_end={} reason={}", 
+                            block_height, cycle_end,
+                            if block_height >= cycle_end { "rotation_complete" } else { "timeout_60s" });
+                }
                 EMERGENCY_STOP_PRODUCTION.store(false, Ordering::Relaxed);
                 EMERGENCY_STOP_HEIGHT.store(0, Ordering::Relaxed);
                 EMERGENCY_STOP_TIME.store(0, Ordering::Relaxed);
@@ -20578,7 +21580,9 @@ impl SimplifiedP2P {
         if failed_producer == "unknown_leader" || 
            failed_producer == "no_leader_selected" || 
            failed_producer == "consensus_lock_failed" {
-            println!("[REPUTATION] ⚠️ Skipping penalty for placeholder producer: {}", failed_producer);
+            if crate::node::is_info() {
+                println!("[REPUTATION] ⚠️ Skipping penalty for placeholder producer: {}", failed_producer);
+            }
             return;
         }
         
@@ -20589,11 +21593,15 @@ impl SimplifiedP2P {
             .unwrap_or(false);
         
         if is_genesis_bootstrap && block_height < 100 {
-            println!("[REPUTATION] ⚠️ Genesis bootstrap phase (block {}): No penalty for {} (technical issues expected)", 
-                     block_height, failed_display);
+            if crate::node::is_info() {
+                println!("[REPUTATION] ⚠️ Genesis bootstrap phase (block {}): No penalty for {} (technical issues expected)", 
+                         block_height, failed_display);
+            }
             // Still record the event but without reputation penalty
-            println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
-                     change_type, block_height, timestamp);
+            if crate::node::is_info() {
+                println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
+                         change_type, block_height, timestamp);
+            }
             
             // Emergency producer reward will be processed via block production
             // DeterministicReputationState.process_block() handles rewards
@@ -20618,14 +21626,18 @@ impl SimplifiedP2P {
             set_emergency_producer_flag(block_height, new_producer.clone());
         
         if new_producer == self.node_id {
-            println!("[INFO][FAILOVER] we_are_emergency h={}", block_height);
+            if crate::node::is_info() {
+                println!("[INFO][FAILOVER] we_are_emergency h={}", block_height);
+            }
         } else if crate::node::is_debug() {
             println!("[DBG][FAILOVER] emergency_set h={} producer={}", block_height, new_producer);
         }
         
         // Log emergency change for network transparency
-        println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
-                 change_type, block_height, timestamp);
+        if crate::node::is_info() {
+            println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
+                     change_type, block_height, timestamp);
+        }
         
         // CONSENSUS: Track emergency confirmations from multiple nodes
         // This provides lightweight Byzantine-like protection without full consensus overhead
@@ -20636,7 +21648,9 @@ impl SimplifiedP2P {
             .0
             .fetch_add(1, Ordering::Relaxed) + 1;
         
-        println!("[CONSENSUS] 📊 Emergency for block #{}: {} confirmations", block_height, confirmation_count);
+        if crate::node::is_info() {
+            println!("[CONSENSUS] 📊 Emergency for block #{}: {} confirmations", block_height, confirmation_count);
+        }
         
         // CLEANUP: Remove old confirmation entries (keep last 100 blocks)
         if EMERGENCY_CONFIRMATIONS.len() > 100 {
@@ -20646,11 +21660,15 @@ impl SimplifiedP2P {
         
         // Log suspicious emergency for monitoring
         if let Some(sender) = &sender_addr {
-            println!("[SECURITY] 🔍 Emergency from {} for block #{} - tracking", sender, block_height);
+            if crate::node::is_info() {
+                println!("[SECURITY] 🔍 Emergency from {} for block #{} - tracking", sender, block_height);
+            }
         }
         
         // Request block immediately (synchronous part)
-        println!("[FAILOVER] 📡 Requesting block #{} from network", block_height);
+        if crate::node::is_info() {
+            println!("[FAILOVER] 📡 Requesting block #{} from network", block_height);
+        }
         
         // Clone values for logging (async part will check consensus)
         let failed_producer_log = failed_producer.clone();
@@ -20667,8 +21685,10 @@ impl SimplifiedP2P {
             let final_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
             
             if block_height_log <= final_height {
-                println!("[FAILOVER] ✅ Block #{} received - Producer {} is INNOCENT", 
-                         block_height_log, failed_producer_log);
+                if crate::node::is_info() {
+                    println!("[FAILOVER] ✅ Block #{} received - Producer {} is INNOCENT", 
+                             block_height_log, failed_producer_log);
+                }
             } else {
                 // Check consensus
                 let conf_key = (block_height_log, failed_producer_log.clone());
@@ -20681,8 +21701,10 @@ impl SimplifiedP2P {
                     // CONSENSUS REACHED: 3+ nodes confirm block missing
                     // Aggressive Catch-up in node.rs will handle resync (15s/5 blocks)
                     // Round Tolerance ±90 in commit_reveal.rs handles message acceptance
-                    println!("[CONSENSUS] ✅ Block #{} missing - CONSENSUS REACHED ({} confirmations)", 
-                             block_height_log, confirmations);
+                    if crate::node::is_info() {
+                        println!("[CONSENSUS] ✅ Block #{} missing - CONSENSUS REACHED ({} confirmations)", 
+                                 block_height_log, confirmations);
+                    }
                     if crate::node::is_info() { 
                         println!("[INFO][TC] stall_confirmed h={} action=aggressive_catchup", block_height_log); 
                     }
@@ -20722,9 +21744,13 @@ impl SimplifiedP2P {
         // ═══════════════════════════════════════════════════════════════════════════
         
         // Log emergency for monitoring (NO slashing action here!)
-        println!("[INFO][FAILOVER] emergency_recorded producer={} h={} new_producer={}", 
-                 failed_producer, block_height, new_producer);
-        println!("[INFO][FAILOVER] slashing=deferred_to_macroblock reason=on_chain_analysis");
+        if crate::node::is_info() {
+            println!("[INFO][FAILOVER] emergency_recorded producer={} h={} new_producer={}", 
+                     failed_producer, block_height, new_producer);
+        }
+        if crate::node::is_info() {
+            println!("[INFO][FAILOVER] slashing=deferred_to_macroblock reason=on_chain_analysis");
+        }
     }
     
     
@@ -20751,8 +21777,12 @@ impl SimplifiedP2P {
             get_privacy_id_for_addr(&from_node)
         };
         
-        println!("[REPUTATION] ⚠️ IGNORED ReputationSync from {} - P2P reputation sync DISABLED", from_display);
-        println!("[REPUTATION]    Use DeterministicReputationState from blockchain instead");
+        if crate::node::is_info() {
+            println!("[REPUTATION] ⚠️ IGNORED ReputationSync from {} - P2P reputation sync DISABLED", from_display);
+        }
+        if crate::node::is_info() {
+            println!("[REPUTATION]    Use DeterministicReputationState from blockchain instead");
+        }
         
         // DO NOTHING - reputation comes from blockchain only
     }
@@ -20777,7 +21807,9 @@ impl SimplifiedP2P {
     #[allow(unused_variables)]
     pub async fn verify_reputation_signature_async(&self, node_id: &str, updates: &[(String, f64)], timestamp: u64, signature: &[u8]) -> bool {
         // DISABLED: Always returns false - reputation sync via P2P is a security vulnerability
-        println!("[REPUTATION] ⚠️ verify_reputation_signature DISABLED - use blockchain reputation");
+        if crate::node::is_info() {
+            println!("[REPUTATION] ⚠️ verify_reputation_signature DISABLED - use blockchain reputation");
+        }
         false
     }
     
@@ -20808,7 +21840,9 @@ impl SimplifiedP2P {
     #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
     pub async fn broadcast_reputation_sync_async(&self) -> Result<(), String> {
         // DISABLED: Returns Ok but does nothing
-        println!("[REPUTATION] ⚠️ broadcast_reputation_sync DISABLED - reputation from blockchain only");
+        if crate::node::is_info() {
+            println!("[REPUTATION] ⚠️ broadcast_reputation_sync DISABLED - reputation from blockchain only");
+        }
         Ok(())
     }
     
@@ -20898,30 +21932,40 @@ impl SimplifiedP2P {
                             Ok(binary_data) => {
                                 let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
                                 let sig_with_prefix = format!("compact_bin:{}", base64_data);
-                                println!("[P2P] ✅ Generated HYBRID signature for reputation sync (bincode v2.24)");
+                                if crate::node::is_info() {
+                                    println!("[P2P] ✅ Generated HYBRID signature for reputation sync (bincode v2.24)");
+                                }
                                 sig_with_prefix.as_bytes().to_vec()
                             }
                             Err(e) => {
-                                println!("[P2P] ❌ Failed to serialize hybrid signature: {}", e);
+                                if crate::node::is_info() {
+                                    println!("[P2P] ❌ Failed to serialize hybrid signature: {}", e);
+                                }
                                 Vec::new()
                             }
                         }
                     }
                     Err(e) => {
-                        println!("[P2P] ❌ Failed to generate hybrid signature: {}", e);
+                        if crate::node::is_info() {
+                            println!("[P2P] ❌ Failed to generate hybrid signature: {}", e);
+                        }
                         Vec::new()
                     }
                 }
             }
             Err(e) => {
-                println!("[P2P] ❌ Cannot create runtime for signature: {}", e);
+                if crate::node::is_info() {
+                    println!("[P2P] ❌ Cannot create runtime for signature: {}", e);
+                }
                 Vec::new()
             }
         };
         
         // Check if signature is valid before sending
         if signature.is_empty() {
-            println!("[P2P] ⚠️ Cannot broadcast reputation sync without valid signature - skipping");
+            if crate::node::is_info() {
+                println!("[P2P] ⚠️ Cannot broadcast reputation sync without valid signature - skipping");
+            }
             return Err("Cannot broadcast without valid quantum-resistant signature".to_string());
         }
         
@@ -20964,7 +22008,9 @@ impl SimplifiedP2P {
                 get_privacy_id_for_addr(&node_id)
             };
             
-            println!("[REPUTATION] 🔄 Starting reputation sync task for {}", display_id);
+            if crate::node::is_info() {
+                println!("[REPUTATION] 🔄 Starting reputation sync task for {}", display_id);
+            }
             let mut iteration = 0u64;
             
             loop {
@@ -20980,7 +22026,9 @@ impl SimplifiedP2P {
                     }
                     (all_reps.into_iter().collect::<Vec<_>>(), all_jails)
                 } else {
-                    println!("[REPUTATION] ⚠️ Failed to lock reputation system");
+                    if crate::node::is_info() {
+                        println!("[REPUTATION] ⚠️ Failed to lock reputation system");
+                    }
                     continue;
                 };
                 
@@ -21028,7 +22076,9 @@ impl SimplifiedP2P {
                 let _message_json = match serde_json::to_string(&sync_msg) {
                     Ok(json) => json,
                     Err(e) => {
-                        println!("[REPUTATION] ❌ Failed to serialize sync message: {}", e);
+                        if crate::node::is_info() {
+                            println!("[REPUTATION] ❌ Failed to serialize sync message: {}", e);
+                        }
                         continue;
                     }
                 };
@@ -21043,7 +22093,9 @@ impl SimplifiedP2P {
                     .collect();
                 
                 if qualified_peers.is_empty() {
-                    println!("[REPUTATION] ⚠️ No qualified peers for gossip sync - skipping iteration #{}", iteration);
+                    if crate::node::is_info() {
+                        println!("[REPUTATION] ⚠️ No qualified peers for gossip sync - skipping iteration #{}", iteration);
+                    }
                     continue;
                 }
                 
@@ -21122,8 +22174,10 @@ impl SimplifiedP2P {
                 }
                 
                 if successful > 0 {
-                    println!("[REPUTATION] 🌐 Gossip #{}: Sent {} reputations to {}/{} peers (fanout={})", 
-                             iteration, reputation_updates.len(), successful, gossip_fanout, gossip_fanout);
+                    if crate::node::is_info() {
+                        println!("[REPUTATION] 🌐 Gossip #{}: Sent {} reputations to {}/{} peers (fanout={})", 
+                                 iteration, reputation_updates.len(), successful, gossip_fanout, gossip_fanout);
+                    }
                 }
             }
         });
@@ -21164,8 +22218,10 @@ impl SimplifiedP2P {
         let first_seen = entry.1;
         let elapsed = first_seen.elapsed();
         
-        println!("[SECURITY] ⚠️ Invalid certificate from {}: {} (count: {}, window: {}s)", 
-                 node_id, reason, count, elapsed.as_secs());
+        if crate::node::is_info() {
+            println!("[SECURITY] ⚠️ Invalid certificate from {}: {} (count: {}, window: {}s)", 
+                     node_id, reason, count, elapsed.as_secs());
+        }
         
         // CRITICAL: Escalating punishment for certificate violations
         // 5 invalid certificates in 10 minutes → critical attack (ban)
@@ -21174,9 +22230,13 @@ impl SimplifiedP2P {
         if count >= 5 && elapsed < Duration::from_secs(600) {
             // PROTECTION: Genesis nodes get warnings but no bans
             if self.is_genesis_node(node_id) {
-                println!("[SECURITY] ⚠️ Genesis node {} has {} invalid certificates - WARNING ONLY", 
-                         node_id, count);
-                println!("[SECURITY] 🛡️ Genesis nodes are protected from automatic bans");
+                if crate::node::is_info() {
+                    println!("[SECURITY] ⚠️ Genesis node {} has {} invalid certificates - WARNING ONLY", 
+                             node_id, count);
+                }
+                if crate::node::is_info() {
+                    println!("[SECURITY] 🛡️ Genesis nodes are protected from automatic bans");
+                }
                 // Record slashing event but Genesis nodes protected from ban
                 let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                 self.report_invalid_block(node_id, current_height, [0u8; 32], "Genesis node: 5+ invalid certificates");
@@ -21185,10 +22245,16 @@ impl SimplifiedP2P {
             }
             
             // CRITICAL ATTACK: 5+ invalid certificates in 10 minutes = malicious node
-            println!("[SECURITY] 🚨🚨🚨 CERTIFICATE ATTACKER DETECTED! 🚨🚨🚨");
-            println!("[SECURITY] 🚨 Node: {} sent {} invalid certificates in {} seconds", 
-                     node_id, count, elapsed.as_secs());
-            println!("[SECURITY] 🚨 APPLYING INSTANT BAN!");
+            if crate::node::is_info() {
+                println!("[SECURITY] 🚨🚨🚨 CERTIFICATE ATTACKER DETECTED! 🚨🚨🚨");
+            }
+            if crate::node::is_info() {
+                println!("[SECURITY] 🚨 Node: {} sent {} invalid certificates in {} seconds", 
+                         node_id, count, elapsed.as_secs());
+            }
+            if crate::node::is_info() {
+                println!("[SECURITY] 🚨 APPLYING INSTANT BAN!");
+            }
             
             // Report as critical attack
             let _ = self.report_critical_attack(
@@ -21202,7 +22268,9 @@ impl SimplifiedP2P {
             INVALID_CERT_TRACKER.remove(node_id);
         } else if count == 3 {
             // Warning level - record slashing evidence
-            println!("[SECURITY] ⚠️ WARNING: {} has sent 3 invalid certificates", node_id);
+            if crate::node::is_info() {
+                println!("[SECURITY] ⚠️ WARNING: {} has sent 3 invalid certificates", node_id);
+            }
             let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             self.report_invalid_block(node_id, current_height, [0u8; 32], "3 invalid certificates");
         }
@@ -21220,8 +22288,10 @@ impl SimplifiedP2P {
         let first_seen = entry.1;
         let elapsed = first_seen.elapsed();
         
-        println!("[SECURITY] ⚠️ Invalid block from {}: {} (count: {}, window: {}s)", 
-                 producer, reason, count, elapsed.as_secs());
+        if crate::node::is_info() {
+            println!("[SECURITY] ⚠️ Invalid block from {}: {} (count: {}, window: {}s)", 
+                     producer, reason, count, elapsed.as_secs());
+        }
         
         // CRITICAL: Soft punishment with escalation
         // 3 invalid blocks → warning + small penalty
@@ -21229,10 +22299,16 @@ impl SimplifiedP2P {
         
         if count >= 10 && elapsed < Duration::from_secs(300) {
             // CRITICAL ATTACK: 10+ invalid blocks in 5 minutes = malicious node
-            println!("[SECURITY] 🚨🚨🚨 MALICIOUS NODE DETECTED! 🚨🚨🚨");
-            println!("[SECURITY] 🚨 Producer: {} sent {} invalid blocks in {} seconds", 
-                     producer, count, elapsed.as_secs());
-            println!("[SECURITY] 🚨 APPLYING INSTANT BAN (1 YEAR)!");
+            if crate::node::is_info() {
+                println!("[SECURITY] 🚨🚨🚨 MALICIOUS NODE DETECTED! 🚨🚨🚨");
+            }
+            if crate::node::is_info() {
+                println!("[SECURITY] 🚨 Producer: {} sent {} invalid blocks in {} seconds", 
+                         producer, count, elapsed.as_secs());
+            }
+            if crate::node::is_info() {
+                println!("[SECURITY] 🚨 APPLYING INSTANT BAN (1 YEAR)!");
+            }
             
             // Report as critical attack
             let _ = self.report_critical_attack(
@@ -21247,13 +22323,17 @@ impl SimplifiedP2P {
             
         } else if count == 3 {
             // WARNING: 3 invalid blocks = possible bug or sync issue
-            println!("[SECURITY] ⚠️ WARNING: {} sent 3 invalid blocks", producer);
+            if crate::node::is_info() {
+                println!("[SECURITY] ⚠️ WARNING: {} sent 3 invalid blocks", producer);
+            }
             let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             self.report_invalid_block(producer, current_height, [0u8; 32], "3 consecutive invalid blocks");
             
         } else if count == 5 {
             // ESCALATION: 5 invalid blocks = suspicious behavior
-            println!("[SECURITY] ⚠️ ESCALATION: {} sent 5 invalid blocks", producer);
+            if crate::node::is_info() {
+                println!("[SECURITY] ⚠️ ESCALATION: {} sent 5 invalid blocks", producer);
+            }
             let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             self.report_invalid_block(producer, current_height, [0u8; 32], "5 consecutive invalid blocks (suspicious)");
         }
@@ -21294,7 +22374,9 @@ impl SimplifiedP2P {
         let was_inserted = EMERGENCY_FAILOVERS_IN_PROGRESS.insert(failover_key.to_string());
         
         if was_inserted {
-            println!("[FAILOVER] 🔒 Locked emergency failover: {}", failover_key);
+            if crate::node::is_info() {
+                println!("[FAILOVER] 🔒 Locked emergency failover: {}", failover_key);
+            }
             
             // CLEANUP: Auto-remove after 30 seconds to prevent memory leak
             // SAFE: Check if Tokio runtime is available to prevent panic
@@ -21303,7 +22385,9 @@ impl SimplifiedP2P {
                 handle.spawn(async move {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     EMERGENCY_FAILOVERS_IN_PROGRESS.remove(&key_clone);
-                    println!("[FAILOVER] 🔓 Auto-unlocked emergency failover: {}", key_clone);
+                    if crate::node::is_info() {
+                        println!("[FAILOVER] 🔓 Auto-unlocked emergency failover: {}", key_clone);
+                    }
                 });
             }
         }
@@ -21314,7 +22398,9 @@ impl SimplifiedP2P {
     /// Clear emergency failover lock (used when broadcast fails)
     pub fn clear_emergency_in_progress(&self, failover_key: &str) {
         EMERGENCY_FAILOVERS_IN_PROGRESS.remove(failover_key);
-        println!("[FAILOVER] 🔓 Cleared emergency failover lock: {}", failover_key);
+        if crate::node::is_info() {
+            println!("[FAILOVER] 🔓 Cleared emergency failover lock: {}", failover_key);
+        }
     }
     
     /// Report critical attack to network for instant ban
@@ -21344,9 +22430,15 @@ impl SimplifiedP2P {
         };
         
         // Log for monitoring and future on-chain inclusion
-        println!("[CRIT][SECURITY] attack_detected attacker={} h={} type={}", attacker, block_height, change_type);
-        println!("[CRIT][SECURITY] evidence={}", evidence);
-        println!("[INFO][SECURITY] action=on_chain_slashing note=will_be_included_in_macroblock");
+        if crate::node::is_warn() {
+            println!("[CRIT][SECURITY] attack_detected attacker={} h={} type={}", attacker, block_height, change_type);
+        }
+        if crate::node::is_warn() {
+            println!("[CRIT][SECURITY] evidence={}", evidence);
+        }
+        if crate::node::is_info() {
+            println!("[INFO][SECURITY] action=on_chain_slashing note=will_be_included_in_macroblock");
+        }
         
         // TODO: Add to slashing evidence queue for inclusion in next MacroBlock
         // For now, detection is logged and macroblock producer will include if they also detect
@@ -21375,7 +22467,9 @@ impl SimplifiedP2P {
                                 // Find first producer that isn't excluded
                                 for p in &producers {
                                     if p.node_id != exclude {
-                                        println!("[SECURITY] ✅ Emergency producer from epoch snapshot: {}", p.node_id);
+                                        if crate::node::is_info() {
+                                            println!("[SECURITY] ✅ Emergency producer from epoch snapshot: {}", p.node_id);
+                                        }
                                         return p.node_id.clone();
                                     }
                                 }
@@ -21391,7 +22485,9 @@ impl SimplifiedP2P {
         for (_, id) in GENESIS_NODE_IPS.iter() {
             let node_id = format!("genesis_node_{}", id);
             if node_id != exclude {
-                println!("[SECURITY] ✅ Emergency producer from Genesis: {}", node_id);
+                if crate::node::is_info() {
+                    println!("[SECURITY] ✅ Emergency producer from Genesis: {}", node_id);
+                }
                 return node_id;
             }
         }
@@ -21415,7 +22511,9 @@ impl SimplifiedP2P {
         block_height: u64,
         change_type: &str
     ) -> Result<(), String> {
-        println!("[FAILOVER] 📢 Broadcasting emergency {} producer change to network", change_type);
+        if crate::node::is_info() {
+            println!("[FAILOVER] 📢 Broadcasting emergency {} producer change to network", change_type);
+        }
         
         // v2.51: Lock-free emergency broadcast
         let timestamp = std::time::SystemTime::now()
@@ -21493,11 +22591,15 @@ impl SimplifiedP2P {
         };
         
         if final_duration > 0 {
-            println!("[BLACKLIST] 🚫 SOFT: {} blacklisted for {}s (reason: {:?}, attempt: {})", 
-                     peer_addr, final_duration, reason, attempts);
+            if crate::node::is_info() {
+                println!("[BLACKLIST] 🚫 SOFT: {} blacklisted for {}s (reason: {:?}, attempt: {})", 
+                         peer_addr, final_duration, reason, attempts);
+            }
         } else {
-            println!("[BLACKLIST] ⛔ HARD: {} permanently blacklisted (reason: {:?})", 
-                     peer_addr, reason);
+            if crate::node::is_info() {
+                println!("[BLACKLIST] ⛔ HARD: {} permanently blacklisted (reason: {:?})", 
+                         peer_addr, reason);
+            }
         }
     }
     
@@ -21519,8 +22621,10 @@ impl SimplifiedP2P {
     /// Remove peer from blacklist (manual override or reputation recovered)
     pub fn remove_from_blacklist(&self, peer_addr: &str) {
         if let Some((_, entry)) = PEER_BLACKLIST.remove(peer_addr) {
-            println!("[BLACKLIST] ✅ Removed {} from blacklist (reason: {:?})", 
-                     peer_addr, entry.reason);
+            if crate::node::is_info() {
+                println!("[BLACKLIST] ✅ Removed {} from blacklist (reason: {:?})", 
+                         peer_addr, entry.reason);
+            }
         }
     }
     
@@ -21598,7 +22702,9 @@ impl SimplifiedP2P {
         });
         
         if removed > 0 {
-            println!("[BLACKLIST] 🧹 Cleaned up {} expired blacklist entries", removed);
+            if crate::node::is_info() {
+                println!("[BLACKLIST] 🧹 Cleaned up {} expired blacklist entries", removed);
+            }
         }
     }
 }

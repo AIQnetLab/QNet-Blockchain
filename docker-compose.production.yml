@@ -3,7 +3,7 @@ services:
   qnet-genesis:
     build:
       context: .
-      dockerfile: Dockerfile.production
+      dockerfile: development/qnet-integration/Dockerfile.production
     container_name: qnet-genesis
     hostname: genesis
     logging:
@@ -39,12 +39,11 @@ services:
       - "9876:9876"   # P2P network
       - "8401:8401"   # Metrics (API port + 400)
     volumes:
-      # Use named volume for blockchain data persistence, tmpfs for logs
-      - genesis-blockchain-data:/app/data/blockchain
-      # Logs stored in container tmpfs - auto-deleted on container removal
+      # v8.1 FIX: Mount volume at /app/data (where RocksDB actually writes)
+      # Previously was /app/data/blockchain which was unused — data was lost on restart
+      - genesis-blockchain-data:/app/data
     tmpfs:
-      - /app/data/logs:noexec,nosuid,size=500m
-      - /app/data/temp:noexec,nosuid,size=200m
+      - /app/logs:noexec,nosuid,size=500m
     networks:
       - qnet-testnet
     restart: unless-stopped
@@ -62,15 +61,15 @@ services:
   qnet-validator1:
     build:
       context: .
-      dockerfile: Dockerfile.production
+      dockerfile: development/qnet-integration/Dockerfile.production
     container_name: qnet-validator1
     hostname: validator1
     logging:
       driver: "json-file"
       options:
-        max-size: "200m"    # 200MB per file
-        max-file: "50"      # 50 files = 10GB total max, oldest auto-deleted
-        compress: "true"    # Compress old logs to save space
+        max-size: "200m"
+        max-file: "50"
+        compress: "true"
     environment:
       - RUST_LOG=info,qnet=debug
       - QNET_TESTNET=1
@@ -89,16 +88,13 @@ services:
       - QNET_ADMIN_SECRET=${QNET_ADMIN_SECRET:?QNET_ADMIN_SECRET must be set in .env}
     command: qnet-node
     ports:
-      - "8002:8001"   # Unified API/RPC (mapped to 8002 on host)
-      - "9877:9877"   # P2P network
-      - "8402:8401"   # Metrics (mapped to 8402 on host)
+      - "8002:8001"
+      - "9877:9877"
+      - "8402:8401"
     volumes:
-      # Use named volume for blockchain data persistence, tmpfs for logs
-      - validator1-blockchain-data:/app/data/blockchain
-      # Logs stored in container tmpfs - auto-deleted on container removal
+      - validator1-blockchain-data:/app/data
     tmpfs:
-      - /app/data/logs:noexec,nosuid,size=500m
-      - /app/data/temp:noexec,nosuid,size=200m
+      - /app/logs:noexec,nosuid,size=500m
     networks:
       - qnet-testnet
     restart: unless-stopped
@@ -118,15 +114,15 @@ services:
   qnet-validator2:
     build:
       context: .
-      dockerfile: Dockerfile.production
+      dockerfile: development/qnet-integration/Dockerfile.production
     container_name: qnet-validator2
     hostname: validator2
     logging:
       driver: "json-file"
       options:
-        max-size: "200m"    # 200MB per file
-        max-file: "50"      # 50 files = 10GB total max, oldest auto-deleted
-        compress: "true"    # Compress old logs to save space
+        max-size: "200m"
+        max-file: "50"
+        compress: "true"
     environment:
       - RUST_LOG=info,qnet=debug
       - QNET_TESTNET=1
@@ -145,16 +141,13 @@ services:
       - QNET_ADMIN_SECRET=${QNET_ADMIN_SECRET:?QNET_ADMIN_SECRET must be set in .env}
     command: qnet-node
     ports:
-      - "8003:8001"   # Unified API/RPC (mapped to 8003 on host)
-      - "9878:9878"   # P2P network
-      - "8403:8401"   # Metrics (mapped to 8403 on host)
+      - "8003:8001"
+      - "9878:9878"
+      - "8403:8401"
     volumes:
-      # Use named volume for blockchain data persistence, tmpfs for logs
-      - validator2-blockchain-data:/app/data/blockchain
-      # Logs stored in container tmpfs - auto-deleted on container removal
+      - validator2-blockchain-data:/app/data
     tmpfs:
-      - /app/data/logs:noexec,nosuid,size=500m
-      - /app/data/temp:noexec,nosuid,size=200m
+      - /app/logs:noexec,nosuid,size=500m
     networks:
       - qnet-testnet
     restart: unless-stopped

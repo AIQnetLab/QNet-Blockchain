@@ -3105,10 +3105,6 @@ fn configure_production_mode() {
     // PRODUCTION: All transactions are ALWAYS validated (signature, balance, nonce)
     // No skip_validation option exists - removed for security
     
-    // Always enable microblocks for production
-    std::env::set_var("QNET_ENABLE_MICROBLOCKS", "1");
-    std::env::set_var("QNET_MICROBLOCK_DEFAULT", "1");
-    
     // Always enable producer mode for production
     std::env::set_var("QNET_IS_LEADER", "1");
     std::env::set_var("QNET_MICROBLOCK_PRODUCER", "1");

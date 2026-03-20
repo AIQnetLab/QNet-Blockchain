@@ -301,55 +301,63 @@ impl ApiRateLimiter {
     fn new() -> Self {
         let mut configs = HashMap::new();
         
-        // Transaction submission: 100 requests/minute per IP (balance between usability and spam protection)
-        // Heavy users (exchanges, DApps) should use API key for unlimited access
+        // v8.1: Configurable via QNET_API_RATE_LIMIT env (format: "requests_per_minute")
+        // Default: 100 tx/min. Operators can increase for benchmark/exchange deployments.
+        let tx_rate: u32 = std::env::var("QNET_API_RATE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        
         configs.insert("transaction".to_string(), RateLimitConfig {
-            max_requests: 100,
+            max_requests: tx_rate,
             window_seconds: 60,
-            block_duration: 300, // 5 min block
+            block_duration: 300,
         });
         
-        // Activation code generation: 5 requests/hour (expensive operation)
         configs.insert("activation".to_string(), RateLimitConfig {
             max_requests: 5,
             window_seconds: 3600,
-            block_duration: 3600, // 1 hour block
+            block_duration: 3600,
         });
         
-        // Light node registration: 3 requests/hour
         configs.insert("light_node_register".to_string(), RateLimitConfig {
             max_requests: 3,
             window_seconds: 3600,
             block_duration: 3600,
         });
 
-        // Light node token refresh: 2 requests/hour (FCM token updates are rare)
         configs.insert("light_node_token_refresh".to_string(), RateLimitConfig {
             max_requests: 2,
             window_seconds: 3600,
             block_duration: 1800,
         });
         
-        // Reward claims: 10 requests/hour
         configs.insert("claim_rewards".to_string(), RateLimitConfig {
             max_requests: 10,
             window_seconds: 3600,
-            block_duration: 1800, // 30 min block
+            block_duration: 1800,
         });
         
-        // General API: 100 requests/minute
+        // v8.1: General and read-only also scale with tx_rate
+        let general_rate = std::cmp::max(tx_rate, 100);
+        let read_rate = std::cmp::max(tx_rate * 3, 300);
+        
         configs.insert("general".to_string(), RateLimitConfig {
-            max_requests: 100,
+            max_requests: general_rate,
             window_seconds: 60,
-            block_duration: 60, // 1 min block
+            block_duration: 60,
         });
         
-        // Read-only endpoints: 300 requests/minute (more lenient)
         configs.insert("read_only".to_string(), RateLimitConfig {
-            max_requests: 300,
+            max_requests: read_rate,
             window_seconds: 60,
             block_duration: 30,
         });
+        
+        if tx_rate != 100 {
+            println!("[INFO][SECURITY] api_rate_limit_configured tx={}/min general={}/min read={}/min", 
+                     tx_rate, general_rate, read_rate);
+        }
         
         Self {
             ip_states: DashMap::new(),

@@ -33,11 +33,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use dashmap::DashMap;
 use quinn::{Endpoint, ServerConfig, ClientConfig, Connection, VarInt, RecvStream, SendStream};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Mutex};
 use serde::{Serialize, Deserialize};
 
 use crate::unified_p2p::{NetworkMessage, get_privacy_id_for_addr};
@@ -96,6 +97,112 @@ pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Protocol version
 pub const PROTOCOL_VERSION: u8 = 1;
+
+/// Maximum concurrent incoming handshakes (v6.3: DoS protection).
+/// Each TLS 1.3 + Kyber handshake costs ~2-5ms CPU. Capping at 64
+/// limits worst-case CPU burn to ~320ms even under botnet flood.
+/// Legitimate peers retry with backoff; this only throttles bursts.
+const MAX_CONCURRENT_HANDSHAKES: usize = 64;
+
+// ============================================================================
+// ADAPTIVE RTT - Per-peer RTT cache for optimal congestion control (v6.3)
+// ============================================================================
+
+/// Conservative default initial_rtt for unknown peers.
+/// Covers inter-continental links (US↔EU ~110ms, EU↔Asia ~200ms).
+/// Quinn Cubic/BBR quickly converges down for same-DC (<1ms) peers.
+const DEFAULT_INITIAL_RTT_MS: u64 = 250;
+
+/// Minimum initial_rtt — never go below this even with cached data.
+/// Prevents over-aggressive sending on brief RTT dips.
+const MIN_INITIAL_RTT_MS: u64 = 10;
+
+/// Maximum initial_rtt — never seed higher than this.
+/// Even satellite links (~600ms) are served within this bound.
+const MAX_INITIAL_RTT_MS: u64 = 2000;
+
+/// Maximum entries in the RTT cache. Bounded to prevent memory leak
+/// when encountering many ephemeral peers. At ~64 bytes per entry,
+/// 10 000 peers = ~640 KB — negligible.
+const RTT_CACHE_MAX_ENTRIES: usize = 10_000;
+
+/// Peer RTT observation: stores the last measured RTT and a timestamp
+/// for cache eviction / freshness checks.
+#[derive(Clone, Debug)]
+struct PeerRttEntry {
+    rtt_ms: u64,
+    updated_at: Instant,
+}
+
+/// Bounded per-peer RTT cache. Uses a simple HashMap with eviction
+/// of the oldest entry when capacity is exceeded.
+/// Protected by Mutex — contention is negligible because writes happen
+/// only on connection close / health-check (every 15-30s per peer).
+struct PeerRttCache {
+    entries: HashMap<SocketAddr, PeerRttEntry>,
+}
+
+impl PeerRttCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(128),
+        }
+    }
+
+    fn get(&self, addr: &SocketAddr) -> Option<u64> {
+        self.entries.get(addr).map(|e| e.rtt_ms)
+    }
+
+    fn update(&mut self, addr: SocketAddr, rtt_ms: u64) {
+        if rtt_ms == 0 {
+            return;
+        }
+        if self.entries.len() >= RTT_CACHE_MAX_ENTRIES && !self.entries.contains_key(&addr) {
+            if let Some(oldest_addr) = self.find_oldest() {
+                self.entries.remove(&oldest_addr);
+            }
+        }
+        self.entries.insert(addr, PeerRttEntry {
+            rtt_ms,
+            updated_at: Instant::now(),
+        });
+    }
+
+    fn find_oldest(&self) -> Option<SocketAddr> {
+        self.entries.iter()
+            .min_by_key(|(_, e)| e.updated_at)
+            .map(|(addr, _)| *addr)
+    }
+}
+
+/// Build a TransportConfig with adaptive initial_rtt and BBR congestion control.
+/// Called once per connection (client-side) or once for the server endpoint.
+fn build_adaptive_transport(initial_rtt_ms: u64) -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
+    transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
+    transport.max_idle_timeout(Some(
+        Duration::from_secs(IDLE_TIMEOUT_SECS)
+            .try_into()
+            .expect("Idle timeout must fit in IdleTimeout"),
+    ));
+    transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
+
+    let clamped_rtt = initial_rtt_ms.clamp(MIN_INITIAL_RTT_MS, MAX_INITIAL_RTT_MS);
+    transport.initial_rtt(Duration::from_millis(clamped_rtt));
+
+    // BBR congestion control: bandwidth-based rather than loss-based (Cubic).
+    // Superior on high-RTT / cross-continental links because it probes actual
+    // bottleneck bandwidth instead of reacting to packet loss.
+    // Used by Solana, Google QUIC (quiche), Cloudflare.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+
+    transport.receive_window(VarInt::from_u32(16_777_216)); // 16 MB
+    transport.send_window(16_777_216); // 16 MB
+    transport.datagram_receive_buffer_size(Some(8_388_608)); // 8 MB
+
+    transport
+}
 
 // ============================================================================
 // NODE HANDSHAKE
@@ -196,6 +303,8 @@ pub struct QuicTransport {
     message_handler: Option<MessageHandler>,
     /// Statistics
     stats: Arc<RwLock<QuicStats>>,
+    /// Per-peer RTT cache for adaptive initial_rtt on reconnect (v6.3)
+    rtt_cache: Arc<Mutex<PeerRttCache>>,
 }
 
 impl QuicTransport {
@@ -209,6 +318,7 @@ impl QuicTransport {
             server_running: Arc::new(AtomicBool::new(false)),
             message_handler: None,
             stats: Arc::new(RwLock::new(QuicStats::default())),
+            rtt_cache: Arc::new(Mutex::new(PeerRttCache::new())),
         }
     }
     
@@ -253,26 +363,10 @@ impl QuicTransport {
                 .map_err(|e| format!("QUIC server config failed: {}", e))?
         ));
         
-        // Transport config - OPTIMIZED FOR HIGH-THROUGHPUT L1 (v2.45)
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
-        transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
-        transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().expect("Idle timeout must fit in IdleTimeout")));
-        transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
-        
-        // PRODUCTION v2.45: High-throughput optimizations
-        // Faster initial RTT estimate for quicker congestion control convergence
-        transport.initial_rtt(Duration::from_millis(50));
-        
-        // Larger receive window for high-bandwidth block propagation (16MB)
-        transport.receive_window(VarInt::from_u32(16_777_216));
-        
-        // Larger send window for sustained throughput (16MB)
-        transport.send_window(16_777_216);
-        
-        // Increase datagram receive buffer for burst handling
-        transport.datagram_receive_buffer_size(Some(8_388_608)); // 8MB
-        
+        // v6.3: Adaptive transport with BBR and conservative initial RTT for server
+        // Server endpoint uses DEFAULT_INITIAL_RTT_MS — incoming connections come from
+        // anywhere in the world; we can't know their RTT beforehand.
+        let transport = build_adaptive_transport(DEFAULT_INITIAL_RTT_MS);
         server_config.transport_config(Arc::new(transport));
         
         // Create endpoint
@@ -281,10 +375,10 @@ impl QuicTransport {
         
         self.endpoint = Some(endpoint);
         
-        // PRIVACY: bind_addr is local, OK to show
-        println!("[INFO][QUIC] transport_initialized addr={}", bind_addr);
-        println!("[QUIC] 📊 Config: timeout={}s, streams={}, window=16MB, rtt=50ms", 
-            CONNECT_TIMEOUT_SECS, MAX_STREAMS_PER_CONN);
+        if is_info() {
+            println!("[INFO][QUIC] transport_initialized addr={} timeout={}s streams={} window=16MB initial_rtt={}ms cc=BBR",
+                bind_addr, CONNECT_TIMEOUT_SECS, MAX_STREAMS_PER_CONN, DEFAULT_INITIAL_RTT_MS);
+        }
         
         Ok(())
     }
@@ -310,21 +404,29 @@ impl QuicTransport {
         
         // Spawn server task
         tokio::spawn(async move {
-            println!("[INFO][QUIC] server_started accepting=true");
+            if is_info() { println!("[INFO][QUIC] server_started accepting=true"); }
+            
+            let handshake_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
             
             while server_running.load(Ordering::Relaxed) {
-                // Accept incoming connection
                 let incoming = match endpoint.accept().await {
                     Some(conn) => conn,
                     None => {
-                        println!("[WARN][QUIC] endpoint_closed");
+                        if crate::node::is_warn() { println!("[WARN][QUIC] endpoint_closed"); }
                         break;
+                    }
+                };
+                
+                let permit = match handshake_semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        if crate::node::is_warn() { println!("[WARN][QUIC] handshake_throttled active={}", MAX_CONCURRENT_HANDSHAKES); }
+                        continue;
                     }
                 };
                 
                 let peer_addr = incoming.remote_address();
                 
-                // Handle connection in separate task
                 let connections_clone = connections.clone();
                 let handler_clone = message_handler.clone();
                 let stats_clone = stats.clone();
@@ -333,141 +435,129 @@ impl QuicTransport {
                 let node_type_clone = node_type.clone();
                 
                 tokio::spawn(async move {
-                    match incoming.await {
-                        Ok(connection) => {
-                            // PRIVACY: Hide real IP in logs
-                            println!("[INFO][QUIC] incoming_conn peer={}", get_privacy_id_for_addr(&peer_addr.to_string()));
-                            
-                            // Perform handshake
-                            let handshake_result = Self::handle_server_handshake(
-                                &connection, 
-                                &node_id_clone, 
-                                &cert_serial_clone,
-                                &node_type_clone
-                            ).await;
-                            
-                            let (remote_node_id, remote_cert_serial, remote_node_type) = match handshake_result {
-                                Ok(h) => h,
-                                Err(e) => {
-                                    println!("[ERR][QUIC] handshake_failed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
-                                    return;
-                                }
-                            };
-                            
-                            println!("[INFO][QUIC] conn_accepted peer={} node={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id);
-                            
-                            // CRITICAL: Prevent self-connect on server side too
-                            if remote_node_id == node_id_clone {
-                                println!("[WARN][QUIC] self_connect_detected side=server action=close");
-                                connection.close(quinn::VarInt::from_u32(0), b"self-connect");
-                                return;
+                    // TLS+Kyber handshake phase — permit limits concurrency
+                    let handshake_outcome = {
+                        let _permit = permit;
+                        let conn_result = incoming.await;
+                        match conn_result {
+                            Ok(connection) => {
+                                let hs = Self::handle_server_handshake(
+                                    &connection,
+                                    &node_id_clone,
+                                    &cert_serial_clone,
+                                    &node_type_clone
+                                ).await;
+                                Some((connection, hs))
                             }
-                            
-                            // SECURITY v3.33: TLS cert SAN check (server side).
-                            // One-way TLS: client cert usually unavailable → Err("peer_identity unavailable") → OK.
-                            // But if cert IS presented and SAN mismatches → close (potential MitM).
-                            match Self::verify_peer_cert_node_id(&connection, &remote_node_id) {
-                                Ok(()) => {
-                                    if is_debug() { println!("[DBG][QUIC] cert_san_ok side=server node={}", remote_node_id); }
-                                }
-                                Err(e) if e.contains("SAN does not contain") => {
-                                    println!("[ERR][QUIC] cert_san_MISMATCH side=server node={} reason={} → closing", remote_node_id, e);
-                                    connection.close(quinn::VarInt::from_u32(403), b"SAN_MISMATCH");
-                                    return;
-                                }
-                                Err(_) => {
-                                    // peer_identity unavailable — normal for one-way TLS
-                                }
-                            }
-                            
-                            // CRITICAL FIX v2.19.24: Smart connection management
-                            // 
-                            // Architecture: Each node pair needs connections for BOTH directions:
-                            // - CLIENT conn (we initiated): we send, they receive via accept
-                            // - SERVER conn (they initiated): they send, we receive via accept
-                            // 
-                            // Rules:
-                            // 1. Accept incoming if we don't have SERVER conn from this node
-                            // 2. Replace SERVER conn if it's DEAD
-                            // 3. Keep our CLIENT conn separate (different peer_addr anyway)
-                            //
-                            // This prevents:
-                            // - Duplicate SERVER connections from same node
-                            // - Closing connections needed for receiving
-                            // - Memory leaks from dead connections
-                            
-                            let mut existing_server_addr: Option<std::net::SocketAddr> = None;
-                            let mut existing_server_alive = false;
-                            
-                            for entry in connections_clone.iter() {
-                                if let Some(ref existing_node_id) = entry.value().remote_node_id {
-                                    if existing_node_id == &remote_node_id {
-                                        // Check if this is a SERVER connection (incoming)
-                                        // SERVER connections have random source port from client
-                                        // Our CLIENT connections use the known QUIC port
-                                        let entry_port = entry.key().port();
-                                        let is_server_conn = entry_port != crate::quic_transport::QUIC_PORT;
-                                        
-                                        if is_server_conn {
-                                            existing_server_addr = Some(*entry.key());
-                                            existing_server_alive = crate::quic_transport::is_connection_alive(entry.value());
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // Handle existing SERVER connection
-                            if let Some(addr) = existing_server_addr {
-                                if existing_server_alive {
-                                    // Already have LIVE server connection - close this duplicate
-                                    println!("[WARN][QUIC] duplicate_conn node={} status=live action=close", remote_node_id);
-                                    connection.close(quinn::VarInt::from_u32(0), b"duplicate-server");
-                                    return;
-                                } else {
-                                    // Remove DEAD server connection
-                                    println!("[INFO][QUIC] replace_dead_conn node={}", remote_node_id);
-                                    connections_clone.remove(&addr);
-                                }
-                            }
-                            
-                            // Store connection
-                            let quic_conn = Arc::new(QuicConnection {
-                                connection: connection.clone(),
-                                remote_node_id: Some(remote_node_id.clone()),
-                                remote_cert_serial: Some(remote_cert_serial),
-                                remote_node_type: Some(remote_node_type.clone()),
-                                connected_at: Instant::now(),
-                                last_activity_ms: AtomicU64::new(Self::current_time_ms()),
-                                messages_sent: AtomicU64::new(0),
-                                messages_received: AtomicU64::new(0),
-                                bytes_sent: AtomicU64::new(0),
-                                bytes_received: AtomicU64::new(0),
-                            });
-                            
-                            connections_clone.insert(peer_addr, quic_conn.clone());
-                            println!("[INFO][QUIC] conn_stored peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type);
-                            
-                            // Update stats
-                            {
+                            Err(e) => {
+                                if crate::node::is_warn() { println!("[WARN][QUIC] conn_failed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e); }
                                 let mut s = stats_clone.write().await;
-                                s.connections_established += 1;
-                                s.active_connections = connections_clone.len();
+                                s.connections_failed += 1;
+                                None
                             }
-                            
-                            // Handle incoming streams (v3.1: pass connections for cleanup on close)
-                            Self::handle_incoming_streams(connection, peer_addr, handler_clone, quic_conn, connections_clone.clone()).await;
                         }
+                        // _permit dropped here — slot freed for next handshake
+                    };
+                    
+                    let (connection, handshake_result) = match handshake_outcome {
+                        Some((c, hs)) => (c, hs),
+                        None => return,
+                    };
+                    
+                    if is_info() {
+                        println!("[INFO][QUIC] incoming_conn peer={}", get_privacy_id_for_addr(&peer_addr.to_string()));
+                    }
+                    
+                    let (remote_node_id, remote_cert_serial, remote_node_type) = match handshake_result {
+                        Ok(h) => h,
                         Err(e) => {
-                            println!("[ERR][QUIC] conn_failed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
-                            let mut s = stats_clone.write().await;
-                            s.connections_failed += 1;
+                            if crate::node::is_warn() { println!("[WARN][QUIC] handshake_failed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e); }
+                            return;
+                        }
+                    };
+                    
+                    if is_info() { println!("[INFO][QUIC] conn_accepted peer={} node={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id); }
+                    
+                    if remote_node_id == node_id_clone {
+                        if crate::node::is_warn() { println!("[WARN][QUIC] self_connect_detected side=server action=close"); }
+                        connection.close(quinn::VarInt::from_u32(0), b"self-connect");
+                        return;
+                    }
+                    
+                    // SECURITY v3.33: TLS cert SAN check (server side).
+                    // One-way TLS: client cert usually unavailable → Err → OK.
+                    // If cert IS presented and SAN mismatches → close (potential MitM).
+                    match Self::verify_peer_cert_node_id(&connection, &remote_node_id) {
+                        Ok(()) => {
+                            if is_debug() { println!("[DBG][QUIC] cert_san_ok side=server node={}", remote_node_id); }
+                        }
+                        Err(e) if e.contains("SAN does not contain") => {
+                            if crate::node::is_warn() { println!("[WARN][QUIC] cert_san_MISMATCH side=server node={} reason={}", remote_node_id, e); }
+                            connection.close(quinn::VarInt::from_u32(403), b"SAN_MISMATCH");
+                            return;
+                        }
+                        Err(_) => {}
+                    }
+                    
+                    // CRITICAL FIX v2.19.24: Smart connection management
+                    // Each node pair needs CLIENT + SERVER conns for bidirectional communication.
+                    // Accept incoming if no live SERVER conn from this node; replace dead ones.
+                    let mut existing_server_addr: Option<std::net::SocketAddr> = None;
+                    let mut existing_server_alive = false;
+                    
+                    for entry in connections_clone.iter() {
+                        if let Some(ref existing_node_id) = entry.value().remote_node_id {
+                            if existing_node_id == &remote_node_id {
+                                let entry_port = entry.key().port();
+                                let is_server_conn = entry_port != crate::quic_transport::QUIC_PORT;
+                                
+                                if is_server_conn {
+                                    existing_server_addr = Some(*entry.key());
+                                    existing_server_alive = crate::quic_transport::is_connection_alive(entry.value());
+                                    break;
+                                }
+                            }
                         }
                     }
+                    
+                    if let Some(addr) = existing_server_addr {
+                        if existing_server_alive {
+                            if crate::node::is_warn() { println!("[WARN][QUIC] duplicate_conn node={} action=close", remote_node_id); }
+                            connection.close(quinn::VarInt::from_u32(0), b"duplicate-server");
+                            return;
+                        } else {
+                            if is_info() { println!("[INFO][QUIC] replace_dead_conn node={}", remote_node_id); }
+                            connections_clone.remove(&addr);
+                        }
+                    }
+                    
+                    let quic_conn = Arc::new(QuicConnection {
+                        connection: connection.clone(),
+                        remote_node_id: Some(remote_node_id.clone()),
+                        remote_cert_serial: Some(remote_cert_serial),
+                        remote_node_type: Some(remote_node_type.clone()),
+                        connected_at: Instant::now(),
+                        last_activity_ms: AtomicU64::new(Self::current_time_ms()),
+                        messages_sent: AtomicU64::new(0),
+                        messages_received: AtomicU64::new(0),
+                        bytes_sent: AtomicU64::new(0),
+                        bytes_received: AtomicU64::new(0),
+                    });
+                    
+                    connections_clone.insert(peer_addr, quic_conn.clone());
+                    if is_info() { println!("[INFO][QUIC] conn_stored peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type); }
+                    
+                    {
+                        let mut s = stats_clone.write().await;
+                        s.connections_established += 1;
+                        s.active_connections = connections_clone.len();
+                    }
+                    
+                    Self::handle_incoming_streams(connection, peer_addr, handler_clone, quic_conn, connections_clone.clone()).await;
                 });
             }
             
-            println!("[INFO][QUIC] server_stopped");
+            if is_info() { println!("[INFO][QUIC] server_stopped"); }
         });
         
         Ok(())
@@ -551,7 +641,7 @@ impl QuicTransport {
                             });
                         }
                         Err(e) => {
-                            println!("[WARN][QUIC] conn_closed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                            if crate::node::is_warn() { println!("[WARN][QUIC] conn_closed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e); }
                             break;
                         }
                     }
@@ -567,7 +657,7 @@ impl QuicTransport {
                             });
                         }
                         Err(e) => {
-                            println!("[WARN][QUIC] uni_closed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                            if crate::node::is_warn() { println!("[WARN][QUIC] uni_closed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e); }
                             break;
                         }
                     }
@@ -578,7 +668,7 @@ impl QuicTransport {
         // v3.1 CRITICAL: Remove connection from DashMap to prevent memory leak
         // Without this, dead connections accumulate forever causing 15GB+ memory usage!
         if connections.remove(&peer_addr).is_some() {
-            println!("[INFO][QUIC] conn_removed_on_close peer={}", get_privacy_id_for_addr(&peer_addr.to_string()));
+            if is_info() { println!("[INFO][QUIC] conn_removed_on_close peer={}", get_privacy_id_for_addr(&peer_addr.to_string())); }
         }
     }
     
@@ -590,22 +680,21 @@ impl QuicTransport {
         handler: Option<MessageHandler>,
         conn: Arc<QuicConnection>,
     ) {
-        // v2.95: Read length-prefixed message (4 bytes length + data)
-        // This allows us to read complete message without waiting for FIN
+        let peer_rtt = conn.connection.rtt();
+        let adaptive_timeout = Duration::from_secs(MESSAGE_TIMEOUT_SECS)
+            .min(Duration::from_millis(5000).max(peer_rtt * 10));
+        
         let mut len_buf = [0u8; 4];
         let data = match tokio::time::timeout(
-            Duration::from_secs(MESSAGE_TIMEOUT_SECS),
+            adaptive_timeout,
             async {
-                // Read length prefix
                 recv.read_exact(&mut len_buf).await?;
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
                 
-                // Sanity check
                 if msg_len > MAX_MESSAGE_SIZE {
                     return Err(quinn::ReadExactError::FinishedEarly(0));
                 }
                 
-                // Read message body
                 let mut data = vec![0u8; msg_len];
                 recv.read_exact(&mut data).await?;
                 Ok(data)
@@ -613,7 +702,6 @@ impl QuicTransport {
         ).await {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
-                // v2.95.1: All bidi senders now use length-prefix, so this is a real error
                 if crate::node::is_warn() {
                     println!("[WARN][QUIC] bidi_read_failed peer={} err={:?}",
                         get_privacy_id_for_addr(&peer_addr.to_string()), e);
@@ -622,7 +710,9 @@ impl QuicTransport {
             }
             Err(_) => {
                 if crate::node::is_warn() {
-                    println!("[WARN][QUIC] bidi_read_timeout peer={}", get_privacy_id_for_addr(&peer_addr.to_string()));
+                    println!("[WARN][QUIC] bidi_read_timeout peer={} timeout={}ms",
+                        get_privacy_id_for_addr(&peer_addr.to_string()),
+                        adaptive_timeout.as_millis());
                 }
                 return;
             }
@@ -669,21 +759,25 @@ impl QuicTransport {
         handler: Option<MessageHandler>,
         conn: Arc<QuicConnection>,
     ) {
-        // v2.95.2: Read length-prefixed message (4 bytes length + data)
+        // v6.3: Adaptive read timeout based on live RTT measurement.
+        // Floor at 5s, ceiling at MESSAGE_TIMEOUT_SECS. For same-DC peers (<1ms RTT)
+        // this yields 5s; for cross-continental (~110ms) yields 5s; for truly slow
+        // links (500ms+ RTT) yields proportionally more headroom.
+        let peer_rtt = conn.connection.rtt();
+        let adaptive_timeout = Duration::from_secs(MESSAGE_TIMEOUT_SECS)
+            .min(Duration::from_millis(5000).max(peer_rtt * 10));
+        
         let mut len_buf = [0u8; 4];
         let data = match tokio::time::timeout(
-            Duration::from_secs(MESSAGE_TIMEOUT_SECS),
+            adaptive_timeout,
             async {
-                // Read length prefix
                 recv.read_exact(&mut len_buf).await?;
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
                 
-                // Sanity check
                 if msg_len > MAX_MESSAGE_SIZE {
                     return Err(quinn::ReadExactError::FinishedEarly(0));
                 }
                 
-                // Read message body
                 let mut data = vec![0u8; msg_len];
                 recv.read_exact(&mut data).await?;
                 Ok(data)
@@ -699,8 +793,9 @@ impl QuicTransport {
             }
             Err(_) => {
                 if crate::node::is_warn() {
-                    println!("[WARN][QUIC] uni_read_timeout peer={}", 
-                        get_privacy_id_for_addr(&peer_addr.to_string()));
+                    println!("[WARN][QUIC] uni_read_timeout peer={} timeout={}ms", 
+                        get_privacy_id_for_addr(&peer_addr.to_string()),
+                        adaptive_timeout.as_millis());
                 }
                 return;
             }
@@ -767,8 +862,7 @@ impl QuicTransport {
             if crate::quic_transport::is_connection_alive(&conn) {
                 return Ok(conn.clone());
             } else {
-                // Connection is dead or zombie - evict and reconnect
-                println!("[INFO][QUIC] removing_dead_conn peer={}", get_privacy_id_for_addr(&peer_addr.to_string()));
+                if is_info() { println!("[INFO][QUIC] removing_dead_conn peer={}", get_privacy_id_for_addr(&peer_addr.to_string())); }
                 self.connections.remove(&peer_addr);
             }
         }
@@ -804,8 +898,7 @@ impl QuicTransport {
                         let base_delay = RETRY_DELAY_MS * (1 << (attempt - 1).min(5));
                         let delay = Duration::from_millis(base_delay.min(MAX_RETRY_DELAY_MS));
                         
-                        // Only log every other attempt to reduce spam
-                        if attempt % 2 == 1 || attempt == max_attempts - 1 {
+                        if crate::node::is_warn() && (attempt % 2 == 1 || attempt == max_attempts - 1) {
                             println!("[WARN][QUIC] conn_attempt_failed attempt={}/{} peer={} retry_in={:?}",
                                 attempt, max_attempts,
                                 get_privacy_id_for_addr(&peer_addr.to_string()),
@@ -847,20 +940,22 @@ impl QuicTransport {
                 .map_err(|e| format!("Client config failed: {}", e))?
         ));
         
-        // Transport config - OPTIMIZED FOR HIGH-THROUGHPUT L1 (v2.45)
-        // CRITICAL FIX: Must include uni_streams for receiving broadcasts!
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
-        transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN)); // CRITICAL: Allow incoming uni streams!
-        transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().expect("Idle timeout must fit in IdleTimeout")));
-        transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
-        
-        // PRODUCTION v2.45: High-throughput optimizations (same as server)
-        transport.initial_rtt(Duration::from_millis(50));
-        transport.receive_window(VarInt::from_u32(16_777_216)); // 16MB
-        transport.send_window(16_777_216); // 16MB
-        transport.datagram_receive_buffer_size(Some(8_388_608)); // 8MB
-        
+        // v6.3: Per-peer adaptive initial_rtt with BBR congestion control.
+        // If we've connected to this peer before, seed Quinn with their measured RTT × 2
+        // (safety margin). Otherwise use conservative global default (250ms).
+        let cached_rtt_ms = {
+            let cache = self.rtt_cache.lock().await;
+            cache.get(&peer_addr)
+        };
+        let initial_rtt_ms = match cached_rtt_ms {
+            Some(rtt) => (rtt * 2).clamp(MIN_INITIAL_RTT_MS, MAX_INITIAL_RTT_MS),
+            None => DEFAULT_INITIAL_RTT_MS,
+        };
+        let transport = build_adaptive_transport(initial_rtt_ms);
+        if is_debug() {
+            println!("[DBG][QUIC] adaptive_transport peer={} initial_rtt={}ms cached={:?}",
+                get_privacy_id_for_addr(&peer_addr.to_string()), initial_rtt_ms, cached_rtt_ms);
+        }
         client_config.transport_config(Arc::new(transport));
         
         // Connect with timeout
@@ -880,7 +975,7 @@ impl QuicTransport {
         
         // CRITICAL: Prevent self-connect
         if remote_node_id == self.node_id {
-            println!("[WARN][QUIC] self_connect_detected side=client action=close");
+            if crate::node::is_warn() { println!("[WARN][QUIC] self_connect_detected side=client action=close"); }
             connection.close(quinn::VarInt::from_u32(0), b"self-connect");
             return Err("Self-connect not allowed".to_string());
         }
@@ -896,7 +991,7 @@ impl QuicTransport {
                 }
             }
             Err(e) if e.contains("SAN does not contain") => {
-                println!("[ERR][QUIC] cert_san_MISMATCH side=client node={} reason={} → closing", remote_node_id, e);
+                if crate::node::is_warn() { println!("[WARN][QUIC] cert_san_MISMATCH side=client node={} reason={}", remote_node_id, e); }
                 connection.close(quinn::VarInt::from_u32(403), b"SAN_MISMATCH");
                 return Err(format!("TLS SAN mismatch for node {}: {}", remote_node_id, e));
             }
@@ -907,7 +1002,7 @@ impl QuicTransport {
             }
         }
         
-        println!("[INFO][QUIC] connected peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type);
+        if is_info() { println!("[INFO][QUIC] connected peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type); }
         
         // Store connection
         let quic_conn = Arc::new(QuicConnection {
@@ -1137,13 +1232,14 @@ impl QuicTransport {
         // v2.95: Do NOT call finish() yet! Keep stream open for ACK.
         // finish() would signal FIN and receiver might interpret as "done"
         
-        // Wait for ACK (1 byte) with production timeout
-        // Network latency + message processing on receiver side
-        const ACK_TIMEOUT_MS: u64 = 2000; // 2 seconds for production networks
+        // v6.3: Adaptive ACK timeout — use peer RTT to compute a fair deadline.
+        // Floor 2s for same-DC, scales to ~5s for cross-continental.
+        let peer_rtt = conn.connection.rtt();
+        let ack_timeout = Duration::from_millis(2000).max(peer_rtt * 10).min(Duration::from_secs(MESSAGE_TIMEOUT_SECS));
         let mut ack_buf = [0u8; 1];
         
         let ack_result = tokio::time::timeout(
-            Duration::from_millis(ACK_TIMEOUT_MS),
+            ack_timeout,
             recv.read_exact(&mut ack_buf)
         ).await;
         
@@ -1273,35 +1369,46 @@ impl QuicTransport {
         }
     }
     
-    /// Get statistics
+    /// Get statistics. Also snapshots live RTT into the per-peer cache so that
+    /// future reconnects to the same peer start with an accurate initial_rtt.
     pub async fn get_stats(&self) -> QuicStats {
         let mut stats = self.stats.read().await.clone();
         stats.active_connections = self.connections.len();
         
-        // Calculate average RTT and sum per-connection stats
         let mut total_rtt: u64 = 0;
         let mut total_sent: u64 = 0;
         let mut total_recv: u64 = 0;
         let mut total_bytes_sent: u64 = 0;
         let mut total_bytes_recv: u64 = 0;
+        let mut rtt_samples: Vec<(SocketAddr, u64)> = Vec::new();
         
         for conn in self.connections.iter() {
-            total_rtt += conn.connection.rtt().as_millis() as u64;
+            let rtt_ms = conn.connection.rtt().as_millis() as u64;
+            total_rtt += rtt_ms;
             total_sent += conn.messages_sent.load(Ordering::Relaxed);
             total_recv += conn.messages_received.load(Ordering::Relaxed);
             total_bytes_sent += conn.bytes_sent.load(Ordering::Relaxed);
             total_bytes_recv += conn.bytes_received.load(Ordering::Relaxed);
+            if rtt_ms > 0 {
+                rtt_samples.push((*conn.key(), rtt_ms));
+            }
         }
         
         if !self.connections.is_empty() {
             stats.avg_rtt_ms = total_rtt / self.connections.len() as u64;
         }
         
-        // Override with per-connection totals (global stats may be stale)
         stats.messages_sent = total_sent;
         stats.messages_received = total_recv;
         stats.bytes_sent = total_bytes_sent;
         stats.bytes_received = total_bytes_recv;
+        
+        if !rtt_samples.is_empty() {
+            let mut cache = self.rtt_cache.lock().await;
+            for (addr, rtt_ms) in rtt_samples {
+                cache.update(addr, rtt_ms);
+            }
+        }
         
         stats
     }
@@ -1379,9 +1486,9 @@ impl QuicTransport {
         let mut alive = 0;
         let mut removed = 0;
         let mut dead_addrs = Vec::new();
+        let mut rtt_snapshots: Vec<(SocketAddr, u64)> = Vec::new();
         let now_ms = Self::current_time_ms();
         
-        // v2.95.1: Reduced threshold - connections idle for 30s get ping-tested
         const STALE_THRESHOLD_SECS: u64 = 30;
         
         for entry in self.connections.iter() {
@@ -1391,18 +1498,32 @@ impl QuicTransport {
             let idle_secs = (now_ms.saturating_sub(last_ms)) / 1000;
             let is_stale = idle_secs > STALE_THRESHOLD_SECS;
             
+            // Snapshot RTT from live connections before potential removal
+            let rtt_ms = conn.connection.rtt().as_millis() as u64;
+            if rtt_ms > 0 {
+                rtt_snapshots.push((*entry.key(), rtt_ms));
+            }
+            
             if is_explicitly_closed {
                 dead_addrs.push(*entry.key());
             } else if is_stale {
-                // v2.95.1: Mark for potential removal - will be verified by active_health_check
                 dead_addrs.push(*entry.key());
                 if crate::node::is_debug() {
-                    println!("[DBG][QUIC] stale_conn_candidate peer={} inactive_secs={}",
+                    println!("[DBG][QUIC] stale_conn peer={} idle={}s",
                         get_privacy_id_for_addr(&entry.key().to_string()),
                         idle_secs);
                 }
             } else {
                 alive += 1;
+            }
+        }
+        
+        // Persist RTT snapshots before removing connections
+        if !rtt_snapshots.is_empty() {
+            if let Ok(mut cache) = self.rtt_cache.try_lock() {
+                for (addr, rtt_ms) in rtt_snapshots {
+                    cache.update(addr, rtt_ms);
+                }
             }
         }
         
@@ -1502,8 +1623,7 @@ impl QuicTransport {
     pub async fn force_reconnect(&self, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
         // Remove any existing connection (dead or alive)
         if self.connections.remove(&peer_addr).is_some() {
-            println!("[INFO][QUIC] force_remove_conn peer={} reason=reconnect", 
-                     get_privacy_id_for_addr(&peer_addr.to_string()));
+            if is_info() { println!("[INFO][QUIC] force_remove_conn peer={}", get_privacy_id_for_addr(&peer_addr.to_string())); }
         }
         
         // Create new connection
