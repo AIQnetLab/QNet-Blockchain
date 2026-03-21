@@ -6281,8 +6281,10 @@ impl BlockchainNode {
                             tx_batch.push((received_tx, tx));
                             }
                             Err(e) => {
-                                println!("[WARN][TX-RECV] deserialize_failed from={} err={}", 
-                                    received_tx.from_peer, e);
+                                if is_warn() {
+                                    println!("[WARN][TX-RECV] deserialize_failed from={} err={}", 
+                                        received_tx.from_peer, e);
+                                }
                             }
                         }
                     }
@@ -10964,7 +10966,7 @@ impl BlockchainNode {
         // Clone shard_coordinator for use inside spawn (avoid self reference)
         let shard_coordinator_opt = self.shard_coordinator.clone();
         
-        tokio::spawn(async move {
+        let production_handle = tokio::spawn(async move {
             // CRITICAL FIX: Start from current global height, not 0
             let mut microblock_height = *height.read().await;
             // CRITICAL FIX: Calculate last_macroblock_trigger from current height
@@ -15579,8 +15581,14 @@ impl BlockchainNode {
                     // QUANTUM: Always use async storage for consistent timing
                     // CRITICAL FIX: Save block with minimal blocking (serialize in main thread, save async)
                     // This ensures block exists before height increment, but doesn't block on I/O
-                    let microblock_data = bincode::serialize(&microblock)
-                        .expect("Failed to serialize microblock");
+                    let microblock_data = match bincode::serialize(&microblock) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            println!("[ERR][PROD] serialize_fail h={} err={}", microblock.height, e);
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                            continue;
+                        }
+                    };
                     
                     let storage_clone = storage.clone();
                     let height_for_storage = microblock.height;
@@ -16719,6 +16727,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 // NOTE: Timing is now at START of loop (v2.42) - no timing needed here
                 // This ensures ALL iterations wait exactly 1 second, even after `continue`
+            }
+        });
+
+        // PRODUCTION: Monitor production loop JoinHandle.
+        // If the loop panics (e.g. corrupted keypair, serialization failure),
+        // tokio absorbs the panic and the task silently dies — the node stays
+        // alive on HTTP but stops producing blocks ("zombie node").
+        // Detecting this and restarting the process lets Docker bring up a
+        // clean instance instead of leaving a zombie in the validator set.
+        tokio::spawn(async move {
+            match production_handle.await {
+                Ok(_) => {
+                    println!("[WARN][PRODUCTION] production_loop exited normally — unexpected");
+                }
+                Err(e) => {
+                    eprintln!("[FATAL][PRODUCTION] production_loop panicked: {:?}", e);
+                    eprintln!("[FATAL][PRODUCTION] restarting process for clean state");
+                    std::process::exit(1);
+                }
             }
         });
     }
@@ -21074,7 +21101,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     reason: format!("Cannot init hybrid crypto: {}", e),
                     recoverable: false,
                 });
-                panic!("CRITICAL: Cannot operate without hybrid quantum-resistant signatures: {}", e);
+                eprintln!("[FATAL][CRYPTO] Cannot init hybrid crypto — restarting node: {}", e);
+                std::process::exit(1);
             }
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
@@ -21085,8 +21113,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let commit_bytes = match hex::decode(commit_hash) {
             Ok(bytes) => bytes,
             Err(e) => {
-                println!("[ERR][CRYPTO] FATAL: Invalid commit hash: {}", e);
-                panic!("CRITICAL: Invalid commit hash for signing: {}", e);
+                eprintln!("[FATAL][CRYPTO] Invalid commit hash '{}' — restarting node: {}", commit_hash, e);
+                std::process::exit(1);
             }
         };
         
@@ -21098,18 +21126,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 match compact_sig.to_binary_compressed() {
                     Ok(binary_data) => {
                         let base64_data = general_purpose::STANDARD.encode(&binary_data);
-                        println!("[CRYPTO] ✅ RECOVERY: HYBRID signature created (bincode v2.24)");
+                        if is_info() { println!("[INFO][CRYPTO] recovery_hybrid_sig_created format=bincode_v2.24"); }
                         format!("compact_bin:{}", base64_data)
                     }
                     Err(e) => {
-                        println!("[ERR][CRYPTO] FATAL: Cannot serialize hybrid signature: {}", e);
-                        panic!("CRITICAL: Cannot serialize hybrid signature: {}", e);
+                        eprintln!("[FATAL][CRYPTO] Cannot serialize hybrid signature — restarting node: {}", e);
+                        std::process::exit(1);
                     }
                 }
             }
             Err(e) => {
-                println!("[ERR][CRYPTO] FATAL: Hybrid signing failed in recovery: {:?}", e);
-                panic!("CRITICAL: Cannot operate without hybrid quantum-resistant signatures: {:?}", e);
+                eprintln!("[FATAL][CRYPTO] Hybrid signing failed — restarting node: {:?}", e);
+                std::process::exit(1);
             }
         }
     }

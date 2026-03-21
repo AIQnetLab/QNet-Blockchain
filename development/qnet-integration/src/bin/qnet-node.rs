@@ -2730,8 +2730,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Now bind signal_listener for GENESIS SYNC
         println!("[GENESIS SYNC] 📡 Starting signal listener on port 8001...");
         
-        let signal_listener = tokio::net::TcpListener::bind("0.0.0.0:8001").await
-            .expect("Failed to bind port 8001 for Genesis sync");
+        let signal_listener = {
+            let mut bound = None;
+            for attempt in 1..=10u32 {
+                match tokio::net::TcpListener::bind("0.0.0.0:8001").await {
+                    Ok(listener) => { bound = Some(listener); break; }
+                    Err(e) => {
+                        println!("[WARN][GENESIS] port_8001_busy attempt={}/10 err={}", attempt, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+            bound.expect("Failed to bind port 8001 after 10 attempts (20s)")
+        };
         
         println!("[GENESIS SYNC] ✅ Signal listener ready on port 8001");
         println!("[GENESIS SYNC] ⏳ Waiting for other Genesis nodes to be ready...");

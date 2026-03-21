@@ -1,4 +1,4 @@
-﻿//! Simplified Regional P2P Network
+//! Simplified Regional P2P Network
 //! 
 //! Simple and efficient P2P with basic regional clustering.
 //! No complex intelligent switching - just regional awareness with failover.
@@ -20814,6 +20814,17 @@ impl SimplifiedP2P {
         
         // Mark as voted
         TIMEOUT_VOTED_HEIGHTS.insert(height, timeout_round);
+
+        // BFT FIX: Count own vote locally BEFORE broadcasting.
+        // Standard BFT protocol: every node includes its own vote in the local tally.
+        // Without this, a node only sees N-1 votes from peers and never reaches
+        // the 2/3+ threshold when the network is at minimum quorum.
+        self.handle_timeout_vote(
+            height, timeout_round,
+            self.node_id.clone(),
+            last_block_hash.to_vec(),
+            signature.clone(),
+        );
         
         // Broadcast to all validators
         let msg = NetworkMessage::TimeoutVote {
@@ -21114,18 +21125,55 @@ impl SimplifiedP2P {
         });
     }
     
-    /// Get count of active validators for Byzantine threshold
-    /// ARCHITECTURE: Uses connected peers + 1 (self) for total network size
+    /// Get count of active validators for Byzantine threshold.
+    ///
+    /// ARCHITECTURE: Uses the DETERMINISTIC epoch-based validator set from the
+    /// macroblock snapshot — the same source used for producer selection.
+    /// All nodes read the same macroblock → identical count → identical threshold.
+    ///
+    /// Using P2P connection count was WRONG: each node sees a different number of
+    /// peers, producing different thresholds and breaking BFT safety at scale.
+    ///
     /// Byzantine threshold = (n * 2 + 2) / 3 ≈ 2/3+
-    /// Examples: 5 nodes → 4 votes, 10 nodes → 7 votes, 100 nodes → 67 votes
+    /// Examples: 5 nodes → 4 votes, 10 nodes → 7 votes, 1000 nodes → 668 votes
     pub fn get_active_validator_count(&self) -> usize {
-        // connected_peers does NOT include self, so add 1
+        let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Genesis epoch (blocks 0-180): fixed 5 genesis validators
+        if local_h <= 180 {
+            return 5;
+        }
+
+        // Normal epoch: read eligible_producers from macroblock snapshot (N-2 rule)
+        let current_epoch = (local_h - 1) / 90 + 1;
+        let required_macroblock = current_epoch.saturating_sub(2);
+
+        if required_macroblock > 0 {
+            if let Some(storage) = crate::node::try_get_storage() {
+                if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(required_macroblock) {
+                    if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
+                        if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
+                            if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
+                                if !producers.is_empty() {
+                                    if crate::node::is_debug() {
+                                        println!("[DBG][BFT] validator_count={} source=macroblock_{} epoch={}",
+                                                 producers.len(), required_macroblock, current_epoch);
+                                    }
+                                    return producers.len();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback (first epochs before macroblock is available): P2P count
         let connected = self.connected_peers_lockfree.len();
-        let total = connected + 1; // +1 for self
-        
-        // No artificial minimum - use real network size
-        // If network is partitioned, Byzantine consensus will naturally fail
-        // which is CORRECT behavior (better fail than wrong consensus)
+        let total = connected + 1;
+        if crate::node::is_debug() {
+            println!("[DBG][BFT] validator_count={} source=p2p_fallback epoch={}", total, current_epoch);
+        }
         total
     }
     

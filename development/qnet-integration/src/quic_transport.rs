@@ -104,6 +104,13 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// Legitimate peers retry with backoff; this only throttles bursts.
 const MAX_CONCURRENT_HANDSHAKES: usize = 64;
 
+/// Hard timeout for incoming TLS+Kyber768 handshake (v6.4: death spiral fix).
+/// If `incoming.await` exceeds this limit, the permit is released immediately.
+/// Without this timeout, stalled peers hold permits for the full QUIC idle timeout
+/// (~30s), and 64 stalled peers permanently block ALL incoming QUIC connections
+/// (observed: 2.5M throttled events in 1 hour — complete QUIC transport death).
+const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
 // ============================================================================
 // ADAPTIVE RTT - Per-peer RTT cache for optimal congestion control (v6.3)
 // ============================================================================
@@ -225,7 +232,7 @@ pub struct QuicConnection {
     pub connection: Connection,
     pub remote_node_id: Option<String>,
     pub remote_cert_serial: Option<String>,
-    pub remote_node_type: Option<String>,  // "super", "full", or "light" (lowercase)
+    pub remote_node_type: Option<String>,  // "super" or "light" (lowercase)
     pub connected_at: Instant,
     /// v2.95.1: Atomic timestamp (ms since UNIX epoch) - can be updated from Arc
     pub last_activity_ms: AtomicU64,
@@ -407,6 +414,7 @@ impl QuicTransport {
             if is_info() { println!("[INFO][QUIC] server_started accepting=true"); }
             
             let handshake_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+            let mut throttle_count: u64 = 0;
             
             while server_running.load(Ordering::Relaxed) {
                 let incoming = match endpoint.accept().await {
@@ -420,10 +428,35 @@ impl QuicTransport {
                 let permit = match handshake_semaphore.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
-                        if crate::node::is_warn() { println!("[WARN][QUIC] handshake_throttled active={}", MAX_CONCURRENT_HANDSHAKES); }
+                        // v6.4: Properly refuse the connection so the peer receives
+                        // CONNECTION_CLOSE and backs off instead of immediately retrying.
+                        // Without refuse(), the peer sees "accepted then dropped" and
+                        // retries at full speed — creating a feedback loop.
+                        incoming.refuse();
+
+                        throttle_count += 1;
+                        if throttle_count <= 3 || throttle_count % 5000 == 0 {
+                            if crate::node::is_warn() {
+                                println!("[WARN][QUIC] handshake_throttled active={} refused_total={}",
+                                         MAX_CONCURRENT_HANDSHAKES, throttle_count);
+                            }
+                        }
+
+                        // Yield to let in-flight handshakes complete and free permits.
+                        // Without this, the loop spins at ~100K/s accept→refuse cycles,
+                        // starving the handshake tasks that HOLD permits.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                         continue;
                     }
                 };
+                
+                // Reset throttle counter when permits become available
+                if throttle_count > 0 {
+                    if crate::node::is_info() {
+                        println!("[INFO][QUIC] throttle_cleared total_refused={}", throttle_count);
+                    }
+                    throttle_count = 0;
+                }
                 
                 let peer_addr = incoming.remote_address();
                 
@@ -435,12 +468,18 @@ impl QuicTransport {
                 let node_type_clone = node_type.clone();
                 
                 tokio::spawn(async move {
-                    // TLS+Kyber handshake phase — permit limits concurrency
+                    // TLS+Kyber handshake phase — permit limits concurrency.
+                    // v6.4: Hard timeout prevents permits from being held indefinitely.
+                    // Root cause of QUIC death spiral: without timeout, stalled TLS handshakes
+                    // hold all 64 permits → no new connections → all peers retry → more stalls.
                     let handshake_outcome = {
                         let _permit = permit;
-                        let conn_result = incoming.await;
-                        match conn_result {
-                            Ok(connection) => {
+                        let timed_result = tokio::time::timeout(
+                            Duration::from_secs(INCOMING_HANDSHAKE_TIMEOUT_SECS),
+                            incoming
+                        ).await;
+                        match timed_result {
+                            Ok(Ok(connection)) => {
                                 let hs = Self::handle_server_handshake(
                                     &connection,
                                     &node_id_clone,
@@ -449,8 +488,14 @@ impl QuicTransport {
                                 ).await;
                                 Some((connection, hs))
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 if crate::node::is_warn() { println!("[WARN][QUIC] conn_failed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e); }
+                                let mut s = stats_clone.write().await;
+                                s.connections_failed += 1;
+                                None
+                            }
+                            Err(_timeout) => {
+                                if crate::node::is_warn() { println!("[WARN][QUIC] handshake_timeout peer={} limit={}s", get_privacy_id_for_addr(&peer_addr.to_string()), INCOMING_HANDSHAKE_TIMEOUT_SECS); }
                                 let mut s = stats_clone.write().await;
                                 s.connections_failed += 1;
                                 None
