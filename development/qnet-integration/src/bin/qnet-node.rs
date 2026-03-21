@@ -1243,10 +1243,32 @@ impl AutoConfig {
             let port = port_str.parse::<u16>().unwrap_or(9876);
             println!("🔌 Using fixed P2P port from QNET_P2P_PORT: {}", port);
             port
+        } else if std::env::var("DOCKER_ENV").is_ok() {
+            // Docker without explicit QNET_P2P_PORT — use default 9876 with retry
+            // Cannot fallback to other ports because only 9876 is mapped in Docker
+            9876
         } else {
-            // Auto-detect only if not in Docker
             find_available_port(9876).await?
         };
+
+        // PORT BIND RETRY for P2P: survive TIME_WAIT after fast Docker restart
+        // In Docker, port mapping is fixed — fallback to another port is fatal
+        if std::env::var("DOCKER_ENV").is_ok() || std::env::var("QNET_P2P_PORT").is_ok() {
+            let mut p2p_bound = false;
+            for attempt in 1u32..=10 {
+                match std::net::TcpListener::bind(format!("0.0.0.0:{}", p2p_port)) {
+                    Ok(_probe) => { p2p_bound = true; break; }
+                    Err(e) => {
+                        println!("[WARN][P2P] port_{}_busy attempt={}/10 err={}", p2p_port, attempt, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+            if !p2p_bound {
+                eprintln!("[FATAL][P2P] Cannot bind port {} after 10 attempts (20s) — restarting node", p2p_port);
+                std::process::exit(1);
+            }
+        }
         
         // RPC port is deprecated - all use unified API on 8001
         let rpc_port = std::env::var("QNET_API_PORT")
@@ -2712,20 +2734,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
         .unwrap_or(false);
     
-    // CRITICAL FIX v2.21.8: Run preflight checks BEFORE binding signal_listener
-    // This ensures ports are available, then we can bind 8001 for GENESIS SYNC
+    // PREFLIGHT: All server nodes (Genesis + Super) run port/network checks before startup.
+    // Catches port conflicts and network issues early — before any binding or P2P activity.
+    if std::env::var("QNET_PREFLIGHT_DONE").unwrap_or_default() != "1" {
+        let node_label = if is_genesis { "GENESIS" } else { "SUPER" };
+        println!("[{}] 🔍 Running pre-flight checks...", node_label);
+        let external_ip = get_physical_ip().await.ok();
+        if let Err(e) = qnet_integration::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
+            eprintln!("[FATAL][{}] Pre-flight checks failed: {} — restarting node", node_label, e);
+            std::process::exit(1);
+        }
+        std::env::set_var("QNET_PREFLIGHT_DONE", "1");
+        println!("[{}] ✅ Pre-flight checks passed", node_label);
+    }
+
     let mut genesis_signal_listener: Option<tokio::net::TcpListener> = None;
     
     if is_genesis {
-        // Run preflight FIRST - before we bind anything
-        println!("[GENESIS] 🔍 Running pre-flight checks...");
-        let external_ip = get_physical_ip().await.ok();
-        if let Err(e) = qnet_integration::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
-            eprintln!("❌ Pre-flight checks failed: {}", e);
-            return Err(e.into());
-        }
-        std::env::set_var("QNET_PREFLIGHT_DONE", "1");
-        println!("[GENESIS] ✅ Pre-flight checks passed");
         
         // Now bind signal_listener for GENESIS SYNC
         println!("[GENESIS SYNC] 📡 Starting signal listener on port 8001...");
@@ -2741,7 +2766,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            bound.expect("Failed to bind port 8001 after 10 attempts (20s)")
+            match bound {
+                Some(listener) => listener,
+                None => {
+                    eprintln!("[FATAL][GENESIS] Cannot bind port 8001 after 10 attempts (20s) — restarting node");
+                    std::process::exit(1);
+                }
+            }
         };
         
         println!("[GENESIS SYNC] ✅ Signal listener ready on port 8001");
@@ -3951,10 +3982,28 @@ async fn start_metrics_server(port: u16) {
     tokio::spawn(async move {
         use warp::Filter;
         
+        // PORT BIND RETRY for metrics — survive TIME_WAIT after fast Docker restart
+        {
+            let mut bound = false;
+            for attempt in 1u32..=10 {
+                match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+                    Ok(_probe) => { bound = true; break; }
+                    Err(e) => {
+                        println!("[WARN][METRICS] port_{}_busy attempt={}/10 err={}", port, attempt, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+            if !bound {
+                eprintln!("[ERR][METRICS] Cannot bind port {} after 10 attempts — metrics disabled", port);
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
         let metrics_route = warp::path("metrics")
             .and(warp::get())
             .map(|| {
-                // Basic Prometheus metrics format
                 format!(
                     "# HELP qnet_node_uptime_seconds Total uptime of the node\n\
                      # TYPE qnet_node_uptime_seconds counter\n\
@@ -3982,7 +4031,6 @@ async fn start_metrics_server(port: u16) {
         
         let routes = metrics_route.with(cors);
         
-        // Get external IP for metrics display
         let external_ip = match tokio::process::Command::new("curl")
             .arg("-s")
             .arg("--max-time")
@@ -3994,7 +4042,7 @@ async fn start_metrics_server(port: u16) {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).trim().to_string()
             }
-            _ => "127.0.0.1".to_string(), // Fallback only for display
+            _ => "127.0.0.1".to_string(),
         };
         
         println!("📈 Metrics available at: http://{}:{}/metrics", external_ip, port);

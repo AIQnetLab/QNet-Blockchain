@@ -1395,6 +1395,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("submit"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(256 * 1024)) // 256 KB max bundle payload
         .and(warp::body::json())
         .and(blockchain_filter.clone())
         .and_then(handle_bundle_submit);
@@ -1546,6 +1547,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("transfer"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(256 * 1024)) // 256 KB max batch payload
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -2404,6 +2406,33 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(benchmark_routes) // BENCHMARK: Real transaction load testing
         .with(cors);
     
+    // PORT BIND RETRY: survive TIME_WAIT after fast Docker restart (same pattern as Genesis signal_listener)
+    // warp::serve().run() binds internally and panics on failure — probe first with retry
+    {
+        let mut bound = false;
+        for attempt in 1u32..=10 {
+            match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+                Ok(_probe) => {
+                    // _probe drops here, freeing port for warp
+                    bound = true;
+                    break;
+                }
+                Err(e) => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][RPC] port_{}_busy attempt={}/10 err={}", port, attempt, e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+        if !bound {
+            eprintln!("[FATAL][RPC] Cannot bind port {} after 10 attempts (20s) — restarting node", port);
+            std::process::exit(1);
+        }
+    }
+    // Brief pause — allows OS to fully process socket release before warp rebinds
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     println!("🚀 Starting comprehensive API server on port {}", port);
     println!("[INFO][RPC] json_rpc addr=0.0.0.0:{}/rpc", port);
     println!("🔌 REST API available at: http://0.0.0.0:{}/api/v1/", port);
@@ -2433,6 +2462,10 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     }
     
     warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+
+    // RPC server exited — this should never happen in normal operation
+    eprintln!("[FATAL][RPC] warp server on port {} exited unexpectedly — restarting node", port);
+    std::process::exit(1);
 }
 
 async fn handle_rpc(
@@ -11085,7 +11118,15 @@ async fn handle_activations_by_wallet(
     }
     
     // LEGACY: If node_type IS specified, use old behavior for backward compatibility
-    let node_type_str = node_type.unwrap();
+    let node_type_str = match node_type {
+        Some(nt) => nt,
+        None => {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "node_type parameter required for legacy query"
+            })));
+        }
+    };
     
     // Initialize activation registry for blockchain query
     let registry = &*GLOBAL_ACTIVATION_REGISTRY;

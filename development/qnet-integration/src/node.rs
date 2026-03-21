@@ -9629,8 +9629,22 @@ impl BlockchainNode {
             let node_clone_unified = self.clone();
             
             println!("[Node] 🚀 Starting unified RPC+API server on port {} BEFORE P2P", unified_port);
-            tokio::spawn(async move {
+            let rpc_handle = tokio::spawn(async move {
                 crate::rpc::start_rpc_server(node_clone_unified, unified_port).await;
+            });
+            // Watchdog: if RPC server exits or panics → process::exit(1) → Docker restart
+            // Same pattern as production_loop watchdog (Fix 5)
+            tokio::spawn(async move {
+                match rpc_handle.await {
+                    Ok(_) => {
+                        eprintln!("[FATAL][RPC] rpc_server port={} exited unexpectedly — restarting node", unified_port);
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("[FATAL][RPC] rpc_server port={} panicked: {:?} — restarting node", unified_port, e);
+                        std::process::exit(1);
+                    }
+                }
             });
             
             // Wait for server readiness  
@@ -16739,7 +16753,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         tokio::spawn(async move {
             match production_handle.await {
                 Ok(_) => {
-                    println!("[WARN][PRODUCTION] production_loop exited normally — unexpected");
+                    eprintln!("[FATAL][PRODUCTION] production_loop exited normally — zombie prevention");
+                    eprintln!("[FATAL][PRODUCTION] restarting process for clean state");
+                    std::process::exit(1);
                 }
                 Err(e) => {
                     eprintln!("[FATAL][PRODUCTION] production_loop panicked: {:?}", e);

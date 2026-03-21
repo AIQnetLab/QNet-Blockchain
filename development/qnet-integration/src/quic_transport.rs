@@ -42,7 +42,7 @@ use tokio::sync::{RwLock, Mutex};
 use serde::{Serialize, Deserialize};
 
 use crate::unified_p2p::{NetworkMessage, get_privacy_id_for_addr};
-use crate::node::{is_info, is_debug};
+use crate::node::{is_info, is_warn, is_debug};
 
 // ============================================================================
 // RETRY CONSTANTS (v2.24 - improved reconnect logic)
@@ -376,9 +376,21 @@ impl QuicTransport {
         let transport = build_adaptive_transport(DEFAULT_INITIAL_RTT_MS);
         server_config.transport_config(Arc::new(transport));
         
-        // Create endpoint
-        let endpoint = Endpoint::server(server_config, bind_addr)
-            .map_err(|e| format!("Endpoint creation failed: {}", e))?;
+        // Create endpoint with retry — survive TIME_WAIT after fast Docker restart
+        let mut endpoint_result = None;
+        for attempt in 1u32..=10 {
+            match Endpoint::server(server_config.clone(), bind_addr) {
+                Ok(ep) => { endpoint_result = Some(ep); break; }
+                Err(e) => {
+                    if is_warn() {
+                        println!("[WARN][QUIC] port_{}_busy attempt={}/10 err={}", bind_addr.port(), attempt, e);
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+        let endpoint = endpoint_result
+            .ok_or_else(|| format!("Cannot bind QUIC port {} after 10 attempts (20s)", bind_addr.port()))?;
         
         self.endpoint = Some(endpoint);
         

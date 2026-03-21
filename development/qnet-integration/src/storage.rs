@@ -675,33 +675,54 @@ impl PersistentStorage {
             cf_opts
         }
         
-        let cfs = vec![
-            ColumnFamilyDescriptor::new("blocks", create_cold_cf_opts()),  // Cold: old blocks
-            ColumnFamilyDescriptor::new("transactions", create_cf_opts()),
-            ColumnFamilyDescriptor::new("accounts", create_cf_opts()),
-            ColumnFamilyDescriptor::new("metadata", create_cf_opts()),
-            ColumnFamilyDescriptor::new("microblocks", create_hot_cf_opts()), // Hot: recent blocks
-            ColumnFamilyDescriptor::new("consensus", create_hot_cf_opts()),   // Hot: consensus data
-            ColumnFamilyDescriptor::new("sync_state", create_cf_opts()),
-            ColumnFamilyDescriptor::new("pending_rewards", create_cf_opts()),
-            ColumnFamilyDescriptor::new("node_registry", create_cf_opts()),
-            ColumnFamilyDescriptor::new("ping_history", create_hot_cf_opts()), // Hot: pings
-            ColumnFamilyDescriptor::new("failover_events", create_cf_opts()),
-            ColumnFamilyDescriptor::new("snapshots", create_cold_cf_opts()),  // Cold: snapshots
-            ColumnFamilyDescriptor::new("tx_index", create_cf_opts()),
-            ColumnFamilyDescriptor::new("tx_by_address", create_cf_opts()),
-            ColumnFamilyDescriptor::new("attestations", create_hot_cf_opts()), // Hot: attestations
-            ColumnFamilyDescriptor::new("heartbeats", create_hot_cf_opts()),   // Hot: heartbeats
-            ColumnFamilyDescriptor::new("poh_state", create_hot_cf_opts()),    // Hot: PoH state
-            ColumnFamilyDescriptor::new("contract_storage", create_cf_opts()), // v5.0: Per-key contract state
-            ColumnFamilyDescriptor::new("fcm_tokens", create_cf_opts()),        // FCM device tokens (genesis-local, not gossiped)
-        ];
-        
-        let db = match DB::open_cf_descriptors(&opts, path, cfs) {
-            Ok(db) => db,
-            Err(e) => {
-                eprintln!("[ERR][STORAGE] rocksdb_error err={}", e);
-                return Err(IntegrationError::StorageError(format!("RocksDB initialization failed: {}", e)));
+        // ColumnFamilyDescriptor doesn't implement Clone — rebuild on each retry attempt
+        fn build_column_families() -> Vec<ColumnFamilyDescriptor> {
+            vec![
+                ColumnFamilyDescriptor::new("blocks", create_cold_cf_opts()),
+                ColumnFamilyDescriptor::new("transactions", create_cf_opts()),
+                ColumnFamilyDescriptor::new("accounts", create_cf_opts()),
+                ColumnFamilyDescriptor::new("metadata", create_cf_opts()),
+                ColumnFamilyDescriptor::new("microblocks", create_hot_cf_opts()),
+                ColumnFamilyDescriptor::new("consensus", create_hot_cf_opts()),
+                ColumnFamilyDescriptor::new("sync_state", create_cf_opts()),
+                ColumnFamilyDescriptor::new("pending_rewards", create_cf_opts()),
+                ColumnFamilyDescriptor::new("node_registry", create_cf_opts()),
+                ColumnFamilyDescriptor::new("ping_history", create_hot_cf_opts()),
+                ColumnFamilyDescriptor::new("failover_events", create_cf_opts()),
+                ColumnFamilyDescriptor::new("snapshots", create_cold_cf_opts()),
+                ColumnFamilyDescriptor::new("tx_index", create_cf_opts()),
+                ColumnFamilyDescriptor::new("tx_by_address", create_cf_opts()),
+                ColumnFamilyDescriptor::new("attestations", create_hot_cf_opts()),
+                ColumnFamilyDescriptor::new("heartbeats", create_hot_cf_opts()),
+                ColumnFamilyDescriptor::new("poh_state", create_hot_cf_opts()),
+                ColumnFamilyDescriptor::new("contract_storage", create_cf_opts()),
+                ColumnFamilyDescriptor::new("fcm_tokens", create_cf_opts()),
+            ]
+        }
+
+        // RETRY: survive stale LOCK file after fast Docker restart.
+        // Previous process may not have released the lock yet.
+        let db = {
+            let mut last_err = String::new();
+            let mut opened = None;
+            for attempt in 1u32..=10 {
+                match DB::open_cf_descriptors(&opts, path, build_column_families()) {
+                    Ok(db) => { opened = Some(db); break; }
+                    Err(e) => {
+                        last_err = format!("{}", e);
+                        eprintln!("[WARN][STORAGE] rocksdb_open attempt={}/10 err={}", attempt, e);
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                }
+            }
+            match opened {
+                Some(db) => db,
+                None => {
+                    eprintln!("[FATAL][STORAGE] RocksDB open failed after 10 attempts: {}", last_err);
+                    return Err(IntegrationError::StorageError(
+                        format!("RocksDB initialization failed after 10 attempts: {}", last_err)
+                    ));
+                }
             }
         };
         
