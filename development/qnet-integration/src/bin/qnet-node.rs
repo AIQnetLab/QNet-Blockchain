@@ -202,9 +202,14 @@ async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &Pr
             println!("   💰 Payment verified: Code purchased during Phase {}", decoded.purchase_phase);
             
             // CRITICAL: Verify burn transaction on Solana blockchain
-            let burn_verified = verify_solana_burn_for_activation(&decoded.wallet_address, &decoded.tx_hash, price as u64).await?;
+            // decoded.wallet_address is only a 5-byte prefix on first launch (before registry);
+            // derive the full Solana address from seed phrase for a valid Solana RPC query.
+            let full_solana_wallet = extract_wallet_from_activation_code(activation_code)
+                .unwrap_or_else(|_| decoded.wallet_address.clone());
+            let burn_verified = verify_solana_burn_for_activation(&full_solana_wallet, &decoded.tx_hash, price as u64).await?;
             if !burn_verified {
-                return Err(format!("Solana burn verification failed: {} 1DEV burn not found for wallet {}", price as u64, &decoded.wallet_address[..8]));
+                let wallet_preview = &full_solana_wallet[..full_solana_wallet.len().min(8)];
+                return Err(format!("Solana burn verification failed: {} 1DEV burn not found for wallet {}", price as u64, wallet_preview));
             }
             
             println!("   ✅ Solana burn verification passed: {} 1DEV burned", price as u64);
@@ -3710,8 +3715,69 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
     
     // Convert to 6 decimals for comparison
     let required_amount_decimals = required_amount * 1_000_000;
-    
-    // Build RPC request to check burn transactions
+    let client = reqwest::Client::new();
+
+    // PRIORITY PATH: When a specific TX hash is known, verify it directly via getTransaction.
+    // This bypasses the wallet-address-based lookup entirely and works even when the
+    // wallet is a short XOR-decoded prefix (first-time registration before registry exists).
+    if !expected_tx_hash.is_empty() {
+        println!("🔍 Direct TX verification: {}...", &expected_tx_hash[..expected_tx_hash.len().min(16)]);
+        let tx_request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTransaction",
+            "params": [expected_tx_hash, {"encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 0}]
+        });
+        if let Ok(tx_response) = client.post(solana_rpc).json(&tx_request).send().await {
+            if let Ok(tx_data) = tx_response.json::<serde_json::Value>().await {
+                if let Some(result) = tx_data.get("result") {
+                    if let Some(transaction) = result.get("transaction") {
+                        if let Some(message) = transaction.get("message") {
+                            if let Some(instructions) = message.get("instructions").and_then(|i| i.as_array()) {
+                                for instruction in instructions {
+                                    if instruction.get("program").and_then(|p| p.as_str()) == Some("spl-token") {
+                                        if let Some(parsed) = instruction.get("parsed") {
+                                            let ix_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                            if let Some(info) = parsed.get("info") {
+                                                let mint_ok = info.get("mint").and_then(|m| m.as_str()) == Some(onedev_mint);
+                                                let amount_ok = info.get("amount")
+                                                    .and_then(|a| a.as_str())
+                                                    .and_then(|a| a.parse::<u64>().ok())
+                                                    .map(|a| a >= required_amount_decimals)
+                                                    .unwrap_or(false);
+                                                let dest_ok = info.get("destination").and_then(|d| d.as_str()) == Some(burn_address);
+
+                                                if (ix_type == "transfer" || ix_type == "transferChecked") && mint_ok && dest_ok && amount_ok {
+                                                    println!("✅ VERIFIED (direct TX): Burn to incinerator confirmed!");
+                                                    println!("   TX: {}...", &expected_tx_hash[..expected_tx_hash.len().min(16)]);
+                                                    return Ok(true);
+                                                }
+                                                if (ix_type == "burn" || ix_type == "burnChecked") && mint_ok && amount_ok {
+                                                    println!("✅ VERIFIED (direct TX): SPL Token burn confirmed!");
+                                                    println!("   TX: {}...", &expected_tx_hash[..expected_tx_hash.len().min(16)]);
+                                                    return Ok(true);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("[WARN] Direct TX verification found no matching burn instruction; falling back to wallet lookup...");
+    }
+
+    // FALLBACK: wallet-address-based lookup (used when no TX hash, or direct path missed).
+    // Guard: skip if wallet address is too short for a valid Solana address (32-44 chars base58).
+    if wallet_address.len() < 32 {
+        println!("❌ VERIFICATION FAILED: No valid burn found for {} 1DEV", required_amount);
+        println!("   Wallet '{}' is too short for Solana address lookup", wallet_address);
+        return Ok(false);
+    }
+
+    // Build RPC request to check burn transactions by wallet
     let request_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -3725,7 +3791,6 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
         ]
     });
 
-    let client = reqwest::Client::new();
     let response = client
         .post(solana_rpc)
         .json(&request_body)
@@ -3740,7 +3805,7 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
 
     if let Some(result) = data.get("result") {
         if let Some(signatures) = result.as_array() {
-            println!("📋 Found {} recent transactions for wallet {}", signatures.len(), &wallet_address[..8]);
+            println!("📋 Found {} recent transactions for wallet {}", signatures.len(), &wallet_address[..wallet_address.len().min(8)]);
             
             // Check each signature for burn transactions to incinerator
             for sig_info in signatures {
@@ -4639,10 +4704,10 @@ async fn query_peers_http(endpoint: &str) -> Result<Vec<String>, String> {
     use std::time::Duration;
     
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15)) // PRODUCTION: Extended timeout for peer discovery
-        .connect_timeout(Duration::from_secs(8)) // Connection timeout for peer queries
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(8))
         .user_agent("QNet-Node/1.0")
-        .tcp_nodelay(true) // Faster peer discovery
+        .tcp_nodelay(true)
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
     
@@ -4650,40 +4715,36 @@ async fn query_peers_http(endpoint: &str) -> Result<Vec<String>, String> {
         Ok(response) if response.status().is_success() => {
             match response.text().await {
                 Ok(text) => {
-                    // Parse peer list (JSON format: {"peers": ["ip1:port1", "ip2:port2"]})
-                    if text.contains("\"peers\"") {
-                        let peers: Vec<String> = text
-                            .split("\"peers\":")
-                            .nth(1)
-                            .unwrap_or("")
-                            .split('[')
-                            .nth(1)
-                            .unwrap_or("")
-                            .split(']')
-                            .next()
-                            .unwrap_or("")
-                            .split(',')
-                            .filter_map(|s| {
-                                let clean = s.trim().trim_matches('"').trim();
-                                if clean.is_empty() || clean == "{" || clean == "}" {
-                                    None
-                                } else {
-                                    Some(clean.to_string())
+                    // Parse peer list using proper JSON parsing.
+                    // Response format: {"peers": [{"address":"ip:port", "id":"...", ...}, ...]}
+                    // or legacy: {"peers": ["ip:port", ...]}
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(peers_array) = json.get("peers").and_then(|p| p.as_array()) {
+                            let peers: Vec<String> = peers_array.iter().filter_map(|entry| {
+                                // Object format: extract "address" field
+                                if let Some(addr) = entry.get("address").and_then(|a| a.as_str()) {
+                                    if !addr.is_empty() && addr.contains(':') {
+                                        return Some(addr.to_string());
+                                    }
                                 }
-                            })
-                            .collect();
-                        
-                        Ok(peers)
-                    } else {
-                        // Try simple comma-separated format
-                        let peers: Vec<String> = text
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty() && s.contains(':'))
-                            .collect();
-                        
-                        Ok(peers)
+                                // String format: use directly
+                                if let Some(s) = entry.as_str() {
+                                    if !s.is_empty() && s.contains(':') {
+                                        return Some(s.to_string());
+                                    }
+                                }
+                                None
+                            }).collect();
+                            return Ok(peers);
+                        }
                     }
+                    // Fallback: simple comma-separated format
+                    let peers: Vec<String> = text
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty() && s.contains(':') && !s.contains('"'))
+                        .collect();
+                    Ok(peers)
                 }
                 Err(e) => Err(format!("Failed to read response: {}", e)),
             }

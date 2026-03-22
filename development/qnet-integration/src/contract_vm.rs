@@ -623,8 +623,6 @@ impl Default for TokenRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    
     // Tests would go here
 }
 

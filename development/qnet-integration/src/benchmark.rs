@@ -825,8 +825,6 @@ mod tests {
     use std::time::Instant;
     use pqcrypto_mldsa::mldsa65 as dilithium3;
     use pqcrypto_traits::sign::SignedMessage as PqSignedMessage;
-    use pqcrypto_traits::sign::PublicKey as PqPublicKey;
-    use pqcrypto_traits::sign::SecretKey as PqSecretKey;
 
     /// Test transaction generation speed (no network required)
     /// Measures: key generation, TX creation, signing
@@ -891,7 +889,7 @@ mod tests {
         let mut handles = Vec::new();
         let start = Instant::now();
         
-        for shard_id in 0..num_shards {
+        for _shard_id in 0..num_shards {
             let handle = tokio::spawn(async move {
                 let manager = BenchmarkManager::new();
                 manager.initialize(10).await; // 10 accounts per shard

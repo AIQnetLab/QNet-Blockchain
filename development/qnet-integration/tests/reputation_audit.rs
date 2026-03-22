@@ -762,7 +762,7 @@ fn test_full_scenario() {
         evidence_hash: [1u8; 32],
     };
     
-    let mut commit = genesis_nodes.iter().cloned().collect::<HashSet<_>>();
+    let commit = genesis_nodes.iter().cloned().collect::<HashSet<_>>();
     let mut reveal = genesis_nodes.iter().cloned().collect::<HashSet<_>>();
     reveal.remove("genesis_node_003"); // Node 3 didn't reveal
     

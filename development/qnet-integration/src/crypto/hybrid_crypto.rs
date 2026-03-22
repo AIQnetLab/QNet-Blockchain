@@ -1066,7 +1066,7 @@ mod tests {
     /// Test rotation threshold (80% of lifetime)
     #[test]
     fn test_rotation_threshold() {
-        let now = SystemTime::now()
+        let _now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();

@@ -1750,11 +1750,12 @@ impl BlockchainNode {
         consensus_participants: &[String],
         _own_node_id: &str,
         _own_node_type: NodeType,
+        macroblock_index: u64,
+        storage: &Storage,
     ) -> Vec<qnet_state::EligibleProducer> {
         const MIN_REPUTATION: f64 = 0.70;
         const MAX_VALIDATORS_PER_EPOCH: usize = 1000;
         
-        // Get deterministic reputation from blockchain-synchronized state
         let current_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1768,8 +1769,6 @@ impl BlockchainNode {
                 std::collections::HashMap::new()
             };
         
-        // DETERMINISTIC: Use ONLY consensus participants (proved via commit+reveal)
-        // NO get_active_full_super_nodes() - that's P2P state which varies between nodes!
         let mut eligible: Vec<qnet_state::EligibleProducer> = consensus_participants.iter()
             .map(|node_id| {
                 let reputation = reputation_map.get(node_id).copied().unwrap_or(0.70);
@@ -1781,21 +1780,59 @@ impl BlockchainNode {
             .filter(|p| p.reputation >= MIN_REPUTATION)
             .collect();
         
-        // Sort by node_id for determinism
         eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         
-        // Apply scalability limit if needed
+        // v3.37: VRF-based fair selection when exceeding MAX_VALIDATORS_PER_EPOCH
+        // Reputation-first ordering preserved; equal-reputation tiebreaker uses
+        // deterministic VRF hash instead of alphabetical node_id — ensures every
+        // node with the same reputation has an equal chance each epoch.
+        // Precompute hashes O(n) — same pattern as select_consensus_committee.
         if eligible.len() > MAX_VALIDATORS_PER_EPOCH {
+            use sha3::{Sha3_256, Digest};
+
+            let vrf_seed: [u8; 32] = if macroblock_index >= 2 {
+                let n_minus_2 = macroblock_index - 2;
+                match storage.get_macroblock_by_height(n_minus_2) {
+                    Ok(Some(data)) => {
+                        match bincode::deserialize::<qnet_state::MacroBlock>(&data) {
+                            Ok(mb) => mb.consensus_data.randomness_beacon.unwrap_or([0u8; 32]),
+                            Err(_) => [0u8; 32],
+                        }
+                    }
+                    _ => [0u8; 32],
+                }
+            } else {
+                [0u8; 32]
+            };
+
+            let vrf_scores: std::collections::HashMap<String, [u8; 32]> = eligible.iter()
+                .map(|p| {
+                    let mut h = Sha3_256::new();
+                    h.update(b"EPOCH_VALIDATOR_VRF_v3.37");
+                    h.update(&vrf_seed);
+                    h.update(&macroblock_index.to_le_bytes());
+                    h.update(p.node_id.as_bytes());
+                    (p.node_id.clone(), h.finalize().into())
+                })
+                .collect();
+
             eligible.sort_by(|a, b| {
                 b.reputation.partial_cmp(&a.reputation)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.node_id.cmp(&b.node_id))
+                    .then_with(|| {
+                        let ha = &vrf_scores[&a.node_id];
+                        let hb = &vrf_scores[&b.node_id];
+                        ha.cmp(hb)
+                    })
             });
             eligible.truncate(MAX_VALIDATORS_PER_EPOCH);
             eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+            println!("[INFO][SNAP] vrf_selection mb={} total={} selected={} seed={}",
+                macroblock_index, consensus_participants.len(), eligible.len(),
+                hex::encode(&vrf_seed[..8]));
         }
         
-        // NOTE: This is consensus_participants, NOT heartbeat eligible! For rewards see reward_heartbeats
         if is_debug() { println!("[DBG][SNAP] consensus_participants={} (NOT heartbeat eligible!)", eligible.len()); }
         eligible
     }
@@ -13516,7 +13553,7 @@ impl BlockchainNode {
                                     }
                                 } else {
                                     // Can't reach producer directly — will rely on BFT timeout
-                                    println!("[WARN][CONS] producer_unreachable={} — timeout will handle", current_producer);
+                                    if is_info() { println!("[INFO][CONS] producer_not_in_peers={} — bft_timeout will handle", current_producer); }
                                 }
                             }
                             
@@ -13836,7 +13873,7 @@ impl BlockchainNode {
                                         // No response from producer - could be network issue or lagging
                                         // Be conservative: assume synchronized if no response (Byzantine resilience)
                                         // Other nodes will reject invalid blocks anyway
-                                        println!("[WARN][PROD] No entropy response from producer {} - assuming synchronized", current_producer);
+                                        if is_info() { println!("[INFO][PROD] no_entropy_response producer={} assuming_synced", current_producer); }
                                         true
                                     }
                                 }
@@ -22560,6 +22597,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         &consensus_data.participants,
                         node_id,
                         node_type.clone(),
+                        consensus_data.round_number,
+                        &storage,
                     ).await;
                     
                     if !snapshot.is_empty() {

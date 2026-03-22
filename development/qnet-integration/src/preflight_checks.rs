@@ -564,14 +564,14 @@ mod tests {
     #[test]
     fn test_check_port_available_tcp() {
         // Should be able to bind to a random high port
-        let result = check_port_available(0, "TCP");
+        let _result = check_port_available(0, "TCP");
         // Port 0 will fail because we need a real port
         // This is just a sanity check that the function works
     }
     
     #[test]
     fn test_check_port_available_udp() {
-        let result = check_port_available(0, "UDP");
+        let _result = check_port_available(0, "UDP");
         // Same as above
     }
     

@@ -22837,7 +22837,6 @@ mod tests {
     #[test]
     fn test_compact_signature_p2p_parsing() {
         use crate::crypto::CompactHybridSignature;
-        use base64::Engine as _;
         
         // Create valid base64 for 32-byte array (ephemeral_public_key)
         let ephemeral_pk = [42u8; 32];

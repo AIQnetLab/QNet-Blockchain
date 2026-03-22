@@ -575,7 +575,7 @@ fn test_rate_limit_vs_total_sends() {
     // Genesis scenario
     let chunks = 18; // 12 data + 6 parity
     let fanout = 4;
-    let peers = 4;
+    let _peers = 4;
     let total_sends = chunks * fanout; // 72
     
     let rate_limit = 20;
