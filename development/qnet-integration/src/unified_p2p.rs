@@ -9194,12 +9194,21 @@ impl SimplifiedP2P {
     }
     
     /// CRITICAL: Force peer cache refresh for Byzantine safety checks (Producer nodes)
+    /// v2.57: Now invalidates BOTH actor-based and legacy caches
     pub fn force_peer_cache_refresh(&self) {
+        // Invalidate actor-based cache (primary) with epoch bump
+        let new_epoch = CACHE_ACTOR.increment_epoch();
+        if let Ok(mut peers_cache) = CACHE_ACTOR.peers_cache.write() {
+            *peers_cache = None;
+        }
+
+        // Invalidate legacy cache for backward compatibility
         if let Ok(mut cached) = CACHED_PEERS.lock() {
             *cached = (Vec::new(), Instant::now(), String::new());
-            if crate::node::is_info() {
-                println!("[INFO][P2P] FORCED: Peer cache cleared for fresh validation");
-            }
+        }
+
+        if crate::node::is_info() {
+            println!("[INFO][P2P] peer_cache_forced_refresh epoch={}", new_epoch);
         }
     }
     
@@ -18117,19 +18126,26 @@ impl SimplifiedP2P {
                         }
                         
                         if crate::node::is_info() {
-                            println!("[P2P] 🔥 PEER EXCHANGE: {} new peers added to connected_peers", added_count);
+                            println!("[INFO][P2P] peer_exchange_complete added={}", added_count);
                         }
                         
                         let _ = validated_count; // tracked but not aggregated further
-                        // CACHE FIX: Invalidate cache after adding peers through exchange
+                        // CACHE FIX v2.57: Invalidate BOTH caches after adding peers through exchange
+                        // Previously only legacy CACHED_PEERS was invalidated, leaving CacheActor stale
                         if added_count > 0 {
-                            // Can't call self.invalidate_peer_cache() from static context
-                            // Directly invalidate the cache here
+                            // Invalidate actor-based cache (primary)
+                            let new_epoch = CACHE_ACTOR.increment_epoch();
+                            if let Ok(mut peers_cache) = CACHE_ACTOR.peers_cache.write() {
+                                *peers_cache = None;
+                            }
+
+                            // Invalidate legacy cache for backward compatibility
                             if let Ok(mut cached) = CACHED_PEERS.lock() {
                                 *cached = (Vec::new(), Instant::now() - Duration::from_secs(3600), String::new());
-                                if crate::node::is_info() {
-                                    println!("[P2P] 🔄 Peer cache invalidated after exchange (added {} peers)", added_count);
-                                }
+                            }
+
+                            if crate::node::is_info() {
+                                println!("[INFO][P2P] peer_cache_invalidated after_exchange added={} epoch={}", added_count, new_epoch);
                             }
                         }
                     }
