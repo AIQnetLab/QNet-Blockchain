@@ -3308,37 +3308,25 @@ impl Storage {
         // Save the macroblock
         self.persistent.save_macroblock(height, macroblock).await?;
         
-        // CRITICAL: Save state snapshot for efficient storage
-        // This is what allows us to reconstruct state without all microblocks
-        if let Ok(state_data) = bincode::serialize(&macroblock) {
-            // SECURITY: Verify state root is correctly calculated from microblocks
-            // state_root MUST be XOR of all microblock hashes in this macroblock
+        // SECURITY: Verify macroblock state_root = XOR of all microblock hashes
+        {
             let mut computed_state_root = [0u8; 32];
-            
-            // Recalculate state root from the microblock hashes stored in macroblock
             for microblock_hash in &macroblock.micro_blocks {
                 for (i, &byte) in microblock_hash.iter().enumerate() {
                     computed_state_root[i] ^= byte;
                 }
             }
-            
-            // NOW we can verify - comparing XOR with XOR!
             if computed_state_root != macroblock.state_root {
                 return Err(IntegrationError::StorageError(
-                    format!("State root verification failed at height {}: expected {:?}, computed {:?}", 
+                    format!("State root verification failed at height {}: expected {:?}, computed {:?}",
                             height, macroblock.state_root, computed_state_root)
                 ));
             }
-            
-            // v3.19: Save state snapshot every 10th macroblock (saves ~45MB/day!)
-            // OLD: Every macroblock = 960 snapshots/day × ~50KB = 48MB/day
-            // NEW: Every 10th = 96 snapshots/day × ~50KB = ~5MB/day
-            // SAFETY: Can restore from any snapshot + replay macroblocks
-            if height % 10 == 0 || height <= 10 {
-                self.save_state_snapshot(height, macroblock.state_root, state_data).await?;
-                println!("[INFO][SNAPSHOT] State snapshot saved at macroblock #{} (every 10th)", height);
-            }
         }
+        // NOTE: Account state snapshots are saved separately by emission/rewards processing
+        // (node.rs) as Vec<(String, Account)>. Previously this path incorrectly saved
+        // serialized MacroBlock data into state_snap keys, causing deserialization failures
+        // on node restart (bincode expected Vec<(String,Account)> but got MacroBlock).
         
         // ═══════════════════════════════════════════════════════════════════════════
         // STORAGE STRATEGY (v3.19)

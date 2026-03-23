@@ -131,12 +131,8 @@ impl CacheActor {
     }
 }
 
-// Actor-based cache
+// Actor-based cache (single source of truth for peer cache)
 static CACHE_ACTOR: Lazy<CacheActor> = Lazy::new(|| CacheActor::new());
-
-// LEGACY: Keep for backward compatibility but redirect to actor
-static CACHED_PEERS: Lazy<Arc<Mutex<(Vec<PeerInfo>, Instant, String)>>> = 
-    Lazy::new(|| Arc::new(Mutex::new((Vec::new(), Instant::now(), String::new()))));
 
 // SYNC FIX: Track blocks currently being downloaded to prevent race conditions
 #[allow(dead_code)]
@@ -8527,20 +8523,12 @@ impl SimplifiedP2P {
     
     /// CACHE FIX: Invalidate peer cache when topology changes
     fn invalidate_peer_cache(&self) {
-        // IMPROVED: Use actor-based cache with epoch versioning
         let new_epoch = CACHE_ACTOR.increment_epoch();
-        
-        // Clear actor cache
         if let Ok(mut peers_cache) = CACHE_ACTOR.peers_cache.write() {
             *peers_cache = None;
-            if crate::node::is_info() {
-                println!("[INFO][P2P] Peer cache invalidated (epoch: {})", new_epoch);
-            }
         }
-        
-        // Legacy cache for backward compatibility
-        if let Ok(mut cached) = CACHED_PEERS.lock() {
-            *cached = (Vec::new(), Instant::now() - Duration::from_secs(3600), String::new());
+        if crate::node::is_info() {
+            println!("[INFO][P2P] peer_cache_invalidated epoch={}", new_epoch);
         }
     }
     
@@ -8998,12 +8986,7 @@ impl SimplifiedP2P {
             .collect();
         peer_addrs.sort();
         
-        let peer_topology = peer_addrs.join("|");
-        let peer_topology_hash = format!("{:x}", peer_topology.len() + peer_addrs.len());
-        let peer_count = self.connected_peers_lockfree.len();
-        let cache_key = format!("regular_{}_{}", peer_count, peer_topology_hash);
-        
-        // IMPROVED: Check new cache actor first, then old cache
+        // Check actor cache (single source of truth)
         let should_refresh = {
             // Try new cache actor first
             if let Some(cached_data) = match CACHE_ACTOR.peers_cache.read() { Ok(g) => g, Err(p) => p.into_inner() }.as_ref() {
@@ -9021,41 +9004,27 @@ impl SimplifiedP2P {
                 }
             }
             
-            // Fallback to old cache
-            if let Ok(cached) = CACHED_PEERS.lock() {
-                let now = Instant::now();
-                
-            if now.duration_since(cached.1) < validation_interval && cached.2 == cache_key {
-                    if crate::node::is_info() {
-                        println!("[INFO][P2P] Using legacy cached peer list ({} peers, age: {}s)", 
-                             cached.0.len(), now.duration_since(cached.1).as_secs());
-                    }
-                return cached.0.clone();
-                }
-            }
-            
             true // Cache expired or unavailable, need refresh
         };
-        
+
         if should_refresh {
-            // RACE CONDITION FIX: Double-check cache before expensive validation
+            // RACE CONDITION FIX: Double-check actor cache before expensive validation
             // Another thread might have refreshed while we were checking
-            if let Ok(cached) = CACHED_PEERS.lock() {
-                let now = Instant::now();
-                if now.duration_since(cached.1) < validation_interval && cached.2 == cache_key {
-                    if crate::node::is_info() {
-                        println!("[INFO][P2P] Cache refreshed by another thread ({} peers)", cached.0.len());
+            if let Some(cached_data) = match CACHE_ACTOR.peers_cache.read() { Ok(g) => g, Err(p) => p.into_inner() }.as_ref() {
+                let age = Instant::now().duration_since(cached_data.timestamp);
+                let topology_hash = CacheActor::get_topology_hash(&peer_addrs);
+                if age < validation_interval && cached_data.topology_hash == topology_hash {
+                    if crate::node::is_debug() {
+                        println!("[DBG][P2P] cache_hit_recheck peers={} epoch={}", cached_data.data.len(), cached_data.epoch);
                     }
-                    return cached.0.clone();
+                    return cached_data.data.clone();
                 }
             }
-            
-            // PERFORMANCE FIX: Do expensive validation WITHOUT holding cache lock
+
             let fresh_peers = self.get_validated_active_peers_internal();
-            
-            // IMPROVED: Update both cache systems
+
+            // Update actor cache (single source of truth)
             {
-                // Update new cache actor
                 let epoch = CACHE_ACTOR.increment_epoch();
                 let topology_hash = CacheActor::get_topology_hash(&fresh_peers.iter().map(|p| p.addr.clone()).collect::<Vec<_>>());
                 *match CACHE_ACTOR.peers_cache.write() { Ok(g) => g, Err(p) => p.into_inner() } = Some(CachedData {
@@ -9064,15 +9033,9 @@ impl SimplifiedP2P {
                     timestamp: Instant::now(),
                     topology_hash,
                 });
-                
-                // Also update old cache for backward compatibility
-                if let Ok(mut cached) = CACHED_PEERS.lock() {
-                    let now = Instant::now();
-            *cached = (fresh_peers.clone(), now, cache_key);
-                }
-                
+
                 if crate::node::is_info() {
-                    println!("[INFO][P2P] Refreshed both peer caches ({} peers, epoch: {})", fresh_peers.len(), epoch);
+                    println!("[INFO][P2P] peer_cache_refreshed peers={} epoch={}", fresh_peers.len(), epoch);
                 }
             }
             
@@ -9194,19 +9157,11 @@ impl SimplifiedP2P {
     }
     
     /// CRITICAL: Force peer cache refresh for Byzantine safety checks (Producer nodes)
-    /// v2.57: Now invalidates BOTH actor-based and legacy caches
     pub fn force_peer_cache_refresh(&self) {
-        // Invalidate actor-based cache (primary) with epoch bump
         let new_epoch = CACHE_ACTOR.increment_epoch();
         if let Ok(mut peers_cache) = CACHE_ACTOR.peers_cache.write() {
             *peers_cache = None;
         }
-
-        // Invalidate legacy cache for backward compatibility
-        if let Ok(mut cached) = CACHED_PEERS.lock() {
-            *cached = (Vec::new(), Instant::now(), String::new());
-        }
-
         if crate::node::is_info() {
             println!("[INFO][P2P] peer_cache_forced_refresh epoch={}", new_epoch);
         }
@@ -18130,18 +18085,12 @@ impl SimplifiedP2P {
                         }
                         
                         let _ = validated_count; // tracked but not aggregated further
-                        // CACHE FIX v2.57: Invalidate BOTH caches after adding peers through exchange
-                        // Previously only legacy CACHED_PEERS was invalidated, leaving CacheActor stale
+                        // CACHE FIX v2.57: Invalidate CacheActor after adding peers through exchange
                         if added_count > 0 {
                             // Invalidate actor-based cache (primary)
                             let new_epoch = CACHE_ACTOR.increment_epoch();
                             if let Ok(mut peers_cache) = CACHE_ACTOR.peers_cache.write() {
                                 *peers_cache = None;
-                            }
-
-                            // Invalidate legacy cache for backward compatibility
-                            if let Ok(mut cached) = CACHED_PEERS.lock() {
-                                *cached = (Vec::new(), Instant::now() - Duration::from_secs(3600), String::new());
                             }
 
                             if crate::node::is_info() {

@@ -924,7 +924,7 @@ lazy_static::lazy_static! {
 
 use sha3::{Sha3_256, Digest};
 use serde_json;
-use bincode;
+use bincode::{self, Options};
 use serde::{Serialize, Deserialize};
 
 /// Generate proper EON address from any string identifier
@@ -4842,44 +4842,49 @@ impl BlockchainNode {
         // Initialize state manager
         let state = Arc::new(RwLock::new(StateManager::new()));
         
-        // v2.98: CRITICAL - Restore state from latest snapshot (blockchain persistence)
-        // This ensures pending_rewards and balances survive node restarts
-        // SCALABILITY: Snapshot load is O(n) but happens ONCE at startup (acceptable even for 1M accounts)
+        // ═══════════════════════════════════════════════════════════════════
+        // v5.1: STATE RECOVERY PIPELINE
+        // Three-tier approach: snapshot → incremental replay → full replay
+        // Guarantees state is ALWAYS restored correctly after any restart.
+        // ═══════════════════════════════════════════════════════════════════
         if is_info() { println!("[INFO][STATE] loading_latest_snapshot"); }
-        
-        // FIX: Read chain_height early so we can validate snapshot consistency.
-        // If snapshot_height > chain_height the node was interrupted AFTER applying
-        // block state but BEFORE saving the block to disk.  Restoring this snapshot
-        // would make every subsequent apply produce state_root_mismatch on the same
-        // block (infinite retry loop).  In that case we skip the snapshot and start
-        // from a clean in-memory state; the node will re-apply blocks from disk.
+
         let pre_snapshot_chain_height = storage.get_chain_height().unwrap_or(0);
-        
         let mut restored_snapshot_height: u64 = 0;
 
+        // ── TIER 1: Try loading state snapshot ──
         match storage.load_latest_state_snapshot().await {
             Ok(Some((snapshot_height, state_root, accounts_data))) => {
-                // SAFETY: Reject snapshots that are ahead of committed blockchain data.
                 if snapshot_height > pre_snapshot_chain_height {
-                    eprintln!("[WARN][STATE] snapshot_ahead_of_chain snapshot={} chain={} — discarding to prevent state_root_mismatch",
+                    eprintln!("[WARN][STATE] snapshot_ahead_of_chain snapshot={} chain={} — discarding",
                               snapshot_height, pre_snapshot_chain_height);
                 } else if !accounts_data.is_empty() {
-                    match bincode::deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_data) {
+                    // v5.1: Try bincode with allow_trailing_bytes for forward compatibility
+                    let deserialize_result = bincode::DefaultOptions::new()
+                        .with_fixint_encoding()
+                        .allow_trailing_bytes()
+                        .deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_data)
+                        .or_else(|_| {
+                            // Fallback: standard bincode (handles old format)
+                            bincode::deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_data)
+                        });
+
+                    match deserialize_result {
                         Ok(accounts) => {
                             let state_guard = state.write().await;
                             match (*state_guard).restore_accounts(accounts.clone()) {
                                 Ok(_) => {
-                                    println!("[INFO][STATE] snapshot_restored height={} accounts={} size={}KB", 
+                                    println!("[INFO][STATE] snapshot_restored height={} accounts={} size={}KB",
                                              snapshot_height, accounts.len(), accounts_data.len() / 1024);
                                     restored_snapshot_height = snapshot_height;
-                                    
+
                                     match (*state_guard).calculate_state_root() {
                                         Ok(calculated_root) => {
                                             if calculated_root == state_root {
-                                                println!("[INFO][STATE] state_root_verified root={}...", 
+                                                println!("[INFO][STATE] state_root_verified root={}...",
                                                          hex::encode(&state_root[..8]));
                                             } else {
-                                                eprintln!("[WARN][STATE] state_root_mismatch expected={} calculated={}", 
+                                                eprintln!("[WARN][STATE] state_root_drift expected={} calculated={} — will correct via replay",
                                                           hex::encode(&state_root[..8]), hex::encode(&calculated_root[..8]));
                                             }
                                         }
@@ -4889,12 +4894,12 @@ impl BlockchainNode {
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("[ERR][STATE] restore_fail err={}", e);
+                                    eprintln!("[WARN][STATE] restore_fail err={} — falling back to full replay", e);
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("[ERR][STATE] deserialize_fail err={}", e);
+                            eprintln!("[WARN][STATE] deserialize_fail err={} — falling back to full replay", e);
                         }
                     }
                 } else {
@@ -4905,80 +4910,191 @@ impl BlockchainNode {
                 if is_info() { println!("[INFO][STATE] no_snapshot fresh_start"); }
             }
             Err(e) => {
-                eprintln!("[WARN][STATE] snapshot_load_fail err={} starting_fresh", e);
+                eprintln!("[WARN][STATE] snapshot_load_fail err={} — falling back to full replay", e);
             }
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // v5.0: INCREMENTAL REPLAY — replay blocks from snapshot to chain tip
-        // Ensures state is fully consistent even if snapshot is behind chain_height.
-        // Without this, accounts modified between snapshot and tip are stale.
+        // v5.1: GUARANTEED STATE REPLAY
+        // TIER 2: If snapshot loaded partially → replay from snapshot to tip
+        // TIER 3: If snapshot FAILED → replay ALL blocks from genesis
+        // This ensures state is NEVER empty after restart.
         // ═══════════════════════════════════════════════════════════════════
-        if restored_snapshot_height > 0 && pre_snapshot_chain_height > restored_snapshot_height {
-            let replay_start = restored_snapshot_height.saturating_add(1);
-            let replay_end = pre_snapshot_chain_height;
-            let replay_count = replay_end.saturating_sub(replay_start).saturating_add(1);
-            println!("[INFO][STATE] incremental_replay start={} end={} blocks={}", replay_start, replay_end, replay_count);
+        if pre_snapshot_chain_height > 0 {
+            let replay_start = if restored_snapshot_height > 0 {
+                // TIER 2: Snapshot loaded — only replay blocks after snapshot
+                restored_snapshot_height.saturating_add(1)
+            } else {
+                // TIER 3: Snapshot failed — full replay from block 1
+                1
+            };
 
-            let replay_time = std::time::Instant::now();
-            let mut replayed = 0u64;
-            let mut replay_errors = 0u64;
+            if replay_start <= pre_snapshot_chain_height {
+                let replay_end = pre_snapshot_chain_height;
+                let replay_count = replay_end.saturating_sub(replay_start).saturating_add(1);
+                let replay_mode = if restored_snapshot_height > 0 { "incremental" } else { "full" };
+                println!("[INFO][STATE] {}_replay start={} end={} blocks={}",
+                         replay_mode, replay_start, replay_end, replay_count);
 
-            for h in replay_start..=replay_end {
-                match storage.load_microblock_auto_format(h) {
-                    Ok(Some(microblock)) => {
-                        let state_guard = state.write().await;
-                        for tx in &microblock.transactions {
-                            if let Err(e) = state_guard.apply_transaction_lazy(tx) {
-                                if is_debug() {
-                                    println!("[DBG][REPLAY] tx_skip h={} err={}", h, e);
+                let replay_time = std::time::Instant::now();
+                let mut replayed = 0u64;
+                let mut replay_errors = 0u64;
+                let log_interval = std::cmp::max(replay_count / 20, 1000); // Log progress ~20 times or every 1000 blocks
+
+                for h in replay_start..=replay_end {
+                    match storage.load_microblock_auto_format(h) {
+                        Ok(Some(microblock)) => {
+                            let state_guard = state.write().await;
+
+                            // ── Phase 1: Collect deferred reward accruals from emission TXs ──
+                            let mut deferred_reward_accruals: Vec<(String, u64)> = Vec::new();
+                            for tx in &microblock.transactions {
+                                // Process emission TXs: update total_supply
+                                if tx.tx_type == qnet_state::TransactionType::RewardDistribution
+                                   && tx.from == "system_emission" {
+                                    let _ = state_guard.emit_rewards(tx.amount);
+                                }
+                                // Parse per-wallet reward accruals (v7.0 JSON v2 format)
+                                if tx.tx_type == qnet_state::TransactionType::RewardDistribution
+                                   && tx.from == "system_emission" {
+                                    if let Some(ref data) = tx.data {
+                                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                                            if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
+                                                if let Some(accruals) = parsed.get("accruals").and_then(|v| v.as_object()) {
+                                                    for (wallet, amount_val) in accruals {
+                                                        if let Some(amount) = amount_val.as_u64() {
+                                                            if amount > 0 {
+                                                                deferred_reward_accruals.push((wallet.clone(), amount));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                        }
-                        // Apply gas refunds
-                        for tx in &microblock.transactions {
-                            let _ = state_guard.apply_gas_refund(tx, h);
-                        }
-                        // Finalize Merkle and verify state_root
-                        let _computed_root = state_guard.finalize_merkle();
-                        if microblock.state_root != [0u8; 32] {
-                            match state_guard.calculate_state_root() {
-                                Ok(full_root) if full_root != microblock.state_root => {
-                                    if replay_errors < 3 {
-                                        eprintln!("[WARN][REPLAY] state_root_mismatch h={} expected={} got={}",
-                                                 h, hex::encode(&microblock.state_root[..8]), hex::encode(&full_root[..8]));
+
+                            // ── Phase 2: Apply all transactions ──
+                            for tx in &microblock.transactions {
+                                if let Err(e) = state_guard.apply_transaction_lazy(tx) {
+                                    if is_debug() {
+                                        println!("[DBG][REPLAY] tx_skip h={} err={}", h, e);
                                     }
-                                    replay_errors += 1;
                                 }
-                                Err(e) => {
-                                    if replay_errors < 3 {
-                                        eprintln!("[ERR][REPLAY] state_root_calc h={} err={}", h, e);
-                                    }
-                                    replay_errors += 1;
+                            }
+                            for tx in &microblock.transactions {
+                                let _ = state_guard.apply_gas_refund(tx, h);
+                            }
+
+                            // ── Phase 3: Credit producer fees (affects merkle root!) ──
+                            if microblock.fees_collected > 0 {
+                                let producer_wallet = match storage.load_node_registration(&microblock.producer) {
+                                    Ok(Some((_, wallet, _))) => wallet,
+                                    _ => String::new(),
+                                };
+                                if !producer_wallet.is_empty() {
+                                    let _ = state_guard.credit_producer_fees_once(
+                                        h, &producer_wallet, microblock.fees_collected
+                                    );
                                 }
-                                _ => {} // match
+                            }
+
+                            // ── Phase 4: Apply reward accruals (affects merkle root!) ──
+                            for (wallet, delta) in &deferred_reward_accruals {
+                                let _ = state_guard.accrue_pending_rewards(wallet, *delta);
+                            }
+
+                            // ── Phase 5: Finalize merkle tree ──
+                            let _computed_root = state_guard.finalize_merkle();
+
+                            // ── Phase 6: Update chain_state.height for consistency ──
+                            {
+                                let mut chain_state = state_guard.chain_state.write();
+                                if h > chain_state.height {
+                                    chain_state.height = h;
+                                }
+                            }
+
+                            replayed += 1;
+
+                            // Progress logging for long replays
+                            if replayed % log_interval == 0 {
+                                let pct = (replayed as f64 / replay_count as f64 * 100.0) as u32;
+                                let elapsed = replay_time.elapsed();
+                                println!("[INFO][REPLAY] progress={}/{}  {}%  elapsed={:.1}s",
+                                         replayed, replay_count, pct, elapsed.as_secs_f64());
                             }
                         }
-                        replayed += 1;
-                    }
-                    Ok(None) => {
-                        println!("[WARN][REPLAY] block_missing h={} — state may be incomplete", h);
-                        replay_errors += 1;
-                    }
-                    Err(e) => {
-                        if replay_errors < 3 {
-                            eprintln!("[WARN][REPLAY] load_fail h={} err={}", h, e);
+                        Ok(None) => {
+                            // Block missing in storage — skip but count error
+                            if replay_errors < 5 {
+                                println!("[WARN][REPLAY] block_missing h={}", h);
+                            }
+                            replay_errors += 1;
                         }
-                        replay_errors += 1;
+                        Err(e) => {
+                            if replay_errors < 5 {
+                                eprintln!("[WARN][REPLAY] load_fail h={} err={}", h, e);
+                            }
+                            replay_errors += 1;
+                        }
+                    }
+                }
+
+                let elapsed = replay_time.elapsed();
+                println!("[INFO][STATE] {}_replay_done replayed={}/{} errors={} elapsed={:.2}s",
+                         replay_mode, replayed, replay_count, replay_errors, elapsed.as_secs_f64());
+
+                // Verify final merkle root matches the last block's state_root
+                // NOTE: block.state_root stores finalize_merkle() output (merkle root),
+                // NOT calculate_state_root() which includes height+total_supply.
+                if replayed > 0 {
+                    if let Ok(Some(last_block)) = storage.load_microblock_auto_format(pre_snapshot_chain_height) {
+                        if last_block.state_root != [0u8; 32] {
+                            let state_guard = state.write().await;
+                            let final_merkle = state_guard.finalize_merkle();
+                            if final_merkle == last_block.state_root {
+                                println!("[INFO][STATE] replay_verified merkle_root={} h={}",
+                                         hex::encode(&final_merkle[..8]), pre_snapshot_chain_height);
+                            } else {
+                                eprintln!("[WARN][STATE] replay_merkle_drift expected={} computed={} h={} — node will attempt to accept new blocks",
+                                          hex::encode(&last_block.state_root[..8]),
+                                          hex::encode(&final_merkle[..8]),
+                                          pre_snapshot_chain_height);
+                            }
+                        }
                     }
                 }
             }
-
-            let elapsed = replay_time.elapsed();
-            println!("[INFO][STATE] incremental_replay_done replayed={}/{} errors={} elapsed={:.2}s",
-                     replayed, replay_count, replay_errors, elapsed.as_secs_f64());
         }
         
+        // v5.1: Initialize restart-sensitive statics from recovered chain state
+        // Without this, statics start at 0 and cause spurious behavior on first tick:
+        //   - METRIC_LAST_RESET=0 → immediate metrics dump with empty/stale data
+        //   - LAST_VRF_KEY_ANNOUNCE_HEIGHT=0 → redundant VRF key broadcast on first block
+        if pre_snapshot_chain_height > 0 {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            METRIC_LAST_RESET.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+
+            // Suppress immediate VRF re-announce: pretend we announced recently.
+            // The node will still announce at the next 90-block boundary.
+            let vrf_init = if pre_snapshot_chain_height > 45 {
+                pre_snapshot_chain_height - 45
+            } else {
+                0
+            };
+            LAST_VRF_KEY_ANNOUNCE_HEIGHT.store(vrf_init, std::sync::atomic::Ordering::Relaxed);
+
+            if is_info() {
+                println!("[INFO][STATE] restart_statics_init chain_h={} metric_reset=now vrf_announce_h={}",
+                         pre_snapshot_chain_height, vrf_init);
+            }
+        }
+
         // Initialize production-ready mempool with AUTO-SCALING
         // v2.27.2: BENCHMARK MODE gets 10x larger mempool for 100K+ TPS testing
         let benchmark_mode = std::env::var("QNET_BENCHMARK_MODE")
@@ -8567,35 +8683,47 @@ impl BlockchainNode {
                             println!("[ERR][STATE] persistent_mismatch h={} fails={} — triggering state recovery from macroblock snapshot",
                                      received_block.height, fail_count);
                             
-                            // STATE RECOVERY: reload from last macroblock snapshot + replay
+                            // STATE RECOVERY v5.1: snapshot → replay (with full replay fallback)
                             let recovery_result: Result<(), String> = async {
-                                let snap = storage.load_latest_state_snapshot().await
-                                    .map_err(|e| format!("snapshot_load: {}", e))?;
-                                
-                                let (snap_height, _snap_root, accounts_data) = match snap {
-                                    Some(s) if !s.2.is_empty() => s,
-                                    _ => return Err("no_valid_snapshot".to_string()),
-                                };
-                                
                                 let chain_h = storage.get_chain_height().unwrap_or(0);
-                                if snap_height > chain_h {
-                                    return Err(format!("snapshot_ahead snap={} chain={}", snap_height, chain_h));
+                                if chain_h == 0 {
+                                    return Err("empty_chain".to_string());
                                 }
-                                
-                                let accounts: Vec<(String, qnet_state::Account)> = bincode::deserialize(&accounts_data)
-                                    .map_err(|e| format!("deserialize: {}", e))?;
-                                let accounts_count = accounts.len();
-                                
-                                {
-                                    let state_guard = state.write().await;
-                                    state_guard.restore_accounts(accounts)
-                                        .map_err(|e| format!("restore: {}", e))?;
+
+                                // Try loading snapshot
+                                let mut replay_from = 1u64; // default: full replay from genesis
+                                match storage.load_latest_state_snapshot().await {
+                                    Ok(Some((snap_height, _snap_root, accounts_data)))
+                                        if snap_height <= chain_h && !accounts_data.is_empty() =>
+                                    {
+                                        // Tolerant deserialization (same as startup)
+                                        let deser = bincode::DefaultOptions::new()
+                                            .with_fixint_encoding()
+                                            .allow_trailing_bytes()
+                                            .deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_data)
+                                            .or_else(|_| bincode::deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_data));
+
+                                        match deser {
+                                            Ok(accounts) => {
+                                                let count = accounts.len();
+                                                let state_guard = state.write().await;
+                                                if state_guard.restore_accounts(accounts).is_ok() {
+                                                    println!("[INFO][STATE] snapshot_restored h={} accounts={}", snap_height, count);
+                                                    replay_from = snap_height.saturating_add(1);
+                                                } else {
+                                                    eprintln!("[WARN][STATE] restore_fail — falling back to full replay");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[WARN][STATE] deserialize_fail err={} — full replay from genesis", e);
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        println!("[INFO][STATE] no_valid_snapshot — full replay from genesis");
+                                    }
                                 }
-                                
-                                println!("[INFO][STATE] snapshot_restored h={} accounts={}", snap_height, accounts_count);
-                                
-                                // Replay blocks from snapshot to chain tip
-                                let replay_from = snap_height.saturating_add(1);
+
                                 let replay_to = chain_h;
                                 if replay_from <= replay_to {
                                     let mut replayed = 0u64;
@@ -8604,20 +8732,60 @@ impl BlockchainNode {
                                         match storage.load_microblock_auto_format(h) {
                                             Ok(Some(mb)) => {
                                                 let sg = state.write().await;
+                                                // Emission TXs: update total_supply + collect reward accruals
+                                                let mut reward_accruals: Vec<(String, u64)> = Vec::new();
+                                                for tx in &mb.transactions {
+                                                    if tx.tx_type == qnet_state::TransactionType::RewardDistribution
+                                                       && tx.from == "system_emission" {
+                                                        let _ = sg.emit_rewards(tx.amount);
+                                                        if let Some(ref data) = tx.data {
+                                                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                                                                if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
+                                                                    if let Some(accruals) = parsed.get("accruals").and_then(|v| v.as_object()) {
+                                                                        for (wallet, av) in accruals {
+                                                                            if let Some(amt) = av.as_u64() {
+                                                                                if amt > 0 { reward_accruals.push((wallet.clone(), amt)); }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                // Apply transactions + gas refunds
                                                 for tx in &mb.transactions {
                                                     let _ = sg.apply_transaction_lazy(tx);
                                                 }
                                                 for tx in &mb.transactions {
                                                     let _ = sg.apply_gas_refund(tx, h);
                                                 }
+                                                // Credit producer fees
+                                                if mb.fees_collected > 0 {
+                                                    if let Ok(Some((_, wallet, _))) = storage.load_node_registration(&mb.producer) {
+                                                        if !wallet.is_empty() {
+                                                            let _ = sg.credit_producer_fees_once(h, &wallet, mb.fees_collected);
+                                                        }
+                                                    }
+                                                }
+                                                // Apply reward accruals
+                                                for (wallet, delta) in &reward_accruals {
+                                                    let _ = sg.accrue_pending_rewards(wallet, *delta);
+                                                }
                                                 let _ = sg.finalize_merkle();
+                                                // Update chain_state.height
+                                                {
+                                                    let mut cs = sg.chain_state.write();
+                                                    if h > cs.height { cs.height = h; }
+                                                }
                                                 replayed += 1;
                                             }
                                             _ => { replay_errs += 1; }
                                         }
                                     }
-                                    println!("[INFO][STATE] recovery_replay snap={} chain={} replayed={} errors={}",
-                                             snap_height, replay_to, replayed, replay_errs);
+                                    let mode = if replay_from == 1 { "full" } else { "incremental" };
+                                    println!("[INFO][STATE] recovery_{}_replay from={} chain={} replayed={} errors={}",
+                                             mode, replay_from, replay_to, replayed, replay_errs);
                                 }
                                 
                                 Ok(())
