@@ -4925,8 +4925,8 @@ impl BlockchainNode {
                 // TIER 2: Snapshot loaded — only replay blocks after snapshot
                 restored_snapshot_height.saturating_add(1)
             } else {
-                // TIER 3: Snapshot failed — full replay from block 1
-                1
+                // TIER 3: Snapshot failed — full replay from genesis (block 0)
+                0
             };
 
             if replay_start <= pre_snapshot_chain_height {
@@ -8691,7 +8691,7 @@ impl BlockchainNode {
                                 }
 
                                 // Try loading snapshot
-                                let mut replay_from = 1u64; // default: full replay from genesis
+                                let mut replay_from = 0u64; // default: full replay from genesis (including block 0)
                                 match storage.load_latest_state_snapshot().await {
                                     Ok(Some((snap_height, _snap_root, accounts_data)))
                                         if snap_height <= chain_h && !accounts_data.is_empty() =>
@@ -8753,12 +8753,11 @@ impl BlockchainNode {
                                                         }
                                                     }
                                                 }
-                                                // Apply transactions + gas refunds
+                                                // Apply transactions + gas refunds (only on success)
                                                 for tx in &mb.transactions {
-                                                    let _ = sg.apply_transaction_lazy(tx);
-                                                }
-                                                for tx in &mb.transactions {
-                                                    let _ = sg.apply_gas_refund(tx, h);
+                                                    if sg.apply_transaction_lazy(tx).is_ok() {
+                                                        let _ = sg.apply_gas_refund(tx, h);
+                                                    }
                                                 }
                                                 // Credit producer fees
                                                 if mb.fees_collected > 0 {
