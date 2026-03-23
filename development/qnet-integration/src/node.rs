@@ -4976,15 +4976,15 @@ impl BlockchainNode {
                             }
 
                             // ── Phase 2: Apply all transactions ──
+                            // Gas refund ONLY on successful TX (matches normal block processing)
                             for tx in &microblock.transactions {
                                 if let Err(e) = state_guard.apply_transaction_lazy(tx) {
                                     if is_debug() {
                                         println!("[DBG][REPLAY] tx_skip h={} err={}", h, e);
                                     }
+                                } else {
+                                    let _ = state_guard.apply_gas_refund(tx, h);
                                 }
-                            }
-                            for tx in &microblock.transactions {
-                                let _ = state_guard.apply_gas_refund(tx, h);
                             }
 
                             // ── Phase 3: Credit producer fees (affects merkle root!) ──
