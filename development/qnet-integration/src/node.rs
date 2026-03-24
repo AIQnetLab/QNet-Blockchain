@@ -12616,13 +12616,14 @@ impl BlockchainNode {
                         const MAX_TIMEOUT_ROUNDS: u64 = 50;    // v5.3: Raised from 10 to survive multiple dead nodes
                                                                 // With 5 candidates and 6s/round, tries each candidate 10 times
                         
-                        // Calculate which timeout_round we SHOULD vote for (local view)
-                        let proposed_timeout_round = if local_delay <= TIMEOUT_GRACE_PERIOD {
+                        // Calculate raw timeout round from delay (uncapped for rotation)
+                        let raw_timeout_round = if local_delay <= TIMEOUT_GRACE_PERIOD {
                             0
                         } else {
-                            let round = ((local_delay - TIMEOUT_GRACE_PERIOD) / TIMEOUT_VOTE_INTERVAL + 1) as u64;
-                            round.min(MAX_TIMEOUT_ROUNDS) // Cap at max rounds
+                            ((local_delay - TIMEOUT_GRACE_PERIOD) / TIMEOUT_VOTE_INTERVAL + 1) as u64
                         };
+                        // Capped version for BFT voting (prevents unbounded vote key space)
+                        let proposed_timeout_round = raw_timeout_round.min(MAX_TIMEOUT_ROUNDS);
                         
                         // v4.2: Timeout votes/certificates keyed by MACROBLOCK INDEX,
                         // not exact microblock height. This ensures nodes at different
@@ -12642,16 +12643,14 @@ impl BlockchainNode {
                             0
                         };
                         
-                        // v5.2: Use max of certified and proposed timeout_round
-                        // Certified: 2/3+ BFT agreement (strongest, but lost on restart)
-                        // Proposed: delay-based local calculation (survives restart via LAST_BLOCK_PRODUCED_TIME)
-                        // After restart, certified=0 (no certs in memory), but proposed=N (large delay)
-                        // → node catches up to correct round immediately instead of deadlocking
-                        let timeout_round = certified_timeout_round.max(proposed_timeout_round);
-                        
-                        // Store timeout_round for producer selection
-                        set_timeout_round(timeout_round, next_height);
-                        update_failover_metrics(local_delay, timeout_round);
+                        // v5.3: Separate timeout for rotation (uncapped) vs voting (capped).
+                        // Rotation uses raw round → (base + raw) % N cycles through ALL candidates.
+                        // Voting uses capped proposed_timeout_round for BFT certificate convergence.
+                        let timeout_round_for_rotation = certified_timeout_round.max(raw_timeout_round);
+
+                        // Store rotation round for producer selection (uncapped)
+                        set_timeout_round(timeout_round_for_rotation, next_height);
+                        update_failover_metrics(local_delay, timeout_round_for_rotation);
                         
                         // v4.0: If we detect stall, vote for timeout (Byzantine consensus)
                         if proposed_timeout_round > 0 && microblock_height > 0 {
