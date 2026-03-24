@@ -4875,16 +4875,23 @@ impl BlockchainNode {
                             match (*state_guard).restore_accounts(accounts.clone()) {
                                 Ok(_) => {
                                     // Restore chain_state from snapshot (total_supply + height)
-                                    {
-                                        let mut cs = state_guard.chain_state.write();
-                                        if snap_total_supply > 0 {
+                                    if snap_total_supply > 0 {
+                                        {
+                                            let mut cs = state_guard.chain_state.write();
                                             cs.total_supply = snap_total_supply;
+                                            cs.height = snapshot_height;
                                         }
-                                        cs.height = snapshot_height;
+                                        println!("[INFO][STATE] snapshot_restored height={} accounts={} total_supply={} size={}KB",
+                                                 snapshot_height, accounts.len(), snap_total_supply, accounts_data.len() / 1024);
+                                        restored_snapshot_height = snapshot_height;
+                                    } else {
+                                        // v5.2: Legacy v1 snapshot has no total_supply — force full replay
+                                        // Clear already-restored accounts to prevent double-counting
+                                        state_guard.clear();
+                                        eprintln!("[WARN][STATE] v1_snapshot_no_total_supply height={} — cleared state, falling back to full replay",
+                                                  snapshot_height);
+                                        // Don't set restored_snapshot_height → TIER 3 will run
                                     }
-                                    println!("[INFO][STATE] snapshot_restored height={} accounts={} total_supply={} size={}KB",
-                                             snapshot_height, accounts.len(), snap_total_supply, accounts_data.len() / 1024);
-                                    restored_snapshot_height = snapshot_height;
 
                                     // Verify merkle root matches snapshot (uses finalize_merkle, not calculate_state_root)
                                     let computed_merkle = state_guard.finalize_merkle();
@@ -4942,11 +4949,13 @@ impl BlockchainNode {
                 let replay_time = std::time::Instant::now();
                 let mut replayed = 0u64;
                 let mut replay_errors = 0u64;
+                let mut last_replayed_block_timestamp: u64 = 0;
                 let log_interval = std::cmp::max(replay_count / 20, 1000); // Log progress ~20 times or every 1000 blocks
 
                 for h in replay_start..=replay_end {
                     match storage.load_microblock_auto_format(h) {
                         Ok(Some(microblock)) => {
+                            last_replayed_block_timestamp = microblock.timestamp;
                             let state_guard = state.write().await;
 
                             // ── Phase 1: Collect deferred reward accruals from emission TXs ──
@@ -5049,6 +5058,20 @@ impl BlockchainNode {
                 println!("[INFO][STATE] {}_replay_done replayed={}/{} errors={} elapsed={:.2}s",
                          replay_mode, replayed, replay_count, replay_errors, elapsed.as_secs_f64());
 
+                // v5.2: Set LAST_BLOCK_PRODUCED_TIME to timestamp of last replayed block
+                // This ensures correct timeout_round calculation after restart.
+                // Without this, node thinks last block was "now" → local_delay=0 → timeout_round=0
+                // → picks wrong producer → consensus deadlock with nodes that have been stalled.
+                if last_replayed_block_timestamp > 0 {
+                    LAST_BLOCK_PRODUCED_TIME.store(last_replayed_block_timestamp, std::sync::atomic::Ordering::Relaxed);
+                    if is_info() {
+                        let now_ts = get_timestamp_safe();
+                        let stale = now_ts.saturating_sub(last_replayed_block_timestamp);
+                        println!("[INFO][STATE] last_block_time_from_replay ts={} stale={}s",
+                                 last_replayed_block_timestamp, stale);
+                    }
+                }
+
                 // Verify final merkle root matches the last block's state_root
                 // NOTE: block.state_root stores finalize_merkle() output (merkle root),
                 // NOT calculate_state_root() which includes height+total_supply.
@@ -5092,9 +5115,14 @@ impl BlockchainNode {
             };
             LAST_VRF_KEY_ANNOUNCE_HEIGHT.store(vrf_init, std::sync::atomic::Ordering::Relaxed);
 
+            // v5.2: Initialize finalized height/round to prevent accepting stale consensus msgs
+            let finalized_round = pre_snapshot_chain_height / 90; // macroblock round
+            LAST_FINALIZED_CONSENSUS_ROUND.store(finalized_round, std::sync::atomic::Ordering::SeqCst);
+            LAST_FINALIZED_HEIGHT.store(finalized_round, std::sync::atomic::Ordering::SeqCst);
+
             if is_info() {
-                println!("[INFO][STATE] restart_statics_init chain_h={} metric_reset=now vrf_announce_h={}",
-                         pre_snapshot_chain_height, vrf_init);
+                println!("[INFO][STATE] restart_statics_init chain_h={} metric_reset=now vrf_announce_h={} finalized_round={}",
+                         pre_snapshot_chain_height, vrf_init, finalized_round);
             }
         }
 
@@ -8759,9 +8787,11 @@ impl BlockchainNode {
                                 if replay_from <= replay_to {
                                     let mut replayed = 0u64;
                                     let mut replay_errs = 0u64;
+                                    let mut last_replay_ts: u64 = 0;
                                     for h in replay_from..=replay_to {
                                         match storage.load_microblock_auto_format(h) {
                                             Ok(Some(mb)) => {
+                                                last_replay_ts = mb.timestamp;
                                                 let sg = state.write().await;
                                                 // Emission TXs: update total_supply + collect reward accruals
                                                 let mut reward_accruals: Vec<(String, u64)> = Vec::new();
@@ -8816,6 +8846,10 @@ impl BlockchainNode {
                                     let mode = if replay_from == 0 { "full" } else { "incremental" };
                                     println!("[INFO][STATE] recovery_{}_replay from={} chain={} replayed={} errors={}",
                                              mode, replay_from, replay_to, replayed, replay_errs);
+                                    // v5.2: Update LAST_BLOCK_PRODUCED_TIME for correct timeout_round
+                                    if last_replay_ts > 0 {
+                                        LAST_BLOCK_PRODUCED_TIME.store(last_replay_ts, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                 }
                                 
                                 Ok(())
@@ -8824,6 +8858,7 @@ impl BlockchainNode {
                             match recovery_result {
                                 Ok(()) => {
                                     println!("[INFO][STATE] recovery_complete clearing_mismatch_counters resuming_sync");
+                                    reset_timeout_round();
                                     mismatch_counter.clear();
                                     wrong_producer_counter.clear();
                                     pending_blocks.clear();
@@ -11864,10 +11899,23 @@ impl BlockchainNode {
             // ═══════════════════════════════════════════════════════════════════════════
             {
                 let now = get_timestamp_safe();
-                LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                // v5.2: Only override if not already set by replay (preserves correct stall delay)
+                let current_lbpt = LAST_BLOCK_PRODUCED_TIME.load(std::sync::atomic::Ordering::Relaxed);
+                if current_lbpt == 0 || microblock_height == 0 {
+                    // Fresh start or genesis — use NOW (no previous block to reference)
+                    LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    // Restart with replay — keep replay timestamp for correct timeout_round sync
+                    if is_info() {
+                        let stale = now.saturating_sub(current_lbpt);
+                        println!("[INFO][STATE] preserving_replay_timestamp lbpt={} stale={}s (timeout sync)",
+                                 current_lbpt, stale);
+                    }
+                }
                 LAST_BLOCK_PRODUCED_HEIGHT.store(microblock_height, std::sync::atomic::Ordering::Relaxed);
-                if is_info() { 
-                    println!("[INFO][GEN] main_loop_init last_block_time={} height={}", now, microblock_height); 
+                if is_info() {
+                    let effective_lbpt = LAST_BLOCK_PRODUCED_TIME.load(std::sync::atomic::Ordering::Relaxed);
+                    println!("[INFO][GEN] main_loop_init last_block_time={} height={}", effective_lbpt, microblock_height); 
                 }
             }
             
@@ -12593,8 +12641,12 @@ impl BlockchainNode {
                             0
                         };
                         
-                        // Use certified round if available, otherwise round 0
-                        let timeout_round = certified_timeout_round;
+                        // v5.2: Use max of certified and proposed timeout_round
+                        // Certified: 2/3+ BFT agreement (strongest, but lost on restart)
+                        // Proposed: delay-based local calculation (survives restart via LAST_BLOCK_PRODUCED_TIME)
+                        // After restart, certified=0 (no certs in memory), but proposed=N (large delay)
+                        // → node catches up to correct round immediately instead of deadlocking
+                        let timeout_round = certified_timeout_round.max(proposed_timeout_round);
                         
                         // Store timeout_round for producer selection
                         set_timeout_round(timeout_round, next_height);
