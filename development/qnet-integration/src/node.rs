@@ -17584,33 +17584,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         &slot_input, round_start_height, leadership_round, 0, candidates.len(),
                     )
                 } else {
+                    // v5.2: Deterministic rotation that ALWAYS skips the failed producer
+                    // Old logic: exclude all previous rounds → with N candidates and >N rounds,
+                    // all are excluded → falls back to failed producer → infinite stall.
+                    // New logic: rotate through remaining (N-1) candidates deterministically.
+                    // timeout=1 → next candidate, timeout=2 → next+1, etc.
+                    // The failed producer (round 0) is NEVER selected again.
                     let round0_idx = DilithiumVrf::deterministic_leader(
                         &slot_input, round_start_height, leadership_round, 0, candidates.len(),
                     );
-                    let mut excluded = std::collections::HashSet::new();
-                    excluded.insert(round0_idx);
-                    for prev in 1..timeout_round {
-                        let idx = DilithiumVrf::deterministic_leader(
-                            &slot_input, round_start_height, leadership_round, prev, candidates.len(),
-                        );
-                        excluded.insert(idx);
-                    }
-                    let preferred = DilithiumVrf::deterministic_leader(
-                        &slot_input, round_start_height, leadership_round, timeout_round, candidates.len(),
-                    );
-                    if !excluded.contains(&preferred) {
-                        preferred
-                    } else {
-                        let mut found = preferred;
-                        for offset in 1..candidates.len() {
-                            let try_idx = (preferred + offset) % candidates.len();
-                            if !excluded.contains(&try_idx) {
-                                found = try_idx;
-                                break;
-                            }
-                        }
-                        found
-                    }
+                    let n = candidates.len();
+                    let offset = ((timeout_round as usize - 1) % (n - 1)) + 1;
+                    (round0_idx + offset) % n
                 };
 
                 let winner = &candidates[selected_idx].0;
