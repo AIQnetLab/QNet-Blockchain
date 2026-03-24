@@ -4854,7 +4854,7 @@ impl BlockchainNode {
 
         // ── TIER 1: Try loading state snapshot ──
         match storage.load_latest_state_snapshot().await {
-            Ok(Some((snapshot_height, state_root, accounts_data))) => {
+            Ok(Some((snapshot_height, state_root, accounts_data, snap_total_supply))) => {
                 if snapshot_height > pre_snapshot_chain_height {
                     eprintln!("[WARN][STATE] snapshot_ahead_of_chain snapshot={} chain={} — discarding",
                               snapshot_height, pre_snapshot_chain_height);
@@ -4874,23 +4874,26 @@ impl BlockchainNode {
                             let state_guard = state.write().await;
                             match (*state_guard).restore_accounts(accounts.clone()) {
                                 Ok(_) => {
-                                    println!("[INFO][STATE] snapshot_restored height={} accounts={} size={}KB",
-                                             snapshot_height, accounts.len(), accounts_data.len() / 1024);
+                                    // Restore chain_state from snapshot (total_supply + height)
+                                    {
+                                        let mut cs = state_guard.chain_state.write();
+                                        if snap_total_supply > 0 {
+                                            cs.total_supply = snap_total_supply;
+                                        }
+                                        cs.height = snapshot_height;
+                                    }
+                                    println!("[INFO][STATE] snapshot_restored height={} accounts={} total_supply={} size={}KB",
+                                             snapshot_height, accounts.len(), snap_total_supply, accounts_data.len() / 1024);
                                     restored_snapshot_height = snapshot_height;
 
-                                    match (*state_guard).calculate_state_root() {
-                                        Ok(calculated_root) => {
-                                            if calculated_root == state_root {
-                                                println!("[INFO][STATE] state_root_verified root={}...",
-                                                         hex::encode(&state_root[..8]));
-                                            } else {
-                                                eprintln!("[WARN][STATE] state_root_drift expected={} calculated={} — will correct via replay",
-                                                          hex::encode(&state_root[..8]), hex::encode(&calculated_root[..8]));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[ERR][STATE] state_root_calc_fail err={}", e);
-                                        }
+                                    // Verify merkle root matches snapshot (uses finalize_merkle, not calculate_state_root)
+                                    let computed_merkle = state_guard.finalize_merkle();
+                                    if computed_merkle == state_root {
+                                        println!("[INFO][STATE] snapshot_merkle_verified root={}...",
+                                                 hex::encode(&state_root[..8]));
+                                    } else {
+                                        eprintln!("[WARN][STATE] snapshot_merkle_drift expected={} computed={} — will correct via replay",
+                                                  hex::encode(&state_root[..8]), hex::encode(&computed_merkle[..8]));
                                     }
                                 }
                                 Err(e) => {
@@ -8693,7 +8696,7 @@ impl BlockchainNode {
                                 // Try loading snapshot
                                 let mut replay_from = 0u64; // default: full replay from genesis (including block 0)
                                 match storage.load_latest_state_snapshot().await {
-                                    Ok(Some((snap_height, _snap_root, accounts_data)))
+                                    Ok(Some((snap_height, _snap_root, accounts_data, snap_total_supply)))
                                         if snap_height <= chain_h && !accounts_data.is_empty() =>
                                     {
                                         // Tolerant deserialization (same as startup)
@@ -8708,7 +8711,17 @@ impl BlockchainNode {
                                                 let count = accounts.len();
                                                 let state_guard = state.write().await;
                                                 if state_guard.restore_accounts(accounts).is_ok() {
-                                                    println!("[INFO][STATE] snapshot_restored h={} accounts={}", snap_height, count);
+                                                    // Restore chain_state from snapshot
+                                                    {
+                                                        let mut cs = state_guard.chain_state.write();
+                                                        if snap_total_supply > 0 {
+                                                            cs.total_supply = snap_total_supply;
+                                                        }
+                                                        cs.height = snap_height;
+                                                    }
+                                                    drop(state_guard);
+                                                    qnet_state::clear_credited_fees_cache();
+                                                    println!("[INFO][STATE] snapshot_restored h={} accounts={} total_supply={}", snap_height, count, snap_total_supply);
                                                     replay_from = snap_height.saturating_add(1);
                                                 } else {
                                                     eprintln!("[WARN][STATE] restore_fail — falling back to full replay");
@@ -8725,6 +8738,24 @@ impl BlockchainNode {
                                 }
 
                                 let replay_to = chain_h;
+                                // CRITICAL: For full replay from genesis, clear ALL state
+                                // to prevent double-counting total_supply, duplicate accounts,
+                                // and stale fee/commitment caches
+                                if replay_from == 0 {
+                                    let sg = state.write().await;
+                                    sg.clear();  // clears accounts, committed_epochs, registered_nodes, merkle tree
+                                    {
+                                        let mut cs = sg.chain_state.write();
+                                        cs.total_supply = 0;
+                                        cs.height = 0;
+                                    }
+                                    drop(sg);
+                                    qnet_state::clear_credited_fees_cache();
+                                    qnet_state::reset_pending_rewards_in_merkle();
+                                    if is_info() {
+                                        println!("[INFO][STATE] recovery_state_cleared for full replay from genesis");
+                                    }
+                                }
                                 if replay_from <= replay_to {
                                     let mut replayed = 0u64;
                                     let mut replay_errs = 0u64;
@@ -8782,7 +8813,7 @@ impl BlockchainNode {
                                             _ => { replay_errs += 1; }
                                         }
                                     }
-                                    let mode = if replay_from == 1 { "full" } else { "incremental" };
+                                    let mode = if replay_from == 0 { "full" } else { "incremental" };
                                     println!("[INFO][STATE] recovery_{}_replay from={} chain={} replayed={} errors={}",
                                              mode, replay_from, replay_to, replayed, replay_errs);
                                 }
@@ -23097,7 +23128,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // Snapshot is saved AFTER broadcast in background task (non-blocking)
                 const EMISSION_MB_INTERVAL: u64 = 160;
                 let is_emission_mb = macroblock.height > 0 && macroblock.height % EMISSION_MB_INTERVAL == 0;
-                let mut emission_snapshot_data: Option<(u64, [u8; 32], Arc<dashmap::DashMap<String, qnet_state::Account>>)> = None;
+                let mut emission_snapshot_data: Option<(u64, [u8; 32], u64, Arc<dashmap::DashMap<String, qnet_state::Account>>)> = None;
                 
                 if is_emission_mb {
                     if is_info() {
@@ -23206,12 +23237,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             // SCALABILITY: DashMap iteration + serialize in spawn_blocking
                             // At 1M+ accounts, clone+serialize takes seconds — must NOT block Tokio
                             let state = state_manager.read().await;
-                            let state_root = (*state).calculate_state_root().unwrap_or([0u8; 32]);
+                            let state_root = (*state).finalize_merkle();
+                            let snap_total_supply = (*state).get_total_supply();
                             let accounts_arc = (*state).accounts.clone(); // Arc bump — O(1)
                             drop(state);
-                            
+
                             if accounts_arc.len() > 0 {
-                                emission_snapshot_data = Some((macroblock.height, state_root, accounts_arc));
+                                emission_snapshot_data = Some((macroblock.height, state_root, snap_total_supply, accounts_arc));
                             }
                                             
                                             // Mark as processed
@@ -23282,7 +23314,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // v3.00: Fully async snapshot — DashMap iterate + serialize in spawn_blocking
                 // SCALABILITY: At 1M+ accounts, iterate+clone+serialize takes seconds
                 // Tokio reactor blocked for 0ms — only Arc clone + state_root on async path
-                if let Some((mb_height, state_root, accounts_arc)) = emission_snapshot_data {
+                if let Some((mb_height, state_root, snap_supply, accounts_arc)) = emission_snapshot_data {
                     let storage_bg = storage.clone();
                     tokio::spawn(async move {
                         // CPU-bound: DashMap iterate + clone entries + serialize — all on blocking pool
@@ -23302,9 +23334,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 return;
                             }
                         };
-                        
+
                         if !state_data.is_empty() {
-                            if let Err(e) = storage_bg.save_state_snapshot(mb_height, state_root, state_data.clone()).await {
+                            if let Err(e) = storage_bg.save_state_snapshot(mb_height, state_root, snap_supply, state_data.clone()).await {
                                 eprintln!("[ERR][EMISSION] bg_snapshot_fail mb={} err={}", mb_height, e);
                             } else {
                                 println!("[INFO][EMISSION] bg_snapshot_saved mb={} size={}KB", mb_height, state_data.len() / 1024);
@@ -25408,10 +25440,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     // v3.00: Fully async snapshot — DashMap iterate + serialize in spawn_blocking
                                     // SCALABILITY: At 1M+ accounts — Tokio blocked for 0ms
                                     let state = self.state.read().await;
-                                    let state_root = (*state).calculate_state_root().unwrap_or([0u8; 32]);
+                                    let state_root = (*state).finalize_merkle();
+                                    let snap_supply = (*state).get_total_supply();
                                     let accounts_arc = (*state).accounts.clone(); // Arc bump — O(1)
                                     drop(state);
-                                    
+
                                     if accounts_arc.len() > 0 {
                                         let storage_bg = self.storage.clone();
                                         let snap_index = index;
@@ -25432,9 +25465,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                     return;
                                                 }
                                             };
-                                            
+
                                             if !state_data.is_empty() {
-                                                if let Err(e) = storage_bg.save_state_snapshot(snap_index, state_root, state_data.clone()).await {
+                                                if let Err(e) = storage_bg.save_state_snapshot(snap_index, state_root, snap_supply, state_data.clone()).await {
                                                     eprintln!("[ERR][REWARDS] bg_snapshot_fail mb={} err={}", snap_index, e);
                                                 } else {
                                                     println!("[INFO][REWARDS] SYNC bg_snapshot_saved mb={} size={}KB", snap_index, state_data.len() / 1024);

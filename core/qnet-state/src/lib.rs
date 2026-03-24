@@ -31,7 +31,7 @@ pub use state::{should_credit_fees, clear_credited_fees_cache, credited_fees_cou
 // v3.39: Block-level snapshot for state_root mismatch recovery
 pub use state::BlockSnapshot;
 // v7.0: Fork gate for pending_rewards in Merkle hash
-pub use state::{activate_pending_rewards_in_merkle, is_pending_rewards_in_merkle};
+pub use state::{activate_pending_rewards_in_merkle, is_pending_rewards_in_merkle, reset_pending_rewards_in_merkle};
 
 #[cfg(feature = "python")]
 pub use python_bindings::*;

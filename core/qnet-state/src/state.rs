@@ -34,6 +34,12 @@ pub fn is_pending_rewards_in_merkle() -> bool {
     PENDING_REWARDS_IN_MERKLE.load(Ordering::Relaxed)
 }
 
+/// v7.0: Reset pending_rewards flag for full state replay from genesis.
+/// During replay, the flag will be re-activated at the correct block via accrue_pending_rewards.
+pub fn reset_pending_rewards_in_merkle() {
+    PENDING_REWARDS_IN_MERKLE.store(false, Ordering::SeqCst);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.26: ATOMIC FEE CREDITING PROTECTION
 // Prevents race condition where same block's fees are credited multiple times
@@ -1225,10 +1231,11 @@ impl StateManager {
     // Applies TX, verifies state_root, rolls back on mismatch
     // ═══════════════════════════════════════════════════════════════════════════════
     
-    /// v3.38: Clear all state (for Genesis block reset)
-    /// WARNING: Only use for Genesis block initialization!
+    /// v3.38: Clear all state (for Genesis block reset or full replay from genesis)
     pub fn clear(&self) {
         self.accounts.clear();
+        self.committed_epochs.clear();
+        self.registered_nodes.clear();
         let mut tree = self.merkle_tree.write();
         *tree = StateMerkleTree::new();
         *self.state_root.write() = [0u8; 32];

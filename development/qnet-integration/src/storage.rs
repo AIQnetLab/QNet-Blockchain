@@ -3215,19 +3215,22 @@ impl Storage {
     }
     
     /// Save state snapshot for in-memory StateManager restoration.
-    /// Payload: [type=0x01 | state_root(32) | accounts_bincode]
+    /// Payload v2: [type=0x02 | state_root(32) | total_supply(8) | height(8) | accounts_bincode]
     /// Wire: [sha3_hash(32) | uncompressed_len(8) | Zstd(payload)]
     /// Written atomically with `latest_state_snap` pointer via WriteBatch.
-    pub async fn save_state_snapshot(&self, height: u64, state_root: [u8; 32], state_data: Vec<u8>) -> IntegrationResult<()> {
+    pub async fn save_state_snapshot(&self, height: u64, state_root: [u8; 32], total_supply: u64, state_data: Vec<u8>) -> IntegrationResult<()> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
 
         let key = format!("state_snap_{}", height);
 
-        // Payload: [type(1) | state_root(32) | accounts_bincode]
-        let mut payload = Vec::with_capacity(1 + 32 + state_data.len());
-        payload.push(0x01); // SNAP_TYPE_STATE
+        // v2 Payload: [type(1)=0x02 | state_root(32) | total_supply(8) | height(8) | accounts_bincode]
+        // Backward compatible: load detects 0x01 (old) vs 0x02 (new)
+        let mut payload = Vec::with_capacity(1 + 32 + 8 + 8 + state_data.len());
+        payload.push(0x02); // SNAP_TYPE_STATE_V2 (includes total_supply + height)
         payload.extend_from_slice(&state_root);
+        payload.extend_from_slice(&total_supply.to_le_bytes());
+        payload.extend_from_slice(&height.to_le_bytes());
         payload.extend_from_slice(&state_data);
         let uncompressed_len = payload.len() as u64;
 
@@ -6276,7 +6279,7 @@ impl Storage {
     /// Load the latest state snapshot for in-memory StateManager restoration at startup.
     /// Uses `latest_state_snap` pointer for O(1) lookup — avoids lexicographic ordering bugs with iterator.
     /// Format: [sha3_hash(32) | uncompressed_len(8) | Zstd(state_root(32) | accounts_bincode)]
-    pub async fn load_latest_state_snapshot(&self) -> IntegrationResult<Option<(u64, [u8; 32], Vec<u8>)>> {
+    pub async fn load_latest_state_snapshot(&self) -> IntegrationResult<Option<(u64, [u8; 32], Vec<u8>, u64)>> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
 
@@ -6349,22 +6352,42 @@ impl Storage {
         }
 
         let snap_type = decompressed[0];
-        if snap_type != 0x01 {
-            return Err(IntegrationError::StorageError(format!(
-                "State snapshot h={} has wrong type: 0x{:02x} (expected 0x01)", latest_height, snap_type
-            )));
-        }
-
-        let state_root: [u8; 32] = decompressed[1..33].try_into()
-            .map_err(|_| IntegrationError::StorageError("Invalid state_root in snapshot payload".to_string()))?;
-        let accounts_data = decompressed[33..].to_vec();
+        let (state_root, total_supply, accounts_data) = match snap_type {
+            0x01 => {
+                // Legacy format: [type(1) | state_root(32) | accounts_bincode]
+                let state_root: [u8; 32] = decompressed[1..33].try_into()
+                    .map_err(|_| IntegrationError::StorageError("Invalid state_root in snapshot payload".to_string()))?;
+                let accounts_data = decompressed[33..].to_vec();
+                (state_root, 0u64, accounts_data)  // total_supply unknown in v1
+            }
+            0x02 => {
+                // v2 format: [type(1) | state_root(32) | total_supply(8) | height(8) | accounts_bincode]
+                if decompressed.len() < 49 {  // 1 + 32 + 8 + 8
+                    return Err(IntegrationError::StorageError(format!(
+                        "State snapshot v2 h={} too short: {} bytes", latest_height, decompressed.len()
+                    )));
+                }
+                let state_root: [u8; 32] = decompressed[1..33].try_into()
+                    .map_err(|_| IntegrationError::StorageError("Invalid state_root in v2 snapshot".to_string()))?;
+                let total_supply = u64::from_le_bytes(decompressed[33..41].try_into()
+                    .map_err(|_| IntegrationError::StorageError("Invalid total_supply in v2 snapshot".to_string()))?);
+                // height at bytes 41..49 (informational, actual height comes from key)
+                let accounts_data = decompressed[49..].to_vec();
+                (state_root, total_supply, accounts_data)
+            }
+            _ => {
+                return Err(IntegrationError::StorageError(format!(
+                    "State snapshot h={} unknown type: 0x{:02x}", latest_height, snap_type
+                )));
+            }
+        };
 
         if crate::node::is_info() {
-            println!("[INFO][SNAPSHOT] state_snap_loaded h={} compressed={}KB accounts={}KB",
-                     latest_height, compressed_data.len() / 1024, accounts_data.len() / 1024);
+            println!("[INFO][SNAPSHOT] state_snap_loaded h={} type=0x{:02x} total_supply={} compressed={}KB accounts={}KB",
+                     latest_height, snap_type, total_supply, compressed_data.len() / 1024, accounts_data.len() / 1024);
         }
 
-        Ok(Some((latest_height, state_root, accounts_data)))
+        Ok(Some((latest_height, state_root, accounts_data, total_supply)))
     }
     
     /// v2.99: Load state snapshot by height and restore into StateManager
@@ -6405,20 +6428,35 @@ impl Storage {
                 let decompressed = zstd::decode_all(compressed_data)
                     .map_err(|e| IntegrationError::Other(format!("Snapshot decompression failed h={}: {}", height, e)))?;
 
-                // Payload: [type(1) | state_root(32) | accounts_bincode]
+                // Payload v1: [type=0x01 | state_root(32) | accounts_bincode]
+                // Payload v2: [type=0x02 | state_root(32) | total_supply(8) | height(8) | accounts_bincode]
                 if decompressed.len() < 33 {
                     return Err(IntegrationError::StorageError(format!(
                         "State snapshot payload too short at h={}: {} bytes", height, decompressed.len()
                     )));
                 }
-                if decompressed[0] != 0x01 {
-                    return Err(IntegrationError::StorageError(format!(
-                        "State snapshot h={} wrong type: 0x{:02x}", height, decompressed[0]
-                    )));
-                }
-                let state_root: [u8; 32] = decompressed[1..33].try_into()
-                    .map_err(|_| IntegrationError::StorageError("Invalid state_root in payload".to_string()))?;
-                let accounts_data = decompressed[33..].to_vec();
+                let (state_root, accounts_data) = match decompressed[0] {
+                    0x01 => {
+                        let sr: [u8; 32] = decompressed[1..33].try_into()
+                            .map_err(|_| IntegrationError::StorageError("Invalid state_root".to_string()))?;
+                        (sr, decompressed[33..].to_vec())
+                    }
+                    0x02 => {
+                        if decompressed.len() < 49 {
+                            return Err(IntegrationError::StorageError(format!(
+                                "State snapshot v2 h={} too short: {} bytes", height, decompressed.len()
+                            )));
+                        }
+                        let sr: [u8; 32] = decompressed[1..33].try_into()
+                            .map_err(|_| IntegrationError::StorageError("Invalid state_root".to_string()))?;
+                        (sr, decompressed[49..].to_vec())
+                    }
+                    t => {
+                        return Err(IntegrationError::StorageError(format!(
+                            "State snapshot h={} unknown type: 0x{:02x}", height, t
+                        )));
+                    }
+                };
 
                 Ok(Some((state_root, accounts_data)))
             }
