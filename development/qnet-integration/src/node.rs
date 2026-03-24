@@ -12613,7 +12613,8 @@ impl BlockchainNode {
                         // Safe minimum grace = 12s. Vote interval = 2× NTP drift + propagation.
                         const TIMEOUT_GRACE_PERIOD: u64 = 12;  // 12s grace (covers VRF+entropy+NTP)
                         const TIMEOUT_VOTE_INTERVAL: u64 = 6;  // 6s per round (2× NTP drift + WAN margin)
-                        const MAX_TIMEOUT_ROUNDS: u64 = 10;    // Max 10 rounds = 72s max failover
+                        const MAX_TIMEOUT_ROUNDS: u64 = 50;    // v5.3: Raised from 10 to survive multiple dead nodes
+                                                                // With 5 candidates and 6s/round, tries each candidate 10 times
                         
                         // Calculate which timeout_round we SHOULD vote for (local view)
                         let proposed_timeout_round = if local_delay <= TIMEOUT_GRACE_PERIOD {
@@ -17584,18 +17585,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         &slot_input, round_start_height, leadership_round, 0, candidates.len(),
                     )
                 } else {
-                    // v5.2: Deterministic rotation that ALWAYS skips the failed producer
-                    // Old logic: exclude all previous rounds → with N candidates and >N rounds,
-                    // all are excluded → falls back to failed producer → infinite stall.
-                    // New logic: rotate through remaining (N-1) candidates deterministically.
-                    // timeout=1 → next candidate, timeout=2 → next+1, etc.
-                    // The failed producer (round 0) is NEVER selected again.
+                    // v5.3: Direct modular rotation through ALL candidates
+                    // Each timeout_round shifts the index by 1 from the previous.
+                    // With N candidates: timeout 1→N-1 covers all others, then cycles.
+                    // No exclusion sets, no collisions, no stalls.
+                    // Dead node at any position is skipped within 6s (next timeout round).
                     let round0_idx = DilithiumVrf::deterministic_leader(
                         &slot_input, round_start_height, leadership_round, 0, candidates.len(),
                     );
-                    let n = candidates.len();
-                    let offset = ((timeout_round as usize - 1) % (n - 1)) + 1;
-                    (round0_idx + offset) % n
+                    (round0_idx + timeout_round as usize) % candidates.len()
                 };
 
                 let winner = &candidates[selected_idx].0;
