@@ -8572,8 +8572,16 @@ impl BlockchainNode {
                             *height.write().await = received_block.height;
                             if is_debug() { println!("[DBG][BLOCK] height_updated h={}", received_block.height); }
                             
-                            // CRITICAL FIX: Update last block time for stall detection
-                            LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
+                            // v5.4: Use block's ON-CHAIN timestamp for LBPT (not wall-clock).
+                            // Block timestamp is identical on all nodes → identical local_delay →
+                            // identical timeout_round. Using get_timestamp_safe() caused divergence
+                            // because nodes received the same block at different wall-clock times.
+                            // This is the Ethereum/Tendermint standard: stall timer references
+                            // the last block's timestamp, not the local reception time.
+                            let block_ts = storage.load_microblock_auto_format(received_block.height)
+                                .ok().flatten().map(|mb| mb.timestamp)
+                                .unwrap_or_else(get_timestamp_safe);
+                            LAST_BLOCK_PRODUCED_TIME.store(block_ts, Ordering::Relaxed);
                             LAST_BLOCK_PRODUCED_HEIGHT.store(received_block.height, Ordering::Relaxed);
                             
                             // v3.9: Reset timeout_round when new block received
@@ -12613,75 +12621,102 @@ impl BlockchainNode {
                         // Safe minimum grace = 12s. Vote interval = 2× NTP drift + propagation.
                         const TIMEOUT_GRACE_PERIOD: u64 = 12;  // 12s grace (covers VRF+entropy+NTP)
                         const TIMEOUT_VOTE_INTERVAL: u64 = 6;  // 6s per round (2× NTP drift + WAN margin)
-                        const MAX_TIMEOUT_ROUNDS: u64 = 50;    // v5.3: Raised from 10 to survive multiple dead nodes
-                                                                // With 5 candidates and 6s/round, tries each candidate 10 times
-                        
-                        // Calculate raw timeout round from delay (uncapped for rotation)
-                        let raw_timeout_round = if local_delay <= TIMEOUT_GRACE_PERIOD {
+
+                        // v5.4: No cap on timeout rounds. With modular rotation (base + round) % N,
+                        // any round deterministically selects a candidate. The old cap at 50 caused
+                        // permanent stalls: if the producer at round 50 was dead, the network froze
+                        // because rounds couldn't advance past 50. Tendermint has no round cap.
+                        // Old vote entries are cleaned up by DashMap TTL in cleanup_timeout_votes().
+
+                        // Calculate proposed timeout round from delay (uncapped — Tendermint standard)
+                        let proposed_timeout_round = if local_delay <= TIMEOUT_GRACE_PERIOD {
                             0
                         } else {
                             ((local_delay - TIMEOUT_GRACE_PERIOD) / TIMEOUT_VOTE_INTERVAL + 1) as u64
                         };
-                        // Capped version for BFT voting (prevents unbounded vote key space)
-                        let proposed_timeout_round = raw_timeout_round.min(MAX_TIMEOUT_ROUNDS);
-                        
+
                         // v4.2: Timeout votes/certificates keyed by MACROBLOCK INDEX,
                         // not exact microblock height. This ensures nodes at different
                         // microblock heights within the same macroblock can still form
                         // quorum and produce a TimeoutCertificate.
                         let timeout_mb_index = microblock_height / 90;
 
+                        // v5.4: Efficient certificate lookup (replaces bounded loop)
                         let certified_timeout_round = if let Some(p2p) = &unified_p2p {
-                            let mut highest = 0u64;
-                            for round in 1..=MAX_TIMEOUT_ROUNDS {
-                                if p2p.has_timeout_certificate(timeout_mb_index, round) {
-                                    highest = round;
-                                }
-                            }
-                            highest
+                            p2p.get_highest_certified_round(timeout_mb_index)
                         } else {
                             0
                         };
-                        
-                        // v5.3: Separate timeout for rotation (uncapped) vs voting (capped).
-                        // Rotation uses raw round → (base + raw) % N cycles through ALL candidates.
-                        // Voting uses capped proposed_timeout_round for BFT certificate convergence.
-                        let timeout_round_for_rotation = certified_timeout_round.max(raw_timeout_round);
 
-                        // Store rotation round for producer selection (uncapped)
+                        // ═══════════════════════════════════════════════════════════════
+                        // v5.4: TENDERMINT-STYLE ROUND ADOPTION (f+1 threshold)
+                        //
+                        // Problem: Each node computes proposed_timeout_round from local
+                        // delay. Even small LBPT differences → different rounds →
+                        // different producers → no consensus → permanent stall.
+                        //
+                        // Solution (Tendermint round-skip): When f+1 validators have
+                        // voted for round R, ALL nodes adopt R for producer selection.
+                        // f+1 guarantees at least one honest node is at that round.
+                        //
+                        // Priority: certified (2/3+ BFT) > adopted (f+1) > proposed (local)
+                        // When agreement exists, local proposed is IGNORED for rotation.
+                        // Nodes continue VOTING at proposed to build vote history.
+                        // ═══════════════════════════════════════════════════════════════
+                        let (adopted_timeout_round, f_plus_1) = if let Some(p2p) = &unified_p2p {
+                            let total_validators = p2p.get_active_validator_count();
+                            let f1 = (total_validators + 2) / 3; // ceil(n/3) = f+1
+                            let adopted = p2p.get_highest_adopted_round(timeout_mb_index, f1);
+                            (adopted, f1)
+                        } else {
+                            (0, 2)
+                        };
+
+                        // Rotation round: use consensus-agreed round when available,
+                        // fall back to local proposed only when no agreement exists.
+                        let timeout_round_for_rotation = if certified_timeout_round > 0 || adopted_timeout_round > 0 {
+                            // Agreement exists — use highest agreed round (ignore local divergence)
+                            certified_timeout_round.max(adopted_timeout_round)
+                        } else {
+                            // No agreement yet — bootstrap with local proposed
+                            proposed_timeout_round
+                        };
+
+                        // Store rotation round for producer selection
                         set_timeout_round(timeout_round_for_rotation, next_height);
                         update_failover_metrics(local_delay, timeout_round_for_rotation);
-                        
+
                         // v4.0: If we detect stall, vote for timeout (Byzantine consensus)
                         if proposed_timeout_round > 0 && microblock_height > 0 {
                             if is_info() {
-                                println!("[INFO][TIMEOUT] stall_detected h={} mb={} local_delay={}s proposed_round={} certified_round={}", 
-                                         next_height, timeout_mb_index, local_delay, proposed_timeout_round, certified_timeout_round);
+                                println!("[INFO][TIMEOUT] stall h={} mb={} delay={}s proposed={} adopted={} certified={} rotation={} f1={}",
+                                         next_height, timeout_mb_index, local_delay, proposed_timeout_round,
+                                         adopted_timeout_round, certified_timeout_round, timeout_round_for_rotation, f_plus_1);
                             }
-                            
+
                             // STATE MACHINE: Network stall detected
                             set_node_state(NodeState::Error {
-                                reason: format!("Stall: delay={}s, voting_round={}", local_delay, proposed_timeout_round),
+                                reason: format!("Stall: delay={}s, voting_round={}", local_delay, timeout_round_for_rotation),
                                 recoverable: true,
                             });
                             
-                            // Broadcast timeout vote if we have higher round than certified
+                            // Broadcast timeout vote at proposed round (always, to build vote history)
                             if proposed_timeout_round > certified_timeout_round {
                                 if let Some(p2p) = &unified_p2p {
                                     // Get last block hash for vote (use macroblock hash as anchor)
                                     let last_block_hash = storage.get_latest_macroblock_hash()
                                         .unwrap_or([0u8; 32]);
-                                    
+
                                     // v4.2: vote_msg uses macroblock index for consistency
-                                    let vote_msg = format!("TIMEOUT:{}:{}:{}", 
+                                    let vote_msg = format!("TIMEOUT:{}:{}:{}",
                                         timeout_mb_index, proposed_timeout_round, hex::encode(&last_block_hash));
-                                    
+
                                     // Sign with quantum crypto (Dilithium)
                                     if let Some(crypto) = try_get_quantum_crypto() {
                                         match crypto.create_consensus_signature(&node_id, &vote_msg).await {
                                             Ok(sig) => {
                                                 p2p.broadcast_timeout_vote(
-                                                    timeout_mb_index, 
+                                                    timeout_mb_index,
                                                     proposed_timeout_round,
                                                     last_block_hash,
                                                     sig.signature.as_bytes().to_vec()
@@ -12696,18 +12731,19 @@ impl BlockchainNode {
                                     }
                                 }
                             }
-                            
-                            // Select producer based on CERTIFIED timeout_round (deterministic!)
-                            if certified_timeout_round > 0 {
+
+                            // v5.4: Select producer based on CONVERGED timeout_round
+                            // Priority: certified > adopted > proposed (same as rotation round)
+                            if timeout_round_for_rotation > 0 {
                                 if let Some(_p2p) = &unified_p2p {
                                     let current_producer = Self::select_microblock_producer_with_round(
                                         next_height, &unified_p2p, &node_id, node_type,
-                                        Some(&storage), &quantum_poh, certified_timeout_round
+                                        Some(&storage), &quantum_poh, timeout_round_for_rotation
                                     ).await;
-                                    
+
                                     if is_info() {
-                                        println!("[INFO][FAILOVER] h={} certified_round={} producer={}", 
-                                                 next_height, certified_timeout_round, current_producer);
+                                        println!("[INFO][FAILOVER] h={} rotation_round={} producer={}",
+                                                 next_height, timeout_round_for_rotation, current_producer);
                                     }
                                 }
                             }

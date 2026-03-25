@@ -20893,6 +20893,34 @@ impl SimplifiedP2P {
     pub fn has_timeout_certificate(&self, height: u64, timeout_round: u64) -> bool {
         TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round))
     }
+
+    /// v5.4: Get highest certified timeout round (BFT 2/3+ proof) for a given height.
+    /// Replaces bounded loop `for round in 1..=MAX` with efficient DashMap scan.
+    pub fn get_highest_certified_round(&self, height: u64) -> u64 {
+        let mut highest = 0u64;
+        for entry in TIMEOUT_CERTIFICATES.iter() {
+            let &(h, round) = entry.key();
+            if h == height && round > highest {
+                highest = round;
+            }
+        }
+        highest
+    }
+
+    /// v5.4: Tendermint-style round adoption via f+1 (minority quorum) votes.
+    /// Returns the highest timeout round for which >= `threshold` validators have voted.
+    /// This enables round convergence: when f+1 nodes reach round R, all nodes adopt R.
+    /// In Tendermint, f+1 ROUND_CHANGE messages trigger round skip — this is the equivalent.
+    pub fn get_highest_adopted_round(&self, height: u64, threshold: usize) -> u64 {
+        let mut highest = 0u64;
+        for entry in TIMEOUT_VOTES.iter() {
+            let &(h, round) = entry.key();
+            if h == height && round > highest && entry.value().len() >= threshold {
+                highest = round;
+            }
+        }
+        highest
+    }
     
     /// Handle incoming timeout proof broadcast
     /// SECURITY: Verifies all signatures before accepting
