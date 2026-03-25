@@ -17231,6 +17231,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
             
             // Check if we have cached result for this round
+            // v5.3: Disable cache when timeout_round > 0 — timeout rotation changes producer
+            // The cache stores round0 producer which is wrong for failover rotation
+            if timeout_round > 0 {
+                can_use_cache = false;
+            }
             // v2.96: Lock-free cache lookup with DashMap
             if can_use_cache {
                 if let Some(entry) = CACHED_PRODUCER_SELECTION.get(&leadership_round) {
