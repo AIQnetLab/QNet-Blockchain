@@ -13,14 +13,7 @@ use std::sync::RwLock as StdRwLock;  // For performance_stats (non-async)
 use blake3;
 use dashmap::DashMap;
 
-/// Safe string preview utility to prevent index out of bounds errors
-fn safe_preview(s: &str, len: usize) -> &str {
-    if s.len() >= len {
-        &s[..len]
-    } else {
-        s
-    }
-}
+
 
 /// Constant-time byte-slice equality to prevent timing side-channel attacks
 #[inline(never)]
@@ -333,7 +326,7 @@ impl QNetQuantumCrypto {
         
         if crate::node::is_debug() {
             println!("[DEBUG][QUANTUM_CRYPTO] xor_key_derived burn_tx={}... node_type={} burn_amount={}",
-                     safe_preview(&burn_tx, 8), node_type, burn_amount);
+                     &burn_tx, node_type, burn_amount);
         }
 
         // 7. XOR decrypt wallet PREFIX (only first 5 bytes are in the code)
@@ -359,7 +352,7 @@ impl QNetQuantumCrypto {
                 
                 if stored_prefix != decrypted_wallet_prefix {
                     eprintln!("[WARN][QUANTUM_CRYPTO] wallet_prefix_mismatch decrypted={}... stored={}... using_stored=true",
-                              safe_preview(&decrypted_wallet_prefix, 8), safe_preview(stored_prefix, 8));
+                              &decrypted_wallet_prefix, stored_prefix);
                     // Continue with stored wallet — it's authoritative
                 }
                 
@@ -396,8 +389,8 @@ impl QNetQuantumCrypto {
 
         if crate::node::is_debug() {
             println!("[DEBUG][QUANTUM_CRYPTO] activation_decoded wallet={}... node_type={} burn_tx={}... elapsed_ms={}",
-                     safe_preview(&payload.wallet, 8), payload.node_type,
-                     safe_preview(&payload.burn_tx, 8), decrypt_time_ms);
+                     &payload.wallet, payload.node_type,
+                     &payload.burn_tx, decrypt_time_ms);
         }
 
         Ok(payload)
@@ -1033,7 +1026,7 @@ impl QNetQuantumCrypto {
     /// Check if activation code has already been used in QNet blockchain
     pub async fn check_blockchain_usage(&self, activation_code: &str) -> Result<bool> {
         println!("[INFO][QUANTUM_CRYPTO] activation_code_usage_check");
-        println!("[DEBUG][QUANTUM_CRYPTO] code={}...", safe_preview(activation_code, 8));
+        println!("[DEBUG][QUANTUM_CRYPTO] code={}...", activation_code);
         
         // Use existing activation validation infrastructure
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(
@@ -1076,8 +1069,8 @@ impl QNetQuantumCrypto {
         // Skip duplicate activation TX for genesis bootstrap codes
         if activation_code.starts_with("QNET-BOOT-") {
             println!("[INFO][QUANTUM_CRYPTO] genesis_node_skip_duplicate_activation_tx");
-            println!("[DEBUG][QUANTUM_CRYPTO] node={}...", safe_preview(node_pubkey, 8));
-            println!("[DEBUG][QUANTUM_CRYPTO] wallet={}...", safe_preview(&payload.wallet, 8));
+            println!("[DEBUG][QUANTUM_CRYPTO] node={}...", node_pubkey);
+            println!("[DEBUG][QUANTUM_CRYPTO] wallet={}...", &payload.wallet);
             println!("[DEBUG][QUANTUM_CRYPTO] node_type={}", payload.node_type);
             return Ok(());
         }
@@ -1142,8 +1135,8 @@ impl QNetQuantumCrypto {
             .map_err(|e| anyhow!("Failed to register activation: {}", e))?;
         
         println!("[INFO][QUANTUM_CRYPTO] activation_recorded_on_chain");
-        println!("[DEBUG][QUANTUM_CRYPTO] node={}...", safe_preview(node_pubkey, 8));
-        println!("[DEBUG][QUANTUM_CRYPTO] wallet={}...", safe_preview(&payload.wallet, 8));
+        println!("[DEBUG][QUANTUM_CRYPTO] node={}...", node_pubkey);
+        println!("[DEBUG][QUANTUM_CRYPTO] wallet={}...", &payload.wallet);
         println!("[DEBUG][QUANTUM_CRYPTO] node_type={}", payload.node_type);
         
         Ok(())
@@ -1237,7 +1230,7 @@ impl QNetQuantumCrypto {
             .unwrap_or(0);
 
         if !env_burn_tx.is_empty() && env_burn_amount > 0 {
-            println!("[INFO][QUANTUM_CRYPTO] xor_key_from_env tx={}... amount={}", safe_preview(&env_burn_tx, 8), env_burn_amount);
+            println!("[INFO][QUANTUM_CRYPTO] xor_key_from_env tx={}... amount={}", &env_burn_tx, env_burn_amount);
             return Ok((env_burn_tx, env_burn_amount));
         }
 
@@ -1249,7 +1242,7 @@ impl QNetQuantumCrypto {
         match registry.get_activation_record_by_hash(&code_hash).await {
             Ok(Some(record)) if !record.tx_hash.is_empty() => {
                 println!("[INFO][QUANTUM_CRYPTO] xor_key_from_registry tx={}... amount={}",
-                    safe_preview(&record.tx_hash, 8), record.activation_amount);
+                    &record.tx_hash, record.activation_amount);
                 return Ok((record.tx_hash, record.activation_amount));
             }
             Ok(_) => {}

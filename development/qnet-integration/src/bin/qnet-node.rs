@@ -2712,7 +2712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quantum_crypto.record_activation_in_blockchain(&activation_code, &payload, &node_pubkey).await?;
         
         println!("✅ Quantum activation recorded in QNet blockchain successfully");
-        println!("   📝 Node: {}...", &node_pubkey[..12]);
+        println!("   📝 Node: {}", node_pubkey);
         println!("   🔐 Quantum-secure: CRYSTALS-Dilithium3 (NIST FIPS 204)");
         println!("   🚫 Database: Not used - blockchain is source of truth");
 
@@ -3605,11 +3605,11 @@ async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
     let burn_verified = verify_solana_burn_transaction(&wallet_address, required_burn).await?;
     
     if !burn_verified {
-        let wallet_preview = if wallet_address.len() >= 8 { &wallet_address[..8] } else { &wallet_address };
+        let wallet_preview = wallet_address.as_str();
         return Err(format!("1DEV burn verification failed: Required {} 1DEV not found for wallet {}", required_burn, wallet_preview));
     }
     
-    let wallet_preview = if wallet_address.len() >= 8 { &wallet_address[..8] } else { &wallet_address };
+    let wallet_preview = wallet_address.as_str();
     println!("✅ 1DEV burn verified: {} 1DEV burned by wallet {}", required_burn, wallet_preview);
     Ok(())
 }
@@ -3668,7 +3668,7 @@ async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: f
                             let burned = info["amount"].as_str()
                                 .and_then(|a| a.parse::<u64>().ok())
                                 .unwrap_or(0);
-                            println!("✅ Found valid SPL Token burn: {} (burned {} 1DEV)", &signature[..16], burned / 1_000_000);
+                            println!("✅ Found valid SPL Token burn: {} (burned {} 1DEV)", &signature, burned / 1_000_000);
                             return Ok(true);
                         }
                     }
@@ -3690,7 +3690,7 @@ async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: f
                             .unwrap_or(0);
                         if pre_amount > post_amount && (pre_amount - post_amount) >= required_amount_decimals {
                             println!("✅ Found valid burn via balance diff: {} (burned {} 1DEV)",
-                                &signature[..16], (pre_amount - post_amount) / 1_000_000);
+                                &signature, (pre_amount - post_amount) / 1_000_000);
                             return Ok(true);
                         }
                     }
@@ -3861,7 +3861,7 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
                                                                         .unwrap_or(0);
 
                                                                     println!("✅ VERIFIED: Valid burn transaction found (transfer to incinerator)!");
-                                                                    println!("   TX: {}", &signature[..16]);
+                                                                    println!("   TX: {}", &signature);
                                                                     println!("   Burned: {} 1DEV (required: {})", burned_amount / 1_000_000, required_amount);
                                                                     println!("   Token: {} (1DEV mint)", onedev_mint);
                                                                     println!("   Destination: {} (official incinerator)", burn_address);
@@ -3889,7 +3889,7 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
                                                                     let authority = info.get("authority").and_then(|a| a.as_str()).unwrap_or("unknown");
 
                                                                     println!("✅ VERIFIED: Valid burn transaction found (SPL Token burn)!");
-                                                                    println!("   TX: {}", &signature[..16]);
+                                                                    println!("   TX: {}", &signature);
                                                                     println!("   Burned: {} 1DEV (required: {})", burned_amount / 1_000_000, required_amount);
                                                                     println!("   Token: {} (1DEV mint)", onedev_mint);
                                                                     println!("   Authority (burner): {}", authority);
@@ -4124,7 +4124,7 @@ async fn start_reward_claiming_service(wallet_key: String, node_type: String) {
         loop {
             interval.tick().await;
             
-            let wallet_preview = if wallet_key.len() >= 8 { &wallet_key[..8] } else { &wallet_key };
+            let wallet_preview = wallet_key.as_str();
         println!("💰 Claiming rewards for wallet: {}...", wallet_preview);
             
             // In production: Claim rewards from blockchain

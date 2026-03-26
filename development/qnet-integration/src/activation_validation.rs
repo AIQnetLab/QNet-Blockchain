@@ -8,14 +8,7 @@ use crate::errors::IntegrationError;
 use hex;
 use serde_json;
 
-/// Safe string preview utility to prevent index out of bounds errors
-fn safe_preview(s: &str, len: usize) -> &str {
-    if s.len() >= len {
-        &s[..len]
-    } else {
-        s
-    }
-}
+
 
 // REMOVED: BlockchainMigrationRecord - migration is just normal node activation!
 
@@ -586,7 +579,7 @@ impl BlockchainActivationRegistry {
             Ok(payload) => Ok(payload.wallet),
             Err(e) => {
                 println!("❌ CRITICAL: Quantum decryption failed - NO FALLBACK for security: {}", e);
-                println!("   Code: {}...", safe_preview(code, 8));
+                println!("   Code: {}...", code);
                 println!("   This means the activation code is invalid, corrupted, or system crypto is broken");
                 Err(IntegrationError::CryptoError(format!("Quantum decryption failed - security requires real wallet extraction: {}", e)))
             }
@@ -693,7 +686,7 @@ impl BlockchainActivationRegistry {
         match self.query_activation_state(code_hash).await {
             Ok(exists) => {
                 println!("✅ Blockchain hash query: hash {} exists: {}", 
-                    &code_hash[..8], exists);
+                    code_hash, exists);
                 Ok(exists) // Return true if hash exists in blockchain
             }
             Err(query_error) => {
@@ -737,7 +730,7 @@ impl BlockchainActivationRegistry {
         let hash_bytes = hex::decode(code_hash).map_err(|e| format!("Invalid hash: {}", e))?;
         let exists = (hash_bytes[0] % 10) == 0; // 10% chance code already exists
         
-        println!("🔗 Blockchain state query: activation {} exists: {}", &code_hash[..8], exists);
+        println!("🔗 Blockchain state query: activation {} exists: {}", code_hash, exists);
         Ok(exists)
     }
     
@@ -846,7 +839,7 @@ impl BlockchainActivationRegistry {
 
     /// Simplified device migration for Light nodes, rate-limited for Full/Super nodes
     pub async fn migrate_device_on_blockchain(&self, code: &str, wallet_address: &str, new_device_signature: &str) -> Result<(), IntegrationError> {
-        println!("🔄 Processing device migration for activation code: {}", safe_preview(code, 8));
+        println!("🔄 Processing device migration for activation code: {}", code);
         
         // Determine node type from activation code
         let node_type = self.determine_node_type_from_code(code).await?;
@@ -1046,7 +1039,7 @@ impl BlockchainActivationRegistry {
         let hash_bytes = hex::decode(code_hash).map_err(|e| format!("Invalid hash: {}", e))?;
         let migration_count = (hash_bytes[0] % 2) as u32; // 0-1 migrations through consensus
         
-        println!("🔗 Consensus engine query: {} migrations for hash {}", migration_count, &code_hash[..8]);
+        println!("🔗 Consensus engine query: {} migrations for hash {}", migration_count, code_hash);
         Ok(migration_count)
     }
     
@@ -1142,7 +1135,7 @@ impl BlockchainActivationRegistry {
                 
                 if self.is_genesis_bootstrap_mode() {
                     println!("🚀 Genesis mode: Creating genesis migration record");
-                    let genesis_hash = format!("genesis_migration_{}", &record.code_hash[..8]);
+                    let genesis_hash = format!("genesis_migration_{}", record.code_hash);
                     Ok(genesis_hash)
                 } else {
                     return Err(IntegrationError::BlockchainError(
@@ -1257,9 +1250,9 @@ impl BlockchainActivationRegistry {
         match self.submit_migration_to_blockchain(migration_record).await {
             Ok(tx_hash) => {
                 println!("✅ Server migration recorded in blockchain");
-                        println!("   Transaction: {}...", safe_preview(&tx_hash, 8));
-        println!("   From: {}...", safe_preview(&migration.from_device, 8));
-        println!("   To: {}...", safe_preview(&migration.to_device, 8));
+                        println!("   Transaction: {}...", &tx_hash);
+        println!("   From: {}...", &migration.from_device);
+        println!("   To: {}...", &migration.to_device);
                 println!("   Timestamp: {}", migration.migration_timestamp);
                 Ok(())
             }
@@ -2061,8 +2054,8 @@ impl BlockchainActivationRegistry {
                 // Code already exists - this is device migration
                 if current_device != new_device_signature {
                     println!("🔄 Device migration detected:");
-                    println!("   Old device: {}...", safe_preview(&current_device, 8));
-                    println!("   New device: {}...", safe_preview(new_device_signature, 8));
+                    println!("   Old device: {}...", &current_device);
+                    println!("   New device: {}...", new_device_signature);
                     
                     // Update device signature in global registry
                     self.update_device_signature(code, new_device_signature).await?;
@@ -2163,8 +2156,8 @@ impl BlockchainActivationRegistry {
         // PRODUCTION: Broadcast via P2P network to inform old device to shut down
         // For now: simulate broadcast
         println!("📡 Broadcasting deactivation signal:");
-        println!("   Code: {}...", safe_preview(code, 8));
-        println!("   Old device: {}...", safe_preview(old_device, 8));
+        println!("   Code: {}...", code);
+        println!("   Old device: {}...", old_device);
         println!("   Message: 'Your activation has been migrated to new device - please shut down'");
         
         Ok(())
@@ -2174,7 +2167,7 @@ impl BlockchainActivationRegistry {
     /// Authenticity is proven by: (1) successful XOR decryption recovering a valid wallet,
     /// (2) transaction funding verification, (3) code derivation from wallet's burn tx.
     async fn verify_wallet_ownership(&self, wallet_address: &str, activation_code: &str) -> Result<bool, IntegrationError> {
-        println!("[INFO][ACTIVATION] verify_wallet_ownership wallet={}", safe_preview(wallet_address, 8));
+        println!("[INFO][ACTIVATION] verify_wallet_ownership wallet={}", wallet_address);
 
         // 1. Verify wallet funded the transaction (Phase 1: Solana burn, Phase 2: QNet transfer)
         let phase = {
@@ -2196,18 +2189,18 @@ impl BlockchainActivationRegistry {
         };
 
         if let Err(e) = self.verify_transaction_funding(wallet_address, activation_code, phase).await {
-            eprintln!("[ERR][ACTIVATION] tx_funding_failed wallet={} err={}", safe_preview(wallet_address, 8), e);
+            eprintln!("[ERR][ACTIVATION] tx_funding_failed wallet={} err={}", wallet_address, e);
             return Ok(false);
         }
 
         // 2. Check activation code was derived from wallet's burn transaction
         if let Err(e) = self.verify_code_derivation_from_wallet(wallet_address, activation_code).await {
-            eprintln!("[ERR][ACTIVATION] code_derivation_failed wallet={} err={}", safe_preview(wallet_address, 8), e);
+            eprintln!("[ERR][ACTIVATION] code_derivation_failed wallet={} err={}", wallet_address, e);
             return Ok(false);
         }
 
         println!("[INFO][ACTIVATION] wallet_ownership_verified wallet={} code={}", 
-                safe_preview(wallet_address, 8), safe_preview(activation_code, 8));
+                wallet_address, activation_code);
 
         Ok(true)
     }
@@ -2247,7 +2240,7 @@ impl BlockchainActivationRegistry {
         // Phase 2: Verify QNC transfer to Pool 3 on QNet blockchain
         if phase == 2 {
             println!("[VERIFY] Phase 2: Verifying QNC transfer to Pool 3 on QNet blockchain");
-            println!("[VERIFY] Transaction hash: {}...", safe_preview(&tx_hash, 8));
+            println!("[VERIFY] Transaction hash: {}...", &tx_hash);
             
             // PRODUCTION: Query QNet blockchain to verify Pool 3 transfer
             // This would check that wallet_address sent QNC to qnet_pool3_contract
@@ -2268,7 +2261,7 @@ impl BlockchainActivationRegistry {
             .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
         
         println!("[VERIFY] Querying Solana RPC: {}", solana_rpc_url);
-        println!("[VERIFY] Transaction hash: {}...", safe_preview(&tx_hash, 8));
+        println!("[VERIFY] Transaction hash: {}...", &tx_hash);
         
         // Create HTTP client (reqwest uses rustls, no OpenSSL needed)
         let client = reqwest::Client::new();
@@ -2394,14 +2387,14 @@ impl BlockchainActivationRegistry {
             
             if !wallet_address.contains(signer_prefix) && !signer_address.contains(wallet_prefix) {
                 println!("[VERIFY] Warning: Wallet address mismatch");
-                println!("[VERIFY]   Expected: {}...", safe_preview(wallet_address, 8));
-                println!("[VERIFY]   Found:    {}...", safe_preview(signer_address, 8));
+                println!("[VERIFY]   Expected: {}", wallet_address);
+                println!("[VERIFY]   Found:    {}", signer_address);
                 // Allow for now, strict matching can be enabled later
             }
             
             println!("[VERIFY] ✅ Solana burn verification successful");
             println!("[VERIFY]   Burned: {} lamports ({} DEV)", burned_amount, burned_amount / 1_000_000_000);
-            println!("[VERIFY]   Signer: {}...", safe_preview(signer_address, 8));
+            println!("[VERIFY]   Signer: {}...", signer_address);
         } else {
             println!("[VERIFY] ⚠️ Could not extract signer address, but burn amount verified");
             println!("[VERIFY] ✅ Solana burn verification successful");
@@ -2439,7 +2432,7 @@ impl BlockchainActivationRegistry {
         if payload.wallet != wallet_address {
             return Err(IntegrationError::SecurityError(
                 format!("Wallet mismatch: code contains {}, claimed {}",
-                       safe_preview(&payload.wallet, 8), safe_preview(wallet_address, 8))
+                       &payload.wallet, wallet_address)
             ));
         }
         
@@ -2526,7 +2519,7 @@ impl BlockchainActivationRegistry {
     /// Check and replace existing active node of same type
     async fn check_and_replace_existing_node(&self, new_node_info: &NodeInfo) -> Result<(), IntegrationError> {
         println!("🔄 Checking for existing {} node on wallet {}...", 
-                 new_node_info.node_type, &new_node_info.wallet_address[..8]);
+                 new_node_info.node_type, new_node_info.wallet_address);
         
         // Look for existing active node of same wallet+type
         let active_nodes = self.active_nodes.read().await;
@@ -2536,7 +2529,7 @@ impl BlockchainActivationRegistry {
                 && existing_node.node_type == new_node_info.node_type {
                 
                 println!("🔄 Found existing {} node: {}", 
-                         existing_node.node_type, &device_sig[..8]);
+                         existing_node.node_type, device_sig);
                 
                 // Send shutdown signal to existing node
                 if let Err(e) = self.send_node_shutdown_signal(existing_node).await {
@@ -2554,7 +2547,7 @@ impl BlockchainActivationRegistry {
     
     /// Send shutdown signal to existing node via HTTP API
     async fn send_node_shutdown_signal(&self, existing_node: &NodeInfo) -> Result<(), IntegrationError> {
-        println!("📡 Sending shutdown signal to existing node: {}", &existing_node.device_signature[..8]);
+        println!("📡 Sending shutdown signal to existing node: {}", existing_node.device_signature);
         
         // Try to extract IP:port from device_signature
         // In QNet, device_signature often contains node connection info
@@ -2675,8 +2668,8 @@ impl BlockchainActivationRegistry {
         // This is much more scalable than HTTP requests to millions of nodes
         
         // For now: Log the blockchain broadcast
-        println!("✅ Blockchain replacement broadcast prepared for node: {}", 
-                 &existing_node.device_signature[..8]);
+        println!("✅ Blockchain replacement broadcast prepared for node: {}",
+                 existing_node.device_signature);
         
         Ok(())
     }
@@ -2688,8 +2681,8 @@ impl BlockchainActivationRegistry {
         // PRODUCTION: Update blockchain state to mark node as inactive
         // This is the authoritative source of truth for node status
         
-        println!("✅ Node marked as replaced in blockchain: {}", 
-                 &existing_node.device_signature[..8]);
+        println!("✅ Node marked as replaced in blockchain: {}",
+                 existing_node.device_signature);
         
         Ok(())
     }
@@ -2698,7 +2691,7 @@ impl BlockchainActivationRegistry {
     /// Returns existing node info if found, regardless of node type
     pub async fn check_wallet_has_any_node(&self, wallet_address: &str) -> Result<Option<(String, String)>, IntegrationError> {
         println!("🔍 [SECURITY] Checking if wallet {} already has a node (1 wallet = 1 node rule)", 
-                 safe_preview(wallet_address, 8));
+                 wallet_address);
         
         // Search in local activation records (any node type)
         {
@@ -2706,7 +2699,7 @@ impl BlockchainActivationRegistry {
             for (code_hash, record) in activation_records.iter() {
                 if record.wallet_address == wallet_address {
                     println!("🚫 [SECURITY] Wallet already has {} node: {}", 
-                             record.node_type, safe_preview(code_hash, 8));
+                             record.node_type, code_hash);
                     return Ok(Some((record.node_type.clone(), format!("HASH:{}", code_hash))));
                 }
             }
@@ -2724,7 +2717,7 @@ impl BlockchainActivationRegistry {
         }
         
         println!("✅ [SECURITY] Wallet {} has no existing nodes - eligible for activation", 
-                 safe_preview(wallet_address, 8));
+                 wallet_address);
         Ok(None)
     }
     
@@ -2737,7 +2730,7 @@ impl BlockchainActivationRegistry {
         node_type: &str
     ) -> Result<Option<String>, IntegrationError> {
         println!("🔍 Querying activation by wallet: {} phase: {} type: {}", 
-                 safe_preview(wallet_address, 8), phase, node_type);
+                 wallet_address, phase, node_type);
         
         // Search in local activation records first (now using hash keys)
         {
@@ -2746,7 +2739,7 @@ impl BlockchainActivationRegistry {
                 if record.wallet_address == wallet_address 
                     && record.phase == phase 
                     && record.node_type.to_lowercase() == node_type.to_lowercase() {
-                    println!("✅ Found existing activation hash in local records: {}", safe_preview(code_hash, 8));
+                    println!("✅ Found existing activation hash in local records: {}", code_hash);
                     // Note: We can't return the original code since we only store hashes
                     // In production, the code should be provided by the user for verification
                     return Ok(Some(format!("HASH_FOUND:{}", code_hash)));
@@ -2760,7 +2753,7 @@ impl BlockchainActivationRegistry {
             for (_device_sig, node_info) in active_nodes.iter() {
                 if node_info.wallet_address == wallet_address 
                     && node_info.node_type.to_lowercase() == node_type.to_lowercase() {
-                    println!("✅ Found existing activation in active nodes: {}", safe_preview(&node_info.activation_code, 8));
+                    println!("✅ Found existing activation in active nodes: {}", &node_info.activation_code);
                     return Ok(Some(node_info.activation_code.clone()));
                 }
             }
@@ -2769,12 +2762,12 @@ impl BlockchainActivationRegistry {
         // Try to query blockchain through consensus
         match self.query_blockchain_for_wallet_activation(wallet_address, phase, node_type).await {
             Ok(Some(code)) => {
-                println!("✅ Found existing activation on blockchain: {}", safe_preview(&code, 8));
+                println!("✅ Found existing activation on blockchain: {}", &code);
                 Ok(Some(code))
             }
             Ok(None) => {
                 println!("⚠️  No existing activation found for wallet {} phase {} type {}", 
-                         safe_preview(wallet_address, 8), phase, node_type);
+                         wallet_address, phase, node_type);
                 Ok(None)
             }
             Err(e) => {
@@ -2791,12 +2784,12 @@ impl BlockchainActivationRegistry {
         let activation_records = self.activation_records.read().await;
         
         if let Some(record) = activation_records.get(code_hash) {
-            println!("✅ Found activation record for hash: {}...", safe_preview(code_hash, 8));
+            println!("✅ Found activation record for hash: {}...", code_hash);
             return Ok(Some(record.clone()));
         }
         
         // Not found locally - could query blockchain in production
-        println!("⚠️ No activation record found for hash: {}...", safe_preview(code_hash, 8));
+        println!("⚠️ No activation record found for hash: {}...", code_hash);
         Ok(None)
     }
     
@@ -2810,7 +2803,7 @@ impl BlockchainActivationRegistry {
         // In production, this would query the actual blockchain
         // For now, return None to indicate no existing activation found
         println!("🔍 Querying blockchain for wallet {} phase {} type {}", 
-                 safe_preview(wallet_address, 8), phase, node_type);
+                 wallet_address, phase, node_type);
         
         // Production blockchain query would happen here
         // For now: No existing activations found (new system)

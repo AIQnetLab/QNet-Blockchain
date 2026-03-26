@@ -184,7 +184,7 @@ impl ContractVM {
             registry.insert(contract_address.clone(), token.clone());
         }
         
-        println!("[VM] 🪙 QRC-20 Token deployed: {} ({}) at {}", name, symbol, &contract_address[..16]);
+        println!("[VM] 🪙 QRC-20 Token deployed: {} ({}) at {}", name, symbol, contract_address);
         
         Ok(token)
     }

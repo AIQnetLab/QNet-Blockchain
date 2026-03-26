@@ -13289,7 +13289,7 @@ async fn generate_quantum_activation_code(
     }
     
     println!("✅ Quantum activation code generated with XOR-encrypted wallet");
-    println!("   Code: {}...", &activation_code[..12]);
+    println!("   Code: {}", activation_code);
     println!("   Encryption key derived from burn_tx:type:amount");
     
     Ok(activation_code)
