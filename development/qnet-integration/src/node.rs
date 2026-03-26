@@ -4801,6 +4801,41 @@ impl BlockchainNode {
                         println!("[WARN][NODE] chain_height_verify_failed error={}", e);
                     }
                 }
+
+                // v5.5: SECONDARY RECOVERY — DB integrity cross-check.
+                // If chain_height is still 0 after verify_and_repair, scan DB for any stored
+                // blocks. This catches cases where metadata CF lost chain_height but blocks
+                // CF has data (OOM kill, power loss during RocksDB flush).
+                {
+                    let current_ch = storage_arc.get_chain_height().unwrap_or(0);
+                    if current_ch == 0 {
+                        // Check if blocks exist despite chain_height=0
+                        if let Ok(Some(_)) = storage_arc.load_microblock(0) {
+                            // Genesis exists — scan forward to find actual height
+                            if is_info() { println!("[INFO][NODE] chain_height_zero_but_genesis_exists scanning"); }
+                            let mut scan_h = 0u64;
+                            let mut last_found = 0u64;
+                            let mut gap = 0u64;
+                            loop {
+                                scan_h += 1;
+                                if storage_arc.load_microblock(scan_h).unwrap_or(None).is_some() {
+                                    last_found = scan_h;
+                                    gap = 0;
+                                } else {
+                                    gap += 1;
+                                    if gap > 10 { break; } // Same gap tolerance as verify_and_repair
+                                }
+                                if scan_h > 200_000 { break; } // Safety limit
+                            }
+                            if last_found > 0 {
+                                println!("[INFO][NODE] chain_height_recovered from_scan h={}", last_found);
+                                let _ = storage_arc.set_chain_height(last_found);
+                            }
+                        } else if is_info() {
+                            println!("[INFO][NODE] chain_height_zero no_genesis fresh_node");
+                        }
+                    }
+                }
                 
                 // POH STATE MIGRATION (v2.19.13): Migrate existing blocks to have separate PoH state
                 // This enables O(1) PoH validation without loading full blocks
@@ -6700,7 +6735,8 @@ impl BlockchainNode {
                             // - SNAPSHOT_INCREMENTAL_INTERVAL = 3600 (1 hour)
                             // - SNAPSHOT_FULL_INTERVAL = 43200 (12 hours)
                             // Only try snapshot if network has at least one incremental snapshot
-                            let mut sync_from = local_height + 1;
+                            // v5.5: Start from 0 if chain is empty — genesis block must be synced first
+                            let mut sync_from = if local_height == 0 { 0 } else { local_height + 1 };
                             
                             // Skip snapshot for Light nodes - they sync only recent blocks
                             let is_light_node = blockchain_for_sync.node_type == NodeType::Light;
@@ -6750,6 +6786,22 @@ impl BlockchainNode {
                                 println!("[INFO][SYNC] light_node skip_snapshot sync_recent_only");
                             }
                             
+                            // v5.5: ALWAYS include genesis block (h=0) in sync.
+                            // Without genesis, block 1 fails MISSING_PREVIOUS:0 → sync deadlock.
+                            // Every L1 ensures genesis exists before syncing the chain.
+                            if sync_from > 0 {
+                                let has_genesis = blockchain_for_sync.storage
+                                    .load_microblock(0).unwrap_or(None).is_some();
+                                if !has_genesis {
+                                    if is_info() { println!("[INFO][SYNC] genesis_missing requesting_block_0"); }
+                                    if let Err(e) = p2p.sync_blocks(0, 0).await {
+                                        if is_warn() { println!("[WARN][SYNC] genesis_request_fail err={}", e); }
+                                    }
+                                    // Brief wait for genesis to be processed
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                }
+                            }
+
                             // Sync remaining blocks in chunks
                             let mut current = sync_from;
                             while current <= network_height {
@@ -8576,8 +8628,8 @@ impl BlockchainNode {
                             // Block timestamp is identical on all nodes → identical local_delay →
                             // identical timeout_round. Using get_timestamp_safe() caused divergence
                             // because nodes received the same block at different wall-clock times.
-                            // This is the Ethereum/Tendermint standard: stall timer references
-                            // the last block's timestamp, not the local reception time.
+                            // Stall timer must reference the block's on-chain timestamp,
+                            // not the local reception time.
                             let block_ts = storage.load_microblock_auto_format(received_block.height)
                                 .ok().flatten().map(|mb| mb.timestamp)
                                 .unwrap_or_else(get_timestamp_safe);
@@ -9237,14 +9289,21 @@ impl BlockchainNode {
                 
                 // MONOTONICITY CHECK: block.timestamp > parent.timestamp
                 // Only in LIVE MODE — during sync, skip (chain hash continuity is sufficient)
-                // v4.4: Also check FAST_SYNC_IN_PROGRESS — after restart a node may be
-                // at h=N receiving h=N+1 (within SYNC_MODE_THRESHOLD) but still syncing.
-                // Without this, a non-monotonic timestamp from a fork-resolved chain
-                // permanently blocks sync with no recovery path.
+                // v5.5: Comprehensive sync detection for BFT-confirmed blocks.
+                // Blocks already confirmed by BFT consensus skip local timestamp validation.
+                // Chain hash continuity (previous_hash check) is sufficient for ordering.
+                // This prevents non-monotonic timestamps from fork-resolution permanently
+                // blocking sync (e.g. block N produced during stall with bad clock).
                 const SYNC_MODE_THRESHOLD: u64 = 50;
                 let local_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
                 let fast_sync_active = FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
+                let sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed);
+                let sync_target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
+                // Block is BFT-confirmed if it's at or below the network consensus height
+                let is_consensus_confirmed = sync_target > 0 && microblock.height <= sync_target;
                 let is_syncing = fast_sync_active
+                    || sync_active
+                    || is_consensus_confirmed
                     || local_height + SYNC_MODE_THRESHOLD < microblock.height;
                 
                 if !is_syncing {
@@ -12625,10 +12684,11 @@ impl BlockchainNode {
                         // v5.4: No cap on timeout rounds. With modular rotation (base + round) % N,
                         // any round deterministically selects a candidate. The old cap at 50 caused
                         // permanent stalls: if the producer at round 50 was dead, the network froze
-                        // because rounds couldn't advance past 50. Tendermint has no round cap.
+                        // because rounds couldn't advance past 50. No round cap needed —
+                        // modular rotation works for any round value.
                         // Old vote entries are cleaned up by DashMap TTL in cleanup_timeout_votes().
 
-                        // Calculate proposed timeout round from delay (uncapped — Tendermint standard)
+                        // Calculate proposed timeout round from delay (uncapped)
                         let proposed_timeout_round = if local_delay <= TIMEOUT_GRACE_PERIOD {
                             0
                         } else {
@@ -12655,7 +12715,7 @@ impl BlockchainNode {
                         // delay. Even small LBPT differences → different rounds →
                         // different producers → no consensus → permanent stall.
                         //
-                        // Solution (Tendermint round-skip): When f+1 validators have
+                        // Solution (f+1 round-skip): When f+1 validators have
                         // voted for round R, ALL nodes adopt R for producer selection.
                         // f+1 guarantees at least one honest node is at that round.
                         //
@@ -13116,6 +13176,10 @@ impl BlockchainNode {
                                     // This prevents chain breaks where node thinks it's at height X without having the blocks
                                     // IMPORTANT: Handle rotation boundaries carefully (every 30 blocks)
                                     let sync_from_height = if microblock_height < network_height {
+                                        // v5.5: Start from 0 when chain is empty — genesis must be synced
+                                        if microblock_height == 0 {
+                                            0 // Include genesis block
+                                        } else {
                                         // Check if we're at rotation boundary where sync might fail
                                         // Rotation happens after blocks 30, 60, 90... (not block 0 which is genesis)
                                         let is_rotation_boundary = microblock_height > 0 && (microblock_height % ROTATION_INTERVAL_BLOCKS) == 0;
@@ -13124,6 +13188,7 @@ impl BlockchainNode {
                                             microblock_height
                                         } else {
                                             microblock_height + 1  // Normal case: sync next block
+                                        }
                                         }
                                     } else {
                                         microblock_height      // We're at same height or ahead
@@ -13140,13 +13205,25 @@ impl BlockchainNode {
                                     let _guard = FastSyncGuard;
                                     
                                     println!("[SYNC] 🚀 Fast downloading blocks {}-{}", sync_from_height, sync_to_height);
-                                    
+
+                                    // v5.5: Request genesis block separately if chain is empty.
+                                    // parallel_download_microblocks starts from current_height+1,
+                                    // so passing 0-1=0 skips block 0. Sync genesis via sync_blocks first.
+                                    if sync_from_height == 0 {
+                                        if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
+                                            println!("[WARN][SYNC] genesis_fast_sync_fail err={}", e);
+                                        } else {
+                                            println!("[INFO][SYNC] genesis_block_requested_for_fast_sync");
+                                        }
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+
                                     // TIMEOUT PROTECTION: Adaptive timeout based on blocks to sync
                                     // PRODUCTION: Use parallel download for faster sync
                                     let blocks_to_sync = sync_to_height.saturating_sub(sync_from_height);
                                     let timeout_secs = std::cmp::max(60, (blocks_to_sync / 10) + 30);  // Min 60s, ~10 blocks/sec + 30s buffer
                                     if is_debug() { println!("[DBG][SYNC] timeout={}s blocks={}", timeout_secs, blocks_to_sync); }
-                                    
+
                                     // CRITICAL FIX: parallel_download_microblocks expects current_height and iterates from current_height+1
                                     // sync_from_height is already the FIRST block to download, so pass sync_from_height-1
                                     let sync_result = tokio::time::timeout(

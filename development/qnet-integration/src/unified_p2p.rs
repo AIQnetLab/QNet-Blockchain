@@ -948,13 +948,24 @@ static TIMEOUT_VOTES: Lazy<Arc<DashMap<(u64, u64), HashMap<String, (Vec<u8>, [u8
 static TIMEOUT_CERTIFICATES: Lazy<Arc<DashMap<(u64, u64), TimeoutCertificate>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
 
+/// O(1) tracker: highest certified round per macroblock index.
+/// Updated on every certificate insert — avoids linear scan of TIMEOUT_CERTIFICATES.
+static HIGHEST_CERTIFIED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// O(1) tracker: highest adopted round (>= f+1 votes) per macroblock index.
+/// Key: macroblock_index, Value: highest round with >= f+1 votes.
+/// Updated on every vote insert — avoids linear scan of TIMEOUT_VOTES.
+static HIGHEST_ADOPTED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
 /// Track which macroblock indices we've already voted for timeout (prevent double-voting)
 /// Key: macroblock_index, Value: timeout_round we voted for
-static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> = 
+static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 // ═══════════════════════════════════════════════════════════════════
-// v4.0: VRF LEADER CLAIMS — Algorand-style secret leader election
+// v4.0: VRF LEADER CLAIMS — secret leader election via VRF
 // Key: leadership_round → Vec<VerifiedLeaderClaim>
 // Collected from P2P gossip, verified before storage
 // ═══════════════════════════════════════════════════════════════════
@@ -4355,10 +4366,13 @@ impl SimplifiedP2P {
                 TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_height);
                 let timeout_certs_removed = timeout_certs_before.saturating_sub(TIMEOUT_CERTIFICATES.len());
                 
+                HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_height);
+                HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_height);
+
                 let timeout_voted_before = TIMEOUT_VOTED_HEIGHTS.len();
                 TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
                 let timeout_voted_removed = timeout_voted_before.saturating_sub(TIMEOUT_VOTED_HEIGHTS.len());
-                
+
                 let timeout_total_removed = timeout_votes_removed + timeout_certs_removed + timeout_voted_removed;
                 
                 // Log if anything was cleaned
@@ -20327,11 +20341,19 @@ impl SimplifiedP2P {
             entry.len()
         };
         
+        // O(1) adopted-round tracker: update when votes reach f+1
+        let f_plus_1 = (total_validators + 2) / 3; // ceil(n/3)
+        if votes_count >= f_plus_1 {
+            HIGHEST_ADOPTED_ROUND.entry(height)
+                .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
+                .or_insert(timeout_round);
+        }
+
         if crate::node::is_info() {
-            println!("[INFO][TIMEOUT] vote_collected h={} round={} voter={} count={}/{}", 
+            println!("[INFO][TIMEOUT] vote_collected h={} round={} voter={} count={}/{}",
                      height, timeout_round, voter_id, votes_count, byzantine_threshold);
         }
-        
+
         // Check if we have enough votes for proof
         if votes_count >= byzantine_threshold {
             self.generate_and_broadcast_timeout_proof(height, timeout_round, hash_arr);
@@ -20394,9 +20416,14 @@ impl SimplifiedP2P {
         
         // Store proof locally
         TIMEOUT_CERTIFICATES.insert((height, timeout_round), proof);
-        
+
+        // O(1) tracker update
+        HIGHEST_CERTIFIED_ROUND.entry(height)
+            .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
+            .or_insert(timeout_round);
+
         if crate::node::is_info() {
-            println!("[INFO][TIMEOUT] proof_generated h={} round={} votes={}", 
+            println!("[INFO][TIMEOUT] proof_generated h={} round={} votes={}",
                      height, timeout_round, votes.len());
         }
         
@@ -20897,29 +20924,15 @@ impl SimplifiedP2P {
     /// v5.4: Get highest certified timeout round (BFT 2/3+ proof) for a given height.
     /// Replaces bounded loop `for round in 1..=MAX` with efficient DashMap scan.
     pub fn get_highest_certified_round(&self, height: u64) -> u64 {
-        let mut highest = 0u64;
-        for entry in TIMEOUT_CERTIFICATES.iter() {
-            let &(h, round) = entry.key();
-            if h == height && round > highest {
-                highest = round;
-            }
-        }
-        highest
+        HIGHEST_CERTIFIED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
     }
 
-    /// v5.4: Tendermint-style round adoption via f+1 (minority quorum) votes.
-    /// Returns the highest timeout round for which >= `threshold` validators have voted.
-    /// This enables round convergence: when f+1 nodes reach round R, all nodes adopt R.
-    /// In Tendermint, f+1 ROUND_CHANGE messages trigger round skip — this is the equivalent.
-    pub fn get_highest_adopted_round(&self, height: u64, threshold: usize) -> u64 {
-        let mut highest = 0u64;
-        for entry in TIMEOUT_VOTES.iter() {
-            let &(h, round) = entry.key();
-            if h == height && round > highest && entry.value().len() >= threshold {
-                highest = round;
-            }
-        }
-        highest
+    /// v5.4: Round adoption via f+1 (minority quorum) votes.
+    /// Returns the highest timeout round that reached >= f+1 votes.
+    /// O(1) lookup via HIGHEST_ADOPTED_ROUND tracker updated on vote insert.
+    /// `_threshold` kept for API compatibility — threshold applied at vote-insert time.
+    pub fn get_highest_adopted_round(&self, height: u64, _threshold: usize) -> u64 {
+        HIGHEST_ADOPTED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
     }
     
     /// Handle incoming timeout proof broadcast
@@ -20988,7 +21001,12 @@ impl SimplifiedP2P {
         };
         
         TIMEOUT_CERTIFICATES.insert((height, timeout_round), proof);
-        
+
+        // O(1) tracker update
+        HIGHEST_CERTIFIED_ROUND.entry(height)
+            .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
+            .or_insert(timeout_round);
+
         if crate::node::is_info() {
             println!("[INFO][TIMEOUT] proof_accepted h={} round={}", height, timeout_round);
         }
@@ -21207,6 +21225,8 @@ impl SimplifiedP2P {
         
         TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_mb);
         TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_mb);
+        HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_mb);
+        HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_mb);
         TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_mb);
     }
     
