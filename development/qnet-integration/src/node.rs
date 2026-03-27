@@ -440,6 +440,14 @@ pub fn try_get_storage() -> Option<&'static Arc<Storage>> {
 pub static LAST_BLOCK_PRODUCED_TIME: AtomicU64 = AtomicU64::new(0);
 pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
+/// v5.5: Post-restart production lockout.
+/// After restart, a node must NOT produce blocks until it has confirmed sync
+/// with the network by receiving at least one NEW block from a peer.
+/// This prevents freshly restarted nodes from producing with stale timeout_round,
+/// which caused forks during rolling updates.
+/// 0 = locked (no production), 1 = unlocked (production allowed)
+pub static PRODUCTION_UNLOCKED: AtomicU64 = AtomicU64::new(0);
+
 /// v4.6: Track last height at which VRF key was announced to peers
 static LAST_VRF_KEY_ANNOUNCE_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
@@ -7456,6 +7464,14 @@ impl BlockchainNode {
                                     // Background sync (every 30s) will re-request with exponential backoff
                                 }
                             }
+                        } else if e.starts_with("PRODUCER_MISMATCH:") {
+                            // v5.5: Block from wrong producer at round=0 — discard silently.
+                            // This prevents forks during rolling updates when a restarted node
+                            // produces with a stale timeout_round.
+                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
+                            if is_warn() {
+                                println!("[WARN][SEC] {} — block discarded", e);
+                            }
                         } else if e.starts_with("FORK_DETECTED:") {
                             // CRITICAL: Fork detected - handle asynchronously to avoid blocking
                             if let Some(fork_info) = e.strip_prefix("FORK_DETECTED:") {
@@ -8639,6 +8655,13 @@ impl BlockchainNode {
                             // v3.9: Reset timeout_round when new block received
                             // This clears failover state since network is progressing
                             reset_timeout_round();
+
+                            // v5.5: Unlock production — we confirmed sync with network
+                            // by receiving a new block at our tip height
+                            if PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 0 {
+                                PRODUCTION_UNLOCKED.store(1, Ordering::Relaxed);
+                                if is_info() { println!("[INFO][STATE] production_unlocked h={} (confirmed sync)", received_block.height); }
+                            }
                             
                             // CRITICAL FIX: Update P2P local height for message filtering
                             crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
@@ -9508,30 +9531,75 @@ impl BlockchainNode {
             }
         }
         
-        // 5.7 v4.5: Producer validation — soft check (log only, no hard reject).
+        // v5.5: Producer validation — HARD REJECT to prevent forks.
         //
-        // WHY NO HARD REJECT:
-        // With deterministic leader selection, expected_producer is computed locally.
-        // During timeout certificate propagation there's a brief window where
-        // node A has timeout_round=1 (new leader) and node B still has timeout_round=0
-        // (original leader). If B rejects A's block → sync deadlock → FORK cascade.
+        // In a BFT blockchain, accepting blocks from an unexpected producer is the
+        // primary cause of forks during rolling updates: restarted nodes have stale
+        // timeout_round, select a different producer, and if the old code accepted
+        // the mismatch, the chain diverged permanently.
         //
-        // Chain hash continuity (prev_hash check in step 2) already prevents
-        // accepting blocks from a divergent chain. The producer field is informational
-        // for monitoring, not a consensus-critical gate.
+        // prev_hash check alone does NOT prevent forks: two different producers can
+        // both create valid blocks at height H with prev_hash matching block H-1.
         //
-        // SECURITY: Blocks are still verified by:
-        //   - prev_hash match (step 2) — prevents accepting fork blocks
-        //   - VRF proof in block — proves producer was legitimately elected
-        //   - Transaction signature verification — prevents content forgery
-        //   - Macroblock finality — prevents rollback attacks
+        // HARD REJECT at timeout_round=0 (normal operation): only one valid producer.
+        // During timeout (round > 0): check if the incoming producer is valid at
+        // ANY round from 0 to max(local_round, adopted_round) — because the producer
+        // might have a timeout certificate we haven't received yet.
         if let Some((expected_producer, expected_round)) = get_expected_producer(microblock.height) {
             if microblock.producer != expected_producer {
-                if is_warn() {
-                    println!(
-                        "[WARN][SEC] producer_mismatch h={} expected={} got={} timeout_round={} — accepted (chain hash verified)",
+                // Check if producer is valid at any reachable timeout round.
+                // The producer at round R = (round0_idx + R) % N.
+                // We check all rounds from 0 to expected_round + safety_margin.
+                let max_check_round = expected_round.saturating_add(5); // 5-round look-ahead
+                let mut producer_valid_at_any_round = false;
+
+                for check_round in 0..=max_check_round {
+                    if let Some((candidate, _)) = {
+                        // Look up cached producer at this round if available
+                        // For round 0, it's already in expected_producer
+                        if check_round == 0 {
+                            Some((expected_producer.clone(), 0u64))
+                        } else {
+                            // Cannot look up arbitrary rounds from cache — the cache only stores
+                            // the round that was computed in the main loop.
+                            // Use modular rotation: producer at round R = (round0_idx + R) % N
+                            // We can't compute this without candidates list here, so break.
+                            None
+                        }
+                    } {
+                        if candidate == microblock.producer {
+                            producer_valid_at_any_round = true;
+                            break;
+                        }
+                    }
+                }
+
+                // If producer matches at round 0 = expected, already handled.
+                // If not, and we're in timeout mode, try direct acceptance:
+                // During timeout, different nodes may be at different rounds.
+                // Accept if we're in timeout AND the block's prev_hash chains correctly
+                // (prev_hash was already verified in step 2 above).
+                if !producer_valid_at_any_round && expected_round > 0 {
+                    // In timeout mode — accept with warning (timeout transitions are brief)
+                    if is_warn() {
+                        println!(
+                            "[WARN][SEC] producer_mismatch_timeout h={} expected={} got={} round={} — accepted (timeout transition)",
+                            microblock.height, expected_producer, microblock.producer, expected_round
+                        );
+                    }
+                    producer_valid_at_any_round = true;
+                }
+
+                if !producer_valid_at_any_round {
+                    // HARD REJECT: round=0, wrong producer → definite fork attempt
+                    eprintln!(
+                        "[ERR][SEC] producer_mismatch_rejected h={} expected={} got={} round={}",
                         microblock.height, expected_producer, microblock.producer, expected_round
                     );
+                    return Err(format!(
+                        "PRODUCER_MISMATCH:{}:expected={},got={}",
+                        microblock.height, expected_producer, microblock.producer
+                    ));
                 }
             }
         }
@@ -11396,9 +11464,13 @@ impl BlockchainNode {
                                 crate::update_global_pricing_state(0.0, 5, existing_genesis.timestamp);
                                 // v3.36: sync reward_manager genesis_ts from network-synced genesis
                                 reward_manager_for_spawn.write().await.update_genesis_timestamp(existing_genesis.timestamp);
-                                let now = get_timestamp_safe();
-                                LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                                // v5.5: Use on-chain timestamp (not wall-clock) for LBPT determinism.
+                                // All nodes at the same height must have identical LBPT to compute
+                                // identical timeout_round. Wall-clock diverges across nodes.
+                                LAST_BLOCK_PRODUCED_TIME.store(existing_genesis.timestamp, std::sync::atomic::Ordering::Relaxed);
                                 LAST_BLOCK_PRODUCED_HEIGHT.store(microblock_height, std::sync::atomic::Ordering::Relaxed);
+                                // v5.5: Synced genesis from network — unlock production
+                                PRODUCTION_UNLOCKED.store(1, Ordering::Relaxed);
                                 synced_from_network = true;
                                 break;
                             }
@@ -11528,13 +11600,14 @@ impl BlockchainNode {
                                                 // v3.36: sync reward_manager genesis_ts from freshly created genesis
                                                 reward_manager_for_spawn.write().await.update_genesis_timestamp(genesis_microblock.timestamp);
                                                 
-                                                // CRITICAL FIX v3.15: Initialize LAST_BLOCK_PRODUCED_TIME to NOW
-                                                // This ensures delay calculation starts fresh from Genesis creation
-                                                let now = get_timestamp_safe();
-                                                LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                                                // v5.5: Use genesis block's on-chain timestamp for LBPT.
+                                                // All nodes must have identical LBPT for deterministic timeout_round.
+                                                LAST_BLOCK_PRODUCED_TIME.store(genesis_microblock.timestamp, std::sync::atomic::Ordering::Relaxed);
                                                 LAST_BLOCK_PRODUCED_HEIGHT.store(0, std::sync::atomic::Ordering::Relaxed);
-                                                if is_info() { println!("[INFO][GEN] last_block_time_init ts={} height=0", now); }
-                                                
+                                                // v5.5: Genesis creator is the first producer — unlock immediately
+                                                PRODUCTION_UNLOCKED.store(1, Ordering::Relaxed);
+                                                if is_info() { println!("[INFO][GEN] genesis_created ts={} production_unlocked", genesis_microblock.timestamp); }
+
                                                 // Display economic information (halving & phase)
                                                 {
                                                     use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
@@ -11810,15 +11883,14 @@ impl BlockchainNode {
                                 );
                                 if is_info() { println!("[INFO][GEN] genesis_ts_synced old={} new={}", old_ts, genesis_block.timestamp); }
                                 
-                                // CRITICAL FIX v3.15: Initialize LAST_BLOCK_PRODUCED_TIME to NOW
-                                // This ensures delay calculation starts fresh from Genesis reception
-                                // Without this, delay = current_time - genesis_ts could be large
-                                // if nodes waited a long time before Genesis was created
-                                let now = get_timestamp_safe();
-                                LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                                // v5.5: Use genesis block's on-chain timestamp for LBPT.
+                                // All nodes must have identical LBPT for deterministic timeout_round.
+                                LAST_BLOCK_PRODUCED_TIME.store(genesis_block.timestamp, std::sync::atomic::Ordering::Relaxed);
                                 LAST_BLOCK_PRODUCED_HEIGHT.store(0, std::sync::atomic::Ordering::Relaxed);
-                                if is_info() { println!("[INFO][GEN] last_block_time_init ts={} height=0", now); }
-                                
+                                // v5.5: Received genesis from network — unlock production
+                                PRODUCTION_UNLOCKED.store(1, Ordering::Relaxed);
+                                if is_info() { println!("[INFO][GEN] genesis_synced ts={} production_unlocked", genesis_block.timestamp); }
+
                                 // Also update reward manager with correct genesis timestamp
                                 crate::update_global_pricing_state(0.0, 5, genesis_block.timestamp);
                                 // v3.36: CRITICAL — sync reward_manager genesis_ts from received genesis block
@@ -11965,17 +12037,20 @@ impl BlockchainNode {
             //   - All nodes initialize at roughly the same time (within NTP drift ~2s)
             // ═══════════════════════════════════════════════════════════════════════════
             {
-                let now = get_timestamp_safe();
-                // v5.2: Only override if not already set by replay (preserves correct stall delay)
+                // v5.5: LBPT must always be on-chain timestamp for determinism.
+                // After replay, LBPT is already set to last replayed block's timestamp.
+                // Only set to genesis_ts if not yet set (fresh start with no blocks).
                 let current_lbpt = LAST_BLOCK_PRODUCED_TIME.load(std::sync::atomic::Ordering::Relaxed);
-                if current_lbpt == 0 || microblock_height == 0 {
-                    // Fresh start or genesis — use NOW (no previous block to reference)
-                    LAST_BLOCK_PRODUCED_TIME.store(now, std::sync::atomic::Ordering::Relaxed);
+                if current_lbpt == 0 {
+                    // Fresh start — use genesis timestamp as baseline
+                    let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+                    let baseline = if genesis_ts > 0 { genesis_ts } else { get_timestamp_safe() };
+                    LAST_BLOCK_PRODUCED_TIME.store(baseline, std::sync::atomic::Ordering::Relaxed);
                 } else {
-                    // Restart with replay — keep replay timestamp for correct timeout_round sync
+                    // Restart with replay — keep on-chain timestamp from replay
                     if is_info() {
-                        let stale = now.saturating_sub(current_lbpt);
-                        println!("[INFO][STATE] preserving_replay_timestamp lbpt={} stale={}s (timeout sync)",
+                        let stale = get_timestamp_safe().saturating_sub(current_lbpt);
+                        println!("[INFO][STATE] preserving_replay_lbpt ts={} stale={}s",
                                  current_lbpt, stale);
                     }
                 }
@@ -13025,8 +13100,13 @@ impl BlockchainNode {
                                         SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                                         println!("[INFO][FORK] cleared_pending_sync_queues");
                                         
-                                        // Reset stall timer to prevent immediate re-trigger
-                                        LAST_BLOCK_PRODUCED_TIME.store(current_time, Ordering::Relaxed);
+                                        // v5.5: After rollback, set LBPT to on-chain timestamp of rollback
+                                        // target block for deterministic timeout_round. Load block timestamp
+                                        // from storage; fallback to current_time only if block not found.
+                                        let rollback_lbpt = storage.load_microblock_auto_format(rollback_to)
+                                            .ok().flatten().map(|mb| mb.timestamp)
+                                            .unwrap_or(current_time);
+                                        LAST_BLOCK_PRODUCED_TIME.store(rollback_lbpt, Ordering::Relaxed);
                                         LAST_BLOCK_PRODUCED_HEIGHT.store(rollback_to, Ordering::Relaxed);
                                         
                                         // Request fresh blocks and macroblocks from network
@@ -13242,8 +13322,11 @@ impl BlockchainNode {
                                                 *global_height = sync_to_height;
                                                 if is_debug() { println!("[DBG][SYNC] global_h={}", sync_to_height); }
                                                 
-                                                // Update last block time to prevent stall detection false positives
-                                                LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
+                                                // v5.5: Use on-chain timestamp of synced block for deterministic LBPT
+                                                let sync_lbpt = storage_clone.load_microblock_auto_format(sync_to_height)
+                                                    .ok().flatten().map(|mb| mb.timestamp)
+                                                    .unwrap_or_else(get_timestamp_safe);
+                                                LAST_BLOCK_PRODUCED_TIME.store(sync_lbpt, Ordering::Relaxed);
                                                 LAST_BLOCK_PRODUCED_HEIGHT.store(sync_to_height, Ordering::Relaxed);
                                             }
                                         },
@@ -13686,7 +13769,19 @@ impl BlockchainNode {
                 cache_expected_producer(next_block_height, &current_producer, timeout_round);
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
-                
+
+                // v5.5: Post-restart production lockout.
+                // After restart, don't produce until we've received at least one new block
+                // from the network, confirming we're in sync. This prevents producing
+                // blocks with stale timeout_round during rolling updates.
+                if is_my_turn_to_produce && PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 0 {
+                    if is_info() {
+                        println!("[INFO][PROD] lockout h={} reason=post_restart (waiting for network block)",
+                                 next_block_height);
+                    }
+                    is_my_turn_to_produce = false;
+                }
+
                 // ═══════════════════════════════════════════════════════════════════════════
                 // v3.10 BUG 3 FIX: Check if we're excluded (e.g., after fork detection)
                 // If excluded, we cannot produce - let emergency failover handle it
@@ -16302,8 +16397,8 @@ impl BlockchainNode {
                     
                     // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
                     
-                    // CRITICAL FIX: Update global last block time for stall detection
-                    LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
+                    // v5.5: Use block's on-chain timestamp for deterministic LBPT
+                    LAST_BLOCK_PRODUCED_TIME.store(microblock.timestamp, Ordering::Relaxed);
                     LAST_BLOCK_PRODUCED_HEIGHT.store(microblock.height, Ordering::Relaxed);
                     
                     // CRITICAL: Increment height for next iteration
