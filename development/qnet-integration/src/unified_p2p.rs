@@ -954,9 +954,15 @@ static HIGHEST_CERTIFIED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// O(1) tracker: highest adopted round (>= f+1 votes) per macroblock index.
-/// Key: macroblock_index, Value: highest round with >= f+1 votes.
+/// Key: macroblock_index, Value: highest round with cumulative >= f+1 votes.
 /// Updated on every vote insert — avoids linear scan of TIMEOUT_VOTES.
+/// BFT cumulative voting: a vote for round R supports ALL rounds <= R.
 static HIGHEST_ADOPTED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Per-voter max round tracker: Key: (mb_index, voter_id), Value: max round voted.
+/// Used for cumulative vote counting — a vote for round R counts as vote for all rounds <= R.
+static VOTER_MAX_ROUND: Lazy<Arc<DashMap<(u64, String), u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// Track which macroblock indices we've already voted for timeout (prevent double-voting)
@@ -4368,6 +4374,7 @@ impl SimplifiedP2P {
                 
                 HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_height);
                 HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_height);
+                VOTER_MAX_ROUND.retain(|(h, _), _| *h >= min_height);
 
                 let timeout_voted_before = TIMEOUT_VOTED_HEIGHTS.len();
                 TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
@@ -20341,12 +20348,30 @@ impl SimplifiedP2P {
             entry.len()
         };
         
-        // O(1) adopted-round tracker: update when votes reach f+1
+        // Track this voter's max round for cumulative counting
+        VOTER_MAX_ROUND.entry((height, voter_id.clone()))
+            .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
+            .or_insert(timeout_round);
+
+        // Cumulative adopted-round tracker: a vote for round R supports ALL rounds <= R.
+        // Find the HIGHEST round that has f+1 cumulative support.
+        // Collect all max_rounds for this height, sort descending.
+        // The f+1-th value (0-indexed) is the highest round with f+1 support.
         let f_plus_1 = (total_validators + 2) / 3; // ceil(n/3)
-        if votes_count >= f_plus_1 {
-            HIGHEST_ADOPTED_ROUND.entry(height)
-                .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
-                .or_insert(timeout_round);
+        let mut max_rounds: Vec<u64> = VOTER_MAX_ROUND.iter()
+            .filter(|e| e.key().0 == height)
+            .map(|e| *e.value())
+            .collect();
+        if max_rounds.len() >= f_plus_1 {
+            // O(N) partial sort: find the f+1-th largest value
+            let idx = f_plus_1 - 1;
+            max_rounds.select_nth_unstable_by(idx, |a, b| b.cmp(a));
+            let best_adopted = max_rounds[idx];
+            if best_adopted > 0 {
+                HIGHEST_ADOPTED_ROUND.entry(height)
+                    .and_modify(|cur| { if best_adopted > *cur { *cur = best_adopted; } })
+                    .or_insert(best_adopted);
+            }
         }
 
         if crate::node::is_info() {
@@ -21227,6 +21252,7 @@ impl SimplifiedP2P {
         TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_mb);
         HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_mb);
         HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_mb);
+        VOTER_MAX_ROUND.retain(|(h, _), _| *h >= min_mb);
         TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_mb);
     }
     

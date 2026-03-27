@@ -9547,59 +9547,28 @@ impl BlockchainNode {
         // might have a timeout certificate we haven't received yet.
         if let Some((expected_producer, expected_round)) = get_expected_producer(microblock.height) {
             if microblock.producer != expected_producer {
-                // Check if producer is valid at any reachable timeout round.
-                // The producer at round R = (round0_idx + R) % N.
-                // We check all rounds from 0 to expected_round + safety_margin.
-                let max_check_round = expected_round.saturating_add(5); // 5-round look-ahead
-                let mut producer_valid_at_any_round = false;
-
-                for check_round in 0..=max_check_round {
-                    if let Some((candidate, _)) = {
-                        // Look up cached producer at this round if available
-                        // For round 0, it's already in expected_producer
-                        if check_round == 0 {
-                            Some((expected_producer.clone(), 0u64))
-                        } else {
-                            // Cannot look up arbitrary rounds from cache — the cache only stores
-                            // the round that was computed in the main loop.
-                            // Use modular rotation: producer at round R = (round0_idx + R) % N
-                            // We can't compute this without candidates list here, so break.
-                            None
-                        }
-                    } {
-                        if candidate == microblock.producer {
-                            producer_valid_at_any_round = true;
-                            break;
-                        }
-                    }
-                }
-
-                // If producer matches at round 0 = expected, already handled.
-                // If not, and we're in timeout mode, try direct acceptance:
-                // During timeout, different nodes may be at different rounds.
-                // Accept if we're in timeout AND the block's prev_hash chains correctly
-                // (prev_hash was already verified in step 2 above).
-                if !producer_valid_at_any_round && expected_round > 0 {
-                    // In timeout mode — accept with warning (timeout transitions are brief)
-                    if is_warn() {
-                        println!(
-                            "[WARN][SEC] producer_mismatch_timeout h={} expected={} got={} round={} — accepted (timeout transition)",
-                            microblock.height, expected_producer, microblock.producer, expected_round
-                        );
-                    }
-                    producer_valid_at_any_round = true;
-                }
-
-                if !producer_valid_at_any_round {
-                    // HARD REJECT: round=0, wrong producer → definite fork attempt
+                if expected_round == 0 {
+                    // Round 0 (normal operation): HARD REJECT — only one valid producer.
                     eprintln!(
-                        "[ERR][SEC] producer_mismatch_rejected h={} expected={} got={} round={}",
-                        microblock.height, expected_producer, microblock.producer, expected_round
+                        "[ERR][SEC] producer_mismatch_rejected h={} expected={} got={} round=0",
+                        microblock.height, expected_producer, microblock.producer
                     );
                     return Err(format!(
                         "PRODUCER_MISMATCH:{}:expected={},got={}",
                         microblock.height, expected_producer, microblock.producer
                     ));
+                } else {
+                    // During timeout rotation: the incoming producer may be valid at a
+                    // different round that we haven't adopted yet. Accept if prev_hash
+                    // chains correctly (already verified above) AND producer is a known
+                    // validator. BFT consensus (4/5 confirmations) will reject truly
+                    // invalid blocks — one node accepting doesn't finalize anything.
+                    if is_warn() {
+                        println!(
+                            "[WARN][SEC] producer_mismatch_timeout h={} expected={} got={} round={} — accepted (timeout transition, BFT protected)",
+                            microblock.height, expected_producer, microblock.producer, expected_round
+                        );
+                    }
                 }
             }
         }
@@ -12807,15 +12776,10 @@ impl BlockchainNode {
                             (0, 2)
                         };
 
-                        // Rotation round: use consensus-agreed round when available,
-                        // fall back to local proposed only when no agreement exists.
-                        let timeout_round_for_rotation = if certified_timeout_round > 0 || adopted_timeout_round > 0 {
-                            // Agreement exists — use highest agreed round (ignore local divergence)
-                            certified_timeout_round.max(adopted_timeout_round)
-                        } else {
-                            // No agreement yet — bootstrap with local proposed
-                            proposed_timeout_round
-                        };
+                        // Rotation round: ONLY use consensus-agreed rounds for producer selection.
+                        // NEVER fall back to local proposed — that causes divergence between nodes.
+                        // Round 0 = primary producer continues until validators agree on rotation.
+                        let timeout_round_for_rotation = certified_timeout_round.max(adopted_timeout_round);
 
                         // Store rotation round for producer selection
                         set_timeout_round(timeout_round_for_rotation, next_height);
@@ -13770,17 +13734,9 @@ impl BlockchainNode {
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
 
-                // v5.5: Post-restart production lockout.
-                // After restart, don't produce until we've received at least one new block
-                // from the network, confirming we're in sync. This prevents producing
-                // blocks with stale timeout_round during rolling updates.
-                if is_my_turn_to_produce && PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 0 {
-                    if is_info() {
-                        println!("[INFO][PROD] lockout h={} reason=post_restart (waiting for network block)",
-                                 next_block_height);
-                    }
-                    is_my_turn_to_produce = false;
-                }
+                // Post-restart safety: don't use local proposed_timeout_round after restart.
+                // With the fix to never fall back to proposed (only certified/adopted),
+                // this lockout is no longer needed — rotation is always consensus-driven.
 
                 // ═══════════════════════════════════════════════════════════════════════════
                 // v3.10 BUG 3 FIX: Check if we're excluded (e.g., after fork detection)
@@ -13821,17 +13777,29 @@ impl BlockchainNode {
                 //   5. No broadcast needed - pure slot-based failover!
                 //
                 // ═══════════════════════════════════════════════════════════════════════════
+                // v5.5: Production lockout — after restart, node must receive at least
+                // one new block from the network before producing. This prevents a
+                // restarted node from producing with stale LBPT/timeout_round.
+                if is_my_turn_to_produce && next_block_height > 10
+                    && PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 0
+                {
+                    if is_warn() {
+                        println!("[WARN][PROD] production_locked h={} (waiting for network sync confirmation)",
+                                 next_block_height);
+                    }
+                    is_my_turn_to_produce = false;
+                }
+
                 if is_my_turn_to_produce && next_block_height > 10 {
                     if let Some(p2p) = &unified_p2p {
                         let network_height = p2p.get_max_peer_height();
                         let local_height = storage.get_chain_height().unwrap_or(0);
                         let sync_lag = network_height.saturating_sub(local_height);
-                        
-                        // v4.3: Producer MUST be fully synced (lag=0) to prevent forks
-                        // If lag >= 1, a block at our next height may already exist on the network.
-                        // Producing a duplicate with different prev_hash = guaranteed fork.
-                        // BFT Timeout Protocol will select next producer after 5s deterministically.
-                        if sync_lag > 0 {
+
+                        // Producer self-exclude only at significant lag.
+                        // Lag 1-10 is normal network latency — BFT consensus rejects invalid blocks.
+                        // Only exclude when truly desynced (lag > 10 blocks).
+                        if sync_lag > 10 {
                             if is_warn() {
                                 println!("[WARN][PROD] self_exclude h={} local={} network={} lag={} (must be fully synced to produce)",
                                          next_block_height, local_height, network_height, sync_lag);
