@@ -1424,7 +1424,8 @@ pub struct SimplifiedP2P {
     block_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>>>,
     
     /// Sync request channel for requesting blocks from storage
-    sync_request_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>>,
+    /// v5.6: Extended with from_peer address so responses can reach unregistered peers
+    sync_request_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64, String, String)>>,
     
     /// ShredProtocol block assembly states
     shred_protocol_assemblies: Arc<DashMap<u64, ShredProtocolBlockAssembly>>,
@@ -2451,7 +2452,8 @@ impl SimplifiedP2P {
     }
     
     /// Set sync request channel for handling block requests
-    pub fn set_sync_request_channel(&mut self, sync_request_tx: tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>) {
+    /// v5.6: Extended with from_peer address for routing responses to unregistered peers
+    pub fn set_sync_request_channel(&mut self, sync_request_tx: tokio::sync::mpsc::UnboundedSender<(u64, u64, String, String)>) {
         self.sync_request_tx = Some(sync_request_tx);
     }
     
@@ -2500,6 +2502,9 @@ impl SimplifiedP2P {
         // This ensures QUIC uses SAME logic as HTTP - no code duplication!
         let quic_message_tx = self.quic_message_tx.clone();
         
+        // v6.5: Share peer_id_to_addr with QUIC transport for bidirectional mapping
+        transport.set_peer_id_to_addr(self.peer_id_to_addr.clone());
+
         let handler: MessageHandler = Arc::new(move |peer_addr, msg| {
             // Convert QUIC SocketAddr to API port format (matches handle_message expectation)
             let peer_str = format!("{}:8001", peer_addr.ip());
@@ -16868,8 +16873,9 @@ impl SimplifiedP2P {
         }
         
         // CRITICAL FIX: Send sync request to node.rs where storage is available
+        // v5.6: Include from_peer address so response can reach unregistered peers
         if let Some(ref sync_tx) = self.sync_request_tx {
-            if let Err(e) = sync_tx.send((from_height, actual_to, requester_id.clone())) {
+            if let Err(e) = sync_tx.send((from_height, actual_to, requester_id.clone(), from_peer.to_string())) {
                 if crate::node::is_info() {
                     println!("[SYNC] ❌ Failed to send sync request to node: {}", e);
                 }
@@ -21175,9 +21181,13 @@ impl SimplifiedP2P {
     pub fn get_active_validator_count(&self) -> usize {
         let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
 
-        // Genesis epoch (blocks 0-180): fixed 5 genesis validators
+        // v6.6: Genesis epoch (blocks 0-180): use 5 genesis validators as BASE,
+        // but also count connected Super peers to reflect actual network size.
+        // This ensures BFT 2/3 threshold grows as new nodes join during genesis epoch.
         if local_h <= 180 {
-            return 5;
+            let connected = self.connected_peers_lockfree.len();
+            let total = std::cmp::max(5, connected + 1); // at least 5 (genesis), grow with network
+            return total;
         }
 
         // Normal epoch: read eligible_producers from macroblock snapshot (N-2 rule)

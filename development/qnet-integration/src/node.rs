@@ -1787,7 +1787,60 @@ impl BlockchainNode {
             })
             .filter(|p| p.reputation >= MIN_REPUTATION)
             .collect();
-        
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v6.6 CRITICAL FIX: BREAK CLOSED CONSENSUS LOOP
+        //
+        // Previously: eligible_producers = consensus_participants ONLY
+        //   → consensus_participants come from previous macroblock's eligible_producers
+        //   → which came from THAT round's consensus_participants → CLOSED LOOP
+        //   → New nodes could NEVER enter consensus even after on-chain registration
+        //
+        // Fix: Scan blockchain for confirmed NodeRegistration TXs with Super node_type.
+        // Any registered Super node with reputation >= MIN_REPUTATION gets added to
+        // the eligible set. This is deterministic — all nodes read the same blockchain.
+        // ═══════════════════════════════════════════════════════════════════════════
+        {
+            let existing_ids: std::collections::HashSet<String> = eligible.iter()
+                .map(|p| p.node_id.clone())
+                .collect();
+
+            let scan_end = macroblock_index * 90; // scan up to this macroblock's boundary
+            let mut registered_super_nodes: Vec<(String, qnet_state::NodeType)> = Vec::new();
+
+            for height in 0..=scan_end {
+                if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
+                    for tx in &block.transactions {
+                        if let qnet_state::TransactionType::NodeRegistration {
+                            node_id, node_type, ..
+                        } = &tx.tx_type {
+                            if *node_type == qnet_state::NodeType::Super && !existing_ids.contains(node_id) {
+                                registered_super_nodes.push((node_id.clone(), node_type.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut added_count = 0usize;
+            for (node_id, _node_type) in &registered_super_nodes {
+                let reputation = reputation_map.get(node_id).copied()
+                    .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION / 100.0);
+                if reputation >= MIN_REPUTATION {
+                    eligible.push(qnet_state::EligibleProducer {
+                        node_id: node_id.clone(),
+                        reputation,
+                    });
+                    added_count += 1;
+                }
+            }
+
+            if added_count > 0 {
+                println!("[INFO][SNAP] v6.6 OPEN_CONSENSUS: added {} registered Super nodes to eligible set (total={})",
+                         added_count, eligible.len());
+            }
+        }
+
         eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         
         // v3.37: VRF-based fair selection when exceeding MAX_VALIDATORS_PER_EPOCH
@@ -5416,7 +5469,8 @@ impl BlockchainNode {
         let (block_tx, block_rx) = tokio::sync::mpsc::unbounded_channel();
         
         // Create sync request channel for handling block requests
-        let (sync_request_tx, mut sync_request_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, String)>();
+        // v5.6: Extended with from_peer_addr so responses reach unregistered new nodes
+        let (sync_request_tx, mut sync_request_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, String, String)>();
         
         // PRODUCTION v2.19.12: Create macroblock sync channels
         let (macroblock_tx, mut macroblock_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6408,11 +6462,11 @@ impl BlockchainNode {
         }
         
         // Start sync request handler AFTER blockchain is created
+        // v5.6: Now receives from_peer_addr for routing to unregistered peers
         let blockchain_clone = blockchain.clone();
         tokio::spawn(async move {
-            while let Some((from_height, to_height, requester_id)) = sync_request_rx.recv().await {
-                // Use existing handle_sync_request method
-                if let Err(e) = blockchain_clone.handle_sync_request(from_height, to_height, requester_id).await {
+            while let Some((from_height, to_height, requester_id, from_peer_addr)) = sync_request_rx.recv().await {
+                if let Err(e) = blockchain_clone.handle_sync_request(from_height, to_height, requester_id, from_peer_addr).await {
                     eprintln!("[ERR][SYNC] handle_request_failed err={}", e);
                 }
             }
@@ -10082,7 +10136,90 @@ impl BlockchainNode {
             let local_height = self.storage.get_chain_height().unwrap_or(0);
             
             println!("[Node] 🔄 Starting network synchronization (local height: {})...", local_height);
-            
+
+            // ════════════════════════════════════════════════════════════════════════
+            // v6.5 FIX: HTTP genesis block download for non-bootstrap nodes
+            // PROBLEM: New nodes joining existing network deadlock in readiness loop
+            //   because sync_blocks(0,0) via QUIC fails (genesis not stored as microblock).
+            // SOLUTION: Download genesis block via HTTP REST API from any genesis node
+            //   BEFORE entering the readiness loop. This is the standard pattern:
+            //   - Ethereum: genesis.json downloaded out-of-band
+            //   - Solana: genesis snapshot via HTTP
+            //   - Cosmos: genesis.json is a required config file
+            // ════════════════════════════════════════════════════════════════════════
+            if !is_bootstrap_node && local_height == 0 {
+                let has_genesis_already = self.storage.load_microblock(0)
+                    .map(|opt| opt.is_some())
+                    .unwrap_or(false);
+
+                if !has_genesis_already {
+                    println!("[GENESIS] 📥 Downloading genesis block via HTTP from genesis nodes...");
+
+                    use crate::unified_p2p::get_genesis_bootstrap_ips;
+                    let genesis_ips = get_genesis_bootstrap_ips();
+                    let mut genesis_downloaded = false;
+
+                    for ip in &genesis_ips {
+                        if genesis_downloaded { break; }
+
+                        // Try multiple endpoints for genesis block download
+                        let urls = vec![
+                            format!("http://{}:8001/api/v1/blockchain/block/0", ip),
+                            format!("http://{}:8001/api/v1/block/0", ip),
+                            format!("http://{}:8001/api/v1/genesis/block", ip),
+                        ];
+
+                        for url in &urls {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                async {
+                                    let client = reqwest::Client::builder()
+                                        .timeout(std::time::Duration::from_secs(8))
+                                        .build()
+                                        .map_err(|e| format!("client_build: {}", e))?;
+                                    let resp = client.get(url).send().await
+                                        .map_err(|e| format!("request: {}", e))?;
+                                    if !resp.status().is_success() {
+                                        return Err(format!("status: {}", resp.status()));
+                                    }
+                                    let bytes = resp.bytes().await
+                                        .map_err(|e| format!("body: {}", e))?;
+                                    Ok::<_, String>(bytes.to_vec())
+                                }
+                            ).await {
+                                Ok(Ok(block_data)) if !block_data.is_empty() => {
+                                    // Try to store as microblock at height 0
+                                    match self.storage.save_microblock(0, &block_data) {
+                                        Ok(_) => {
+                                            println!("[GENESIS] ✅ Genesis block downloaded from {} ({} bytes)", ip, block_data.len());
+                                            genesis_downloaded = true;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            if is_warn() { println!("[WARN][GENESIS] save_failed from={} err={}", ip, e); }
+                                        }
+                                    }
+                                }
+                                Ok(Ok(_)) => {
+                                    if is_debug() { println!("[DBG][GENESIS] empty_response from={} url={}", ip, url); }
+                                }
+                                Ok(Err(e)) => {
+                                    if is_debug() { println!("[DBG][GENESIS] http_fail from={} err={}", ip, e); }
+                                }
+                                Err(_) => {
+                                    if is_debug() { println!("[DBG][GENESIS] timeout from={}", ip); }
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback: Try to get genesis via QUIC sync if HTTP failed
+                    if !genesis_downloaded {
+                        println!("[GENESIS] ⚠️ HTTP download failed, will retry via P2P sync in readiness loop");
+                    }
+                }
+            }
+
             // CRITICAL FIX: Register in global registry BEFORE waiting for peers
             // This allows other nodes to discover us via gossip during their sync
             if let Some(ref p2p) = self.unified_p2p {
@@ -10233,13 +10370,47 @@ impl BlockchainNode {
                                 wait_time += 5;
                                 continue;
                             }
-                            
+
+                            // ══════════════════════════════════════════════════════════════
+                            // v6.5 FIX: Early activation for non-bootstrap nodes
+                            // CORRECT FLOW: Genesis downloaded → Activate → Confirm → Sync
+                            // (Ethereum: deposit TX confirmed → validator activated → sync)
+                            // (Cosmos: gentx in genesis → node starts → sync)
+                            //
+                            // PROBLEM: save_activation_code() was called AFTER readiness loop
+                            //   in qnet-node.rs:2891, and the first attempt failed with
+                            //   "activation_tx_no_mempool reason=not_initialized".
+                            // SOLUTION: Call save_activation_code() early — as soon as genesis
+                            //   block is available and peers are connected. This ensures
+                            //   NodeActivation TX reaches the producer BEFORE sync starts.
+                            // ══════════════════════════════════════════════════════════════
+                            if !is_bootstrap_node {
+                                static EARLY_ACTIVATION_DONE: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+
+                                if !EARLY_ACTIVATION_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+                                    let activation_code = std::env::var("QNET_ACTIVATION_CODE").unwrap_or_default();
+                                    if !activation_code.is_empty() {
+                                        println!("[ACTIVATION] 🔑 Early activation: genesis available, peers connected, broadcasting TX...");
+                                        match self.save_activation_code(&activation_code, self.node_type).await {
+                                            Ok(_) => {
+                                                println!("[ACTIVATION] ✅ Early activation completed — TX broadcast to network");
+                                                EARLY_ACTIVATION_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+                                            }
+                                            Err(e) => {
+                                                println!("[WARN][ACTIVATION] early_activation_fail err={} — will retry in qnet-node.rs", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             if is_info() { println!("[INFO][NODE] net_ready peers={} stable={}s", real_peer_count, stabilization_time); }
                             println!("[Node] 🚀 Starting production!");
-                            
+
                             // STATE MACHINE: Ready to produce
                             set_node_state(NodeState::Idle { last_height: 0 });
-                            
+
                             break;
                         }
                     }
@@ -10263,12 +10434,22 @@ impl BlockchainNode {
                         let genesis_peers: Vec<String> = genesis_ips.iter()
                             .map(|ip| format!("{}:8001", ip))
                             .collect();
-                        
+
                         println!("[Node] 🔄 Attempting to connect to Genesis peers...");
                         p2p.add_discovered_peers(&genesis_peers);
-                        
+
                         // Also re-register to propagate our presence
                         p2p.register_as_active_node_async().await;
+                    }
+
+                    // v5.6 FIX: Non-bootstrap nodes joining existing network MUST request genesis
+                    // Without this, new super nodes deadlock: ready_to_start requires has_genesis,
+                    // but genesis request was only inside the ready_to_start block
+                    if !is_bootstrap_node && !has_genesis && has_enough_peers {
+                        if is_info() { println!("[INFO][NODE] requesting_genesis peers={} wait={}s", real_peer_count, wait_time); }
+                        if let Err(e) = p2p.sync_blocks(0, 0).await {
+                            if is_warn() { println!("[WARN][NODE] genesis_request_fail err={}", e); }
+                        }
                     }
                     
                     // Wait and retry
@@ -18601,9 +18782,28 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         
                         let storage_clone = storage.clone();
                         let mb_idx = required_macroblock;
-                        let genesis_ids: Vec<String> = (1..=5)
+                        // v6.6: Dynamic participant list — scan blocks for all registered Super nodes
+                        // instead of hardcoding 5 genesis nodes. Genesis nodes are always included
+                        // as baseline, then any on-chain NodeRegistration Super nodes are added.
+                        let mut participant_ids: Vec<String> = (1..=5)
                             .map(|i| format!("genesis_node_{:03}", i))
                             .collect();
+                        // Scan blocks in this macroblock range for NodeRegistration TXs
+                        for h in mb_start..=mb_end {
+                            if let Ok(Some(block)) = storage.load_microblock_auto_format(h) {
+                                for tx in &block.transactions {
+                                    if let qnet_state::TransactionType::NodeRegistration {
+                                        ref node_id, ref node_type, ..
+                                    } = tx.tx_type {
+                                        if *node_type == qnet_state::NodeType::Super
+                                           && !participant_ids.contains(node_id) {
+                                            participant_ids.push(node_id.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let genesis_ids = participant_ids;
                         
                         // Synchronous assembly — we need the result NOW for this round
                         let dummy_consensus = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -25121,9 +25321,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Handle incoming sync request from peer
     /// CRITICAL FIX v2.61: Size-based batched sync to prevent QUIC message loss
-    pub async fn handle_sync_request(&self, from_height: u64, to_height: u64, requester_id: String) -> Result<(), QNetError> {
-        if is_info() { 
-            println!("[INFO][SYNC] request from={} heights={}-{}", requester_id, from_height, to_height); 
+    /// v5.6: Added from_peer_addr for routing responses to unregistered new nodes
+    pub async fn handle_sync_request(&self, from_height: u64, to_height: u64, requester_id: String, from_peer_addr: String) -> Result<(), QNetError> {
+        if is_info() {
+            println!("[INFO][SYNC] request from={} addr={} heights={}-{}", requester_id, from_peer_addr, from_height, to_height);
         }
         
         // Get microblocks from storage (already in network format)
@@ -25134,7 +25335,36 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         if blocks_data.is_empty() {
-            if is_debug() { println!("[DBG][SYNC] empty_response heights={}-{}", from_height, to_height); }
+            if is_info() { println!("[INFO][SYNC] empty_range heights={}-{} sending_empty_batch", from_height, to_height); }
+            // v6.5 FIX: ALWAYS send a response, even for empty ranges
+            // PROBLEM: Silent return Ok(()) caused requesting node to timeout after 2s
+            //   with "3 peers did not respond for h=0-0" — infinite retry loop
+            // SOLUTION: Send empty BlocksBatch so requester knows range is empty
+            //   This is standard P2P protocol: every request gets a response.
+            //   (Ethereum devp2p, libp2p — always respond with data or empty)
+            if let Some(ref p2p) = self.unified_p2p {
+                let peer_addr = p2p.get_peer_address_by_id(&requester_id)
+                    .or_else(|| {
+                        let peers = p2p.get_validated_active_peers();
+                        peers.iter().find(|p| p.id == requester_id).map(|p| p.addr.clone())
+                    })
+                    .or_else(|| {
+                        if !from_peer_addr.is_empty() { Some(from_peer_addr.clone()) } else { None }
+                    });
+
+                if let Some(addr) = peer_addr {
+                    let empty_response = crate::unified_p2p::NetworkMessage::BlocksBatch {
+                        blocks: Vec::new(),
+                        from_height,
+                        to_height,
+                        sender_id: self.node_id.clone(),
+                    };
+                    p2p.send_network_message(&addr, empty_response);
+                    if is_info() { println!("[INFO][SYNC] empty_batch_sent to={} addr={}", requester_id, addr); }
+                } else {
+                    if is_warn() { println!("[WARN][SYNC] empty_batch_no_addr id={} from={}", requester_id, from_peer_addr); }
+                }
+            }
             return Ok(());
         }
         
@@ -25156,14 +25386,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             const SYNC_BATCH_DELAY_MS: u64 = 5;  // 5ms pacing between batches
             
             // Find peer address
+            // v5.6: Use from_peer_addr as fallback for new nodes not yet in peer registry
             let peer_addr = p2p.get_peer_address_by_id(&requester_id)
                 .or_else(|| {
                     let peers = p2p.get_validated_active_peers();
                     peers.iter().find(|p| p.id == requester_id).map(|p| p.addr.clone())
+                })
+                .or_else(|| {
+                    if !from_peer_addr.is_empty() {
+                        if is_info() { println!("[INFO][SYNC] using_from_peer_addr id={} addr={}", requester_id, from_peer_addr); }
+                        Some(from_peer_addr.clone())
+                    } else {
+                        None
+                    }
                 });
-            
+
             let Some(addr) = peer_addr else {
-                if is_info() { println!("[WARN][SYNC] peer_not_found id={}", requester_id); }
+                if is_info() { println!("[WARN][SYNC] peer_not_found id={} from_addr={}", requester_id, from_peer_addr); }
                 return Ok(());
             };
             
@@ -26345,12 +26584,24 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Add to mempool for inclusion in next block
             let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
             let tx_hash = registration_tx.hash.clone();
-            if self.mempool.add_binary_transaction(tx_bytes, tx_hash.clone(), 0) {
-                if is_info() { 
-                    println!("[INFO][REG] onchain_tx_submitted node={} wallet={}... hash={}...", 
-                             self.node_id, 
+            if self.mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
+                if is_info() {
+                    println!("[INFO][REG] onchain_tx_submitted node={} wallet={}... hash={}...",
+                             self.node_id,
                              &wallet_address[..16.min(wallet_address.len())],
-                             &tx_hash[..16.min(tx_hash.len())]); 
+                             &tx_hash[..16.min(tx_hash.len())]);
+                }
+                // v6.5 FIX: Broadcast NodeRegistration TX to network
+                // PROBLEM: TX was only added to local mempool without broadcast.
+                //   If this node is not the current producer, TX would never be included in a block.
+                // SOLUTION: Use broadcast_transaction() (Gulf Stream → producer + gossip backup)
+                //   Same as NodeActivation TX in activation_validation.rs:1984
+                if let Some(ref p2p) = self.unified_p2p {
+                    if let Err(e) = p2p.broadcast_transaction(tx_bytes) {
+                        if is_warn() { println!("[WARN][REG] broadcast_fail hash={}... err={}", &tx_hash[..16.min(tx_hash.len())], e); }
+                    } else {
+                        if is_info() { println!("[INFO][REG] registration_tx_broadcast hash={}", &tx_hash[..16.min(tx_hash.len())]); }
+                    }
                 }
             } else {
                 eprintln!("[WARN][REG] onchain_tx_failed node={}", self.node_id);

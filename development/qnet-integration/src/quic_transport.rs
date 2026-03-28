@@ -312,6 +312,9 @@ pub struct QuicTransport {
     stats: Arc<RwLock<QuicStats>>,
     /// Per-peer RTT cache for adaptive initial_rtt on reconnect (v6.3)
     rtt_cache: Arc<Mutex<PeerRttCache>>,
+    /// v6.5: node_id → "IP:8001" mapping shared with P2P layer
+    /// Populated on QUIC handshake so genesis nodes know how to reach new peers
+    peer_id_to_addr: Option<Arc<DashMap<String, String>>>,
 }
 
 impl QuicTransport {
@@ -326,9 +329,16 @@ impl QuicTransport {
             message_handler: None,
             stats: Arc::new(RwLock::new(QuicStats::default())),
             rtt_cache: Arc::new(Mutex::new(PeerRttCache::new())),
+            peer_id_to_addr: None,
         }
     }
     
+    /// v6.5: Set peer_id_to_addr mapping shared with P2P layer
+    /// Called before start_server() to enable bidirectional peer discovery
+    pub fn set_peer_id_to_addr(&mut self, map: Arc<DashMap<String, String>>) {
+        self.peer_id_to_addr = Some(map);
+    }
+
     /// Set message handler callback
     pub fn set_message_handler(&mut self, handler: MessageHandler) {
         self.message_handler = Some(handler);
@@ -420,6 +430,7 @@ impl QuicTransport {
         let node_id = self.node_id.clone();
         let cert_serial = self.cert_serial.clone();
         let node_type = self.node_type.clone();
+        let peer_id_to_addr_map = self.peer_id_to_addr.clone();
         
         // Spawn server task
         tokio::spawn(async move {
@@ -477,6 +488,7 @@ impl QuicTransport {
                 let stats_clone = stats.clone();
                 let node_id_clone = node_id.clone();
                 let cert_serial_clone = cert_serial.clone();
+                let peer_id_map_clone = peer_id_to_addr_map.clone();
                 let node_type_clone = node_type.clone();
                 
                 tokio::spawn(async move {
@@ -603,6 +615,20 @@ impl QuicTransport {
                     
                     connections_clone.insert(peer_addr, quic_conn.clone());
                     if is_info() { println!("[INFO][QUIC] conn_stored peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type); }
+
+                    // v6.5 FIX: Map remote_node_id → "IP:8001" in P2P peer_id_to_addr
+                    // PROBLEM: Genesis nodes couldn't route responses to new nodes because
+                    //   ensure_peer_connected() uses privacy hash IDs, not real node_ids.
+                    //   QUIC handshake extracts remote_node_id but never mapped it.
+                    // SOLUTION: On every successful QUIC handshake (server side),
+                    //   insert remote_node_id → "peer_ip:8001" into shared DashMap.
+                    //   This enables handle_sync_request() and broadcast_transaction()
+                    //   to find the address of newly connected peers.
+                    if let Some(ref pid_map) = peer_id_map_clone {
+                        let peer_api_addr = format!("{}:8001", peer_addr.ip());
+                        pid_map.insert(remote_node_id.clone(), peer_api_addr.clone());
+                        if is_info() { println!("[INFO][QUIC] peer_mapped node_id={} addr={}", remote_node_id, peer_api_addr); }
+                    }
                     
                     {
                         let mut s = stats_clone.write().await;
@@ -1060,7 +1086,14 @@ impl QuicTransport {
         }
         
         if is_info() { println!("[INFO][QUIC] connected peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type); }
-        
+
+        // v6.5: Map remote_node_id → address on client side too
+        if let Some(ref pid_map) = self.peer_id_to_addr {
+            let peer_api_addr = format!("{}:8001", peer_addr.ip());
+            pid_map.insert(remote_node_id.clone(), peer_api_addr.clone());
+            if is_info() { println!("[INFO][QUIC] peer_mapped_client node_id={} addr={}", remote_node_id, peer_api_addr); }
+        }
+
         // Store connection
         let quic_conn = Arc::new(QuicConnection {
             connection,

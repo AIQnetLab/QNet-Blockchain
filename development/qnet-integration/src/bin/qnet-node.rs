@@ -2886,7 +2886,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     
     // Save activation code to persistent storage for future restarts
-    // Always save in development mode to remember selected node type
+    // v6.5: Early activation may have already been called inside readiness loop
+    //   (when genesis block became available). This is a fallback for cases where
+    //   early activation didn't trigger (e.g., genesis nodes, or early activation failed).
+    //   Mempool deduplicates TX by hash, so double-call is safe.
     if !activation_code.is_empty() {
         if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
             println!("⚠️  Warning: Could not save activation code: {}", e);

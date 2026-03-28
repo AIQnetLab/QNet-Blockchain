@@ -1978,11 +1978,24 @@ impl BlockchainActivationRegistry {
                     // Use transaction.hash which was calculated via canonical_bytes()
                     if mempool_arc.add_binary_transaction(tx_bytes.clone(), transaction.hash.clone(), transaction.gas_price) {
                         println!("[INFO][REGISTRY] activation_tx_added hash={}", &transaction.hash[..16.min(transaction.hash.len())]);
-                        // v4.3: Broadcast to ALL peers so ANY producer can include in next block
-                        // Without this, TX stays only in local mempool until this node produces a block
+                        // v6.5: Gulf Stream broadcast → current producer + gossip backup
+                        // If producer unknown (new node just started), fallback sends to ALL genesis nodes
+                        // This ensures activation TX reaches whoever is producing blocks
                         if let Some(p2p) = crate::node::try_get_p2p() {
-                            let _ = p2p.broadcast_transaction(tx_bytes);
+                            let _ = p2p.broadcast_transaction(tx_bytes.clone());
                             println!("[INFO][REGISTRY] activation_tx_broadcast hash={}", &transaction.hash[..16.min(transaction.hash.len())]);
+
+                            // v6.5: Explicit send to ALL genesis nodes as guaranteed fallback
+                            // New node may not know current producer yet — ensure TX reaches the network
+                            let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
+                            let tx_msg = crate::unified_p2p::NetworkMessage::Transaction {
+                                data: tx_bytes,
+                            };
+                            for ip in &genesis_ips {
+                                let addr = format!("{}:8001", ip);
+                                p2p.send_network_message(&addr, tx_msg.clone());
+                            }
+                            println!("[INFO][REGISTRY] activation_tx_sent_to_genesis nodes={}", genesis_ips.len());
                         }
                     } else {
                         println!("[WARN][REGISTRY] activation_tx_skip hash={} reason=duplicate_or_full", &transaction.hash[..16.min(transaction.hash.len())]);
