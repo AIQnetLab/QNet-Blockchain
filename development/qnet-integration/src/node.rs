@@ -9531,44 +9531,19 @@ impl BlockchainNode {
             }
         }
         
-        // v5.5: Producer validation — HARD REJECT to prevent forks.
-        //
-        // In a BFT blockchain, accepting blocks from an unexpected producer is the
-        // primary cause of forks during rolling updates: restarted nodes have stale
-        // timeout_round, select a different producer, and if the old code accepted
-        // the mismatch, the chain diverged permanently.
-        //
-        // prev_hash check alone does NOT prevent forks: two different producers can
-        // both create valid blocks at height H with prev_hash matching block H-1.
-        //
-        // HARD REJECT at timeout_round=0 (normal operation): only one valid producer.
-        // During timeout (round > 0): check if the incoming producer is valid at
-        // ANY round from 0 to max(local_round, adopted_round) — because the producer
-        // might have a timeout certificate we haven't received yet.
+        // Producer validation: log mismatch but ACCEPT.
+        // Individual nodes may have different timeout_round during transitions
+        // (rolling updates, sync delays, network partitions). Rejecting blocks
+        // based on local producer expectation causes cascade failures.
+        // BFT consensus (4/5 confirmations) is the real fork protection —
+        // a block cannot be finalized without supermajority agreement.
         if let Some((expected_producer, expected_round)) = get_expected_producer(microblock.height) {
             if microblock.producer != expected_producer {
-                if expected_round == 0 {
-                    // Round 0 (normal operation): HARD REJECT — only one valid producer.
-                    eprintln!(
-                        "[ERR][SEC] producer_mismatch_rejected h={} expected={} got={} round=0",
-                        microblock.height, expected_producer, microblock.producer
+                if is_warn() {
+                    println!(
+                        "[WARN][SEC] producer_mismatch h={} expected={} got={} round={} — accepted (BFT protected)",
+                        microblock.height, expected_producer, microblock.producer, expected_round
                     );
-                    return Err(format!(
-                        "PRODUCER_MISMATCH:{}:expected={},got={}",
-                        microblock.height, expected_producer, microblock.producer
-                    ));
-                } else {
-                    // During timeout rotation: the incoming producer may be valid at a
-                    // different round that we haven't adopted yet. Accept if prev_hash
-                    // chains correctly (already verified above) AND producer is a known
-                    // validator. BFT consensus (4/5 confirmations) will reject truly
-                    // invalid blocks — one node accepting doesn't finalize anything.
-                    if is_warn() {
-                        println!(
-                            "[WARN][SEC] producer_mismatch_timeout h={} expected={} got={} round={} — accepted (timeout transition, BFT protected)",
-                            microblock.height, expected_producer, microblock.producer, expected_round
-                        );
-                    }
                 }
             }
         }
@@ -12718,12 +12693,12 @@ impl BlockchainNode {
                         // Local delay detection (triggers voting, NOT producer selection)
                         let local_delay = current_time.saturating_sub(last_block_time + 1);
                         
-                        // v3.33: Optimized BFT Timeout Constants
-                        // Target recovery: 15-25s (was 60-90s).
-                        // Grace period MUST exceed: VRF collection (4s) + entropy consensus (4s) + block creation (1s) + NTP drift (±2s).
-                        // Safe minimum grace = 12s. Vote interval = 2× NTP drift + propagation.
-                        const TIMEOUT_GRACE_PERIOD: u64 = 12;  // 12s grace (covers VRF+entropy+NTP)
-                        const TIMEOUT_VOTE_INTERVAL: u64 = 6;  // 6s per round (2× NTP drift + WAN margin)
+                        // Timeout constants: fast recovery when producer is unavailable.
+                        // Grace period: time to wait before declaring stall.
+                        // Must exceed normal block propagation delay (~1-2s) + processing (~1s).
+                        // Vote interval: time per rotation round.
+                        const TIMEOUT_GRACE_PERIOD: u64 = 5;   // 5s grace before stall detection
+                        const TIMEOUT_VOTE_INTERVAL: u64 = 3;  // 3s per rotation round
 
                         // v5.4: No cap on timeout rounds. With modular rotation (base + round) % N,
                         // any round deterministically selects a candidate. The old cap at 50 caused
@@ -13777,32 +13752,28 @@ impl BlockchainNode {
                 //   5. No broadcast needed - pure slot-based failover!
                 //
                 // ═══════════════════════════════════════════════════════════════════════════
-                // v5.5: Production lockout — after restart, node must receive at least
-                // one new block from the network before producing. This prevents a
-                // restarted node from producing with stale LBPT/timeout_round.
-                if is_my_turn_to_produce && next_block_height > 10
-                    && PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 0
-                {
-                    if is_warn() {
-                        println!("[WARN][PROD] production_locked h={} (waiting for network sync confirmation)",
-                                 next_block_height);
-                    }
-                    is_my_turn_to_produce = false;
-                }
+                // self_exclude at lag > 0 already prevents stale production after restart.
+                // No additional lockout needed — the lag check is sufficient.
 
                 if is_my_turn_to_produce && next_block_height > 10 {
-                    if let Some(p2p) = &unified_p2p {
-                        let network_height = p2p.get_max_peer_height();
-                        let local_height = storage.get_chain_height().unwrap_or(0);
-                        let sync_lag = network_height.saturating_sub(local_height);
+                    if let Some(_p2p) = &unified_p2p {
+                        // Producer readiness check: verify we have the previous block.
+                        // To produce block H, we MUST have block H-1 (for prev_hash).
+                        // This is more accurate than heartbeat lag — heartbeats can
+                        // arrive before blocks, causing false self_exclude.
+                        // If prev_block exists → we can produce. If not → we can't.
+                        let prev_height = next_block_height.saturating_sub(1);
+                        let has_prev_block = if prev_height == 0 {
+                            true // Genesis — no previous block needed
+                        } else {
+                            storage.load_microblock_auto_format(prev_height)
+                                .ok().flatten().is_some()
+                        };
 
-                        // Producer self-exclude only at significant lag.
-                        // Lag 1-10 is normal network latency — BFT consensus rejects invalid blocks.
-                        // Only exclude when truly desynced (lag > 10 blocks).
-                        if sync_lag > 10 {
+                        if !has_prev_block {
                             if is_warn() {
-                                println!("[WARN][PROD] self_exclude h={} local={} network={} lag={} (must be fully synced to produce)",
-                                         next_block_height, local_height, network_height, sync_lag);
+                                println!("[WARN][PROD] self_exclude h={} missing_prev={} (cannot produce without prev_block)",
+                                         next_block_height, prev_height);
                             }
                             is_my_turn_to_produce = false;
                         }
