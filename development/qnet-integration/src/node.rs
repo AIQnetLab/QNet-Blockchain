@@ -4937,7 +4937,30 @@ impl BlockchainNode {
         
         // Initialize state manager
         let state = Arc::new(RwLock::new(StateManager::new()));
-        
+
+        // ═══════════════════════════════════════════════════════════════════
+        // v7.1: RESTORE FORK FLAGS FROM PERSISTENT STORAGE
+        // Fork activation state persisted in RocksDB metadata CF.
+        // Ensures fork flags survive restarts without relying on snapshot
+        // format or replay coverage. Reset on full replay (TIER 3),
+        // re-activated at the correct block by accrue_pending_rewards().
+        // ═══════════════════════════════════════════════════════════════════
+        match storage.load_fork_flag("pending_rewards_in_merkle") {
+            Ok(Some(true)) => {
+                qnet_state::activate_pending_rewards_in_merkle();
+                println!("[INFO][STATE] fork_flag_restored pending_rewards_in_merkle=true (from DB)");
+            }
+            Ok(Some(false)) => {
+                if is_info() { println!("[INFO][STATE] fork_flag_loaded pending_rewards_in_merkle=false"); }
+            }
+            Ok(None) => {
+                if is_info() { println!("[INFO][STATE] fork_flag_not_set pending_rewards_in_merkle (pre-v7.1 DB)"); }
+            }
+            Err(e) => {
+                eprintln!("[WARN][STATE] fork_flag_load_fail err={} — will be determined by replay", e);
+            }
+        }
+
         // ═══════════════════════════════════════════════════════════════════
         // v5.1: STATE RECOVERY PIPELINE
         // Three-tier approach: snapshot → incremental replay → full replay
@@ -5032,6 +5055,10 @@ impl BlockchainNode {
                 restored_snapshot_height.saturating_add(1)
             } else {
                 // TIER 3: Snapshot failed — full replay from genesis (block 0)
+                // v7.1: Reset fork flags (memory + DB) for clean replay — will be
+                // re-activated at the correct block by accrue_pending_rewards()
+                qnet_state::reset_pending_rewards_in_merkle();
+                let _ = storage.save_fork_flag("pending_rewards_in_merkle", false);
                 0
             };
 
@@ -5109,8 +5136,14 @@ impl BlockchainNode {
                             }
 
                             // ── Phase 4: Apply reward accruals (affects merkle root!) ──
+                            let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
                             for (wallet, delta) in &deferred_reward_accruals {
                                 let _ = state_guard.accrue_pending_rewards(wallet, *delta);
+                            }
+                            // v7.1: Persist fork flag on first activation
+                            if !fork_was_active && qnet_state::is_pending_rewards_in_merkle() {
+                                let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
+                                println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (startup replay h={})", h);
                             }
 
                             // ── Phase 5: Finalize merkle tree ──
@@ -8147,17 +8180,23 @@ impl BlockchainNode {
                             
                             // v7.0: Apply reward accruals BEFORE finalize_merkle (deterministic, in-block)
                             if !deferred_reward_accruals.is_empty() {
+                                let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
                                 for (wallet, delta) in &deferred_reward_accruals {
                                     if let Some(ref mut snap) = block_snapshot {
                                         snap.record_pre_images(&[wallet.clone()], &state_guard.accounts);
                                     }
                                     if let Err(e) = state_guard.accrue_pending_rewards(wallet, *delta) {
-                                        eprintln!("[WARN][REWARDS] sync_accrue_fail wallet={}... err={}", 
+                                        eprintln!("[WARN][REWARDS] sync_accrue_fail wallet={}... err={}",
                                                  &wallet[..wallet.len().min(16)], e);
                                     }
                                 }
+                                // v7.1: Persist fork flag on first activation
+                                if !fork_was_active && qnet_state::is_pending_rewards_in_merkle() {
+                                    let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
+                                    println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (sync h={})", microblock.height);
+                                }
                                 if is_info() {
-                                    println!("[INFO][REWARDS] sync_accruals_applied count={} h={}", 
+                                    println!("[INFO][REWARDS] sync_accruals_applied count={} h={}",
                                              deferred_reward_accruals.len(), microblock.height);
                                 }
                             }
@@ -8858,6 +8897,13 @@ impl BlockchainNode {
                                     return Err("empty_chain".to_string());
                                 }
 
+                                // v7.1: Reset fork flag in memory only. DB flag will be:
+                                //   - Reset if full replay from genesis (no valid snapshot)
+                                //   - Restored from DB if snapshot-based recovery (flag already persisted)
+                                // This prevents losing fork activation state on snapshot-based recovery
+                                // when replay range doesn't cover the activation block.
+                                qnet_state::reset_pending_rewards_in_merkle();
+
                                 // Try loading snapshot
                                 let mut replay_from = 0u64; // default: full replay from genesis (including block 0)
                                 match storage.load_latest_state_snapshot().await {
@@ -8886,6 +8932,11 @@ impl BlockchainNode {
                                                     }
                                                     drop(state_guard);
                                                     qnet_state::clear_credited_fees_cache();
+                                                    // v7.1: Restore fork flag from DB for snapshot-based recovery
+                                                    if let Ok(Some(true)) = storage.load_fork_flag("pending_rewards_in_merkle") {
+                                                        qnet_state::activate_pending_rewards_in_merkle();
+                                                        println!("[INFO][STATE] fork_flag_restored pending_rewards_in_merkle=true (recovery snapshot)");
+                                                    }
                                                     println!("[INFO][STATE] snapshot_restored h={} accounts={} total_supply={}", snap_height, count, snap_total_supply);
                                                     replay_from = snap_height.saturating_add(1);
                                                 } else {
@@ -8917,6 +8968,7 @@ impl BlockchainNode {
                                     drop(sg);
                                     qnet_state::clear_credited_fees_cache();
                                     qnet_state::reset_pending_rewards_in_merkle();
+                                    let _ = storage.save_fork_flag("pending_rewards_in_merkle", false);
                                     if is_info() {
                                         println!("[INFO][STATE] recovery_state_cleared for full replay from genesis");
                                     }
@@ -8966,8 +9018,14 @@ impl BlockchainNode {
                                                     }
                                                 }
                                                 // Apply reward accruals
+                                                let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
                                                 for (wallet, delta) in &reward_accruals {
                                                     let _ = sg.accrue_pending_rewards(wallet, *delta);
+                                                }
+                                                // v7.1: Persist fork flag on first activation
+                                                if !fork_was_active && qnet_state::is_pending_rewards_in_merkle() {
+                                                    let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
+                                                    println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (recovery h={})", h);
                                                 }
                                                 let _ = sg.finalize_merkle();
                                                 // Update chain_state.height
@@ -15948,13 +16006,19 @@ impl BlockchainNode {
                         }
                         
                         // v7.0: Apply reward accruals BEFORE finalize_merkle
+                        let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
                         for (wallet, delta) in &producer_reward_accruals {
                             if let Err(e) = state_guard.accrue_pending_rewards(wallet, *delta) {
-                                eprintln!("[WARN][REWARDS] producer_accrue_fail wallet={}... err={}", 
+                                eprintln!("[WARN][REWARDS] producer_accrue_fail wallet={}... err={}",
                                          &wallet[..wallet.len().min(16)], e);
                             }
                         }
-                        
+                        // v7.1: Persist fork flag on first activation
+                        if !fork_was_active && qnet_state::is_pending_rewards_in_merkle() {
+                            let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
+                            println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (producer h={})", next_block_height);
+                        }
+
                         // 2. Get producer wallet for fee crediting
                         let producer_wallet = match storage.load_node_registration(&node_id) {
                             Ok(Some((_, wallet, _))) => wallet,

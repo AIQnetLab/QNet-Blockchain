@@ -1235,11 +1235,40 @@ impl PersistentStorage {
     pub fn set_chain_height(&self, height: u64) -> IntegrationResult<()> {
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
-        
+
         self.db.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes())?;
         Ok(())
     }
-    
+
+    // ═══════════════════════════════════════════════════════════════════
+    // v7.1: FORK FLAG PERSISTENCE
+    // Persists consensus fork flags in RocksDB so they survive node restarts.
+    // Without this, a fork flag activated at block N would be lost on restart
+    // if the snapshot is taken after N and replay doesn't cover block N.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Save a named fork flag to RocksDB metadata CF.
+    /// Fork flags are persisted as single-byte values: 1 = active, 0 = inactive.
+    pub fn save_fork_flag(&self, flag_name: &str, active: bool) -> IntegrationResult<()> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let key = format!("fork_{}", flag_name);
+        self.db.put_cf(&metadata_cf, key.as_bytes(), &[active as u8])?;
+        Ok(())
+    }
+
+    /// Load a named fork flag from RocksDB metadata CF.
+    /// Returns None if the flag was never persisted (fresh DB or pre-v7.1 node).
+    pub fn load_fork_flag(&self, flag_name: &str) -> IntegrationResult<Option<bool>> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let key = format!("fork_{}", flag_name);
+        match self.db.get_cf(&metadata_cf, key.as_bytes())? {
+            Some(data) if !data.is_empty() => Ok(Some(data[0] != 0)),
+            _ => Ok(None),
+        }
+    }
+
     /// DATA CONSISTENCY: Reset chain height to 0 (DANGEROUS - requires explicit confirmation)
     /// This function will ONLY work if QNET_FORCE_RESET=1 AND QNET_CONFIRM_RESET=YES
     pub fn reset_chain_height(&self) -> IntegrationResult<()> {
@@ -2908,6 +2937,16 @@ impl Storage {
     /// DATA CONSISTENCY: Reset chain height to 0 (wrapper for persistent storage)
     pub fn reset_chain_height(&self) -> IntegrationResult<()> {
         self.persistent.reset_chain_height()
+    }
+
+    /// v7.1: Save fork flag to persistent storage
+    pub fn save_fork_flag(&self, flag_name: &str, active: bool) -> IntegrationResult<()> {
+        self.persistent.save_fork_flag(flag_name, active)
+    }
+
+    /// v7.1: Load fork flag from persistent storage
+    pub fn load_fork_flag(&self, flag_name: &str) -> IntegrationResult<Option<bool>> {
+        self.persistent.load_fork_flag(flag_name)
     }
     
     pub fn get_block_hash(&self, height: u64) -> IntegrationResult<Option<String>> {

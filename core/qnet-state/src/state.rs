@@ -1446,17 +1446,18 @@ impl StateManager {
     /// v2.98: Restore accounts from snapshot (after node restart or sync)
     /// v3.22: Optimized with batch Merkle insert for O(n) instead of O(n²)
     /// This replaces in-memory DashMap with persisted blockchain state
+    /// v7.1: REMOVED premature fork activation. pending_rewards > 0 does NOT mean
+    /// the fork was active — update_pending_rewards() (SET path) writes pending_rewards
+    /// without activating the fork. The fork flag must ONLY be activated by
+    /// accrue_pending_rewards() during deterministic block replay.
+    /// This prevents state_root_mismatch on every node restart.
     pub fn restore_accounts(&self, accounts: Vec<(String, Account)>) -> StateResult<()> {
         let count = accounts.len();
         self.accounts.clear();
 
-        // v7.0: Detect if state snapshot was created after fork activation.
-        // If any account has pending_rewards > 0, the fork was already active
-        // when the snapshot was taken, so we must activate it for correct hashing.
-        let has_pending = accounts.iter().any(|(_, acc)| acc.pending_rewards > 0);
-        if has_pending {
-            activate_pending_rewards_in_merkle();
-        }
+        // v7.1: Do NOT activate fork here. Let block replay handle it correctly.
+        // The fork flag (PENDING_REWARDS_IN_MERKLE) will be activated when replay
+        // encounters a block with non-empty v2 emission accruals.
 
         // v3.22: Rebuild merkle tree with batch inserts
         let mut tree = self.merkle_tree.write();
