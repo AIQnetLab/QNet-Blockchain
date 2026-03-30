@@ -848,10 +848,11 @@ impl PersistentStorage {
         // This prevents accepting blocks from fork/attack with gaps
         let mut result = self.find_max_continuous_height(&microblocks_cf, metadata_height)?;
         
-        // v3.0: CRITICAL FIX - If metadata_height is low (0-10) and no continuous blocks found,
-        // scan for FIRST existing block and use that as starting point
-        // This handles the case where OOM corrupted metadata but blocks are intact
-        if result.is_none() && metadata_height < 100 {
+        // v9.0: CRITICAL FIX - If no continuous blocks found from metadata_height,
+        // scan for FIRST existing block and use that as starting point.
+        // Previously had arbitrary `< 100` cutoff — if metadata stuck at e.g. 5000
+        // but blocks exist up to 8000, recovery was SKIPPED and node stalled permanently.
+        if result.is_none() {
             if is_warn() {
                 println!("[WARN][STORAGE] no_continuous_from_h={} scanning_for_first_block", metadata_height);
             }
@@ -1115,11 +1116,18 @@ impl PersistentStorage {
                         }
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][STORAGE] prune_iter_error: {}", e);
+                    }
+                    break;
+                }
             }
         }
-        
-        if deleted % 1000 != 0 {
+
+        // v9.1: Always flush remaining batch (was: only if deleted % 1000 != 0,
+        // which lost up to 999 deletes on iterator error mid-batch).
+        if !batch.is_empty() {
             self.db.write(batch)?;
         }
         
@@ -2079,15 +2087,35 @@ impl PersistentStorage {
     }
     
     /// PRODUCTION v2.45: Delete macroblock by index (for fork recovery)
-    /// Used when node is stuck on fork and needs to resync from network
+    /// v9.0: Cleans ALL associated data: macroblock record + state/full/delta snapshots + IPFS ref.
+    /// Key schema: macroblocks created at height = macroblock_index * 90.
+    /// Snapshots use height-based keys: state_snap_{h}, full_snap_{h}, delta_{h}, ipfs_{h}.
     pub fn delete_macroblock(&self, macroblock_index: u64) -> IntegrationResult<()> {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
-        
+
+        let mut batch = rocksdb::WriteBatch::default();
+
+        // Delete macroblock record
         let key = format!("macroblock_{}", macroblock_index);
-        self.db.delete_cf(&microblocks_cf, key.as_bytes())?;
-        
-        println!("[INFO][STORAGE] delete_mb idx={}", macroblock_index);
+        batch.delete_cf(&microblocks_cf, key.as_bytes());
+
+        // v9.0: Delete ALL associated snapshot variants using correct key formats.
+        // Macroblock at index N corresponds to microblock height N * 90.
+        if let Some(snapshots_cf) = self.db.cf_handle("snapshots") {
+            let height = macroblock_index * 90;
+            // Delete all known snapshot key formats for this height
+            batch.delete_cf(&snapshots_cf, format!("state_snap_{}", height).as_bytes());
+            batch.delete_cf(&snapshots_cf, format!("full_snap_{}", height).as_bytes());
+            batch.delete_cf(&snapshots_cf, format!("delta_{}", height).as_bytes());
+            batch.delete_cf(&snapshots_cf, format!("ipfs_{}", height).as_bytes());
+        }
+
+        self.db.write(batch)?;
+
+        if crate::node::is_info() {
+            println!("[INFO][STORAGE] delete_mb idx={} h={} +snapshots", macroblock_index, macroblock_index * 90);
+        }
         Ok(())
     }
     
@@ -2289,11 +2317,18 @@ impl PersistentStorage {
             },
             None => {
                 // Fallback: Check microblocks for legacy data (will be removed in future)
+                // v9.1: Bounded to 100K iterations to prevent OOM on large chains
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
-        
+
         let iter = self.db.iterator_cf(&microblocks_cf, rocksdb::IteratorMode::Start);
+        let mut scan_count = 0usize;
+        const MAX_LEGACY_SCAN: usize = 100_000;
         for item in iter {
+            scan_count += 1;
+            if scan_count > MAX_LEGACY_SCAN {
+                break;
+            }
             let (key, data) = item.map_err(|e| IntegrationError::StorageError(e.to_string()))?;
             let key_str = std::str::from_utf8(&key).unwrap_or("");
             
@@ -3170,23 +3205,34 @@ impl Storage {
             state_root: microblock.state_root,
         };
         
-        // Step 3: Save PoH state separately for fast validation (v2.19.13)
-        // This enables O(1) PoH validation without loading full block
+        // Step 3: Prepare PoH state for inclusion in atomic batch
         let poh_state = qnet_state::PoHState::from_microblock(microblock);
-        self.persistent.save_poh_state(&poh_state)?;
-        
+        let poh_data = bincode::serialize(&poh_state)
+            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+        let poh_key = format!("poh_{}", height);
+
         // Serialize EfficientMicroBlock (much smaller than full MicroBlock)
         let efficient_data = bincode::serialize(&efficient_block)
             .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-        
+
         // Apply adaptive compression to EfficientMicroBlock
         let compressed_block = self.compress_block_adaptive(&efficient_data, height)?;
-        
-        // Write all in single atomic batch
+
+        // v9.0: Single atomic WriteBatch for ALL data: TXs + PoH + block header + chain_height.
+        // Previously: save_poh_state() + db.write(batch) + save_microblock() = 3 separate writes.
+        // Crash between any two = orphaned data (TXs without header, PoH without block, etc).
+        // Now: everything in ONE WriteBatch for crash-safe atomicity.
+        let microblocks_cf = self.persistent.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks CF not found".to_string()))?;
+        let metadata_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata CF not found".to_string()))?;
+        let poh_cf = self.persistent.db.cf_handle("poh_state")
+            .ok_or_else(|| IntegrationError::StorageError("poh_state CF not found".to_string()))?;
+        let block_key = format!("microblock_{}", height);
+        batch.put_cf(&microblocks_cf, block_key.as_bytes(), &compressed_block);
+        batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
+        batch.put_cf(&poh_cf, poh_key.as_bytes(), &poh_data);
         self.persistent.db.write(batch)?;
-        
-        // Save the efficient block
-        self.persistent.save_microblock(height, &compressed_block)?;
         
         // Log savings for monitoring (every 100 blocks)
         if height % 100 == 0 {
@@ -3204,10 +3250,35 @@ impl Storage {
         self.persistent.load_microblock(height)
     }
     
-    /// Delete a microblock at the specified height (for fork resolution)
+    /// Delete a microblock at the specified height (for fork resolution).
+    /// v9.0: Also cleans up TX indices to prevent orphaned data.
     pub fn delete_microblock(&self, height: u64) -> IntegrationResult<()> {
-        println!("[INFO][STORAGE] delete_microblock h={}", height);
-        // Also delete associated PoH state
+        if crate::node::is_info() {
+            println!("[INFO][STORAGE] delete_microblock h={}", height);
+        }
+
+        // v9.0: Load block BEFORE deletion to get TX hashes for index cleanup.
+        // If block is in EfficientMicroBlock format, tx_hashes are directly available.
+        // If load fails, still delete the block (orphaned indices are less bad than orphaned blocks).
+        if let Ok(Some(block)) = self.load_microblock_auto_format(height) {
+            let tx_cf = self.persistent.db.cf_handle("transactions");
+            let tx_index_cf = self.persistent.db.cf_handle("tx_index");
+            if let (Some(tx_cf), Some(tx_index_cf)) = (tx_cf, tx_index_cf) {
+                let mut cleanup_batch = rocksdb::WriteBatch::default();
+                for tx in &block.transactions {
+                    let tx_key = format!("tx_{}", tx.hash);
+                    cleanup_batch.delete_cf(&tx_cf, tx_key.as_bytes());
+                    cleanup_batch.delete_cf(&tx_index_cf, tx_key.as_bytes());
+                }
+                if !block.transactions.is_empty() {
+                    if let Err(e) = self.persistent.db.write(cleanup_batch) {
+                        eprintln!("[WARN][STORAGE] tx_index_cleanup_failed h={} err={}", height, e);
+                    }
+                }
+            }
+        }
+
+        // Delete PoH state and block header
         let _ = self.persistent.delete_poh_state(height);
         self.persistent.delete_microblock(height)
     }
@@ -3852,6 +3923,19 @@ impl Storage {
                 }
             }
             
+            // v9.0: Verify all transactions loaded. If any are missing, the block
+            // is incomplete and would cause consensus divergence (different nodes see
+            // different TX counts for the same block).
+            let expected_tx_count = efficient_block.transaction_hashes.len();
+            if transactions.len() != expected_tx_count && expected_tx_count > 0 {
+                eprintln!("[ERR][STORAGE] incomplete_block h={} expected_txs={} loaded={}",
+                         height, expected_tx_count, transactions.len());
+                return Err(IntegrationError::StorageError(
+                    format!("Block {} missing {} transactions", height,
+                            expected_tx_count - transactions.len())
+                ));
+            }
+
             // Reconstruct full MicroBlock (including QRB VRF data)
             let microblock = qnet_state::MicroBlock {
                 height: efficient_block.height,
@@ -5809,10 +5893,22 @@ impl Storage {
         
         // 5. Old snapshots — keep latest 3
         let snapshots_removed = self.cleanup_old_snapshots(3).unwrap_or(0);
+
+        // 6. v9.0: Prune old tx_index + tx_by_address (runs on ALL node types including Super).
+        // Retention: 100,000 blocks (~28h at 1 block/sec). Explorer API queries use tx_by_address;
+        // keeping ~1 day is sufficient for most wallet UIs. Historical queries → archive node.
+        const TX_INDEX_RETENTION_BLOCKS: u64 = 100_000;
+        let tx_pruned = if current_height > TX_INDEX_RETENTION_BLOCKS {
+            let prune_before = current_height - TX_INDEX_RETENTION_BLOCKS;
+            self.prune_old_transactions(prune_before).unwrap_or(0)
+        } else {
+            0
+        };
+
+        let total_removed = pings_removed as u64 + poh_removed as u64 + consensus_removed as u64
+            + failover_removed as u64 + snapshots_removed as u64 + tx_pruned;
         
-        let total_removed = pings_removed + poh_removed + consensus_removed + failover_removed + snapshots_removed;
-        
-        // 6. Trigger compaction on ALL CFs to physically reclaim disk space
+        // 7. Trigger compaction on ALL CFs to physically reclaim disk space
         if total_removed > 0 {
             if let Err(e) = self.persistent.compact_all() {
                 println!("[WARN][CLEANUP] compaction_failed err={}", e);
@@ -5821,8 +5917,8 @@ impl Storage {
         
         let elapsed = start.elapsed();
         if total_removed > 0 {
-            println!("[INFO][CLEANUP] ephemeral_cleanup_done elapsed={:?} pings={} poh={} consensus={} failover={} snapshots={} total={}",
-                     elapsed, pings_removed, poh_removed, consensus_removed, failover_removed, snapshots_removed, total_removed);
+            println!("[INFO][CLEANUP] ephemeral_cleanup_done elapsed={:?} pings={} poh={} consensus={} failover={} snapshots={} tx_idx={} total={}",
+                     elapsed, pings_removed, poh_removed, consensus_removed, failover_removed, snapshots_removed, tx_pruned, total_removed);
         }
         
         Ok(())
@@ -6590,15 +6686,25 @@ impl Storage {
             }
             
             if cursor + 4 > decompressed.len() { break; }
-            let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Key length field must be 4 bytes")) as usize;
+            let key_len = u32::from_le_bytes(
+                match decompressed[cursor..cursor+4].try_into() {
+                    Ok(b) => b,
+                    Err(_) => break, // v9.1: safe break instead of panic
+                }
+            ) as usize;
             cursor += 4;
-            
+
             if cursor + key_len > decompressed.len() { break; }
             let key = &decompressed[cursor..cursor+key_len];
             cursor += key_len;
-            
+
             if cursor + 4 > decompressed.len() { break; }
-            let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Value length field must be 4 bytes")) as usize;
+            let value_len = u32::from_le_bytes(
+                match decompressed[cursor..cursor+4].try_into() {
+                    Ok(b) => b,
+                    Err(_) => break, // v9.1: safe break instead of panic
+                }
+            ) as usize;
             cursor += 4;
             
             if cursor + value_len > decompressed.len() { break; }
@@ -7060,88 +7166,100 @@ impl Storage {
         Ok(())
     }
     
-    /// PRODUCTION: Prune old transactions that are no longer in retained blocks
-    /// Transactions are stored separately from blocks for fast lookup
-    /// After block pruning, orphaned transactions must also be removed
-    fn prune_old_transactions(&self, prune_before_height: u64) -> IntegrationResult<u64> {
+    /// v9.0: Prune old transactions + tx_index + tx_by_address below retention height.
+    /// Uses HashSet for O(1) lookups (was O(n) Vec::contains — quadratic on large datasets).
+    /// Called from prune_old_blocks() for non-Super nodes, and from run_ephemeral_cleanup()
+    /// for ALL node types (Super nodes keep blocks but prune tx indices beyond retention).
+    pub fn prune_old_transactions(&self, prune_before_height: u64) -> IntegrationResult<u64> {
         let tx_cf = self.persistent.db.cf_handle("transactions")
             .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
         let tx_index_cf = self.persistent.db.cf_handle("tx_index")
             .ok_or_else(|| IntegrationError::StorageError("tx_index column family not found".to_string()))?;
         let tx_by_addr_cf = self.persistent.db.cf_handle("tx_by_address")
             .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
-        
+
         let mut batch = WriteBatch::default();
         let mut pruned_count: u64 = 0;
-        let mut tx_hashes_to_prune: Vec<String> = Vec::new();
-        
+        // v9.0: Use HashSet for O(1) membership test (was Vec::contains = O(n))
+        let mut tx_hashes_to_prune: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         // Step 1: Find transactions in blocks before prune_before_height using tx_index
         let iter = self.persistent.db.iterator_cf(&tx_index_cf, rocksdb::IteratorMode::Start);
         for item in iter {
             let (key, value) = item?;
-            
-            // tx_index stores: tx_hash -> block_height
+
+            // tx_index stores: tx_hash -> block_height (8 bytes BE)
             if value.len() >= 8 {
                 let block_height = u64::from_be_bytes(value[..8].try_into().unwrap_or([0u8; 8]));
-                
+
                 if block_height < prune_before_height {
                     let tx_key = String::from_utf8_lossy(&key).to_string();
-                    tx_hashes_to_prune.push(tx_key);
+                    tx_hashes_to_prune.insert(tx_key);
                 }
             }
         }
-        
+
+        if tx_hashes_to_prune.is_empty() {
+            return Ok(0);
+        }
+
         // Step 2: Delete transactions and their indices
         for tx_key in &tx_hashes_to_prune {
-            // Delete from transactions CF
             batch.delete_cf(&tx_cf, tx_key.as_bytes());
-            
-            // Delete from tx_index CF
             batch.delete_cf(&tx_index_cf, tx_key.as_bytes());
-            
+
             pruned_count += 1;
-            
-            // Apply batch every 1000 transactions to avoid memory issues
-            if pruned_count % 1000 == 0 {
+
+            // Apply batch every 5000 transactions to limit memory
+            if pruned_count % 5000 == 0 {
                 self.persistent.db.write(batch)?;
                 batch = WriteBatch::default();
-                println!("[PRUNING] Pruned {} transactions...", pruned_count);
+                if crate::node::is_info() {
+                    println!("[INFO][PRUNE] tx_progress count={}", pruned_count);
+                }
             }
         }
-        
-        // Step 3: Clean up tx_by_address index (more complex - need to scan)
-        // This index stores: addr_{address}_{timestamp}_{tx_hash}
-        // We need to remove entries for pruned transactions
+
+        // Step 3: Clean up tx_by_address index
+        // Key format: addr_{address}_{timestamp_hex}_{tx_hash}
+        // v9.0: O(1) HashSet lookup per entry instead of O(n) Vec::contains
         let addr_iter = self.persistent.db.iterator_cf(&tx_by_addr_cf, rocksdb::IteratorMode::Start);
-        let mut addr_keys_to_delete: Vec<Vec<u8>> = Vec::new();
-        
+        let mut addr_pruned: u64 = 0;
+
         for item in addr_iter {
             let (key, _value) = item?;
             let key_str = String::from_utf8_lossy(&key);
-            
-            // Extract tx_hash from key format: addr_{address}_{timestamp}_{tx_hash}
+
+            // Extract tx_hash from last segment of key
             if let Some(tx_hash) = key_str.rsplit('_').next() {
                 let tx_key = format!("tx_{}", tx_hash);
                 if tx_hashes_to_prune.contains(&tx_key) {
-                    addr_keys_to_delete.push(key.to_vec());
+                    batch.delete_cf(&tx_by_addr_cf, &key);
+                    addr_pruned += 1;
+
+                    if addr_pruned % 5000 == 0 {
+                        self.persistent.db.write(batch)?;
+                        batch = WriteBatch::default();
+                    }
                 }
             }
         }
-        
-        for key in addr_keys_to_delete {
-            batch.delete_cf(&tx_by_addr_cf, &key);
-        }
-        
+
         // Apply remaining batch
         if !batch.is_empty() {
             self.persistent.db.write(batch)?;
         }
-        
+
         // Force compaction on transaction CFs to reclaim space
         if pruned_count > 0 {
             self.persistent.db.compact_range_cf(&tx_cf, None::<&[u8]>, None::<&[u8]>);
             self.persistent.db.compact_range_cf(&tx_index_cf, None::<&[u8]>, None::<&[u8]>);
             self.persistent.db.compact_range_cf(&tx_by_addr_cf, None::<&[u8]>, None::<&[u8]>);
+
+            if crate::node::is_info() {
+                println!("[INFO][PRUNE] tx_done txs={} addr_entries={} before_h={}",
+                         pruned_count, addr_pruned, prune_before_height);
+            }
         }
         
         Ok(pruned_count)
@@ -7445,7 +7563,10 @@ impl Storage {
                 let expected_hash = manifest.chunk_hashes[i].clone();
                 let sem = semaphore.clone();
                 handles.push(tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return Err(IntegrationError::Other("Snapshot semaphore closed".into())),
+                    };
                     let url = format!("http://{}/api/v1/snapshot/{}/chunk/{}", peer, height, i);
                     let resp = client.get(&url).send().await
                         .map_err(|e| IntegrationError::Other(format!("Chunk {} download: {}", i, e)))?;

@@ -92,8 +92,35 @@ pub const QUIC_PORT: u16 = 10876;
 /// NOTE: peer.addr contains API port (8001), so offset = 10876 - 8001 = 2875
 pub const QUIC_PORT_OFFSET: u16 = 2875;
 
-/// Maximum message size (10 MB - for macroblocks)
+/// Maximum message size (10 MB - for macroblocks/block batches)
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
+
+/// v9.0: Per-message-type size limits.
+/// Enforced BEFORE memory allocation to prevent OOM from oversized small messages.
+/// Type byte is extracted from wire header position [1] before deserialization.
+/// Returns max allowed payload size for a given message type byte.
+fn max_size_for_message_type(msg_type: u8) -> usize {
+    match msg_type {
+        // Block data: full 10 MB (macroblocks can be large)
+        1 => MAX_MESSAGE_SIZE,         // Block
+        8 => 512 * 1024 + 256,        // ShredProtocolChunk: 512 KB data + header
+        // Consensus messages: 64 KB max (signatures + metadata only)
+        5 => 64 * 1024,               // ConsensusCommit
+        6 => 64 * 1024,               // ConsensusReveal
+        // Small control messages: 8 KB
+        4 => 8 * 1024,                // HealthPing (Dilithium sig ~3KB + metadata)
+        3 => 256 * 1024,              // PeerDiscovery (can contain many peers)
+        // Deprecated: reject entirely
+        7 => 0,                        // EmergencyProducerChange (deprecated)
+        9 => 0,                        // ReputationSyncDeprecated
+        // Type 0 = catch-all (Transaction, VrfLeaderClaim, TimeoutVote, SyncStatus,
+        //   BlocksBatch, MacroblocksBatch, EntropyRequest/Response, heartbeats, etc.)
+        // Use 2 MB — large enough for tx batches but not full 10 MB abuse
+        2 => 1024 * 1024,             // Transaction: 1 MB
+        0 => 2 * 1024 * 1024,         // Catch-all: 2 MB
+        _ => 2 * 1024 * 1024,         // Unknown: 2 MB
+    }
+}
 
 /// Protocol version
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -110,6 +137,34 @@ const MAX_CONCURRENT_HANDSHAKES: usize = 64;
 /// (~30s), and 64 stalled peers permanently block ALL incoming QUIC connections
 /// (observed: 2.5M throttled events in 1 hour — complete QUIC transport death).
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
+/// v9.1: Max concurrent QUIC connections from a single IP address.
+/// Prevents single-source resource exhaustion while allowing reasonable
+/// multi-node setups behind NAT (e.g., 3-4 nodes per datacenter).
+/// At 20 per IP × 500 global cap, an attacker needs 25+ IPs to saturate.
+const MAX_CONNECTIONS_PER_IP: u32 = 20;
+
+/// v9.2: TOFU pin lifetime (24 hours). After this, the pin expires and re-pins
+/// on next connection. This handles cert rotation on rolling restarts:
+/// node restarts with new self-signed cert → peers accept after TTL expires.
+const TOFU_PIN_TTL_SECS: u64 = 86_400;
+
+/// v9.2: TOFU grace period (2 hours). If a pin is OLDER than this and a NEW
+/// fingerprint arrives, the pin is updated (not rejected). This allows cert
+/// rotation without waiting for full TTL. Within the first 2 hours after
+/// pinning, any change IS suspicious (possible MITM) → rejected.
+const TOFU_PIN_GRACE_AFTER_SECS: u64 = 7_200;
+
+/// v9.2: Maximum TOFU pins to prevent memory growth from attacker node_ids.
+/// At ~80 bytes per entry (32 fp + 8 ts + ~40 key), 10K pins ≈ 800KB.
+const TOFU_MAX_PINS: usize = 10_000;
+
+/// v9.2: TOFU pin entry with timestamp for TTL-based expiry and cert rotation.
+#[derive(Debug, Clone)]
+struct TofuPin {
+    fingerprint: [u8; 32],
+    pinned_at: u64, // unix timestamp (seconds)
+}
 
 // ============================================================================
 // ADAPTIVE RTT - Per-peer RTT cache for optimal congestion control (v6.3)
@@ -315,6 +370,16 @@ pub struct QuicTransport {
     /// v6.5: node_id → "IP:8001" mapping shared with P2P layer
     /// Populated on QUIC handshake so genesis nodes know how to reach new peers
     peer_id_to_addr: Option<Arc<DashMap<String, String>>>,
+    /// v9.0: TOFU (Trust On First Use) cert fingerprint pinning.
+    /// Maps node_id → SHA3-256(cert DER) on first successful connection.
+    /// Subsequent connections from same node_id MUST present same cert fingerprint.
+    /// Prevents MITM even if attacker knows the expected SAN format.
+    /// v9.2: Stores TofuPin with timestamp for TTL expiry + cert rotation.
+    cert_fingerprint_pins: Arc<DashMap<String, TofuPin>>,
+    /// v9.1: Per-IP connection counter to prevent single-IP resource exhaustion.
+    /// Maps IP → active connection count. Decremented on connection close.
+    /// Max MAX_CONNECTIONS_PER_IP concurrent connections from one IP address.
+    per_ip_connections: Arc<DashMap<std::net::IpAddr, u32>>,
 }
 
 impl QuicTransport {
@@ -330,6 +395,8 @@ impl QuicTransport {
             stats: Arc::new(RwLock::new(QuicStats::default())),
             rtt_cache: Arc::new(Mutex::new(PeerRttCache::new())),
             peer_id_to_addr: None,
+            cert_fingerprint_pins: Arc::new(DashMap::new()),
+            per_ip_connections: Arc::new(DashMap::new()),
         }
     }
     
@@ -431,7 +498,9 @@ impl QuicTransport {
         let cert_serial = self.cert_serial.clone();
         let node_type = self.node_type.clone();
         let peer_id_to_addr_map = self.peer_id_to_addr.clone();
-        
+        let tofu_pins = self.cert_fingerprint_pins.clone();
+        let per_ip_conns = self.per_ip_connections.clone();
+
         // Spawn server task
         tokio::spawn(async move {
             if is_info() { println!("[INFO][QUIC] server_started accepting=true"); }
@@ -482,7 +551,21 @@ impl QuicTransport {
                 }
                 
                 let peer_addr = incoming.remote_address();
-                
+
+                // v9.1: Per-IP connection limit — reject before TLS handshake to save CPU
+                let peer_ip = peer_addr.ip();
+                let current_ip_count = per_ip_conns.get(&peer_ip).map(|v| *v).unwrap_or(0);
+                if current_ip_count >= MAX_CONNECTIONS_PER_IP {
+                    incoming.refuse();
+                    if crate::node::is_warn() {
+                        println!("[WARN][QUIC] per_ip_limit ip={} count={} max={}",
+                                 peer_ip, current_ip_count, MAX_CONNECTIONS_PER_IP);
+                    }
+                    continue;
+                }
+                // Increment counter; decremented when connection task ends
+                per_ip_conns.entry(peer_ip).and_modify(|c| *c += 1).or_insert(1);
+
                 let connections_clone = connections.clone();
                 let handler_clone = message_handler.clone();
                 let stats_clone = stats.clone();
@@ -490,8 +573,25 @@ impl QuicTransport {
                 let cert_serial_clone = cert_serial.clone();
                 let peer_id_map_clone = peer_id_to_addr_map.clone();
                 let node_type_clone = node_type.clone();
-                
+                let tofu_pins_clone = tofu_pins.clone();
+                let per_ip_conns_clone = per_ip_conns.clone();
+                let peer_ip_clone = peer_ip;
+
                 tokio::spawn(async move {
+                    // v9.1: Scope guard — always decrement per-IP counter when task exits.
+                    // This fires on every exit path (early return, handshake fail, connection end).
+                    struct IpGuard { ip: std::net::IpAddr, map: Arc<DashMap<std::net::IpAddr, u32>> }
+                    impl Drop for IpGuard {
+                        fn drop(&mut self) {
+                            self.map.entry(self.ip).and_modify(|c| { *c = c.saturating_sub(1); });
+                            // Clean up zero entries to prevent map growth
+                            if self.map.get(&self.ip).map(|v| *v == 0).unwrap_or(false) {
+                                self.map.remove(&self.ip);
+                            }
+                        }
+                    }
+                    let _ip_guard = IpGuard { ip: peer_ip_clone, map: per_ip_conns_clone };
+
                     // TLS+Kyber handshake phase — permit limits concurrency.
                     // v6.4: Hard timeout prevents permits from being held indefinitely.
                     // Root cause of QUIC death spiral: without timeout, stalled TLS handshakes
@@ -553,16 +653,16 @@ impl QuicTransport {
                         return;
                     }
                     
-                    // SECURITY v3.33: TLS cert SAN check (server side).
+                    // v9.0: X.509 SAN verification + TOFU cert pinning (server side).
                     // One-way TLS: client cert usually unavailable → Err → OK.
-                    // If cert IS presented and SAN mismatches → close (potential MitM).
-                    match Self::verify_peer_cert_node_id(&connection, &remote_node_id) {
+                    // SAN mismatch or TOFU pin mismatch → close (MITM).
+                    match Self::verify_peer_cert_node_id(&connection, &remote_node_id, &tofu_pins_clone) {
                         Ok(()) => {
                             if is_debug() { println!("[DBG][QUIC] cert_san_ok side=server node={}", remote_node_id); }
                         }
-                        Err(e) if e.contains("SAN does not contain") => {
-                            if crate::node::is_warn() { println!("[WARN][QUIC] cert_san_MISMATCH side=server node={} reason={}", remote_node_id, e); }
-                            connection.close(quinn::VarInt::from_u32(403), b"SAN_MISMATCH");
+                        Err(e) if e.contains("SAN does not contain") || e.contains("TOFU_PIN_MISMATCH") || e.contains("X.509 parse") => {
+                            if crate::node::is_warn() { println!("[WARN][QUIC] cert_REJECTED side=server node={} reason={}", remote_node_id, e); }
+                            connection.close(quinn::VarInt::from_u32(403), b"CERT_REJECTED");
                             return;
                         }
                         Err(_) => {}
@@ -600,6 +700,19 @@ impl QuicTransport {
                         }
                     }
                     
+                    // v9.0 BUG-18: Total connection limit.
+                    // Prevents resource exhaustion from too many peers.
+                    // Genesis phase: 50 max. Scales with network growth.
+                    const MAX_TOTAL_CONNECTIONS: usize = 500;
+                    if connections_clone.len() >= MAX_TOTAL_CONNECTIONS {
+                        if crate::node::is_warn() {
+                            println!("[WARN][QUIC] max_connections_reached={} refusing node={}",
+                                     MAX_TOTAL_CONNECTIONS, remote_node_id);
+                        }
+                        connection.close(quinn::VarInt::from_u32(503), b"max_connections");
+                        return;
+                    }
+
                     let quic_conn = Arc::new(QuicConnection {
                         connection: connection.clone(),
                         remote_node_id: Some(remote_node_id.clone()),
@@ -612,7 +725,7 @@ impl QuicTransport {
                         bytes_sent: AtomicU64::new(0),
                         bytes_received: AtomicU64::new(0),
                     });
-                    
+
                     connections_clone.insert(peer_addr, quic_conn.clone());
                     if is_info() { println!("[INFO][QUIC] conn_stored peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type); }
 
@@ -710,6 +823,11 @@ impl QuicTransport {
         quic_conn: Arc<QuicConnection>,
         connections: Arc<DashMap<SocketAddr, Arc<QuicConnection>>>,
     ) {
+        // v9.0: Per-connection concurrent stream task limit.
+        // Prevents a single peer from exhausting tokio runtime with unbounded task spawns.
+        const MAX_CONCURRENT_STREAM_TASKS: usize = 64;
+        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAM_TASKS));
+
         loop {
             // Accept bidirectional or unidirectional streams
             tokio::select! {
@@ -719,7 +837,12 @@ impl QuicTransport {
                         Ok((send, recv)) => {
                             let handler_clone = handler.clone();
                             let conn_clone = quic_conn.clone();
+                            let sem = stream_semaphore.clone();
                             tokio::spawn(async move {
+                                let _permit = match sem.acquire().await {
+                                    Ok(p) => p,
+                                    Err(_) => return, // semaphore closed
+                                };
                                 Self::handle_bidi_stream(peer_addr, send, recv, handler_clone, conn_clone).await;
                             });
                         }
@@ -735,7 +858,12 @@ impl QuicTransport {
                         Ok(recv) => {
                             let handler_clone = handler.clone();
                             let conn_clone = quic_conn.clone();
+                            let sem = stream_semaphore.clone();
                             tokio::spawn(async move {
+                                let _permit = match sem.acquire().await {
+                                    Ok(p) => p,
+                                    Err(_) => return,
+                                };
                                 Self::handle_uni_stream(peer_addr, recv, handler_clone, conn_clone).await;
                             });
                         }
@@ -773,14 +901,34 @@ impl QuicTransport {
             async {
                 recv.read_exact(&mut len_buf).await?;
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
-                
+
                 if msg_len > MAX_MESSAGE_SIZE {
                     return Err(quinn::ReadExactError::FinishedEarly(0));
                 }
-                
-                let mut data = vec![0u8; msg_len];
-                recv.read_exact(&mut data).await?;
-                Ok(data)
+
+                // v9.0: Read header first (6 bytes), check per-type limit before full allocation
+                if msg_len >= 6 {
+                    let mut header = [0u8; 6];
+                    recv.read_exact(&mut header).await?;
+                    let msg_type = header[1];
+                    let type_limit = max_size_for_message_type(msg_type);
+                    if msg_len > type_limit {
+                        // Drop oversized message — don't allocate
+                        return Err(quinn::ReadExactError::FinishedEarly(0));
+                    }
+                    let mut data = Vec::with_capacity(msg_len);
+                    data.extend_from_slice(&header);
+                    if msg_len > 6 {
+                        let mut rest = vec![0u8; msg_len - 6];
+                        recv.read_exact(&mut rest).await?;
+                        data.extend_from_slice(&rest);
+                    }
+                    Ok(data)
+                } else {
+                    let mut data = vec![0u8; msg_len];
+                    recv.read_exact(&mut data).await?;
+                    Ok(data)
+                }
             }
         ).await {
             Ok(Ok(d)) => d,
@@ -800,12 +948,12 @@ impl QuicTransport {
                 return;
             }
         };
-        
+
         conn.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
         conn.messages_received.fetch_add(1, Ordering::Relaxed);
         // v2.95.1: Update last_activity on message receipt (confirmed delivery TO us)
         conn.last_activity_ms.store(Self::current_time_ms(), Ordering::Relaxed);
-        
+
         // Parse message
         let msg = match Self::parse_message(&data) {
             Ok(m) => m,
@@ -856,27 +1004,46 @@ impl QuicTransport {
             async {
                 recv.read_exact(&mut len_buf).await?;
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
-                
+
                 if msg_len > MAX_MESSAGE_SIZE {
                     return Err(quinn::ReadExactError::FinishedEarly(0));
                 }
-                
-                let mut data = vec![0u8; msg_len];
-                recv.read_exact(&mut data).await?;
-                Ok(data)
+
+                // v9.0: Read header first, enforce per-type size limit before allocation
+                if msg_len >= 6 {
+                    let mut header = [0u8; 6];
+                    recv.read_exact(&mut header).await?;
+                    let msg_type = header[1];
+                    let type_limit = max_size_for_message_type(msg_type);
+                    if msg_len > type_limit {
+                        return Err(quinn::ReadExactError::FinishedEarly(0));
+                    }
+                    let mut data = Vec::with_capacity(msg_len);
+                    data.extend_from_slice(&header);
+                    if msg_len > 6 {
+                        let mut rest = vec![0u8; msg_len - 6];
+                        recv.read_exact(&mut rest).await?;
+                        data.extend_from_slice(&rest);
+                    }
+                    Ok(data)
+                } else {
+                    let mut data = vec![0u8; msg_len];
+                    recv.read_exact(&mut data).await?;
+                    Ok(data)
+                }
             }
         ).await {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
                 if crate::node::is_warn() {
-                    println!("[WARN][QUIC] uni_read_failed peer={} err={:?}", 
+                    println!("[WARN][QUIC] uni_read_failed peer={} err={:?}",
                         get_privacy_id_for_addr(&peer_addr.to_string()), e);
                 }
                 return;
             }
             Err(_) => {
                 if crate::node::is_warn() {
-                    println!("[WARN][QUIC] uni_read_timeout peer={} timeout={}ms", 
+                    println!("[WARN][QUIC] uni_read_timeout peer={} timeout={}ms",
                         get_privacy_id_for_addr(&peer_addr.to_string()),
                         adaptive_timeout.as_millis());
                 }
@@ -913,24 +1080,38 @@ impl QuicTransport {
         }
     }
     
-    /// Parse binary message
+    /// Parse binary message with per-type size enforcement
     fn parse_message(data: &[u8]) -> Result<NetworkMessage, String> {
         if data.len() < 6 {
             return Err("Message too short".into());
         }
-        
+
         // Check header
         let version = data[0];
         if version != PROTOCOL_VERSION {
             return Err(format!("Protocol version mismatch: {}", version));
         }
-        
+
+        let msg_type = data[1];
         let payload_len = u32::from_be_bytes([data[2], data[3], data[4], data[5]]) as usize;
-        
+
+        // v9.0: Per-message-type size limit BEFORE deserialization.
+        // Prevents OOM from e.g. a 10 MB "heartbeat" that should be 2 KB.
+        let type_limit = max_size_for_message_type(msg_type);
+        if type_limit == 0 {
+            return Err(format!("Rejected deprecated message type={}", msg_type));
+        }
+        if payload_len > type_limit {
+            return Err(format!(
+                "Message type={} payload={}B exceeds type_limit={}B",
+                msg_type, payload_len, type_limit
+            ));
+        }
+
         if data.len() < 6 + payload_len {
             return Err("Incomplete message".into());
         }
-        
+
         // Deserialize payload
         bincode::deserialize(&data[6..6+payload_len])
             .map_err(|e| format!("Deserialize failed: {}", e))
@@ -1063,20 +1244,18 @@ impl QuicTransport {
             return Err("Self-connect not allowed".to_string());
         }
         
-        // SECURITY v3.33: STRICT TLS cert SAN verification (client side).
-        // If peer_identity is available (server presented cert), SAN MUST match.
-        // SAN mismatch = potential MitM → close connection immediately.
-        // peer_identity unavailable (one-way TLS) = allowed, Dilithium provides auth.
-        match Self::verify_peer_cert_node_id(&connection, &remote_node_id) {
+        // v9.0: X.509 SAN verification + TOFU cert pinning (client side).
+        // SAN mismatch or TOFU pin mismatch → close immediately (MITM).
+        match Self::verify_peer_cert_node_id(&connection, &remote_node_id, &self.cert_fingerprint_pins) {
             Ok(()) => {
                 if is_info() {
-                    println!("[INFO][QUIC] cert_san_verified side=client node={}", remote_node_id);
+                    println!("[INFO][QUIC] cert_verified side=client node={}", remote_node_id);
                 }
             }
-            Err(e) if e.contains("SAN does not contain") => {
-                if crate::node::is_warn() { println!("[WARN][QUIC] cert_san_MISMATCH side=client node={} reason={}", remote_node_id, e); }
-                connection.close(quinn::VarInt::from_u32(403), b"SAN_MISMATCH");
-                return Err(format!("TLS SAN mismatch for node {}: {}", remote_node_id, e));
+            Err(e) if e.contains("SAN does not contain") || e.contains("TOFU_PIN_MISMATCH") || e.contains("X.509 parse") => {
+                if crate::node::is_warn() { println!("[WARN][QUIC] cert_REJECTED side=client node={} reason={}", remote_node_id, e); }
+                connection.close(quinn::VarInt::from_u32(403), b"CERT_REJECTED");
+                return Err(format!("Cert verification failed for node {}: {}", remote_node_id, e));
             }
             Err(e) => {
                 if is_debug() {
@@ -1779,16 +1958,22 @@ impl rustls::client::danger::ServerCertVerifier for SelfSignedCertVerifier {
 // ============================================================================
 
 impl QuicTransport {
-    /// Best-effort TLS cert SAN verification.
+    /// v9.0: Proper X.509 SAN verification + TOFU (Trust On First Use) cert pinning.
+    ///
+    /// 1. Parse certificate via x509-parser (ASN.1 DER, not byte search)
+    /// 2. Extract SAN dNSName entries, match against "qnet-{node_id}"
+    /// 3. Compute SHA3-256 fingerprint of cert DER bytes
+    /// 4. TOFU: If first time seeing this node_id → pin fingerprint.
+    ///          If seen before → fingerprint MUST match or reject (MITM)
     ///
     /// Returns:
-    ///   Ok(())       — cert found and SAN matches claimed node_id
-    ///   Err(reason)  — cert unavailable (one-way TLS, Quinn doesn't expose client cert)
-    ///                  OR SAN mismatch (genuine potential MitM)
-    ///
-    /// Callers must NOT close the connection on Err — they should log and continue.
-    /// Dilithium3-signed consensus messages provide cryptographic node_id binding.
-    fn verify_peer_cert_node_id(conn: &Connection, claimed_node_id: &str) -> Result<(), String> {
+    ///   Ok(())       — cert found, SAN matches, TOFU pin OK (or first-seen)
+    ///   Err(reason)  — cert unavailable / SAN mismatch / TOFU pin mismatch
+    fn verify_peer_cert_node_id(
+        conn: &Connection,
+        claimed_node_id: &str,
+        pins: &DashMap<String, TofuPin>,
+    ) -> Result<(), String> {
         let expected_san = format!("qnet-{}", claimed_node_id);
 
         let peer_identity = match conn.peer_identity() {
@@ -1805,17 +1990,115 @@ impl QuicTransport {
 
         let cert_bytes = cert_der.as_ref();
 
-        // SAN dNSName is encoded as UTF-8 string in DER.
-        // rcgen::generate_simple_self_signed(vec!["qnet-{id}"]) always produces this format.
-        if find_subsequence(cert_bytes, expected_san.as_bytes()).is_some() {
-            return Ok(());
+        // Step 1: Proper ASN.1 X.509 parsing (replaces unsafe byte substring search)
+        let (_, parsed_cert) = x509_parser::parse_x509_certificate(cert_bytes)
+            .map_err(|e| format!("X.509 parse failed: {}", e))?;
+
+        // Step 2: Check SubjectAlternativeName extension for exact dNSName match
+        let mut san_matched = false;
+        if let Ok(Some(san_ext)) = parsed_cert.subject_alternative_name() {
+            for name in &san_ext.value.general_names {
+                if let x509_parser::prelude::GeneralName::DNSName(dns) = name {
+                    if *dns == expected_san {
+                        san_matched = true;
+                        break;
+                    }
+                }
+            }
         }
 
-        Err(format!("cert SAN does not contain '{}'", expected_san))
-    }
-}
+        if !san_matched {
+            return Err(format!("cert SAN does not contain '{}' (X.509 parsed)", expected_san));
+        }
 
-/// Boyer-Moore-ish byte subsequence search
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+        // Step 3: Compute SHA3-256 fingerprint for TOFU pinning
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(cert_bytes);
+        let fingerprint: [u8; 32] = hasher.finalize().into();
+
+        // Step 4: TOFU v9.2 — Trust On First Use with TTL + grace period
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        match pins.get(claimed_node_id) {
+            Some(entry) => {
+                let pin = entry.value();
+                let pin_age = now_ts.saturating_sub(pin.pinned_at);
+
+                if pin.fingerprint == fingerprint {
+                    // Fingerprint matches — all good, refresh timestamp to extend TTL
+                    drop(entry);
+                    pins.insert(claimed_node_id.to_string(), TofuPin {
+                        fingerprint,
+                        pinned_at: now_ts,
+                    });
+                } else if pin_age > TOFU_PIN_TTL_SECS {
+                    // Pin expired — allow re-pin with new cert (normal rotation)
+                    drop(entry);
+                    pins.insert(claimed_node_id.to_string(), TofuPin {
+                        fingerprint,
+                        pinned_at: now_ts,
+                    });
+                    if is_info() {
+                        println!("[INFO][TOFU] repin_expired node={} age={}s fp={}",
+                            claimed_node_id, pin_age, hex::encode(&fingerprint[..8]));
+                    }
+                } else if pin_age >= TOFU_PIN_GRACE_AFTER_SECS {
+                    // Past grace period — cert rotation allowed (rolling restart scenario)
+                    drop(entry);
+                    pins.insert(claimed_node_id.to_string(), TofuPin {
+                        fingerprint,
+                        pinned_at: now_ts,
+                    });
+                    if is_info() {
+                        println!("[INFO][TOFU] repin_rotation node={} age={}s fp={}",
+                            claimed_node_id, pin_age, hex::encode(&fingerprint[..8]));
+                    }
+                } else {
+                    // Within grace period and fingerprint changed — suspicious (possible MITM)
+                    let pinned_hex = hex::encode(&pin.fingerprint[..8]);
+                    drop(entry);
+                    return Err(format!(
+                        "TOFU_PIN_MISMATCH: node={} age={}s(<{}s grace) pinned={} received={} — possible MITM",
+                        claimed_node_id, pin_age, TOFU_PIN_GRACE_AFTER_SECS,
+                        pinned_hex, hex::encode(&fingerprint[..8]),
+                    ));
+                }
+            }
+            None => {
+                // First time seeing this node_id — enforce max pins then insert
+                if pins.len() >= TOFU_MAX_PINS {
+                    // Evict the oldest pin to make room
+                    let mut oldest_key: Option<String> = None;
+                    let mut oldest_ts = u64::MAX;
+                    for entry in pins.iter() {
+                        if entry.value().pinned_at < oldest_ts {
+                            oldest_ts = entry.value().pinned_at;
+                            oldest_key = Some(entry.key().clone());
+                        }
+                    }
+                    if let Some(key) = oldest_key {
+                        pins.remove(&key);
+                        if is_info() {
+                            println!("[INFO][TOFU] evict_oldest node={} age={}s pins={}",
+                                key, now_ts.saturating_sub(oldest_ts), pins.len());
+                        }
+                    }
+                }
+                pins.insert(claimed_node_id.to_string(), TofuPin {
+                    fingerprint,
+                    pinned_at: now_ts,
+                });
+                if is_info() {
+                    println!("[INFO][TOFU] pin_new node={} fp={} pins={}",
+                        claimed_node_id, hex::encode(&fingerprint[..8]), pins.len());
+                }
+            }
+        }
+
+        Ok(())
+    }
 }

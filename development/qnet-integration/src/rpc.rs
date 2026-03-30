@@ -9401,16 +9401,20 @@ async fn handle_get_reward_pools(
     let blocks_in_epoch = current_height % 14400;
     
     // PRODUCTION v2.43.1: Use cached accumulated pools (10 sec TTL)
+    // v9.1: Single read lock acquire to avoid double-lock deadlock risk
     let (accumulated_pool2, accumulated_pool3) = {
-        // Check cache first
-        let cache_valid = {
+        // Check cache and extract values in one lock scope
+        let cached_values = {
             let cache = REWARD_POOLS_CACHE.read().unwrap();
-            cache.1.elapsed().as_secs() < REWARD_POOLS_CACHE_TTL_SECS && cache.0.epoch == current_epoch
-        };
-        
-        if cache_valid {
-            let cache = REWARD_POOLS_CACHE.read().unwrap();
-            (cache.0.pool2_fees, cache.0.pool3_activations)
+            if cache.1.elapsed().as_secs() < REWARD_POOLS_CACHE_TTL_SECS && cache.0.epoch == current_epoch {
+                Some((cache.0.pool2_fees, cache.0.pool3_activations))
+            } else {
+                None
+            }
+        }; // read lock dropped here
+
+        if let Some(values) = cached_values {
+            values
         } else {
             // Refresh cache
             let (p2, p3) = if let Some(p2p) = blockchain.get_unified_p2p() {
@@ -10847,10 +10851,33 @@ async fn handle_register_device(
     };
     
     // SECURITY: Only user super nodes can register device_id. Genesis nodes are excluded.
-    if !node_id.starts_with("super_") {
+    // v7.2: Check actual node_type from registration, not node_id prefix.
+    // Non-genesis super nodes may have node_id like "node_{hostname}" (Docker).
+    if node_id.starts_with("genesis_node_") {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Only super node device registration is supported"
+            "error": "Genesis nodes use QNET_BOOTSTRAP_ID for identity, not device registration"
+        })));
+    }
+    // Verify the node is registered as Super in storage
+    // load_node_registration returns (node_type, wallet, reputation)
+    let is_super = {
+        let storage = blockchain.get_storage();
+        match storage.load_node_registration(node_id) {
+            Ok(Some((node_type, _, _))) => {
+                node_type.eq_ignore_ascii_case("super")
+            }
+            _ => {
+                // Pre-registration: trust body.node_type for nodes not yet in storage
+                let body_type = body["node_type"].as_str().unwrap_or("");
+                body_type.eq_ignore_ascii_case("super")
+            }
+        }
+    };
+    if !is_super {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Only registered super nodes can register device_id"
         })));
     }
     

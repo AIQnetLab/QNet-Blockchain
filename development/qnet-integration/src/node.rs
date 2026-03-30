@@ -19,7 +19,6 @@ const FAST_SYNC_THRESHOLD: u64 = 10; // Trigger fast sync if behind by 10+ block
 #[allow(dead_code)]
 const FAST_SYNC_TIMEOUT_SECS: u64 = 60; // Fast sync timeout
 const BACKGROUND_SYNC_TIMEOUT_SECS: u64 = 30; // Background sync timeout
-const SYNC_DEADLOCK_TIMEOUT_SECS: u64 = 60; // Timeout for detecting stuck sync operations
 const SNAPSHOT_FULL_INTERVAL: u64 = 43200; // Full snapshot every 12 hours (43,200 microblocks = 480 macroblocks)
 const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3600; // Incremental snapshot every 1 hour (3,600 microblocks = 40 macroblocks)
 const API_HEALTH_CHECK_RETRIES: u32 = 5; // API health check attempts
@@ -323,9 +322,6 @@ pub fn should_check_fork() -> bool {
     }
 }
 
-/// BUG 2 FIX: Minimum consensus threshold (40% of nodes)
-/// If votes < this threshold, do NOT produce - trigger emergency instead
-pub const MIN_CONSENSUS_VOTES_PERCENT: u64 = 40;
 static SYNC_TARGET_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 // v3.5: Flag to skip slot timing after sync completion
@@ -337,6 +333,9 @@ static JUST_COMPLETED_SYNC: AtomicBool = AtomicBool::new(false);
 // DEADLOCK PROTECTION: Track when sync started to detect stuck operations
 static SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
 static FAST_SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
+/// v9.0: Progress-based sync timeout. Updated on each synced block.
+/// Deadlock = no progress for 120s (instead of fixed 300s cap).
+static LAST_SYNC_PROGRESS_TIME: AtomicU64 = AtomicU64::new(0);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.8: DETERMINISTIC TIMEOUT-BASED FAILOVER
@@ -462,18 +461,42 @@ pub static LAST_FINALIZED_CONSENSUS_ROUND: AtomicU64 = AtomicU64::new(0);
 // This provides the same guarantee as Casper FFG checkpoints.
 pub static LAST_FINALIZED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
-/// v3.33: Check if rollback to target_height is allowed by finality rules.
+/// v9.0 BUG-30: Check if rollback to target_height is allowed by finality rules.
+/// LAST_FINALIZED_HEIGHT stores mb_index * 90 = the highest finalized microblock height.
+/// All 8 code paths that set this value use the same mb_index*90 format.
 /// Returns Err with reason if rollback would violate finality.
 pub fn check_finality_allows_rollback(target_height: u64) -> Result<(), String> {
-    let finalized = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-    if finalized > 0 && target_height < finalized {
+    let finalized_height = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+    if finalized_height > 0 && target_height < finalized_height {
         Err(format!(
-            "FINALITY_VIOLATION: rollback to {} blocked — blocks up to {} are finalized (macroblock consensus)",
-            target_height, finalized
+            "FINALITY_VIOLATION: rollback to {} blocked — blocks up to {} are finalized",
+            target_height, finalized_height
         ))
     } else {
         Ok(())
     }
+}
+
+/// v9.0 BUG-12: Atomic height update helper.
+/// Updates all 3 height sources in one call to prevent inconsistency.
+/// - `height_lock`: Arc<RwLock<u64>> (RAM height)
+/// - `storage`: for set_chain_height (RocksDB)
+/// - LOCAL_BLOCKCHAIN_HEIGHT (AtomicU64 for lock-free reads)
+pub async fn update_all_heights(
+    height_lock: &tokio::sync::RwLock<u64>,
+    storage: &crate::storage::Storage,
+    new_height: u64,
+) {
+    {
+        let mut h = height_lock.write().await;
+        *h = new_height;
+    }
+    if let Err(e) = storage.set_chain_height(new_height) {
+        eprintln!("[ERR][STORAGE] set_chain_height failed h={}: {}", new_height, e);
+    }
+    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+        new_height, std::sync::atomic::Ordering::SeqCst
+    );
 }
 
 // CRITICAL FIX v2.49: Prevent duplicate consensus tasks for same MacroBlock
@@ -670,6 +693,12 @@ lazy_static::lazy_static! {
     pub static ref PRODUCER_VOTES: DashMap<(u64, String), String> = DashMap::new();
 }
 
+/// v9.0: Equivocation evidence queue for timeout vote double-voting.
+/// Key: (height, voter_id), Value: (round, detected_timestamp).
+/// Drained at macroblock creation and included as slashing events.
+pub static EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, String), (u64, u64)>> =
+    once_cell::sync::Lazy::new(|| DashMap::new());
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MEMORY LEAK FIX v3.20: Periodic cleanup for global DashMaps
 // PROBLEM: ENTROPY_RESPONSES, PRODUCER_VOTES, REQUESTED_CERTIFICATES grow unbounded
@@ -709,9 +738,14 @@ pub fn cleanup_global_hashmaps(current_height: u64) {
     REQUESTED_CERTIFICATES.retain(|_, &mut timestamp| now.saturating_sub(timestamp) < 300);
     let cert_removed = cert_before.saturating_sub(REQUESTED_CERTIFICATES.len());
     
-    if (entropy_removed > 0 || votes_removed > 0 || cert_removed > 0) && is_info() {
-        println!("[INFO][MEM] cleanup h={} entropy_removed={} votes_removed={} certs_removed={}", 
-                 current_height, entropy_removed, votes_removed, cert_removed);
+    // v9.0: Cleanup stale equivocation evidence (keep last 500 blocks)
+    let equivoc_before = EQUIVOCATION_EVIDENCE.len();
+    EQUIVOCATION_EVIDENCE.retain(|k, _| k.0 >= min_valid_height);
+    let equivoc_removed = equivoc_before.saturating_sub(EQUIVOCATION_EVIDENCE.len());
+
+    if (entropy_removed > 0 || votes_removed > 0 || cert_removed > 0 || equivoc_removed > 0) && is_info() {
+        println!("[INFO][MEM] cleanup h={} entropy={} votes={} certs={} equivoc={}",
+                 current_height, entropy_removed, votes_removed, cert_removed, equivoc_removed);
     }
 }
 
@@ -1679,15 +1713,61 @@ impl BlockchainNode {
             }
         }
         
+        // v9.0: Drain timeout vote equivocation evidence for this epoch
+        let equivocation_entries: Vec<_> = EQUIVOCATION_EVIDENCE.iter()
+            .filter(|e| {
+                let (h, _) = e.key();
+                *h >= start_height && *h <= end_height
+            })
+            .map(|e| {
+                let (h, voter) = e.key().clone();
+                let (round, _ts) = *e.value();
+                (h, voter, round)
+            })
+            .collect();
+
+        for (eq_height, eq_voter, eq_round) in &equivocation_entries {
+            use qnet_consensus::deterministic_reputation::SlashingType;
+            use sha3::{Sha3_512, Digest};
+
+            let mut hasher = Sha3_512::new();
+            hasher.update(eq_voter.as_bytes());
+            hasher.update(&eq_height.to_le_bytes());
+            hasher.update(&eq_round.to_le_bytes());
+            hasher.update(b"timeout_equivocation_v9.0");
+            let hash_result = hasher.finalize();
+            let mut evidence_hash = [0u8; 32];
+            evidence_hash.copy_from_slice(&hash_result[..32]);
+
+            println!("[CRIT][SLASH] TIMEOUT_EQUIVOCATION voter={} h={} round={}",
+                     eq_voter, eq_height, eq_round);
+
+            slashing_events.push(SlashingEvent {
+                offender: eq_voter.clone(),
+                offense: SlashingType::InvalidBlock {
+                    height: *eq_height,
+                    block_hash: evidence_hash,
+                    reason: format!("timeout_vote_equivocation:round={}", eq_round),
+                },
+                penalty: 0.5, // 50% penalty for equivocation
+                detected_at_height: *eq_height,
+                reporter: reporter_node_id.to_string(),
+                evidence_hash,
+            });
+
+            // Remove processed evidence
+            EQUIVOCATION_EVIDENCE.remove(&(*eq_height, eq_voter.clone()));
+        }
+
         // Log analysis result
         if slashing_events.is_empty() {
-            println!("[INFO][SLASH] epoch={}-{} analyzed={} slashing=0 no_cryptographic_violations", 
+            println!("[INFO][SLASH] epoch={}-{} analyzed={} slashing=0 no_cryptographic_violations",
                      start_height, end_height, end_height.saturating_sub(start_height).saturating_add(1));
         } else {
-            println!("[WARN][SLASH] epoch={}-{} analyzed={} violations={}", 
+            println!("[WARN][SLASH] epoch={}-{} analyzed={} violations={}",
                      start_height, end_height, end_height.saturating_sub(start_height).saturating_add(1), slashing_events.len());
         }
-        
+
         slashing_events
     }
     
@@ -5244,8 +5324,12 @@ impl BlockchainNode {
             };
             LAST_VRF_KEY_ANNOUNCE_HEIGHT.store(vrf_init, std::sync::atomic::Ordering::Relaxed);
 
-            // v5.2: Initialize finalized height/round to prevent accepting stale consensus msgs
-            let finalized_round = pre_snapshot_chain_height / 90; // macroblock round
+            // v9.0: Initialize finalized height/round to prevent accepting stale consensus msgs.
+            // CRITICAL: LAST_FINALIZED_HEIGHT stores mb_index * 90 (microblock height),
+            // NOT raw mb_index. All other 7 code paths use mb_index * 90 format.
+            // Startup must match to prevent finality check miscalculation.
+            let finalized_mb_index = pre_snapshot_chain_height / 90;
+            let finalized_round = finalized_mb_index * 90;
             LAST_FINALIZED_CONSENSUS_ROUND.store(finalized_round, std::sync::atomic::Ordering::SeqCst);
             LAST_FINALIZED_HEIGHT.store(finalized_round, std::sync::atomic::Ordering::SeqCst);
 
@@ -5392,9 +5476,10 @@ impl BlockchainNode {
                 if is_debug() { println!("[DBG][NODE] chain_height={}", height); }
                 
                 // CRITICAL FIX: Initialize P2P local height for message filtering
+                // v9.0: Release ordering pairs with Acquire in consensus paths
                 crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                    height, 
-                    std::sync::atomic::Ordering::Relaxed
+                    height,
+                    std::sync::atomic::Ordering::Release
                 );
                 if is_debug() { println!("[DBG][NODE] p2p_height_init={}", height); }
                 
@@ -6692,24 +6777,76 @@ impl BlockchainNode {
             
             // Wait a bit for P2P connections to establish
             tokio::time::sleep(Duration::from_secs(3)).await;
-            
+
             if let Some(p2p) = &blockchain_for_sync.unified_p2p {
-                // Get network consensus height
-                match p2p.sync_blockchain_height().await {
-                    Ok(network_height) => {
-                        let local_height = *blockchain_for_sync.height.read().await;
-                        
+                // v7.2: RELIABLE NETWORK HEIGHT DETECTION
+                // Heartbeat cache may be cold at startup (updates every 30s).
+                // If cached height looks stale (< 100), probe bootstrap nodes
+                // via direct HTTP to get the real network height.
+                let mut network_height = match p2p.sync_blockchain_height().await {
+                    Ok(h) => h,
+                    Err(_) => 0,
+                };
+
+                if network_height < 100 {
+                    if is_info() {
+                        println!("[INFO][SYNC] heartbeat_cache_cold height={} probing_bootstrap_nodes", network_height);
+                    }
+                    let bootstrap_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .build()
+                        .unwrap_or_default();
+                    let mut http_heights: Vec<u64> = Vec::new();
+                    for ip in bootstrap_ips.iter().take(5) {
+                        let url = format!("http://{}:8001/api/v1/block/latest", ip);
+                        match client.get(&url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                                    if let Some(h) = json.get("height").and_then(|v| v.as_u64()) {
+                                        http_heights.push(h);
+                                        if is_info() {
+                                            println!("[INFO][SYNC] http_probe ip={} height={}", ip, h);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                if is_debug() {
+                                    println!("[DBG][SYNC] http_probe_failed ip={}", ip);
+                                }
+                            }
+                        }
+                    }
+                    if http_heights.len() >= 2 {
+                        http_heights.sort();
+                        let median = http_heights[http_heights.len() / 2];
+                        if median > network_height {
+                            println!("[INFO][SYNC] http_height_override cached={} http_median={} probes={}",
+                                     network_height, median, http_heights.len());
+                            network_height = median;
+                        }
+                    }
+                }
+
+                let local_height = *blockchain_for_sync.height.read().await;
+
                         // ═══════════════════════════════════════════════════════════════════
                         // PRODUCTION v2.31: PROACTIVE FORK DETECTION ON STARTUP
-                        // If local height is AHEAD of network, we might be on a fork!
-                        // This happens when:
-                        // - Node was on a fork and restarted
-                        // - Node has old database from different chain
-                        // - Network reorganized while node was offline
+                        // v9.0: Requires peer quorum before rollback to prevent
+                        // single malicious peer from forcing rollback via low height report.
                         // ═══════════════════════════════════════════════════════════════════
-                        if local_height > network_height + 10 && network_height > 0 {
-                            println!("[WARN][SYNC] LOCAL HEIGHT {} AHEAD OF NETWORK {} - POSSIBLE FORK!", 
-                                     local_height, network_height);
+                        const MIN_PEERS_FOR_ROLLBACK: usize = 4;
+                        let validated_peers = p2p.get_validated_active_peers();
+                        let high_rep_peers: Vec<_> = validated_peers.iter()
+                            .filter(|peer| peer.reputation >= 70.0)
+                            .collect();
+
+                        if local_height > network_height + 3 && network_height > 0
+                           && high_rep_peers.len() >= MIN_PEERS_FOR_ROLLBACK
+                        {
+                            println!("[WARN][SYNC] LOCAL {} AHEAD OF NETWORK {} peers_confirmed={} - ROLLBACK",
+                                     local_height, network_height, high_rep_peers.len());
                             if is_info() { println!("[INFO][SYNC] proactive_rollback"); }
                             
                             // STATE MACHINE: Fork resolution
@@ -6738,21 +6875,34 @@ impl BlockchainNode {
                             
                             if is_info() { println!("[INFO][ROLLBACK] deleting from={} to={}", rollback_from, rollback_to); }
                             
+                            let mut delete_failures = 0u64;
                             for h in rollback_from..=rollback_to {
                                 if let Err(e) = blockchain_for_sync.storage.delete_microblock(h) {
                                     println!("[WARN][ROLLBACK] delete_failed h={} err={}", h, e);
+                                    delete_failures += 1;
                                 }
                             }
-                            
-                            // Update chain height to network height (all sources of truth)
-                            {
-                                let mut height_guard = blockchain_for_sync.height.write().await;
-                                *height_guard = network_height;
+                            // v9.0 BUG-29: Verify deletions actually succeeded
+                            if delete_failures > 0 {
+                                // Verify the blocks are really gone
+                                let mut still_present = 0u64;
+                                for h in rollback_from..=rollback_to {
+                                    if blockchain_for_sync.storage.load_microblock_auto_format(h).ok().flatten().is_some() {
+                                        still_present += 1;
+                                    }
+                                }
+                                if still_present > 0 {
+                                    println!("[ERR][ROLLBACK] {} blocks still present after deletion (of {} failures)",
+                                             still_present, delete_failures);
+                                }
                             }
-                            blockchain_for_sync.storage.set_chain_height(network_height).ok();
-                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                network_height, std::sync::atomic::Ordering::Relaxed
-                            );
+
+                            // v9.0: Update all height sources atomically
+                            crate::node::update_all_heights(
+                                &blockchain_for_sync.height,
+                                &blockchain_for_sync.storage,
+                                network_height,
+                            ).await;
                             
                             // End rollback protection
                             crate::storage::end_rollback_protection();
@@ -6782,7 +6932,14 @@ impl BlockchainNode {
                                 current_height: network_height,
                             });
                             if is_info() { println!("[INFO][SYNC] fork_resolved"); }
-                            
+
+                        } else if local_height > network_height + 3 && network_height > 0
+                                  && high_rep_peers.len() < MIN_PEERS_FOR_ROLLBACK
+                        {
+                            // v9.0: Not enough peers to confirm — skip rollback, just log
+                            println!("[WARN][SYNC] local={} > network={} but only {} peers (need {}) — skipping rollback",
+                                     local_height, network_height, high_rep_peers.len(), MIN_PEERS_FOR_ROLLBACK);
+
                         } else {
                             // ═══════════════════════════════════════════════════════════════════════════
                             // PRODUCTION v2.54: Check for pending gap sync from fire-and-forget broadcast
@@ -6899,17 +7056,36 @@ impl BlockchainNode {
 
                             // Sync remaining blocks in chunks
                             let mut current = sync_from;
+                            let mut consecutive_no_progress = 0u32;
                             while current <= network_height {
                                 let chunk_end = std::cmp::min(current + 100, network_height);
-                                
+
                                 if is_debug() { println!("[DBG][SYNC] request from={} to={}", current, chunk_end); }
                                 if let Err(e) = p2p.sync_blocks(current, chunk_end).await {
                                     println!("[WARN][SYNC] Sync failed at block {}: {}", current, e);
                                     break;
                                 }
-                                
+
+                                // v9.0 BUG-10: Verify blocks actually landed in storage.
+                                // sync_blocks can return Ok but blocks may not be stored
+                                // (e.g., all responses were dup_storage or validation failed).
+                                // Check actual chain height to detect no-progress loops.
+                                let actual_h = blockchain_for_sync.storage.get_chain_height().unwrap_or(0);
+                                if actual_h < current {
+                                    consecutive_no_progress += 1;
+                                    println!("[WARN][SYNC] no_progress chunk={}-{} storage_h={} attempt={}",
+                                             current, chunk_end, actual_h, consecutive_no_progress);
+                                    if consecutive_no_progress >= 3 {
+                                        println!("[ERR][SYNC] sync_stalled after 3 no-progress chunks at h={}", current);
+                                        break;
+                                    }
+                                    // Retry same chunk after brief delay
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    continue;
+                                }
+                                consecutive_no_progress = 0;
                                 current = chunk_end + 1;
-                                
+
                                 // Small delay between chunks
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
@@ -6923,7 +7099,7 @@ impl BlockchainNode {
                                 if stored_h > ram_h {
                                     *blockchain_for_sync.height.write().await = stored_h;
                                     crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                        stored_h, std::sync::atomic::Ordering::Relaxed
+                                        stored_h, std::sync::atomic::Ordering::Release
                                     );
                                     if is_info() {
                                         println!("[INFO][SYNC] ram_height_synced ram={}->{} source=rocksdb", ram_h, stored_h);
@@ -7003,14 +7179,6 @@ impl BlockchainNode {
                             NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
                             if is_info() { println!("[INFO][SYNC] already_synced h={}", local_height); }
                         }
-                    },
-                    Err(e) => {
-                        println!("[WARN][SYNC] Could not determine network height: {}", e);
-                        // Clear sync flag on error - no target to reach
-                        SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
-                    }
-                }
             } else {
                 // No P2P - clear sync flag
                 SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
@@ -7661,11 +7829,13 @@ impl BlockchainNode {
                                                                     println!("[WARN][REORG] delete_failed h={} err={}", h, e);
                                                                 }
                                                             }
-                                                            
+
                                                             *height_clone.write().await = rollback_to;
-                                                            storage_clone.set_chain_height(rollback_to).ok();
+                                                            if let Err(e) = storage_clone.set_chain_height(rollback_to) {
+                                                                eprintln!("[ERR][STORAGE] rollback_set_chain_height failed h={}: {}", rollback_to, e);
+                                                            }
                                                             crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                                                rollback_to, std::sync::atomic::Ordering::Relaxed
+                                                                rollback_to, std::sync::atomic::Ordering::Release
                                                             );
                                                             
                                                             crate::storage::end_rollback_protection();
@@ -7742,8 +7912,8 @@ impl BlockchainNode {
                                                         if is_debug() { println!("[DBG][REORG] high_rep_validators={}", high_rep_count); }
                                                         
                                                         // Only resync if we have enough validators to trust
-                                                        // MIN_PEERS_FOR_CONSENSUS = 4 (Byzantine 3f+1 where f=1)
-                                                        const MIN_PEERS_FOR_RESYNC: usize = 3;
+                                                        // BFT 3f+1 where f=1 → need 4 peers minimum
+                                                        const MIN_PEERS_FOR_RESYNC: usize = 4;
                                                         
                                                         if high_rep_count >= MIN_PEERS_FOR_RESYNC {
                                                             if is_info() { println!("[INFO][REORG] resync validators={}", high_rep_count); }
@@ -7766,9 +7936,11 @@ impl BlockchainNode {
                                                                 let _ = storage_clone.delete_microblock(h);
                                                             }
                                                             *height_clone.write().await = rollback_to;
-                                                            storage_clone.set_chain_height(rollback_to).ok();
+                                                            if let Err(e) = storage_clone.set_chain_height(rollback_to) {
+                                                                eprintln!("[ERR][STORAGE] rollback_set_chain_height failed h={}: {}", rollback_to, e);
+                                                            }
                                                             crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                                                rollback_to, std::sync::atomic::Ordering::Relaxed
+                                                                rollback_to, std::sync::atomic::Ordering::Release
                                                             );
                                                             
                                                             crate::storage::end_rollback_protection();
@@ -7864,15 +8036,34 @@ impl BlockchainNode {
                                 }
                             }
                         } else if e.contains("TIMESTAMP_INVALID") {
-                            // v4.4: Timestamp validation failure — block exists in canonical
-                            // chain but has non-monotonic timestamp (caused by fork-resolution
-                            // race where producer didn't have parent in storage yet).
-                            // Recovery: skip monotonicity for this block since chain hash
-                            // continuity already guarantees ordering. Clear pending and let
-                            // the sync re-request — the FAST_SYNC flag fix (above) will
-                            // bypass monotonicity on retry.
-                            eprintln!("[WARN][TIMESTAMP] recovery h={} err={} — clearing pending, will retry with sync-mode bypass",
-                                     received_block.height, e);
+                            // v9.0: TIMESTAMP_INVALID escalation.
+                            // Problem: clearing pending and retrying doesn't help if sync flags
+                            // aren't set — the block gets rejected again in an infinite loop.
+                            // Solution: count consecutive failures per height. After 3 failures,
+                            // force FAST_SYNC_IN_PROGRESS=true so timestamp validation switches
+                            // to sync mode (skips monotonicity check). Auto-clear after 30s.
+                            static TIMESTAMP_FAIL_COUNTS: once_cell::sync::Lazy<dashmap::DashMap<u64, u32>> =
+                                once_cell::sync::Lazy::new(|| dashmap::DashMap::new());
+                            let fail_count = {
+                                let mut entry = TIMESTAMP_FAIL_COUNTS.entry(received_block.height).or_insert(0);
+                                *entry += 1;
+                                *entry
+                            };
+
+                            if fail_count >= 3 && !FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed) {
+                                eprintln!("[WARN][TIMESTAMP] escalation h={} fails={} — forcing sync-mode bypass for 30s",
+                                         received_block.height, fail_count);
+                                FAST_SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
+                                // Auto-clear sync flag after 30 seconds
+                                tokio::spawn(async {
+                                    tokio::time::sleep(Duration::from_secs(30)).await;
+                                    FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                                    TIMESTAMP_FAIL_COUNTS.clear();
+                                });
+                            } else {
+                                eprintln!("[WARN][TIMESTAMP] recovery h={} fails={} err={} — clearing pending, will retry",
+                                         received_block.height, fail_count, e);
+                            }
                             crate::unified_p2p::clear_block_pending_sync(received_block.height);
                         } else {
                             eprintln!("[ERR][BLOCK] invalid_microblock h={} err={}", received_block.height, e);
@@ -8744,7 +8935,10 @@ impl BlockchainNode {
                                 .unwrap_or_else(get_timestamp_safe);
                             LAST_BLOCK_PRODUCED_TIME.store(block_ts, Ordering::Relaxed);
                             LAST_BLOCK_PRODUCED_HEIGHT.store(received_block.height, Ordering::Relaxed);
-                            
+
+                            // v9.0: Track sync progress for deadlock detection
+                            LAST_SYNC_PROGRESS_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
+
                             // v3.9: Reset timeout_round when new block received
                             // This clears failover state since network is progressing
                             reset_timeout_round();
@@ -8757,9 +8951,10 @@ impl BlockchainNode {
                             }
                             
                             // CRITICAL FIX: Update P2P local height for message filtering
+                            // v9.0: Release ordering pairs with Acquire in consensus paths
                             crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                received_block.height, 
-                                std::sync::atomic::Ordering::Relaxed
+                                received_block.height,
+                                std::sync::atomic::Ordering::Release
                             );
                             
                             // EVENT-BASED OPTIMIZATION: Broadcast height update to all listeners
@@ -9063,8 +9258,54 @@ impl BlockchainNode {
                                     crate::unified_p2p::clear_all_pending_sync_macroblocks();
                                 }
                                 Err(reason) => {
-                                    println!("[ERR][STATE] recovery_failed reason={} — will retry on next threshold", reason);
-                                    mismatch_counter.remove(&received_block.height);
+                                    // v9.0 BUG-28: Track recovery failures. If snapshot+replay
+                                    // fails 3 times for the same height, escalate to full rollback
+                                    // to the last macroblock boundary and re-sync from network.
+                                    static RECOVERY_FAIL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                    let rf = RECOVERY_FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                    println!("[ERR][STATE] recovery_failed reason={} attempt={}/3", reason, rf);
+
+                                    if rf >= 3 {
+                                        // v9.0: Circuit breaker — track TOTAL escalations (never resets)
+                                        static TOTAL_ESCALATION_COUNT: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        let total_esc = TOTAL_ESCALATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+                                        if total_esc > 3 {
+                                            // Circuit breaker OPEN: stop auto-recovery, need manual intervention
+                                            println!("[CRIT][STATE] CIRCUIT_BREAKER: {} escalations, entering safe mode. Manual restart required.", total_esc);
+                                            mismatch_counter.clear();
+                                            RECOVERY_FAIL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+                                            // Don't rollback — just stop processing mismatched blocks
+                                        } else {
+                                            println!("[ERR][STATE] escalating to full rollback (escalation {}/3)", total_esc);
+                                            RECOVERY_FAIL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+                                            let cycle_start = (received_block.height / 90) * 90;
+                                            let rb_target = if cycle_start >= 90 { cycle_start.saturating_sub(90) } else { 0 };
+                                            if let Err(reason) = check_finality_allows_rollback(rb_target) {
+                                                println!("[ERR][STATE] finality_blocks_rollback: {}", reason);
+                                            } else if crate::storage::start_rollback_protection(rb_target) {
+                                                for h in (rb_target + 1)..=received_block.height {
+                                                    let _ = storage.delete_microblock(h);
+                                                }
+                                                if let Err(e) = storage.set_chain_height(rb_target) {
+                                                    eprintln!("[ERR][STORAGE] rollback_set_chain_height failed h={}: {}", rb_target, e);
+                                                }
+                                                *height.write().await = rb_target;
+                                                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                                    rb_target, std::sync::atomic::Ordering::Release);
+                                                crate::storage::end_rollback_protection();
+                                                mismatch_counter.clear();
+                                                crate::unified_p2p::clear_all_pending_sync();
+                                                crate::unified_p2p::clear_all_pending_sync_macroblocks();
+                                                println!("[INFO][STATE] escalation_rollback_complete new_h={}", rb_target);
+                                            }
+                                        }
+                                    } else {
+                                        // Don't remove counter — just decrement to prevent restart from 0
+                                        mismatch_counter.entry(received_block.height)
+                                            .and_modify(|(count, _)| *count = count.saturating_sub(2));
+                                    }
                                 }
                             }
                         } else if fail_count < MISMATCH_RECOVERY_THRESHOLD {
@@ -9575,6 +9816,23 @@ impl BlockchainNode {
             ));
         }
         
+        // v9.0 BUG-20: Verify merkle_root matches actual transactions.
+        // Without this, a producer could include a valid signature but fake transactions
+        // (e.g., extra transfers) while keeping the merkle_root from a different TX set.
+        if !microblock.transactions.is_empty() && microblock.merkle_root != [0u8; 32] {
+            let computed_merkle = Self::calculate_merkle_root(&microblock.transactions);
+            if computed_merkle != microblock.merkle_root {
+                eprintln!("[ERR][SEC] merkle_root_mismatch h={} expected={} computed={}",
+                         microblock.height,
+                         hex::encode(&microblock.merkle_root[..8]),
+                         hex::encode(&computed_merkle[..8]));
+                return Err(format!(
+                    "MERKLE_ROOT_MISMATCH:h={}:producer={}",
+                    microblock.height, microblock.producer
+                ));
+            }
+        }
+
         // 5.5. Verify PoH sequence (if PoH is available and block has PoH data)
         // Only verify for blocks that have valid PoH data (not genesis or pre-PoH blocks)
         // 
@@ -13178,29 +13436,38 @@ impl BlockchainNode {
                                     let height_gap = network_height.saturating_sub(microblock_height);
                                     
                                     // v2.83: MUCH HIGHER threshold to prevent destructive rollbacks
-                                    // Only trigger rollback for SEVERE stalls, not minor sync delays
-                                    // Small networks (≤10 nodes): 50 blocks - allow time for sync
-                                    // Medium networks (11-100): 100 blocks - more tolerance
-                                    // Large networks (100+): 200 blocks - high latency tolerance
+                                    // v9.0: Trigger rollback based on network size.
+                                    // Small networks need FAST detection (10 blocks) — a 50-block
+                                    // gap on a 5-node genesis net means the network is dead.
+                                    // Larger networks tolerate more because propagation is slower.
                                     let network_size = p2p.get_active_full_super_nodes().len();
                                     let dynamic_threshold = match network_size {
-                                        0..=10 => 50,     // Genesis/small: was 5, now 50
-                                        11..=100 => 100,  // Medium: was 10, now 100
-                                        _ => 200,         // Large: was 20, now 200
+                                        0..=10 => 10,     // Genesis/small: fast detection
+                                        11..=100 => 50,   // Medium: moderate tolerance
+                                        _ => 100,         // Large: high latency tolerance
                                     };
-                                    
-                                    // v2.83: PROTECTION against infinite rollback loop
-                                    // Only allow ONE rollback per 10 minutes
+
+                                    // v9.0: ADAPTIVE cooldown — escalates on repeated rollbacks.
+                                    // First rollback: 60s cooldown (react fast to stall).
+                                    // Second: 120s. Third+: 300s max (prevent infinite loop).
                                     static LAST_ROLLBACK_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                    static ROLLBACK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                                     let now_secs = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs();
                                     let last_rollback = LAST_ROLLBACK_TIME.load(std::sync::atomic::Ordering::Relaxed);
-                                    let rollback_cooldown = 600; // 10 minutes cooldown
-                                    
+                                    let rb_count = ROLLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                                    let rollback_cooldown = match rb_count {
+                                        0 => 60,    // First rollback: 1 min
+                                        1 => 120,   // Second: 2 min
+                                        2 => 180,   // Third: 3 min
+                                        _ => 300,   // 4th+: 5 min max
+                                    };
+
                                     if height_gap > dynamic_threshold && (now_secs - last_rollback) > rollback_cooldown {
                                         LAST_ROLLBACK_TIME.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                                        ROLLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         
                                         println!("[ERR][FORK] slot_delay={}s behind={} blocks threshold={}", 
                                                  local_delay, height_gap, dynamic_threshold);
@@ -13233,12 +13500,21 @@ impl BlockchainNode {
                                         println!("[INFO][FORK] rollback from={} to={}", microblock_height, rollback_to);
                                         
                                         // Delete blocks from rollback_to+1 to current
+                                        let mut stall_delete_fails = 0u64;
                                         for h in (rollback_to.saturating_add(1))..=microblock_height {
                                             if let Err(e) = storage.delete_microblock(h) {
                                                 println!("[WARN][FORK] delete_block_failed h={} err={}", h, e);
+                                                stall_delete_fails += 1;
                                             }
                                         }
-                                        
+                                        // v9.0 BUG-29: Verify critical blocks actually deleted
+                                        if stall_delete_fails > 0 {
+                                            let spot_check = rollback_to.saturating_add(1);
+                                            if storage.load_microblock_auto_format(spot_check).ok().flatten().is_some() {
+                                                println!("[ERR][FORK] block {} still in storage after delete!", spot_check);
+                                            }
+                                        }
+
                                         // Delete macroblocks that might be corrupted
                                         let mb_from = (rollback_to / 90) + 1;
                                         let mb_to = microblock_height / 90;
@@ -13248,22 +13524,18 @@ impl BlockchainNode {
                                             }
                                         }
                                         
-                                        // Update local height (all 3 sources of truth)
+                                        // v9.0: Update all height sources atomically
                                         microblock_height = rollback_to;
-                                        {
-                                            let mut h = height.write().await;
-                                            *h = rollback_to;
-                                        }
-                                        storage.set_chain_height(rollback_to).ok();
-                                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                            rollback_to, std::sync::atomic::Ordering::Relaxed
-                                        );
-                                        
+                                        crate::node::update_all_heights(&height, &storage, rollback_to).await;
+
                                         // End rollback protection
                                         crate::storage::end_rollback_protection();
                                         
                                         println!("[INFO][FORK] rollback_complete new_h={}", rollback_to);
-                                        
+
+                                        // v9.0: Reset adaptive cooldown counter on successful rollback
+                                        ROLLBACK_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+
                                         // v3.31: Clear ALL stale state after rollback
                                         // Without this, stale entries block re-queueing of blocks
                                         // causing dup_pending on ALL sync responses → sync deadlock
@@ -13413,10 +13685,19 @@ impl BlockchainNode {
                                     FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                     SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                                 } else {
-                                    let sync_elapsed = current_time.saturating_sub(sync_start_time);
-                                    
-                                    if sync_elapsed >= SYNC_DEADLOCK_TIMEOUT_SECS {
-                                        println!("[SYNC] 🔓 DEADLOCK DETECTED: Fast sync stuck for {}s, force clearing flag", sync_elapsed);
+                                    // v9.0: Progress-based deadlock detection.
+                                    // Instead of fixed cap (was 300s), check time since LAST progress.
+                                    // If blocks are flowing (even slowly), sync continues indefinitely.
+                                    // Deadlock = no new block for 120s.
+                                    let last_progress = LAST_SYNC_PROGRESS_TIME.load(Ordering::Relaxed);
+                                    let progress_ref = if last_progress > 0 { last_progress } else { sync_start_time };
+                                    let since_progress = current_time.saturating_sub(progress_ref);
+                                    const SYNC_NO_PROGRESS_TIMEOUT: u64 = 120; // 2 min without ANY block = stuck
+
+                                    if since_progress >= SYNC_NO_PROGRESS_TIMEOUT {
+                                        let sync_elapsed = current_time.saturating_sub(sync_start_time);
+                                        println!("[SYNC] DEADLOCK: no progress for {}s (total={}s), clearing sync flag",
+                                                 since_progress, sync_elapsed);
                                         FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                         FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
                                         SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
@@ -13428,7 +13709,8 @@ impl BlockchainNode {
                             if !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
                                 // Record sync start time for deadlock detection
                                 FAST_SYNC_START_TIME.store(current_time, Ordering::Relaxed);
-                                println!("[SYNC] ⚡ FAST SYNC MODE: {} blocks behind, catching up...", height_difference);
+                                LAST_SYNC_PROGRESS_TIME.store(current_time, Ordering::Relaxed);
+                                println!("[SYNC] FAST SYNC: {} blocks behind, catching up...", height_difference);
                                 
                                     // CRITICAL FIX: Do NOT update height before syncing blocks!
                                     // This prevents chain breaks where node thinks it's at height X without having the blocks
@@ -13733,9 +14015,15 @@ impl BlockchainNode {
                     
                     // Trigger emergency sync
                     if let Some(ref p2p) = unified_p2p {
-                        println!("[WARN][CONS] Starting emergency sync from {} to {}", 
+                        println!("[WARN][CONS] Starting emergency sync from {} to {}",
                                 local_stored_height + 1, expected_height);
-                        
+
+                        // Set sync flags so timestamp validation bypasses monotonicity check.
+                        // Without this, blocks from other fork branches get TIMESTAMP_INVALID
+                        // and recovery loops forever.
+                        FAST_SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
+                        SYNC_TARGET_HEIGHT.store(expected_height, Ordering::SeqCst);
+
                         // STATE MACHINE: Emergency sync
                         let progress = ((local_stored_height as f64 / expected_height as f64) * 100.0) as u8;
                         set_node_state(NodeState::Syncing {
@@ -13743,13 +14031,32 @@ impl BlockchainNode {
                             target_height: expected_height,
                             progress_percent: progress,
                         });
-                        
-                        // Use fast sync for emergency
+
+                        // v9.0 BUG-25: Aggregate timeout for emergency sync.
+                        // sync_blocks can hang if peers are unresponsive. Scale timeout
+                        // with gap size: base 30s + 1s per block, max 120s.
+                        let gap = expected_height.saturating_sub(local_stored_height);
+                        let timeout_secs = std::cmp::min(30 + gap, 120);
                         let sync_start = std::time::Instant::now();
-                        if let Err(e) = p2p.sync_blocks(local_stored_height + 1, expected_height).await {
-                            println!("[WARN][CONS] Emergency sync failed: {}", e);
-                        } else {
-                            if is_info() { println!("[INFO][CONS] emrg_sync {:?}", sync_start.elapsed()); }
+                        let sync_result = tokio::time::timeout(
+                            Duration::from_secs(timeout_secs),
+                            p2p.sync_blocks(local_stored_height + 1, expected_height)
+                        ).await;
+
+                        // Always clear sync flags after emergency sync (success or failure)
+                        FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
+
+                        match sync_result {
+                            Ok(Err(e)) => {
+                                println!("[WARN][CONS] Emergency sync failed: {}", e);
+                            }
+                            Err(_) => {
+                                println!("[ERR][CONS] Emergency sync TIMEOUT after {}s (gap={})", timeout_secs, gap);
+                            }
+                            Ok(Ok(())) => {
+                                if is_info() { println!("[INFO][CONS] emrg_sync {:?}", sync_start.elapsed()); }
+                            }
                         }
                         
                         // BUG FIX: After emergency sync, repair chain_height metadata
@@ -14089,8 +14396,11 @@ impl BlockchainNode {
                             Self::get_previous_microblock_hash(&storage, entropy_height + 1).await
                         };
                         
-                        // Query a sample of peers for their entropy
-                        let peers = p2p.get_validated_active_peers();
+                        // v9.0 BUG-22: Sort peers deterministically before sampling.
+                        // Different nodes may have peers in different order in DashMap.
+                        // Sort by peer ID ensures ALL nodes sample the SAME peers.
+                        let mut peers = p2p.get_validated_active_peers();
+                        peers.sort_by(|a, b| a.id.cmp(&b.id));
                         
                         // ARCHITECTURE: Adaptive sample size for Byzantine consensus
                         // CRITICAL: Sample from QUALIFIED PRODUCERS (reputation ≥70%, Super/Full only)
@@ -14629,10 +14939,18 @@ impl BlockchainNode {
                                     selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
                                     selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
                                 ]);
+                                // v9.1: Guard against empty candidates (would panic on % 0)
+                                if sorted_candidates.is_empty() {
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][PROD] fallback_no_candidates h={}", next_block_height);
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    continue;
+                                }
                                 let selection_index = (selection_value % sorted_candidates.len() as u64) as usize;
-                                
+
                                 let new_producer = sorted_candidates[selection_index].clone();
-                                println!("[INFO][PROD] fallback={} excluded={} cand={}", 
+                                println!("[INFO][PROD] fallback={} excluded={} cand={}",
                                          new_producer, current_producer, sorted_candidates.len());
                                 
                                 // Update producer for this round
@@ -16595,9 +16913,10 @@ impl BlockchainNode {
                         *global_height = microblock_height;
                         
                         // Update P2P local height for message filtering
+                        // v9.0: Release ordering pairs with Acquire in consensus paths
                         crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                            microblock_height, 
-                            std::sync::atomic::Ordering::Relaxed
+                            microblock_height,
+                            std::sync::atomic::Ordering::Release
                         );
                     }
                     
@@ -18551,6 +18870,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
             ]);
             
+            // v9.1: Guard against empty candidates (would panic on % 0)
+            if sorted_candidates.is_empty() {
+                println!("[WARN][FAILOVER] emergency_no_candidates h={}", current_height);
+                return failed_producer.to_string();
+            }
             let selection_index = (selection_value as usize) % sorted_candidates.len();
             let emergency_producer = sorted_candidates[selection_index].0.clone();
             

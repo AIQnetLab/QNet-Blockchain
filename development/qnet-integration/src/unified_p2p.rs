@@ -1511,6 +1511,10 @@ pub struct SimplifiedP2P {
     /// Auto-cleaned every 60 seconds (TX older than 2 minutes removed)
     /// Capacity: 1M TX hashes (~64MB memory)
     seen_tx_hashes: Arc<DashSet<String>>,
+
+    /// v9.1: Dedup for ActiveNodeAnnouncement gossip (prevents 27× Dilithium re-verification).
+    /// Key: "node_id:timestamp" — cleared every 60s alongside seen_tx_hashes.
+    seen_announcements: Arc<DashSet<String>>,
     
     // ═══════════════════════════════════════════════════════════════════════════
     // v2.50.0: POOL 2 & POOL 3 ACCUMULATORS
@@ -2363,6 +2367,7 @@ impl SimplifiedP2P {
             
             // ANTI-STORM v2.25: Prevent gossip amplification
             seen_tx_hashes: Arc::new(DashSet::new()),
+            seen_announcements: Arc::new(DashSet::new()),
             
             // v2.50.0: Pool 2 & Pool 3 accumulators for deterministic rewards
             pool2_accumulated_fees: Arc::new(AtomicU64::new(0)),
@@ -4203,17 +4208,24 @@ impl SimplifiedP2P {
         };
         
         let seen_tx_hashes = Arc::clone(&self.seen_tx_hashes);
-        
+        let seen_announcements = Arc::clone(&self.seen_announcements);
+
         handle.spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 let count = seen_tx_hashes.len();
                 if count > 0 {
                     seen_tx_hashes.clear();
-                    if crate::node::is_info() { println!("[ANTI-STORM] 🧹 Cleared {} TX hashes from dedup cache", count); }
+                    if crate::node::is_info() { println!("[ANTI-STORM] Cleared {} TX hashes from dedup cache", count); }
+                }
+
+                // v9.1: Clear announcement dedup cache alongside TX hashes
+                let ann_count = seen_announcements.len();
+                if ann_count > 0 {
+                    seen_announcements.clear();
                 }
             }
         });
@@ -5807,11 +5819,41 @@ impl SimplifiedP2P {
             }
         }
         
+        // v9.0: Validate chunk fields BEFORE any allocation.
+        // Prevents OOM from malicious total_chunks or oversized data.
+        if chunk.total_chunks > SHRED_PROTOCOL_MAX_CHUNKS {
+            if crate::node::is_warn() {
+                println!("[WARN][SHRED] reject_oversized total_chunks={} max={} from={}",
+                         chunk.total_chunks, SHRED_PROTOCOL_MAX_CHUNKS, get_privacy_id_for_addr(from_peer));
+            }
+            return;
+        }
+        if chunk.data.len() > SHRED_PROTOCOL_CHUNK_SIZE {
+            if crate::node::is_warn() {
+                println!("[WARN][SHRED] reject_oversized chunk_data={} max={} from={}",
+                         chunk.data.len(), SHRED_PROTOCOL_CHUNK_SIZE, get_privacy_id_for_addr(from_peer));
+            }
+            return;
+        }
+        if chunk.chunk_index >= chunk.total_chunks && !chunk.is_parity {
+            if crate::node::is_warn() {
+                println!("[WARN][SHRED] reject_bad_index idx={} total={}", chunk.chunk_index, chunk.total_chunks);
+            }
+            return;
+        }
+        // Cap pending assemblies to prevent memory exhaustion from future blocks
+        const MAX_PENDING_ASSEMBLIES: usize = 30;
+        if !self.shred_protocol_assemblies.contains_key(&height)
+           && self.shred_protocol_assemblies.len() >= MAX_PENDING_ASSEMBLIES
+        {
+            return; // don't start new assembly if too many pending
+        }
+
         // CRITICAL FIX: Track state OUTSIDE DashMap lock to prevent deadlock
         // DashMap entry() holds a lock that would block remove() in reconstruct functions
         // v2.60: Added is_new_chunk to prevent infinite forwarding loops
         let (should_reconstruct_all, should_reconstruct_parity, total_chunks, chunks_count, parity_count, is_new_chunk);
-        
+
         {
             // Scoped block to release DashMap lock before calling reconstruct
             let mut assembly = self.shred_protocol_assemblies.entry(height)
@@ -10001,6 +10043,38 @@ impl SimplifiedP2P {
             .as_secs()
     }
     
+    /// v9.0: Per-peer consensus message rate check.
+    /// Returns true if message should be DROPPED (rate exceeded).
+    fn is_consensus_rate_limited(&self, peer_id: &str, msg_type: &str, max_per_min: usize) -> bool {
+        let now = self.current_timestamp();
+        let rate_key = format!("cons_{}_{}", msg_type, peer_id);
+        let mut entry = self.rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
+            requests: Vec::new(),
+            max_requests: max_per_min,
+            window_seconds: 60,
+            blocked_until: 0,
+        });
+        if entry.blocked_until > now {
+            // v9.1: Cap maximum block duration to 600s to prevent permanent block on NTP drift.
+            // If blocked_until is more than 600s in the future, it's likely a clock issue — unblock.
+            if entry.blocked_until.saturating_sub(now) > 600 {
+                entry.blocked_until = 0;
+            } else {
+                return true; // still blocked
+            }
+        }
+        entry.requests.retain(|&t| t > now.saturating_sub(60));
+        if entry.requests.len() >= max_per_min {
+            entry.blocked_until = now + 300; // block 5 min
+            if crate::node::is_warn() {
+                println!("[WARN][RATE] consensus_{} flood from={} blocked_5min", msg_type, peer_id);
+            }
+            return true;
+        }
+        entry.requests.push(now);
+        false
+    }
+
     /// Regional clustering for geographical load balancing
     fn start_regional_clustering(&self) {
         // SAFE: Check if Tokio runtime is available to prevent panic
@@ -10546,7 +10620,8 @@ impl SimplifiedP2P {
                 
                 if storage.load_microblock(height).unwrap_or(None).is_some() {
                     block_received = true;
-                    LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Relaxed);
+                    // v9.0: Release ordering pairs with Acquire loads in consensus paths
+                    LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Release);
                     break;
                 }
             }
@@ -11470,6 +11545,14 @@ impl SimplifiedP2P {
                 }
                 
                 // Mark as seen BEFORE processing (prevents race conditions)
+                // v9.1: Capacity cap — clear if exceeding 1M entries to prevent OOM
+                // between periodic 60s cleanup cycles (e.g., during TX flood)
+                if self.seen_tx_hashes.len() > 1_000_000 {
+                    self.seen_tx_hashes.clear();
+                    if crate::node::is_warn() {
+                        println!("[WARN][ANTI-STORM] seen_tx_hashes emergency_clear cap=1M");
+                    }
+                }
                 self.seen_tx_hashes.insert(tx_hash.clone());
                 
                 // PRODUCTION v2.19.25: Full transaction processing
@@ -11522,6 +11605,13 @@ impl SimplifiedP2P {
                 self.update_peer_last_seen(from_peer);
                 
                 // ANTI-STORM v2.25: Filter out already-seen transactions
+                // v9.1: Capacity cap — emergency clear at 1M to prevent OOM
+                if self.seen_tx_hashes.len() > 1_000_000 {
+                    self.seen_tx_hashes.clear();
+                    if crate::node::is_warn() {
+                        println!("[WARN][ANTI-STORM] seen_tx_hashes emergency_clear cap=1M");
+                    }
+                }
                 let mut new_txs: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
                 for tx_data in &transactions {
                     let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_data));
@@ -11593,6 +11683,13 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::HealthPing { from, timestamp, height, signature, public_key } => {
+                // v9.1: Rate limit BEFORE Dilithium3 verification (~35ms CPU each).
+                // HealthPings arrive every 10s per peer → max 6/min is generous.
+                // Without this, an attacker floods pings to burn CPU on sig verification.
+                if self.is_consensus_rate_limited(from_peer, "health_ping", 12) {
+                    return;
+                }
+
                 // v8.0: Separate signature verification from timestamp freshness.
                 // Dilithium signature proves the SENDER actually sent this height.
                 // Timestamp freshness (age_secs) is only anti-replay — it should NOT
@@ -11634,22 +11731,22 @@ impl SimplifiedP2P {
             NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, signature, timestamp } => {
                 self.update_peer_last_seen(&node_id);
 
-                // v8.0: Skip consensus processing while syncing.
-                // A node at height 0 receiving consensus for round 104000+ wastes CPU
-                // on signature verification that will always fail (missing certs).
-                // Ethereum: nodes in sync mode don't participate in consensus.
-                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                // v9.0: Rate limit consensus messages (max 10/min per peer)
+                if self.is_consensus_rate_limited(&node_id, "commit", 10) { return; }
+
+                // v9.0: Acquire ordering ensures we see the latest height written by any thread.
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
                 if round_id > 0 && local_h + 100 < round_id {
                     // Too far behind — silently drop consensus messages
                     return;
                 }
 
-                if crate::node::is_debug() { 
-                    println!("[DBG][CONS] commit_recv round={} from={}", round_id, node_id); 
+                if crate::node::is_debug() {
+                    println!("[DBG][CONS] commit_recv round={} from={}", round_id, node_id);
                 }
                 if self.is_macroblock_consensus_round(round_id) {
-                    if crate::node::is_info() { 
-                        println!("[INFO][MACRO] commit_process round={}", round_id); 
+                    if crate::node::is_info() {
+                        println!("[INFO][MACRO] commit_process round={}", round_id);
                     }
                     self.handle_remote_consensus_commit(round_id, node_id, commit_hash, signature, timestamp);
                 }
@@ -11658,8 +11755,11 @@ impl SimplifiedP2P {
             NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp, signature } => {
                 self.update_peer_last_seen(&node_id);
 
-                // v8.0: Skip consensus processing while syncing (see ConsensusCommit above)
-                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                // v9.0: Rate limit consensus messages (max 10/min per peer)
+                if self.is_consensus_rate_limited(&node_id, "reveal", 10) { return; }
+
+                // v9.0: Acquire ordering for consensus-critical height check
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
                 if round_id > 0 && local_h + 100 < round_id {
                     return;
                 }
@@ -11682,8 +11782,11 @@ impl SimplifiedP2P {
             NetworkMessage::VrfLeaderClaim { round, node_id, vrf_output, vrf_proof, slot_seed, reputation, timestamp, vrf_public_key, gossip_ttl } => {
                 self.update_peer_last_seen(&node_id);
 
-                // v8.0: Skip VRF claims while syncing (same logic as consensus)
-                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                // v9.0: Rate limit VRF claims (max 5/min per peer)
+                if self.is_consensus_rate_limited(&node_id, "vrf", 5) { return; }
+
+                // v9.0: Acquire ordering for consensus-critical height check
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
                 if round > 0 && local_h + 100 < round {
                     return;
                 }
@@ -11824,10 +11927,14 @@ impl SimplifiedP2P {
 
             NetworkMessage::TimeoutVote { height, timeout_round, voter_id, last_block_hash, signature } => {
                 self.update_peer_last_seen(&voter_id);
-                if crate::node::is_debug() { 
-                    println!("[DBG][TIMEOUT] vote_recv h={} round={} voter={}", height, timeout_round, voter_id); 
+
+                // v9.0: Rate limit timeout votes (max 30/min per peer)
+                if self.is_consensus_rate_limited(&voter_id, "timeout", 30) { return; }
+
+                if crate::node::is_debug() {
+                    println!("[DBG][TIMEOUT] vote_recv h={} round={} voter={}", height, timeout_round, voter_id);
                 }
-                
+
                 // Process timeout vote and check if certificate is ready
                 self.handle_timeout_vote(height, timeout_round, voter_id, last_block_hash, signature);
             }
@@ -12181,7 +12288,18 @@ impl SimplifiedP2P {
                 // Drop zero-hash responses — they mean "I don't have this block yet"
                 // and would poison the requester's cache, blocking consensus forever.
                 if entropy_hash != [0u8; 32] {
-                    crate::node::ENTROPY_RESPONSES.insert((block_height, responder_id.clone()), entropy_hash);
+                    // v9.0: Verify responder_id matches the transport-verified sender.
+                    // STRICT: Only exact address match. No substring fallbacks.
+                    // Better to miss 1 response than accept a spoofed one.
+                    let sender_verified = self.get_peer_address(&responder_id)
+                        .map(|addr| addr == from_peer)
+                        .unwrap_or(false);
+                    if sender_verified {
+                        crate::node::ENTROPY_RESPONSES.insert((block_height, responder_id.clone()), entropy_hash);
+                    } else if crate::node::is_warn() {
+                        println!("[WARN][ENTROPY] rejected_unverified from={} claimed={} h={}",
+                                 from_peer, responder_id, block_height);
+                    }
                 }
             }
             
@@ -12991,12 +13109,25 @@ impl SimplifiedP2P {
                 node_id, node_type, shard_id, reputation, timestamp, signature, gossip_hop
             } => {
                 self.update_peer_last_seen(from_peer);
-                
+
+                // v9.1: Rate limit BEFORE Dilithium3 verification (~35ms CPU each).
+                // Announcements arrive every ~30s per node, gossip fan-out ×3 → max 10/min per peer.
+                if self.is_consensus_rate_limited(from_peer, "active_announce", 15) {
+                    return;
+                }
+
+                // v9.1: Dedup — skip if already processed this exact announcement.
+                // Prevents 27× redundant Dilithium verification from gossip fan-out.
+                let announce_key = format!("{}:{}", node_id, timestamp);
+                if !self.seen_announcements.insert(announce_key) {
+                    return; // Already seen and verified
+                }
+
                 // GOSSIP TTL: Max 3 hops
                 if gossip_hop >= 3 {
                     return;
                 }
-                
+
                 // TIMESTAMP VALIDATION: Must be within ±5 minutes
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -13005,7 +13136,7 @@ impl SimplifiedP2P {
                 if timestamp > now + 300 || timestamp < now.saturating_sub(300) {
                     return;
                 }
-                
+
                 // SECURITY (NIST FIPS 204 compliant): ALWAYS verify Dilithium signature
                 // ActiveNodeAnnouncement affects pinger selection - MUST be verified
                 // Skipping verification would allow replay attacks and fake registrations
@@ -16322,23 +16453,43 @@ impl SimplifiedP2P {
         });
     }
     
-    /// Cleanup stale active nodes (not seen in 15 minutes)
+    /// Cleanup stale active nodes (not seen in 15 minutes) + capacity cap
     pub fn cleanup_stale_active_nodes(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
         let cutoff = now - (15 * 60);  // 15 minutes ago
-        
+
         // v2.51: Lock-free cleanup
         let before = self.active_full_super_nodes.len();
         self.active_full_super_nodes.retain(|_, v| v.last_seen > cutoff);
         let removed = before - self.active_full_super_nodes.len();
-        
+
         if removed > 0 {
             if crate::node::is_info() {
-                println!("[CLEANUP] 🧹 Removed {} stale active nodes (>15min)", removed);
+                println!("[CLEANUP] removed {} stale active nodes (>15min)", removed);
+            }
+        }
+
+        // v9.0: Capacity cap to prevent unbounded memory growth at scale.
+        // If still over limit after TTL eviction, evict oldest entries.
+        const MAX_ACTIVE_NODES: usize = 10_000;
+        let current_len = self.active_full_super_nodes.len();
+        if current_len > MAX_ACTIVE_NODES {
+            // Collect (key, last_seen) sorted by last_seen ascending
+            let mut entries: Vec<(String, u64)> = self.active_full_super_nodes.iter()
+                .map(|e| (e.key().clone(), e.value().last_seen))
+                .collect();
+            entries.sort_by_key(|e| e.1);
+
+            let to_evict = current_len - MAX_ACTIVE_NODES;
+            for (key, _) in entries.iter().take(to_evict) {
+                self.active_full_super_nodes.remove(key);
+            }
+            if crate::node::is_warn() {
+                println!("[WARN][CLEANUP] capacity_evict count={} cap={}", to_evict, MAX_ACTIVE_NODES);
             }
         }
     }
@@ -16785,29 +16936,25 @@ impl SimplifiedP2P {
             .unwrap_or_default()
             .as_secs();
         
-        // CRITICAL FIX: Adaptive rate limiting based on sync state
-        // If peer is far behind, allow unlimited sync requests for recovery
-        // ARCHITECTURE: Use REQUEST RANGE as proxy for how far behind the requester is
-        // This is MORE ACCURATE than trying to track each peer's height (which requires HTTP calls)
-        // If requester asks for blocks 1-100, they're clearly behind by at least 100 blocks
-        let blocks_behind = if to_height > from_height {
-            to_height - from_height  // Request range indicates how far behind
-        } else {
-            0
-        };
+        // v7.2: Adaptive rate limiting based on REAL lag, not request size.
+        // Compare the requested height against our local chain tip.
+        // A node requesting h=300 when we are at h=8000 is 7700 blocks behind —
+        // that's a syncing node, not a DDoS. Let it catch up.
+        let local_chain_height = LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let blocks_behind = local_chain_height.saturating_sub(to_height);
         
-        // v3.0: CRITICAL FIX - Genesis nodes bypass rate limiting to prevent network isolation
-        // PROBLEM: Genesis nodes blocked each other during sync, causing entire network to halt
-        // SOLUTION: Genesis nodes get unlimited sync requests (they are trusted bootstrap nodes)
-        let is_genesis_requester = requester_id.starts_with("genesis_node_");
+        // v9.0 BUG-16: Genesis bypass uses ONLY transport-verified IP (from_peer),
+        // NOT the self-declared requester_id which is spoofable.
+        // QUIC+TLS ensures from_peer IP is authentic (can't be spoofed without valid cert).
         let is_genesis_peer = from_peer.split(':').next()
             .map(|ip| is_genesis_node_ip(ip))
             .unwrap_or(false);
-        
+
         // Check rate limit (adaptive based on sync state)
         let rate_limited = {
-            // v3.0: GENESIS BYPASS - Never rate limit genesis nodes syncing with each other
-            if is_genesis_requester || is_genesis_peer {
+            // v9.0: GENESIS BYPASS - Only by verified IP, not self-declared ID
+            if is_genesis_peer {
                 false // Genesis nodes always allowed
             // CRITICAL: No rate limit for nodes catching up (>5 blocks behind)
             } else if blocks_behind > 5 {
@@ -17205,6 +17352,12 @@ impl SimplifiedP2P {
     /// PRODUCTION: Used during initial sync and catch-up
     /// v2.96: Filter by failover cache + retry to next peer on failure
     pub async fn sync_macroblocks(&self, from_index: u64, to_index: u64) -> Result<(), String> {
+        // v7.2: MacroBlock numbering starts at 1 (first created at h=90).
+        // Index 0 never exists — skip silently to avoid wasting 5 peer timeouts.
+        let from_index = from_index.max(1);
+        if from_index > to_index {
+            return Ok(()); // Nothing to sync (e.g. from=1 but to=0 means no macroblocks yet)
+        }
         if crate::node::is_info() {
             println!("[INFO][MB-SYNC] start from={} to={}", from_index, to_index);
         }
@@ -20071,12 +20224,14 @@ impl SimplifiedP2P {
         
         // ═══════════════════════════════════════════════════════════════════════════
         // SECURITY: Reputation check from blockchain (v2.21.5)
+        // v9.1: Compare directly on 0-100 scale (was ÷100 + compare to 0.70,
+        // which relied on IEEE754 coincidence for correctness).
         // ═══════════════════════════════════════════════════════════════════════════
-        let reputation_score = self.get_node_reputation_from_blockchain(&node_id) / 100.0;
-        
-        if reputation_score < 0.70 {
+        let reputation_score = self.get_node_reputation_from_blockchain(&node_id);
+
+        if reputation_score < 70.0 {
             if crate::node::is_warn() {
-                println!("[WARN][CONS] commit_low_rep node={} rep={:.1}", node_id, reputation_score * 100.0);
+                println!("[WARN][CONS] commit_low_rep node={} rep={:.1}", node_id, reputation_score);
             }
             return;
         }
@@ -20207,13 +20362,14 @@ impl SimplifiedP2P {
         
         // ═══════════════════════════════════════════════════════════════════════════
         // SECURITY: Reputation check from blockchain (v2.21.5)
+        // v9.1: Compare directly on 0-100 scale (was ÷100 + compare to 0.70).
         // ═══════════════════════════════════════════════════════════════════════════
-        let reputation_score = self.get_node_reputation_from_blockchain(&node_id) / 100.0;
-        
-        if reputation_score < 0.70 {
+        let reputation_score = self.get_node_reputation_from_blockchain(&node_id);
+
+        if reputation_score < 70.0 {
             if crate::node::is_info() {
-                println!("[CONSENSUS] ❌ Rejecting reveal from jailed node: {} (reputation: {:.1}%)", 
-                         node_id, reputation_score * 100.0);
+                println!("[CONSENSUS] Rejecting reveal from jailed node: {} (reputation: {:.1}%)",
+                         node_id, reputation_score);
             }
             return;
         }
@@ -20407,13 +20563,20 @@ impl SimplifiedP2P {
         self.verify_consensus_signature(voter_id, message, &sig_str)
     }
     
-    /// Report timeout equivocation for potential slashing
+    /// Report timeout equivocation for slashing.
+    /// v9.0: Stores evidence in global queue, drained at macroblock creation.
     fn report_timeout_equivocation(&self, voter_id: &str, height: u64, round: u64) {
-        // Evidence for future slashing implementation
         if crate::node::is_warn() {
             println!("[WARN][SLASH] timeout_equivocation voter={} h={} round={}", voter_id, height, round);
         }
-        // TODO: Add to slashing evidence queue for inclusion in next macroblock
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        crate::node::EQUIVOCATION_EVIDENCE.insert(
+            (height, voter_id.to_string()),
+            (round, now),
+        );
     }
     
     /// Generate and broadcast TimeoutProof when 2/3+ votes collected
@@ -21179,7 +21342,8 @@ impl SimplifiedP2P {
     /// Byzantine threshold = (n * 2 + 2) / 3 ≈ 2/3+
     /// Examples: 5 nodes → 4 votes, 10 nodes → 7 votes, 1000 nodes → 668 votes
     pub fn get_active_validator_count(&self) -> usize {
-        let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        // v9.0: Acquire ordering — BFT threshold depends on correct height
+        let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
 
         // v6.6: Genesis epoch (blocks 0-180): use 5 genesis validators as BASE,
         // but also count connected Super peers to reflect actual network size.
@@ -21398,7 +21562,8 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: Validate emergency message against LOCAL blockchain state
         // SECURITY: Don't trust emergency messages blindly - verify we actually need failover
-        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+        // v9.0: Acquire ordering — failover decisions depend on accurate height
+        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Acquire);
         
         // VALIDATION #1: Ignore failover for blocks too far in the future
         if block_height > local_height + 10 {
@@ -21779,7 +21944,8 @@ impl SimplifiedP2P {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             
             // Step 2: Check if block arrived (using global state)
-            let final_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+            // v9.0: Acquire ordering for consensus-critical failover check
+            let final_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Acquire);
             
             if block_height_log <= final_height {
                 if crate::node::is_info() {
