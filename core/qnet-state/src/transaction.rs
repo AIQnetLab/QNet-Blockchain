@@ -289,6 +289,20 @@ pub enum TransactionType {
         eligible_count: u32,             // Count of eligible nodes (popcount of bitmap)
         bitmap_compressed: Vec<u8>,      // zstd-compressed bitmap (1 bit per Light node)
     },
+    /// v9.4: Node reactivation after offline period
+    /// Sent by returning nodes after sync to re-enter eligible producers set.
+    /// Similar to Cosmos MsgUnjail — explicit on-chain signal that node is back online and synced.
+    /// Free system TX (gas_limit = 0), deduplicated per macroblock-epoch.
+    NodeReactivation {
+        node_id: String,
+        /// Current chain height at time of reactivation (proves node is synced)
+        current_height: u64,
+        /// Hash of latest macroblock the node has (proves sync completeness)
+        last_macroblock_hash: String,
+        /// Macroblock index of the latest macroblock
+        #[serde(default)]
+        last_macroblock_index: u64,
+    },
 }
 
 /// Individual ping sample with Merkle proof
@@ -604,6 +618,7 @@ impl Transaction {
             TransactionType::HeartbeatCommitment { .. } => 0,
             TransactionType::LightNodeEligibilityBitmap { .. } => 0,
             TransactionType::NodeRegistration { .. } => 0,
+            TransactionType::NodeReactivation { .. } => 0,
             // Deprecated batch types: per-item gas based on operation type
             TransactionType::BatchRewardClaims { node_ids, .. } => {
                 gas_limits::REWARD_CLAIM * node_ids.len() as u64
@@ -1012,8 +1027,33 @@ impl Transaction {
                 }
                 // Empty api_endpoint = node chose to hide IP (valid for Super nodes)
             }
+            TransactionType::NodeReactivation { node_id, current_height, last_macroblock_hash, last_macroblock_index } => {
+                // v9.4: Validate reactivation TX
+                if node_id.is_empty() {
+                    return Err("NodeReactivation: node_id cannot be empty".to_string());
+                }
+                if last_macroblock_hash.is_empty() {
+                    return Err("NodeReactivation: last_macroblock_hash cannot be empty".to_string());
+                }
+                if *current_height == 0 {
+                    return Err("NodeReactivation: current_height must be > 0".to_string());
+                }
+                if *last_macroblock_index == 0 && *current_height > 90 {
+                    return Err("NodeReactivation: last_macroblock_index required for height > 90".to_string());
+                }
+                // Sanity: macroblock_index should roughly match current_height / 90
+                if *last_macroblock_index > 0 {
+                    let expected_max_mb = (*current_height / 90) + 1;
+                    if *last_macroblock_index > expected_max_mb {
+                        return Err(format!(
+                            "NodeReactivation: last_macroblock_index {} inconsistent with height {}",
+                            last_macroblock_index, current_height
+                        ));
+                    }
+                }
+            }
         }
-        
+
         Ok(())
     }
     
@@ -1724,8 +1764,17 @@ impl Transaction {
                 }
                 // Registration data is stored in blockchain for immutable lookup
             }
+            TransactionType::NodeReactivation { node_id, current_height, last_macroblock_index, .. } => {
+                // v9.4: System transaction: node reactivation signal
+                // No balance changes — only signals that the node is back online and synced.
+                // Picked up by create_eligible_producers_snapshot() Level 1 scan.
+                if is_info_log() {
+                    println!("[INFO][NODE-REACT] reactivated: {} h={} mb={}",
+                        node_id, current_height, last_macroblock_index);
+                }
+            }
         }
-        
+
         Ok(())
     }
     

@@ -750,6 +750,21 @@ struct TransactionRequest {
     dilithium_public_key: Option<String>,
 }
 
+/// v9.4: NodeReactivation submit request (for returning nodes)
+/// Node sends this after sync to re-enter eligible producers set.
+/// Unlike NodeRegistration (one-time), this can be sent on every restart/re-sync.
+#[derive(Debug, Deserialize)]
+struct NodeReactivationRequest {
+    /// Node ID (e.g., "genesis_node_001" or "super_xyz")
+    node_id: String,
+    /// Current synced chain height
+    current_height: u64,
+    /// Hash of the latest macroblock the node has
+    last_macroblock_hash: String,
+    /// Index of the latest macroblock
+    last_macroblock_index: u64,
+}
+
 /// v6.0: Client-created NodeRegistration TX submit request
 /// Client signs: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
 /// This endpoint accepts the signed TX and routes it directly to the current producer.
@@ -795,7 +810,7 @@ struct TransactionHistoryQuery {
     /// Transactions per page (default: 20, max: 100)
     #[serde(default = "default_per_page")]
     per_page: usize,
-    /// Filter by transaction type: "transfer", "reward", "activation", "heartbeat_commitment", "ping_commitment", "node_registration", "swap", "system", "all" (default: "all")
+    /// Filter by transaction type: "transfer", "reward", "activation", "heartbeat_commitment", "ping_commitment", "node_registration", "node_reactivation", "swap", "system", "all" (default: "all")
     #[serde(default = "default_tx_type")]
     tx_type: String,
     /// Filter by direction: "sent", "received", "all" (default: "all")
@@ -1358,6 +1373,18 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_node_registration_client_submit);
+
+    // v9.4: NodeReactivation TX submit (returning nodes re-enter eligible producers)
+    let node_reactivation_submit = api_v1
+        .and(warp::path("node-reactivation"))
+        .and(warp::path("submit"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_node_reactivation_submit);
 
     // Transaction get - RATE LIMITED v3.19
     let transaction_get = api_v1
@@ -2328,7 +2355,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(generate_activation_code)
         .or(verify_activation)
         .or(node_secure_info)
-        .or(node_registration_submit);
+        .or(node_registration_submit)
+        .or(node_reactivation_submit);
 
     let consensus_routes = consensus_commit
         .or(consensus_reveal)
@@ -3604,11 +3632,13 @@ async fn handle_transaction_history(
                         "heartbeat_commitment" => matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. }),
                         "ping_commitment" => matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. }),
                         "node_registration" => matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }),
+                        "node_reactivation" => matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. }),
                         "swap" => matches!(tx.tx_type, qnet_state::TransactionType::Swap { .. }),
-                        "system" => matches!(tx.tx_type, 
+                        "system" => matches!(tx.tx_type,
                             qnet_state::TransactionType::HeartbeatCommitment { .. } |
                             qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
                             qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
+                            qnet_state::TransactionType::NodeReactivation { .. } |
                             qnet_state::TransactionType::RewardDistribution
                         ),
                         _ => true, // "all" or unknown
@@ -3655,6 +3685,7 @@ async fn handle_transaction_history(
                     qnet_state::TransactionType::PingCommitmentWithSampling { .. } => "ping_commitment",
                     qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } => "bitmap_commitment",
                     qnet_state::TransactionType::NodeRegistration { .. } => "node_registration",
+                    qnet_state::TransactionType::NodeReactivation { .. } => "node_reactivation",
                     qnet_state::TransactionType::Swap { .. } => "swap",
                     _ => "other",
                 };
@@ -13001,6 +13032,84 @@ async fn handle_node_registration_client_submit(
     }
 }
 
+/// v9.4: Handle NodeReactivation TX submit (returning nodes re-enter eligible producers)
+/// POST /api/v1/node-reactivation/submit
+/// Creates NodeReactivation TX and adds to mempool + broadcasts.
+async fn handle_node_reactivation_submit(
+    req: NodeReactivationRequest,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "transaction") {
+        return Ok(rate_limit_response);
+    }
+
+    // Validate node_id format
+    if !req.node_id.starts_with("super_") && !req.node_id.starts_with("genesis_node_") {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Only Super/Genesis nodes can reactivate"
+        })));
+    }
+
+    if req.last_macroblock_hash.is_empty() || req.last_macroblock_hash.len() < 16 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid macroblock hash"
+        })));
+    }
+
+    if req.current_height == 0 || req.last_macroblock_index == 0 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "current_height and last_macroblock_index must be > 0"
+        })));
+    }
+
+    // Create NodeReactivation TX (sync, same pattern as NodeRegistration)
+    let mut react_tx = crate::node::BlockchainNode::create_node_reactivation_tx(
+        &req.node_id,
+        req.current_height,
+        &req.last_macroblock_hash,
+        req.last_macroblock_index,
+    );
+
+    // Sign with hybrid Ed25519 + Dilithium3 (same as NodeRegistration for Super/Genesis nodes)
+    let wallet_identity = blockchain.get_wallet_identity();
+    crate::node::BlockchainNode::sign_reactivation_tx(
+        &mut react_tx,
+        &req.node_id,
+        wallet_identity.as_deref(),
+    );
+
+    let tx_hash = react_tx.hash.clone();
+    let tx_bytes = bincode::serialize(&react_tx).unwrap_or_default();
+    let mempool = blockchain.get_mempool();
+
+    if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), react_tx.gas_price) {
+        println!("[INFO][NODE-REACTIVATION] tx_added node={} h={} mb={} hash={}",
+                 req.node_id, req.current_height, req.last_macroblock_index,
+                 &tx_hash[..16.min(tx_hash.len())]);
+
+        // Broadcast to all peers for fast inclusion
+        if let Some(p2p) = blockchain.get_unified_p2p() {
+            let _ = p2p.broadcast_transaction(tx_bytes);
+        }
+
+        Ok(warp::reply::json(&json!({
+            "success": true,
+            "tx_hash": tx_hash,
+            "node_id": req.node_id,
+            "message": "NodeReactivation TX submitted — node will re-enter eligible producers within 2-3 macroblocks"
+        })))
+    } else {
+        Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Failed to add TX to mempool (duplicate or mempool full)"
+        })))
+    }
+}
+
 /// Handle sync status request
 async fn handle_sync_status(
     remote_addr: Option<std::net::SocketAddr>,
@@ -13010,7 +13119,7 @@ async fn handle_sync_status(
     if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
         return Ok(rate_limit_response);
     }
-    
+
     let local_height = blockchain.get_height().await;
     
     // CRITICAL FIX v2.105: Use max(local, cached) to prevent stale peer heights

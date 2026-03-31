@@ -138,11 +138,21 @@ const MAX_CONCURRENT_HANDSHAKES: usize = 64;
 /// (observed: 2.5M throttled events in 1 hour — complete QUIC transport death).
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
-/// v9.1: Max concurrent QUIC connections from a single IP address.
-/// Prevents single-source resource exhaustion while allowing reasonable
-/// multi-node setups behind NAT (e.g., 3-4 nodes per datacenter).
-/// At 20 per IP × 500 global cap, an attacker needs 25+ IPs to saturate.
-const MAX_CONNECTIONS_PER_IP: u32 = 20;
+/// v9.3: Tiered per-IP connection limits.
+/// Genesis/validator IPs get higher limits for reliable consensus connectivity.
+/// Unknown IPs get stricter limits for DoS protection.
+/// RATIONALE: Every production L1 (Ethereum geth, Solana) gives trusted validators
+/// preferential treatment. With 5 genesis nodes × 100 = 500 connections (within global cap).
+/// Unknown IPs at 20 per IP × 500 global cap need 25+ IPs to saturate.
+const MAX_CONNECTIONS_PER_IP_GENESIS: u32 = 100;
+const MAX_CONNECTIONS_PER_IP_DEFAULT: u32 = 20;
+
+/// v9.3: Check if IP belongs to a genesis node (compile-time known validators).
+fn is_genesis_ip(ip: &std::net::IpAddr) -> bool {
+    let ip_str = ip.to_string();
+    crate::genesis_constants::GENESIS_NODE_IPS.iter()
+        .any(|(genesis_ip, _)| *genesis_ip == ip_str)
+}
 
 /// v9.2: TOFU pin lifetime (24 hours). After this, the pin expires and re-pins
 /// on next connection. This handles cert rotation on rolling restarts:
@@ -411,24 +421,76 @@ impl QuicTransport {
         self.message_handler = Some(handler);
     }
     
-    /// Generate self-signed TLS certificate
-    fn generate_tls_cert(node_id: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), String> {
+    /// v9.3: Load persistent TLS cert from disk, or generate + save if missing.
+    /// Every production L1 uses persistent identity keys (stored in data dir).
+    /// Ephemeral certs cause TOFU pin mismatches on every restart → network partition.
+    fn load_or_generate_tls_cert(node_id: &str, data_dir: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), String> {
+        let tls_dir = format!("{}/tls", data_dir);
+        let cert_path = format!("{}/cert.der", tls_dir);
+        let key_path = format!("{}/key.der", tls_dir);
+
+        // Try loading existing cert+key from disk
+        if let (Ok(cert_bytes), Ok(key_bytes)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
+            if !cert_bytes.is_empty() && !key_bytes.is_empty() {
+                if crate::node::is_info() {
+                    println!("[INFO][QUIC] tls_cert_loaded path={} size={}B", cert_path, cert_bytes.len());
+                }
+                return Ok((
+                    CertificateDer::from(cert_bytes),
+                    PrivateKeyDer::Pkcs8(key_bytes.into()),
+                ));
+            }
+        }
+
+        // Generate new cert
         let cert = rcgen::generate_simple_self_signed(vec![format!("qnet-{}", node_id)])
             .map_err(|e| format!("Certificate generation failed: {}", e))?;
-        
+
         let cert_der = cert.serialize_der()
             .map_err(|e| format!("Certificate serialization failed: {}", e))?;
         let key_der = cert.get_key_pair().serialize_der();
-        
+
+        // Save to disk (create dir if needed, owner-only permissions)
+        if let Err(e) = std::fs::create_dir_all(&tls_dir) {
+            if crate::node::is_warn() {
+                println!("[WARN][QUIC] tls_dir_create_fail path={} err={}", tls_dir, e);
+            }
+            // Continue without persistence — better than failing startup
+        } else {
+            // Atomic write: write to .tmp then rename — prevents corrupt files on crash
+            let cert_tmp = format!("{}.tmp", cert_path);
+            let key_tmp = format!("{}.tmp", key_path);
+            if let Err(e) = std::fs::write(&cert_tmp, &cert_der)
+                .and_then(|_| std::fs::rename(&cert_tmp, &cert_path)) {
+                if crate::node::is_warn() { println!("[WARN][QUIC] tls_cert_write_fail err={}", e); }
+                let _ = std::fs::remove_file(&cert_tmp);
+            }
+            if let Err(e) = std::fs::write(&key_tmp, &key_der)
+                .and_then(|_| std::fs::rename(&key_tmp, &key_path)) {
+                if crate::node::is_warn() { println!("[WARN][QUIC] tls_key_write_fail err={}", e); }
+                let _ = std::fs::remove_file(&key_tmp);
+            }
+            // Best-effort chmod 0600 (Unix only, no-op on Windows)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
+            if crate::node::is_info() {
+                println!("[INFO][QUIC] tls_cert_generated_and_saved path={}", cert_path);
+            }
+        }
+
         Ok((CertificateDer::from(cert_der), PrivateKeyDer::Pkcs8(key_der.into())))
     }
-    
+
     /// Initialize QUIC transport (creates endpoint)
     pub async fn init(&mut self, bind_addr: SocketAddr, cert_serial: &str) -> Result<(), String> {
         self.cert_serial = cert_serial.to_string();
-        
-        // Generate TLS certificate
-        let (cert, key) = Self::generate_tls_cert(&self.node_id)?;
+
+        // v9.3: Load persistent TLS cert (or generate on first run)
+        let data_dir = std::env::var("QNET_DATA_DIR").unwrap_or_else(|_| "/app/data".to_string());
+        let (cert, key) = Self::load_or_generate_tls_cert(&self.node_id, &data_dir)?;
         
         // Server config — v4.8: aws-lc-rs provider for ML-KEM 768 (Kyber) hybrid key exchange
         // TLS 1.3 with X25519Kyber768Draft00 = post-quantum secure P2P transport
@@ -552,14 +614,17 @@ impl QuicTransport {
                 
                 let peer_addr = incoming.remote_address();
 
-                // v9.1: Per-IP connection limit — reject before TLS handshake to save CPU
+                // v9.3: Tiered per-IP connection limit — reject before TLS handshake to save CPU.
+                // Genesis/validator IPs get higher limits for consensus reliability.
                 let peer_ip = peer_addr.ip();
+                let ip_limit = if is_genesis_ip(&peer_ip) { MAX_CONNECTIONS_PER_IP_GENESIS } else { MAX_CONNECTIONS_PER_IP_DEFAULT };
                 let current_ip_count = per_ip_conns.get(&peer_ip).map(|v| *v).unwrap_or(0);
-                if current_ip_count >= MAX_CONNECTIONS_PER_IP {
+                if current_ip_count >= ip_limit {
                     incoming.refuse();
                     if crate::node::is_warn() {
-                        println!("[WARN][QUIC] per_ip_limit ip={} count={} max={}",
-                                 peer_ip, current_ip_count, MAX_CONNECTIONS_PER_IP);
+                        println!("[WARN][QUIC] per_ip_limit ip={} count={} max={} tier={}",
+                                 peer_ip, current_ip_count, ip_limit,
+                                 if is_genesis_ip(&peer_ip) { "genesis" } else { "default" });
                     }
                     continue;
                 }
@@ -1147,21 +1212,32 @@ impl QuicTransport {
                     return Ok(conn.clone());
                 }
             }
-            
+
             match self.try_connect_once(endpoint, peer_addr).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
+                    // v9.3: CERT_REJECTED — abort immediately, no retry.
+                    // The peer's TOFU pin is set. Retrying with the same cert fingerprint
+                    // will fail identically. Only wastes bandwidth and floods per_ip_limit.
+                    if e.contains("CERT_REJECTED") || e.contains("TOFU_PIN_MISMATCH") || e.contains("Cert verification failed") {
+                        if crate::node::is_warn() {
+                            println!("[WARN][QUIC] cert_rejected_no_retry peer={} reason={}",
+                                get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                        }
+                        return Err(format!("CERT_REJECTED (no retry): {}", e));
+                    }
+
                     // v2.24: Track handshake failures separately
                     if e.contains("aborted by peer") || e.contains("handshake") {
                         handshake_failures += 1;
                     }
                     last_error = e;
-                    
+
                     if attempt < max_attempts {
                         // v2.24: Exponential backoff with cap
                         let base_delay = RETRY_DELAY_MS * (1 << (attempt - 1).min(5));
                         let delay = Duration::from_millis(base_delay.min(MAX_RETRY_DELAY_MS));
-                        
+
                         if crate::node::is_warn() && (attempt % 2 == 1 || attempt == max_attempts - 1) {
                             println!("[WARN][QUIC] conn_attempt_failed attempt={}/{} peer={} retry_in={:?}",
                                 attempt, max_attempts,
@@ -2058,14 +2134,30 @@ impl QuicTransport {
                             claimed_node_id, pin_age, hex::encode(&fingerprint[..8]));
                     }
                 } else {
-                    // Within grace period and fingerprint changed — suspicious (possible MITM)
-                    let pinned_hex = hex::encode(&pin.fingerprint[..8]);
-                    drop(entry);
-                    return Err(format!(
-                        "TOFU_PIN_MISMATCH: node={} age={}s(<{}s grace) pinned={} received={} — possible MITM",
-                        claimed_node_id, pin_age, TOFU_PIN_GRACE_AFTER_SECS,
-                        pinned_hex, hex::encode(&fingerprint[..8]),
-                    ));
+                    // v9.3: Genesis nodes ALWAYS allowed to re-pin — their IPs are
+                    // hardcoded at compile time, so cert rotation is legitimate (deploy/restart).
+                    // Non-genesis: reject within grace period (possible MITM).
+                    let is_genesis_node_id = claimed_node_id.starts_with("genesis_node_");
+                    if is_genesis_node_id {
+                        drop(entry);
+                        pins.insert(claimed_node_id.to_string(), TofuPin {
+                            fingerprint,
+                            pinned_at: now_ts,
+                        });
+                        if is_info() {
+                            println!("[INFO][TOFU] repin_genesis node={} age={}s fp={}",
+                                claimed_node_id, pin_age, hex::encode(&fingerprint[..8]));
+                        }
+                    } else {
+                        // Within grace period and fingerprint changed — suspicious (possible MITM)
+                        let pinned_hex = hex::encode(&pin.fingerprint[..8]);
+                        drop(entry);
+                        return Err(format!(
+                            "TOFU_PIN_MISMATCH: node={} age={}s(<{}s grace) pinned={} received={} — possible MITM",
+                            claimed_node_id, pin_age, TOFU_PIN_GRACE_AFTER_SECS,
+                            pinned_hex, hex::encode(&fingerprint[..8]),
+                        ));
+                    }
                 }
             }
             None => {

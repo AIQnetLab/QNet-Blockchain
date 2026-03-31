@@ -10449,16 +10449,23 @@ impl SimplifiedP2P {
         // Use semaphore to limit concurrent workers
         let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel_workers));
         
-        // CRITICAL FIX: Use filtered and prioritized peers (blacklist + reputation + Light nodes excluded)
-        // SCALABILITY: Light nodes are NOT sync sources (millions of Light nodes in production)
-        let filtered_peers = self.get_sync_peers_filtered(20);
-        let peers: Vec<String> = filtered_peers.iter()
-            .map(|p| p.addr.clone())
-            .collect();
-        
+        // v9.3: Use height-filtered peers — only peers that have the blocks we need.
+        // Prevents empty_range responses when all peers are at same/lower height.
+        // Fallback: if no peers have target height, try any peer (they may have received blocks since last heartbeat).
+        let filtered_peers = self.get_sync_peers_filtered_by_height(20, target_height);
+        let peers: Vec<String> = if filtered_peers.is_empty() {
+            // Fallback: any sync-capable peer (height may be stale)
+            if crate::node::is_info() {
+                println!("[SYNC] no peers at h>={}, fallback=any_peer", target_height);
+            }
+            self.get_sync_peers_filtered(20).iter().map(|p| p.addr.clone()).collect()
+        } else {
+            filtered_peers.iter().map(|p| p.addr.clone()).collect()
+        };
+
         if peers.is_empty() {
             if crate::node::is_info() {
-                println!("[SYNC] ⚠️ No suitable sync peers available (blacklist/reputation filtered)");
+                println!("[SYNC] no suitable sync peers available (blacklist/reputation/height filtered)");
             }
             return;
         }
@@ -11299,6 +11306,10 @@ pub struct ActiveNodeInfo {
     pub shard_id: u8,
     pub reputation: f64,
     pub last_seen: u64,             // Last heartbeat/announcement timestamp
+    /// v9.3: Last known block height (from heartbeat/announcement).
+    /// Used to exclude syncing nodes from consensus and choose correct sync peers.
+    #[serde(default)]
+    pub block_height: u64,
 }
 
 /// Internal consensus messages for node communication
@@ -13110,9 +13121,15 @@ impl SimplifiedP2P {
             } => {
                 self.update_peer_last_seen(from_peer);
 
-                // v9.1: Rate limit BEFORE Dilithium3 verification (~35ms CPU each).
-                // Announcements arrive every ~30s per node, gossip fan-out ×3 → max 10/min per peer.
-                if self.is_consensus_rate_limited(from_peer, "active_announce", 15) {
+                // v9.2: Adaptive rate limit BEFORE Dilithium3 verification (~35ms CPU each).
+                // Scales with network size: more peers → each peer relays more unique announces.
+                // Formula: base 10 + active_nodes/5, capped at 200/min.
+                // 5 nodes → 11/min, 100 nodes → 30/min, 1000 nodes → 200/min (cap).
+                // This ensures: (a) small networks aren't over-limited, (b) large networks
+                // don't allow unbounded CPU burn, (c) no magic constants to tune manually.
+                let active_count = self.active_full_super_nodes.len();
+                let adaptive_limit = (10 + active_count / 5).min(200);
+                if self.is_consensus_rate_limited(from_peer, "active_announce", adaptive_limit) {
                     return;
                 }
 
@@ -13220,20 +13237,37 @@ impl SimplifiedP2P {
                     .unwrap_or(true);
                     
                 if should_update {
+                    // v9.3: Get peer's block height from connected_peers for sync tracking
+                    let peer_height = self.connected_peers_lockfree.iter()
+                        .find(|e| e.value().id == node_id)
+                        .map(|e| e.value().last_block_height)
+                        .unwrap_or(0);
                     self.active_full_super_nodes.insert(node_id.clone(), ActiveNodeInfo {
                         node_id: node_id.clone(),
                         node_type: node_type.clone(),
                         shard_id,
                         reputation: effective_reputation, // Use REAL reputation!
                         last_seen: timestamp,
+                        block_height: peer_height,
                     });
                     if crate::node::is_info() {
-                        println!("[INFO][ACTIVE] updated node={} type={} shard={} rep={:.1}", 
-                                 node_id, node_type, shard_id, effective_reputation);
+                        println!("[INFO][ACTIVE] updated node={} type={} shard={} rep={:.1} h={}",
+                                 node_id, node_type, shard_id, effective_reputation, peer_height);
                     }
                 }
                 
-                // RE-GOSSIP
+                // v9.2: RE-GOSSIP with adaptive fan-out, decaying per hop.
+                // hop 0→1: sqrt(peers) clamped 2..6
+                // hop 1→2: sqrt(peers)/2 clamped 1..3
+                // hop 2→3: terminal (gossip_hop >= 3 rejected above)
+                // Decay prevents exponential explosion while maintaining O(log n) propagation.
+                let peer_count = self.connected_peers_lockfree.len().max(1);
+                let base_fanout = (peer_count as f64).sqrt().ceil() as usize;
+                let relay_fanout = match gossip_hop {
+                    0 => base_fanout.clamp(2, 6),       // first relay: wider spread
+                    1 => (base_fanout / 2).clamp(1, 3), // second relay: narrower
+                    _ => 1,                              // last hop: minimal
+                };
                 let forward_msg = NetworkMessage::ActiveNodeAnnouncement {
                     node_id,
                     node_type,
@@ -13243,7 +13277,7 @@ impl SimplifiedP2P {
                     signature,
                     gossip_hop: gossip_hop + 1,
                 };
-                self.gossip_to_random_peers(forward_msg, 3);
+                self.gossip_to_random_peers(forward_msg, relay_fanout);
             }
             
             // PRODUCTION: Request active nodes list
@@ -16306,12 +16340,25 @@ impl SimplifiedP2P {
         // Only register if rep >= MIN_CONSENSUS_REPUTATION
         if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
             if crate::node::is_warn() {
-                println!("[WARN][ACTIVE] register_skip reason=low_rep rep={:.1} min={:.0}", 
+                println!("[WARN][ACTIVE] register_skip reason=low_rep rep={:.1} min={:.0}",
                          reputation, qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION);
             }
             return;
         }
-        
+
+        // v9.3: Don't register if more than 1 macroblock behind network.
+        // Syncing nodes must not participate in consensus — they can be selected
+        // as producer but can't produce, causing network stall.
+        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
+        let network_height = self.get_max_peer_height();
+        if network_height > 90 && local_height + 90 < network_height {
+            if crate::node::is_warn() {
+                println!("[WARN][ACTIVE] register_skip reason=syncing local={} net={} gap={}",
+                         local_height, network_height, network_height - local_height);
+            }
+            return;
+        }
+
         // Register locally (v2.51: lock-free)
         self.active_full_super_nodes.insert(self.node_id.clone(), ActiveNodeInfo {
             node_id: self.node_id.clone(),
@@ -16319,10 +16366,11 @@ impl SimplifiedP2P {
             shard_id: self.shard_id,
             reputation,
             last_seen: now,
+            block_height: local_height,
         });
         if crate::node::is_info() {
-            println!("[INFO][ACTIVE] registered_async node={} type={} total={}", 
-                     self.node_id, node_type_str, self.active_full_super_nodes.len());
+            println!("[INFO][ACTIVE] registered_async node={} type={} h={} total={}",
+                     self.node_id, node_type_str, local_height, self.active_full_super_nodes.len());
         }
         
         // Sign with ASYNC Dilithium (proper quantum-resistant signature)
@@ -16347,10 +16395,20 @@ impl SimplifiedP2P {
             signature,
             gossip_hop: 0,
         };
-        
-        self.gossip_to_random_peers(msg, 5);
+
+        // v9.2: Adaptive fan-out — sqrt(peers), min 3, max 8.
+        // 5 peers → 3, 25 peers → 5, 64 peers → 8 (cap).
+        // Combined with 3-hop re-gossip (fan-out 3 each), total propagation:
+        //   hop0: sqrt(n) peers, hop1: ×3, hop2: ×3 = sqrt(n) × 9
+        //   At 1000 nodes: ~32 × 9 = ~288 messages (vs 5 × 9 = 45 fixed).
+        //   At 5 nodes: 3 × 9 = 27 (covers all, same as before).
+        // This matches epidemic gossip theory: O(sqrt(n)) fan-out achieves
+        // O(log n) propagation rounds with high probability.
+        let peer_count = self.connected_peers_lockfree.len().max(1);
+        let adaptive_fanout = ((peer_count as f64).sqrt().ceil() as usize).clamp(3, 8);
+        self.gossip_to_random_peers(msg, adaptive_fanout);
     }
-    
+
     /// Register this node as active Full/Super node (SYNC version for std::thread::spawn)
     /// WARNING: Only use in pure sync contexts where NO tokio runtime exists!
     pub fn register_as_active_node(&self) {
@@ -16372,12 +16430,23 @@ impl SimplifiedP2P {
         // Only register if rep >= MIN_CONSENSUS_REPUTATION
         if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
             if crate::node::is_warn() {
-                println!("[WARN][ACTIVE] register_skip reason=low_rep rep={:.1} min={:.0}", 
+                println!("[WARN][ACTIVE] register_skip reason=low_rep rep={:.1} min={:.0}",
                          reputation, qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION);
             }
             return;
         }
-        
+
+        // v9.3: Don't register if syncing (>1 macroblock behind)
+        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
+        let network_height = self.get_max_peer_height();
+        if network_height > 90 && local_height + 90 < network_height {
+            if crate::node::is_warn() {
+                println!("[WARN][ACTIVE] register_skip reason=syncing local={} net={} gap={}",
+                         local_height, network_height, network_height - local_height);
+            }
+            return;
+        }
+
         // Register locally (v2.51: lock-free)
         self.active_full_super_nodes.insert(self.node_id.clone(), ActiveNodeInfo {
             node_id: self.node_id.clone(),
@@ -16385,10 +16454,11 @@ impl SimplifiedP2P {
             shard_id: self.shard_id,
             reputation,
             last_seen: now,
+            block_height: local_height,
         });
         if crate::node::is_info() {
-            println!("[INFO][ACTIVE] registered node={} type={} total={}", 
-                     self.node_id, node_type_str, self.active_full_super_nodes.len());
+            println!("[INFO][ACTIVE] registered node={} type={} h={} total={}",
+                     self.node_id, node_type_str, local_height, self.active_full_super_nodes.len());
         }
         
         // Sign with SYNC Dilithium (creates new runtime - safe in std::thread::spawn)
@@ -16413,10 +16483,13 @@ impl SimplifiedP2P {
             signature,
             gossip_hop: 0,
         };
-        
-        self.gossip_to_random_peers(msg, 5);
+
+        // v9.2: Adaptive fan-out (same formula as async version)
+        let peer_count = self.connected_peers_lockfree.len().max(1);
+        let adaptive_fanout = ((peer_count as f64).sqrt().ceil() as usize).clamp(3, 8);
+        self.gossip_to_random_peers(msg, adaptive_fanout);
     }
-    
+
     /// Request active nodes list from peers (on startup)
     pub fn request_active_nodes_sync(&self) {
         let request = NetworkMessage::ActiveNodesRequest {
@@ -16443,6 +16516,12 @@ impl SimplifiedP2P {
         // Calculate shard from node_id
         let shard_id = Self::calculate_light_node_shard(node_id);
         
+        // v9.3: Get peer height for sync tracking
+        let peer_height = self.connected_peers_lockfree.iter()
+            .find(|e| e.value().id == node_id)
+            .map(|e| e.value().last_block_height)
+            .unwrap_or(0);
+
         // Update active nodes map (v2.51: lock-free)
         self.active_full_super_nodes.insert(node_id.to_string(), ActiveNodeInfo {
             node_id: node_id.to_string(),
@@ -16450,10 +16529,11 @@ impl SimplifiedP2P {
             shard_id,
             reputation,
             last_seen: timestamp,
+            block_height: peer_height,
         });
     }
     
-    /// Cleanup stale active nodes (not seen in 15 minutes) + capacity cap
+    /// v9.3: Cleanup stale active nodes (not seen in 15 minutes) + height-based + capacity cap
     pub fn cleanup_stale_active_nodes(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -16461,15 +16541,31 @@ impl SimplifiedP2P {
             .as_secs();
 
         let cutoff = now - (15 * 60);  // 15 minutes ago
+        let network_height = self.get_max_peer_height();
 
-        // v2.51: Lock-free cleanup
+        // v2.51: Lock-free cleanup — stale by time
         let before = self.active_full_super_nodes.len();
-        self.active_full_super_nodes.retain(|_, v| v.last_seen > cutoff);
+        self.active_full_super_nodes.retain(|node_id, v| {
+            // Remove if not seen in 15 minutes
+            if v.last_seen <= cutoff {
+                return false;
+            }
+            // v9.3: Remove if >2 macroblocks behind network (severely desynced).
+            // Don't apply during network bootstrap (network_height < 180).
+            // Don't remove self (local height updates asynchronously).
+            if network_height > 180 && v.block_height + 180 < network_height && *node_id != self.node_id {
+                if crate::node::is_info() {
+                    println!("[CLEANUP] evict_desynced node={} h={} net={}", node_id, v.block_height, network_height);
+                }
+                return false;
+            }
+            true
+        });
         let removed = before - self.active_full_super_nodes.len();
 
         if removed > 0 {
             if crate::node::is_info() {
-                println!("[CLEANUP] removed {} stale active nodes (>15min)", removed);
+                println!("[CLEANUP] removed {} stale/desynced active nodes", removed);
             }
         }
 
@@ -17636,13 +17732,36 @@ impl SimplifiedP2P {
             })
             .cloned()
             .collect();
-        
+
         // Fallback: if no peers pass filter, use all (network might be starting)
         if live_peers.is_empty() {
             if crate::node::is_warn() {
                 println!("[WARN][SYNC] no_live_peers fallback=all");
             }
             live_peers = peers;
+        }
+
+        // v9.3: Filter peers by block height — only request from peers that have the blocks we need.
+        // Prevents empty_range responses and wasted bandwidth.
+        if to_height > 0 {
+            let height_qualified: Vec<_> = live_peers.iter()
+                .filter(|p| p.last_block_height >= to_height)
+                .cloned()
+                .collect();
+            if !height_qualified.is_empty() {
+                if crate::node::is_debug() {
+                    println!("[DEBUG][SYNC] height_filter h={}-{} qualified={}/{} peers",
+                             from_height, to_height, height_qualified.len(), live_peers.len());
+                }
+                live_peers = height_qualified;
+            } else if crate::node::is_warn() {
+                // No peers report having these blocks — use all live peers as fallback.
+                // This handles bootstrap and peers that haven't reported height yet (default=0).
+                println!("[WARN][SYNC] no_peers_at_height h={} max_peer_h={} fallback=all_live count={}",
+                         to_height,
+                         live_peers.iter().map(|p| p.last_block_height).max().unwrap_or(0),
+                         live_peers.len());
+            }
         }
         
         // Sort by combined reputation (best first)
@@ -22896,14 +23015,26 @@ impl SimplifiedP2P {
     /// SCALABILITY: Returns top-N peers sorted by latency and reputation
     /// CRITICAL: Light nodes NEVER included as sync SOURCE (they only RECEIVE macroblock headers)
     /// NOTE: Light nodes DO receive blocks via broadcast, but don't serve blocks to others
+    /// v9.3: Added `min_height` parameter — only return peers whose `last_block_height >= min_height`.
+    /// This prevents requesting blocks from peers that don't have them (empty_range responses).
     pub fn get_sync_peers_filtered(&self, max_peers: usize) -> Vec<PeerInfo> {
+        self.get_sync_peers_filtered_by_height(max_peers, 0)
+    }
+
+    /// v9.3: Sync peer selection with height filter.
+    /// Only returns peers whose last_block_height >= min_height.
+    pub fn get_sync_peers_filtered_by_height(&self, max_peers: usize, min_height: u64) -> Vec<PeerInfo> {
         let mut eligible_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
             .filter_map(|entry| {
                 let peer = entry.value().clone();
-                
+
                 // CRITICAL: Light nodes are NOT sync sources (don't store full blocks)
-                // They RECEIVE macroblock headers but don't serve blocks to others
                 if peer.node_type == NodeType::Light {
+                    return None;
+                }
+
+                // v9.3: Skip peers that don't have the blocks we need
+                if min_height > 0 && peer.last_block_height < min_height {
                     return None;
                 }
                 

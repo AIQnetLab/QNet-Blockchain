@@ -699,6 +699,17 @@ impl StateManager {
                     )));
                 }
             }
+            TransactionType::NodeReactivation { node_id, last_macroblock_index, .. } => {
+                // v9.4: Deduplicate by macroblock-epoch (90 blocks).
+                // A node can reactivate at most once per macroblock-epoch.
+                let mb_epoch = last_macroblock_index;
+                if self.is_epoch_committed("reactivation", node_id, *mb_epoch) {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "duplicate NodeReactivation: node={} mb_epoch={} already reactivated",
+                        node_id, mb_epoch
+                    )));
+                }
+            }
             _ => {} // Non-commitment TXs — no dedup check needed
         }
         Ok(())
@@ -721,6 +732,10 @@ impl StateManager {
             }
             TransactionType::NodeRegistration { node_id, wallet_address, .. } => {
                 self.mark_node_registered(node_id, wallet_address);
+            }
+            TransactionType::NodeReactivation { node_id, last_macroblock_index, .. } => {
+                // v9.4: Mark reactivation to prevent duplicates within same mb-epoch
+                self.mark_epoch_committed("reactivation", node_id, *last_macroblock_index);
             }
             _ => {} // Non-commitment TXs — nothing to mark
         }

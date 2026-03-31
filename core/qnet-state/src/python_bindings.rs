@@ -289,6 +289,9 @@ impl PyTransaction {
             TransactionType::ContractDeploy => "contract_deploy".to_string(),
             TransactionType::ContractCall => "contract_call".to_string(),
             TransactionType::RewardDistribution => "reward_distribution".to_string(),
+            TransactionType::NodeRegistration { .. } => "node_registration".to_string(),
+            TransactionType::NodeReactivation { .. } => "node_reactivation".to_string(),
+            _ => "other".to_string(),
         }
     }
     

@@ -767,6 +767,25 @@ impl BlockValidator {
                 }
                 // System transaction - no gas fees
             }
+            TransactionType::NodeReactivation { node_id, current_height, last_macroblock_hash, last_macroblock_index } => {
+                // v9.4: Node reactivation validation
+                if node_id.is_empty() {
+                    return Err(IntegrationError::ValidationError("NodeReactivation: node_id cannot be empty".to_string()));
+                }
+                if !node_id.starts_with("super_") && !node_id.starts_with("genesis_node_") {
+                    return Err(IntegrationError::ValidationError(
+                        format!("NodeReactivation: only Super/Genesis nodes can reactivate, got: {}", node_id)
+                    ));
+                }
+                if last_macroblock_hash.is_empty() || last_macroblock_hash.len() < 16 {
+                    return Err(IntegrationError::ValidationError("NodeReactivation: invalid macroblock hash".to_string()));
+                }
+                if *current_height == 0 {
+                    return Err(IntegrationError::ValidationError("NodeReactivation: current_height must be > 0".to_string()));
+                }
+                // System transaction - no gas fees
+                let _ = last_macroblock_index; // used in dedup check at state level
+            }
             TransactionType::LightNodeEligibilityBitmap { genesis_id, total_assigned, eligible_count, .. } => {
                 // v2.89: Light Node Eligibility Bitmap validation
                 if !genesis_id.starts_with("genesis_node_") {

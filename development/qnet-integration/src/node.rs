@@ -1829,8 +1829,9 @@ impl BlockchainNode {
     /// PRODUCTION: Scales to millions of nodes with MAX_VALIDATORS_PER_EPOCH limit
     /// PRODUCTION v2.34: Create DETERMINISTIC eligible producers snapshot
     /// 
-    /// ARCHITECTURE: Uses ONLY consensus participants (who proved participation via commit+reveal)
-    /// NO P2P registry lookups - all nodes compute IDENTICAL list from consensus data!
+    /// ARCHITECTURE v9.3: Base set = actual BFT committers (who proved sync by signing commit).
+    /// Grace window: recently registered Super nodes (last 3 epochs) added for onboarding.
+    /// NO P2P registry lookups - all nodes compute IDENTICAL list from on-chain data!
     /// 
     /// Reputation is taken from DeterministicReputationState which is synchronized via blockchain.
     async fn create_eligible_producers_snapshot(
@@ -1879,45 +1880,123 @@ impl BlockchainNode {
         // Fix: Scan blockchain for confirmed NodeRegistration TXs with Super node_type.
         // Any registered Super node with reputation >= MIN_REPUTATION gets added to
         // the eligible set. This is deterministic — all nodes read the same blockchain.
+        //
+        // v9.3: TWO-LEVEL RE-ENTRY for nodes not in current BFT committers:
+        //
+        // LEVEL 1: Recent registration scan (grace period for NEW nodes).
+        //   Scan last 3 epochs for NodeRegistration TXs. New nodes get a window
+        //   to join BFT consensus before their registration ages out.
+        //
+        // LEVEL 2: Carry-over from recent macroblocks (re-entry for RETURNING nodes).
+        //   If a node was in eligible_producers of ANY of the last 3 macroblocks,
+        //   keep it — it was recently active and may have just missed one BFT round.
+        //   This is fully deterministic: all nodes read the same macroblocks.
+        //
+        // Without Level 2, a genesis node offline for >3 epochs is permanently
+        // locked out (registration at block 0 is outside scan window).
         // ═══════════════════════════════════════════════════════════════════════════
         {
             let existing_ids: std::collections::HashSet<String> = eligible.iter()
                 .map(|p| p.node_id.clone())
                 .collect();
 
-            let scan_end = macroblock_index * 90; // scan up to this macroblock's boundary
-            let mut registered_super_nodes: Vec<(String, qnet_state::NodeType)> = Vec::new();
+            // ── LEVEL 1: Recent NodeRegistration + NodeReactivation TX scan ──
+            let scan_end = macroblock_index * 90;
+            const REGISTRATION_GRACE_EPOCHS: u64 = 3;
+            let scan_start = scan_end.saturating_sub(REGISTRATION_GRACE_EPOCHS * 90);
+            let mut added_reg_count = 0usize;
+            let mut added_react_count = 0usize;
 
-            for height in 0..=scan_end {
+            for height in scan_start..=scan_end {
                 if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
                     for tx in &block.transactions {
+                        // v6.6: NodeRegistration TX — new nodes entering the network
                         if let qnet_state::TransactionType::NodeRegistration {
                             node_id, node_type, ..
                         } = &tx.tx_type {
                             if *node_type == qnet_state::NodeType::Super && !existing_ids.contains(node_id) {
-                                registered_super_nodes.push((node_id.clone(), node_type.clone()));
+                                let reputation = reputation_map.get(node_id).copied()
+                                    .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION / 100.0);
+                                if reputation >= MIN_REPUTATION {
+                                    eligible.push(qnet_state::EligibleProducer {
+                                        node_id: node_id.clone(),
+                                        reputation,
+                                    });
+                                    added_reg_count += 1;
+                                }
+                            }
+                        }
+                        // v9.4: NodeReactivation TX — returning nodes re-entering consensus
+                        if let qnet_state::TransactionType::NodeReactivation {
+                            node_id, ..
+                        } = &tx.tx_type {
+                            if !existing_ids.contains(node_id) {
+                                let reputation = reputation_map.get(node_id).copied()
+                                    .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION / 100.0);
+                                if reputation >= MIN_REPUTATION {
+                                    // Check not already added by registration scan above
+                                    let already_added = eligible.iter().any(|p| p.node_id == *node_id);
+                                    if !already_added {
+                                        eligible.push(qnet_state::EligibleProducer {
+                                            node_id: node_id.clone(),
+                                            reputation,
+                                        });
+                                        added_react_count += 1;
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
 
-            let mut added_count = 0usize;
-            for (node_id, _node_type) in &registered_super_nodes {
-                let reputation = reputation_map.get(node_id).copied()
-                    .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION / 100.0);
-                if reputation >= MIN_REPUTATION {
-                    eligible.push(qnet_state::EligibleProducer {
-                        node_id: node_id.clone(),
-                        reputation,
-                    });
-                    added_count += 1;
+            if added_reg_count > 0 || added_react_count > 0 {
+                println!("[INFO][SNAP] v9.4 L1_SCAN: added {} registrations + {} reactivations (h={}-{}) total={}",
+                         added_reg_count, added_react_count, scan_start, scan_end, eligible.len());
+            }
+
+            // ── LEVEL 2: Carry-over from recent macroblock eligible sets ──
+            // Nodes that were in eligible_producers within the last 3 macroblocks
+            // are carried over. This allows returning nodes to re-enter WITHOUT
+            // a new on-chain registration TX — they just need to have been active
+            // recently (within ~3 epochs ≈ 4.5 minutes).
+            //
+            // This is deterministic: all nodes read the same macroblocks from storage.
+            const CARRYOVER_LOOKBACK: u64 = 3;
+            let carryover_start = macroblock_index.saturating_sub(CARRYOVER_LOOKBACK);
+            let updated_existing_ids: std::collections::HashSet<String> = eligible.iter()
+                .map(|p| p.node_id.clone())
+                .collect();
+            let mut carryover_count = 0usize;
+
+            for mb_idx in carryover_start..macroblock_index {
+                if mb_idx == 0 { continue; }
+                if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(mb_idx) {
+                    if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
+                        if let Some(ref snapshot_data) = mb.consensus_data.eligible_producers {
+                            if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
+                                for p in &producers {
+                                    if !updated_existing_ids.contains(&p.node_id) {
+                                        let reputation = reputation_map.get(&p.node_id).copied()
+                                            .unwrap_or(p.reputation);
+                                        if reputation >= MIN_REPUTATION {
+                                            eligible.push(qnet_state::EligibleProducer {
+                                                node_id: p.node_id.clone(),
+                                                reputation,
+                                            });
+                                            carryover_count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
-            if added_count > 0 {
-                println!("[INFO][SNAP] v6.6 OPEN_CONSENSUS: added {} registered Super nodes to eligible set (total={})",
-                         added_count, eligible.len());
+            if carryover_count > 0 {
+                println!("[INFO][SNAP] v9.3 L2_CARRYOVER: added {} from recent macroblocks ({}-{}) total={}",
+                         carryover_count, carryover_start, macroblock_index.saturating_sub(1), eligible.len());
             }
         }
 
@@ -2150,6 +2229,122 @@ impl BlockchainNode {
         Self::create_node_registration_tx_with_timestamp(node_id, node_type, wallet_address, registration_proof, api_endpoint, None)
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v9.4: NodeReactivation TX — returning nodes signal they're back online
+    // Pattern: IDENTICAL to NodeRegistration TX flow (sync, not async)
+    //   Genesis nodes: unsigned system TX (same as genesis NodeRegistration)
+    //   Super nodes: hybrid Ed25519+Dilithium3 signed (same as super NodeRegistration)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Create base NodeReactivation TX (unsigned).
+    /// Signing is done separately by the caller via sign_reactivation_tx().
+    /// ALL nodes (Genesis + Super) sign with hybrid Ed25519 (BIP44) + Dilithium3 (WalletIdentity).
+    pub fn create_node_reactivation_tx(
+        node_id: &str,
+        current_height: u64,
+        last_macroblock_hash: &str,
+        last_macroblock_index: u64,
+    ) -> qnet_state::Transaction {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut tx = qnet_state::Transaction {
+            from: node_id.to_string(),
+            to: None,
+            amount: 0,
+            nonce: last_macroblock_index, // Epoch-based nonce for dedup
+            gas_price: u64::MAX,          // MAX priority — must land quickly
+            gas_limit: 0,                 // FREE system operation
+            timestamp,
+            hash: String::new(),
+            signature: None,              // Filled by caller for Super nodes
+            public_key: None,             // Filled by caller for Super nodes
+            tx_type: qnet_state::TransactionType::NodeReactivation {
+                node_id: node_id.to_string(),
+                current_height,
+                last_macroblock_hash: last_macroblock_hash.to_string(),
+                last_macroblock_index,
+            },
+            data: Some(format!(
+                "node_reactivation:{}:h={}:mb={}:{}",
+                node_id, current_height, last_macroblock_index,
+                &last_macroblock_hash[..16.min(last_macroblock_hash.len())]
+            )),
+            dilithium_signature: None,    // Filled by caller for Super nodes
+            dilithium_public_key: None,   // Filled by caller for Super nodes
+        };
+
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    /// v9.4: Create and SIGN NodeReactivation TX (for Super nodes with wallet identity).
+    /// Same signing flow as NodeRegistration for Super nodes (line 27237-27283):
+    ///   1. Ed25519 from BIP44 mnemonic
+    ///   2. Dilithium3 from WalletIdentity
+    ///   3. Mark as signed, recalculate hash
+    pub fn sign_reactivation_tx(
+        tx: &mut qnet_state::Transaction,
+        node_id: &str,
+        wallet_identity: Option<&crate::crypto::vrf::WalletIdentity>,
+    ) {
+        let canonical_msg = format!("node_reactivation:{}:{}",
+            node_id, tx.timestamp);
+
+        // Layer 1: Ed25519 from BIP44 m/44'/9999'/0'/0'/0' (same as NodeRegistration line 27248)
+        let mnemonic = std::env::var("QNET_WALLET_SEED").unwrap_or_default();
+        if !mnemonic.is_empty() {
+            use ed25519_dalek::Signer;
+            match crate::crypto::solana_derivation::derive_qnet_signing_key_from_mnemonic(&mnemonic) {
+                Ok(signing_key) => {
+                    let ed_sig = signing_key.sign(canonical_msg.as_bytes());
+                    tx.signature = Some(hex::encode(ed_sig.to_bytes()));
+                    tx.public_key = Some(hex::encode(signing_key.verifying_key().as_bytes()));
+                }
+                Err(e) => {
+                    eprintln!("[WARN][REACTIVATION] ed25519_sign_failed: {}", e);
+                }
+            }
+        }
+
+        // Layer 2: Dilithium3 from WalletIdentity (same as NodeRegistration line 27262)
+        if let Some(identity) = wallet_identity {
+            match identity.sign_consensus(node_id, canonical_msg.as_bytes()) {
+                Ok(consensus_sig) => {
+                    tx.dilithium_signature = Some(consensus_sig);
+                    tx.dilithium_public_key = Some(hex::encode(&identity.dilithium_pk));
+                }
+                Err(e) => {
+                    eprintln!("[WARN][REACTIVATION] dilithium3_sign_failed: {}", e);
+                }
+            }
+        }
+
+        // Recalculate hash after signing (same as NodeRegistration line 27277)
+        tx.hash = tx.calculate_hash();
+
+        println!("[INFO][REACTIVATION] signed ed25519={} dilithium3={} node={}",
+            tx.signature.is_some(), tx.dilithium_signature.is_some(), node_id);
+    }
+
+    /// v9.4: Get SHA3-256 hash of macroblock data from storage.
+    /// Tries mb_index first, falls back to mb_index-1.
+    /// Returns empty string if neither available.
+    fn get_latest_macroblock_hash(storage: &Arc<Storage>, mb_index: u64) -> String {
+        use sha3::{Sha3_256, Digest};
+        for idx in [mb_index, mb_index.saturating_sub(1)] {
+            if idx == 0 { continue; }
+            if let Ok(Some(data)) = storage.get_macroblock_by_height(idx) {
+                let mut hasher = Sha3_256::new();
+                hasher.update(&data);
+                return hex::encode(hasher.finalize());
+            }
+        }
+        String::new()
+    }
+
     /// Find node registration in blockchain (searches all blocks)
     /// Returns (node_type, wallet_address) if found
     pub async fn find_node_registration(&self, node_id: &str) -> Option<(qnet_state::NodeType, String)> {
@@ -2401,6 +2596,23 @@ impl BlockchainNode {
                                     let _ = storage.save_vrf_public_key(node_id, pk_hex);
                                     if is_info() {
                                         println!("[INFO][VRF-KEY] on_chain_registered node={} pk_hash={}",
+                                                 node_id, &pk_hex[..16]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // v9.4: NodeReactivation — register VRF key if present (same as NodeRegistration)
+                qnet_state::TransactionType::NodeReactivation { node_id, .. } => {
+                    if let Some(ref pk_hex) = tx.dilithium_public_key {
+                        if pk_hex.len() == crate::crypto::vrf::D3_PK_BYTES * 2 {
+                            if !crate::genesis_constants::has_vrf_key(node_id) {
+                                if let Ok(pk_bytes) = hex::decode(pk_hex) {
+                                    crate::genesis_constants::register_vrf_public_key(node_id, &pk_bytes);
+                                    let _ = storage.save_vrf_public_key(node_id, pk_hex);
+                                    if is_info() {
+                                        println!("[INFO][VRF-KEY] reactivation_registered node={} pk_hash={}",
                                                  node_id, &pk_hex[..16]);
                                     }
                                 }
@@ -6453,13 +6665,14 @@ impl BlockchainNode {
         let reward_manager_for_blocks = blockchain.reward_manager.clone();
         let reputation_for_blocks = blockchain.deterministic_reputation.clone();
         let mempool_for_blocks = blockchain.mempool.clone();
+        let wallet_identity_for_blocks = blockchain.wallet_identity.clone();
         tokio::spawn(async move {
             Self::process_received_blocks(
-                block_rx, 
+                block_rx,
                 storage_for_blocks,
-                state_for_blocks, 
-                height_for_blocks, 
-                p2p_for_blocks, 
+                state_for_blocks,
+                height_for_blocks,
+                p2p_for_blocks,
                 poh_for_blocks,
                 node_id_for_blocks,
                 node_type_for_blocks,
@@ -6467,6 +6680,7 @@ impl BlockchainNode {
                 reward_manager_for_blocks,
                 reputation_for_blocks,
                 mempool_for_blocks,
+                wallet_identity_for_blocks,
             ).await;
         });
         
@@ -7296,10 +7510,11 @@ impl BlockchainNode {
         reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
         deterministic_reputation: Arc<ParkingRwLock<DeterministicReputationState>>,
         mempool: Arc<SimpleMempool>,
+        wallet_identity: Option<Arc<crate::crypto::vrf::WalletIdentity>>,
     ) {
         // CRITICAL FIX: Buffer for out-of-order blocks
         // Key: block height, Value: (block data, retry count, timestamp)
-        let mut pending_blocks: std::collections::HashMap<u64, (crate::unified_p2p::ReceivedBlock, u8, std::time::Instant)> = 
+        let mut pending_blocks: std::collections::HashMap<u64, (crate::unified_p2p::ReceivedBlock, u8, std::time::Instant)> =
             std::collections::HashMap::new();
         
         // CRITICAL: Separate timers for retry (fast) and cleanup (slow)
@@ -8766,10 +8981,50 @@ impl BlockchainNode {
                         // CRITICAL: If we become producer immediately after sync, we must
                         // create block without waiting for slot time (network expects it NOW)
                         JUST_COMPLETED_SYNC.store(true, Ordering::SeqCst);
-                        
-                        if is_info() { 
-                            println!("[INFO][SYNC] target_reached h={} target={} sync_complete skip_slot=true", 
-                                     received_block.height, target); 
+
+                        if is_info() {
+                            println!("[INFO][SYNC] target_reached h={} target={} sync_complete skip_slot=true",
+                                     received_block.height, target);
+                        }
+
+                        // ═══════════════════════════════════════════════════════
+                        // v9.4: Auto-send NodeReactivation TX after sync
+                        // Same signing flow as NodeRegistration for Super nodes:
+                        //   Ed25519 (BIP44 mnemonic) + Dilithium3 (WalletIdentity)
+                        // Both Genesis and Super nodes sign — no bypass.
+                        // ═══════════════════════════════════════════════════════
+                        if !matches!(node_type, NodeType::Light) {
+                            let sync_height = received_block.height;
+                            let mb_index = sync_height / 90;
+                            if mb_index > 0 {
+                                let mb_hash = Self::get_latest_macroblock_hash(&storage, mb_index);
+                                if !mb_hash.is_empty() {
+                                    let mut react_tx = Self::create_node_reactivation_tx(
+                                        &node_id, sync_height, &mb_hash, mb_index,
+                                    );
+                                    // Sign: same as NodeRegistration (hybrid Ed25519+Dilithium3)
+                                    Self::sign_reactivation_tx(
+                                        &mut react_tx,
+                                        &node_id,
+                                        wallet_identity.as_ref().map(|arc| arc.as_ref()),
+                                    );
+                                    println!("[INFO][REACTIVATION] sync TX h={} mb={} hash={}",
+                                             sync_height, mb_index, &react_tx.hash[..16]);
+                                    if let Ok(tx_bytes) = bincode::serialize(&react_tx) {
+                                        let gas_price = react_tx.gas_price;
+                                        let tx_hash = react_tx.hash.clone();
+                                        if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), gas_price) {
+                                            println!("[INFO][REACTIVATION] TX in mempool hash={}", &tx_hash[..16]);
+                                            // Broadcast to network (same as NodeRegistration line 27300)
+                                            if let Some(ref p2p) = unified_p2p {
+                                                let _ = p2p.broadcast_transaction(tx_bytes);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    println!("[WARN][REACTIVATION] no macroblock hash available mb={}", mb_index);
+                                }
+                            }
                         }
                     }
                     
@@ -11782,6 +12037,7 @@ impl BlockchainNode {
         let storage = self.storage.clone();
         let height = self.height.clone();
         let unified_p2p = self.unified_p2p.clone();
+        let wallet_identity_for_reactivation = self.wallet_identity.clone();
         let microblock_interval = self.microblock_interval;
         let is_leader = self.is_leader.clone();
         let node_id = self.node_id.clone();
@@ -12514,7 +12770,39 @@ impl BlockchainNode {
                     println!("[ACTIVE] ✅ Registered as active {:?} node", node_type);
                 }
             }
-            
+
+            // v9.4: Send NodeReactivation TX on startup if already synced
+            // Covers quick restart scenario where sync is not needed
+            // Same signing flow as NodeRegistration for Super nodes:
+            //   Ed25519 (BIP44 mnemonic) + Dilithium3 (WalletIdentity)
+            // Both Genesis and Super nodes sign — no bypass.
+            if node_type != NodeType::Light && microblock_height > 90 {
+                let mb_idx = microblock_height / 90;
+                let mb_hash = Self::get_latest_macroblock_hash(&storage, mb_idx);
+                if !mb_hash.is_empty() {
+                    let mut react_tx = Self::create_node_reactivation_tx(
+                        &node_id, microblock_height, &mb_hash, mb_idx,
+                    );
+                    Self::sign_reactivation_tx(
+                        &mut react_tx, &node_id,
+                        wallet_identity_for_reactivation.as_ref().map(|arc| arc.as_ref()),
+                    );
+                    println!("[INFO][REACTIVATION] startup TX h={} mb={} hash={}",
+                             microblock_height, mb_idx, &react_tx.hash[..16]);
+                    if let Ok(tx_bytes) = bincode::serialize(&react_tx) {
+                        let gas_price = react_tx.gas_price;
+                        let tx_hash = react_tx.hash.clone();
+                        if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), gas_price) {
+                            println!("[INFO][REACTIVATION] startup TX in mempool hash={}", &tx_hash[..16]);
+                            // Broadcast to network (same as NodeRegistration line 27300)
+                            if let Some(ref p2p) = unified_p2p {
+                                let _ = p2p.broadcast_transaction(tx_bytes);
+                            }
+                        }
+                    }
+                }
+            }
+
             // CPU MONITORING: Track CPU usage periodically
             let mut cpu_check_counter = 0u64;
             let start_time = std::time::Instant::now();
@@ -12869,9 +13157,10 @@ impl BlockchainNode {
                             }
                         }
                         
-                        // CRITICAL: Re-register as active node to update global registry
-                        // This ensures our node is visible to all other nodes via gossip
-                        p2p.register_as_active_node_async().await;
+                        // v9.2: Removed per-block register_as_active_node_async() call.
+                        // Was firing every ~1s → 240 announces/min per peer → rate limit flood.
+                        // Periodic registration (every 60s, line ~12885) is sufficient.
+                        // Heartbeats (every 10s) already prove liveness to peers.
                     }
                 }
                 
@@ -13194,8 +13483,12 @@ impl BlockchainNode {
                         // Grace period: time to wait before declaring stall.
                         // Must exceed normal block propagation delay (~1-2s) + processing (~1s).
                         // Vote interval: time per rotation round.
-                        const TIMEOUT_GRACE_PERIOD: u64 = 5;   // 5s grace before stall detection
-                        const TIMEOUT_VOTE_INTERVAL: u64 = 3;  // 3s per rotation round
+                        // v9.3: Fast timeout recovery (proven BFT parameters).
+                        // Grace: 3s (>RTT + block propagation). Vote interval: 1s per round.
+                        // With 6 candidates: full cycle = 6×1s + 3s = 9 seconds (was 5+6×3=23s).
+                        // Dead producer penalty: ~4s instead of ~8s. Critical for liveness.
+                        const TIMEOUT_GRACE_PERIOD: u64 = 3;   // 3s grace before stall detection
+                        const TIMEOUT_VOTE_INTERVAL: u64 = 1;  // 1s per rotation round
 
                         // v5.4: No cap on timeout rounds. With modular rotation (base + round) % N,
                         // any round deterministically selects a candidate. The old cap at 50 caused
@@ -13485,10 +13778,27 @@ impl BlockchainNode {
                                             0
                                         };
                                         
-                                        // v3.33: FINALITY CHECK — cannot rollback below finalized macroblock
+                                        // v9.3: FINALITY CHECK — cannot rollback below finalized macroblock.
+                                        // EXCEPTION: During fast sync, finality may be ahead of actual chain
+                                        // (macroblocks synced but microblocks incomplete). In that case,
+                                        // reset finality to actual chain height so recovery can proceed.
                                         if let Err(reason) = check_finality_allows_rollback(rollback_to) {
-                                            println!("[ERR][FORK] {} — skipping stall recovery rollback", reason);
-                                            continue;
+                                            let finalized = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                                            if finalized > microblock_height {
+                                                // Finality is AHEAD of chain — impossible state, fix it
+                                                let safe = (microblock_height / 90) * 90;
+                                                LAST_FINALIZED_HEIGHT.store(safe, std::sync::atomic::Ordering::SeqCst);
+                                                LAST_FINALIZED_CONSENSUS_ROUND.store(safe, std::sync::atomic::Ordering::SeqCst);
+                                                println!("[WARN][FORK] finality_ahead_of_chain finalized={} chain={} reset_to={}", finalized, microblock_height, safe);
+                                                // Re-check after reset
+                                                if let Err(reason2) = check_finality_allows_rollback(rollback_to) {
+                                                    println!("[ERR][FORK] {} — skipping stall recovery rollback (post-reset)", reason2);
+                                                    continue;
+                                                }
+                                            } else {
+                                                println!("[ERR][FORK] {} — skipping stall recovery rollback", reason);
+                                                continue;
+                                            }
                                         }
                                         
                                         // v3.23: Start rollback protection
@@ -15742,10 +16052,11 @@ impl BlockchainNode {
                             // v2.87: System TX bypass nonce/balance validation
                             // HeartbeatCommitment/PingCommitment are validator rewards - MUST be included!
                             // v2.89: LightNodeEligibilityBitmap (Genesis bitmap TX)
-                            let is_system_tx = tx.from == "system_emission" 
+                            let is_system_tx = tx.from == "system_emission"
                                 || tx.from == "system_ping_commitment"
                                 || tx.from.starts_with("system_")
                                 || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. })
+                                || matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. })
                                 || matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. })
                                 || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. })
                                 || matches!(tx.tx_type, qnet_state::TransactionType::LightNodeEligibilityBitmap { .. });
@@ -16515,10 +16826,10 @@ impl BlockchainNode {
                                     ) && tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:");
                                     
                                     let is_system_tx = !is_client_nodereg && (
-                                        tx.from == "system_emission" 
+                                        tx.from == "system_emission"
                                         || tx.from == "system_ping_commitment"
                                         || tx.from.starts_with("system_")
-                                        || matches!(tx.tx_type, 
+                                        || matches!(tx.tx_type,
                                             qnet_state::TransactionType::HeartbeatCommitment { .. } |
                                             qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
                                             qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
@@ -16537,9 +16848,147 @@ impl BlockchainNode {
                                         return false;
                                     }
                                     // NodeRegistration has amount=0 by protocol — exempt from amount check.
+                                    // NodeReactivation has amount=0 + hybrid signature — verify both layers.
                                     // All other user TX must have non-zero amount and Ed25519 signature.
+                                    let is_node_reactivation = matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. });
                                     if is_client_nodereg {
-                                        if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
+                                        // v9.4: Full Ed25519 + Dilithium3 verification for client-signed NodeRegistration
+                                        // Canonical: "client_node_reg:{node_id}:{wallet}:{proof}:{timestamp}"
+                                        let reg_ed25519_ok = (|| -> Option<bool> {
+                                            let sig_hex = tx.signature.as_ref()?;
+                                            let pk_hex = tx.public_key.as_ref()?;
+                                            if sig_hex.is_empty() || pk_hex.is_empty() { return None; }
+
+                                            // Reconstruct canonical message from TX fields
+                                            let (node_id, wallet_address, registration_proof) = match &tx.tx_type {
+                                                qnet_state::TransactionType::NodeRegistration {
+                                                    node_id, wallet_address, registration_proof, ..
+                                                } => (node_id.as_str(), wallet_address.as_str(), registration_proof.as_str()),
+                                                _ => return None,
+                                            };
+                                            let canonical_msg = format!("client_node_reg:{}:{}:{}:{}",
+                                                node_id, wallet_address, registration_proof, tx.timestamp);
+
+                                            let sig_bytes = hex::decode(sig_hex).ok()?;
+                                            let pk_bytes = hex::decode(pk_hex).ok()?;
+                                            let sig = ed25519_dalek::Signature::from_bytes(
+                                                sig_bytes.as_slice().try_into().ok()?
+                                            );
+                                            let pk = ed25519_dalek::VerifyingKey::from_bytes(
+                                                pk_bytes.as_slice().try_into().ok()?
+                                            ).ok()?;
+                                            use ed25519_dalek::Verifier;
+                                            pk.verify(canonical_msg.as_bytes(), &sig).ok()?;
+                                            Some(true)
+                                        })().unwrap_or(false);
+                                        if !reg_ed25519_ok {
+                                            println!("[WARN][BLOCK-VALIDATION] NodeRegistration Ed25519 FAILED from={}", tx.from);
+                                            return false;
+                                        }
+
+                                        // Dilithium3: verify against VRF_PK_REGISTRY if key is registered
+                                        // (first registration won't have a registered key yet — skip in that case)
+                                        if let qnet_state::TransactionType::NodeRegistration { node_id, wallet_address, registration_proof, .. } = &tx.tx_type {
+                                            if let Some(registered_pk) = crate::genesis_constants::get_vrf_public_key(node_id) {
+                                                let dil_ok = (|| -> Option<bool> {
+                                                    let dil_sig_str = tx.dilithium_signature.as_ref()?;
+                                                    if dil_sig_str.is_empty() { return None; }
+                                                    let prefix = format!("dilithium_sig_{}_", node_id);
+                                                    let b64_part = dil_sig_str.strip_prefix(&prefix)?;
+                                                    use base64::engine::general_purpose;
+                                                    use base64::Engine;
+                                                    let combined = general_purpose::STANDARD.decode(b64_part).ok()?;
+                                                    if combined.len() < 8 { return None; }
+                                                    let sig_len = u32::from_le_bytes(combined[0..4].try_into().ok()?) as usize;
+                                                    if combined.len() < 4 + sig_len + 4 { return None; }
+                                                    let sm_bytes = &combined[4..4 + sig_len];
+                                                    if registered_pk.len() != 1952 { return None; }
+                                                    use pqcrypto_mldsa::mldsa65 as dilithium3;
+                                                    use pqcrypto_traits::sign::{SignedMessage as SmTrait, PublicKey as PkTrait};
+                                                    let signed_msg = dilithium3::SignedMessage::from_bytes(sm_bytes).ok()?;
+                                                    let pk = dilithium3::PublicKey::from_bytes(&registered_pk).ok()?;
+                                                    let canonical_msg = format!("client_node_reg:{}:{}:{}:{}",
+                                                        node_id, wallet_address, registration_proof, tx.timestamp);
+                                                    let opened_msg = dilithium3::open(&signed_msg, &pk).ok()?;
+                                                    if opened_msg != canonical_msg.as_bytes() { return None; }
+                                                    Some(true)
+                                                })().unwrap_or(false);
+                                                if !dil_ok {
+                                                    println!("[WARN][BLOCK-VALIDATION] NodeRegistration Dilithium3 FAILED from={}", tx.from);
+                                                    return false;
+                                                }
+                                            }
+                                            // No registered key = first registration — Dilithium3 check skipped
+                                            // (key gets registered from THIS tx via cache_node_registrations)
+                                        }
+                                    } else if is_node_reactivation {
+                                        // v9.4: NodeReactivation — FULL cryptographic verification
+                                        // Layer 1: Ed25519 (BIP44) — mathematical signature check
+                                        // Layer 2: Dilithium3 — crypto verify against REGISTERED VRF key (identity binding)
+                                        let node_id = &tx.from;
+                                        let canonical_msg = format!("node_reactivation:{}:{}", node_id, tx.timestamp);
+
+                                        // ── Layer 1: Ed25519 cryptographic verification ──
+                                        let ed25519_ok = (|| -> Option<bool> {
+                                            let sig_hex = tx.signature.as_ref()?;
+                                            let pk_hex = tx.public_key.as_ref()?;
+                                            if sig_hex.is_empty() || pk_hex.is_empty() { return None; }
+                                            let sig_bytes = hex::decode(sig_hex).ok()?;
+                                            let pk_bytes = hex::decode(pk_hex).ok()?;
+                                            let sig = ed25519_dalek::Signature::from_bytes(
+                                                sig_bytes.as_slice().try_into().ok()?
+                                            );
+                                            let pk = ed25519_dalek::VerifyingKey::from_bytes(
+                                                pk_bytes.as_slice().try_into().ok()?
+                                            ).ok()?;
+                                            use ed25519_dalek::Verifier;
+                                            pk.verify(canonical_msg.as_bytes(), &sig).ok()?;
+                                            Some(true)
+                                        })().unwrap_or(false);
+                                        if !ed25519_ok {
+                                            println!("[WARN][BLOCK-VALIDATION] NodeReactivation Ed25519 FAILED from={}", node_id);
+                                            return false;
+                                        }
+
+                                        // ── Layer 2: Dilithium3 cryptographic verification against registered VRF key ──
+                                        let dilithium_ok = (|| -> Option<bool> {
+                                            let dil_sig_str = tx.dilithium_signature.as_ref()?;
+                                            if dil_sig_str.is_empty() { return None; }
+
+                                            // Parse format: "dilithium_sig_{node_id}_{base64}"
+                                            let prefix = format!("dilithium_sig_{}_", node_id);
+                                            let b64_part = dil_sig_str.strip_prefix(&prefix)?;
+
+                                            use base64::engine::general_purpose;
+                                            use base64::Engine;
+                                            let combined = general_purpose::STANDARD.decode(b64_part).ok()?;
+
+                                            // Layout: [sig_len:4][SignedMessage bytes][pk_len:4][PublicKey bytes]
+                                            if combined.len() < 8 { return None; }
+                                            let sig_len = u32::from_le_bytes(combined[0..4].try_into().ok()?) as usize;
+                                            if combined.len() < 4 + sig_len + 4 { return None; }
+                                            let sm_bytes = &combined[4..4 + sig_len];
+
+                                            // Get REGISTERED Dilithium3 PK from VRF_PK_REGISTRY (identity binding)
+                                            let registered_pk = crate::genesis_constants::get_vrf_public_key(node_id)?;
+                                            if registered_pk.len() != 1952 { return None; }
+
+                                            // Verify: open() checks signature AND extracts original message
+                                            use pqcrypto_mldsa::mldsa65 as dilithium3;
+                                            use pqcrypto_traits::sign::{SignedMessage as SmTrait, PublicKey as PkTrait};
+                                            let signed_msg = dilithium3::SignedMessage::from_bytes(sm_bytes).ok()?;
+                                            let pk = dilithium3::PublicKey::from_bytes(&registered_pk).ok()?;
+                                            let opened_msg = dilithium3::open(&signed_msg, &pk).ok()?;
+
+                                            // Verify extracted message matches expected canonical format
+                                            if opened_msg != canonical_msg.as_bytes() {
+                                                return None;
+                                            }
+                                            Some(true)
+                                        })().unwrap_or(false);
+                                        if !dilithium_ok {
+                                            println!("[WARN][BLOCK-VALIDATION] NodeReactivation Dilithium3 FAILED from={} (sig invalid or key not registered)",
+                                                node_id);
                                             return false;
                                         }
                                     } else if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
@@ -19176,7 +19625,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         let mut participant_ids: Vec<String> = (1..=5)
                             .map(|i| format!("genesis_node_{:03}", i))
                             .collect();
-                        // Scan blocks in this macroblock range for NodeRegistration TXs
+                        // Scan blocks in this macroblock range for NodeRegistration + NodeReactivation TXs
                         for h in mb_start..=mb_end {
                             if let Ok(Some(block)) = storage.load_microblock_auto_format(h) {
                                 for tx in &block.transactions {
@@ -19185,6 +19634,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     } = tx.tx_type {
                                         if *node_type == qnet_state::NodeType::Super
                                            && !participant_ids.contains(node_id) {
+                                            participant_ids.push(node_id.clone());
+                                        }
+                                    }
+                                    // v9.4: Also scan for NodeReactivation TXs (returning nodes)
+                                    if let qnet_state::TransactionType::NodeReactivation {
+                                        ref node_id, ..
+                                    } = tx.tx_type {
+                                        if !participant_ids.contains(node_id) {
                                             participant_ids.push(node_id.clone());
                                         }
                                     }
@@ -19918,12 +20375,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
                 if highest > 0 {
-                    // v2.48: Initialize global atomic with round number (mb_index * 90)
+                    // v9.3: Initialize finality from macroblock count, but CAP at actual chain_height.
+                    // BUG FIX: If macroblocks 1-50 exist (synced) but microblocks only up to h=202,
+                    // setting finality to 50*90=4500 blocks stall recovery from rolling back.
+                    // Every L1 (Ethereum FFG, Tendermint) only finalizes blocks that ACTUALLY exist.
                     let round = highest * 90;
-                    LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
-                    LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
-                    println!("[CONSENSUS-LISTENER] 📊 Initialized from storage: last macroblock #{} round={} finality_h={} (chain height: {})", 
-                             highest, round, round, chain_height);
+                    let safe_finality = round.min(chain_height);
+                    LAST_FINALIZED_CONSENSUS_ROUND.store(safe_finality, std::sync::atomic::Ordering::SeqCst);
+                    LAST_FINALIZED_HEIGHT.store(safe_finality, std::sync::atomic::Ordering::SeqCst);
+                    if safe_finality < round {
+                        println!("[WARN][CONSENSUS-LISTENER] finality_capped mb_round={} chain_h={} safe={} — microblocks incomplete",
+                                 round, chain_height, safe_finality);
+                    }
+                    println!("[CONSENSUS-LISTENER] Initialized from storage: last macroblock #{} round={} finality_h={} (chain height: {})",
+                             highest, round, safe_finality, chain_height);
                 }
             }
             
@@ -23534,7 +23999,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         println!("[INFO][MB] reputation slashing={} jails={} stored=true",
                  slashing_events.len(), automatic_jails.len());
-        
+
+        // v9.3: Use ACTUAL BFT participants (who committed) for eligible producers snapshot.
+        // NOT the invited list — only nodes that proved they were synced by signing a commit.
+        // This is deterministic: consensus_commits is stored in macroblock, all nodes read the same data.
+        let actual_bft_participants: Vec<String> = {
+            let mut v: Vec<String> = commit_participants_set.iter().cloned().collect();
+            v.sort();
+            v
+        };
+        if is_info() {
+            println!("[INFO][MB] eligible_base invited={} actual_bft={}",
+                     consensus_data.participants.len(), actual_bft_participants.len());
+        }
+
         let macroblock = qnet_state::MacroBlock {
             height: consensus_data.round_number,
             timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
@@ -23564,9 +24042,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // Eliminates gossip race conditions that cause forks!
                 // ═══════════════════════════════════════════════════════════════════
                 eligible_producers: {
+                    // v9.3: Pass ACTUAL BFT committers, not invited list.
+                    // Nodes that didn't commit are not synced → must not be eligible.
                     let snapshot = Self::create_eligible_producers_snapshot(
                         p2p,
-                        &consensus_data.participants,
+                        &actual_bft_participants,
                         node_id,
                         node_type.clone(),
                         consensus_data.round_number,
@@ -23578,9 +24058,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         if is_debug() { println!("[DBG][MB] producer_snapshot nodes={}", snapshot.len()); }
                         bincode::serialize(&snapshot).ok()
                     } else {
-                        if is_debug() { println!("[DBG][MB] Empty producer snapshot - using consensus participants"); }
-                        // Fallback: use consensus participants
-                        let fallback: Vec<qnet_state::EligibleProducer> = consensus_data.participants.iter()
+                        if is_debug() { println!("[DBG][MB] Empty producer snapshot - using actual BFT participants"); }
+                        // Fallback: use actual BFT committers (not invited list)
+                        let fallback: Vec<qnet_state::EligibleProducer> = actual_bft_participants.iter()
                             .map(|id| qnet_state::EligibleProducer {
                                 node_id: id.clone(),
                                 reputation: 0.70,  // Default
@@ -24581,13 +25061,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // This prevents DoS attacks where attacker floods mempool with invalid nonces
         // v2.93: System transactions bypass nonce check - use tx_type NOT from field!
         // HeartbeatCommitment has from=node_id, not "system_*"
-        let is_system_tx = tx.from == "system_emission" 
+        let is_system_tx = tx.from == "system_emission"
             || tx.from == "system_ping_commitment"
             || tx.from.starts_with("system_")
             || matches!(tx.tx_type,
                 qnet_state::TransactionType::HeartbeatCommitment { .. } |
                 qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
                 qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
+                qnet_state::TransactionType::NodeReactivation { .. } |
                 qnet_state::TransactionType::RewardDistribution |
                 qnet_state::TransactionType::NodeRegistration { .. }
             );
