@@ -148,6 +148,11 @@ static CACHED_BLOCKCHAIN_HEIGHT: Lazy<Arc<Mutex<(u64, Instant)>>> =
 pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> = 
     Lazy::new(|| Arc::new(AtomicU64::new(0)));
 
+// v9.5: Best known peer height — O(1) read for sync-gate checks.
+// Updated atomically when peer heartbeats arrive (update_peer_last_seen).
+// Replaces O(N) scan of active_full_super_nodes on every consensus tick.
+pub static BEST_PEER_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
 // PRODUCTION v2.54: Gap detection pending sync queue
 // When gap detected in handle_shred_protocol_chunk, store here for background sync
 // node.rs sync loop will pick up and process these gaps
@@ -3019,17 +3024,25 @@ impl SimplifiedP2P {
         if let Some((_, peer_info)) = self.connected_peers_lockfree.remove(peer_addr) {
             // Remove from ID index
             self.peer_id_to_addr.remove(&peer_info.id);
-            
+
             // Remove from shard mapping
             let mut hasher = Sha3_256::new();
             hasher.update(peer_info.id.as_bytes());
             let hash = hasher.finalize();
             let peer_shard = hash[0];
-            
+
             if let Some(mut shard_peers) = self.peer_shards.get_mut(&peer_shard) {
                 shard_peers.retain(|addr| addr != peer_addr);
             }
-            
+
+            // v9.5: Recalculate BEST_PEER_HEIGHT when a peer disconnects.
+            // Without this, BEST_PEER_HEIGHT sticks at the disconnected peer's height
+            // and synced nodes think they're behind → voting blocked → network halts.
+            // O(N) but only runs on disconnect (rare), not every tick.
+            if peer_info.last_block_height >= BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) {
+                self.recalculate_best_peer_height();
+            }
+
             if crate::node::is_debug() {
                 println!("[DBG][P2P] peer_removed id={} shard={}", peer_info.id, peer_shard);
             }
@@ -3327,11 +3340,13 @@ impl SimplifiedP2P {
                 // Direct update - height comes from Dilithium-signed heartbeat
                 if h > peer.last_block_height {
                     peer.last_block_height = h;
+                    // v9.5: O(1) atomic update — avoids O(N) scan in get_best_peer_height()
+                    BEST_PEER_HEIGHT.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             return;
         }
-            
+
             // v2.24.4: If exact match fails, find by IP (port-agnostic)
             // v2.58: REMOVED MAX_TRUSTED_HEIGHT_JUMP - see above comment
             for mut entry in self.connected_peers_lockfree.iter_mut() {
@@ -3342,6 +3357,8 @@ impl SimplifiedP2P {
                         // Direct update - height comes from Dilithium-signed heartbeat
                         if h > entry.last_block_height {
                             entry.last_block_height = h;
+                            // v9.5: O(1) atomic update
+                            BEST_PEER_HEIGHT.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     return;
@@ -4160,10 +4177,36 @@ impl SimplifiedP2P {
                 }
                 
                 // v2.51: All cleanup done via lockfree DashMap above
-                if !peers_to_remove.is_empty() && crate::node::is_info() {
-                    println!("[INFO][P2P] cleanup_inactive removed={}", peers_to_remove.len());
+                if !peers_to_remove.is_empty() {
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] cleanup_inactive removed={}", peers_to_remove.len());
+                    }
+                    // v9.5: Recalculate BEST_PEER_HEIGHT after bulk peer removal.
+                    // Without this, disconnected peer's height sticks → sync gate blocks voting.
+                    let new_best = connected_peers_lockfree.iter()
+                        .map(|e| e.value().last_block_height)
+                        .max()
+                        .unwrap_or(0);
+                    BEST_PEER_HEIGHT.store(new_best, std::sync::atomic::Ordering::Relaxed);
                 }
-                
+
+                // v9.5: Periodic BEST_PEER_HEIGHT refresh (safety net every 5 minutes).
+                // Covers edge cases where height becomes stale without peer removal
+                // (e.g., peer stops sending heartbeats but TCP stays alive).
+                {
+                    let current_best = connected_peers_lockfree.iter()
+                        .map(|e| e.value().last_block_height)
+                        .max()
+                        .unwrap_or(0);
+                    let stored = BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                    if current_best < stored {
+                        BEST_PEER_HEIGHT.store(current_best, std::sync::atomic::Ordering::Relaxed);
+                        if crate::node::is_info() {
+                            println!("[INFO][P2P] best_peer_height_corrected old={} new={}", stored, current_best);
+                        }
+                    }
+                }
+
                 // CRITICAL v2.24: QUIC health check and cleanup
                 if let Some(ref quic_transport) = quic_transport {
                     let transport = quic_transport.read().await;
@@ -11939,6 +11982,13 @@ impl SimplifiedP2P {
             NetworkMessage::TimeoutVote { height, timeout_round, voter_id, last_block_hash, signature } => {
                 self.update_peer_last_seen(&voter_id);
 
+                // v9.5: Early height filter — discard obviously stale/future votes before signature check.
+                // saturating_add prevents overflow from malicious u64::MAX height values.
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if (local_h > 20 && height.saturating_add(20) < local_h) || height > local_h.saturating_add(50) {
+                    return;
+                }
+
                 // v9.0: Rate limit timeout votes (max 30/min per peer)
                 if self.is_consensus_rate_limited(&voter_id, "timeout", 30) { return; }
 
@@ -12061,6 +12111,13 @@ impl SimplifiedP2P {
             // v3.33: Block Attestation — validator confirms block validity
             NetworkMessage::BlockAttestationMsg { block_height, block_hash, attester_id, signature, timestamp } => {
                 self.update_peer_last_seen(from_peer);
+
+                // v9.5: Drop stale attestations from unsynced peers (same logic as timeout votes).
+                // saturating_add prevents overflow from malicious height values.
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if local_h > 20 && block_height.saturating_add(20) < local_h {
+                    return;
+                }
 
                 // Skip unsigned attestations (empty sig = invalid)
                 if signature.is_empty() {
@@ -16612,6 +16669,25 @@ impl SimplifiedP2P {
             .collect()
     }
     
+    /// v9.5: Get the highest reported height among all connected peers.
+    /// O(1) — reads global AtomicU64 updated on every heartbeat.
+    /// Used to determine if THIS node is synced enough to participate in consensus.
+    pub fn get_best_peer_height(&self) -> u64 {
+        BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// v9.5: Recalculate BEST_PEER_HEIGHT from scratch by scanning all connected peers.
+    /// Called when a peer disconnects (conditional: only if the disconnected peer's height
+    /// was >= current BEST_PEER_HEIGHT). Also called periodically (every 30s) as safety net.
+    /// O(N) where N = connected peers, but runs infrequently.
+    pub fn recalculate_best_peer_height(&self) {
+        let new_best = self.connected_peers_lockfree.iter()
+            .map(|entry| entry.value().last_block_height)
+            .max()
+            .unwrap_or(0);
+        BEST_PEER_HEIGHT.store(new_best, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Get node reputation by ID
     /// DEPRECATED: Use get_node_reputation_from_blockchain() instead
     #[deprecated(note = "Use get_node_reputation_from_blockchain() for v2.21.5+")]
@@ -17725,57 +17801,58 @@ impl SimplifiedP2P {
         // This ensures syncing nodes get all necessary data for producer validation
         self.request_timeout_proofs(from_height, to_height);
         
-        let peers = self.get_validated_active_peers();
-        if peers.is_empty() {
-            return Err("No peers available for sync".to_string());
-        }
-        
-        // v2.96: Get LIVE genesis nodes from failover cache (updated every 20s)
-        let working_genesis_ips = Self::filter_working_genesis_nodes_static(get_genesis_bootstrap_ips());
-        
-        // v2.96: Filter peers by failover connectivity cache
-        let mut live_peers: Vec<_> = peers.iter()
-            .filter(|p| {
-                let peer_ip = p.addr.split(':').next().unwrap_or("");
-                working_genesis_ips.iter().any(|ip| ip == peer_ip)
-            })
-            .cloned()
-            .collect();
+        // v9.6: Use get_sync_peers_filtered_by_height() for L1-grade peer selection.
+        // This replaces the old genesis-IP-only filter that forced ALL sync through 5 genesis nodes.
+        // Now ANY qualified Super peer can serve blocks — same pattern as Ethereum/Solana/Cosmos.
+        // Filters: reputation >= 70%, height >= to_height, blacklist, Light nodes excluded.
+        let mut live_peers = self.get_sync_peers_filtered_by_height(10, to_height);
 
-        // Fallback: if no peers pass filter, use all (network might be starting)
         if live_peers.is_empty() {
-            if crate::node::is_warn() {
-                println!("[WARN][SYNC] no_live_peers fallback=all");
-            }
-            live_peers = peers;
+            // Fallback 1: Try without height filter (bootstrap or peers haven't reported height yet)
+            live_peers = self.get_sync_peers_filtered(10);
         }
 
-        // v9.3: Filter peers by block height — only request from peers that have the blocks we need.
-        // Prevents empty_range responses and wasted bandwidth.
-        if to_height > 0 {
-            let height_qualified: Vec<_> = live_peers.iter()
-                .filter(|p| p.last_block_height >= to_height)
+        if live_peers.is_empty() {
+            // Fallback 2: Genesis nodes only (network bootstrap — no peers have reputation yet).
+            // This is the ONLY case where we filter by genesis IP, matching L1 bootnode pattern:
+            // genesis nodes for discovery/bootstrap, any qualified peer for ongoing sync.
+            let all_peers = self.get_validated_active_peers();
+            let working_genesis_ips = Self::filter_working_genesis_nodes_static(get_genesis_bootstrap_ips());
+            live_peers = all_peers.iter()
+                .filter(|p| {
+                    let peer_ip = p.addr.split(':').next().unwrap_or("");
+                    working_genesis_ips.iter().any(|ip| ip == peer_ip)
+                })
                 .cloned()
                 .collect();
-            if !height_qualified.is_empty() {
-                if crate::node::is_debug() {
-                    println!("[DEBUG][SYNC] height_filter h={}-{} qualified={}/{} peers",
-                             from_height, to_height, height_qualified.len(), live_peers.len());
-                }
-                live_peers = height_qualified;
-            } else if crate::node::is_warn() {
-                // No peers report having these blocks — use all live peers as fallback.
-                // This handles bootstrap and peers that haven't reported height yet (default=0).
-                println!("[WARN][SYNC] no_peers_at_height h={} max_peer_h={} fallback=all_live count={}",
-                         to_height,
-                         live_peers.iter().map(|p| p.last_block_height).max().unwrap_or(0),
-                         live_peers.len());
+
+            if live_peers.is_empty() {
+                // Fallback 3: Absolute last resort — use any connected peer
+                live_peers = all_peers;
             }
+
+            if live_peers.is_empty() {
+                return Err("No peers available for sync".to_string());
+            }
+
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] no_qualified_peers fallback=genesis count={}", live_peers.len());
+            }
+        } else if crate::node::is_debug() {
+            println!("[DEBUG][SYNC] qualified_peers h={}-{} count={}", from_height, to_height, live_peers.len());
         }
         
-        // Sort by combined reputation (best first)
-        live_peers.sort_by(|a, b| b.combined_reputation().partial_cmp(&a.combined_reputation())
-            .unwrap_or(std::cmp::Ordering::Equal));
+        // v9.5: Sort by block height first (peers with more blocks first), then reputation.
+        // This ensures we request from peers most likely to have the blocks we need,
+        // especially when height filtering passed through stale peers as fallback.
+        live_peers.sort_by(|a, b| {
+            let height_cmp = b.last_block_height.cmp(&a.last_block_height);
+            if height_cmp != std::cmp::Ordering::Equal {
+                return height_cmp;
+            }
+            b.combined_reputation().partial_cmp(&a.combined_reputation())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         
         // ═══════════════════════════════════════════════════════════════════════════
         // v2.105: CRITICAL FIX - SEQUENTIAL retry with WAIT for response
@@ -20579,8 +20656,11 @@ impl SimplifiedP2P {
     
     /// Handle incoming timeout vote from peer
     /// SECURITY: Verifies Dilithium signature before accepting vote
-    fn handle_timeout_vote(&self, height: u64, timeout_round: u64, voter_id: String, 
+    fn handle_timeout_vote(&self, height: u64, timeout_round: u64, voter_id: String,
                            last_block_hash: Vec<u8>, signature: Vec<u8>) {
+        // v9.5: Height filter is applied at dispatch level (NetworkMessage::TimeoutVote handler)
+        // before this function is called — no duplicate check needed here.
+
         // Validate vote data
         if last_block_hash.len() != 32 {
             if crate::node::is_warn() {

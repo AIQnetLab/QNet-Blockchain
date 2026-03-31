@@ -614,10 +614,19 @@ impl QuicTransport {
                 
                 let peer_addr = incoming.remote_address();
 
-                // v9.3: Tiered per-IP connection limit — reject before TLS handshake to save CPU.
+                // v9.5: Tiered per-IP connection limit — reject before TLS handshake to save CPU.
                 // Genesis/validator IPs get higher limits for consensus reliability.
+                // During active sync, increase default limit to prevent sync stalls.
                 let peer_ip = peer_addr.ip();
-                let ip_limit = if is_genesis_ip(&peer_ip) { MAX_CONNECTIONS_PER_IP_GENESIS } else { MAX_CONNECTIONS_PER_IP_DEFAULT };
+                let is_syncing = crate::node::FAST_SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
+                    || crate::node::SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+                let ip_limit = if is_genesis_ip(&peer_ip) {
+                    MAX_CONNECTIONS_PER_IP_GENESIS
+                } else if is_syncing {
+                    MAX_CONNECTIONS_PER_IP_DEFAULT * 3  // 60 during sync (3x normal)
+                } else {
+                    MAX_CONNECTIONS_PER_IP_DEFAULT
+                };
                 let current_ip_count = per_ip_conns.get(&peer_ip).map(|v| *v).unwrap_or(0);
                 if current_ip_count >= ip_limit {
                     incoming.refuse();

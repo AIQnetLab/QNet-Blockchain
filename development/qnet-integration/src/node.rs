@@ -190,8 +190,8 @@ pub fn clear_emergency_producer() {
 
 // CRITICAL: Global synchronization flags for API access
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+pub static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+pub static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
 
 // v3.0: Event-driven sync completion (NOT polling!)
@@ -305,6 +305,25 @@ pub fn is_producer_excluded(producer_id: &str, current_height: u64) -> bool {
 pub fn clear_expired_exclusions(current_height: u64) {
     let mut excluded = EXCLUDED_PRODUCERS.write();
     excluded.retain(|_, (_, _, until_height)| current_height < *until_height);
+}
+
+/// v9.5: Fork recovery cooldown — prevents spamming sync_macroblocks when fork detection
+/// triggers repeatedly. Without this, 30000 nodes simultaneously forking would each
+/// spam macroblock requests every consensus tick (1s), overwhelming the network.
+/// Cooldown: 60 seconds between fork recovery attempts.
+static LAST_FORK_RECOVERY: StdAtomicU64 = StdAtomicU64::new(0);
+const FORK_RECOVERY_COOLDOWN_SECS: u64 = 60;
+
+/// v9.5: Check if fork recovery is allowed (respects cooldown)
+pub fn try_fork_recovery() -> bool {
+    let now = get_timestamp_safe();
+    let last = LAST_FORK_RECOVERY.load(StdOrdering::Relaxed);
+    if now.saturating_sub(last) >= FORK_RECOVERY_COOLDOWN_SECS {
+        LAST_FORK_RECOVERY.store(now, StdOrdering::Relaxed);
+        true
+    } else {
+        false
+    }
 }
 
 /// BUG 4 FIX: Last runtime fork check timestamp
@@ -8693,8 +8712,39 @@ impl BlockchainNode {
                                             }
                                         }
                                         // v7.0: Note — reward accruals already applied BEFORE finalize_merkle above
-                                        
+
+                                        // v9.5: CRITICAL — Extract VRF keys from NodeRegistration TXs in synced blocks.
+                                        // Without this, a node syncing from h=0 has NO VRF keys in memory,
+                                        // causing block #1+ validation to fail with "Invalid signature"
+                                        // because verify_microblock_signature() can't find the producer's key.
+                                        // Genesis block contains all 5 genesis NodeRegistration TXs with VRF keys.
+                                        // Later blocks may contain new node registrations/reactivations.
+                                        if !microblock.transactions.is_empty() {
+                                            let has_reg_tx = microblock.transactions.iter().any(|tx| {
+                                                matches!(&tx.tx_type,
+                                                    qnet_state::TransactionType::NodeRegistration { .. } |
+                                                    qnet_state::TransactionType::NodeReactivation { .. })
+                                            });
+                                            if has_reg_tx {
+                                                Self::cache_node_registrations_from_transactions(&storage, &microblock.transactions);
+                                                if is_info() {
+                                                    println!("[INFO][VRF-SYNC] extracted_keys h={} tx_count={}",
+                                                             microblock.height, microblock.transactions.len());
+                                                }
+                                            }
+                                        }
+
                                         // v3.33: Broadcast block attestation with real Dilithium signature
+                                        // v9.5: SYNC GATE — only broadcast attestations when synced.
+                                        // A syncing node at h=100 broadcasting attestations for old blocks
+                                        // is useless noise that wastes bandwidth.
+                                        let attest_our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                                        let attest_best_h = if let Some(ref p2p) = unified_p2p {
+                                            p2p.get_best_peer_height()
+                                        } else { attest_our_h };
+                                        let attest_synced = attest_best_h == 0 || attest_our_h + 20 >= attest_best_h;
+
+                                        if attest_synced {
                                         if let Some(ref p2p) = unified_p2p {
                                             let mut block_hasher = Sha3_256::new();
                                             block_hasher.update(&decompressed_data);
@@ -8724,6 +8774,7 @@ impl BlockchainNode {
                                             }
                                             crate::unified_p2p::cleanup_old_attestations(received_block.height);
                                         }
+                                        } // attest_synced
                                         
                                         Ok(())
                                     }
@@ -13172,9 +13223,22 @@ impl BlockchainNode {
                 let reg_counter = ACTIVE_NODE_REGISTRATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 
                 if reg_counter % 60 == 0 && node_type != NodeType::Light {
-                    if let Some(ref p2p) = unified_p2p {
-                        println!("[ACTIVE] 📡 Periodic registration to global registry...");
-                        p2p.register_as_active_node_async().await;
+                    // v9.5: Sync gate — unsynced node MUST NOT register as active.
+                    // A node at h=100 in a network at h=6000 registering as active
+                    // pollutes VRF producer selection → gets elected → can't produce → timeout.
+                    // With 30000 nodes constantly syncing, this would cause permanent timeouts.
+                    let reg_our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                    let reg_best_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                    let reg_synced = reg_best_h == 0 || reg_our_h + 20 >= reg_best_h;
+
+                    if reg_synced {
+                        if let Some(ref p2p) = unified_p2p {
+                            if is_info() { println!("[ACTIVE] periodic_registration h={}", reg_our_h); }
+                            p2p.register_as_active_node_async().await;
+                        }
+                    } else if is_info() {
+                        println!("[INFO][ACTIVE] registration_skipped_unsynced our_h={} best_h={} gap={}",
+                                 reg_our_h, reg_best_h, reg_best_h.saturating_sub(reg_our_h));
                     }
                 }
                 
@@ -13551,7 +13615,17 @@ impl BlockchainNode {
                         update_failover_metrics(local_delay, timeout_round_for_rotation);
 
                         // v4.0: If we detect stall, vote for timeout (Byzantine consensus)
-                        if proposed_timeout_round > 0 && microblock_height > 0 {
+                        // v9.5: CRITICAL — unsynced nodes MUST NOT vote. A node at h=100 sending
+                        // timeout votes into a network at h=6000 poisons consensus with stale
+                        // round numbers, causing fork detection and network halt.
+                        // Gate: only vote if we're within 20 blocks of best known peer height.
+                        let our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                        let best_peer_h = if let Some(ref p2p) = unified_p2p {
+                            p2p.get_best_peer_height()
+                        } else { our_h };
+                        let is_synced_enough = best_peer_h == 0 || our_h + 20 >= best_peer_h;
+
+                        if proposed_timeout_round > 0 && microblock_height > 0 && is_synced_enough {
                             if is_info() {
                                 println!("[INFO][TIMEOUT] stall h={} mb={} delay={}s proposed={} adopted={} certified={} rotation={} f1={}",
                                          next_height, timeout_mb_index, local_delay, proposed_timeout_round,
@@ -15043,14 +15117,12 @@ impl BlockchainNode {
                                 // At startup, lagging nodes return empty entropy - NOT a real fork!
                                 if matches == 0 && total_responses >= MIN_FORK_DETECTION_RESPONSES && next_block_height > 10 {
                                     // DEFINITE FORK: Multiple peers responded with DIFFERENT entropy
-                                    println!("[ERR][CONS] fork_detected mismatches={} matches=0 total={}", 
+                                    println!("[ERR][CONS] fork_detected mismatches={} matches=0 total={}",
                                              mismatches, total_responses);
-                                    
+
                                     if is_my_turn_to_produce {
                                         // v3.33: Producer yields this rotation only — BFT Timeout handles failover.
-                                        // Don't self-exclude for 3 rotations: we may have correct entropy
-                                        // while the minority has stale data. Let timeout protocol decide.
-                                        println!("[INFO][CONS] producer_yield_fork h={} mismatches={}", 
+                                        println!("[INFO][CONS] producer_yield_fork h={} mismatches={}",
                                                  next_block_height, mismatches);
                                         is_my_turn_to_produce = false;
                                         *is_leader.write().await = false;
@@ -15060,11 +15132,42 @@ impl BlockchainNode {
                                             reason: format!("Fork: {} mismatches, 0 matches", mismatches),
                                             recoverable: true,
                                         });
-                                        // v3.10: Validators self-exclude from production for 3 rotations
+                                        // v9.5: FORK RECOVERY — rollback to last macroblock boundary + re-sync.
                                         let rotation_interval = 30u64;
                                         let exclude_until = ((next_block_height / rotation_interval) + 3) * rotation_interval;
                                         exclude_producer(&node_id, "entropy_fork_detected", exclude_until);
-                                        println!("[INFO][CONS] self_excluded until_h={}", exclude_until);
+
+                                        // v9.5: Cooldown prevents 30000 nodes from spamming sync_macroblocks
+                                        // every consensus tick when network-wide fork occurs.
+                                        if try_fork_recovery() {
+                                            // Rollback at most 2 macroblock epochs (180 blocks).
+                                            // Clamped to prevent O(100000) clear_block_pending_sync calls
+                                            // when height is large (e.g., h=100000, rollback_to=0 → 100k iterations).
+                                            let rollback_to = next_block_height.saturating_sub(180);
+                                            let mb_from = rollback_to / 90;
+                                            let mb_from = if mb_from == 0 { 1 } else { mb_from };
+                                            let mb_to = next_block_height / 90 + 1;
+                                            println!("[INFO][CONS] fork_recovery h={} rollback_to={} mb={}-{} exclude_until={}",
+                                                     next_block_height, rollback_to, mb_from, mb_to, exclude_until);
+
+                                            if let Some(ref p2p) = unified_p2p {
+                                                let p2p_clone = p2p.clone();
+                                                let clear_from = rollback_to;
+                                                let clear_to = next_block_height;
+                                                tokio::spawn(async move {
+                                                    for h in clear_from..=clear_to {
+                                                        crate::unified_p2p::clear_block_pending_sync(h);
+                                                    }
+                                                    if let Err(e) = p2p_clone.sync_macroblocks(mb_from, mb_to).await {
+                                                        eprintln!("[WARN][CONS] fork_recovery_sync_fail err={}", e);
+                                                    } else {
+                                                        println!("[INFO][CONS] fork_recovery_sync_ok mb_range={}-{}", mb_from, mb_to);
+                                                    }
+                                                });
+                                            }
+                                        } else {
+                                            println!("[INFO][CONS] fork_recovery_cooldown h={} (60s between attempts)", next_block_height);
+                                        }
                                     }
                                     continue;
                                 } else if matches == 0 && (total_responses < MIN_FORK_DETECTION_RESPONSES || next_block_height <= 10) {
@@ -15073,13 +15176,13 @@ impl BlockchainNode {
                                              total_responses, MIN_FORK_DETECTION_RESPONSES, next_block_height);
                                 } else if mismatches > matches {
                                     // MAJORITY FORK: More peers disagree than agree
-                                    println!("[ERR][CONS] fork_detected mismatches={} matches={} majority=disagree", 
+                                    println!("[ERR][CONS] fork_detected mismatches={} matches={} majority=disagree",
                                              mismatches, matches);
-                                    
+
                                     if is_my_turn_to_produce {
                                         // v3.33: Producer yields — majority disagrees with our entropy,
                                         // meaning majority selected a different producer. We're in the minority.
-                                        println!("[INFO][CONS] producer_yield_majority h={} mismatches={} matches={}", 
+                                        println!("[INFO][CONS] producer_yield_majority h={} mismatches={} matches={}",
                                                  next_block_height, mismatches, matches);
                                         is_my_turn_to_produce = false;
                                         *is_leader.write().await = false;
@@ -15089,6 +15192,34 @@ impl BlockchainNode {
                                             reason: format!("Fork: {} mismatches vs {} matches", mismatches, matches),
                                             recoverable: true,
                                         });
+                                        // v9.5: FORK RECOVERY — majority disagrees, we're on wrong chain.
+                                        // Cooldown shared with definite-fork path (same AtomicU64).
+                                        if try_fork_recovery() {
+                                            let rollback_to = next_block_height.saturating_sub(180);
+                                            let mb_from = rollback_to / 90;
+                                            let mb_from = if mb_from == 0 { 1 } else { mb_from };
+                                            let mb_to = next_block_height / 90 + 1;
+                                            println!("[INFO][CONS] majority_fork_recovery h={} rollback_to={} mb={}-{}",
+                                                     next_block_height, rollback_to, mb_from, mb_to);
+
+                                            if let Some(ref p2p) = unified_p2p {
+                                                let p2p_clone = p2p.clone();
+                                                let clear_from = rollback_to;
+                                                let clear_to = next_block_height;
+                                                tokio::spawn(async move {
+                                                    for h in clear_from..=clear_to {
+                                                        crate::unified_p2p::clear_block_pending_sync(h);
+                                                    }
+                                                    if let Err(e) = p2p_clone.sync_macroblocks(mb_from, mb_to).await {
+                                                        eprintln!("[WARN][CONS] majority_fork_recovery_fail err={}", e);
+                                                    } else {
+                                                        println!("[INFO][CONS] majority_fork_recovery_ok mb_range={}-{}", mb_from, mb_to);
+                                                    }
+                                                });
+                                            }
+                                        } else {
+                                            println!("[INFO][CONS] majority_fork_recovery_cooldown h={}", next_block_height);
+                                        }
                                     }
                                     continue;
                                 } else {
