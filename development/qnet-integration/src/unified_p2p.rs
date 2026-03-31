@@ -13127,10 +13127,19 @@ impl SimplifiedP2P {
                 // 5 nodes → 11/min, 100 nodes → 30/min, 1000 nodes → 200/min (cap).
                 // This ensures: (a) small networks aren't over-limited, (b) large networks
                 // don't allow unbounded CPU burn, (c) no magic constants to tune manually.
-                let active_count = self.active_full_super_nodes.len();
-                let adaptive_limit = (10 + active_count / 5).min(200);
-                if self.is_consensus_rate_limited(from_peer, "active_announce", adaptive_limit) {
-                    return;
+                //
+                // v9.5: Bootstrap bypass — at height 0 (no blocks produced yet), nodes MUST
+                // register with each other to reach quorum and start producing. Rate limiting
+                // at this stage causes a deadlock: nodes can't register → can't produce →
+                // stay at height 0 forever. Dedup (seen_announcements below) still prevents
+                // redundant Dilithium3 verification, so CPU is protected without rate limiting.
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if local_h > 0 {
+                    let active_count = self.active_full_super_nodes.len();
+                    let adaptive_limit = (10 + active_count / 5).min(200);
+                    if self.is_consensus_rate_limited(from_peer, "active_announce", adaptive_limit) {
+                        return;
+                    }
                 }
 
                 // v9.1: Dedup — skip if already processed this exact announcement.
