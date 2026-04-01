@@ -7198,12 +7198,25 @@ impl BlockchainNode {
                             }
                         }
                         
+                        // v9.7: Use maximum of all height sources for sync target.
+                        // sync_blockchain_height() may return stale data (cold cache, few peers).
+                        // BEST_PEER_HEIGHT is updated from handshakes (immediate) and HealthPings.
+                        // HTTP probe is a fallback. Take the highest — sync re-check (v9.7) will
+                        // catch any remaining gap after target is reached.
+                        let best_atomic_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                        if best_atomic_h > network_height {
+                            println!("[INFO][SYNC] height_upgrade: sync_blockchain_height={} BEST_PEER_HEIGHT={} using={}",
+                                     network_height, best_atomic_h, best_atomic_h);
+                            network_height = best_atomic_h;
+                        }
+
                         if network_height > local_height + 10 {
-                            if is_info() { println!("[INFO][SYNC] net={} local={} syncing", 
+                            if is_info() { println!("[INFO][SYNC] net={} local={} syncing",
                                     network_height, local_height); }
-                            
+
                             // v3.0: Set target height for event-driven sync completion
                             // process_received_blocks will clear SYNC_IN_PROGRESS when this height is reached
+                            // v9.7: Target now includes handshake-sourced heights, not just heartbeat cache
                             SYNC_TARGET_HEIGHT.store(network_height, Ordering::SeqCst);
                             if is_info() { println!("[INFO][SYNC] target_height_set h={}", network_height); }
                             
@@ -8735,14 +8748,14 @@ impl BlockchainNode {
                                         }
 
                                         // v3.33: Broadcast block attestation with real Dilithium signature
-                                        // v9.5: SYNC GATE — only broadcast attestations when synced.
+                                        // v9.7: SYNC GATE — only broadcast attestations when fully synced.
                                         // A syncing node at h=100 broadcasting attestations for old blocks
-                                        // is useless noise that wastes bandwidth.
+                                        // is useless noise that wastes bandwidth. With 30000 nodes, thousands
+                                        // syncing simultaneously would flood network with stale attestations.
                                         let attest_our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                                        let attest_best_h = if let Some(ref p2p) = unified_p2p {
-                                            p2p.get_best_peer_height()
-                                        } else { attest_our_h };
-                                        let attest_synced = attest_best_h == 0 || attest_our_h + 20 >= attest_best_h;
+                                        let attest_best_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                                        let attest_synced = NODE_IS_SYNCHRONIZED.load(std::sync::atomic::Ordering::Relaxed)
+                                            && (attest_best_h == 0 || attest_our_h + 20 >= attest_best_h);
 
                                         if attest_synced {
                                         if let Some(ref p2p) = unified_p2p {
@@ -9023,19 +9036,68 @@ impl BlockchainNode {
                     // Check if we've reached the target height and clear sync flags
                     let target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
                     if target > 0 && received_block.height >= target {
-                        // Sync complete! Clear flags
+                        // ═══════════════════════════════════════════════════════════════════
+                        // v9.7: RE-CHECK — did network advance while we were syncing?
+                        // ═══════════════════════════════════════════════════════════════════
+                        // ROOT CAUSE: Sync target was set from stale data (e.g., HTTP probe
+                        // returned ~100 when network is at 5220). Handshake heights and
+                        // HealthPings updated BEST_PEER_HEIGHT during sync, but target was
+                        // already locked. Now we check: if BEST_PEER_HEIGHT >> our height,
+                        // re-enter sync with correct target instead of declaring "synchronized".
+                        //
+                        // Without this fix: node reaches h=100, declares NODE_IS_SYNCHRONIZED=true,
+                        // registers as active, gets selected by VRF → can't produce → timeout.
+                        // ═══════════════════════════════════════════════════════════════════
+                        let our_height = received_block.height;
+                        let best_peer_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
+
+                        if best_peer_h > our_height + 20 {
+                            // Network is still far ahead — re-enter sync with real target.
+                            // Guard: only spawn new sync task if target actually changes.
+                            // Without this guard, multiple concurrent sync_blocks tasks could
+                            // be spawned if blocks arrive from gap_sync / block propagation
+                            // while the previous re-sync is still running.
+                            let new_target = best_peer_h;
+                            let old_target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
+                            if new_target > old_target {
+                                SYNC_TARGET_HEIGHT.store(new_target, Ordering::SeqCst);
+                                // Keep SYNC_IN_PROGRESS = true, NODE_IS_SYNCHRONIZED = false
+                                println!("[INFO][SYNC] re-entering_sync: target_was={} reached={} best_peer={} new_target={}",
+                                         target, our_height, best_peer_h, new_target);
+
+                                // Trigger continued sync from current position
+                                if let Some(ref p2p) = unified_p2p {
+                                    let p2p_clone = p2p.clone();
+                                    let from_h = our_height + 1;
+                                    let to_h = new_target;
+                                    tokio::spawn(async move {
+                                        if let Err(e) = p2p_clone.sync_blocks(from_h, to_h).await {
+                                            println!("[WARN][SYNC] re-sync_err: {}", e);
+                                        }
+                                    });
+                                }
+                            } else {
+                                // Target already set to this or higher value — another re-sync
+                                // is already in progress. Don't spawn duplicate task.
+                                if is_debug() {
+                                    println!("[DBG][SYNC] re-sync_skip: target_already={} new_would_be={}",
+                                             old_target, new_target);
+                                }
+                            }
+                        } else {
+                        // Sync truly complete — network height matches or is close
                         SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                         SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                         NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
-                        
+
                         // v3.5: Set flag to skip slot timing on first block after sync
                         // CRITICAL: If we become producer immediately after sync, we must
                         // create block without waiting for slot time (network expects it NOW)
                         JUST_COMPLETED_SYNC.store(true, Ordering::SeqCst);
 
                         if is_info() {
-                            println!("[INFO][SYNC] target_reached h={} target={} sync_complete skip_slot=true",
-                                     received_block.height, target);
+                            println!("[INFO][SYNC] target_reached h={} target={} best_peer={} sync_complete skip_slot=true",
+                                     received_block.height, target, best_peer_h);
                         }
 
                         // ═══════════════════════════════════════════════════════
@@ -9077,8 +9139,9 @@ impl BlockchainNode {
                                 }
                             }
                         }
+                        } // end else (sync truly complete)
                     }
-                    
+
                     // CRITICAL FIX v3.3: Remove TX from mempool after receiving block from other node
                     // This prevents TX duplication when THIS node becomes producer
                     // Problem: TX stays in mempool after being included in block by OTHER node
@@ -10995,16 +11058,17 @@ impl BlockchainNode {
 
                             // ══════════════════════════════════════════════════════════════
                             // v6.5 FIX: Early activation for non-bootstrap nodes
-                            // CORRECT FLOW: Genesis downloaded → Activate → Confirm → Sync
-                            // (Ethereum: deposit TX confirmed → validator activated → sync)
-                            // (Cosmos: gentx in genesis → node starts → sync)
+                            // v9.7: DEFERRED until sync completes — unsynced nodes MUST NOT
+                            //   register as validators. NodeRegistration TX before sync →
+                            //   VRF selects node as producer → node at h=100 can't produce
+                            //   block at h=5220 → 5-second timeout → network stalls.
                             //
-                            // PROBLEM: save_activation_code() was called AFTER readiness loop
-                            //   in qnet-node.rs:2891, and the first attempt failed with
-                            //   "activation_tx_no_mempool reason=not_initialized".
-                            // SOLUTION: Call save_activation_code() early — as soon as genesis
-                            //   block is available and peers are connected. This ensures
-                            //   NodeActivation TX reaches the producer BEFORE sync starts.
+                            // NEW FLOW: Genesis downloaded → Sync → Sync complete →
+                            //   Activate → NodeRegistration TX → VRF eligible
+                            //
+                            // The activation TX is now sent from the sync completion handler
+                            // (see v9.7 sync re-check block) and from the periodic registration
+                            // loop ONLY when NODE_IS_SYNCHRONIZED == true.
                             // ══════════════════════════════════════════════════════════════
                             if !is_bootstrap_node {
                                 static EARLY_ACTIVATION_DONE: std::sync::atomic::AtomicBool =
@@ -11013,15 +11077,22 @@ impl BlockchainNode {
                                 if !EARLY_ACTIVATION_DONE.load(std::sync::atomic::Ordering::Relaxed) {
                                     let activation_code = std::env::var("QNET_ACTIVATION_CODE").unwrap_or_default();
                                     if !activation_code.is_empty() {
-                                        println!("[ACTIVATION] 🔑 Early activation: genesis available, peers connected, broadcasting TX...");
-                                        match self.save_activation_code(&activation_code, self.node_type).await {
-                                            Ok(_) => {
-                                                println!("[ACTIVATION] ✅ Early activation completed — TX broadcast to network");
-                                                EARLY_ACTIVATION_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        // v9.7: Check if node is synchronized before sending activation TX.
+                                        // If not synced yet, defer — will be sent after sync completes.
+                                        let node_synced = NODE_IS_SYNCHRONIZED.load(std::sync::atomic::Ordering::Relaxed);
+                                        if node_synced {
+                                            println!("[ACTIVATION] 🔑 Activation: node synced, broadcasting NodeRegistration TX...");
+                                            match self.save_activation_code(&activation_code, self.node_type).await {
+                                                Ok(_) => {
+                                                    println!("[ACTIVATION] ✅ Activation completed — TX broadcast to network");
+                                                    EARLY_ACTIVATION_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+                                                }
+                                                Err(e) => {
+                                                    println!("[WARN][ACTIVATION] activation_fail err={} — will retry", e);
+                                                }
                                             }
-                                            Err(e) => {
-                                                println!("[WARN][ACTIVATION] early_activation_fail err={} — will retry in qnet-node.rs", e);
-                                            }
+                                        } else {
+                                            println!("[INFO][ACTIVATION] deferred — node not yet synced (will activate after sync)");
                                         }
                                     }
                                 }
@@ -13223,22 +13294,61 @@ impl BlockchainNode {
                 let reg_counter = ACTIVE_NODE_REGISTRATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 
                 if reg_counter % 60 == 0 && node_type != NodeType::Light {
-                    // v9.5: Sync gate — unsynced node MUST NOT register as active.
-                    // A node at h=100 in a network at h=6000 registering as active
-                    // pollutes VRF producer selection → gets elected → can't produce → timeout.
-                    // With 30000 nodes constantly syncing, this would cause permanent timeouts.
+                    // v9.7: HARDENED sync gate — unsynced node MUST NOT register as active.
+                    // Three conditions must ALL be true:
+                    //   1. NODE_IS_SYNCHRONIZED flag (set only after sync completes with re-check)
+                    //   2. Height gap check: our_height + 20 >= best_peer_height
+                    //   3. Best_peer_height > 0 (network height known from handshake/HealthPing)
+                    //
+                    // v9.5 bug: `reg_best_h == 0` allowed bypass before first HealthPing (15s window).
+                    // v9.7 fix: Handshake now sets BEST_PEER_HEIGHT immediately, AND we require
+                    //   NODE_IS_SYNCHRONIZED which is only true after sync completes with re-check.
+                    //
+                    // With 30000 nodes, thousands may be syncing at any moment. Without this gate,
+                    // VRF selects unsynced node → can't produce → 5s timeout → throughput drops.
                     let reg_our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                     let reg_best_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                    let reg_synced = reg_best_h == 0 || reg_our_h + 20 >= reg_best_h;
+                    let is_node_synced = NODE_IS_SYNCHRONIZED.load(std::sync::atomic::Ordering::Relaxed);
+                    let height_ok = reg_best_h == 0 || reg_our_h + 20 >= reg_best_h;
+                    let reg_synced = is_node_synced && height_ok;
 
                     if reg_synced {
                         if let Some(ref p2p) = unified_p2p {
-                            if is_info() { println!("[ACTIVE] periodic_registration h={}", reg_our_h); }
+                            if is_info() { println!("[ACTIVE] periodic_registration h={} best={}", reg_our_h, reg_best_h); }
                             p2p.register_as_active_node_async().await;
                         }
-                    } else if is_info() {
-                        println!("[INFO][ACTIVE] registration_skipped_unsynced our_h={} best_h={} gap={}",
-                                 reg_our_h, reg_best_h, reg_best_h.saturating_sub(reg_our_h));
+                    } else {
+                        if is_info() {
+                            println!("[INFO][ACTIVE] registration_skipped_unsynced our_h={} best_h={} gap={} synced={}",
+                                     reg_our_h, reg_best_h, reg_best_h.saturating_sub(reg_our_h), is_node_synced);
+                        }
+
+                        // v9.7: DESYNC MONITOR — detect post-sync desynchronization.
+                        // If NODE_IS_SYNCHRONIZED=true but we fell behind by >50 blocks
+                        // (network partition, slow processing, restart), reset flag and
+                        // re-enter sync. Without this, a desynced node stays "synchronized"
+                        // flag=true forever (height gate blocks registration, but flag is stale).
+                        // 50 blocks (not 20): avoid flapping from normal propagation jitter.
+                        if is_node_synced && reg_best_h > 0 && reg_our_h + 50 < reg_best_h {
+                            NODE_IS_SYNCHRONIZED.store(false, std::sync::atomic::Ordering::SeqCst);
+                            let gap = reg_best_h.saturating_sub(reg_our_h);
+                            println!("[WARN][DESYNC] post-sync desynchronization detected our={} best={} gap={} — re-syncing",
+                                     reg_our_h, reg_best_h, gap);
+
+                            // Re-enter sync: set target and spawn sync task
+                            SYNC_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+                            SYNC_TARGET_HEIGHT.store(reg_best_h, std::sync::atomic::Ordering::SeqCst);
+                            if let Some(ref p2p) = unified_p2p {
+                                let p2p_clone = p2p.clone();
+                                let from_h = reg_our_h + 1;
+                                let to_h = reg_best_h;
+                                tokio::spawn(async move {
+                                    if let Err(e) = p2p_clone.sync_blocks(from_h, to_h).await {
+                                        println!("[WARN][DESYNC] re-sync_err: {}", e);
+                                    }
+                                });
+                            }
+                        }
                     }
                 }
                 

@@ -141,8 +141,8 @@ const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 /// v9.3: Tiered per-IP connection limits.
 /// Genesis/validator IPs get higher limits for reliable consensus connectivity.
 /// Unknown IPs get stricter limits for DoS protection.
-/// RATIONALE: Every production L1 (Ethereum geth, Solana) gives trusted validators
-/// preferential treatment. With 5 genesis nodes × 100 = 500 connections (within global cap).
+/// RATIONALE: Standard L1 practice — trusted validators get preferential connection limits.
+/// With 5 genesis nodes × 100 = 500 connections (within global cap).
 /// Unknown IPs at 20 per IP × 500 global cap need 25+ IPs to saturate.
 const MAX_CONNECTIONS_PER_IP_GENESIS: u32 = 100;
 const MAX_CONNECTIONS_PER_IP_DEFAULT: u32 = 20;
@@ -266,7 +266,7 @@ fn build_adaptive_transport(initial_rtt_ms: u64) -> quinn::TransportConfig {
     // BBR congestion control: bandwidth-based rather than loss-based (Cubic).
     // Superior on high-RTT / cross-continental links because it probes actual
     // bottleneck bandwidth instead of reacting to packet loss.
-    // Used by Solana, Google QUIC (quiche), Cloudflare.
+    // Used by major L1 networks, Google QUIC (quiche), Cloudflare.
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
     transport.receive_window(VarInt::from_u32(16_777_216)); // 16 MB
@@ -287,6 +287,51 @@ pub struct NodeHandshake {
     pub protocol_version: u8,
     pub node_type: String,
     pub timestamp: u64,
+    /// v9.7: Block height at handshake time — peers know real height from first second.
+    /// Without this, all peers start at height 0 and sync determines wrong network_height
+    /// (100 instead of 5220) → sync completes prematurely → node declared synchronized
+    /// while thousands of blocks behind → VRF selects it → network stalls.
+    pub block_height: u64,
+}
+
+/// v9.7: Legacy handshake format (pre-v9.7 nodes without block_height).
+/// Used for backward-compatible deserialization when connecting to older nodes.
+/// bincode is positional — new field at the end causes deserialization failure
+/// if the sender didn't include it. Fallback to this struct, height defaults to 0.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NodeHandshakeLegacy {
+    pub node_id: String,
+    pub cert_serial: String,
+    pub protocol_version: u8,
+    pub node_type: String,
+    pub timestamp: u64,
+}
+
+impl NodeHandshakeLegacy {
+    fn into_handshake(self) -> NodeHandshake {
+        NodeHandshake {
+            node_id: self.node_id,
+            cert_serial: self.cert_serial,
+            protocol_version: self.protocol_version,
+            node_type: self.node_type,
+            timestamp: self.timestamp,
+            block_height: 0, // Legacy node — height unknown, will be set by first HealthPing
+        }
+    }
+}
+
+/// v9.7: Deserialize handshake with backward compatibility.
+/// Try new format (with block_height) first, fall back to legacy (without).
+fn deserialize_handshake(data: &[u8]) -> Result<NodeHandshake, String> {
+    // Try new format first (includes block_height)
+    if let Ok(hs) = bincode::deserialize::<NodeHandshake>(data) {
+        return Ok(hs);
+    }
+    // Fallback: legacy format without block_height (pre-v9.7 nodes)
+    match bincode::deserialize::<NodeHandshakeLegacy>(data) {
+        Ok(legacy) => Ok(legacy.into_handshake()),
+        Err(e) => Err(format!("Handshake deserialize failed (both formats): {}", e)),
+    }
 }
 
 // ============================================================================
@@ -711,15 +756,21 @@ impl QuicTransport {
                         println!("[INFO][QUIC] incoming_conn peer={}", get_privacy_id_for_addr(&peer_addr.to_string()));
                     }
                     
-                    let (remote_node_id, remote_cert_serial, remote_node_type) = match handshake_result {
+                    let (remote_node_id, remote_cert_serial, remote_node_type, remote_block_height) = match handshake_result {
                         Ok(h) => h,
                         Err(e) => {
                             if crate::node::is_warn() { println!("[WARN][QUIC] handshake_failed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e); }
                             return;
                         }
                     };
-                    
-                    if is_info() { println!("[INFO][QUIC] conn_accepted peer={} node={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id); }
+
+                    if is_info() { println!("[INFO][QUIC] conn_accepted peer={} node={} h={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_block_height); }
+
+                    // v9.7: Immediately update BEST_PEER_HEIGHT from handshake — no 15s wait.
+                    // This ensures sync_blockchain_height() sees real network height from the start.
+                    if remote_block_height > 0 {
+                        crate::unified_p2p::BEST_PEER_HEIGHT.fetch_max(remote_block_height, std::sync::atomic::Ordering::Relaxed);
+                    }
                     
                     if remote_node_id == node_id_clone {
                         if crate::node::is_warn() { println!("[WARN][QUIC] self_connect_detected side=server action=close"); }
@@ -835,12 +886,14 @@ impl QuicTransport {
     
     /// Handle server-side handshake
     /// v2.24: Added timeout to prevent hanging connections
+    /// v9.7: Returns (node_id, cert_serial, node_type, block_height) — height enables
+    /// immediate BEST_PEER_HEIGHT update instead of waiting 15s for first HealthPing.
     async fn handle_server_handshake(
         conn: &Connection,
         our_node_id: &str,
         our_cert_serial: &str,
         our_node_type: &str,
-    ) -> Result<(String, String, String), String> {
+    ) -> Result<(String, String, String, u64), String> {
         // v2.24: Timeout for entire handshake (prevents "aborted by peer" errors)
         let handshake_timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
         
@@ -861,9 +914,9 @@ impl QuicTransport {
             let mut data = vec![0u8; len];
             recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
             
-            let peer_handshake: NodeHandshake = bincode::deserialize(&data)
-                .map_err(|e| format!("Handshake deserialize failed: {}", e))?;
-            
+            // v9.7: Backward-compatible deserialization (supports pre-v9.7 nodes)
+            let peer_handshake = deserialize_handshake(&data)?;
+
             // Send our handshake
             let our_handshake = NodeHandshake {
                 node_id: our_node_id.to_string(),
@@ -874,17 +927,20 @@ impl QuicTransport {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                // v9.7: Include our current block height so peer knows it immediately
+                block_height: crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed),
             };
-            
+
             let handshake_bytes = bincode::serialize(&our_handshake)
                 .map_err(|e| format!("Handshake serialize failed: {}", e))?;
-            
+
             let len_bytes = (handshake_bytes.len() as u32).to_be_bytes();
             send.write_all(&len_bytes).await.map_err(|e| format!("Write len failed: {}", e))?;
             send.write_all(&handshake_bytes).await.map_err(|e| format!("Write data failed: {}", e))?;
             send.finish().map_err(|e| format!("Finish failed: {}", e))?;
-            
-            Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type))
+
+            // v9.7: Return height from handshake for immediate BEST_PEER_HEIGHT update
+            Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type, peer_handshake.block_height))
         }).await.map_err(|_| "Handshake timeout".to_string())?
     }
     
@@ -1320,8 +1376,13 @@ impl QuicTransport {
             .map_err(|e| format!("Connection failed: {}", e))?;
         
         // Perform client handshake
-        let (remote_node_id, remote_cert_serial, remote_node_type) = self.perform_client_handshake(&connection).await?;
-        
+        let (remote_node_id, remote_cert_serial, remote_node_type, remote_block_height) = self.perform_client_handshake(&connection).await?;
+
+        // v9.7: Immediately update BEST_PEER_HEIGHT from handshake
+        if remote_block_height > 0 {
+            crate::unified_p2p::BEST_PEER_HEIGHT.fetch_max(remote_block_height, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // CRITICAL: Prevent self-connect
         if remote_node_id == self.node_id {
             if crate::node::is_warn() { println!("[WARN][QUIC] self_connect_detected side=client action=close"); }
@@ -1396,10 +1457,11 @@ impl QuicTransport {
     
     /// Perform client-side handshake
     /// v2.24: Added timeout to prevent hanging connections
-    async fn perform_client_handshake(&self, conn: &Connection) -> Result<(String, String, String), String> {
+    /// v9.7: Returns (node_id, cert_serial, node_type, block_height)
+    async fn perform_client_handshake(&self, conn: &Connection) -> Result<(String, String, String, u64), String> {
         // v2.24: Timeout for entire handshake
         let handshake_timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
-        
+
         tokio::time::timeout(handshake_timeout, async {
             // Our handshake
             let our_handshake = NodeHandshake {
@@ -1411,6 +1473,8 @@ impl QuicTransport {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                // v9.7: Include our current block height
+                block_height: crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed),
             };
             
             let handshake_bytes = bincode::serialize(&our_handshake)
@@ -1438,13 +1502,14 @@ impl QuicTransport {
             let mut data = vec![0u8; len];
             recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
             
-            let peer_handshake: NodeHandshake = bincode::deserialize(&data)
-                .map_err(|e| format!("Deserialize failed: {}", e))?;
-            
-            Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type))
+            // v9.7: Backward-compatible deserialization (supports pre-v9.7 nodes)
+            let peer_handshake = deserialize_handshake(&data)?;
+
+            // v9.7: Return height from handshake
+            Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type, peer_handshake.block_height))
         }).await.map_err(|_| "Handshake timeout".to_string())?
     }
-    
+
     /// Send message to peer (request-response) with retry
     pub async fn send_message(&self, peer_addr: SocketAddr, msg: &NetworkMessage) -> Result<(), String> {
         // Serialize message once

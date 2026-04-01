@@ -17803,7 +17803,7 @@ impl SimplifiedP2P {
         
         // v9.6: Use get_sync_peers_filtered_by_height() for L1-grade peer selection.
         // This replaces the old genesis-IP-only filter that forced ALL sync through 5 genesis nodes.
-        // Now ANY qualified Super peer can serve blocks — same pattern as Ethereum/Solana/Cosmos.
+        // Now ANY qualified Super peer can serve blocks — standard L1 bootnode pattern.
         // Filters: reputation >= 70%, height >= to_height, blacklist, Light nodes excluded.
         let mut live_peers = self.get_sync_peers_filtered_by_height(10, to_height);
 
