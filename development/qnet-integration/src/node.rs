@@ -1919,59 +1919,98 @@ impl BlockchainNode {
                 .map(|p| p.node_id.clone())
                 .collect();
 
-            // ── LEVEL 1: Recent NodeRegistration + NodeReactivation TX scan ──
+            // ── LEVEL 1: Recent NodeReactivation TX scan (SYNC-PROOF REQUIRED) ──
+            //
+            // v10.0 CRITICAL FIX: NodeRegistration alone does NOT grant eligibility.
+            // A node MUST prove it is synced via NodeReactivation TX, which contains
+            // `current_height` — the node's chain height at reactivation time.
+            // Only nodes with current_height within SYNC_PROXIMITY_BLOCKS of scan_end
+            // are added to the eligible set. This is fully deterministic (on-chain data).
+            //
+            // Flow: Register (NodeRegistration) → Sync to tip → Reactivate (NodeReactivation) → Eligible
+            //
+            // Without this gate, a node at height 300 could be added to the producer pool
+            // while the chain is at height 23000, causing consensus divergence and network stall.
+            //
+            // NodeRegistration TXs are still scanned to build a set of REGISTERED nodes,
+            // but registration alone is necessary-not-sufficient for eligibility.
             let scan_end = macroblock_index * 90;
             const REGISTRATION_GRACE_EPOCHS: u64 = 3;
             let scan_start = scan_end.saturating_sub(REGISTRATION_GRACE_EPOCHS * 90);
-            let mut added_reg_count = 0usize;
+            // Sync proximity: node must be within 1 epoch (90 blocks) of the chain tip
+            const SYNC_PROXIMITY_BLOCKS: u64 = 90;
             let mut added_react_count = 0usize;
+            let mut skipped_unsynced_reg = 0usize;
+            let mut skipped_unsynced_react = 0usize;
 
+            // Phase 1: Collect registered Super node IDs (necessary condition)
+            let mut registered_super_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
             for height in scan_start..=scan_end {
                 if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
                     for tx in &block.transactions {
-                        // v6.6: NodeRegistration TX — new nodes entering the network
                         if let qnet_state::TransactionType::NodeRegistration {
                             node_id, node_type, ..
                         } = &tx.tx_type {
-                            if *node_type == qnet_state::NodeType::Super && !existing_ids.contains(node_id) {
-                                let reputation = reputation_map.get(node_id).copied()
-                                    .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION / 100.0);
-                                if reputation >= MIN_REPUTATION {
-                                    eligible.push(qnet_state::EligibleProducer {
-                                        node_id: node_id.clone(),
-                                        reputation,
-                                    });
-                                    added_reg_count += 1;
-                                }
-                            }
-                        }
-                        // v9.4: NodeReactivation TX — returning nodes re-entering consensus
-                        if let qnet_state::TransactionType::NodeReactivation {
-                            node_id, ..
-                        } = &tx.tx_type {
-                            if !existing_ids.contains(node_id) {
-                                let reputation = reputation_map.get(node_id).copied()
-                                    .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION / 100.0);
-                                if reputation >= MIN_REPUTATION {
-                                    // Check not already added by registration scan above
-                                    let already_added = eligible.iter().any(|p| p.node_id == *node_id);
-                                    if !already_added {
-                                        eligible.push(qnet_state::EligibleProducer {
-                                            node_id: node_id.clone(),
-                                            reputation,
-                                        });
-                                        added_react_count += 1;
-                                    }
-                                }
+                            if *node_type == qnet_state::NodeType::Super {
+                                registered_super_nodes.insert(node_id.clone());
                             }
                         }
                     }
                 }
             }
 
-            if added_reg_count > 0 || added_react_count > 0 {
-                println!("[INFO][SNAP] v9.4 L1_SCAN: added {} registrations + {} reactivations (h={}-{}) total={}",
-                         added_reg_count, added_react_count, scan_start, scan_end, eligible.len());
+            // Phase 2: Only NodeReactivation with sync proof grants eligibility
+            for height in scan_start..=scan_end {
+                if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
+                    for tx in &block.transactions {
+                        if let qnet_state::TransactionType::NodeReactivation {
+                            node_id, current_height, ..
+                        } = &tx.tx_type {
+                            if existing_ids.contains(node_id) {
+                                continue; // Already in base consensus_participants
+                            }
+                            let already_added = eligible.iter().any(|p| p.node_id == *node_id);
+                            if already_added {
+                                continue; // Already added by earlier reactivation TX
+                            }
+
+                            // SYNC PROOF: current_height must be within SYNC_PROXIMITY_BLOCKS of scan_end
+                            // Lower bound: node must not be too far behind
+                            // Upper bound: node must not claim a height beyond chain tip (spoofing)
+                            if *current_height + SYNC_PROXIMITY_BLOCKS < scan_end || *current_height > scan_end + SYNC_PROXIMITY_BLOCKS {
+                                skipped_unsynced_react += 1;
+                                if is_info() {
+                                    let reason = if *current_height > scan_end + SYNC_PROXIMITY_BLOCKS { "future_height" } else { "behind" };
+                                    println!("[INFO][SNAP] v10.0 REJECTED reactivation node={} current_h={} scan_end={} reason={}",
+                                             node_id, current_height, scan_end, reason);
+                                }
+                                continue;
+                            }
+
+                            let reputation = reputation_map.get(node_id).copied()
+                                .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION / 100.0);
+                            if reputation >= MIN_REPUTATION {
+                                eligible.push(qnet_state::EligibleProducer {
+                                    node_id: node_id.clone(),
+                                    reputation,
+                                });
+                                added_react_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Count registrations without reactivation (for logging)
+            for reg_node in &registered_super_nodes {
+                if !existing_ids.contains(reg_node) && !eligible.iter().any(|p| p.node_id == *reg_node) {
+                    skipped_unsynced_reg += 1;
+                }
+            }
+
+            if added_react_count > 0 || skipped_unsynced_reg > 0 || skipped_unsynced_react > 0 {
+                println!("[INFO][SNAP] v10.0 L1_SCAN: added={} skipped_reg_no_reactivation={} skipped_react_unsynced={} (h={}-{}) total={}",
+                         added_react_count, skipped_unsynced_reg, skipped_unsynced_react, scan_start, scan_end, eligible.len());
             }
 
             // ── LEVEL 2: Carry-over from recent macroblock eligible sets ──
@@ -7549,17 +7588,37 @@ impl BlockchainNode {
         // Key: block height, Value: (block data, retry count, timestamp)
         let mut pending_blocks: std::collections::HashMap<u64, (crate::unified_p2p::ReceivedBlock, u8, std::time::Instant)> =
             std::collections::HashMap::new();
-        
+
         // CRITICAL: Separate timers for retry (fast) and cleanup (slow)
         let mut last_retry_check = std::time::Instant::now();  // Retry pending blocks every 2s
         let mut last_cleanup_check = std::time::Instant::now(); // Cleanup expired every 30s
-        
+
         // CRITICAL FIX: Create channel for re-queuing blocks
         let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<crate::unified_p2p::ReceivedBlock>();
-        
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // v10.0 CRITICAL FIX: ORDERED SYNC BUFFER
+        //
+        // During initial sync (SYNC_IN_PROGRESS=true), blocks arrive from 3 peers
+        // simultaneously in ARBITRARY order. Without ordering, each out-of-order
+        // block triggers MISSING_PREVIOUS → pending_blocks → 2s retry timer,
+        // turning a 100-block chunk into a 200+ second ordeal.
+        //
+        // Solution: BTreeMap collects ALL arriving blocks during sync. After each
+        // insertion, drain the contiguous sequence starting from (local_height+1)
+        // and feed them to the processing pipeline IN ORDER. This eliminates
+        // MISSING_PREVIOUS entirely during sync — O(1) amortized per block.
+        //
+        // The buffer is bounded by MAX_SYNC_BUFFER_SIZE to prevent memory abuse.
+        // When not in sync mode, blocks bypass this buffer entirely (live mode).
+        // ═══════════════════════════════════════════════════════════════════════
+        let mut sync_order_buffer: std::collections::BTreeMap<u64, crate::unified_p2p::ReceivedBlock> =
+            std::collections::BTreeMap::new();
+        const MAX_SYNC_BUFFER_SIZE: usize = 2000; // ~200MB max, covers 22+ chunks
+
         // DDoS PROTECTION: Track requested blocks to avoid duplicate requests
         // Key: block height, Value: (request timestamp, retry count)
-        let mut requested_blocks: std::collections::HashMap<u64, (std::time::Instant, u8)> = 
+        let mut requested_blocks: std::collections::HashMap<u64, (std::time::Instant, u8)> =
             std::collections::HashMap::new();
         const MAX_CONCURRENT_REQUESTS: usize = 10; // Limit concurrent block requests
         // ADAPTIVE SYNC: Fast mode for catching up, normal mode for steady state
@@ -7605,19 +7664,149 @@ impl BlockchainNode {
         let mut last_wp_recovery_attempt = std::time::Instant::now().checked_sub(Duration::from_secs(120)).unwrap_or_else(std::time::Instant::now);
         const WP_RECOVERY_COOLDOWN_SECS: u64 = 60;
         
+        let mut sync_buf_flush_interval = tokio::time::interval(Duration::from_secs(3));
+        sync_buf_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
-            // Check both channels - prioritize retries
-            let (received_block, is_retry) = tokio::select! {
-                Some(block) = retry_rx.recv() => (block, true),
-                Some(block) = block_rx.recv() => (block, false),
+            // Check channels + periodic flush timer
+            let (received_block_opt, is_retry) = tokio::select! {
+                Some(block) = retry_rx.recv() => (Some(block), true),
+                Some(block) = block_rx.recv() => (Some(block), false),
+                _ = sync_buf_flush_interval.tick() => (None, false), // Periodic flush trigger
                 else => break, // Both channels closed
             };
-            
+
+            // v10.0: Periodic flush — when tick fires with no block, just flush buffer
+            if received_block_opt.is_none() {
+                let is_sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+                    || FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
+                if !is_sync_active && !sync_order_buffer.is_empty() {
+                    let flushed = sync_order_buffer.len();
+                    for (_, block) in std::mem::take(&mut sync_order_buffer) {
+                        let _ = retry_tx.send(block);
+                    }
+                    println!("[INFO][SYNC-BUF] periodic_flush={} blocks_to_retry", flushed);
+                }
+                // Also try draining contiguous blocks even during sync (timer-based)
+                if is_sync_active && !sync_order_buffer.is_empty() {
+                    let local_h = storage.get_chain_height().unwrap_or(0);
+                    let genesis_ok = local_h > 0 || storage.load_microblock(0).map(|r| r.is_some()).unwrap_or(false)
+                        || sync_order_buffer.contains_key(&0);
+                    if genesis_ok {
+                        let mut next_exp = if local_h == 0 && sync_order_buffer.contains_key(&0)
+                            && storage.load_microblock(0).map(|r| r.is_none()).unwrap_or(true) { 0 } else { local_h + 1 };
+                        let mut timer_drained = Vec::new();
+                        while let Some(block) = sync_order_buffer.remove(&next_exp) {
+                            timer_drained.push(block);
+                            next_exp += 1;
+                        }
+                        if !timer_drained.is_empty() {
+                            println!("[INFO][SYNC-BUF] timer_drain={} h={}-{}", timer_drained.len(),
+                                     timer_drained.first().map(|b| b.height).unwrap_or(0),
+                                     timer_drained.last().map(|b| b.height).unwrap_or(0));
+                            for block in timer_drained {
+                                let _ = retry_tx.send(block);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            let received_block = received_block_opt.unwrap();
+
             // DIAGNOSTIC: Log retry attempts
             if is_retry {
                 if is_debug() { println!("[DBG][BLOCK] retry h={}", received_block.height); }
             }
-            
+
+            // ═══════════════════════════════════════════════════════════════════════
+            // v10.0: ORDERED SYNC BUFFER — collect blocks, drain in order
+            //
+            // During sync, blocks arrive from multiple peers in arbitrary order.
+            // Instead of validating immediately (triggering MISSING_PREVIOUS for
+            // out-of-order blocks), buffer in BTreeMap and drain contiguously.
+            //
+            // This converts O(n * retry_delay) sync into O(n) — blocks are never
+            // rejected for ordering, only for actual validation errors.
+            // ═══════════════════════════════════════════════════════════════════════
+            let is_sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+                || FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
+
+            // Collect blocks to process: either from sync buffer drain or single block
+            let blocks_to_process: Vec<(crate::unified_p2p::ReceivedBlock, bool)>;
+
+            if is_sync_active && !is_retry {
+                // SYNC MODE: buffer the block, then drain contiguous sequence
+                let bh = received_block.height;
+                if sync_order_buffer.len() < MAX_SYNC_BUFFER_SIZE {
+                    sync_order_buffer.entry(bh).or_insert(received_block);
+                } else if !sync_order_buffer.contains_key(&bh) {
+                    // Buffer full — evict highest block to make room for lower (more useful) block
+                    if let Some((&max_h, _)) = sync_order_buffer.iter().next_back() {
+                        if bh < max_h {
+                            sync_order_buffer.remove(&max_h);
+                            sync_order_buffer.insert(bh, received_block);
+                        }
+                        // else: block is higher than everything in buffer, drop it
+                    }
+                }
+
+                // Drain contiguous sequence starting from local_height + 1
+                let local_h = storage.get_chain_height().unwrap_or(0);
+                let genesis_in_storage = local_h > 0 || storage.load_microblock(0).map(|r| r.is_some()).unwrap_or(false);
+                let mut next_expected = local_h + 1;
+
+                if !genesis_in_storage {
+                    // Genesis (block 0) is missing — we MUST process it first
+                    if sync_order_buffer.contains_key(&0) {
+                        // Genesis is in buffer — drain starting from 0
+                        next_expected = 0;
+                    } else {
+                        // Genesis not in buffer AND not in storage — cannot drain anything
+                        // Blocks 1+ would fail MISSING_PREVIOUS:0, wasting cycles
+                        continue;
+                    }
+                }
+
+                let mut drained = Vec::new();
+                while let Some(block) = sync_order_buffer.remove(&next_expected) {
+                    drained.push((block, false));
+                    next_expected += 1;
+                }
+
+                if !drained.is_empty() && drained.len() > 1 {
+                    if is_info() {
+                        println!("[INFO][SYNC-BUF] drained {} blocks h={}-{} buffered={}",
+                                 drained.len(),
+                                 drained.first().map(|(b, _)| b.height).unwrap_or(0),
+                                 drained.last().map(|(b, _)| b.height).unwrap_or(0),
+                                 sync_order_buffer.len());
+                    }
+                }
+
+                if drained.is_empty() {
+                    // No contiguous blocks ready yet — continue receiving
+                    continue;
+                }
+                blocks_to_process = drained;
+            } else {
+                // LIVE MODE or RETRY: process single block immediately (existing behavior)
+                blocks_to_process = vec![(received_block, is_retry)];
+            }
+
+            // When sync completes, flush remaining buffer into retry channel
+            if !is_sync_active && !sync_order_buffer.is_empty() {
+                let flushed = sync_order_buffer.len();
+                for (_, block) in std::mem::take(&mut sync_order_buffer) {
+                    let _ = retry_tx.send(block);
+                }
+                if flushed > 0 {
+                    println!("[INFO][SYNC-BUF] sync_complete flush={} blocks_to_retry", flushed);
+                }
+            }
+
+            for (received_block, is_retry) in blocks_to_process {
+
             // ═══════════════════════════════════════════════════════════════════
             // v4.1: Ignore blocks from self-excluded producers (entropy_fork_detected only)
             // v3.10 origin: was also used by emergency_failover, now removed (caused FORKS)
@@ -9709,6 +9898,8 @@ impl BlockchainNode {
                 }
             }
             
+            } // end for (received_block, is_retry) in blocks_to_process — v10.0 ordered sync buffer
+
             // v3.34: Periodic cleanup of stale mismatch counters (prevent memory leak)
             if !mismatch_counter.is_empty() {
                 let current_chain_h = storage.get_chain_height().unwrap_or(0);
@@ -19940,12 +20131,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             participant_ids.push(node_id.clone());
                                         }
                                     }
-                                    // v9.4: Also scan for NodeReactivation TXs (returning nodes)
+                                    // v10.0: NodeReactivation TXs — only include if sync-proven
+                                    // Same check as create_eligible_producers_snapshot LEVEL 1:
+                                    // current_height must be within 90 blocks of macroblock boundary
                                     if let qnet_state::TransactionType::NodeReactivation {
-                                        ref node_id, ..
+                                        ref node_id, current_height, ..
                                     } = tx.tx_type {
                                         if !participant_ids.contains(node_id) {
-                                            participant_ids.push(node_id.clone());
+                                            let proximity_ok = current_height + 90 >= mb_end
+                                                && current_height <= mb_end + 90;
+                                            if proximity_ok {
+                                                participant_ids.push(node_id.clone());
+                                            } else if is_info() {
+                                                println!("[INFO][CAND] v10.0 SKIP reactivation node={} current_h={} mb_end={} reason=unsynced",
+                                                         node_id, current_height, mb_end);
+                                            }
                                         }
                                     }
                                 }
