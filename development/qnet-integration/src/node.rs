@@ -7419,11 +7419,12 @@ impl BlockchainNode {
                             // This is proper architecture - flag cleared at the SOURCE
                             if is_info() { println!("[INFO][SYNC] initial_sync_requests_sent target={}", network_height); }
                         } else {
-                            // Already synced - clear flags
+                            // Already synced - clear sync flags but do NOT force NODE_IS_SYNCHRONIZED=true.
+                            // v9.8: network_height here comes from HTTP probe (stale). Let the main loop
+                            // FIX 1 (line ~15564) determine sync status via live get_max_peer_height().
                             SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                             SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
-                            NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
-                            if is_info() { println!("[INFO][SYNC] already_synced h={}", local_height); }
+                            if is_info() { println!("[INFO][SYNC] already_synced h={} — sync flag deferred to main loop", local_height); }
                         }
             } else {
                 // No P2P - clear sync flag
@@ -9084,11 +9085,27 @@ impl BlockchainNode {
                                              old_target, new_target);
                                 }
                             }
-                        } else {
-                        // Sync truly complete — network height matches or is close
+                        } else if best_peer_h == 0 {
+                        // v9.8: BEST_PEER_HEIGHT not yet populated (handshake pending).
+                        // Don't declare sync complete on zero data — defer to main loop
+                        // FIX 1 (network-aware NODE_IS_SYNCHRONIZED via get_max_peer_height).
+                        // End sync process so we don't block, but don't force sync=true.
                         SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                         SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
-                        NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
+                        JUST_COMPLETED_SYNC.store(true, Ordering::SeqCst);
+                        if is_info() {
+                            println!("[INFO][SYNC] target_reached h={} best_peer=0 — deferring sync flag to main loop",
+                                     received_block.height);
+                        }
+                        } else {
+                        // Sync truly complete — network height matches or is close.
+                        // v9.8: Do NOT set NODE_IS_SYNCHRONIZED=true here. BEST_PEER_HEIGHT
+                        // can be stale (handshake race). Let main loop FIX 1 (line ~15564)
+                        // determine sync status via live get_max_peer_height() from DashMap.
+                        // This eliminates the race: event sets true → VRF selects → main loop
+                        // would set false 1s later → but too late, block already produced unsynced.
+                        SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
 
                         // v3.5: Set flag to skip slot timing on first block after sync
                         // CRITICAL: If we become producer immediately after sync, we must
@@ -9096,7 +9113,7 @@ impl BlockchainNode {
                         JUST_COMPLETED_SYNC.store(true, Ordering::SeqCst);
 
                         if is_info() {
-                            println!("[INFO][SYNC] target_reached h={} target={} best_peer={} sync_complete skip_slot=true",
+                            println!("[INFO][SYNC] target_reached h={} target={} best_peer={} sync_complete — sync flag deferred to main loop",
                                      received_block.height, target, best_peer_h);
                         }
 
@@ -13323,25 +13340,28 @@ impl BlockchainNode {
                                      reg_our_h, reg_best_h, reg_best_h.saturating_sub(reg_our_h), is_node_synced);
                         }
 
-                        // v9.7: DESYNC MONITOR — detect post-sync desynchronization.
-                        // If NODE_IS_SYNCHRONIZED=true but we fell behind by >50 blocks
-                        // (network partition, slow processing, restart), reset flag and
-                        // re-enter sync. Without this, a desynced node stays "synchronized"
-                        // flag=true forever (height gate blocks registration, but flag is stale).
+                        // v9.8: DESYNC MONITOR — detect post-sync desynchronization.
+                        // Uses live peer heights from DashMap instead of BEST_PEER_HEIGHT atomic
+                        // which can be 0 if handshake didn't complete. get_max_peer_height() is
+                        // always current (reads connected_peers_lockfree directly).
                         // 50 blocks (not 20): avoid flapping from normal propagation jitter.
-                        if is_node_synced && reg_best_h > 0 && reg_our_h + 50 < reg_best_h {
+                        let desync_net_h = if let Some(ref p2p) = unified_p2p {
+                            let live_h = p2p.get_max_peer_height();
+                            if live_h > reg_our_h { live_h } else { 0 }
+                        } else { 0 };
+                        if is_node_synced && desync_net_h > 0 && reg_our_h + 50 < desync_net_h {
                             NODE_IS_SYNCHRONIZED.store(false, std::sync::atomic::Ordering::SeqCst);
-                            let gap = reg_best_h.saturating_sub(reg_our_h);
+                            let gap = desync_net_h.saturating_sub(reg_our_h);
                             println!("[WARN][DESYNC] post-sync desynchronization detected our={} best={} gap={} — re-syncing",
-                                     reg_our_h, reg_best_h, gap);
+                                     reg_our_h, desync_net_h, gap);
 
                             // Re-enter sync: set target and spawn sync task
                             SYNC_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
-                            SYNC_TARGET_HEIGHT.store(reg_best_h, std::sync::atomic::Ordering::SeqCst);
+                            SYNC_TARGET_HEIGHT.store(desync_net_h, std::sync::atomic::Ordering::SeqCst);
                             if let Some(ref p2p) = unified_p2p {
                                 let p2p_clone = p2p.clone();
                                 let from_h = reg_our_h + 1;
-                                let to_h = reg_best_h;
+                                let to_h = desync_net_h;
                                 tokio::spawn(async move {
                                     if let Err(e) = p2p_clone.sync_blocks(from_h, to_h).await {
                                         println!("[WARN][DESYNC] re-sync_err: {}", e);
@@ -14674,8 +14694,16 @@ impl BlockchainNode {
                 // Lagging node should NOT produce blocks - must sync first
                 // ═══════════════════════════════════════════════════════════════════
                 if let Some(ref p2p) = unified_p2p {
-                    // Use cached network height (non-blocking)
-                    let network_height = p2p.get_cached_network_height().unwrap_or(0);
+                    // v9.8: Fallback chain for network height:
+                    // 1. Cached height (fast, <1s old)
+                    // 2. Live peer heights from DashMap (always current)
+                    let network_height = if let Some(cached) = p2p.get_cached_network_height() {
+                        cached
+                    } else {
+                        let live = p2p.get_max_peer_height();
+                        // get_max_peer_height includes local — only use if higher than us
+                        if live > microblock_height { live } else { 0 }
+                    };
                     let our_height = microblock_height;
                     let lag = network_height.saturating_sub(our_height);
                     
@@ -14725,6 +14753,23 @@ impl BlockchainNode {
                             p2p.broadcast_vrf_key_announce();
                             LAST_VRF_KEY_ANNOUNCE_HEIGHT.store(next_block_height, Ordering::Relaxed);
                         }
+                    }
+                }
+
+                // v9.8: Production gate — don't produce if too far ahead of last finalized.
+                // Without this, producer advances height indefinitely without BFT confirmation,
+                // diverging from network. MAX_UNFINALIZED = 90 (one full epoch) — generous
+                // enough for normal BFT delays, but prevents runaway divergence.
+                {
+                    const MAX_UNFINALIZED_BLOCKS: u64 = 90;
+                    let last_finalized = LAST_FINALIZED_CONSENSUS_ROUND.load(Ordering::SeqCst);
+                    if last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS + 90 {
+                        if is_info() {
+                            println!("[WARN][PROD] production_gate: height={} finalized={} gap={} — waiting for BFT",
+                                     next_block_height, last_finalized, next_block_height - last_finalized);
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
                 }
 
@@ -15521,18 +15566,35 @@ impl BlockchainNode {
                 // producer detection in block reception (line ~6730) and production loop
                 // (line ~13425) remains as a secondary safety net.
                 
-                // CRITICAL FIX: Update NODE_IS_SYNCHRONIZED for ALL nodes BEFORE producer check
-                // This was a BUG: flag was only updated in else branch (non-producers)
-                // Producer nodes need this flag set to pass is_next_block_producer() check
+                // CRITICAL FIX v9.8: Network-aware NODE_IS_SYNCHRONIZED check.
+                // Previous bug: compared LOCAL stored vs LOCAL height only — never checked network.
+                // A node 5000 blocks behind network would declare synchronized=true if stored==local.
+                // Now: local_ok (storage vs RAM) AND network_ok (storage vs peer heights).
                 {
                     let current_stored_height = storage.get_chain_height().unwrap_or(0);
-                    let is_synchronized = if microblock_height > 10 {
+                    let local_ok = if microblock_height > 10 {
                         // Normal operation: allow max 10 blocks behind
                         current_stored_height + 10 >= microblock_height
                     } else {
                         // Genesis phase: must be within 1 block
                         current_stored_height + 1 >= microblock_height
                     };
+
+                    // v9.8: Check against actual network height from connected peers.
+                    // get_max_peer_height() reads DashMap directly (always fresh), unlike
+                    // BEST_PEER_HEIGHT atomic which can be 0 if handshake didn't complete.
+                    // When no peers connected: returns local_height → network_ok=true (correct:
+                    // can't know network state without peers, trust local).
+                    let network_ok = if let Some(ref p2p) = unified_p2p {
+                        let net_h = p2p.get_max_peer_height();
+                        // net_h includes local_height, so if no peers → net_h == local_height.
+                        // Only flag desync when peers report genuinely higher height.
+                        net_h == 0 || net_h <= current_stored_height + 10
+                    } else {
+                        true // No P2P yet — trust local
+                    };
+
+                    let is_synchronized = local_ok && network_ok;
                     NODE_IS_SYNCHRONIZED.store(is_synchronized, Ordering::SeqCst);
                 }
                 

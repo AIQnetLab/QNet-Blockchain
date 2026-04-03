@@ -11982,10 +11982,14 @@ impl SimplifiedP2P {
             NetworkMessage::TimeoutVote { height, timeout_round, voter_id, last_block_hash, signature } => {
                 self.update_peer_last_seen(&voter_id);
 
-                // v9.5: Early height filter — discard obviously stale/future votes before signature check.
+                // v9.5/v9.8: Early height filter — discard obviously stale/future votes before signature check.
                 // saturating_add prevents overflow from malicious u64::MAX height values.
+                // FIX: `height` is macroblock INDEX (microblock_height / 90), so compare against
+                // local macroblock index, NOT raw microblock height. The old code compared
+                // index (~623) vs height (~56100) — always true — dropping ALL timeout votes.
                 let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                if (local_h > 20 && height.saturating_add(20) < local_h) || height > local_h.saturating_add(50) {
+                let local_mb_index = local_h / 90;
+                if (local_mb_index > 20 && height.saturating_add(20) < local_mb_index) || height > local_mb_index.saturating_add(50) {
                     return;
                 }
 
