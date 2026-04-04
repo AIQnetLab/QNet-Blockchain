@@ -26,8 +26,11 @@ ENV CARGO_HTTP_MULTIPLEXING=false
 ENV CARGO_NET_RETRY=10
 ENV CARGO_HTTP_TIMEOUT=300
 
-# Build production binary (time crate already pinned to 0.3.36 in Cargo.lock)
-RUN cargo build --profile release-fast --bin qnet-node \
+# Pin time crate for compatibility, then build with thin LTO to stay within CI memory limits.
+# fat LTO on 90K-line crate needs 8+GB RAM — GitHub Actions Docker build has ~7GB.
+ENV CARGO_PROFILE_RELEASE_FAST_LTO=thin
+RUN cargo update time --precise 0.3.36 \
+    && cargo build --profile release-fast --bin qnet-node -j 2 \
     && strip target/release-fast/qnet-node \
     && cp target/release-fast/qnet-node /usr/local/bin/
 
