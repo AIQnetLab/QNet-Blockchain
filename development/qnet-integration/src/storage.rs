@@ -6183,22 +6183,24 @@ impl Storage {
     
     /// Create incremental state snapshot at specified height
     pub async fn create_incremental_snapshot(&self, height: u64) -> IntegrationResult<()> {
-        const INCREMENTAL_INTERVAL: u64 = 1_000;
-        const FULL_SNAPSHOT_INTERVAL: u64 = 10_000;
-        
+        // v10.1: Intervals MUST match node.rs constants (SNAPSHOT_INCREMENTAL_INTERVAL / SNAPSHOT_FULL_INTERVAL)
+        // Previous bug: hardcoded 1_000/10_000 caused 43200 % 1000 = 200 → no snapshot created!
+        const INCREMENTAL_INTERVAL: u64 = 3_600;   // 1 hour (matches SNAPSHOT_INCREMENTAL_INTERVAL)
+        const FULL_SNAPSHOT_INTERVAL: u64 = 43_200; // 12 hours (matches SNAPSHOT_FULL_INTERVAL)
+
         // Check if this is a full snapshot height (priority)
         if height % FULL_SNAPSHOT_INTERVAL == 0 {
             return self.create_state_snapshot(height).await;
         }
-        
+
         // Check if this is an incremental snapshot height
         if height % INCREMENTAL_INTERVAL != 0 {
             return Ok(()); // Not a snapshot height
         }
-        
+
         println!("[INFO][STORAGE] incremental_snapshot_start height={}", height);
         let start_time = std::time::Instant::now();
-        
+
         // Find the previous snapshot to base delta on
         let base_height = (height / FULL_SNAPSHOT_INTERVAL) * FULL_SNAPSHOT_INTERVAL;
         if base_height == 0 {
@@ -6273,10 +6275,10 @@ impl Storage {
     
     /// Create full state snapshot at specified height
     pub async fn create_state_snapshot(&self, height: u64) -> IntegrationResult<()> {
-        // PRODUCTION: Only create snapshots at round boundaries (every 10,000 blocks)
-        const SNAPSHOT_INTERVAL: u64 = 10_000;
-        if height % SNAPSHOT_INTERVAL != 0 && height != 0 {
-            return Ok(()); // Not a full snapshot height
+        // v10.1: Guard removed — caller (create_incremental_snapshot) already checks intervals.
+        // Previous bug: hardcoded 10_000 here blocked creation at h=43200 (43200 % 10000 = 3200).
+        if height == 0 {
+            return Ok(()); // No snapshot at genesis
         }
         
         println!("[INFO][STORAGE] state_snapshot_start height={}", height);
@@ -6600,7 +6602,10 @@ impl Storage {
     }
     
     /// Load a full snapshot by height and restore accounts + rewards directly into RocksDB.
-    /// Payload: [type=0x02 | version(4) | height(8) | ts(8) | accounts | rewards]
+    /// v10.1: Supports TWO binary formats:
+    ///   Format A (create_state_snapshot): [0x02 | protocol_version:u32 | height:u64 | timestamp:u64 | KV pairs...]
+    ///   Format B (save_state_snapshot):   [0x02 | state_root:[u8;32] | total_supply:u64 | height:u64 | bincode(accounts)]
+    /// Detection: after 0x02, read 4 bytes as u32. protocol_version < 10_000 → Format A. Otherwise → Format B.
     pub async fn load_state_snapshot(&self, height: u64) -> IntegrationResult<()> {
         if crate::node::is_info() {
             println!("[INFO][SNAPSHOT] full_snap_loading h={}", height);
@@ -6609,9 +6614,20 @@ impl Storage {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
 
+        // v10.1: Try full_snap_ first, then state_snap_ (download_snapshot_chunked saves as full_snap_,
+        // but the data may have originated from a peer's state_snap_ via get_snapshot_data)
         let snapshot_key = format!("full_snap_{}", height);
-        let snapshot_data = self.persistent.db.get_cf(&snapshots_cf, snapshot_key.as_bytes())?
-            .ok_or_else(|| IntegrationError::StorageError(format!("Full snapshot at h={} not found", height)))?;
+        let snapshot_data = match self.persistent.db.get_cf(&snapshots_cf, snapshot_key.as_bytes())? {
+            Some(d) => d,
+            None => {
+                // Fallback: try state_snap_ key directly (local node)
+                let state_key = format!("state_snap_{}", height);
+                self.persistent.db.get_cf(&snapshots_cf, state_key.as_bytes())?
+                    .ok_or_else(|| IntegrationError::StorageError(
+                        format!("Snapshot at h={} not found (tried full_snap_ and state_snap_)", height)
+                    ))?
+            }
+        };
 
         // Bounds check: [sha3_hash(32) | uncompressed_len(8)] + at least 1 byte compressed
         if snapshot_data.len() < 41 {
@@ -6640,7 +6656,7 @@ impl Storage {
         // Decompress with Zstd (unified format, same as save path)
         let decompressed = zstd::decode_all(compressed_data)
             .map_err(|e| IntegrationError::StorageError(format!("Full snapshot decompression failed h={}: {}", height, e)))?;
-        
+
         // Parse and restore state
         let mut cursor = 0;
 
@@ -6653,21 +6669,127 @@ impl Storage {
         }
         cursor += 1; // skip type byte
 
-        // Check protocol version
+        // v10.1: DETECT FORMAT — read first 4 bytes after type discriminator
+        // Format A (create_state_snapshot): protocol_version as u32 (always < 10_000)
+        // Format B (save_state_snapshot):   first 4 bytes of state_root hash (random, virtually always >= 10_000)
         if cursor + 4 > decompressed.len() {
             return Err(IntegrationError::StorageError(format!(
-                "Full snapshot h={} truncated at version field", height
+                "Full snapshot h={} truncated after type byte", height
             )));
         }
-        let version = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into()
-            .map_err(|_| IntegrationError::StorageError("Invalid version field".to_string()))?);
+        let probe = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into()
+            .map_err(|_| IntegrationError::StorageError("Invalid probe field".to_string()))?);
+
+        let is_format_b = probe >= 10_000; // state_root hash byte → huge number
+
+        if is_format_b {
+            // ═══════════════════════════════════════════════════════════════════
+            // FORMAT B: save_state_snapshot — [0x02 | state_root(32) | total_supply(8) | height(8) | bincode(accounts)]
+            // This format comes from P2P download when peer serves state_snap_ data.
+            // ═══════════════════════════════════════════════════════════════════
+            if cursor + 48 > decompressed.len() {
+                return Err(IntegrationError::StorageError(format!(
+                    "Format B snapshot h={} truncated: need 48 bytes header, have {}", height, decompressed.len() - cursor
+                )));
+            }
+            let _state_root = &decompressed[cursor..cursor+32];
+            cursor += 32;
+            let _total_supply = u64::from_le_bytes(decompressed[cursor..cursor+8].try_into()
+                .map_err(|_| IntegrationError::StorageError("Invalid total_supply".to_string()))?);
+            cursor += 8;
+            let snap_height = u64::from_le_bytes(decompressed[cursor..cursor+8].try_into()
+                .map_err(|_| IntegrationError::StorageError("Invalid height".to_string()))?);
+            cursor += 8;
+
+            println!("[INFO][SNAPSHOT] format_B detected h={} snap_h={} supply={}", height, snap_height, _total_supply);
+
+            // Remaining bytes = bincode-serialized accounts HashMap
+            let accounts_cf = self.persistent.db.cf_handle("accounts")
+                .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+
+            if cursor < decompressed.len() {
+                let accounts_data = &decompressed[cursor..];
+                // Deserialize bincode accounts: HashMap<String, AccountState> or Vec<(key, value)>
+                // save_state_snapshot uses bincode::serialize(&accounts) where accounts is the full map
+                match bincode::deserialize::<std::collections::HashMap<String, Vec<u8>>>(accounts_data) {
+                    Ok(accounts_map) => {
+                        let mut batch = WriteBatch::default();
+                        let mut account_count = 0u64;
+                        for (key, value) in &accounts_map {
+                            batch.put_cf(&accounts_cf, key.as_bytes(), value);
+                            account_count += 1;
+                        }
+                        self.persistent.db.write(batch)?;
+                        println!("[INFO][SNAPSHOT] format_B_restored h={} accounts={}", height, account_count);
+
+                        if account_count == 0 {
+                            eprintln!("[ERR][SNAPSHOT] format_B_empty h={} — 0 accounts", height);
+                            return Err(IntegrationError::StorageError(format!(
+                                "Format B snapshot h={} restored 0 accounts", height
+                            )));
+                        }
+                    }
+                    Err(_) => {
+                        // Fallback: try deserializing as raw KV pairs (same format as Format A body)
+                        let mut batch = WriteBatch::default();
+                        let mut account_count = 0u64;
+                        let mut c = cursor;
+                        while c + 4 <= decompressed.len() {
+                            let key_len = u32::from_le_bytes(
+                                match decompressed[c..c+4].try_into() { Ok(b) => b, Err(_) => break }
+                            ) as usize;
+                            c += 4;
+                            if c + key_len > decompressed.len() || key_len > 1_000_000 { break; }
+                            let key = &decompressed[c..c+key_len];
+                            c += key_len;
+                            if c + 4 > decompressed.len() { break; }
+                            let value_len = u32::from_le_bytes(
+                                match decompressed[c..c+4].try_into() { Ok(b) => b, Err(_) => break }
+                            ) as usize;
+                            c += 4;
+                            if c + value_len > decompressed.len() || value_len > 100_000_000 { break; }
+                            let value = &decompressed[c..c+value_len];
+                            c += value_len;
+                            batch.put_cf(&accounts_cf, key, value);
+                            account_count += 1;
+                        }
+                        self.persistent.db.write(batch)?;
+                        println!("[INFO][SNAPSHOT] format_B_kv_fallback h={} accounts={}", height, account_count);
+
+                        if account_count == 0 {
+                            eprintln!("[ERR][SNAPSHOT] format_B_kv_empty h={}", height);
+                            return Err(IntegrationError::StorageError(format!(
+                                "Format B snapshot h={} restored 0 accounts (kv fallback)", height
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // v10.1: CRITICAL — set chain_height so node syncs only blocks AFTER snapshot.
+            // Without this, chain_height stays 0 → node re-downloads ALL blocks from genesis.
+            // Every L1 (Ethereum, Solana, Near) does this: snapshot = trusted state at height H.
+            self.set_chain_height(height)?;
+            println!("[INFO][SNAPSHOT] format_B_chain_height_set h={}", height);
+
+            if crate::node::is_info() {
+                println!("[INFO][SNAPSHOT] format_B_load_complete h={}", height);
+            }
+            return Ok(());
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // FORMAT A: create_state_snapshot — [0x02 | version(4) | height(8) | timestamp(8) | KV pairs | markers...]
+        // This is the canonical full snapshot format.
+        // ═══════════════════════════════════════════════════════════════════
+        let version = probe; // already read as u32
         cursor += 4;
-        
+
         if version != crate::node::PROTOCOL_VERSION {
-            println!("[WARN][STORAGE] snapshot_version_mismatch snapshot_v={} current_v={}", 
+            println!("[WARN][STORAGE] snapshot_version_mismatch snapshot_v={} current_v={}",
                      version, crate::node::PROTOCOL_VERSION);
         }
-        
+
         // Skip height and timestamp
         cursor += 16;
         
@@ -6829,6 +6951,12 @@ impl Storage {
                 "Full snapshot h={} restored 0 accounts", height
             )));
         }
+
+        // v10.1: CRITICAL — set chain_height so node syncs only blocks AFTER snapshot.
+        // Without this, chain_height stays 0 → node re-downloads ALL blocks from genesis.
+        // Every L1 (Ethereum, Solana, Near) does this: snapshot = trusted state at height H.
+        self.set_chain_height(height)?;
+        println!("[INFO][SNAPSHOT] format_A_chain_height_set h={}", height);
 
         Ok(())
     }

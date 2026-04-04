@@ -7302,13 +7302,19 @@ impl BlockchainNode {
                                 
                                 match blockchain_for_sync.storage.fast_sync_with_snapshot(p2p, network_height).await {
                                     Ok(()) => {
-                                        // Snapshot loaded - update sync_from
+                                        // v10.1: Snapshot sets chain_height in storage.
+                                        // Read it back and update RAM height + global atomics.
                                         let new_local = blockchain_for_sync.storage.get_chain_height().unwrap_or(local_height);
                                         if new_local > local_height {
                                             sync_from = new_local + 1;
+                                            // Update RAM height to match storage
+                                            *blockchain_for_sync.height.write().await = new_local;
+                                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                                new_local, std::sync::atomic::Ordering::Release
+                                            );
                                             if is_info() {
-                                                println!("[INFO][SYNC] snapshot_loaded new_height={} saved_blocks={}", 
-                                                         new_local, new_local - local_height);
+                                                println!("[INFO][SYNC] snapshot_loaded new_height={} skipped_blocks={} sync_from={}",
+                                                         new_local, new_local - local_height, sync_from);
                                             }
                                         }
                                     }
@@ -7323,10 +7329,11 @@ impl BlockchainNode {
                                 println!("[INFO][SYNC] light_node skip_snapshot sync_recent_only");
                             }
                             
-                            // v5.5: ALWAYS include genesis block (h=0) in sync.
+                            // v5.5: Include genesis block (h=0) when syncing from near-zero.
                             // Without genesis, block 1 fails MISSING_PREVIOUS:0 → sync deadlock.
-                            // Every L1 ensures genesis exists before syncing the chain.
-                            if sync_from > 0 {
+                            // v10.1: Skip genesis download when snapshot loaded (sync_from >> 0).
+                            // After snapshot at h=43200, genesis block is irrelevant — state is in snapshot.
+                            if sync_from > 0 && sync_from <= 100 {
                                 let has_genesis = blockchain_for_sync.storage
                                     .load_microblock(0).unwrap_or(None).is_some();
                                 if !has_genesis {
@@ -7337,6 +7344,8 @@ impl BlockchainNode {
                                     // Brief wait for genesis to be processed
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                 }
+                            } else if sync_from > 100 && is_info() {
+                                println!("[INFO][SYNC] post_snapshot_sync skip_genesis sync_from={}", sync_from);
                             }
 
                             // Sync remaining blocks in chunks
@@ -7393,13 +7402,14 @@ impl BlockchainNode {
                             }
                             
                             if is_info() { println!("[INFO][SYNC] microblock_sync_complete"); }
-                            
+
                             // PRODUCTION v2.19.12: Sync macroblocks after microblocks
                             // Macroblocks are needed for:
-                            // - Light nodes (they only store macroblock headers)
                             // - State verification (state_root validation)
                             // - Consensus history (commit/reveal data)
-                            let local_macroblock_index = local_height / 90;
+                            // v10.1: Re-read actual height (may have advanced via snapshot + block sync)
+                            let actual_local_height = blockchain_for_sync.storage.get_chain_height().unwrap_or(0);
+                            let local_macroblock_index = actual_local_height / 90;
                             let network_macroblock_index = network_height / 90;
                             
                             if network_macroblock_index > local_macroblock_index {
@@ -10348,16 +10358,32 @@ impl BlockchainNode {
                         // Block #1 SPECIAL CASE: Genesis might not be synced yet
                         // Return special error to trigger Genesis sync
                         if is_warn() { println!("[WARN][VALIDATION] genesis_missing action=sync_request"); }
-                        
+
                         // CRITICAL: Return special error for missing Genesis
                         return Err("MISSING_PREVIOUS:0".to_string());
                     } else {
-                        // ALL other blocks: MUST have previous block for security
-                        if is_warn() { println!("[WARN][VALIDATION] prev_block_missing h={} need={}", 
-                                 microblock.height, microblock.height - 1); }
-                        
-                        // CRITICAL: Return special error to trigger sync request
-                        return Err(format!("MISSING_PREVIOUS:{}", microblock.height - 1));
+                        // v10.1: POST-SNAPSHOT SYNC — first block after snapshot has no predecessor in storage.
+                        // After snapshot at h=43200, block 43201 arrives but microblock 43200 doesn't exist.
+                        // This is expected: snapshot restores STATE, not individual blocks.
+                        // Skip previous_hash validation ONLY for the first block after chain_height (set by snapshot).
+                        // All subsequent blocks (43202, 43203, ...) will validate normally against their predecessor.
+                        // Same pattern as Ethereum snap sync: trust snapshot boundary, validate everything after.
+                        let stored_height = storage.get_chain_height().unwrap_or(0);
+                        let is_post_snapshot_first_block = stored_height > 0
+                            && microblock.height == stored_height + 1
+                            && SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+
+                        if is_post_snapshot_first_block {
+                            println!("[INFO][VALIDATION] post_snapshot_trust h={} snap_h={} prev_hash_skip=trusted",
+                                     microblock.height, stored_height);
+                        } else {
+                            // ALL other blocks: MUST have previous block for security
+                            if is_warn() { println!("[WARN][VALIDATION] prev_block_missing h={} need={}",
+                                     microblock.height, microblock.height - 1); }
+
+                            // CRITICAL: Return special error to trigger sync request
+                            return Err(format!("MISSING_PREVIOUS:{}", microblock.height - 1));
+                        }
                     }
                 }
             }
@@ -14153,13 +14179,21 @@ impl BlockchainNode {
                                         _ => 300,   // 4th+: 5 min max
                                     };
 
-                                    if height_gap > dynamic_threshold && (now_secs - last_rollback) > rollback_cooldown {
+                                    // v10.1: CRITICAL — never rollback while sync is in progress.
+                                    // A syncing node is ALWAYS behind the network (gap > threshold).
+                                    // Without this guard, fork detection triggers destructive rollback
+                                    // on every cooldown cycle, creating an infinite rollback→resync loop
+                                    // that prevents the node from ever catching up.
+                                    let sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+                                        || FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
+
+                                    if height_gap > dynamic_threshold && (now_secs - last_rollback) > rollback_cooldown && !sync_active {
                                         LAST_ROLLBACK_TIME.store(now_secs, std::sync::atomic::Ordering::Relaxed);
                                         ROLLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        
-                                        println!("[ERR][FORK] slot_delay={}s behind={} blocks threshold={}", 
+
+                                        println!("[ERR][FORK] slot_delay={}s behind={} blocks threshold={}",
                                                  local_delay, height_gap, dynamic_threshold);
-                                        println!("[INFO][FORK] force_resync local={} network={} nodes={}", 
+                                        println!("[INFO][FORK] force_resync local={} network={} nodes={}",
                                                  microblock_height, network_height, network_size);
                                         
                                         // v3.30: Smart rollback — go to START of current macroblock cycle

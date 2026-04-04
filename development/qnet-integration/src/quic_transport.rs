@@ -477,13 +477,26 @@ impl QuicTransport {
         // Try loading existing cert+key from disk
         if let (Ok(cert_bytes), Ok(key_bytes)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
             if !cert_bytes.is_empty() && !key_bytes.is_empty() {
-                if crate::node::is_info() {
-                    println!("[INFO][QUIC] tls_cert_loaded path={} size={}B", cert_path, cert_bytes.len());
+                // v10.1: Verify SAN matches current node_id before reusing cert.
+                // When a container restarts with a new hostname, node_id changes but
+                // the persisted cert still has the OLD SAN → every peer rejects with
+                // CERT_REJECTED (403). Detect this and regenerate automatically.
+                let expected_san = format!("qnet-{}", node_id);
+                let san_ok = Self::cert_san_matches(&cert_bytes, &expected_san);
+                if san_ok {
+                    if crate::node::is_info() {
+                        println!("[INFO][QUIC] tls_cert_loaded path={} size={}B san={}", cert_path, cert_bytes.len(), expected_san);
+                    }
+                    return Ok((
+                        CertificateDer::from(cert_bytes),
+                        PrivateKeyDer::Pkcs8(key_bytes.into()),
+                    ));
+                } else {
+                    println!("[WARN][QUIC] tls_cert_san_mismatch expected={} — regenerating cert", expected_san);
+                    // Remove stale cert+key so we generate fresh ones below
+                    let _ = std::fs::remove_file(&cert_path);
+                    let _ = std::fs::remove_file(&key_path);
                 }
-                return Ok((
-                    CertificateDer::from(cert_bytes),
-                    PrivateKeyDer::Pkcs8(key_bytes.into()),
-                ));
             }
         }
 
@@ -527,6 +540,26 @@ impl QuicTransport {
         }
 
         Ok((CertificateDer::from(cert_der), PrivateKeyDer::Pkcs8(key_der.into())))
+    }
+
+    /// v10.1: Check if a DER-encoded certificate's SAN contains the expected dNSName.
+    /// Used by load_or_generate_tls_cert to detect stale certs after hostname change.
+    fn cert_san_matches(cert_bytes: &[u8], expected_san: &str) -> bool {
+        match x509_parser::parse_x509_certificate(cert_bytes) {
+            Ok((_, parsed)) => {
+                if let Ok(Some(san_ext)) = parsed.subject_alternative_name() {
+                    for name in &san_ext.value.general_names {
+                        if let x509_parser::prelude::GeneralName::DNSName(dns) = name {
+                            if *dns == expected_san {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            Err(_) => false, // Corrupt cert — treat as mismatch, will regenerate
+        }
     }
 
     /// Initialize QUIC transport (creates endpoint)
