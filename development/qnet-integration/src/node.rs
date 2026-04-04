@@ -1258,8 +1258,11 @@ impl RotationTracker {
 /// Status of HeartbeatCommitment TX - tracks from creation to confirmation
 #[derive(Debug, Clone)]
 pub struct HeartbeatCommitmentStatus {
-    /// TX hash for tracking
+    /// TX hash for tracking (latest)
     pub tx_hash: String,
+    /// ALL TX hashes sent for this epoch (original + retries)
+    /// v10.1 FIX: confirmation check must find ANY of these, not just the latest
+    pub all_tx_hashes: Vec<String>,
     /// Block height when TX was created and sent
     pub sent_at_height: u64,
     /// Block height when TX was confirmed (included in block), None if pending
@@ -1272,8 +1275,10 @@ pub struct HeartbeatCommitmentStatus {
 
 impl HeartbeatCommitmentStatus {
     pub fn new(tx_hash: String, sent_at_height: u64) -> Self {
+        let all = vec![tx_hash.clone()];
         Self {
             tx_hash,
+            all_tx_hashes: all,
             sent_at_height,
             confirmed_at_height: None,
             retry_count: 0,
@@ -11770,12 +11775,13 @@ impl BlockchainNode {
                                                 // v2.96: Track with HeartbeatCommitmentStatus (pending until confirmed)
                                                 let tx_hash_clone = tx.hash.clone();
                                                 if let Some(mut existing) = heartbeat_tracker.get_mut(&current_epoch) {
-                                                    // Retry case - increment counter
+                                                    // Retry case - increment counter, keep ALL hashes for confirmation check
                                                     existing.increment_retry();
                                                     existing.value_mut().sent_at_height = current_height;
                                                     existing.value_mut().tx_hash = tx_hash_clone.clone();
-                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX retry #{} submitted epoch={} hash={}", 
-                                                             existing.retry_count, current_epoch, &tx_hash_clone[..16]);
+                                                    existing.value_mut().all_tx_hashes.push(tx_hash_clone.clone());
+                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX retry #{} submitted epoch={} hash={} total_hashes={}",
+                                                             existing.retry_count, current_epoch, &tx_hash_clone[..16], existing.all_tx_hashes.len());
                                                 } else {
                                                     // First send
                                                     heartbeat_tracker.insert(
@@ -11949,14 +11955,14 @@ impl BlockchainNode {
                             
                             for check_height in scan_start..=scan_end {
                                 if let Ok(Some(block_data)) = storage.load_microblock_auto_format(check_height) {
-                                    // Check if our TX is in this block
+                                    // Check if ANY of our TX hashes is in this block
                                     for tx in &block_data.transactions {
                                         if let qnet_state::TransactionType::HeartbeatCommitment { node_id: tx_node_id, .. } = &tx.tx_type {
-                                            if tx_node_id == &node_id && tx.hash == status.tx_hash {
+                                            if tx_node_id == &node_id && status.all_tx_hashes.contains(&tx.hash) {
                                                 // Found our TX! Mark as confirmed
                                                 status.mark_confirmed(check_height);
-                                                println!("[INFO][HEARTBEAT-COMMITMENT] TX CONFIRMED epoch={} block={} hash={}", 
-                                                         epoch, check_height, &status.tx_hash[..16]);
+                                                println!("[INFO][HEARTBEAT-COMMITMENT] TX CONFIRMED epoch={} block={} hash={}",
+                                                         epoch, check_height, &tx.hash[..16]);
                                                 break;
                                             }
                                         }
@@ -12226,8 +12232,9 @@ impl BlockchainNode {
                                                         existing.increment_retry();
                                                         existing.value_mut().sent_at_height = current_height;
                                                         existing.value_mut().tx_hash = tx_hash_clone.clone();
-                                                        println!("[INFO][LIGHT-BITMAP] TX retry #{} submitted epoch={} hash={}",
-                                                                 existing.retry_count, current_epoch, &tx_hash_clone[..16]);
+                                                        existing.value_mut().all_tx_hashes.push(tx_hash_clone.clone());
+                                                        println!("[INFO][LIGHT-BITMAP] TX retry #{} submitted epoch={} hash={} total_hashes={}",
+                                                                 existing.retry_count, current_epoch, &tx_hash_clone[..16], existing.all_tx_hashes.len());
                                                     } else {
                                                         bitmap_tracker.insert(
                                                             current_epoch,
@@ -12349,10 +12356,10 @@ impl BlockchainNode {
                                     if let Ok(Some(block_data)) = storage.load_microblock_auto_format(check_height) {
                                         for tx in &block_data.transactions {
                                             if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } = &tx.tx_type {
-                                                if genesis_id == &node_id && tx.hash == status.tx_hash {
+                                                if genesis_id == &node_id && status.all_tx_hashes.contains(&tx.hash) {
                                                     status.mark_confirmed(check_height);
                                                     println!("[INFO][LIGHT-BITMAP] TX CONFIRMED epoch={} block={} hash={}",
-                                                             epoch, check_height, &status.tx_hash[..16]);
+                                                             epoch, check_height, &tx.hash[..16]);
                                                     break;
                                                 }
                                             }
@@ -16646,6 +16653,11 @@ impl BlockchainNode {
                     let mut user_txs: Vec<qnet_state::Transaction> = Vec::new();
                     let mut rejection_reasons: Vec<(String, String)> = Vec::new(); // v3.1: Track reasons
                     
+                    // v10.1: Track commitment TX senders to deduplicate (one per node_id per epoch)
+                    let mut seen_heartbeat_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    let mut seen_ping_senders: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    let mut seen_bitmap_genesis: std::collections::HashSet<String> = std::collections::HashSet::new();
+
                     for (hash, tx, is_valid, reject_reason) in validated {
                         if is_valid {
                             // v2.68: Separate system TX from user TX
@@ -16658,7 +16670,30 @@ impl BlockchainNode {
                                 || matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. })
                                 || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. })
                                 || matches!(tx.tx_type, qnet_state::TransactionType::LightNodeEligibilityBitmap { .. });
-                            
+
+                            // v10.1: Block-level dedup — one commitment TX per node_id per block
+                            let is_dup_commitment = match &tx.tx_type {
+                                qnet_state::TransactionType::HeartbeatCommitment { node_id, .. } => {
+                                    !seen_heartbeat_nodes.insert(node_id.clone())
+                                }
+                                qnet_state::TransactionType::PingCommitmentWithSampling { .. } => {
+                                    !seen_ping_senders.insert(tx.from.clone())
+                                }
+                                qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } => {
+                                    !seen_bitmap_genesis.insert(genesis_id.clone())
+                                }
+                                _ => false,
+                            };
+
+                            if is_dup_commitment {
+                                if is_info() {
+                                    println!("[INFO][BLOCK] dedup_commitment type={:?} from={} hash={}",
+                                             std::mem::discriminant(&tx.tx_type), &tx.from, &hash[..hash.len().min(16)]);
+                                }
+                                invalid_tx_hashes.push(hash);
+                                continue;
+                            }
+
                             if is_system {
                                 system_txs.push(tx);
                             } else {
