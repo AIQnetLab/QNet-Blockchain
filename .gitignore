@@ -53,7 +53,7 @@ env/
 
 # Rust
 target/
-Cargo.lock
+# IMPORTANT: Cargo.lock is tracked for deterministic builds — do NOT ignore it
 **/*.rs.bk
 *.pdb
 
@@ -360,7 +360,6 @@ dist/
 build/
 
 # Rust build artifacts
-Cargo.lock
 debug/
 release/
 
@@ -478,9 +477,6 @@ coverage/
 # Rust specific
 **/*.rs.bk
 *.pdb
-
-# Cargo
-Cargo.lock
 
 # Generated files
 generated/
