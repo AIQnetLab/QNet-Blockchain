@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     libclang-dev \
+    zlib1g-dev \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
@@ -26,11 +27,9 @@ ENV CARGO_HTTP_MULTIPLEXING=false
 ENV CARGO_NET_RETRY=10
 ENV CARGO_HTTP_TIMEOUT=300
 
-# CI Docker builds have ~7GB RAM. fat LTO on 90K-line workspace needs 8+GB.
-# Switch to thin LTO in Cargo.toml before build (env override doesn't work for hyphenated profiles).
-RUN sed -i 's/lto = "fat"/lto = "thin"/g' Cargo.toml \
-    && cargo update time --precise 0.3.36 \
-    && cargo build --profile release-fast --bin qnet-node -j 2 \
+# Pin time crate for compatibility, then build
+RUN cargo update time --precise 0.3.36 \
+    && cargo build --profile release-fast --bin qnet-node \
     && strip target/release-fast/qnet-node \
     && cp target/release-fast/qnet-node /usr/local/bin/
 
