@@ -1,64 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTransactionByHash } from '../../../../../lib/db';
 import { rateLimit, getClientIdentifier } from '../../../../../lib/rate-limit';
-
-// NODE_RPC_URL is now defined in getNodeRpcUrl() function below
+import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 
 // Rate limiting: 200 requests per minute per IP
 const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-
-// Map transaction type to display string
-// v3.15: Claims from system_rewards_pool show as Transfer
-function mapTxType(type: string | object | undefined, fromAddress?: string): string {
-  if (!type) return 'Transfer';
-  
-  // Claim rewards from pool = Transfer (not Reward)
-  if (fromAddress === 'system_rewards_pool') {
-    return 'Transfer';
-  }
-  
-  const typeStr = typeof type === 'object' ? Object.keys(type)[0] : String(type);
-  
-  const map: Record<string, string> = {
-    'Transfer': 'Transfer',
-    'NodeActivation': 'Node Activation',
-    'NodeRegistration': 'Registration',
-    'Swap': 'Swap',
-    'RewardDistribution': 'Reward',
-    'ContractDeploy': 'Smart Contract',
-    'ContractCall': 'Smart Contract',
-    'HeartbeatCommitment': 'Heartbeat',
-    'Heartbeat': 'Heartbeat',
-    'LightNodeEligibilityBitmap': 'Heartbeat',  // Light node bitmap — Rust enum name
-    'bitmap_commitment': 'Heartbeat',            // Light node bitmap — API string name
-    'bitmapcommitment': 'Heartbeat',             // Light node bitmap — lowercased variant
-    'lightnodeeligibilitybitmap': 'Heartbeat',   // Light node bitmap — fully lowercased
-    'CreateAccount': 'System',
-    'BatchRewardClaims': 'Reward',
-    'BatchNodeActivations': 'Node Activation',
-    'BatchTransfers': 'Transfer',
-    'PingAttestation': 'System',
-    'PingCommitmentWithSampling': 'System',
-  };
-  return map[typeStr] || map[typeStr.toLowerCase()] || 'Transfer';
-}
-
-// Format amount from nanoQNC to QNC (ALWAYS divide by 1e9)
-// v3.52: Full precision, no zero-padding
-function formatAmount(amount: number | string | undefined): string {
-  if (!amount) return '0 QNC';
-  const num = typeof amount === 'string' ? parseFloat(amount) : amount;
-  if (num === 0 || !Number.isFinite(num)) return '0 QNC';
-  const qnc = num / 1e9;
-  
-  const fixed = qnc.toFixed(9);
-  const trimmed = fixed.replace(/\.?0+$/, '');
-  
-  const [intPart, decPart] = trimmed.split('.');
-  const intFormatted = Number(intPart).toLocaleString('en-US');
-  return decPart ? intFormatted + '.' + decPart + ' QNC' : intFormatted + ' QNC';
-}
 
 // Validate and sanitize NODE_RPC_URL to prevent SSRF
 function getNodeRpcUrl(): string {

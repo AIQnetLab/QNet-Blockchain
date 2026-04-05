@@ -41,8 +41,7 @@ export async function POST() {
   } catch (err) {
     return NextResponse.json({
       success: false,
-      error: err instanceof Error ? err.message : 'Unknown error',
-      stack: err instanceof Error ? err.stack : undefined,
+      error: 'Sync service error',
     }, { status: 500 });
   }
 }
@@ -57,7 +56,7 @@ export async function GET() {
   } catch (err) {
     return NextResponse.json({
       success: false,
-      error: err instanceof Error ? err.message : 'Unknown error',
+      error: 'Failed to get sync status',
     }, { status: 500 });
   }
 }

@@ -3,6 +3,10 @@ import { Pool, QueryResult, QueryResultRow } from 'pg';
 // Database connection pool
 let pool: Pool | null = null;
 
+// Cached sync_state height (avoids extra DB query on every /api/activity request)
+let cachedSyncHeight: { value: number; expires: number } | null = null;
+const SYNC_HEIGHT_CACHE_TTL = 5000; // 5 seconds
+
 export function getDbPool(): Pool {
   if (!pool) {
     const databaseUrl = process.env.DATABASE_URL;
@@ -224,15 +228,28 @@ export async function getTransactions(
   const mainParams = [perPage, offset, ...filterValues];
   const countParams = [...filterValues];
 
-  const [transactionsResult, countResult, syncStateResult] = await Promise.all([
+  // Use cached sync height if fresh (saves 1 DB query per request)
+  let currentHeight = 0;
+  const now = Date.now();
+  if (cachedSyncHeight && now < cachedSyncHeight.expires) {
+    currentHeight = cachedSyncHeight.value;
+  }
+
+  const queries: Promise<any>[] = [
     query<TransactionRow>(transactionsQuery, mainParams),
     query<{ total: string }>(countQuery, countParams.length > 0 ? countParams : undefined),
-    query<{ last_height: string | null }>('SELECT last_height FROM sync_state ORDER BY updated_at DESC LIMIT 1')
-  ]);
+  ];
+  if (!currentHeight) {
+    queries.push(query<{ last_height: string | null }>('SELECT last_height FROM sync_state ORDER BY updated_at DESC LIMIT 1'));
+  }
 
-  const transactions = transactionsResult.rows;
-  const total = parseInt(countResult.rows[0]?.total || '0', 10);
-  const currentHeight = parseInt(syncStateResult.rows[0]?.last_height || '0', 10);
+  const results = await Promise.all(queries);
+  const transactions = results[0].rows;
+  const total = parseInt(results[1].rows[0]?.total || '0', 10);
+  if (!currentHeight && results[2]) {
+    currentHeight = parseInt(results[2].rows[0]?.last_height || '0', 10);
+    cachedSyncHeight = { value: currentHeight, expires: now + SYNC_HEIGHT_CACHE_TTL };
+  }
 
   return { transactions, total, currentHeight };
 }

@@ -410,7 +410,7 @@ export async function GET(
     return NextResponse.json({
       success: false,
       verified: false,
-      error: err instanceof Error ? err.message : 'Unknown error',
+      error: 'Failed to generate balance proof',
     }, { status: 500 });
   }
 }

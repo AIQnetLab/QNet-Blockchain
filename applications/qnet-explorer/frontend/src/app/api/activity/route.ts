@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTransactions } from '../../../../lib/db';
 import { rateLimit, getClientIdentifier } from '../../../../lib/rate-limit';
+import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 10; // Cache for 10 seconds
@@ -8,75 +9,6 @@ export const revalidate = 10; // Cache for 10 seconds
 // Rate limiting: 100 requests per minute per IP
 const RATE_LIMIT_MAX = 100;
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-
-// Format amount from nanoQNC to QNC
-// v3.52: Dynamic precision — never lose small amounts
-function formatAmount(amount: number | string): string {
-  const numAmount = Number(amount);
-  if (!numAmount || !Number.isFinite(numAmount)) return '0.00 QNC';
-  const qnc = numAmount / 1e9;
-  
-  if (qnc >= 0.01) {
-    return qnc.toLocaleString('en-US', { 
-      minimumFractionDigits: 2, 
-      maximumFractionDigits: 2 
-    }) + ' QNC';
-  }
-  
-  const full = qnc.toFixed(9).replace(/0+$/, '').replace(/\.$/, '');
-  return full + ' QNC';
-}
-
-// Map transaction type to display string
-// v2.95.3: Unified heartbeat types, removed "Validator" category
-// v3.15: Claims from system_rewards_pool show as Transfer
-function mapTxType(type: string, fromAddress?: string): string {
-  // Claim rewards from pool = Transfer (not Reward)
-  if (fromAddress === 'system_rewards_pool') {
-    return 'Transfer';
-  }
-  
-  const normalized = type.toLowerCase().replace(/_/g, '');
-  
-  const map: Record<string, string> = {
-    // User transactions
-    'transfer': 'Transfer',
-    'batchtransfers': 'Transfer',
-    'swap': 'Swap',
-    
-    // Node lifecycle
-    'nodeactivation': 'Activation',
-    'batchnodeactivations': 'Activation',
-    'noderegistration': 'Registration',
-    'registration': 'Registration',
-    
-    // Rewards
-    'rewarddistribution': 'Reward',
-    'batchrewardclaims': 'Reward',
-    'systemreward': 'Reward',
-    'systemrewards': 'Reward',
-    'systememission': 'Reward',
-    'emission': 'Reward',
-    'reward': 'Reward',
-    
-    // Heartbeat (ALL node activity attestations)
-    'heartbeatcommitment': 'Heartbeat',           // Full/Super nodes
-    'pingcommitmentwithsampling': 'Heartbeat',    // Light nodes (legacy)
-    'lightnodeeligibilitybitmap': 'Heartbeat',    // Light nodes (bitmap) — Rust Serde name
-    'bitmapcommitment': 'Heartbeat',              // Light nodes (bitmap) — API string name
-    'pingattestation': 'Heartbeat',               // Legacy ping
-    
-    // Smart Contracts
-    'contractdeploy': 'Contract',
-    'contractcall': 'Contract',
-    
-    // System
-    'createaccount': 'System',
-    'system': 'System',
-  };
-  
-  return map[normalized] || 'Other';
-}
 
 export async function GET(request: NextRequest) {
   try {
@@ -168,70 +100,23 @@ export async function GET(request: NextRequest) {
     // Get transactions from PostgreSQL
     const { transactions, total, currentHeight } = await getTransactions(page, perPage, sortOrder, typeFilter, displayTypes);
 
-    // Map to response format - return ALL fields
-    // Note: perPage is already validated to max 500, so we use all transactions
+    // Lightweight response for list view — no signatures/keys (saves ~80% bandwidth)
+    // Full data available via /api/tx/[hash] for detail pages
     const responseData = transactions.map((tx) => ({
       hash: tx.hash,
       type: mapTxType(tx.tx_type, tx.from_address),
       from: tx.from_address,
       to: tx.to_address || 'N/A',
       amount: formatAmount(tx.amount),
-      amount_raw: tx.amount,
       block: tx.block,
       timestamp: tx.timestamp,
-      time: '', // Client computes relative time from timestamp
-      nonce: tx.nonce,
-      gas_price: tx.gas_price,
-      gas_limit: tx.gas_limit,
-      signature: tx.signature,
-      public_key: tx.public_key,
-      is_quantum_signed: tx.is_quantum_signed,
-      dilithium_signature: tx.dilithium_signature,
-      dilithium_public_key: tx.dilithium_public_key,
-      tx_type: tx.tx_type,
-      data: tx.data,
+      time: '',
       status: tx.status || 'confirmed',
-      block_height: tx.block,
+      is_quantum_signed: tx.is_quantum_signed,
     }));
 
-    // Limit JSON response size (max 10MB)
-    const jsonString = JSON.stringify({
-      success: true,
-      version: 'v4.0-postgresql',
-      totalStored: total,
-      data: responseData,
-      pagination: {
-        page,
-        perPage,
-        total,
-        hasMore: (page * perPage) < total,
-        currentHeight,
-      },
-    });
-    
-    if (jsonString.length > 10 * 1024 * 1024) {
-      /* log disabled */
-      return NextResponse.json({
-        success: true,
-        version: 'v4.0-postgresql',
-        totalStored: total,
-        data: [],
-        pagination: {
-          page,
-          perPage,
-          total,
-          hasMore: true,
-        },
-        error: 'Response too large, please use pagination',
-      }, {
-        status: 413,
-      });
-    }
-  
   return NextResponse.json({
     success: true,
-      version: 'v4.0-postgresql',
-      totalStored: total,
     data: responseData,
     pagination: {
       page,
@@ -248,10 +133,10 @@ export async function GET(request: NextRequest) {
       }
     });
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+    console.error('[API /activity] Error:', err instanceof Error ? err.message : err);
     return NextResponse.json({
       success: false,
-      error: `Database error: ${errorMessage}`,
+      error: 'Service temporarily unavailable',
       data: [],
       pagination: {
         page: 1,

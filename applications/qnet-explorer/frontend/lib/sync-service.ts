@@ -73,6 +73,8 @@ const INTEGRITY_CHECK_INTERVAL = 600000; // 10 minutes
 const RECOVERY_INTERVAL = 300000; // 5 minutes — periodic scan for missing TXs
 const WS_RECONNECT_DELAY_BASE = 1000; // Initial reconnect delay: 1 second
 const WS_RECONNECT_DELAY_MAX = 60000; // Max reconnect delay: 60 seconds
+const WS_MAX_RECONNECT_ATTEMPTS = 50; // Circuit breaker: stop after 50 failed attempts
+const WS_HEARTBEAT_INTERVAL = 30000; // Ping every 30 seconds to detect dead connections
 
 // ============================================================================
 // WebSocket JSON-RPC for bulk block fetching (NO HTTP overhead!)
@@ -1264,6 +1266,8 @@ async function verifyDataIntegrity(): Promise<void> {
 let wsConnection: WebSocket | null = null;
 let wsReconnectDelay = WS_RECONNECT_DELAY_BASE;
 let wsReconnectTimeout: NodeJS.Timeout | null = null;
+let wsHeartbeatInterval: NodeJS.Timeout | null = null;
+let wsReconnectAttempts = 0;
 let isWsConnected = false;
 
 // v3.53: Retry queue for blocks with TX that failed to process
@@ -1407,7 +1411,16 @@ function connectWebSocket(): void {
     wsConnection.on('open', async () => {
       console.log('[WS] Connected to node (realtime sync enabled)');
       isWsConnected = true;
-      wsReconnectDelay = WS_RECONNECT_DELAY_BASE; // Reset delay on successful connect
+      wsReconnectDelay = WS_RECONNECT_DELAY_BASE;
+      wsReconnectAttempts = 0; // Reset circuit breaker on successful connect
+
+      // Heartbeat: ping every 30s to detect dead connections
+      if (wsHeartbeatInterval) clearInterval(wsHeartbeatInterval);
+      wsHeartbeatInterval = setInterval(() => {
+        if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
+          wsConnection.ping();
+        }
+      }, WS_HEARTBEAT_INTERVAL);
       
       // Only run catchup from WS if initial sync is already done
       // (otherwise initial sync handles it and WS catchup would race/override it)
@@ -1443,7 +1456,8 @@ function connectWebSocket(): void {
       console.log(`[WS] Disconnected (code=${code}, reason=${reason.toString()})`);
       isWsConnected = false;
       wsConnection = null;
-      
+      if (wsHeartbeatInterval) { clearInterval(wsHeartbeatInterval); wsHeartbeatInterval = null; }
+
       // Schedule reconnection with exponential backoff
       scheduleWsReconnect();
     });
@@ -1465,8 +1479,16 @@ function scheduleWsReconnect(): void {
     clearTimeout(wsReconnectTimeout);
   }
 
-  console.log(`[WS] Reconnecting in ${wsReconnectDelay / 1000}s...`);
-  
+  wsReconnectAttempts++;
+
+  // Circuit breaker: after max attempts, fall back to polling permanently
+  if (wsReconnectAttempts > WS_MAX_RECONNECT_ATTEMPTS) {
+    console.error(`[WS] Circuit breaker: ${WS_MAX_RECONNECT_ATTEMPTS} failed attempts, falling back to polling`);
+    return; // Polling fallback will keep running
+  }
+
+  console.log(`[WS] Reconnecting in ${wsReconnectDelay / 1000}s... (attempt ${wsReconnectAttempts}/${WS_MAX_RECONNECT_ATTEMPTS})`);
+
   wsReconnectTimeout = setTimeout(() => {
     connectWebSocket();
   }, wsReconnectDelay);
@@ -1479,6 +1501,10 @@ function disconnectWebSocket(): void {
   if (wsReconnectTimeout) {
     clearTimeout(wsReconnectTimeout);
     wsReconnectTimeout = null;
+  }
+  if (wsHeartbeatInterval) {
+    clearInterval(wsHeartbeatInterval);
+    wsHeartbeatInterval = null;
   }
 
   if (wsConnection) {

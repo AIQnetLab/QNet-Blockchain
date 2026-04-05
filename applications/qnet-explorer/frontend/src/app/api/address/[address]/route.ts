@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTransactionsByAddress } from '../../../../../lib/db';
+import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 
 // ============================================================================
 // PRODUCTION v3.0: PostgreSQL-based address data
@@ -34,59 +35,6 @@ export interface AddressData {
     block: number;
     status: 'confirmed' | 'pending';
   }>;
-}
-
-// Format amount from nanoQNC to QNC
-// v3.52: Full precision, no zero-padding — 1,234.56 not 1,234.56000
-function formatAmount(amount: number | string): string {
-  const numAmount = Number(amount);
-  if (!numAmount || !Number.isFinite(numAmount)) return '0 QNC';
-  const qnc = numAmount / 1e9;
-  
-  // Up to 9 decimals (nanoQNC precision), trim trailing zeros
-  const fixed = qnc.toFixed(9);
-  const trimmed = fixed.replace(/\.?0+$/, '');
-  
-  // Add thousand separators to integer part
-  const [intPart, decPart] = trimmed.split('.');
-  const intFormatted = Number(intPart).toLocaleString('en-US');
-  return decPart ? intFormatted + '.' + decPart + ' QNC' : intFormatted + ' QNC';
-}
-
-// Map transaction type to display string
-// v3.15: Claims from system_rewards_pool show as Transfer
-function mapTxType(type: string, fromAddress?: string): string {
-  if (!type) return 'Transfer';
-  
-  // Claim rewards from pool = Transfer (not Reward)
-  if (fromAddress === 'system_rewards_pool') {
-    return 'Transfer';
-  }
-  
-  const normalized = type.toLowerCase().replace(/_/g, '').replace(/-/g, '');
-  
-  const map: Record<string, string> = {
-    'transfer': 'Transfer',
-    'nodeactivation': 'Node Activation',
-    'noderegistration': 'Registration',
-    'swap': 'Swap',
-    'rewarddistribution': 'Reward',
-    'contractdeploy': 'Smart Contract',
-    'contractcall': 'Smart Contract',
-    'registration': 'Registration',
-    'reward': 'Reward',
-    'heartbeatcommitment': 'Heartbeat',
-    'heartbeat': 'Heartbeat',
-    'lightnodeeligibilitybitmap': 'Heartbeat',
-    'bitmapcommitment': 'Heartbeat',
-    'pingcommitmentwithsampling': 'System',
-    'pingattestation': 'System',
-  };
-  
-  if (map[normalized]) return map[normalized];
-  if (normalized.includes('heartbeat') || normalized.includes('bitmap')) return 'Heartbeat';
-  if (normalized.includes('reward') || normalized.includes('emission')) return 'Reward';
-  return 'Transfer';
 }
 
 // Create system address data
@@ -221,7 +169,7 @@ export async function GET(
   } catch (err) {
     return NextResponse.json({
       success: false,
-      error: err instanceof Error ? err.message : 'Database error',
+      error: 'Failed to load address data',
       data: {
         address,
         balance: '0',
