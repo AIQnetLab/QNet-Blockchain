@@ -104,7 +104,7 @@ jobs:
       with:
         node-version: '18'
         cache: 'npm'
-        cache-dependency-path: applications/qnet-explorer/frontend/package-lock.json
+        cache-dependency-path: applications/qnet-explorer/package-lock.json
     
     - name: Check frontend structure
       run: |
