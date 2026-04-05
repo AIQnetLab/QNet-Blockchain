@@ -3,7 +3,7 @@ import { getTransactions } from '../../../../lib/db';
 import { rateLimit, getClientIdentifier } from '../../../../lib/rate-limit';
 
 export const dynamic = 'force-dynamic';
-export const revalidate = 0;
+export const revalidate = 10; // Cache for 10 seconds
 
 // Rate limiting: 100 requests per minute per IP
 const RATE_LIMIT_MAX = 100;
@@ -145,7 +145,7 @@ export async function GET(request: NextRequest) {
       sortOrder = sortParam as 'asc' | 'desc';
     }
     
-    // Validate type filter
+    // Validate type filter (single type, raw DB name)
     let typeFilter: string | undefined = undefined;
     if (typeParam) {
       if (!/^[a-zA-Z0-9_\s-]+$/.test(typeParam)) {
@@ -157,8 +157,16 @@ export async function GET(request: NextRequest) {
       typeFilter = typeParam;
     }
 
+    // Support multiple display-type filters (e.g. types=Transfer,Reward)
+    const typesParam = searchParams.get('types');
+    let displayTypes: string[] | undefined = undefined;
+    if (typesParam) {
+      displayTypes = typesParam.split(',').filter(t => /^[a-zA-Z]+$/.test(t.trim())).map(t => t.trim());
+      if (displayTypes.length === 0) displayTypes = undefined;
+    }
+
     // Get transactions from PostgreSQL
-    const { transactions, total, currentHeight } = await getTransactions(page, perPage, sortOrder, typeFilter);
+    const { transactions, total, currentHeight } = await getTransactions(page, perPage, sortOrder, typeFilter, displayTypes);
 
     // Map to response format - return ALL fields
     // Note: perPage is already validated to max 500, so we use all transactions

@@ -147,11 +147,24 @@ export async function getTransactionByHash(hash: string): Promise<TransactionRow
   return result.rows[0] || null;
 }
 
+// Map display type names back to raw DB tx_type values
+const DISPLAY_TYPE_TO_DB: Record<string, string[]> = {
+  'Transfer': ['Transfer', 'BatchTransfers'],
+  'Reward': ['RewardDistribution', 'BatchRewardClaims', 'SystemReward', 'SystemRewards', 'SystemEmission', 'Emission', 'Reward'],
+  'Swap': ['Swap'],
+  'Heartbeat': ['HeartbeatCommitment', 'PingCommitmentWithSampling', 'LightNodeEligibilityBitmap', 'BitmapCommitment', 'PingAttestation'],
+  'Registration': ['NodeRegistration', 'Registration'],
+  'Activation': ['NodeActivation', 'BatchNodeActivations'],
+  'Contract': ['ContractDeploy', 'ContractCall'],
+  'System': ['CreateAccount', 'System'],
+};
+
 export async function getTransactions(
   page: number = 1,
   perPage: number = 50,
   sortOrder: 'asc' | 'desc' = 'desc',
-  typeFilter?: string
+  typeFilter?: string,
+  displayTypes?: string[]
 ): Promise<{ transactions: TransactionRow[]; total: number; currentHeight: number }> {
   // Validate and sanitize inputs
   if (!Number.isInteger(page) || page < 1) {
@@ -163,39 +176,57 @@ export async function getTransactions(
   if (sortOrder !== 'asc' && sortOrder !== 'desc') {
     throw new Error('Invalid sortOrder: must be "asc" or "desc"');
   }
-  
+
   const offset = (page - 1) * perPage;
-  let whereClause = '';
-  const params: unknown[] = [perPage, offset];
-  let paramIndex = 3;
+  let whereClauseMain = '';
+  let whereClauseCount = '';
+  const filterValues: unknown[] = [];
 
   if (typeFilter && typeFilter !== 'All') {
-    // Validate typeFilter to prevent SQL injection (even though params protect us)
     if (!/^[a-zA-Z0-9_\s-]+$/.test(typeFilter)) {
       throw new Error('Invalid typeFilter format');
     }
-    whereClause = `WHERE tx_type = $${paramIndex}`;
-    params.push(typeFilter);
-    paramIndex++;
+    filterValues.push(typeFilter);
+    whereClauseMain = `WHERE tx_type = $3`;
+    whereClauseCount = `WHERE tx_type = $1`;
+  } else if (displayTypes && displayTypes.length > 0) {
+    const dbTypes: string[] = [];
+    for (const dt of displayTypes) {
+      const mapped = DISPLAY_TYPE_TO_DB[dt];
+      if (mapped) dbTypes.push(...mapped);
+    }
+    if (dbTypes.length > 0) {
+      filterValues.push(...dbTypes);
+      const mainPlaceholders = dbTypes.map((_, i) => `$${3 + i}`).join(', ');
+      const countPlaceholders = dbTypes.map((_, i) => `$${1 + i}`).join(', ');
+      whereClauseMain = `WHERE tx_type IN (${mainPlaceholders})`;
+      whereClauseCount = `WHERE tx_type IN (${countPlaceholders})`;
+    }
   }
 
   const orderBy = sortOrder === 'desc' ? 'DESC' : 'ASC';
-  
+
   const transactionsQuery = `
-    SELECT * FROM transactions 
-    ${whereClause}
-    ORDER BY block ${orderBy}, timestamp ${orderBy}
+    SELECT hash, tx_type, from_address, to_address, amount, block, timestamp,
+           nonce, gas_price, gas_limit, signature, public_key,
+           is_quantum_signed, dilithium_signature, dilithium_public_key, data, status
+    FROM transactions
+    ${whereClauseMain}
+    ORDER BY block ${orderBy}, timestamp ${orderBy}, tx_type ${orderBy}, hash ${orderBy}
     LIMIT $1 OFFSET $2
   `;
 
   const countQuery = `
-    SELECT COUNT(*) as total FROM transactions 
-    ${whereClause}
+    SELECT COUNT(*) as total FROM transactions
+    ${whereClauseCount}
   `;
 
+  const mainParams = [perPage, offset, ...filterValues];
+  const countParams = [...filterValues];
+
   const [transactionsResult, countResult, syncStateResult] = await Promise.all([
-    query<TransactionRow>(transactionsQuery, params),
-    query<{ total: string }>(countQuery, params.slice(2)),
+    query<TransactionRow>(transactionsQuery, mainParams),
+    query<{ total: string }>(countQuery, countParams.length > 0 ? countParams : undefined),
     query<{ last_height: string | null }>('SELECT last_height FROM sync_state ORDER BY updated_at DESC LIMIT 1')
   ]);
 

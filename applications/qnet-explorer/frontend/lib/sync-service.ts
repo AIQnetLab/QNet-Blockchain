@@ -253,8 +253,11 @@ function transformTransaction(
     return null;
   }
 
-  // Always use blockTimestamp (authoritative, set by producer node) — never trust client timestamp
-  let rawTs = blockTimestamp || 0;
+  // v3.53: Use TX-level timestamp first (most accurate), block timestamp as fallback
+  // API returns timestamp on both block and individual TX objects
+  const txTs = Number(tx.timestamp) || 0;
+  const fallbackTs = blockTimestamp || 0;
+  let rawTs = (txTs > 0 ? txTs : fallbackTs);
   if (!Number.isFinite(rawTs) || rawTs < 0) {
     warn('[Sync] Invalid timestamp, fallback to 0:', rawTs);
     rawTs = 0;

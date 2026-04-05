@@ -64,17 +64,17 @@ function formatTimeAgo(timestamp: number, blockHeight?: number): string {
   // Genesis block or genesis transactions (block 0)
   if (blockHeight === 0) return 'Genesis';
   if (!timestamp || timestamp === 0) return 'Genesis';
-  
+
   const now = Date.now();
   // Handle both seconds and milliseconds timestamps
   const ts = timestamp > 1e12 ? timestamp : timestamp * 1000;
-  
+
   // If timestamp is before year 2024 (chain launch), treat as Genesis
   // 1704067200000 = 2024-01-01T00:00:00Z
   if (ts < 1704067200000) return 'Genesis';
-  
+
   const diff = now - ts;
-  
+
   if (diff < 0) return 'just now';
   if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
@@ -156,43 +156,21 @@ export default function ExplorerPage() {
     }
   }, []);
 
-  // Filter and sort locally
+  // Data comes pre-filtered and sorted from API — just convert to array
   const filteredAndSortedActivity = useMemo(() => {
-    let items = Array.from(transactionMap.values());
-    
-    // Filter by types (multiple selection)
-    if (typeFilters.length > 0) {
-      items = items.filter(tx => typeFilters.includes(tx.type));
-    }
-    
-    // PRIMARY SORT: By BLOCK HEIGHT (newest blocks first when desc)
-    // SECONDARY SORT: By timestamp within same block
-    const sorted = [...items].sort((a, b) => {
-      // Primary sort by block height
-      const blockA = typeof a.block === 'number' ? a.block : Number(a.block) || 0;
-      const blockB = typeof b.block === 'number' ? b.block : Number(b.block) || 0;
-      
-      if (blockA !== blockB) {
-        return sortOrder === 'desc' ? (blockB - blockA) : (blockA - blockB);
-      }
-      
-      // Secondary sort by timestamp within same block
-      let tsA = typeof a.timestamp === 'number' ? a.timestamp : Number(a.timestamp) || 0;
-      let tsB = typeof b.timestamp === 'number' ? b.timestamp : Number(b.timestamp) || 0;
-      
-      return sortOrder === 'desc' ? (tsB - tsA) : (tsA - tsB);
-    });
-    
-    return sorted;
-  }, [transactionMap, sortOrder, typeFilters]);
+    return Array.from(transactionMap.values());
+  }, [transactionMap]);
 
   // Fetch activity for specific page
   const fetchActivity = useCallback(async (pageNum: number, forceRefresh: boolean = false) => {
     try {
       setLoading(true);
-      
+
       const refreshParam = forceRefresh ? '&refresh=1' : '';
-      const res = await fetch(`/api/activity?page=${pageNum}&limit=${ITEMS_PER_PAGE}&sort=desc${refreshParam}`, {
+      const typeParam = typeFilters.length > 0 && typeFilters.length < TX_TYPES.length
+        ? `&types=${encodeURIComponent(typeFilters.join(','))}`
+        : '';
+      const res = await fetch(`/api/activity?page=${pageNum}&limit=${ITEMS_PER_PAGE}&sort=${sortOrder}${typeParam}${refreshParam}`, {
         cache: 'no-store'
       });
       const data = await res.json();
@@ -238,7 +216,7 @@ export default function ExplorerPage() {
       setLoading(false);
       setHasFetched(true);
     }
-  }, []);
+  }, [typeFilters, sortOrder]);
 
   // Initial fetch after mount
   useEffect(() => {
@@ -248,17 +226,17 @@ export default function ExplorerPage() {
     }
   }, [mounted, fetchActivity]);
 
-  // Fetch when page changes
+  // Fetch when page, filters, or sort changes
   useEffect(() => {
     if (mounted && initialLoadDone.current) {
       fetchActivity(page);
     }
-  }, [page, mounted, fetchActivity]);
+  }, [page, typeFilters, sortOrder, mounted, fetchActivity]);
 
-  // Background refresh transactions every 30 seconds (only if on page 1)
+  // Background refresh transactions every 5 seconds (only if on page 1)
   useEffect(() => {
     if (!mounted || page !== 1) return;
-    const interval = setInterval(() => fetchActivity(1), 5000); // Update every 5 seconds
+    const interval = setInterval(() => fetchActivity(1), 5000);
     return () => clearInterval(interval);
   }, [mounted, page, fetchActivity]);
 
@@ -274,7 +252,7 @@ export default function ExplorerPage() {
         }
       } catch {}
     };
-    const interval = setInterval(fetchHeight, 5000); // Update every 5 seconds
+    const interval = setInterval(fetchHeight, 5000);
     return () => clearInterval(interval);
   }, [mounted]);
 
@@ -310,9 +288,10 @@ export default function ExplorerPage() {
     return pages;
   };
 
-  // Toggle sort by clicking TIME header
+  // Toggle sort — triggers server-side re-fetch via useEffect
   const toggleSort = () => {
     setSortOrder(prev => prev === 'desc' ? 'asc' : 'desc');
+    setPage(1);
   };
 
   const handleSearch = () => {
@@ -367,11 +346,12 @@ export default function ExplorerPage() {
                     key={type}
                     className={`filter-chip ${typeFilters.includes(type) ? 'active' : ''}`}
                     onClick={() => {
-                      setTypeFilters(prev => 
-                        prev.includes(type) 
+                      setTypeFilters(prev =>
+                        prev.includes(type)
                           ? prev.filter(t => t !== type)
                           : [...prev, type]
                       );
+                      setPage(1);
                     }}
                   >
                     {type}
@@ -380,7 +360,7 @@ export default function ExplorerPage() {
               </div>
             </div>
             <span className="tx-count">
-              {filteredAndSortedActivity.length} transactions
+              {totalCount} transactions
             </span>
           </div>
         </div>
