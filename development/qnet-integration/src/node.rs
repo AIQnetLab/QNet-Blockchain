@@ -13,6 +13,7 @@ pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 
 // PRODUCTION CONSTANTS - No hardcoded magic numbers!
 const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
+const FORK_CHECK_INTERVAL: u64 = 5; // v10.0: Lightweight fork detection every 5 blocks (6× faster than rotation-only)
 #[allow(dead_code)]
 const MIN_BYZANTINE_NODES: usize = 4; // 3f+1 where f=1
 const FAST_SYNC_THRESHOLD: u64 = 10; // Trigger fast sync if behind by 10+ blocks (lowered from 50 for faster detection)  
@@ -480,6 +481,13 @@ pub static LAST_FINALIZED_CONSENSUS_ROUND: AtomicU64 = AtomicU64::new(0);
 // This provides the same guarantee as Casper FFG checkpoints.
 pub static LAST_FINALIZED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
+// v10.0: ENTROPY MISMATCH GUARD — prevents finalizing diverged chains.
+// When entropy mismatch is detected, finality advancement is paused to keep
+// rollback possible. Without this, finalized diverged chains create permanent deadlock.
+// Reset when entropy consensus succeeds (bft_ok) at next rotation boundary.
+pub static ENTROPY_MISMATCH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static ENTROPY_MISMATCH_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
 /// v9.0 BUG-30: Check if rollback to target_height is allowed by finality rules.
 /// LAST_FINALIZED_HEIGHT stores mb_index * 90 = the highest finalized microblock height.
 /// All 8 code paths that set this value use the same mb_index*90 format.
@@ -494,6 +502,31 @@ pub fn check_finality_allows_rollback(target_height: u64) -> Result<(), String> 
     } else {
         Ok(())
     }
+}
+
+/// v10.0: UNIFIED ROLLBACK CLEANUP — single function for ALL rollback paths.
+/// Prevents the bug where a new rollback path forgets to clear entropy/vote caches.
+/// Called after blocks are deleted and height is updated.
+pub fn complete_rollback_cleanup(target_height: u64) {
+    crate::unified_p2p::clear_all_pending_sync();
+    crate::unified_p2p::clear_all_pending_sync_macroblocks();
+    clear_expected_producer_cache_above(target_height);
+    ENTROPY_RESPONSES.retain(|k, _| k.0 < target_height);
+    PRODUCER_VOTES.retain(|k, _| k.0 < target_height);
+    FORK_CHECK_RESPONSES.retain(|k, _| k.0 < target_height);
+}
+
+/// v10.0: UNIFIED FINALITY ADVANCEMENT — single function for ALL finality paths.
+/// Checks entropy mismatch guard before advancing LAST_FINALIZED_HEIGHT.
+/// Returns true if finality was advanced, false if blocked by entropy mismatch.
+pub fn try_advance_finality(round: u64, context: &str) -> bool {
+    if ENTROPY_MISMATCH_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        println!("[WARN][{}] skip_finality_entropy_mismatch round={}", context, round);
+        return false;
+    }
+    LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
+    LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
+    true
 }
 
 /// v9.0 BUG-12: Atomic height update helper.
@@ -710,6 +743,13 @@ lazy_static::lazy_static! {
     /// Value: voted_producer_id
     /// Used for Byzantine 66% consensus on producer selection
     pub static ref PRODUCER_VOTES: DashMap<(u64, String), String> = DashMap::new();
+
+    /// v10.0: Lightweight fork check responses — early warning system.
+    /// Key: (block_height, responder_node_id)
+    /// Value: block_hash at that height from that peer
+    /// Checked every FORK_CHECK_INTERVAL (5) blocks for fast fork detection.
+    /// Compared against local block hash — mismatch triggers immediate recovery.
+    pub static ref FORK_CHECK_RESPONSES: DashMap<(u64, String), [u8; 32]> = DashMap::new();
 }
 
 /// v9.0: Equivocation evidence queue for timeout vote double-voting.
@@ -747,7 +787,10 @@ pub fn cleanup_global_hashmaps(current_height: u64) {
     let votes_before = PRODUCER_VOTES.len();
     PRODUCER_VOTES.retain(|k, _| k.0 >= min_valid_height);
     let votes_removed = votes_before.saturating_sub(PRODUCER_VOTES.len());
-    
+
+    // v10.0: Cleanup FORK_CHECK_RESPONSES - remove entries for old heights
+    FORK_CHECK_RESPONSES.retain(|k, _| k.0 >= min_valid_height);
+
     // Cleanup REQUESTED_CERTIFICATES - keep only recent (last 5 minutes)
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7189,10 +7232,8 @@ impl BlockchainNode {
                             let network_macroblock_index = network_height / 90;
                             
                             // v3.31: Clear pending sync queues after rollback
-                            crate::unified_p2p::clear_all_pending_sync();
-                            crate::unified_p2p::clear_all_pending_sync_macroblocks();
-                            clear_expected_producer_cache_above(network_height);
-                            
+                            complete_rollback_cleanup(network_height);
+
                             if is_info() { println!("[INFO][ROLLBACK] complete new_height={}", network_height); }
                             if is_info() { println!("[INFO][SYNC] req_fresh_blocks"); }
                             
@@ -8293,11 +8334,9 @@ impl BlockchainNode {
                                                             crate::storage::end_rollback_protection();
                                                             
                                                             // v3.31: Clear pending sync queues after rollback
-                                                            crate::unified_p2p::clear_all_pending_sync();
-                                                            crate::unified_p2p::clear_all_pending_sync_macroblocks();
-                                                            clear_expected_producer_cache_above(rollback_to);
+                                                            complete_rollback_cleanup(rollback_to);
                                                         }
-                                                        
+
                                                         // Sync missing blocks
                                                         let sync_to = std::cmp::min(network_height, fork_height.saturating_add(100));
                                                         if is_debug() { println!("[DBG][REORG] request from={} to={}", fork_height, sync_to); }
@@ -8398,10 +8437,8 @@ impl BlockchainNode {
                                                             crate::storage::end_rollback_protection();
                                                             
                                                             // v3.31: Clear pending sync queues after rollback
-                                                            crate::unified_p2p::clear_all_pending_sync();
-                                                            crate::unified_p2p::clear_all_pending_sync_macroblocks();
-                                                            clear_expected_producer_cache_above(rollback_to);
-                                                            
+                                                            complete_rollback_cleanup(rollback_to);
+
                                                             // Request blocks from network
                                                             // sync_blocks() selects best_peer (highest combined reputation)
                                                             // Blocks will be validated when received
@@ -9161,9 +9198,9 @@ impl BlockchainNode {
                                         .all(|h| storage.load_microblock(h).unwrap_or(None).is_some());
 
                                     if all_microblocks_present {
-                                        LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
-                                        LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
-                                        if is_debug() { println!("[DBG][MB-P2P] finalized_round={} mb={} finality_h={}", round, mb_height, round); }
+                                        if try_advance_finality(round, "MB-P2P") {
+                                            if is_debug() { println!("[DBG][MB-P2P] finalized_round={} mb={} finality_h={}", round, mb_height, round); }
+                                        }
                                     } else {
                                         println!("[WARN][MB-P2P] skip_finality_update mb={} round={} — microblocks incomplete, finality stays at {}",
                                                  mb_height, round, prev_round);
@@ -9886,8 +9923,8 @@ impl BlockchainNode {
                                                     rb_target, std::sync::atomic::Ordering::Release);
                                                 crate::storage::end_rollback_protection();
                                                 mismatch_counter.clear();
-                                                crate::unified_p2p::clear_all_pending_sync();
-                                                crate::unified_p2p::clear_all_pending_sync_macroblocks();
+                                                complete_rollback_cleanup(rb_target);
+
                                                 println!("[INFO][STATE] escalation_rollback_complete new_h={}", rb_target);
                                             }
                                         }
@@ -10547,23 +10584,41 @@ impl BlockchainNode {
                         return Ok(());
                     } else {
                         // REAL FORK: Same height but different content!
-                        if is_warn() { 
-                            println!("[WARN][SEC] fork_detected h={} existing_merkle={:x} new_merkle={:x}", 
+                        if is_warn() {
+                            println!("[WARN][SEC] fork_detected h={} existing_merkle={:x} new_merkle={:x}",
                                      microblock.height,
-                                     u64::from_le_bytes([existing_block.merkle_root[0], existing_block.merkle_root[1], 
+                                     u64::from_le_bytes([existing_block.merkle_root[0], existing_block.merkle_root[1],
                                                         existing_block.merkle_root[2], existing_block.merkle_root[3],
                                                         existing_block.merkle_root[4], existing_block.merkle_root[5],
                                                         existing_block.merkle_root[6], existing_block.merkle_root[7]]),
                                      u64::from_le_bytes([microblock.merkle_root[0], microblock.merkle_root[1],
                                                         microblock.merkle_root[2], microblock.merkle_root[3],
                                                         microblock.merkle_root[4], microblock.merkle_root[5],
-                                                        microblock.merkle_root[6], microblock.merkle_root[7]])); 
+                                                        microblock.merkle_root[6], microblock.merkle_root[7]]));
                         }
-                        return Err(format!(
-                            "FORK_DETECTED:{}:{}",
-                            microblock.height,
-                            microblock.producer
-                        ));
+                        // v10.0: DETERMINISTIC FORK CHOICE — all nodes pick the same block.
+                        // Without this, nodes that receive blocks in different order keep
+                        // different versions → silent fork → entropy divergence → deadlock.
+                        // Rule: lowest merkle_root wins (deterministic, no coordination needed).
+                        if microblock.merkle_root < existing_block.merkle_root {
+                            // New block wins — replace existing. Will be saved below.
+                            println!("[INFO][SEC] fork_choice h={} winner=new — replacing existing block (lower merkle)",
+                                     microblock.height);
+                            // Invalidate caches for this height since block changes
+                            ENTROPY_RESPONSES.retain(|k, _| k.0 < microblock.height);
+                            PRODUCER_VOTES.retain(|k, _| k.0 < microblock.height);
+                            FORK_CHECK_RESPONSES.retain(|k, _| k.0 < microblock.height);
+                            // Fall through to save the new block
+                        } else {
+                            // Existing block wins — keep it, still signal fork for awareness
+                            println!("[INFO][SEC] fork_choice h={} winner=existing — keeping current block (lower merkle)",
+                                     microblock.height);
+                            return Err(format!(
+                                "FORK_DETECTED:{}:{}",
+                                microblock.height,
+                                microblock.producer
+                            ));
+                        }
                     }
                 }
                 Ok(None) => {
@@ -14285,12 +14340,8 @@ impl BlockchainNode {
                                         // v3.31: Clear ALL stale state after rollback
                                         // Without this, stale entries block re-queueing of blocks
                                         // causing dup_pending on ALL sync responses → sync deadlock
-                                        crate::unified_p2p::clear_all_pending_sync();
-                                        // v3.36: Also clear macroblock pending — without this,
-                                        // deleted macroblocks stay "pending" and responses are
-                                        // discarded by mark_macroblock_pending_sync → recovery fails
-                                        crate::unified_p2p::clear_all_pending_sync_macroblocks();
-                                        clear_expected_producer_cache_above(rollback_to);
+                                        complete_rollback_cleanup(rollback_to);
+
                                         FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                         FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
                                         SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
@@ -15133,6 +15184,83 @@ impl BlockchainNode {
                     }
                 }
                 
+                // ═══════════════════════════════════════════════════════════════
+                // v10.0: LIGHTWEIGHT FORK CHECK — every 5 blocks (early warning)
+                // NOT a full BFT consensus — just compare block hashes with peers.
+                // If mismatch detected → trigger immediate fork recovery.
+                // Detection: ≤5 seconds instead of ≤30 seconds (6× faster).
+                // Overhead: ~100 bytes × 3-5 peers = ~500 bytes per check (negligible).
+                // ═══════════════════════════════════════════════════════════════
+                let is_rotation_boundary_check = next_block_height > 1 && (next_block_height - 1) % ROTATION_INTERVAL_BLOCKS == 0;
+                let is_fork_check = next_block_height > FINALITY_WINDOW
+                    && next_block_height % FORK_CHECK_INTERVAL == 0
+                    && !is_rotation_boundary_check; // Skip when rotation does full entropy check
+
+                if is_fork_check {
+                    if let Some(p2p) = &unified_p2p {
+                        // Check a finalized block (FINALITY_WINDOW deep) — all synced nodes have it
+                        let check_height = next_block_height - FINALITY_WINDOW;
+                        let our_hash = Self::get_previous_microblock_hash(&storage, check_height + 1).await;
+
+                        if our_hash != [0u8; 32] {
+                            // Send check to 3 random peers (fire-and-forget, no blocking)
+                            let peers = p2p.get_validated_active_peers();
+                            let check_msg = crate::unified_p2p::NetworkMessage::ForkCheckRequest {
+                                block_height: check_height,
+                                block_hash: our_hash,
+                                requester_id: node_id.clone(),
+                            };
+                            for peer in peers.iter().take(3) {
+                                p2p.send_network_message(&peer.addr, check_msg.clone());
+                            }
+
+                            // Check responses from PREVIOUS fork check (5 blocks ago)
+                            let prev_check_height = check_height.saturating_sub(FORK_CHECK_INTERVAL);
+                            let prev_our_hash = Self::get_previous_microblock_hash(&storage, prev_check_height + 1).await;
+                            if prev_our_hash != [0u8; 32] {
+                                let mut fc_matches = 0u32;
+                                let mut fc_mismatches = 0u32;
+                                for entry in FORK_CHECK_RESPONSES.iter() {
+                                    if entry.key().0 == prev_check_height {
+                                        if *entry.value() == prev_our_hash {
+                                            fc_matches += 1;
+                                        } else {
+                                            fc_mismatches += 1;
+                                        }
+                                    }
+                                }
+                                // If we got responses AND majority disagrees → early fork signal
+                                if fc_mismatches > 0 && fc_mismatches >= fc_matches && (fc_matches + fc_mismatches) >= 2 {
+                                    println!("[ERR][FORK-CHECK] early_fork_detected h={} matches={} mismatches={} — triggering recovery",
+                                             prev_check_height, fc_matches, fc_mismatches);
+                                    ENTROPY_MISMATCH_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    ENTROPY_MISMATCH_HEIGHT.store(prev_check_height, std::sync::atomic::Ordering::SeqCst);
+
+                                    // Trigger immediate fork recovery (same as entropy fork recovery)
+                                    if try_fork_recovery() {
+                                        let rollback_to = prev_check_height.saturating_sub(90);
+                                        complete_rollback_cleanup(rollback_to);
+                                        if let Some(ref p2p_inner) = unified_p2p {
+                                            let p2p_clone = p2p_inner.clone();
+                                            let mb_from = rollback_to / 90;
+                                            let mb_from = if mb_from == 0 { 1 } else { mb_from };
+                                            let mb_to = next_block_height / 90 + 1;
+                                            tokio::spawn(async move {
+                                                let _ = p2p_clone.sync_macroblocks(mb_from, mb_to).await;
+                                            });
+                                        }
+                                        println!("[INFO][FORK-CHECK] recovery_triggered rollback_to={}", rollback_to);
+                                    }
+                                } else if fc_matches > 0 && fc_mismatches == 0 && is_debug() {
+                                    println!("[DBG][FORK-CHECK] ok h={} matches={}", prev_check_height, fc_matches);
+                                }
+                            }
+                            // Cleanup old fork check responses
+                            FORK_CHECK_RESPONSES.retain(|k, _| k.0 >= check_height.saturating_sub(FORK_CHECK_INTERVAL));
+                        }
+                    }
+                }
+
                 // CRITICAL: Verify entropy consensus at rotation boundaries
                 // This prevents different nodes selecting different producers
                 // Rotation happens when creating blocks 31, 61, 91... (first block of new round)
@@ -15142,7 +15270,7 @@ impl BlockchainNode {
                 // Without this check, a producer elected by a minority (due to missing VRF claims)
                 // starts producing immediately while the majority elected someone else → fork.
                 // Cost: ~2-3s added to first block of each rotation (every 30 blocks).
-                if next_block_height > 1 && (next_block_height - 1) % ROTATION_INTERVAL_BLOCKS == 0 {
+                if is_rotation_boundary_check {
                     let entropy_role = if is_my_turn_to_produce { "producer" } else { "validator" };
                     if is_info() {
                         println!("[INFO][CONS] rotation_boundary h={} role={} entropy_check", next_block_height, entropy_role);
@@ -15384,6 +15512,11 @@ impl BlockchainNode {
                                 if matches >= byzantine_threshold {
                                     let elapsed_ms = consensus_start.elapsed().as_millis();
                                     if is_info() { println!("[INFO][CONS] bft_ok match={} ms={}", matches, elapsed_ms); }
+                                    // v10.0: Clear entropy mismatch guard — consensus succeeded
+                                    if ENTROPY_MISMATCH_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                                        ENTROPY_MISMATCH_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        println!("[INFO][CONS] entropy_mismatch_cleared h={}", next_block_height);
+                                    }
                                     consensus_reached = true;
                                     break;
                                 }
@@ -15507,6 +15640,11 @@ impl BlockchainNode {
                                     println!("[ERR][CONS] fork_detected mismatches={} matches=0 total={}",
                                              mismatches, total_responses);
 
+                                    // v10.0: Block finality advancement while entropy diverges
+                                    // This prevents finalizing diverged chains → permanent deadlock
+                                    ENTROPY_MISMATCH_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    ENTROPY_MISMATCH_HEIGHT.store(next_block_height, std::sync::atomic::Ordering::SeqCst);
+
                                     if is_my_turn_to_produce {
                                         // v3.33: Producer yields this rotation only — BFT Timeout handles failover.
                                         println!("[INFO][CONS] producer_yield_fork h={} mismatches={}",
@@ -15537,6 +15675,8 @@ impl BlockchainNode {
                                             println!("[INFO][CONS] fork_recovery h={} rollback_to={} mb={}-{} exclude_until={}",
                                                      next_block_height, rollback_to, mb_from, mb_to, exclude_until);
 
+                                            complete_rollback_cleanup(rollback_to);
+
                                             if let Some(ref p2p) = unified_p2p {
                                                 let p2p_clone = p2p.clone();
                                                 let clear_from = rollback_to;
@@ -15566,6 +15706,10 @@ impl BlockchainNode {
                                     println!("[ERR][CONS] fork_detected mismatches={} matches={} majority=disagree",
                                              mismatches, matches);
 
+                                    // v10.0: Block finality advancement while entropy diverges
+                                    ENTROPY_MISMATCH_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    ENTROPY_MISMATCH_HEIGHT.store(next_block_height, std::sync::atomic::Ordering::SeqCst);
+
                                     if is_my_turn_to_produce {
                                         // v3.33: Producer yields — majority disagrees with our entropy,
                                         // meaning majority selected a different producer. We're in the minority.
@@ -15588,6 +15732,8 @@ impl BlockchainNode {
                                             let mb_to = next_block_height / 90 + 1;
                                             println!("[INFO][CONS] majority_fork_recovery h={} rollback_to={} mb={}-{}",
                                                      next_block_height, rollback_to, mb_from, mb_to);
+
+                                            complete_rollback_cleanup(rollback_to);
 
                                             if let Some(ref p2p) = unified_p2p {
                                                 let p2p_clone = p2p.clone();
@@ -21208,8 +21354,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                     .all(|h| storage_cons.load_microblock(h).unwrap_or(None).is_some());
 
                                                 if all_present {
-                                                    LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
-                                                    LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
+                                                    try_advance_finality(round, "ASYNC-CONS");
                                                 } else {
                                                     println!("[WARN][ASYNC-CONS] skip_finality_update mb={} round={} — microblocks incomplete", mb_idx, round);
                                                 }
@@ -22104,8 +22249,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let pfp_all_present = (pfp_mb_start..=pfp_mb_end)
             .all(|h| storage.load_microblock(h).unwrap_or(None).is_some());
         if pfp_all_present {
-            LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
-            LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
+            try_advance_finality(round, "PFP");
         } else {
             println!("[WARN][PFP] skip_finality_update mb={} round={} — microblocks incomplete", macroblock_index, round);
         }
@@ -24896,8 +25040,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 let cons_all_present = (cons_mb_start..=cons_mb_end)
                     .all(|h| storage.load_microblock(h).unwrap_or(None).is_some());
                 if cons_all_present {
-                    LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
-                    LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
+                    try_advance_finality(round, "MB");
                 } else {
                     println!("[WARN][MB] skip_finality_update mb={} round={} — microblocks incomplete", cons_mb_height, round);
                 }
@@ -27162,9 +27305,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
             if round > prev_round {
                 if missing_microblocks.is_empty() {
-                    LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
-                    LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
-                    println!("[INFO][MB-SYNC] finalized_round_updated mb={} round={} finality_h={}", index, round, round);
+                    if try_advance_finality(round, "MB-SYNC") {
+                        println!("[INFO][MB-SYNC] finalized_round_updated mb={} round={} finality_h={}", index, round, round);
+                    }
                 } else {
                     println!("[WARN][MB-SYNC] skip_finality_update mb={} round={} missing_microblocks={} — finality stays at {}",
                              index, round, missing_microblocks.len(), prev_round);

@@ -11122,6 +11122,24 @@ pub enum NetworkMessage {
         responder_id: String,
     },
     
+    /// v10.0: Lightweight fork check — sent every FORK_CHECK_INTERVAL (5) blocks.
+    /// NOT a full BFT consensus — just an early warning. ~100 bytes per message.
+    /// If mismatch detected, triggers full fork recovery immediately instead of
+    /// waiting up to 30 blocks for rotation boundary entropy check.
+    ForkCheckRequest {
+        block_height: u64,
+        block_hash: [u8; 32],
+        requester_id: String,
+    },
+
+    /// v10.0: Response to fork check — peer reports their block hash at requested height.
+    ForkCheckResponse {
+        block_height: u64,
+        block_hash: [u8; 32],
+        responder_id: String,
+        has_block: bool,
+    },
+
     /// v3.16: Producer vote for Byzantine 66% consensus
     /// Sent at rotation boundaries to agree on producer selection
     ProducerVote {
@@ -12375,6 +12393,48 @@ impl SimplifiedP2P {
                 }
             }
             
+            // v10.0: Lightweight fork check — respond with our block hash
+            NetworkMessage::ForkCheckRequest { block_height, block_hash: _, requester_id } => {
+                self.update_peer_last_seen(from_peer);
+                // Only respond if we have the block
+                if let Some(storage) = crate::node::try_get_storage() {
+                    match storage.load_microblock(block_height) {
+                        Ok(Some(block_data)) => {
+                            use sha3::{Sha3_256, Digest};
+                            let mut hasher = Sha3_256::new();
+                            hasher.update(&block_data);
+                            let result = hasher.finalize();
+                            let mut hash = [0u8; 32];
+                            hash.copy_from_slice(&result);
+                            let response = NetworkMessage::ForkCheckResponse {
+                                block_height,
+                                block_hash: hash,
+                                responder_id: self.node_id.clone(),
+                                has_block: true,
+                            };
+                            if let Some(requester_addr) = self.get_peer_address(&requester_id) {
+                                self.send_network_message(&requester_addr, response);
+                            }
+                        },
+                        _ => {
+                            // Don't respond if we don't have the block
+                        }
+                    }
+                }
+            }
+
+            // v10.0: Fork check response — store in FORK_CHECK_RESPONSES for comparison
+            NetworkMessage::ForkCheckResponse { block_height, block_hash, responder_id, has_block } => {
+                if has_block {
+                    let sender_verified = self.get_peer_address(&responder_id)
+                        .map(|addr| addr == from_peer)
+                        .unwrap_or(false);
+                    if sender_verified {
+                        crate::node::FORK_CHECK_RESPONSES.insert((block_height, responder_id), block_hash);
+                    }
+                }
+            }
+
             // v3.16: Producer vote for Byzantine 66% consensus on producer selection
             NetworkMessage::ProducerVote { block_height, voted_producer, voter_id, timeout_round: _ } => {
                 // Store vote in PRODUCER_VOTES for consensus verification
