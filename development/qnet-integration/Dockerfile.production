@@ -1,18 +1,25 @@
-# PRODUCTION QNet Node Dockerfile - Latest Rust and dependencies
-FROM rust:1.93-slim AS builder
+# PRODUCTION QNet Node Dockerfile - Ubuntu 22.04 (glibc 2.35)
+FROM ubuntu:22.04 AS builder
 
 LABEL maintainer="QNet Development Team"
 LABEL description="Production QNet Blockchain Node"
 LABEL version="2.0.0"
 
-# Install minimal system dependencies  
+# Prevent interactive prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies + Rust
 RUN apt-get update && apt-get install -y \
+    curl \
     pkg-config \
     libssl-dev \
     libclang-dev \
     zlib1g-dev \
     build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0
+
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Set working directory
 WORKDIR /build
@@ -32,8 +39,10 @@ RUN cargo build --profile release-fast --bin qnet-node \
     && strip target/release-fast/qnet-node \
     && cp target/release-fast/qnet-node /usr/local/bin/
 
-# Production runtime image
-FROM debian:bookworm-slim
+# Production runtime image — same Ubuntu 22.04 for glibc compatibility
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Install minimal runtime dependencies including gosu for user switching
 RUN apt-get update && apt-get install -y \
