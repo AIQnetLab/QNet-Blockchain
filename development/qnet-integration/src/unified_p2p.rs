@@ -301,28 +301,46 @@ pub fn mark_block_pending_sync(height: u64) -> bool {
         cleanup_pending_sync_blocks();
     }
     
-    // Hard limit: emergency cleanup
+    // Hard limit: emergency cleanup with PRIORITY EVICTION
     if PENDING_SYNC_BLOCKS.len() >= MAX_PENDING_SYNC_BLOCKS {
         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
         let mut entries_to_remove: Vec<u64> = Vec::new();
-        
-        // Remove entries below local height (already processed)
+
+        // Phase 1: Remove entries below local height (already processed)
         for entry in PENDING_SYNC_BLOCKS.iter() {
             if *entry.key() < local_height.saturating_sub(5) {
                 entries_to_remove.push(*entry.key());
             }
-            if entries_to_remove.len() >= 100 {
-                break;
+        }
+
+        for h in &entries_to_remove {
+            PENDING_SYNC_BLOCKS.remove(h);
+        }
+
+        // Phase 2: If still full, EVICT FARTHEST blocks from local_height.
+        // Near-height blocks are needed next; far blocks can be re-requested later.
+        // This prevents the deadlock where far blocks occupy all slots and
+        // near blocks (that the node needs to advance) get rejected.
+        if PENDING_SYNC_BLOCKS.len() >= MAX_PENDING_SYNC_BLOCKS {
+            let mut all_heights: Vec<u64> = PENDING_SYNC_BLOCKS.iter()
+                .map(|entry| *entry.key())
+                .collect();
+            // Sort by distance from local_height (farthest first)
+            all_heights.sort_by_key(|h| std::cmp::Reverse(h.abs_diff(local_height)));
+            // Evict top 50% (farthest blocks)
+            let evict_count = all_heights.len() / 2;
+            for h in all_heights.iter().take(evict_count) {
+                PENDING_SYNC_BLOCKS.remove(h);
+            }
+            if crate::node::is_info() {
+                println!("[INFO][SYNC] priority_eviction local_h={} evicted={} remaining={}",
+                         local_height, evict_count, PENDING_SYNC_BLOCKS.len());
             }
         }
-        
-        for h in entries_to_remove {
-            PENDING_SYNC_BLOCKS.remove(&h);
-        }
-        
+
         if PENDING_SYNC_BLOCKS.len() >= MAX_PENDING_SYNC_BLOCKS {
             if crate::node::is_warn() {
-                println!("[WARN][SYNC] queue_full_after_cleanup size={} rejecting={}", 
+                println!("[WARN][SYNC] queue_full_after_cleanup size={} rejecting={}",
                          PENDING_SYNC_BLOCKS.len(), height);
             }
             return false;
@@ -10468,11 +10486,19 @@ impl SimplifiedP2P {
         let parallel_workers: usize = workers;
         let chunk_size_blocks: u64 = chunk_size;
         
-        // v10.1: Download ALL missing blocks in one call.
-        // Wave-based limiting (old WAVE_SIZE=100) was causing our fast sync loop
-        // to need many iterations. Semaphore already limits concurrency.
-        // The caller (fast sync loop) handles re-invocation if network advances.
-        let actual_target = target_height;
+        // v10.3: Download only NEAREST missing blocks, not all at once.
+        // Downloading ALL ranges simultaneously floods PENDING_SYNC_BLOCKS (max 1000)
+        // with far-away blocks, causing backpressure that rejects near-height blocks
+        // the node actually needs next. This creates a sync deadlock where the node
+        // advances ~100 blocks per 60s TTL cycle instead of continuously.
+        //
+        // Solution: limit to nearest 500 blocks. The caller (fast sync loop) re-invokes
+        // as local_height advances, naturally sliding the window forward.
+        const MAX_SYNC_WINDOW: u64 = 500;
+        let actual_target = std::cmp::min(target_height, current_height + MAX_SYNC_WINDOW);
+
+        // Filter missing_blocks to only include blocks within the window
+        missing_blocks.retain(|h| *h <= actual_target);
         
         if crate::node::is_info() {
             println!("[SYNC] ⚡ Starting parallel sync: {} blocks (target: {}) with {} workers", 

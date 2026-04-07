@@ -7354,18 +7354,19 @@ impl BlockchainNode {
                             // Skip snapshot for Light nodes - they sync only recent blocks
                             let is_light_node = blockchain_for_sync.node_type == NodeType::Light;
                             
-                            // v3.3: IMPROVED SNAPSHOT SYNC for returning nodes
+                            // v10.3: IMPROVED SNAPSHOT SYNC for returning nodes
                             // Try snapshot if:
                             // 1. Not a Light node (they don't need full history)
                             // 2. EITHER: New node (local_height < 100)
-                            //    OR: Large gap (>10,000 blocks = ~2.7 hours offline)
+                            //    OR: Large gap (>2,000 blocks = ~33 min offline)
                             // 3. Network has at least one full snapshot (43,200+ blocks)
                             //
-                            // RATIONALE: Node offline for days should use snapshot, not sync 500K blocks!
-                            // Example: 500K blocks × 100 batch = 5,000 requests × 25 sec = ~35 hours to sync
-                            // With snapshot: download snapshot + sync remaining = minutes
+                            // RATIONALE: Block-by-block sync for large gaps floods the
+                            // pending queue with parallel requests, causing backpressure
+                            // deadlocks. Snapshot avoids this entirely.
+                            // Threshold lowered from 10K to 2K to use snapshot more aggressively.
                             let gap = network_height.saturating_sub(local_height);
-                            let large_gap_threshold = 10_000; // ~2.7 hours worth of blocks
+                            let large_gap_threshold = 2_000; // ~33 minutes worth of blocks
                             let should_use_snapshot = !is_light_node 
                                 && (local_height < 100 || gap > large_gap_threshold)
                                 && network_height > SNAPSHOT_FULL_INTERVAL;  // Need at least 1 full snapshot
