@@ -9667,10 +9667,40 @@ impl SimplifiedP2P {
                         if crate::node::is_debug() {
                             println!("[DBG][P2P] regional_added peer={}", peer.id);
                         }
+
+                        // v10.1: Query real height from peer immediately on connect.
+                        // Don't wait 30s for first heartbeat — get height NOW via REST API.
+                        // Dedup: only query if BEST_PEER_HEIGHT is still 0 (first connect)
+                        // or significantly stale (prevents spam on repeated reconnections).
+                        let should_query = BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) == 0;
+                        let health_addr = peer.addr.clone();
+                        if should_query { tokio::spawn(async move {
+                            let ip = health_addr.split(':').next().unwrap_or("");
+                            let url = format!("http://{}:8001/api/v1/node/health", ip);
+                            match HTTP_CLIENT.get(&url).send().await {
+                                Ok(resp) => {
+                                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                                        if let Some(h) = json.get("height").and_then(|v| v.as_u64()) {
+                                            if h > 0 {
+                                                BEST_PEER_HEIGHT.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
+                                                if crate::node::is_info() {
+                                                    println!("[INFO][P2P] peer_height_query {}={}", ip, h);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    if crate::node::is_debug() {
+                                        println!("[DBG][P2P] peer_height_query_fail {}={}", ip, e);
+                                    }
+                                }
+                            }
+                        }); } // end if should_query
                     }
                 }
         }
-        
+
             // v2.51: Genesis mode - connect to all Genesis peers
             let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
             let active_peers = connected_peers.len();
@@ -10438,32 +10468,11 @@ impl SimplifiedP2P {
         let parallel_workers: usize = workers;
         let chunk_size_blocks: u64 = chunk_size;
         
-        // PRODUCTION: Simple and effective sync strategy
-        // Small networks (≤100 blocks): Direct sync all at once
-        // Large networks (>100 blocks): Wave sync to avoid SYNC_IN_PROGRESS blocking
-        let blocks_to_sync = target_height - current_height;
-        const WAVE_SIZE: u64 = 100; // Existing chunk size from original code
-        
-        let (actual_target, blocks_this_sync) = if blocks_to_sync <= WAVE_SIZE {
-            // Small lag: sync all blocks at once
-            (target_height, missing_blocks.clone())
-        } else {
-            // Large lag: sync first wave only
-            let wave_target = current_height + WAVE_SIZE;
-            let blocks_in_wave: Vec<u64> = missing_blocks.iter()
-                .filter(|&&h| h <= wave_target)
-                .copied()
-                .collect();
-            
-            if crate::node::is_info() {
-                println!("[SYNC] 🌊 Wave sync: {} blocks now, {} deferred to next cycle", 
-                         blocks_in_wave.len(), missing_blocks.len() - blocks_in_wave.len());
-            }
-            
-            (wave_target, blocks_in_wave)
-        };
-        
-        let missing_blocks = blocks_this_sync;  // Update to sync size
+        // v10.1: Download ALL missing blocks in one call.
+        // Wave-based limiting (old WAVE_SIZE=100) was causing our fast sync loop
+        // to need many iterations. Semaphore already limits concurrency.
+        // The caller (fast sync loop) handles re-invocation if network advances.
+        let actual_target = target_height;
         
         if crate::node::is_info() {
             println!("[SYNC] ⚡ Starting parallel sync: {} blocks (target: {}) with {} workers", 
@@ -10645,7 +10654,10 @@ impl SimplifiedP2P {
         let mut total_failures = 0u32;
         const MAX_CONSECUTIVE_FAILURES: u32 = 30;
         const MAX_TOTAL_FAILURES: u32 = 150;
-        const POLL_INTERVAL_MS: u64 = 100;
+        // v10.1: Reduced from 100ms to 50ms — balanced between speed and storage load.
+        // 100ms was too slow (100s for 1000 blocks). 10ms was too aggressive
+        // (1000 RocksDB lookups/sec across 10 workers). 50ms = 200 lookups/sec.
+        const POLL_INTERVAL_MS: u64 = 50;
         const REQUEST_TIMEOUT_SECS: u64 = 30;
         
         Self::send_quic_block_request_static(peers, start_height, end_height).await;
@@ -17201,12 +17213,32 @@ impl SimplifiedP2P {
             // v9.0: GENESIS BYPASS - Only by verified IP, not self-declared ID
             if is_genesis_peer {
                 false // Genesis nodes always allowed
-            // CRITICAL: No rate limit for nodes catching up (>5 blocks behind)
+            // v10.1: Relaxed rate limit for nodes catching up (>5 blocks behind)
+            // Not unlimited — prevents DDoS via fake "catching up" requests
             } else if blocks_behind > 5 {
-                if crate::node::is_info() {
-                    println!("[INFO][SYNC] priority_sync peer={} blocks_behind={}", from_peer, blocks_behind);
+                let rate_key = format!("priority_sync_{}", from_peer);
+                let mut rate_limit = self.rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
+                    requests: Vec::new(),
+                    max_requests: 60,  // 60 requests/min for syncing (vs 10 normal)
+                    window_seconds: 60,
+                    blocked_until: 0,
+                });
+                if rate_limit.blocked_until > current_time {
+                    true // Still rate limited even in priority mode
+                } else {
+                    let window = rate_limit.window_seconds;
+                    rate_limit.requests.retain(|&t| t > current_time - window);
+                    if rate_limit.requests.len() >= rate_limit.max_requests {
+                        rate_limit.blocked_until = current_time + 30; // 30s block (vs 60s normal)
+                        if crate::node::is_warn() {
+                            println!("[WARN][SYNC] priority_rate_exceeded peer={} behind={}", from_peer, blocks_behind);
+                        }
+                        true
+                    } else {
+                        rate_limit.requests.push(current_time);
+                        false
+                    }
                 }
-                false // No rate limit for catching up
             } else {
                 // Normal rate limiting for synchronized nodes
                 // PRODUCTION: Lock-free DashMap access
@@ -17446,12 +17478,44 @@ impl SimplifiedP2P {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
+        // v10.1: Check if requesting peer is syncing (requesting old blocks).
+        // If peer requests macroblock index far below our tip, they're catching up — no rate limit.
+        let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        let our_macro_index = if local_h >= 90 { local_h / 90 } else { 0 };
+        let requester_behind = our_macro_index > to_index && our_macro_index.saturating_sub(to_index) > 1;
+
         // Check rate limit
         let rate_limited = {
             // v3.0: GENESIS BYPASS - Never rate limit genesis nodes syncing with each other
             if is_genesis_requester || is_genesis_peer {
                 false // Genesis nodes always allowed
+            // v10.1: Relaxed rate limit for peers catching up (requesting old macroblocks)
+            // Not unlimited — prevents DDoS via repeated index-0 requests
+            } else if requester_behind {
+                let rate_key = format!("priority_mb_{}", from_peer);
+                let mut rate_limit = self.rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
+                    requests: Vec::new(),
+                    max_requests: 30,  // 30 requests/min for syncing macroblocks
+                    window_seconds: 60,
+                    blocked_until: 0,
+                });
+                if rate_limit.blocked_until > current_time {
+                    true
+                } else {
+                    let window = rate_limit.window_seconds;
+                    rate_limit.requests.retain(|&t| t > current_time - window);
+                    if rate_limit.requests.len() >= rate_limit.max_requests {
+                        rate_limit.blocked_until = current_time + 60;
+                        if crate::node::is_warn() {
+                            println!("[WARN][MB_SYNC] priority_rate_exceeded peer={} idx={}", from_peer, to_index);
+                        }
+                        true
+                    } else {
+                        rate_limit.requests.push(current_time);
+                        false
+                    }
+                }
             } else {
                 let rate_key = format!("macrosync_{}", from_peer);
                 

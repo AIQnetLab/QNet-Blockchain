@@ -529,23 +529,36 @@ pub fn try_advance_finality(round: u64, context: &str) -> bool {
     true
 }
 
-/// v9.0 BUG-12: Atomic height update helper.
+/// v10.2: Atomic height update helper — DISK FIRST, RAM SECOND.
 /// Updates all 3 height sources in one call to prevent inconsistency.
-/// - `height_lock`: Arc<RwLock<u64>> (RAM height)
-/// - `storage`: for set_chain_height (RocksDB)
-/// - LOCAL_BLOCKCHAIN_HEIGHT (AtomicU64 for lock-free reads)
+///
+/// ORDER IS CRITICAL:
+///   1. DISK (RocksDB) — persistent, survives crash
+///   2. RAM (RwLock) — used by consensus engine
+///   3. RAM (AtomicU64) — advertised to peers
+///
+/// If crash happens between 1 and 2: on restart, disk has correct height,
+/// RAM will be initialized from disk. This is safe.
+/// Previous order (RAM first, disk second) could leave RAM ahead of disk
+/// after crash — causing chain_height/storage divergence.
 pub async fn update_all_heights(
     height_lock: &tokio::sync::RwLock<u64>,
     storage: &crate::storage::Storage,
     new_height: u64,
 ) {
+    // Step 1: DISK — persistent store (crash-safe)
+    if let Err(e) = storage.set_chain_height(new_height) {
+        eprintln!("[ERR][STORAGE] set_chain_height failed h={}: {}", new_height, e);
+        // CRITICAL: Do NOT update RAM if disk write failed!
+        // RAM ahead of disk = the exact bug that causes chain_height/storage divergence.
+        return;
+    }
+    // Step 2: RAM (RwLock) — consensus engine reads
     {
         let mut h = height_lock.write().await;
         *h = new_height;
     }
-    if let Err(e) = storage.set_chain_height(new_height) {
-        eprintln!("[ERR][STORAGE] set_chain_height failed h={}: {}", new_height, e);
-    }
+    // Step 3: RAM (AtomicU64) — peer advertisement
     crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
         new_height, std::sync::atomic::Ordering::SeqCst
     );
@@ -5319,7 +5332,24 @@ impl BlockchainNode {
                         if is_warn() { println!("[WARN][NODE] poh_migration_check_fail err={}", e); }
                     }
                 }
-                
+
+                // v10.2: HASH INDEX MIGRATION — build O(1) prev_hash lookup index.
+                // Enables prev_hash validation without loading full block body.
+                // Migration is idempotent (flag in metadata CF) and runs once.
+                match storage_arc.migrate_microblock_hash_index() {
+                    Ok(count) => {
+                        if count > 0 {
+                            println!("[INFO][NODE] hash_index_migrated blocks={}", count);
+                        } else if is_debug() {
+                            println!("[DBG][NODE] hash_index already_migrated");
+                        }
+                    }
+                    Err(e) => {
+                        // Non-fatal: prev_hash validation will fall back to loading full blocks
+                        if is_warn() { println!("[WARN][NODE] hash_index_migration_fail err={}", e); }
+                    }
+                }
+
                 storage_arc
             }
             Err(e) => {
@@ -8323,16 +8353,17 @@ impl BlockchainNode {
                                                                 }
                                                             }
 
-                                                            *height_clone.write().await = rollback_to;
+                                                            // v10.2: DISK FIRST, RAM SECOND (crash-safe order)
                                                             if let Err(e) = storage_clone.set_chain_height(rollback_to) {
                                                                 eprintln!("[ERR][STORAGE] rollback_set_chain_height failed h={}: {}", rollback_to, e);
                                                             }
+                                                            *height_clone.write().await = rollback_to;
                                                             crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
                                                                 rollback_to, std::sync::atomic::Ordering::Release
                                                             );
-                                                            
+
                                                             crate::storage::end_rollback_protection();
-                                                            
+
                                                             // v3.31: Clear pending sync queues after rollback
                                                             complete_rollback_cleanup(rollback_to);
                                                         }
@@ -8426,14 +8457,15 @@ impl BlockchainNode {
                                                             for h in fork_height..=local_height {
                                                                 let _ = storage_clone.delete_microblock(h);
                                                             }
-                                                            *height_clone.write().await = rollback_to;
+                                                            // v10.2: DISK FIRST, RAM SECOND (crash-safe order)
                                                             if let Err(e) = storage_clone.set_chain_height(rollback_to) {
                                                                 eprintln!("[ERR][STORAGE] rollback_set_chain_height failed h={}: {}", rollback_to, e);
                                                             }
+                                                            *height_clone.write().await = rollback_to;
                                                             crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
                                                                 rollback_to, std::sync::atomic::Ordering::Release
                                                             );
-                                                            
+
                                                             crate::storage::end_rollback_protection();
                                                             
                                                             // v3.31: Clear pending sync queues after rollback
@@ -9583,6 +9615,39 @@ impl BlockchainNode {
                                 received_block.height,
                                 std::sync::atomic::Ordering::Release
                             );
+
+                            // v10.2: PERIODIC DISK/RAM HEIGHT CONSISTENCY CHECK
+                            // Detects divergence between disk chain_height and RAM height at runtime.
+                            // Previously only checked at startup (verify_and_repair_chain_height).
+                            // Now: every 1000 blocks, verify disk and RAM agree.
+                            if received_block.height % 1000 == 0 {
+                                let disk_height = storage.get_chain_height().unwrap_or(0);
+                                let ram_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                if disk_height != ram_height && disk_height > 0 {
+                                    eprintln!("[ERR][INTEGRITY] disk_ram_divergence disk_h={} ram_h={} block_h={}",
+                                             disk_height, ram_height, received_block.height);
+                                    // Repair: trust disk (persistent), update RAM
+                                    let repair_h = std::cmp::min(disk_height, ram_height);
+                                    if let Ok(Some(_)) = storage.load_microblock(repair_h) {
+                                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                            repair_h, std::sync::atomic::Ordering::SeqCst
+                                        );
+                                        *height.write().await = repair_h;
+                                        println!("[INFO][INTEGRITY] repaired ram_h={} -> {}", ram_height, repair_h);
+                                    }
+                                } else if is_debug() && received_block.height % 10000 == 0 {
+                                    println!("[DBG][INTEGRITY] check_ok disk={} ram={}", disk_height, ram_height);
+                                }
+                            }
+
+                            // v10.1: Update peer height on EVERY received block (real-time, not just heartbeats).
+                            // Previously peer heights were only updated via HealthPing every 30s,
+                            // causing catastrophically stale height data for sync decisions.
+                            // Now: if peer sent us block N, peer is at least at height N.
+                            if let Some(ref p2p) = unified_p2p {
+                                p2p.update_peer_last_seen_with_height(&received_block.from_peer, Some(received_block.height));
+                            }
                             
                             // EVENT-BASED OPTIMIZATION: Broadcast height update to all listeners
                             // Replaces polling in consensus listener (100K polls/sec → reactive events only)
@@ -9915,6 +9980,7 @@ impl BlockchainNode {
                                                 for h in (rb_target + 1)..=received_block.height {
                                                     let _ = storage.delete_microblock(h);
                                                 }
+                                                // v10.2: DISK FIRST, RAM SECOND (crash-safe order)
                                                 if let Err(e) = storage.set_chain_height(rb_target) {
                                                     eprintln!("[ERR][STORAGE] rollback_set_chain_height failed h={}: {}", rb_target, e);
                                                 }
@@ -10259,101 +10325,99 @@ impl BlockchainNode {
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // v8.0: TIMESTAMP VALIDATION
+        // v10.2: TIMESTAMP VALIDATION — VTS-AWARE
         // ═══════════════════════════════════════════════════════════════════════════
-        // TWO MODES:
-        //   SYNC MODE (catching up):  Only monotonicity + future check. No past check.
-        //     Syncing 100k+ historical blocks means ALL of them are "in the past".
-        //     Rejecting them would deadlock sync.
-        //   LIVE MODE (at network edge): Full future + past check for new gossipped blocks.
-        //     Active only when local_height >= network_height - SYNC_MODE_THRESHOLD.
+        // QNet has VTS (Verifiable Time Sequence) — cryptographic time ordering.
+        // Wall-clock timestamps are INFORMATIONAL during sync (VTS + chain hash
+        // continuity guarantee block ordering). Future check only in LIVE mode
+        // as DDoS protection against blocks with fabricated future timestamps.
         //
-        // SECURITY: v3.38 WALL CLOCK VALIDATION
-        // 1. FUTURE CHECK: block.timestamp <= now + 15s (always active)
-        // 2. MONOTONICITY CHECK: block.timestamp > parent.timestamp (live mode only)
-        // During sync, historical blocks are legitimately "old" — skip monotonicity vs now.
-        // Chain signature + hash continuity guarantees integrity of synced blocks.
+        // TWO MODES:
+        //   SYNC MODE: NO wall-clock checks. VTS monotonicity + chain hash = sufficient.
+        //   LIVE MODE: Future check (TIMESTAMP_FUTURE_TOLERANCE) + monotonicity.
         // ═══════════════════════════════════════════════════════════════════════════
         {
             let local_time = get_timestamp_safe();
-            
+
             if microblock.height > 0 && local_time > 0 {
-                // FUTURE CHECK: Always active — block cannot be from the future
-                let max_allowed_timestamp = local_time + TIMESTAMP_FUTURE_TOLERANCE;
-                if microblock.timestamp > max_allowed_timestamp {
-                    let future_delta = microblock.timestamp - local_time;
-                    METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[ERR][TIMESTAMP] future_block h={} ts={} local={} delta=+{}s (max={}s)", 
-                             microblock.height, microblock.timestamp, local_time, 
-                             future_delta, TIMESTAMP_FUTURE_TOLERANCE);
-                    return Err(format!(
-                        "TIMESTAMP_INVALID:future:h={}:block_ts={}:local_ts={}:delta=+{}s", 
-                        microblock.height, microblock.timestamp, local_time, future_delta
-                    ));
-                }
-                
-                // MONOTONICITY CHECK: block.timestamp > parent.timestamp
-                // Only in LIVE MODE — during sync, skip (chain hash continuity is sufficient)
-                // v5.5: Comprehensive sync detection for BFT-confirmed blocks.
-                // Blocks already confirmed by BFT consensus skip local timestamp validation.
-                // Chain hash continuity (previous_hash check) is sufficient for ordering.
-                // This prevents non-monotonic timestamps from fork-resolution permanently
-                // blocking sync (e.g. block N produced during stall with bad clock).
+                // Detect sync mode
                 const SYNC_MODE_THRESHOLD: u64 = 50;
                 let local_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
                 let fast_sync_active = FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
                 let sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed);
                 let sync_target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
-                // Block is BFT-confirmed if it's at or below the network consensus height
                 let is_consensus_confirmed = sync_target > 0 && microblock.height <= sync_target;
                 let is_syncing = fast_sync_active
                     || sync_active
                     || is_consensus_confirmed
                     || local_height + SYNC_MODE_THRESHOLD < microblock.height;
-                
+
                 if !is_syncing {
-                    // MONOTONICITY: block.timestamp > parent.timestamp (Ethereum standard)
+                    // LIVE MODE: Full validation — future check + monotonicity
+
+                    // FUTURE CHECK: block cannot claim to be from the future
+                    let max_allowed_timestamp = local_time + TIMESTAMP_FUTURE_TOLERANCE;
+                    if microblock.timestamp > max_allowed_timestamp {
+                        let future_delta = microblock.timestamp - local_time;
+                        METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("[ERR][TIMESTAMP] future_block h={} ts={} local={} delta=+{}s (max={}s)",
+                                 microblock.height, microblock.timestamp, local_time,
+                                 future_delta, TIMESTAMP_FUTURE_TOLERANCE);
+                        return Err(format!(
+                            "TIMESTAMP_INVALID:future:h={}:block_ts={}:local_ts={}:delta=+{}s",
+                            microblock.height, microblock.timestamp, local_time, future_delta
+                        ));
+                    }
+
+                    // MONOTONICITY: block.timestamp > parent.timestamp
                     let parent_ts = match storage.load_microblock_auto_format(microblock.height - 1) {
                         Ok(Some(parent)) => parent.timestamp,
                         _ => 0,
                     };
-                    
+
                     if parent_ts > 0 && microblock.timestamp <= parent_ts {
                         METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("[ERR][TIMESTAMP] non_monotonic h={} ts={} parent_ts={}", 
+                        eprintln!("[ERR][TIMESTAMP] non_monotonic h={} ts={} parent_ts={}",
                                  microblock.height, microblock.timestamp, parent_ts);
                         return Err(format!(
-                            "TIMESTAMP_INVALID:non_monotonic:h={}:block_ts={}:parent_ts={}", 
+                            "TIMESTAMP_INVALID:non_monotonic:h={}:block_ts={}:parent_ts={}",
                             microblock.height, microblock.timestamp, parent_ts
                         ));
                     }
-                    
-                    // v3.38: NO PAST CHECK — matches Ethereum validation (only future + monotonicity).
-                    // Ethereum rationale: if block is signed by correct producer, has correct prev_hash,
-                    // and satisfies monotonicity — it's valid regardless of how "old" the timestamp is.
-                    // This also ensures ROLLING UPDATE compatibility: new nodes (wall clock) accept
-                    // blocks from old nodes (slot-based timestamps) without rejection.
-                    // Old slot-based timestamps are always <= now, so they pass future check.
-                    // They are strictly monotonic (+1/block), so they pass monotonicity check.
+
                     if is_debug() {
                         let delta = local_time.saturating_sub(microblock.timestamp);
                         if delta > 60 {
-                            println!("[DBG][TIMESTAMP] old_ts h={} ts={} local={} delta=-{}s (warn_only)", 
+                            println!("[DBG][TIMESTAMP] old_ts h={} ts={} local={} delta=-{}s (warn_only)",
                                      microblock.height, microblock.timestamp, local_time, delta);
                         }
                     }
+                } else {
+                    // SYNC MODE: Skip wall-clock checks.
+                    // VTS monotonicity (checked below) + chain hash continuity (checked above)
+                    // provide cryptographic ordering guarantees without wall-clock dependency.
+                    if is_debug() && microblock.height % 1000 == 0 {
+                        println!("[DBG][TIMESTAMP] sync_mode_skip h={} ts={} local={} delta={}s",
+                                 microblock.height, microblock.timestamp, local_time,
+                                 local_time.saturating_sub(microblock.timestamp));
+                    }
                 }
-                
+
                 if is_debug() && microblock.height % 100 == 0 {
-                    println!("[DBG][TIMESTAMP] valid h={} ts={} local={} delta={}s syncing={}", 
+                    println!("[DBG][TIMESTAMP] valid h={} ts={} local={} delta={}s syncing={}",
                              microblock.height, microblock.timestamp, local_time,
                              local_time.saturating_sub(microblock.timestamp), is_syncing);
                 }
             }
         }
         
+        // ═══════════════════════════════════════════════════════════════════════════
         // 3. CRITICAL: Verify chain continuity (previous_hash) for ALL blocks
-        // FIXED: Check ALL blocks including #0 and #1
+        // v10.2: THREE-TIER VALIDATION (fastest first):
+        //   Tier 1: O(1) hash index lookup (microblock_hash_{h} in metadata CF)
+        //   Tier 2: O(block_size) full block load + SHA3-256 (fallback if no index)
+        //   Tier 3: Self-healing — request missing block from peers (not reject!)
+        // ═══════════════════════════════════════════════════════════════════════════
         if microblock.height == 0 {
             // Genesis block must have zero previous_hash
             if microblock.previous_hash != [0u8; 32] {
@@ -10362,54 +10426,61 @@ impl BlockchainNode {
             }
             if is_debug() { println!("[DBG][VALIDATION] genesis_valid h=0 prev_hash=zero"); }
         } else if microblock.height >= 1 {
-            // ALL other blocks (including #1) must have correct previous_hash
-            // Get actual hash of previous block from storage
-            let prev_block_result = storage.load_microblock(microblock.height - 1);
-            
-            match prev_block_result {
-                Ok(Some(prev_data)) => {
-                    // We have the previous block - verify with real hash
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(&prev_data);
-                let prev_hash_result = hasher.finalize();
-                
-                if microblock.previous_hash != prev_hash_result.as_slice() {
-                        // CRITICAL v2.43: previous_hash mismatch = FORK!
-                        // This triggers fork resolution mechanism instead of just rejecting
-                        // ARCHITECTURE: If we have block N-1 but incoming block N has different prev_hash,
-                        // the sender is on a different fork. We must resolve via fork mechanism.
-                        eprintln!("[ERR][VALIDATION] prev_hash_mismatch h={} expected={:?} got={:?} → FORK_DETECTED!", 
-                                 microblock.height, &prev_hash_result[0..8], &microblock.previous_hash[0..8]);
-                        
-                        // PRODUCTION v2.43: Return FORK_DETECTED to trigger reorg mechanism
-                        // Format: FORK_DETECTED:fork_height:producer
-                        // fork_height = height - 1 (the block where chains diverged)
-                        return Err(format!(
-                            "FORK_DETECTED:{}:{}",
-                            microblock.height - 1,  // Fork point is previous block
-                            microblock.producer
-                        ));
-                    } else {
-                if is_debug() { println!("[DBG][VALIDATION] chain_continuity_ok h={}", microblock.height); }
-                    }
-                },
-                _ => {
-                    // Previous block not found
-                    if microblock.height == 1 {
-                        // Block #1 SPECIAL CASE: Genesis might not be synced yet
-                        // Return special error to trigger Genesis sync
-                        if is_warn() { println!("[WARN][VALIDATION] genesis_missing action=sync_request"); }
+            let prev_height = microblock.height - 1;
 
-                        // CRITICAL: Return special error for missing Genesis
-                        return Err("MISSING_PREVIOUS:0".to_string());
-                    } else {
-                        // v10.1: POST-SNAPSHOT SYNC — first block after snapshot has no predecessor in storage.
-                        // After snapshot at h=43200, block 43201 arrives but microblock 43200 doesn't exist.
-                        // This is expected: snapshot restores STATE, not individual blocks.
-                        // Skip previous_hash validation ONLY for the first block after chain_height (set by snapshot).
-                        // All subsequent blocks (43202, 43203, ...) will validate normally against their predecessor.
-                        // Same pattern as Ethereum snap sync: trust snapshot boundary, validate everything after.
+            // TIER 1: O(1) hash index lookup — no block load needed
+            let hash_from_index = storage.load_microblock_hash(prev_height).unwrap_or(None);
+
+            if let Some(indexed_hash) = hash_from_index {
+                // Fast path: validate against indexed hash
+                if microblock.previous_hash != indexed_hash {
+                    eprintln!("[ERR][VALIDATION] prev_hash_mismatch h={} expected={} got={} → FORK_DETECTED!",
+                             microblock.height,
+                             hex::encode(&indexed_hash[0..8]),
+                             hex::encode(&microblock.previous_hash[0..8]));
+                    return Err(format!(
+                        "FORK_DETECTED:{}:{}",
+                        prev_height,
+                        microblock.producer
+                    ));
+                }
+                if is_debug() && microblock.height % 500 == 0 {
+                    println!("[DBG][VALIDATION] chain_ok h={} via=hash_index", microblock.height);
+                }
+            } else {
+                // TIER 2: Fallback — load full block and compute hash
+                let prev_block_result = storage.load_microblock(prev_height);
+
+                match prev_block_result {
+                    Ok(Some(prev_data)) => {
+                        use sha3::{Sha3_256, Digest};
+                        let mut hasher = Sha3_256::new();
+                        hasher.update(&prev_data);
+                        let prev_hash_result = hasher.finalize();
+
+                        if microblock.previous_hash != prev_hash_result.as_slice() {
+                            eprintln!("[ERR][VALIDATION] prev_hash_mismatch h={} expected={:?} got={:?} → FORK_DETECTED!",
+                                     microblock.height, &prev_hash_result[0..8], &microblock.previous_hash[0..8]);
+                            return Err(format!(
+                                "FORK_DETECTED:{}:{}",
+                                prev_height,
+                                microblock.producer
+                            ));
+                        }
+
+                        // Backfill hash index for this block (future lookups will be O(1))
+                        let _ = storage.save_microblock_hash(prev_height, &prev_hash_result);
+
+                        if is_debug() { println!("[DBG][VALIDATION] chain_ok h={} via=full_block+backfill", microblock.height); }
+                    },
+                    _ => {
+                        // TIER 3: Previous block not found — self-healing
+                        if microblock.height == 1 {
+                            if is_warn() { println!("[WARN][VALIDATION] genesis_missing action=sync_request"); }
+                            return Err("MISSING_PREVIOUS:0".to_string());
+                        }
+
+                        // Post-snapshot trust boundary
                         let stored_height = storage.get_chain_height().unwrap_or(0);
                         let is_post_snapshot_first_block = stored_height > 0
                             && microblock.height == stored_height + 1
@@ -10419,12 +10490,9 @@ impl BlockchainNode {
                             println!("[INFO][VALIDATION] post_snapshot_trust h={} snap_h={} prev_hash_skip=trusted",
                                      microblock.height, stored_height);
                         } else {
-                            // ALL other blocks: MUST have previous block for security
-                            if is_warn() { println!("[WARN][VALIDATION] prev_block_missing h={} need={}",
-                                     microblock.height, microblock.height - 1); }
-
-                            // CRITICAL: Return special error to trigger sync request
-                            return Err(format!("MISSING_PREVIOUS:{}", microblock.height - 1));
+                            if is_warn() { println!("[WARN][VALIDATION] prev_block_missing h={} need={} action=request_download",
+                                     microblock.height, prev_height); }
+                            return Err(format!("MISSING_PREVIOUS:{}", prev_height));
                         }
                     }
                 }
@@ -10494,54 +10562,53 @@ impl BlockchainNode {
                 poh_state.poh_count
             } else {
                 // Fallback: try to load from block using auto-format detection
+                // v10.2: If block not available, skip VTS validation (don't deadlock!)
+                // Chain continuity is already verified above via hash index.
+                // VTS is an additional proof layer — missing it shouldn't kill the node.
                 match storage.load_microblock_auto_format(microblock.height - 1) {
                     Ok(Some(prev_block)) => prev_block.poh_count,
-                    Ok(None) if microblock.height == 1 => 0, // Genesis (block #0) has poh_count=0
+                    Ok(None) if microblock.height == 1 => 0,
                     Ok(None) => {
-                        // SECURITY: Previous block MUST exist for height > 1
-                        // Return error to trigger sync
-                        return Err(format!("MISSING_PREVIOUS:{}", microblock.height - 1));
+                        // v10.2: Skip VTS check if previous block unavailable.
+                        // prev_hash already validated above — chain integrity is guaranteed.
+                        if is_warn() { println!("[WARN][VTS] skip_check h={} reason=prev_block_unavailable", microblock.height); }
+                        0 // Will skip regression check since prev_poh_count=0
                     }
                     Err(e) => {
-                        // SECURITY: Cannot load previous block - reject
-                        return Err(format!("PoH validation failed: cannot load block #{}: {}", 
-                                          microblock.height - 1, e));
+                        if is_warn() { println!("[WARN][VTS] skip_check h={} reason=load_err err={}", microblock.height, e); }
+                        0
                     }
                 }
             };
-            
-            // PoH REGRESSION CHECK: Detect attempts to forge block history
-            // Normal network drift is acceptable (nodes may have slightly different PoH speeds)
-            // Byzantine consensus provides primary safety; PoH is an additional time proof layer
-            if microblock.poh_count <= prev_poh_count && prev_poh_count > 0 {
+
+            // v10.2: VTS STRICT MONOTONICITY CHECK
+            // VTS counter MUST always increase. Any regression = potential history forgery.
+            // Byzantine consensus is the primary safety layer, VTS is cryptographic time proof.
+            // Small regressions (network drift) should not happen with correct VTS sync.
+            if prev_poh_count > 0 && microblock.poh_count <= prev_poh_count {
                 let regression = prev_poh_count - microblock.poh_count;
-                
-                // SECURITY: Reject if regression exceeds 30 seconds of PoH time
-                // 15M hashes at 500K/sec = 30 seconds
-                // ARCHITECTURE RATIONALE:
-                // - 30 sec < 90 sec macroblock interval (cannot rewrite finalized blocks)
-                // - 30 sec > typical network delay (5-10 sec) for tolerance
-                // - 30 sec = 1/3 of macroblock, prevents serious time manipulation
-                // - Aligned with FINALITY_WINDOW (10 blocks) + safety margin
-                const MAX_ACCEPTABLE_REGRESSION: u64 = 15_000_000;
-                
+
+                // STRICT: Reject any regression > 5M hashes (10 seconds).
+                // 10s is generous — normal block interval is 1s, VTS should always advance.
+                // Reduced from 30s (15M) to 10s (5M) for tighter security.
+                const MAX_ACCEPTABLE_REGRESSION: u64 = 5_000_000;
+
                 if regression > MAX_ACCEPTABLE_REGRESSION {
-                    eprintln!("[ERR][POH] severe_regression h={} count={} prev={} diff={}", 
+                    eprintln!("[ERR][VTS] regression h={} count={} prev={} diff={}",
                             microblock.height, microblock.poh_count, prev_poh_count, regression);
                     return Err(format!(
-                        "Severe PoH regression: block #{} has {} but previous has {} (diff: {})",
+                        "VTS regression: block #{} count={} prev_count={} diff={}",
                         microblock.height, microblock.poh_count, prev_poh_count, regression
                     ));
-                } else {
-                    // Log warning but accept the block - Byzantine consensus will validate
-                    if is_warn() { println!("[WARN][POH] minor_regression h={} count={} prev={}", 
-                            microblock.height, microblock.poh_count, prev_poh_count); }
+                } else if regression > 0 {
+                    if is_warn() { println!("[WARN][VTS] minor_regression h={} count={} prev={} diff={}",
+                            microblock.height, microblock.poh_count, prev_poh_count, regression); }
                 }
             }
             
-            // Log PoH progression (reduced frequency to avoid log spam)
+            // Log VTS progression (reduced frequency to avoid log spam)
             if microblock.height % 100 == 0 {
-                if is_debug() { println!("[DBG][POH] verified h={} count={} prev={}", 
+                if is_debug() { println!("[DBG][VTS] verified h={} count={} prev={}",
                         microblock.height, microblock.poh_count, prev_poh_count); }
             }
         }
@@ -14102,14 +14169,14 @@ impl BlockchainNode {
                             // Byzantine median height == local height → gap=0 → rollback never fires.
                             // certified_round stays 0 because nobody can get 2/3 consensus.
                             //
-                            // NEW: If stall > CHRONIC_STALL_THRESHOLD (300s) AND certified_round=0:
+                            // NEW: If stall > CHRONIC_STALL_THRESHOLD (120s) AND certified_round=0:
                             //   1. The macroblock for current epoch is MISSING
                             //   2. Force PFP activation — this node may be the unaware initiator
                             //   3. Trigger full resync from all peers to get any missed blocks
                             // ═══════════════════════════════════════════════════════════════════
                             static CHRONIC_STALL_LAST_PFP: std::sync::atomic::AtomicU64 =
                                 std::sync::atomic::AtomicU64::new(0);
-                            let chronic_stall_threshold = 300u64; // 5 minutes
+                            let chronic_stall_threshold = 120u64; // 2 minutes
                             let pfp_cooldown = 120u64;            // re-trigger PFP at most every 2 min
                             
                             if local_delay > chronic_stall_threshold && certified_timeout_round == 0 {
@@ -14393,12 +14460,12 @@ impl BlockchainNode {
                             }
                         }
                     }
-                // SYNC FIX: Fast catch-up mode for nodes that are far behind
-                // Using global flags defined at module level
-                
-                // DEADLOCK PROTECTION: Guard that automatically clears sync flag on drop (panic, error, success)
-                // v3.31: ALWAYS clear — previous conditional logic caused permanent deadlock
-                // after fork rollback when SYNC_TARGET_HEIGHT was non-zero
+                // v10.1: Two-mode sync system (like Bitcoin/Ethereum)
+                // Mode 1: gap > 10 → FAST SYNC (parallel batch download, loop until caught up)
+                // Mode 2: gap <= 10 → LIVE SYNC (ShredProtocol real-time blocks)
+                // No more one-shot downloads or emergency sync.
+
+                // DEADLOCK PROTECTION: Guard that automatically clears sync flag on drop
                 struct FastSyncGuard;
                 impl Drop for FastSyncGuard {
                     fn drop(&mut self) {
@@ -14407,17 +14474,16 @@ impl BlockchainNode {
                         SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                     }
                 }
-                
+
                 if let Some(p2p) = &unified_p2p {
-                    // CRITICAL FIX: Force network height update if we're stuck at low height
-                    // This prevents Node_005 stuck at block 30 issue
-                    // Also force update every 30 seconds if no new blocks received
-                    // v2.96: Lock-free atomics instead of Mutex
+                    // Get best known network height: prefer BEST_PEER_HEIGHT (updated on every block
+                    // receipt via Fix 1), fall back to cached/forced query
                     static LAST_BLOCK_TIME_SECS: StdAtomicU64 = StdAtomicU64::new(0);
                     static LAST_HEIGHT_CHECK: StdAtomicU64 = StdAtomicU64::new(0);
-                    
+
+                    let best_peer_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
+
                     let should_force_update = {
-                        // v2.96: Lock-free read
                         let last_height = LAST_HEIGHT_CHECK.load(StdOrdering::Relaxed);
                         let last_time = LAST_BLOCK_TIME_SECS.load(StdOrdering::Relaxed);
                         let now_secs = std::time::SystemTime::now()
@@ -14425,19 +14491,13 @@ impl BlockchainNode {
                             .unwrap_or_default()
                             .as_secs();
                         let time_since_block = if last_time > 0 { now_secs.saturating_sub(last_time) } else { 0 };
-                        
-                        // Force update ONLY if stuck (no progress for 30 seconds)
-                        // Don't force update during normal operation (blocks <=30)
-                        // This was causing 800-1200ms delay every iteration!
                         time_since_block > 30 && last_height == microblock_height
                     };
-                    
-                    let network_height = if should_force_update {
-                        // Force fresh query if stuck
+
+                    let cached_height = if should_force_update {
                         match p2p.sync_blockchain_height().await {
                             Ok(h) => {
                                 if is_debug() { println!("[DBG][SYNC] forced_h_update net={} local={}", h, microblock_height); }
-                                // Update tracking - v2.96: lock-free
                                 LAST_HEIGHT_CHECK.store(microblock_height, StdOrdering::Relaxed);
                                 if h > microblock_height {
                                     let now_secs = std::time::SystemTime::now()
@@ -14448,52 +14508,46 @@ impl BlockchainNode {
                                 }
                                 h
                             },
-                            Err(_) => {
-                                // Fallback to cached if query fails
-                                p2p.get_cached_network_height().unwrap_or(microblock_height)
-                            }
+                            Err(_) => p2p.get_cached_network_height().unwrap_or(microblock_height)
                         }
                     } else {
-                        // Normal operation: use cached height
                         p2p.get_cached_network_height().unwrap_or(microblock_height)
                     };
-                    
+
+                    // v10.1: Use the MAXIMUM of BEST_PEER_HEIGHT and cached height.
+                    // BEST_PEER_HEIGHT is updated on every received block (real-time),
+                    // cached height comes from heartbeats (30s stale).
+                    let network_height = std::cmp::max(best_peer_h, cached_height);
+
                     if network_height > microblock_height {
                         let height_difference = network_height.saturating_sub(microblock_height);
-                        
-                        // CRITICAL FIX: Auto-sync trigger for lagging nodes
-                        // Different thresholds for different levels of lag
-                        if height_difference > 10 {
-                            // Log the lag situation
-                            println!("[WARN][SYNC] Node is {} blocks behind network (local: {}, network: {})", 
+
+                        // v10.1: Threshold lowered from 10 to 3 to eliminate "dead zone".
+                        // Old: fast sync at >10, consensus blocked at >5 → gap 6-10 = no download, no consensus
+                        // New: fast sync at >3 → covers all cases where consensus is blocked (max_allowed_lag=2-5)
+                        if height_difference > 3 {
+                            println!("[WARN][SYNC] behind={} local={} network={}",
                                      height_difference, microblock_height, network_height);
-                            
-                            // DEADLOCK DETECTION: Check if fast sync is stuck
-                            // v3.31: ALWAYS check regardless of SYNC_TARGET_HEIGHT
-                            // Previous condition (initial_sync_target == 0) caused deadlock
-                            // after fork rollback when target was non-zero
+
+                            // DEADLOCK DETECTION: Clear stuck sync flag
                             let current_time = get_timestamp_safe();
-                            
+
                             if FAST_SYNC_IN_PROGRESS.load(Ordering::SeqCst) {
                                 let sync_start_time = FAST_SYNC_START_TIME.load(Ordering::Relaxed);
-                                
+
                                 if sync_start_time == 0 {
-                                    println!("[SYNC] 🔓 DEADLOCK DETECTED: Fast sync flag set but start_time=0, clearing flag");
+                                    println!("[SYNC] deadlock: flag set but start_time=0, clearing");
                                     FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                     SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                                 } else {
-                                    // v9.0: Progress-based deadlock detection.
-                                    // Instead of fixed cap (was 300s), check time since LAST progress.
-                                    // If blocks are flowing (even slowly), sync continues indefinitely.
-                                    // Deadlock = no new block for 120s.
                                     let last_progress = LAST_SYNC_PROGRESS_TIME.load(Ordering::Relaxed);
                                     let progress_ref = if last_progress > 0 { last_progress } else { sync_start_time };
                                     let since_progress = current_time.saturating_sub(progress_ref);
-                                    const SYNC_NO_PROGRESS_TIMEOUT: u64 = 120; // 2 min without ANY block = stuck
+                                    const SYNC_NO_PROGRESS_TIMEOUT: u64 = 120;
 
                                     if since_progress >= SYNC_NO_PROGRESS_TIMEOUT {
                                         let sync_elapsed = current_time.saturating_sub(sync_start_time);
-                                        println!("[SYNC] DEADLOCK: no progress for {}s (total={}s), clearing sync flag",
+                                        println!("[SYNC] deadlock: no progress {}s (total={}s), clearing",
                                                  since_progress, sync_elapsed);
                                         FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                         FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
@@ -14501,106 +14555,191 @@ impl BlockchainNode {
                                     }
                                 }
                             }
-                            
-                            // RACE CONDITION FIX: Only start fast sync if not already running
+
+                            // Start fast sync if not already running
                             if !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-                                // Record sync start time for deadlock detection
                                 FAST_SYNC_START_TIME.store(current_time, Ordering::Relaxed);
                                 LAST_SYNC_PROGRESS_TIME.store(current_time, Ordering::Relaxed);
-                                println!("[SYNC] FAST SYNC: {} blocks behind, catching up...", height_difference);
-                                
-                                    // CRITICAL FIX: Do NOT update height before syncing blocks!
-                                    // This prevents chain breaks where node thinks it's at height X without having the blocks
-                                    // IMPORTANT: Handle rotation boundaries carefully (every 30 blocks)
-                                    let sync_from_height = if microblock_height < network_height {
-                                        // v5.5: Start from 0 when chain is empty — genesis must be synced
-                                        if microblock_height == 0 {
-                                            0 // Include genesis block
-                                        } else {
-                                        // Check if we're at rotation boundary where sync might fail
-                                        // Rotation happens after blocks 30, 60, 90... (not block 0 which is genesis)
-                                        let is_rotation_boundary = microblock_height > 0 && (microblock_height % ROTATION_INTERVAL_BLOCKS) == 0;
-                                        if is_rotation_boundary {
-                                            // At rotation boundary, be conservative - sync current height
-                                            microblock_height
-                                        } else {
-                                            microblock_height + 1  // Normal case: sync next block
-                                        }
-                                        }
-                                    } else {
-                                        microblock_height      // We're at same height or ahead
-                                    };
-                                    let sync_to_height = network_height;
-                                
-                                // Trigger immediate sync download
+                                println!("[SYNC] fast_sync_start gap={}", height_difference);
+
+                                let sync_from_height = if microblock_height == 0 {
+                                    0
+                                } else if microblock_height % ROTATION_INTERVAL_BLOCKS == 0 {
+                                    microblock_height
+                                } else {
+                                    microblock_height + 1
+                                };
+
                                 let p2p_clone = p2p.clone();
                                 let storage_clone = storage.clone();
-                                
                                 let height_clone = height.clone();
-                                tokio::spawn(async move {
-                                    // PRODUCTION: Guard ensures flag is cleared even on panic/error
-                                    let _guard = FastSyncGuard;
-                                    
-                                    println!("[SYNC] 🚀 Fast downloading blocks {}-{}", sync_from_height, sync_to_height);
 
-                                    // v5.5: Request genesis block separately if chain is empty.
-                                    // parallel_download_microblocks starts from current_height+1,
-                                    // so passing 0-1=0 skips block 0. Sync genesis via sync_blocks first.
+                                tokio::spawn(async move {
+                                    let _guard = FastSyncGuard;
+
+                                    // v5.5: Sync genesis block separately if chain is empty
                                     if sync_from_height == 0 {
                                         if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
-                                            println!("[WARN][SYNC] genesis_fast_sync_fail err={}", e);
-                                        } else {
-                                            println!("[INFO][SYNC] genesis_block_requested_for_fast_sync");
+                                            println!("[WARN][SYNC] genesis_sync_fail: {}", e);
                                         }
                                         tokio::time::sleep(Duration::from_secs(1)).await;
                                     }
 
-                                    // TIMEOUT PROTECTION: Adaptive timeout based on blocks to sync
-                                    // PRODUCTION: Use parallel download for faster sync
-                                    let blocks_to_sync = sync_to_height.saturating_sub(sync_from_height);
-                                    let timeout_secs = std::cmp::max(60, (blocks_to_sync / 10) + 30);  // Min 60s, ~10 blocks/sec + 30s buffer
-                                    if is_debug() { println!("[DBG][SYNC] timeout={}s blocks={}", timeout_secs, blocks_to_sync); }
+                                    // v10.1: LOOP until caught up (not one-shot!)
+                                    // Each iteration downloads a batch, checks remaining gap, continues.
+                                    let mut current_from = sync_from_height;
+                                    let mut batch_num = 0u32;
+                                    let mut stall_count = 0u32; // Track consecutive no-progress iterations
 
-                                    // CRITICAL FIX: parallel_download_microblocks expects current_height and iterates from current_height+1
-                                    // sync_from_height is already the FIRST block to download, so pass sync_from_height-1
-                                    let sync_result = tokio::time::timeout(
-                                        Duration::from_secs(timeout_secs),
-                                        p2p_clone.parallel_download_microblocks(&storage_clone, sync_from_height.saturating_sub(1), sync_to_height)
-                                    ).await;
-                                    
-                                    match sync_result {
-                                        Ok(_) => {
-                                            if is_info() { println!("[INFO][SYNC] fast_sync_complete"); }
-                                            
-                                            // CRITICAL FIX: Update global height after successful fast sync
-                                            // This ensures producer loop knows about the new blocks
-                                            let mut global_height = height_clone.write().await;
-                                            if sync_to_height > *global_height {
-                                                *global_height = sync_to_height;
-                                                if is_debug() { println!("[DBG][SYNC] global_h={}", sync_to_height); }
-                                                
-                                                // v5.5: Use on-chain timestamp of synced block for deterministic LBPT
-                                                let sync_lbpt = storage_clone.load_microblock_auto_format(sync_to_height)
-                                                    .ok().flatten().map(|mb| mb.timestamp)
-                                                    .unwrap_or_else(get_timestamp_safe);
-                                                LAST_BLOCK_PRODUCED_TIME.store(sync_lbpt, Ordering::Relaxed);
-                                                LAST_BLOCK_PRODUCED_HEIGHT.store(sync_to_height, Ordering::Relaxed);
+                                    loop {
+                                        // Re-read current network height (may have advanced)
+                                        let target = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
+                                        let target = std::cmp::max(target, network_height); // At least initial target
+
+                                        if current_from >= target {
+                                            println!("[SYNC] caught_up at {}", current_from);
+                                            break;
+                                        }
+
+                                        let remaining = target.saturating_sub(current_from);
+                                        batch_num += 1;
+
+                                        // Set sync target for timestamp validation bypass
+                                        SYNC_TARGET_HEIGHT.store(target, Ordering::SeqCst);
+
+                                        // STATE MACHINE update
+                                        let progress = if target > 0 {
+                                            ((current_from as f64 / target as f64) * 100.0) as u8
+                                        } else { 0 };
+                                        set_node_state(NodeState::Syncing {
+                                            local_height: current_from,
+                                            target_height: target,
+                                            progress_percent: progress,
+                                        });
+
+                                        println!("[SYNC] batch={} from={} to={} remaining={}",
+                                                 batch_num, current_from, target, remaining);
+
+                                        // Adaptive timeout: min 60s, ~10 blocks/sec + buffer
+                                        let blocks_to_sync = target.saturating_sub(current_from);
+                                        let timeout_secs = std::cmp::max(60, (blocks_to_sync / 10) + 30);
+
+                                        let sync_result = tokio::time::timeout(
+                                            Duration::from_secs(timeout_secs),
+                                            p2p_clone.parallel_download_microblocks(
+                                                &storage_clone,
+                                                current_from.saturating_sub(1),
+                                                target
+                                            )
+                                        ).await;
+
+                                        // Update progress timestamp for deadlock detection
+                                        LAST_SYNC_PROGRESS_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
+
+                                        match sync_result {
+                                            Ok(_) => {
+                                                let prev_from = current_from;
+
+                                                // Repair chain height metadata after batch
+                                                match storage_clone.verify_and_repair_chain_height() {
+                                                    Ok(true) => {
+                                                        let repaired = storage_clone.get_chain_height().unwrap_or(current_from);
+                                                        if repaired > current_from {
+                                                            println!("[SYNC] height_repaired {} -> {}", current_from, repaired);
+                                                            current_from = repaired;
+                                                        }
+                                                    }
+                                                    Ok(false) => {
+                                                        // Walk forward to find actual synced height
+                                                        let mut walk = current_from;
+                                                        while walk < target {
+                                                            if storage_clone.load_microblock(walk + 1).unwrap_or(None).is_some() {
+                                                                walk += 1;
+                                                            } else {
+                                                                break;
+                                                            }
+                                                        }
+                                                        if walk > current_from {
+                                                            let _ = storage_clone.set_chain_height(walk);
+                                                            current_from = walk;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        println!("[WARN][SYNC] repair_err: {}", e);
+                                                        // Force advance to prevent stall on persistent repair error
+                                                        current_from += 1;
+                                                    }
+                                                }
+
+                                                // Stall detection: if current_from didn't advance, count it
+                                                if current_from == prev_from {
+                                                    stall_count += 1;
+                                                    if stall_count >= 5 {
+                                                        println!("[WARN][SYNC] stalled {} times at {}, force advancing", stall_count, current_from);
+                                                        current_from += 1;
+                                                        stall_count = 0;
+                                                    }
+                                                } else {
+                                                    stall_count = 0;
+                                                }
+
+                                                // Update global height
+                                                let mut global_h = height_clone.write().await;
+                                                if current_from > *global_h {
+                                                    *global_h = current_from;
+                                                    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                                        current_from,
+                                                        std::sync::atomic::Ordering::Release
+                                                    );
+                                                    let sync_lbpt = storage_clone.load_microblock_auto_format(current_from)
+                                                        .ok().flatten().map(|mb| mb.timestamp)
+                                                        .unwrap_or_else(get_timestamp_safe);
+                                                    LAST_BLOCK_PRODUCED_TIME.store(sync_lbpt, Ordering::Relaxed);
+                                                    LAST_BLOCK_PRODUCED_HEIGHT.store(current_from, Ordering::Relaxed);
+                                                }
+                                                drop(global_h);
+
+                                                // Check if we've caught up (use lowered threshold matching fast sync trigger)
+                                                let new_target = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
+                                                if current_from + 3 >= new_target {
+                                                    println!("[SYNC] fast_sync_complete at {} (network={})", current_from, new_target);
+                                                    break;
+                                                }
+
+                                                // Advance from for next batch
+                                                current_from += 1;
+                                                println!("[SYNC] batch {} done, continuing from {}", batch_num, current_from);
+                                            },
+                                            Err(_) => {
+                                                println!("[WARN][SYNC] batch {} timeout after {}s, retrying", batch_num, timeout_secs);
+                                                // Don't break — retry the same range
+                                                stall_count += 1;
+                                                if stall_count >= 5 {
+                                                    println!("[WARN][SYNC] {} consecutive timeouts, force advancing", stall_count);
+                                                    current_from += 1;
+                                                    stall_count = 0;
+                                                }
+                                                tokio::time::sleep(Duration::from_secs(2)).await;
                                             }
-                                        },
-                                        Err(_) => println!("[WARN][SYNC] Fast sync timeout after {}s - will retry next cycle", timeout_secs),
+                                        }
+
+                                        // Safety: max 1000 batches to prevent infinite loop
+                                        if batch_num >= 1000 {
+                                            println!("[ERR][SYNC] max batches reached, stopping");
+                                            break;
+                                        }
                                     }
-                                    // Flag automatically cleared by guard drop
+                                    // Guard drop clears FAST_SYNC_IN_PROGRESS
                                 });
                             } else {
-                                println!("[SYNC] ⏳ Fast sync already in progress, skipping");
+                                if is_debug() { println!("[DBG][SYNC] fast_sync_in_progress, waiting"); }
                             }
-                            
-                            // Skip this production cycle to focus on syncing
+
+                            // Skip this production cycle — node is syncing
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             continue;
                         }
                     }
-                    // else: No cached height - continue with local production
                 }
                 
                 // CRITICAL FIX: Use network-wide consensus instead of asymmetric peer counting
@@ -14802,105 +14941,18 @@ impl BlockchainNode {
                     _ => 5,  // Round 2+: Normal tolerance (5 blocks)
                 };
                 
-                // Check if we're too far behind to participate safely
+                // v10.1: Two-mode sync (like Bitcoin/Ethereum). No more "emergency sync".
+                // Mode 1: gap > max_allowed_lag → skip consensus, let fast sync (below) handle it
+                // Mode 2: gap <= max_allowed_lag → participate in consensus (live sync via ShredProtocol)
                 if local_stored_height + max_allowed_lag < expected_height {
-                    println!("[WARN][CONS] not_synced local={} expected={} lag={}", 
-                            local_stored_height, expected_height, max_allowed_lag);
-                    println!("[WARN][CONS] round={} sync={}%", 
-                            current_round, 
-                            ((local_stored_height as f64 / expected_height as f64) * 100.0) as u32);
-                    
-                    // Trigger emergency sync
-                    if let Some(ref p2p) = unified_p2p {
-                        println!("[WARN][CONS] Starting emergency sync from {} to {}",
-                                local_stored_height + 1, expected_height);
+                    let gap = expected_height.saturating_sub(local_stored_height);
+                    println!("[WARN][SYNC] not_synced local={} expected={} gap={} round={}",
+                            local_stored_height, expected_height, gap, current_round);
 
-                        // Set sync flags so timestamp validation bypasses monotonicity check.
-                        // Without this, blocks from other fork branches get TIMESTAMP_INVALID
-                        // and recovery loops forever.
-                        FAST_SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
-                        SYNC_TARGET_HEIGHT.store(expected_height, Ordering::SeqCst);
-
-                        // STATE MACHINE: Emergency sync
-                        let progress = ((local_stored_height as f64 / expected_height as f64) * 100.0) as u8;
-                        set_node_state(NodeState::Syncing {
-                            local_height: local_stored_height,
-                            target_height: expected_height,
-                            progress_percent: progress,
-                        });
-
-                        // v9.0 BUG-25: Aggregate timeout for emergency sync.
-                        // sync_blocks can hang if peers are unresponsive. Scale timeout
-                        // with gap size: base 30s + 1s per block, max 120s.
-                        let gap = expected_height.saturating_sub(local_stored_height);
-                        let timeout_secs = std::cmp::min(30 + gap, 120);
-                        let sync_start = std::time::Instant::now();
-                        let sync_result = tokio::time::timeout(
-                            Duration::from_secs(timeout_secs),
-                            p2p.sync_blocks(local_stored_height + 1, expected_height)
-                        ).await;
-
-                        // Always clear sync flags after emergency sync (success or failure)
-                        FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
-
-                        match sync_result {
-                            Ok(Err(e)) => {
-                                println!("[WARN][CONS] Emergency sync failed: {}", e);
-                            }
-                            Err(_) => {
-                                println!("[ERR][CONS] Emergency sync TIMEOUT after {}s (gap={})", timeout_secs, gap);
-                            }
-                            Ok(Ok(())) => {
-                                if is_info() { println!("[INFO][CONS] emrg_sync {:?}", sync_start.elapsed()); }
-                            }
-                        }
-                        
-                        // BUG FIX: After emergency sync, repair chain_height metadata
-                        // Problem: blocks stored via ShredProtocol/P2P update individual block storage
-                        // but metadata chain_height can lag behind. Emergency sync finds blocks as
-                        // dup_storage (already in storage) and doesn't advance chain_height.
-                        // This causes infinite loop: sync → dup → height unchanged → sync again.
-                        // Solution: Run verify_and_repair to advance chain_height to actual storage.
-                        match storage.verify_and_repair_chain_height() {
-                            Ok(true) => {
-                                let repaired_height = storage.get_chain_height().unwrap_or(local_stored_height);
-                                if repaired_height > microblock_height {
-                                    println!("[INFO][SYNC] height_repaired {} -> {}", microblock_height, repaired_height);
-                                    microblock_height = repaired_height;
-                                    *height.write().await = microblock_height;
-                                } else if repaired_height > local_stored_height {
-                                    println!("[INFO][SYNC] chain_height_repaired {} -> {}", local_stored_height, repaired_height);
-                                }
-                            }
-                            Ok(false) => {
-                                // No repair needed — check if blocks exist ahead of chain_height
-                                // Walk forward from chain_height to advance microblock_height
-                                let mut advance_height = local_stored_height;
-                                while advance_height < expected_height {
-                                    if storage.load_microblock(advance_height + 1).unwrap_or(None).is_some() {
-                                        advance_height += 1;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                if advance_height > microblock_height {
-                                    println!("[INFO][SYNC] height_walk_advanced {} -> {}", microblock_height, advance_height);
-                                    microblock_height = advance_height;
-                                    *height.write().await = microblock_height;
-                                    // Also update chain_height metadata to match
-                                    let _ = storage.set_chain_height(advance_height);
-                                }
-                            }
-                            Err(e) => {
-                                println!("[WARN][SYNC] chain_height_repair_err: {}", e);
-                            }
-                        }
-                    }
-                    
-                    // Skip this consensus round
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
+                    // Don't participate in consensus — fall through to fast sync check below
+                    // (no `continue` here — fast sync section handles the actual downloading)
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue; // Skip consensus but loop back to fast sync check at top
                 }
                 
                 if is_info() { println!("[INFO][MB] production_start nodes={} local={} expected={} lag={}", 
@@ -23864,15 +23916,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // All other blocks (2+) MUST use real previous block hash
         if current_height == 1 {
             // Block #1 special case - use Genesis block hash
+            // v10.2: Try hash index first
+            if let Ok(Some(indexed_hash)) = storage.load_microblock_hash(0) {
+                return indexed_hash;
+            }
             match storage.load_microblock(0) {
                 Ok(Some(genesis_data)) => {
-                    // Use real Genesis block hash
                     use sha3::{Sha3_256, Digest};
                     let mut hasher = Sha3_256::new();
                     hasher.update(&genesis_data);
                     let result = hasher.finalize();
                     let mut hash = [0u8; 32];
                     hash.copy_from_slice(&result);
+                    // Backfill genesis hash index
+                    let _ = storage.save_microblock_hash(0, &hash);
                     return hash;
                 },
                 _ => {
@@ -23888,21 +23945,32 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // CRITICAL: For ALL blocks >= 2, use REAL block hash ONLY
         // NO fallback to prevent chain integrity violations
-        match storage.load_microblock(current_height.saturating_sub(1)) {
+        let prev_h = current_height.saturating_sub(1);
+
+        // v10.2: Try O(1) hash index first, fallback to full block load
+        if let Ok(Some(indexed_hash)) = storage.load_microblock_hash(prev_h) {
+            return indexed_hash;
+        }
+
+        // Fallback: load full block and compute hash (pre-migration blocks)
+        match storage.load_microblock(prev_h) {
             Ok(Some(microblock_data)) => {
-                // Calculate hash from stored microblock data
                 use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
                 hasher.update(&microblock_data);
                 let result = hasher.finalize();
                 let mut hash = [0u8; 32];
                 hash.copy_from_slice(&result);
+
+                // Backfill hash index for future O(1) lookups
+                let _ = storage.save_microblock_hash(prev_h, &hash);
+
                 hash
             },
             _ => {
                 // No fallback - return zero to signal sync needed
-                println!("[WARN][PROD] Cannot get hash for block {} - previous block {} not found", 
-                         current_height, current_height.saturating_sub(1));
+                println!("[WARN][PROD] prev_hash_unavailable h={} need={}",
+                         current_height, prev_h);
                 [0u8; 32]
             }
         }

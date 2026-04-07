@@ -1485,10 +1485,20 @@ impl PersistentStorage {
         
         let key = format!("microblock_{}", height);
         
+        // v10.2: Compute block hash and store in index (same WriteBatch = atomic)
+        // This enables O(1) prev_hash validation without loading full block body.
+        // Hash is SHA3-256 of raw stored data — same as get_previous_microblock_hash() in node.rs.
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(data);
+        let block_hash = hasher.finalize();
+        let hash_key = format!("microblock_hash_{}", height);
+
         let mut batch = WriteBatch::default();
         batch.put_cf(&microblocks_cf, key.as_bytes(), data);
         batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
-        
+        batch.put_cf(&metadata_cf, hash_key.as_bytes(), block_hash.as_slice());
+
         self.db.write(batch)?;
         Ok(())
     }
@@ -1942,22 +1952,75 @@ impl PersistentStorage {
     pub fn load_microblock(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
-        
+
         let key = format!("microblock_{}", height);
         match self.db.get_cf(&microblocks_cf, key.as_bytes())? {
             Some(data) => Ok(Some(data)),
             None => Ok(None),
         }
     }
-    
+
+    /// v10.2: O(1) microblock hash lookup from index.
+    /// Returns SHA3-256 hash of stored block data without loading the full block.
+    /// Used for prev_hash validation — eliminates O(block_size) load+hash overhead.
+    pub fn load_microblock_hash(&self, height: u64) -> IntegrationResult<Option<[u8; 32]>> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+
+        let hash_key = format!("microblock_hash_{}", height);
+        match self.db.get_cf(&metadata_cf, hash_key.as_bytes())? {
+            Some(data) if data.len() == 32 => {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&data);
+                Ok(Some(hash))
+            }
+            Some(data) => {
+                eprintln!("[ERR][STORAGE] invalid_hash_index_len h={} len={}", height, data.len());
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// v10.2: Build hash index entry for a single block (used by migration).
+    /// Loads raw block data, computes SHA3-256, stores in metadata CF.
+    pub fn build_microblock_hash_index(&self, height: u64) -> IntegrationResult<bool> {
+        let microblocks_cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks CF not found".to_string()))?;
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata CF not found".to_string()))?;
+
+        let block_key = format!("microblock_{}", height);
+        match self.db.get_cf(&microblocks_cf, block_key.as_bytes())? {
+            Some(data) => {
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(&data);
+                let block_hash = hasher.finalize();
+                let hash_key = format!("microblock_hash_{}", height);
+                self.db.put_cf(&metadata_cf, hash_key.as_bytes(), block_hash.as_slice())?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Delete a microblock at the specified height (for fork resolution)
+    /// v10.2: Also removes hash index entry to keep index consistent
     pub fn delete_microblock(&self, height: u64) -> IntegrationResult<()> {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
-        
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+
         let key = format!("microblock_{}", height);
-        self.db.delete_cf(&microblocks_cf, key.as_bytes())?;
-        
+        let hash_key = format!("microblock_hash_{}", height);
+
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&microblocks_cf, key.as_bytes());
+        batch.delete_cf(&metadata_cf, hash_key.as_bytes());
+        self.db.write(batch)?;
+
         Ok(())
     }
     
@@ -3229,8 +3292,18 @@ impl Storage {
         let poh_cf = self.persistent.db.cf_handle("poh_state")
             .ok_or_else(|| IntegrationError::StorageError("poh_state CF not found".to_string()))?;
         let block_key = format!("microblock_{}", height);
+
+        // v10.2: Compute and store block hash in same atomic WriteBatch.
+        // O(1) prev_hash validation — no need to load+decompress full block.
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(&compressed_block);
+        let block_hash = hasher.finalize();
+        let hash_key = format!("microblock_hash_{}", height);
+
         batch.put_cf(&microblocks_cf, block_key.as_bytes(), &compressed_block);
         batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
+        batch.put_cf(&metadata_cf, hash_key.as_bytes(), block_hash.as_slice());
         batch.put_cf(&poh_cf, poh_key.as_bytes(), &poh_data);
         self.persistent.db.write(batch)?;
         
@@ -3249,7 +3322,88 @@ impl Storage {
     pub fn load_microblock(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
         self.persistent.load_microblock(height)
     }
-    
+
+    /// v10.2: O(1) microblock hash lookup from index.
+    /// Returns stored block hash without loading/decompressing the full block.
+    pub fn load_microblock_hash(&self, height: u64) -> IntegrationResult<Option<[u8; 32]>> {
+        self.persistent.load_microblock_hash(height)
+    }
+
+    /// v10.2: Save a hash index entry (used for backfilling during validation fallback).
+    pub fn save_microblock_hash(&self, height: u64, hash: &[u8]) -> IntegrationResult<()> {
+        let metadata_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata CF not found".to_string()))?;
+        let hash_key = format!("microblock_hash_{}", height);
+        self.persistent.db.put_cf(&metadata_cf, hash_key.as_bytes(), hash)?;
+        Ok(())
+    }
+
+    /// v10.2: Migrate existing blocks to hash index.
+    /// Called once at startup if migration flag not set.
+    /// Builds hash index for all existing microblocks.
+    pub fn migrate_microblock_hash_index(&self) -> IntegrationResult<u64> {
+        use crate::node::is_info;
+
+        let metadata_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata CF not found".to_string()))?;
+
+        // Check if migration already completed
+        if let Some(flag) = self.persistent.db.get_cf(&metadata_cf, b"hash_index_migrated")? {
+            if flag == b"1" {
+                if is_info() {
+                    println!("[INFO][STORAGE] hash_index_migration already_complete");
+                }
+                return Ok(0);
+            }
+        }
+
+        let chain_height = self.get_chain_height().unwrap_or(0);
+        if chain_height == 0 {
+            self.persistent.db.put_cf(&metadata_cf, b"hash_index_migrated", b"1")?;
+            return Ok(0);
+        }
+
+        println!("[INFO][STORAGE] hash_index_migration start blocks=0..{}", chain_height);
+
+        let mut indexed = 0u64;
+        let mut batch_count = 0u64;
+        let mut batch = rocksdb::WriteBatch::default();
+
+        let microblocks_cf = self.persistent.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks CF not found".to_string()))?;
+
+        for h in 0..=chain_height {
+            let block_key = format!("microblock_{}", h);
+            if let Some(data) = self.persistent.db.get_cf(&microblocks_cf, block_key.as_bytes())? {
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(&data);
+                let block_hash = hasher.finalize();
+                let hash_key = format!("microblock_hash_{}", h);
+                batch.put_cf(&metadata_cf, hash_key.as_bytes(), block_hash.as_slice());
+                indexed += 1;
+                batch_count += 1;
+
+                // Flush every 1000 blocks to limit memory usage
+                if batch_count >= 1000 {
+                    self.persistent.db.write(batch)?;
+                    batch = rocksdb::WriteBatch::default();
+                    batch_count = 0;
+                    if h % 10000 == 0 {
+                        println!("[INFO][STORAGE] hash_index_migration progress h={}/{} indexed={}", h, chain_height, indexed);
+                    }
+                }
+            }
+        }
+
+        // Flush remaining + set migration flag
+        batch.put_cf(&metadata_cf, b"hash_index_migrated", b"1");
+        self.persistent.db.write(batch)?;
+
+        println!("[INFO][STORAGE] hash_index_migration complete indexed={} total={}", indexed, chain_height);
+        Ok(indexed)
+    }
+
     /// Delete a microblock at the specified height (for fork resolution).
     /// v9.0: Also cleans up TX indices to prevent orphaned data.
     pub fn delete_microblock(&self, height: u64) -> IntegrationResult<()> {
