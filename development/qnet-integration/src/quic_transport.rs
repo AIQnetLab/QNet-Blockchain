@@ -56,10 +56,34 @@ const CONNECT_RETRY_ATTEMPTS: u32 = 3;
 const HANDSHAKE_RETRY_ATTEMPTS: u32 = 5;
 
 /// Delay between retry attempts (exponential backoff base)
-const RETRY_DELAY_MS: u64 = 50;
+/// v2.96: Split into CONNECT (handshake) and SEND (message delivery) delays.
+/// Connect uses aggressive backoff (1s base) because handshake storms are the problem.
+/// Send uses moderate delay (200ms base) because message delivery must stay responsive.
+const RETRY_DELAY_MS: u64 = 200;
 
-/// Maximum delay between retries (v2.45: reduced from 2000ms to 500ms)
-const MAX_RETRY_DELAY_MS: u64 = 500;
+/// Maximum delay between retries for send operations
+const MAX_RETRY_DELAY_MS: u64 = 2_000;
+
+/// v2.96: Connect-specific backoff base (1 second) — replaces RETRY_DELAY_MS for connect().
+/// At old 50ms: 4 peers × 5 subsystems × 5 retries = 100 handshakes/sec to restarting node.
+/// At 1000ms with jitter: reconnects spread over seconds.
+const CONNECT_RETRY_DELAY_MS: u64 = 1_000;
+
+/// v2.96: Connect-specific backoff ceiling (30 seconds).
+/// Aligned with production L1 backoff ranges (Avalanche: 1s-60s, CometBFT: 5s-8hrs).
+const CONNECT_MAX_RETRY_DELAY_MS: u64 = 30_000;
+
+/// v2.96: Per-peer reconnect cooldown — minimum seconds between connect() attempts to same addr.
+/// Multiple subsystems (sync, heartbeat, peer_exchange, BFT, macroblock) call connect() independently.
+/// Without cooldown, a single node generates 25+ handshake attempts/sec to one peer.
+/// With cooldown, max 1 attempt per PEER_RECONNECT_COOLDOWN_SECS regardless of caller count.
+const PEER_RECONNECT_COOLDOWN_SECS: u64 = 5;
+
+/// v2.96: Maximum concurrent outbound connection attempts.
+/// Prevents self-DoS when many peers disconnect simultaneously (e.g., network restart).
+/// Without limit: 1000 peers down → 1000 parallel handshakes → saturates CPU and network.
+/// With limit: orderly reconnection queue, 10 at a time.
+const MAX_CONCURRENT_OUTBOUND_DIALS: usize = 10;
 
 
 // ============================================================================
@@ -138,14 +162,21 @@ const MAX_CONCURRENT_HANDSHAKES: usize = 64;
 /// (observed: 2.5M throttled events in 1 hour — complete QUIC transport death).
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
-/// v9.3: Tiered per-IP connection limits.
-/// Genesis/validator IPs get higher limits for reliable consensus connectivity.
-/// Unknown IPs get stricter limits for DoS protection.
-/// RATIONALE: Standard L1 practice — trusted validators get preferential connection limits.
-/// With 5 genesis nodes × 100 = 500 connections (within global cap).
-/// Unknown IPs at 20 per IP × 500 global cap need 25+ IPs to saturate.
-const MAX_CONNECTIONS_PER_IP_GENESIS: u32 = 100;
-const MAX_CONNECTIONS_PER_IP_DEFAULT: u32 = 20;
+/// v2.96: Three-tier per-IP connection limits (aligned with production L1 patterns).
+///
+/// Tier 1 — Genesis: unlimited (u32::MAX). Only 5 IPs, hardcoded. Consensus must never
+///   be blocked by rate limiting between genesis nodes. Equivalent to CometBFT
+///   `unconditional_peer_ids` and Polkadot `reserved-nodes`.
+///
+/// Tier 2 — Known peers: 200. IPs that completed at least one successful QUIC handshake.
+///   Covers activated super-nodes with burn proof. High limit accommodates cloud hosting
+///   where multiple nodes share an IP (NAT, Contabo/Hetzner shared subnets).
+///
+/// Tier 3 — Unknown: 10. Never-seen IPs. Strict limit for DDoS protection.
+///   After first successful handshake, IP promoted to Tier 2 automatically.
+const MAX_CONNECTIONS_PER_IP_GENESIS: u32 = u32::MAX;
+const MAX_CONNECTIONS_PER_IP_KNOWN: u32 = 200;
+const MAX_CONNECTIONS_PER_IP_UNKNOWN: u32 = 10;
 
 /// v9.3: Check if IP belongs to a genesis node (compile-time known validators).
 fn is_genesis_ip(ip: &std::net::IpAddr) -> bool {
@@ -433,8 +464,19 @@ pub struct QuicTransport {
     cert_fingerprint_pins: Arc<DashMap<String, TofuPin>>,
     /// v9.1: Per-IP connection counter to prevent single-IP resource exhaustion.
     /// Maps IP → active connection count. Decremented on connection close.
-    /// Max MAX_CONNECTIONS_PER_IP concurrent connections from one IP address.
     per_ip_connections: Arc<DashMap<std::net::IpAddr, u32>>,
+    /// v2.96: Known peer IPs — promoted from unknown after first successful handshake.
+    /// Gets higher per_ip_limit (Tier 2). Persists for transport lifetime.
+    known_peer_ips: Arc<DashMap<std::net::IpAddr, ()>>,
+    /// v2.96: Per-peer reconnect cooldown — tracks last connect() attempt time per address.
+    /// Prevents reconnect storms when multiple subsystems independently trigger connect().
+    last_connect_attempt: Arc<DashMap<SocketAddr, Instant>>,
+    /// v2.96: Per-peer connect-in-progress guard — prevents parallel connect() to same addr.
+    /// Only one connect() flight per peer at a time; others get cached error immediately.
+    connect_in_progress: Arc<DashMap<SocketAddr, ()>>,
+    /// v2.96: Outbound dial semaphore — limits concurrent outbound handshakes.
+    /// Prevents self-DoS when many peers disconnect simultaneously.
+    outbound_dial_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl QuicTransport {
@@ -452,6 +494,10 @@ impl QuicTransport {
             peer_id_to_addr: None,
             cert_fingerprint_pins: Arc::new(DashMap::new()),
             per_ip_connections: Arc::new(DashMap::new()),
+            known_peer_ips: Arc::new(DashMap::new()),
+            last_connect_attempt: Arc::new(DashMap::new()),
+            connect_in_progress: Arc::new(DashMap::new()),
+            outbound_dial_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_OUTBOUND_DIALS)),
         }
     }
     
@@ -640,6 +686,7 @@ impl QuicTransport {
         let peer_id_to_addr_map = self.peer_id_to_addr.clone();
         let tofu_pins = self.cert_fingerprint_pins.clone();
         let per_ip_conns = self.per_ip_connections.clone();
+        let known_ips = self.known_peer_ips.clone();
 
         // Spawn server task
         tokio::spawn(async move {
@@ -692,26 +739,24 @@ impl QuicTransport {
                 
                 let peer_addr = incoming.remote_address();
 
-                // v9.5: Tiered per-IP connection limit — reject before TLS handshake to save CPU.
-                // Genesis/validator IPs get higher limits for consensus reliability.
-                // During active sync, increase default limit to prevent sync stalls.
+                // v2.96: Three-tier per-IP connection limit — reject before TLS handshake to save CPU.
+                // Tier 1 (Genesis): unlimited — consensus must never be blocked.
+                // Tier 2 (Known): 200 — peers that completed handshake before.
+                // Tier 3 (Unknown): 10 — strict DDoS protection for never-seen IPs.
                 let peer_ip = peer_addr.ip();
-                let is_syncing = crate::node::FAST_SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
-                    || crate::node::SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
-                let ip_limit = if is_genesis_ip(&peer_ip) {
-                    MAX_CONNECTIONS_PER_IP_GENESIS
-                } else if is_syncing {
-                    MAX_CONNECTIONS_PER_IP_DEFAULT * 3  // 60 during sync (3x normal)
+                let (ip_limit, tier_name) = if is_genesis_ip(&peer_ip) {
+                    (MAX_CONNECTIONS_PER_IP_GENESIS, "genesis")
+                } else if known_ips.contains_key(&peer_ip) {
+                    (MAX_CONNECTIONS_PER_IP_KNOWN, "known")
                 } else {
-                    MAX_CONNECTIONS_PER_IP_DEFAULT
+                    (MAX_CONNECTIONS_PER_IP_UNKNOWN, "unknown")
                 };
                 let current_ip_count = per_ip_conns.get(&peer_ip).map(|v| *v).unwrap_or(0);
                 if current_ip_count >= ip_limit {
                     incoming.refuse();
                     if crate::node::is_warn() {
                         println!("[WARN][QUIC] per_ip_limit ip={} count={} max={} tier={}",
-                                 peer_ip, current_ip_count, ip_limit,
-                                 if is_genesis_ip(&peer_ip) { "genesis" } else { "default" });
+                                 peer_ip, current_ip_count, ip_limit, tier_name);
                     }
                     continue;
                 }
@@ -727,6 +772,7 @@ impl QuicTransport {
                 let node_type_clone = node_type.clone();
                 let tofu_pins_clone = tofu_pins.clone();
                 let per_ip_conns_clone = per_ip_conns.clone();
+                let known_ips_clone = known_ips.clone();
                 let peer_ip_clone = peer_ip;
 
                 tokio::spawn(async move {
@@ -885,7 +931,9 @@ impl QuicTransport {
                     });
 
                     connections_clone.insert(peer_addr, quic_conn.clone());
-                    if is_info() { println!("[INFO][QUIC] conn_stored peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type); }
+                    // v2.96: Promote IP to known tier after successful handshake
+                    known_ips_clone.insert(peer_ip_clone, ());
+                    if is_info() { println!("[INFO][QUIC] conn_stored peer={} node={} type={} ip_tier=known", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type); }
 
                     // v6.5 FIX: Map remote_node_id → "IP:8001" in P2P peer_id_to_addr
                     // PROBLEM: Genesis nodes couldn't route responses to new nodes because
@@ -1282,7 +1330,7 @@ impl QuicTransport {
     
     /// Connect to a peer (client mode) with auto-retry
     /// CRITICAL: Thread-safe with double-check to prevent race conditions
-    /// v2.24: Improved retry logic for handshake failures
+    /// v2.96: Added per-peer cooldown, connect dedup, outbound semaphore, jitter
     pub async fn connect(&self, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
         // FIRST CHECK: Existing connection - but only if it's truly ALIVE (not a zombie)
         if let Some(conn) = self.connections.get(&peer_addr) {
@@ -1293,18 +1341,55 @@ impl QuicTransport {
                 self.connections.remove(&peer_addr);
             }
         }
-        
+
+        // v2.96: Per-peer reconnect cooldown — reject if last attempt was < COOLDOWN ago.
+        // This is the primary defense against reconnect storms: 5 subsystems calling connect()
+        // simultaneously all get instant rejection except the first one within the window.
+        if let Some(last) = self.last_connect_attempt.get(&peer_addr) {
+            let elapsed = last.value().elapsed();
+            if elapsed < Duration::from_secs(PEER_RECONNECT_COOLDOWN_SECS) {
+                return Err(format!("cooldown: {}ms remaining",
+                    (PEER_RECONNECT_COOLDOWN_SECS * 1000).saturating_sub(elapsed.as_millis() as u64)));
+            }
+        }
+
+        // v2.96: Connect-in-progress dedup — only one connect() flight per peer address.
+        // If another task is already connecting to this peer, return immediately.
+        if self.connect_in_progress.contains_key(&peer_addr) {
+            return Err("connect_in_progress: another task is already connecting to this peer".to_string());
+        }
+        self.connect_in_progress.insert(peer_addr, ());
+        // Scope guard: remove connect_in_progress on ALL exit paths
+        struct ConnectGuard { addr: SocketAddr, map: Arc<DashMap<SocketAddr, ()>> }
+        impl Drop for ConnectGuard {
+            fn drop(&mut self) { self.map.remove(&self.addr); }
+        }
+        let _connect_guard = ConnectGuard { addr: peer_addr, map: self.connect_in_progress.clone() };
+
+        // Record attempt time (even before acquiring semaphore — cooldown applies to queued attempts too)
+        self.last_connect_attempt.insert(peer_addr, Instant::now());
+
+        // v2.96: Outbound dial semaphore — limits concurrent outbound handshakes globally.
+        // Prevents self-DoS when many peers are down (e.g., network-wide restart).
+        // Peers wait in queue instead of all hammering simultaneously.
+        let _dial_permit = match tokio::time::timeout(
+            Duration::from_secs(10),
+            self.outbound_dial_semaphore.acquire()
+        ).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err("outbound_semaphore_closed".to_string()),
+            Err(_) => return Err("outbound_semaphore_timeout: too many pending dials".to_string()),
+        };
+
         let endpoint = self.endpoint.as_ref()
             .ok_or("Endpoint not initialized")?;
-        
-        // v2.24: Use extended retry for handshake failures (common at startup)
+
         let max_attempts = HANDSHAKE_RETRY_ATTEMPTS;
         let mut last_error = String::new();
         let mut handshake_failures = 0u32;
-        
+
         for attempt in 1..=max_attempts {
-            // CRITICAL FIX: Double-check before creating connection (race condition protection)
-            // Another task may have created connection while we were waiting
+            // Double-check: another task may have created connection while we were waiting
             if let Some(conn) = self.connections.get(&peer_addr) {
                 if crate::quic_transport::is_connection_alive(&conn) {
                     return Ok(conn.clone());
@@ -1312,11 +1397,13 @@ impl QuicTransport {
             }
 
             match self.try_connect_once(endpoint, peer_addr).await {
-                Ok(conn) => return Ok(conn),
+                Ok(conn) => {
+                    // v2.96: Promote peer IP to known tier on successful connection
+                    self.known_peer_ips.insert(peer_addr.ip(), ());
+                    return Ok(conn);
+                },
                 Err(e) => {
                     // v9.3: CERT_REJECTED — abort immediately, no retry.
-                    // The peer's TOFU pin is set. Retrying with the same cert fingerprint
-                    // will fail identically. Only wastes bandwidth and floods per_ip_limit.
                     if e.contains("CERT_REJECTED") || e.contains("TOFU_PIN_MISMATCH") || e.contains("Cert verification failed") {
                         if crate::node::is_warn() {
                             println!("[WARN][QUIC] cert_rejected_no_retry peer={} reason={}",
@@ -1325,32 +1412,35 @@ impl QuicTransport {
                         return Err(format!("CERT_REJECTED (no retry): {}", e));
                     }
 
-                    // v2.24: Track handshake failures separately
                     if e.contains("aborted by peer") || e.contains("handshake") {
                         handshake_failures += 1;
                     }
                     last_error = e;
 
                     if attempt < max_attempts {
-                        // v2.24: Exponential backoff with cap
-                        let base_delay = RETRY_DELAY_MS * (1 << (attempt - 1).min(5));
-                        let delay = Duration::from_millis(base_delay.min(MAX_RETRY_DELAY_MS));
+                        // v2.96: Exponential backoff 1s→2s→4s→8s→16s (capped at 30s) + jitter ±30%
+                        let base_delay = CONNECT_RETRY_DELAY_MS * (1u64 << (attempt - 1).min(5));
+                        let capped = base_delay.min(CONNECT_MAX_RETRY_DELAY_MS);
+                        // Jitter: multiply by 0.7-1.3 to desynchronize concurrent retries
+                        let jitter = 0.7 + (peer_addr.port() as f64 % 100.0) / 100.0 * 0.6
+                            + (attempt as f64 * 0.07);  // deterministic per-peer jitter
+                        let delay_ms = (capped as f64 * jitter) as u64;
+                        let delay = Duration::from_millis(delay_ms.max(500)); // floor 500ms
 
-                        if crate::node::is_warn() && (attempt % 2 == 1 || attempt == max_attempts - 1) {
-                            println!("[WARN][QUIC] conn_attempt_failed attempt={}/{} peer={} retry_in={:?}",
+                        if crate::node::is_warn() && (attempt == 1 || attempt == max_attempts - 1) {
+                            println!("[WARN][QUIC] conn_attempt_failed attempt={}/{} peer={} retry_in={}ms",
                                 attempt, max_attempts,
                                 get_privacy_id_for_addr(&peer_addr.to_string()),
-                                delay);
+                                delay_ms);
                         }
                         tokio::time::sleep(delay).await;
                     }
                 }
             }
         }
-        
-        // v2.24: More informative error message
+
         if handshake_failures > 0 {
-            Err(format!("Failed after {} attempts ({} handshake failures): {}", 
+            Err(format!("Failed after {} attempts ({} handshake failures): {}",
                 max_attempts, handshake_failures, last_error))
         } else {
             Err(format!("Failed to connect after {} attempts: {}", max_attempts, last_error))
@@ -1564,7 +1654,7 @@ impl QuicTransport {
                         }
                     }
                     if attempt < CONNECT_RETRY_ATTEMPTS {
-                        let delay = Duration::from_millis(RETRY_DELAY_MS * (1 << (attempt - 1)));
+                        let delay = Duration::from_millis((RETRY_DELAY_MS * (1 << (attempt - 1))).min(MAX_RETRY_DELAY_MS));
                         tokio::time::sleep(delay).await;
                     }
                 }
@@ -1642,7 +1732,7 @@ impl QuicTransport {
                         }
                     }
                     if attempt < CONNECT_RETRY_ATTEMPTS {
-                        let delay = Duration::from_millis(RETRY_DELAY_MS * (1 << (attempt - 1)));
+                        let delay = Duration::from_millis((RETRY_DELAY_MS * (1 << (attempt - 1))).min(MAX_RETRY_DELAY_MS));
                         tokio::time::sleep(delay).await;
                     }
                 }
@@ -1736,7 +1826,7 @@ impl QuicTransport {
                         }
                     }
                     if attempt < CONNECT_RETRY_ATTEMPTS {
-                        let delay = Duration::from_millis(RETRY_DELAY_MS * (1 << (attempt - 1)));
+                        let delay = Duration::from_millis((RETRY_DELAY_MS * (1 << (attempt - 1))).min(MAX_RETRY_DELAY_MS));
                         tokio::time::sleep(delay).await;
                     }
                 }
@@ -1989,7 +2079,12 @@ impl QuicTransport {
                 println!("[INFO][QUIC] health_check removed={} alive={}", removed, alive);
             }
         }
-        
+
+        // v2.96: Purge stale cooldown entries (older than 2× cooldown period)
+        // Prevents unbounded memory growth in last_connect_attempt map.
+        let cooldown_purge_threshold = Duration::from_secs(PEER_RECONNECT_COOLDOWN_SECS * 2);
+        self.last_connect_attempt.retain(|_, instant| instant.elapsed() < cooldown_purge_threshold);
+
         (alive, removed)
     }
     
