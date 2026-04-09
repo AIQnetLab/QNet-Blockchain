@@ -13282,12 +13282,41 @@ impl BlockchainNode {
                             std::sync::atomic::Ordering::Relaxed
                         );
                         crate::update_global_pricing_state(0.0, 5, genesis_block.timestamp);
-                        if is_info() { 
-                            println!("[INFO][GEN] genesis_ts_synced_from_storage old={} new={}", old_ts, genesis_block.timestamp); 
+                        if is_info() {
+                            println!("[INFO][GEN] genesis_ts_synced_from_storage old={} new={}", old_ts, genesis_block.timestamp);
                         }
                     }
                     // v3.36: CRITICAL — sync reward_manager genesis_ts so halving calc is correct
                     reward_manager_for_spawn.write().await.update_genesis_timestamp(genesis_block.timestamp);
+
+                    // v11.1: Ensure genesis TXs are applied even when genesis arrived via P2P
+                    // before this code path. Genesis may be in storage (from process_received_blocks)
+                    // but its PK registration TXs not yet applied to state/VRF registry.
+                    // Idempotent: cache_node_registrations skips already-registered nodes.
+                    if !genesis_block.transactions.is_empty() {
+                        let has_vrf_keys = crate::genesis_constants::has_vrf_key("genesis_node_001");
+                        if !has_vrf_keys {
+                            {
+                                let state_guard = state.write().await;
+                                match state_guard.apply_block_batch(&genesis_block.transactions) {
+                                    Ok(count) => {
+                                        if is_info() {
+                                            println!("[INFO][GEN] genesis_tx_applied count={}", count);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if is_warn() {
+                                            println!("[WARN][GEN] genesis_tx_apply_failed err={}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            Self::cache_node_registrations_from_transactions(&storage, &genesis_block.transactions);
+                            if is_info() {
+                                println!("[INFO][GEN] genesis_registrations_cached tx_count={}", genesis_block.transactions.len());
+                            }
+                        }
+                    }
                 } else {
                     if is_warn() { println!("[WARN][GEN] failed_to_load_genesis_for_ts_sync"); }
                 }
