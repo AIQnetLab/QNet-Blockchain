@@ -7701,7 +7701,9 @@ impl BlockchainNode {
         // ═══════════════════════════════════════════════════════════════════════
         let mut sync_order_buffer: std::collections::BTreeMap<u64, crate::unified_p2p::ReceivedBlock> =
             std::collections::BTreeMap::new();
-        const MAX_SYNC_BUFFER_SIZE: usize = 2000; // ~200MB max, covers 22+ chunks
+        // v11.0: Increased from 2000 to 4000 — with sequential sync, buffer pressure is lower
+        // but larger buffer handles edge cases during wave transitions
+        const MAX_SYNC_BUFFER_SIZE: usize = 4000;
 
         // DDoS PROTECTION: Track requested blocks to avoid duplicate requests
         // Key: block height, Value: (request timestamp, retry count)
@@ -7850,7 +7852,7 @@ impl BlockchainNode {
                         next_expected = 0;
                     } else {
                         // Genesis not in buffer AND not in storage — cannot drain anything
-                        // Blocks 1+ would fail MISSING_PREVIOUS:0, wasting cycles
+                        if is_debug() { println!("[DBG][SYNC-BUF] waiting_genesis buffered={}", sync_order_buffer.len()); }
                         continue;
                     }
                 }
@@ -9303,10 +9305,11 @@ impl BlockchainNode {
                         if is_debug() { println!("[DBG][BLOCK] pending_removed h={} retry=ok", received_block.height); }
                     }
                     
-                    // v3.0: Clear from sync queue dedup tracker after successful storage
-                    // This allows future re-requests if needed (e.g., after rollback)
+                    // v11.0: Completion-based cleanup — clear this block AND all below
+                    // Blocks below current height are already stored, no need to track
                     crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                    
+                    crate::unified_p2p::clear_blocks_below_height(received_block.height);
+
                     // v3.0: EVENT-DRIVEN sync completion (NOT polling!)
                     // Check if we've reached the target height and clear sync flags
                     let target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
@@ -9340,14 +9343,22 @@ impl BlockchainNode {
                                 println!("[INFO][SYNC] re-entering_sync: target_was={} reached={} best_peer={} new_target={}",
                                          target, our_height, best_peer_h, new_target);
 
-                                // Trigger continued sync from current position
+                                // v11.0: Trigger continued sync with CHUNKED sequential download
                                 if let Some(ref p2p) = unified_p2p {
                                     let p2p_clone = p2p.clone();
                                     let from_h = our_height + 1;
                                     let to_h = new_target;
                                     tokio::spawn(async move {
-                                        if let Err(e) = p2p_clone.sync_blocks(from_h, to_h).await {
-                                            println!("[WARN][SYNC] re-sync_err: {}", e);
+                                        let mut current = from_h;
+                                        while current <= to_h {
+                                            let chunk_end = std::cmp::min(current + 99, to_h);
+                                            if let Err(e) = p2p_clone.sync_blocks(current, chunk_end).await {
+                                                if crate::node::is_warn() {
+                                                    println!("[WARN][SYNC] re-sync_chunk_err h={}-{} err={}", current, chunk_end, e);
+                                                }
+                                            }
+                                            current = chunk_end + 1;
+                                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                         }
                                     });
                                 }
@@ -13699,20 +13710,56 @@ impl BlockchainNode {
                         if is_node_synced && desync_net_h > 0 && reg_our_h + 50 < desync_net_h {
                             NODE_IS_SYNCHRONIZED.store(false, std::sync::atomic::Ordering::SeqCst);
                             let gap = desync_net_h.saturating_sub(reg_our_h);
-                            println!("[WARN][DESYNC] post-sync desynchronization detected our={} best={} gap={} — re-syncing",
-                                     reg_our_h, desync_net_h, gap);
+                            if is_warn() { println!("[WARN][DESYNC] detected our={} best={} gap={}", reg_our_h, desync_net_h, gap); }
 
-                            // Re-enter sync: set target and spawn sync task
+                            // v11.0: Re-enter sync with CHUNKED sequential download
+                            // Old approach: single sync_blocks(from, to) for entire gap → only first 100 blocks sent
                             SYNC_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
                             SYNC_TARGET_HEIGHT.store(desync_net_h, std::sync::atomic::Ordering::SeqCst);
                             if let Some(ref p2p) = unified_p2p {
                                 let p2p_clone = p2p.clone();
+                                let storage_for_desync = storage.clone();
                                 let from_h = reg_our_h + 1;
                                 let to_h = desync_net_h;
                                 tokio::spawn(async move {
-                                    if let Err(e) = p2p_clone.sync_blocks(from_h, to_h).await {
-                                        println!("[WARN][DESYNC] re-sync_err: {}", e);
+                                    // Guard: clear SYNC_IN_PROGRESS on exit (panic/error safety)
+                                    struct DesyncGuard;
+                                    impl Drop for DesyncGuard {
+                                        fn drop(&mut self) {
+                                            SYNC_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        }
                                     }
+                                    let _guard = DesyncGuard;
+
+                                    // Sequential chunked sync — 100 blocks per request
+                                    let mut current = from_h;
+                                    let mut consecutive_fails = 0u32;
+                                    while current <= to_h {
+                                        let chunk_end = std::cmp::min(current + 99, to_h);
+                                        if let Err(e) = p2p_clone.sync_blocks(current, chunk_end).await {
+                                            consecutive_fails += 1;
+                                            if crate::node::is_warn() {
+                                                println!("[WARN][DESYNC] chunk_err h={}-{} fails={} err={}", current, chunk_end, consecutive_fails, e);
+                                            }
+                                            if consecutive_fails >= 10 {
+                                                if crate::node::is_warn() {
+                                                    println!("[WARN][DESYNC] abort fails=10 h={}", current);
+                                                }
+                                                break;
+                                            }
+                                        } else {
+                                            consecutive_fails = 0;
+                                        }
+                                        // Advance based on actual storage height (not just request range)
+                                        let actual_h = storage_for_desync.get_chain_height().unwrap_or(0);
+                                        if actual_h >= chunk_end {
+                                            current = chunk_end + 1;
+                                        } else {
+                                            current = actual_h + 1;
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    }
+                                    // _guard drops here → SYNC_IN_PROGRESS = false
                                 });
                             }
                         }
@@ -14016,27 +14063,32 @@ impl BlockchainNode {
                         
                         let last_block_time = LAST_BLOCK_PRODUCED_TIME.load(std::sync::atomic::Ordering::Relaxed);
                         let last_block_time = if last_block_time == 0 { genesis_ts } else { last_block_time };
-                        
+
                         // Local delay detection (triggers voting, NOT producer selection)
                         let local_delay = current_time.saturating_sub(last_block_time + 1);
-                        
+
+                        // v11.0: STALE LBPT PROTECTION after restart
+                        // After restart, LBPT comes from replay (last saved block timestamp).
+                        // If node was offline 30min, local_delay=1800s → timeout_round=1797 →
+                        // completely wrong producer selection → consensus stall.
+                        // FIX: Until PRODUCTION_UNLOCKED (set when first network block arrives),
+                        // cap local_delay to prevent stale-LBPT-driven round inflation.
+                        // Node still uses certified/adopted rounds from BFT protocol.
+                        let production_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
+                        let local_delay = if !production_unlocked && local_delay > 30 {
+                            // After restart with stale LBPT: cap delay to 30s
+                            // This prevents wrong timeout_round while allowing normal stall detection
+                            if is_info() {
+                                println!("[INFO][TIMEOUT] lbpt_stale_cap raw_delay={}s capped=30s production_locked=true", local_delay);
+                            }
+                            30
+                        } else {
+                            local_delay
+                        };
+
                         // Timeout constants: fast recovery when producer is unavailable.
-                        // Grace period: time to wait before declaring stall.
-                        // Must exceed normal block propagation delay (~1-2s) + processing (~1s).
-                        // Vote interval: time per rotation round.
-                        // v9.3: Fast timeout recovery (proven BFT parameters).
-                        // Grace: 3s (>RTT + block propagation). Vote interval: 1s per round.
-                        // With 6 candidates: full cycle = 6×1s + 3s = 9 seconds (was 5+6×3=23s).
-                        // Dead producer penalty: ~4s instead of ~8s. Critical for liveness.
                         const TIMEOUT_GRACE_PERIOD: u64 = 3;   // 3s grace before stall detection
                         const TIMEOUT_VOTE_INTERVAL: u64 = 1;  // 1s per rotation round
-
-                        // v5.4: No cap on timeout rounds. With modular rotation (base + round) % N,
-                        // any round deterministically selects a candidate. The old cap at 50 caused
-                        // permanent stalls: if the producer at round 50 was dead, the network froze
-                        // because rounds couldn't advance past 50. No round cap needed —
-                        // modular rotation works for any round value.
-                        // Old vote entries are cleaned up by DashMap TTL in cleanup_timeout_votes().
 
                         // Calculate proposed timeout round from delay (uncapped)
                         let proposed_timeout_round = if local_delay <= TIMEOUT_GRACE_PERIOD {
@@ -14091,16 +14143,17 @@ impl BlockchainNode {
                         set_timeout_round(timeout_round_for_rotation, next_height);
                         update_failover_metrics(local_delay, timeout_round_for_rotation);
 
-                        // v4.0: If we detect stall, vote for timeout (Byzantine consensus)
-                        // v9.5: CRITICAL — unsynced nodes MUST NOT vote. A node at h=100 sending
-                        // timeout votes into a network at h=6000 poisons consensus with stale
-                        // round numbers, causing fork detection and network halt.
-                        // Gate: only vote if we're within 20 blocks of best known peer height.
+                        // v11.0: HARDENED vote gate — unsynced/restarting nodes MUST NOT vote
+                        // Three conditions required:
+                        //   1. Height gap <= 20 blocks from best peer
+                        //   2. PRODUCTION_UNLOCKED = true (first network block received since restart)
+                        //   3. best_peer_h > 0 (don't bypass gate when peer heights unknown)
                         let our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                         let best_peer_h = if let Some(ref p2p) = unified_p2p {
                             p2p.get_best_peer_height()
                         } else { our_h };
-                        let is_synced_enough = best_peer_h == 0 || our_h + 20 >= best_peer_h;
+                        let is_synced_enough = production_unlocked
+                            && (best_peer_h == 0 || our_h + 20 >= best_peer_h);
 
                         if proposed_timeout_round > 0 && microblock_height > 0 && is_synced_enough {
                             if is_info() {
@@ -15130,9 +15183,23 @@ impl BlockchainNode {
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
 
-                // Post-restart safety: don't use local proposed_timeout_round after restart.
-                // With the fix to never fall back to proposed (only certified/adopted),
-                // this lockout is no longer needed — rotation is always consensus-driven.
+                // v11.0: HARD GATE — no production while sync in progress
+                // Prevents producing blocks at stale height while sync is still running.
+                // Node must be fully synchronized AND production unlocked (first network block received).
+                if is_my_turn_to_produce {
+                    let sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+                        || FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
+                    let prod_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
+                    let node_synced = NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed);
+
+                    if sync_active || (!prod_unlocked && microblock_height > 5) || !node_synced {
+                        if is_info() {
+                            println!("[INFO][PROD] gate_blocked h={} sync={} unlocked={} synced={}",
+                                     next_block_height, sync_active, prod_unlocked, node_synced);
+                        }
+                        is_my_turn_to_produce = false;
+                    }
+                }
 
                 // ═══════════════════════════════════════════════════════════════════════════
                 // v3.10 BUG 3 FIX: Check if we're excluded (e.g., after fork detection)

@@ -2754,19 +2754,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut genesis_signal_listener: Option<tokio::net::TcpListener> = None;
-    
+
     if is_genesis {
-        
+
         // Now bind signal_listener for GENESIS SYNC
-        println!("[GENESIS SYNC] 📡 Starting signal listener on port 8001...");
-        
+        if is_info() { println!("[INFO][GENESIS] signal_listener_start port=8001"); }
+
         let signal_listener = {
             let mut bound = None;
             for attempt in 1..=10u32 {
                 match tokio::net::TcpListener::bind("0.0.0.0:8001").await {
                     Ok(listener) => { bound = Some(listener); break; }
                     Err(e) => {
-                        println!("[WARN][GENESIS] port_8001_busy attempt={}/10 err={}", attempt, e);
+                        if is_warn() { println!("[WARN][GENESIS] port_8001_busy attempt={}/10 err={}", attempt, e); }
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                 }
@@ -2779,10 +2779,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         };
-        
-        println!("[GENESIS SYNC] ✅ Signal listener ready on port 8001");
-        println!("[GENESIS SYNC] ⏳ Waiting for other Genesis nodes to be ready...");
-        
+
+        if is_info() { println!("[INFO][GENESIS] signal_listener_ready port=8001"); }
+
         let genesis_ips = vec![
             "154.38.160.39",
             "62.171.157.44",
@@ -2790,39 +2789,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "5.189.130.160",
             "162.244.25.114",
         ];
-        
-        // Get our IP for self-skip
+
         let our_ip = get_physical_ip().await.unwrap_or_else(|_| "127.0.0.1".to_string());
         let mut ready_count = 0;
         let mut attempts = 0;
         const MAX_ATTEMPTS: u32 = 60; // 60 * 2s = 120 seconds max wait
         const REQUIRED_PEERS: usize = 4; // Need ALL 4 other Genesis nodes ready (5 total - 1 self = 4)
-        
+
+        if is_info() { println!("[INFO][GENESIS] waiting_for_peers required={}", REQUIRED_PEERS); }
+
         while ready_count < REQUIRED_PEERS && attempts < MAX_ATTEMPTS {
             attempts += 1;
             ready_count = 0;
-            
-            // Accept any incoming connections (non-blocking) to signal we're alive
-            // Use short timeout so we don't block the check loop
+
+            // Accept incoming TCP connections (non-blocking signal)
             loop {
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(10),
                     signal_listener.accept()
                 ).await {
-                    Ok(Ok((socket, _))) => {
-                        drop(socket); // Accept and drop - just signals we're alive
-                    }
-                    _ => break, // No more pending connections
+                    Ok(Ok((socket, _))) => { drop(socket); }
+                    _ => break,
                 }
             }
-            
+
             // Check other Genesis nodes
             for ip in &genesis_ips {
                 // Skip self
                 if *ip == our_ip {
                     continue;
                 }
-                
+
                 // Check if node API port is responding (TCP 8001)
                 let is_ready = match tokio::time::timeout(
                     std::time::Duration::from_secs(1),
@@ -2831,41 +2828,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Ok(_)) => true,
                     _ => false,
                 };
-                
+
                 if is_ready {
                     ready_count += 1;
                 }
             }
-            
+
             if ready_count >= REQUIRED_PEERS {
-                println!("[GENESIS SYNC] ✅ {} Genesis nodes ready, proceeding with startup", ready_count);
+                if is_info() { println!("[INFO][GENESIS] peers_ready count={} required={}", ready_count, REQUIRED_PEERS); }
                 break;
             }
-            
-            println!("[GENESIS SYNC] ⏳ {}/{} Genesis nodes ready (attempt {}/{}), waiting 2s...", 
-                     ready_count, REQUIRED_PEERS, attempts, MAX_ATTEMPTS);
+
+            if is_debug() { println!("[DEBUG][GENESIS] waiting ready={}/{} attempt={}/{}", ready_count, REQUIRED_PEERS, attempts, MAX_ATTEMPTS); }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        
+
         if ready_count < REQUIRED_PEERS {
-            println!("[GENESIS SYNC] ⚠️ Only {} Genesis nodes ready after {} attempts, starting anyway", 
-                     ready_count, attempts);
+            if is_warn() { println!("[WARN][GENESIS] partial_start ready={} attempts={} max={}", ready_count, attempts, MAX_ATTEMPTS); }
         }
-        
+
         // CRITICAL FIX v2.21.8: DO NOT drop listener here!
         // Keep it alive so connectivity_test in BlockchainNode::new() will PASS
         // Other nodes still have their listeners active = TCP 8001 is reachable
-        println!("[GENESIS SYNC] ✅ Keeping signal listener active for BlockchainNode creation...");
+        if is_info() { println!("[INFO][GENESIS] listener_kept_alive reason=blockchain_node_creation"); }
         genesis_signal_listener = Some(signal_listener);
-        
+
         // Note: QNET_PREFLIGHT_DONE=1 was set at line 2624 after preflight passed
         // BlockchainNode::new() will skip preflight checks because of this flag
-        
+
         // Brief wait for all nodes to reach this point
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    println!("🔍 DEBUG: About to create BlockchainNode...");
+    if is_debug() { println!("[DEBUG][NODE] creating_blockchain_node"); }
     let mut node = match BlockchainNode::new_with_config(
         &config.data_dir.to_string_lossy(),
         config.p2p_port,
@@ -2874,13 +2869,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         region,
     ).await {
         Ok(node) => {
-            println!("🔍 DEBUG: BlockchainNode created successfully");
+            if is_info() { println!("[INFO][NODE] blockchain_node_created"); }
             node
         }
         Err(e) => {
-            println!("❌ ERROR: BlockchainNode creation failed: {}", e);
-            eprintln!("❌ ERROR: BlockchainNode creation failed: {}", e);
-            println!("🔍 DEBUG: Error details: {:?}", e);
+            eprintln!("[ERROR][NODE] blockchain_node_failed err={}", e);
             return Err(format!("BlockchainNode creation failed: {}", e).into());
         }
     };
@@ -2892,7 +2885,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   Mempool deduplicates TX by hash, so double-call is safe.
     if !activation_code.is_empty() {
         if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
-            println!("⚠️  Warning: Could not save activation code: {}", e);
+            if is_warn() { println!("[WARN][NODE] activation_code_save_failed err={}", e); }
         }
     }
     
@@ -2903,7 +2896,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // BlockchainNode is created, connectivity_test passed (other nodes still have listeners)
     // Now we can drop our listener so RPC server can bind to 8001
     if let Some(listener) = genesis_signal_listener.take() {
-        println!("[GENESIS SYNC] 🔌 Releasing port 8001 for RPC server...");
+        if is_info() { println!("[INFO][GENESIS] releasing_port port=8001 reason=rpc_server"); }
         drop(listener);
         // Brief wait for OS to release socket
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2918,15 +2911,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // Start node
-    println!("🚀 Starting QNet node...");
+    if is_info() { println!("[INFO][NODE] starting"); }
     
     // DAEMON MODE: Prepare log file
     let log_file_path = std::path::Path::new(&config.data_dir).join("qnet-node.log");
-    println!("📝 Log file: {}", log_file_path.display());
-    
+    if is_debug() { println!("[DEBUG][NODE] log_file path={}", log_file_path.display()); }
+
     // Start the blockchain node (keep reference for peer injection)
     if let Err(e) = node.start().await {
-        eprintln!("❌ Node failed to start: {}", e);
+        eprintln!("[ERROR][NODE] start_failed err={}", e);
         return Err(format!("Node startup failed: {}", e).into());
     }
     
@@ -2934,21 +2927,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     
     // CRITICAL FIX: Now run DHT discovery AFTER API server is running
-    println!("🔍 API server ready - starting DHT peer discovery...");
+    if is_info() { println!("[INFO][NODE] api_ready starting_dht_discovery"); }
     let (_, discovered_peers) = scan_active_qnet_nodes().await;
-    
+
     // Add discovered peers to P2P system
     if !discovered_peers.is_empty() {
-        println!("🔗 Discovered {} peers, integrating with P2P network...", discovered_peers.len());
-        
+        if is_info() { println!("[INFO][P2P] discovered_peers count={}", discovered_peers.len()); }
+
         // FIXED: Now we can inject peers into the running node
         node.add_discovered_peers(&discovered_peers);
-        
-        for peer in &discovered_peers {
-            println!("🔗 Integrated active peer: {}", peer);
+
+        if is_debug() {
+            for peer in &discovered_peers {
+                println!("[DEBUG][P2P] integrated_peer addr={}", peer);
+            }
         }
-        
-        println!("✅ Peers successfully integrated into P2P network");
+
+        if is_info() { println!("[INFO][P2P] peers_integrated count={}", discovered_peers.len()); }
     }
     
     // Start background node monitoring
@@ -2974,9 +2969,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Monitor peer connections
             if let Ok(peer_count) = node_clone.get_peer_count().await {
                 if peer_count > 0 {
-                    println!("[MONITOR] ✅ {} peers connected", peer_count);
+                    if is_debug() { println!("[DEBUG][MONITOR] peers_connected count={}", peer_count); }
                 } else {
-                    println!("[MONITOR] ⚠️ No peers connected - running standalone");
+                    if is_warn() { println!("[WARN][MONITOR] no_peers_connected"); }
                 }
             }
 
@@ -3015,19 +3010,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => "localhost".to_string()
     };
     
-    println!("🚀 QNet Node #{} started successfully!", 
-        std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("N/A".to_string()));
-    println!("🌐 Region: {:?} | Type: {:?} | IP: {}", 
-        region, node_type, external_ip);
-    println!("📡 Endpoints: P2P={} RPC={} API={}", 
-        config.p2p_port, config.rpc_port, std::env::var("QNET_CURRENT_API_PORT").unwrap_or("8001".to_string()));
-    
-    println!("");
-    println!("📖 View detailed logs: docker logs -f qnet-node");
-    println!("🔍 Filter blockchain logs: docker logs qnet-node | grep \"Block #\\|Syncing\\|Macroblock\"");
-    println!("📊 Monitor P2P: docker logs qnet-node | grep \"peer\\|P2P\\|Connected\"");
-    println!("");
-    println!("=== BLOCKCHAIN LOGS (Live) ===");
+    if is_info() {
+        let node_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("N/A".to_string());
+        let api_port = std::env::var("QNET_CURRENT_API_PORT").unwrap_or("8001".to_string());
+        println!("[INFO][NODE] started node_id={} region={:?} type={:?} ip={} p2p={} rpc={} api={}",
+            node_id, region, node_type, external_ip, config.p2p_port, config.rpc_port, api_port);
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // PRODUCTION FIX v2.30: Graceful shutdown with certificate persistence

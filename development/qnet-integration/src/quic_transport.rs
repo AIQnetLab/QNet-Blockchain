@@ -170,7 +170,7 @@ const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 ///
 /// Tier 2 — Known peers: 200. IPs that completed at least one successful QUIC handshake.
 ///   Covers activated super-nodes with burn proof. High limit accommodates cloud hosting
-///   where multiple nodes share an IP (NAT, Contabo/Hetzner shared subnets).
+///   where multiple nodes share an IP (NAT, cloud shared subnets).
 ///
 /// Tier 3 — Unknown: 10. Never-seen IPs. Strict limit for DDoS protection.
 ///   After first successful handshake, IP promoted to Tier 2 automatically.

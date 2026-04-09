@@ -200,16 +200,19 @@ static EMERGENCY_FAILOVERS_IN_PROGRESS: Lazy<Arc<DashSet<String>>> =
 static PENDING_SYNC_BLOCKS: Lazy<DashMap<u64, u64>> = 
     Lazy::new(|| DashMap::new());
 
-// v3.0: Maximum blocks in sync queue before backpressure
-// Prevents OOM even if storage is slow to process
-const MAX_PENDING_SYNC_BLOCKS: usize = 1000;
+// v11.0: Maximum blocks in sync queue before backpressure
+// Increased from 1000 to 2000 — completion-based cleanup prevents TTL cycling
+const MAX_PENDING_SYNC_BLOCKS: usize = 2000;
 
-// v3.0: TTL for pending sync blocks (60 seconds)
-// If block not processed in 60s, remove from tracker to allow re-request
-const PENDING_SYNC_BLOCK_TTL_SECS: u64 = 60;
+// v11.0: REMOVED TTL-based cleanup — replaced with completion-based cleanup
+// Old TTL (60s) caused infinite remove/re-add cycles: blocks removed by timer,
+// re-added by retry → sync never progresses. Now blocks stay in pending until
+// explicitly completed (stored) or failed (max retries exhausted).
+// Kept as fallback safety net: 5 minutes (was 60s)
+const PENDING_SYNC_BLOCK_TTL_SECS: u64 = 300;
 
-// v2.104: Soft limit before cleanup triggers (80% of max)
-const SOFT_LIMIT_PENDING_SYNC_BLOCKS: usize = 800;
+// v11.0: Soft limit before cleanup triggers (80% of max)
+const SOFT_LIMIT_PENDING_SYNC_BLOCKS: usize = 1600;
 
 /// v3.0: Check if block is already pending in sync queue
 pub fn is_block_pending_sync(height: u64) -> bool {
@@ -255,99 +258,90 @@ pub fn cleanup_pending_sync_blocks() -> usize {
     removed
 }
 
-/// v3.0: Mark block as pending in sync queue
-/// v2.104: FIXED - On backpressure, cleanup stale entries first instead of dropping
+/// v11.0: Mark block as pending in sync queue — COMPLETION-BASED cleanup
 /// ═══════════════════════════════════════════════════════════════════════════
-/// PROBLEM (before v2.104):
-/// When queue reached 1000 entries, ALL new blocks were rejected.
-/// If node was behind, it could never catch up -> deadlock.
+/// ARCHITECTURE (v11.0):
+/// Blocks stay pending until EXPLICITLY completed via clear_block_pending_sync()
+/// or clear_blocks_below_height(). No TTL cycling.
 ///
-/// ADDITIONAL FIX v2.104:
-/// If block is ALREADY in pending but timestamp is OLD (>TTL), allow re-queue.
-/// This fixes case where block was added to pending but never processed.
+/// Cleanup strategy:
+/// 1. Already-pending fresh blocks are skipped (dedup)
+/// 2. Soft limit: evict blocks below local_height (already stored)
+/// 3. Hard limit: evict farthest-from-local blocks (re-requestable)
+/// 4. Stale safety net: 5 min TTL (was 60s) — only for truly stuck entries
 ///
-/// SOLUTION:
-/// 1. Soft limit (800): Trigger proactive cleanup
-/// 2. Hard limit (1000): Emergency cleanup of outdated entries
-/// 3. If block already in pending but stale (>TTL): allow re-queue
-/// 4. Only reject if queue is STILL full after cleanup
-///
-/// Returns false if already pending (and fresh) or queue is still full
+/// Returns false if already pending or queue full after cleanup
 /// ═══════════════════════════════════════════════════════════════════════════
 pub fn mark_block_pending_sync(height: u64) -> bool {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    
-    // v2.104: Check if block is already pending but STALE
-    // If pending for >TTL seconds, it likely never got processed - allow re-queue
+
+    // Dedup: if already pending and not ancient, skip
     if let Some(entry) = PENDING_SYNC_BLOCKS.get(&height) {
         let timestamp = *entry;
         if now.saturating_sub(timestamp) < PENDING_SYNC_BLOCK_TTL_SECS {
-            // Block is pending and fresh - skip
             return false;
         }
-        // Block is pending but stale - remove it to allow re-queue
-        drop(entry); // Release lock before remove
+        // Safety net: entry stuck for >5 min — allow re-queue
+        drop(entry);
         PENDING_SYNC_BLOCKS.remove(&height);
         if crate::node::is_debug() {
-            println!("[DBG][SYNC] stale_pending_cleared h={} age={}s", height, now.saturating_sub(timestamp));
+            println!("[DBG][SYNC] stale_safety_net h={} age={}s", height, now.saturating_sub(timestamp));
         }
     }
-    
-    // Soft limit: proactive cleanup
+
+    // Soft limit: evict already-processed blocks (below local_height)
     if PENDING_SYNC_BLOCKS.len() >= SOFT_LIMIT_PENDING_SYNC_BLOCKS {
-        cleanup_pending_sync_blocks();
+        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        let before = PENDING_SYNC_BLOCKS.len();
+        PENDING_SYNC_BLOCKS.retain(|h, _| *h >= local_height.saturating_sub(5));
+        let removed = before.saturating_sub(PENDING_SYNC_BLOCKS.len());
+        if removed > 0 && crate::node::is_info() {
+            println!("[INFO][SYNC] pending_evict_below local_h={} removed={} remaining={}",
+                     local_height, removed, PENDING_SYNC_BLOCKS.len());
+        }
     }
-    
-    // Hard limit: emergency cleanup with PRIORITY EVICTION
+
+    // Hard limit: evict farthest blocks from local_height
     if PENDING_SYNC_BLOCKS.len() >= MAX_PENDING_SYNC_BLOCKS {
         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-        let mut entries_to_remove: Vec<u64> = Vec::new();
-
-        // Phase 1: Remove entries below local height (already processed)
-        for entry in PENDING_SYNC_BLOCKS.iter() {
-            if *entry.key() < local_height.saturating_sub(5) {
-                entries_to_remove.push(*entry.key());
-            }
-        }
-
-        for h in &entries_to_remove {
+        let mut all_heights: Vec<u64> = PENDING_SYNC_BLOCKS.iter()
+            .map(|entry| *entry.key())
+            .collect();
+        all_heights.sort_by_key(|h| std::cmp::Reverse(h.abs_diff(local_height)));
+        // Evict top 25% farthest (was 50% — less aggressive now with larger buffer)
+        let evict_count = all_heights.len() / 4;
+        for h in all_heights.iter().take(evict_count) {
             PENDING_SYNC_BLOCKS.remove(h);
         }
-
-        // Phase 2: If still full, EVICT FARTHEST blocks from local_height.
-        // Near-height blocks are needed next; far blocks can be re-requested later.
-        // This prevents the deadlock where far blocks occupy all slots and
-        // near blocks (that the node needs to advance) get rejected.
-        if PENDING_SYNC_BLOCKS.len() >= MAX_PENDING_SYNC_BLOCKS {
-            let mut all_heights: Vec<u64> = PENDING_SYNC_BLOCKS.iter()
-                .map(|entry| *entry.key())
-                .collect();
-            // Sort by distance from local_height (farthest first)
-            all_heights.sort_by_key(|h| std::cmp::Reverse(h.abs_diff(local_height)));
-            // Evict top 50% (farthest blocks)
-            let evict_count = all_heights.len() / 2;
-            for h in all_heights.iter().take(evict_count) {
-                PENDING_SYNC_BLOCKS.remove(h);
-            }
-            if crate::node::is_info() {
-                println!("[INFO][SYNC] priority_eviction local_h={} evicted={} remaining={}",
-                         local_height, evict_count, PENDING_SYNC_BLOCKS.len());
-            }
+        if crate::node::is_info() {
+            println!("[INFO][SYNC] pending_evict_far local_h={} evicted={} remaining={}",
+                     local_height, evict_count, PENDING_SYNC_BLOCKS.len());
         }
 
         if PENDING_SYNC_BLOCKS.len() >= MAX_PENDING_SYNC_BLOCKS {
             if crate::node::is_warn() {
-                println!("[WARN][SYNC] queue_full_after_cleanup size={} rejecting={}",
-                         PENDING_SYNC_BLOCKS.len(), height);
+                println!("[WARN][SYNC] pending_full size={} rejecting={}", PENDING_SYNC_BLOCKS.len(), height);
             }
             return false;
         }
     }
-    
+
     PENDING_SYNC_BLOCKS.insert(height, now).is_none()
+}
+
+/// v11.0: Bulk-clear all pending entries at or below given height
+/// Called when local_height advances — these blocks are already stored
+pub fn clear_blocks_below_height(height: u64) {
+    let before = PENDING_SYNC_BLOCKS.len();
+    PENDING_SYNC_BLOCKS.retain(|h, _| *h > height);
+    let removed = before.saturating_sub(PENDING_SYNC_BLOCKS.len());
+    if removed > 0 && crate::node::is_debug() {
+        println!("[DBG][SYNC] pending_clear_below h={} removed={} remaining={}",
+                 height, removed, PENDING_SYNC_BLOCKS.len());
+    }
 }
 
 /// v3.0: Remove block from pending set after processing
@@ -10131,7 +10125,7 @@ impl SimplifiedP2P {
 
         // v2.95: Try QUIC (UDP) first — works even when TCP ports are blocked by firewalls.
         // This is critical for node updates: TCP connections break when containers restart,
-        // and many hosting providers (Contabo, etc.) block non-standard TCP ports.
+        // and some hosting providers block non-standard TCP ports.
         // UDP/QUIC is rarely blocked, so this ensures peer discovery always works.
         let quic_port: u16 = 10876; // Fixed QUIC port (API port 8001 + QUIC_PORT_OFFSET 2875)
         let quic_addr = format!("{}:{}", ip, quic_port);
@@ -10492,111 +10486,37 @@ impl SimplifiedP2P {
     }
 
     /// Download missing microblocks in parallel for faster synchronization
+    /// v11.0: SEQUENTIAL SYNC WITH PREFETCH — replaces parallel flood
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// ARCHITECTURE:
+    /// Instead of spawning 10 workers downloading random chunks simultaneously
+    /// (which floods PENDING_SYNC_BLOCKS and causes buffer eviction deadlocks),
+    /// use a SLIDING WINDOW approach:
+    ///
+    /// 1. Download blocks in sequential waves of WAVE_SIZE (50 blocks)
+    /// 2. Each wave: send requests to 3 peers in parallel (existing sync_blocks)
+    /// 3. Wait for wave to complete (poll storage every 200ms)
+    /// 4. Advance window, start next wave
+    /// 5. Prefetch: start next wave while current wave processes
+    ///
+    /// RESULT: Blocks arrive in near-order, sync_order_buffer drains continuously,
+    /// PENDING_SYNC_BLOCKS stays small, no eviction cascades.
+    /// ═══════════════════════════════════════════════════════════════════════════
     pub async fn parallel_download_microblocks(&self, storage: &Arc<crate::storage::Storage>, current_height: u64, target_height: u64) {
         if target_height <= current_height { return; }
-        
-        // OPTIMIZATION: Check which blocks are actually missing
-        let mut missing_blocks = Vec::new();
-        for height in (current_height + 1)..=target_height {
-            if storage.load_microblock(height).unwrap_or(None).is_none() {
-                missing_blocks.push(height);
-            }
-        }
-        
-        if missing_blocks.is_empty() {
-            if crate::node::is_info() {
-                println!("[SYNC] ✅ All blocks {}-{} already present, skipping download", 
-                         current_height + 1, target_height);
-            }
-            return;
-        }
-        
-        // PRODUCTION: Adaptive parallel download configuration based on node type
-        // OPTIMIZATION: Different resources for different node types
-        // Super/Full nodes: 15 workers, 50 blocks/chunk (fast sync, powerful hardware)
-        // Light nodes: 5 workers, 20 blocks/chunk (battery-friendly, mobile devices)
-        
-        // PRODUCTION: Detect node type from environment with safe default
-        // v3.18: Full nodes removed - default to "super" (server node) if not specified
-        let node_type = std::env::var("QNET_NODE_TYPE").unwrap_or_else(|_| "super".to_string());
-        
-        let (workers, chunk_size) = match node_type.to_lowercase().as_str() {
-            "light" => {
-                // Light nodes (mobile devices): Minimal resources
-                // - Only sync last 1000 blocks
-                // - Battery-friendly: 5 workers max
-                // - Small chunks for quick completion
-                (5, 20)
-            },
-            "super" => {
-                // Super nodes (servers): Balanced performance
-                // v3.18: Full nodes removed
-                // - Full blockchain sync
-                // - 10 workers = proven stable in production
-                // - Avoids network overload with many nodes
-                (10, 100)
-            },
-            _ => {
-                // FALLBACK: Unknown type defaults to Full node parameters
-                if crate::node::is_info() {
-                    println!("[SYNC] ⚠️ Unknown node type '{}', using Full node parameters", node_type);
-                }
-                (10, 100)
-            }
-        };
-        
-        let parallel_workers: usize = workers;
-        let chunk_size_blocks: u64 = chunk_size;
-        
-        // v10.3: Download only NEAREST missing blocks, not all at once.
-        // Downloading ALL ranges simultaneously floods PENDING_SYNC_BLOCKS (max 1000)
-        // with far-away blocks, causing backpressure that rejects near-height blocks
-        // the node actually needs next. This creates a sync deadlock where the node
-        // advances ~100 blocks per 60s TTL cycle instead of continuously.
-        //
-        // Solution: limit to nearest 500 blocks. The caller (fast sync loop) re-invokes
-        // as local_height advances, naturally sliding the window forward.
-        const MAX_SYNC_WINDOW: u64 = 500;
-        let actual_target = std::cmp::min(target_height, current_height + MAX_SYNC_WINDOW);
 
-        // Filter missing_blocks to only include blocks within the window
-        missing_blocks.retain(|h| *h <= actual_target);
-        
-        if crate::node::is_info() {
-            println!("[SYNC] ⚡ Starting parallel sync: {} blocks (target: {}) with {} workers", 
-                     missing_blocks.len(), actual_target, parallel_workers);
-        }
-        
-        // Split MISSING blocks into chunks for parallel processing
-        let mut chunks = Vec::new();
-        let mut i = 0;
-        
-        while i < missing_blocks.len() {
-            let chunk_end = std::cmp::min(i + chunk_size_blocks as usize, missing_blocks.len());
-            let chunk_blocks: Vec<u64> = missing_blocks[i..chunk_end].to_vec();
-            if !chunk_blocks.is_empty() {
-                let start = match chunk_blocks.first() { Some(s) => *s, None => continue };
-                let end = match chunk_blocks.last() { Some(e) => *e, None => continue };
-                chunks.push((start, end));
-            }
-            i = chunk_end;
-        }
-        
-        // Create parallel download tasks
-        let storage_arc = Arc::new(storage.clone());
-        let mut tasks = Vec::new();
-        
-        // Use semaphore to limit concurrent workers
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel_workers));
-        
-        // v9.3: Use height-filtered peers — only peers that have the blocks we need.
-        // Prevents empty_range responses when all peers are at same/lower height.
-        // Fallback: if no peers have target height, try any peer (they may have received blocks since last heartbeat).
+        let gap = target_height - current_height;
+
+        // Adaptive wave size based on gap
+        let wave_size: u64 = if gap > 1000 { 100 } else if gap > 100 { 50 } else { 20 };
+        // Max concurrent waves (prefetch ahead)
+        let max_prefetch_waves: u64 = 2;
+
+        // Select peers once for entire sync session
         let filtered_peers = self.get_sync_peers_filtered_by_height(20, target_height);
         let peers: Vec<String> = if filtered_peers.is_empty() {
-            // Fallback: any sync-capable peer (height may be stale)
             if crate::node::is_info() {
-                println!("[SYNC] no peers at h>={}, fallback=any_peer", target_height);
+                println!("[INFO][SYNC] no_peers_at_h={} fallback=any", target_height);
             }
             self.get_sync_peers_filtered(20).iter().map(|p| p.addr.clone()).collect()
         } else {
@@ -10604,118 +10524,156 @@ impl SimplifiedP2P {
         };
 
         if peers.is_empty() {
-            if crate::node::is_info() {
-                println!("[SYNC] no suitable sync peers available (blacklist/reputation/height filtered)");
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] no_sync_peers available");
             }
             return;
         }
-        
-        for (chunk_start, chunk_end) in chunks {
-            let storage_clone = storage_arc.clone();
-            let sem_clone = semaphore.clone();
-            let peers_clone = peers.clone();
-            
-            let task = tokio::spawn(async move {
-                let _permit = match sem_clone.acquire().await {
-                    Ok(p) => p,
-                    Err(_) => { println!("[SYNC] ⚠️ Semaphore closed"); return; }
-                };
-                
-                if crate::node::is_info() {
-                    println!("[SYNC] 🔄 Worker started for blocks {}-{}", chunk_start, chunk_end);
-                }
-                let start_time = std::time::Instant::now();
-                
-                // Download blocks in this chunk directly without self reference
-                Self::download_block_range_static(&peers_clone, &**storage_clone, chunk_start, chunk_end).await;
-                
-                let duration = start_time.elapsed();
-                if crate::node::is_info() {
-                    println!("[SYNC] ✅ Worker completed blocks {}-{} in {:.2}s", 
-                             chunk_start, chunk_end, duration.as_secs_f64());
-                }
-            });
-            
-            tasks.push(task);
-        }
-        
-        // Wait for all tasks to complete
-        let start_time = std::time::Instant::now();
-        futures::future::join_all(tasks).await;
-        
-        let duration = start_time.elapsed();
-        // CRITICAL FIX: Use actual_target (not target_height) for wave sync accuracy
-        let blocks_synced = actual_target - current_height;
-        let blocks_per_sec = if duration.as_secs_f64() > 0.0 {
-            blocks_synced as f64 / duration.as_secs_f64()
-        } else {
-            0.0
-        };
-        
+
         if crate::node::is_info() {
-            println!("[SYNC] 🎯 Parallel sync complete: {} blocks in {:.2}s ({:.1} blocks/sec)", 
-                     blocks_synced, duration.as_secs_f64(), blocks_per_sec);
+            println!("[INFO][SYNC] sequential_sync start h={} target={} gap={} wave={} peers={}",
+                     current_height, target_height, gap, wave_size, peers.len());
         }
-        
-        // CRITICAL: Verify chain integrity after parallel download
-        // Check for missing blocks that could cause consensus issues
-        let mut missing_blocks = Vec::new();
-        for height in (current_height + 1)..=target_height {
-            // CRITICAL FIX: Check for BOTH errors AND missing blocks (Ok(None))
-            if storage.load_microblock(height).unwrap_or(None).is_none() {
-                missing_blocks.push(height);
-            }
-        }
-        
-        if !missing_blocks.is_empty() {
-            if crate::node::is_info() {
-                println!("[SYNC] ⚠️ Chain integrity check failed: {} blocks missing", missing_blocks.len());
-            }
-            if crate::node::is_info() {
-                println!("[SYNC] ⚠️ Missing blocks: {:?}", &missing_blocks[..missing_blocks.len().min(10)]);
-            }
-            
-            // PRODUCTION: Request missing blocks sequentially to ensure chain continuity
-            for height in missing_blocks {
-                if crate::node::is_info() {
-                    println!("[SYNC] 🔄 Requesting missing block #{}", height);
+
+        let start_time = std::time::Instant::now();
+        let mut wave_start = current_height + 1;
+        let mut consecutive_empty_waves = 0u32;
+        let mut total_downloaded = 0u64;
+
+        while wave_start <= target_height {
+            let wave_end = std::cmp::min(wave_start + wave_size - 1, target_height);
+
+            // Check which blocks in this wave are actually missing
+            let mut wave_missing: Vec<(u64, u64)> = Vec::new();
+            let mut range_start: Option<u64> = None;
+            let mut range_end: u64 = 0;
+
+            for h in wave_start..=wave_end {
+                if storage.load_microblock(h).unwrap_or(None).is_none() {
+                    match range_start {
+                        None => { range_start = Some(h); range_end = h; }
+                        Some(_) => { range_end = h; }
+                    }
+                } else if let Some(rs) = range_start.take() {
+                    wave_missing.push((rs, range_end));
                 }
-                // Use existing download method for single blocks
-                Self::download_block_range_static(&peers, storage, height, height).await;
             }
-            
-            // Final verification - check ALL blocks are present
-            let mut still_missing = Vec::new();
-            for height in (current_height + 1)..=target_height {
-                match storage.load_microblock(height) {
-                    Ok(Some(_)) => {
-                        // Block exists
-                    },
-                    _ => {
-                        still_missing.push(height);
+            if let Some(rs) = range_start {
+                wave_missing.push((rs, range_end));
+            }
+
+            if wave_missing.is_empty() {
+                // All blocks in this wave already present — skip
+                wave_start = wave_end + 1;
+                continue;
+            }
+
+            // Download missing ranges in this wave (sequential, small batches)
+            for (range_from, range_to) in &wave_missing {
+                Self::download_block_range_static(&peers, &**storage, *range_from, *range_to).await;
+            }
+
+            // Wait for blocks to arrive (poll storage, max 15s per wave)
+            let wave_timeout = std::time::Duration::from_secs(15);
+            let wave_poll_start = std::time::Instant::now();
+            let mut wave_received = false;
+
+            while wave_poll_start.elapsed() < wave_timeout {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                // Check if first missing block arrived
+                let first_missing = wave_missing.first().map(|(f, _)| *f).unwrap_or(wave_start);
+                if storage.load_microblock(first_missing).unwrap_or(None).is_some() {
+                    // Count how many arrived
+                    let mut count = 0u64;
+                    for h in wave_start..=wave_end {
+                        if storage.load_microblock(h).unwrap_or(None).is_some() {
+                            count += 1;
+                        }
+                    }
+                    total_downloaded += count;
+
+                    // Good enough if 80% arrived (remainder picked up by integrity check)
+                    let wave_total = wave_end - wave_start + 1;
+                    if count >= wave_total * 4 / 5 || count == wave_total {
+                        wave_received = true;
+                        break;
                     }
                 }
             }
-            
-            if !still_missing.is_empty() {
-                if crate::node::is_info() {
-                    println!("[SYNC] ❌ Chain integrity failed: {} blocks still missing after retry", still_missing.len());
+
+            if !wave_received {
+                consecutive_empty_waves += 1;
+                if crate::node::is_warn() {
+                    println!("[WARN][SYNC] wave_timeout h={}-{} empty_streak={}", wave_start, wave_end, consecutive_empty_waves);
                 }
-                if crate::node::is_info() {
-                    println!("[SYNC] ❌ Missing blocks: {:?}", &still_missing[..still_missing.len().min(10)]);
+                if consecutive_empty_waves >= 5 {
+                    if crate::node::is_warn() {
+                        println!("[WARN][SYNC] sequential_sync_stalled at={} after 5 empty waves", wave_start);
+                    }
+                    break;
                 }
-                // PRODUCTION: Mark node as not synchronized if chain is broken
-                use crate::node::NODE_IS_SYNCHRONIZED;
-                NODE_IS_SYNCHRONIZED.store(false, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                if crate::node::is_info() {
-                    println!("[SYNC] ✅ Chain integrity restored: all blocks present");
+                // Retry same wave with brief delay
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+
+            consecutive_empty_waves = 0;
+            wave_start = wave_end + 1;
+
+            // Prefetch: fire-and-forget request for NEXT wave while we process current
+            if wave_start <= target_height {
+                let prefetch_end = std::cmp::min(wave_start + wave_size * max_prefetch_waves - 1, target_height);
+                let request = NetworkMessage::RequestBlocks {
+                    from_height: wave_start,
+                    to_height: prefetch_end,
+                    requester_id: self.node_id.clone(),
+                };
+                // Send to best peer (fire-and-forget, no wait)
+                if let Some(peer_addr) = peers.first() {
+                    self.send_network_message(peer_addr, request);
                 }
             }
-        } else {
-            if crate::node::is_info() {
-                println!("[SYNC] ✅ Chain integrity verified: all {} blocks present", blocks_synced);
+
+            // Brief yield to let block processing catch up
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let duration = start_time.elapsed();
+        let blocks_per_sec = if duration.as_secs_f64() > 0.0 {
+            total_downloaded as f64 / duration.as_secs_f64()
+        } else { 0.0 };
+
+        if crate::node::is_info() {
+            println!("[INFO][SYNC] sequential_sync_done downloaded={} time={:.1}s speed={:.1}blk/s",
+                     total_downloaded, duration.as_secs_f64(), blocks_per_sec);
+        }
+
+        // Integrity check: verify contiguous chain
+        let mut missing_count = 0u64;
+        let mut first_gap: Option<u64> = None;
+        let check_end = std::cmp::min(target_height, current_height + 500); // Check nearest 500
+        for height in (current_height + 1)..=check_end {
+            if storage.load_microblock(height).unwrap_or(None).is_none() {
+                missing_count += 1;
+                if first_gap.is_none() { first_gap = Some(height); }
             }
+        }
+
+        if missing_count > 0 {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] integrity_gaps={} first_gap={} range={}-{}",
+                         missing_count, first_gap.unwrap_or(0), current_height + 1, check_end);
+            }
+            // Patch gaps sequentially (critical blocks only — nearest 100)
+            let patch_end = std::cmp::min(check_end, current_height + 100);
+            for height in (current_height + 1)..=patch_end {
+                if storage.load_microblock(height).unwrap_or(None).is_none() {
+                    Self::download_block_range_static(&peers, &**storage, height, height).await;
+                }
+            }
+        } else if crate::node::is_info() {
+            println!("[INFO][SYNC] integrity_ok range={}-{}", current_height + 1, check_end);
         }
     }
     
