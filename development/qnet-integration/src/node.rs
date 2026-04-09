@@ -14074,7 +14074,29 @@ impl BlockchainNode {
                         // FIX: Until PRODUCTION_UNLOCKED (set when first network block arrives),
                         // cap local_delay to prevent stale-LBPT-driven round inflation.
                         // Node still uses certified/adopted rounds from BFT protocol.
-                        let production_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
+                        let mut production_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
+
+                        // v11.1: Auto-unlock when node is synchronized after restart
+                        // Without this, restarted nodes with existing data stay locked until
+                        // a new block is saved — creating a chicken-and-egg deadlock
+                        if !production_unlocked {
+                            let our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                            let best_h = if let Some(ref p2p) = unified_p2p {
+                                p2p.get_best_peer_height()
+                            } else { 0 };
+                            let peer_count = if let Some(ref p2p) = unified_p2p {
+                                p2p.get_validated_active_peers().len()
+                            } else { 0 };
+                            // Unlock if: has data, has peers, and within 20 blocks of best peer
+                            if our_h > 0 && peer_count > 0 && (best_h == 0 || our_h + 20 >= best_h) {
+                                PRODUCTION_UNLOCKED.store(1, Ordering::Relaxed);
+                                production_unlocked = true;
+                                if is_info() {
+                                    println!("[INFO][STATE] auto_unlock our_h={} best_h={} peers={}", our_h, best_h, peer_count);
+                                }
+                            }
+                        }
+
                         let local_delay = if !production_unlocked && local_delay > 30 {
                             // After restart with stale LBPT: cap delay to 30s
                             // This prevents wrong timeout_round while allowing normal stall detection

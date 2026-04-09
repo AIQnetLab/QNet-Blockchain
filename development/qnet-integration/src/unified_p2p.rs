@@ -7236,14 +7236,9 @@ impl SimplifiedP2P {
         let block_type = if assembly.is_macroblock { "macro".to_string() } else { "micro".to_string() };
         
         if let Some(ref block_tx) = &*block_tx_guard {
-            // v3.0 FIX: Deduplication for ShredProtocol path
-            if !mark_block_pending_sync(height) {
-                if crate::node::is_debug() {
-                    println!("[DBG][SHRED] block_skip_dup h={}", height);
-                }
-                return; // Already being processed
-            }
-            
+            // v11.1: Track pending (not a gate) — storage-level dedup in node.rs
+            mark_block_pending_sync(height);
+
             let received_block = ReceivedBlock {
                 height,
                 data: block_data,
@@ -7417,14 +7412,9 @@ impl SimplifiedP2P {
                 Err(p) => p.into_inner()
             };
             if let Some(ref block_tx) = &*block_tx_guard {
-                // v3.0 FIX: Deduplication for Reed-Solomon path
-                if !mark_block_pending_sync(height) {
-                    if crate::node::is_debug() {
-                        println!("[DBG][RS] block_skip_dup h={}", height);
-                    }
-                    return; // Already being processed
-                }
-                
+                // v11.1: Track pending (not a gate) — storage-level dedup in node.rs
+                mark_block_pending_sync(height);
+
                 let received_block = ReceivedBlock {
                     height,
                     data: block_data,
@@ -11592,25 +11582,15 @@ impl SimplifiedP2P {
                     Err(p) => p.into_inner()
                 };
                 match &*block_tx_guard {
-                    Some(_) => {}, // Silent success
-                    None => println!("[DIAGNOSTIC] ❌ Block channel is MISSING - this explains discarded blocks"),
+                    Some(_) => {},
+                    None => { if crate::node::is_warn() { println!("[WARN][P2P] block_channel_missing"); } },
                 }
                 
                 // PRODUCTION: Send block to main node for processing via storage
                 if let Some(ref block_tx) = &*block_tx_guard {
-                    // v3.0 FIX: DEDUPLICATION for broadcast path
-                    // Without this, same block from multiple peers causes memory leak
-                    // mark_block_pending_sync returns false if:
-                    // 1. Block already in pending queue (another peer sent it)
-                    // 2. Backpressure - queue full (MAX_PENDING_SYNC_BLOCKS)
-                    if !mark_block_pending_sync(height) {
-                        if crate::node::is_debug() {
-                            println!("[DBG][P2P] block_skip_dup h={} from={}", height, from_peer);
-                        }
-                        drop(block_tx_guard);
-                        return; // Skip duplicate - already being processed
-                    }
-                    
+                    // v11.1: Track pending (not a gate) — storage-level dedup in node.rs
+                    mark_block_pending_sync(height);
+
                     let received_block = ReceivedBlock {
                         height,
                         data,
@@ -17384,6 +17364,15 @@ impl SimplifiedP2P {
             return;
         }
         
+        // v11.1: Don't serve blocks we don't have — prevents empty batch spam
+        let our_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        if from_height > our_h && our_h > 0 {
+            if crate::node::is_info() {
+                println!("[INFO][SYNC] skip_above_our_height from={} our_h={} peer={}", from_height, our_h, requester_id);
+            }
+            return;
+        }
+
         // Validate request range (max 100 blocks per batch for performance)
         let max_batch = 100;
         let actual_to = if to_height.saturating_sub(from_height) > max_batch {
@@ -17391,26 +17380,22 @@ impl SimplifiedP2P {
         } else {
             to_height
         };
-        
+
         if crate::node::is_info() {
-            println!("[SYNC] 📤 Preparing blocks {}-{} for {}", from_height, actual_to, requester_id);
+            println!("[INFO][SYNC] serve heights={}-{} peer={}", from_height, actual_to, requester_id);
         }
         
         // CRITICAL FIX: Send sync request to node.rs where storage is available
         // v5.6: Include from_peer address so response can reach unregistered peers
         if let Some(ref sync_tx) = self.sync_request_tx {
             if let Err(e) = sync_tx.send((from_height, actual_to, requester_id.clone(), from_peer.to_string())) {
-                if crate::node::is_info() {
-                    println!("[SYNC] ❌ Failed to send sync request to node: {}", e);
-                }
-            } else {
-                if crate::node::is_info() {
-                    println!("[SYNC] ✅ Sync request forwarded to node for processing");
+                if crate::node::is_warn() {
+                    println!("[WARN][SYNC] request_forward_failed err={}", e);
                 }
             }
         } else {
-            if crate::node::is_info() {
-                println!("[SYNC] ⚠️ Sync request channel not available - sending empty response");
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] sync_channel_unavailable peer={}", requester_id);
             }
             
             // Fallback: send empty batch to prevent timeout
@@ -17425,7 +17410,7 @@ impl SimplifiedP2P {
             if let Some(peer_addr) = self.peer_id_to_addr.get(&requester_id) {
                 self.send_network_message(&peer_addr.clone(), response);
                 if crate::node::is_info() {
-                    println!("[SYNC] 📤 Sent empty response to {}", requester_id);
+                    println!("[INFO][SYNC] fallback_empty_batch peer={}", requester_id);
                 }
             } else {
                 // Fallback for Genesis nodes not in index
@@ -17433,7 +17418,7 @@ impl SimplifiedP2P {
                 if let Some(peer) = peers.iter().find(|p| p.id == requester_id) {
                     self.send_network_message(&peer.addr, response);
                     if crate::node::is_info() {
-                        println!("[SYNC] 📤 Sent empty response to {} (Genesis fallback)", requester_id);
+                        println!("[INFO][SYNC] fallback_empty_batch peer={} lookup=scan", requester_id);
                     }
                 }
             }
@@ -17497,24 +17482,17 @@ impl SimplifiedP2P {
             let mut skipped_backpressure = 0u32;
             
             for (height, data) in blocks {
-                // v3.0: LAYER 1 - Skip if already in pending queue (another peer sent it)
-                // mark_block_pending_sync returns false if already present OR backpressure
-                if !mark_block_pending_sync(height) {
-                    // Check why it failed
-                    if is_block_pending_sync(height) {
-                        skipped_pending += 1;
-                    } else {
-                        skipped_backpressure += 1;
-                    }
-                    continue;
-                }
-                
-                // v3.0: LAYER 2 - Skip if block already exists in storage
+                // v11.1: Dedup at STORAGE level only — never skip delivered blocks
+                // Previous dup_pending skip caused deadlock: block marked pending on first
+                // request, then every re-delivery skipped → block never reached sync_order_buffer.
+                // Now: always accept delivered blocks, let sync_order_buffer handle ordering.
                 if storage.load_microblock(height).unwrap_or(None).is_some() {
-                    clear_block_pending_sync(height); // Remove from pending since it's done
+                    clear_block_pending_sync(height);
                     skipped_exists += 1;
                     continue;
                 }
+                // Mark as pending (tracking only, not a gate)
+                mark_block_pending_sync(height);
                 
                 // Create ReceivedBlock for processing
                 let received_block = ReceivedBlock {

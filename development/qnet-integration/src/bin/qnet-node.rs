@@ -2743,19 +2743,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Catches port conflicts and network issues early — before any binding or P2P activity.
     if std::env::var("QNET_PREFLIGHT_DONE").unwrap_or_default() != "1" {
         let node_label = if is_genesis { "GENESIS" } else { "SUPER" };
-        println!("[{}] 🔍 Running pre-flight checks...", node_label);
+        if is_info() { println!("[INFO][PREFLIGHT] start node_type={}", node_label); }
         let external_ip = get_physical_ip().await.ok();
         if let Err(e) = qnet_integration::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
-            eprintln!("[FATAL][{}] Pre-flight checks failed: {} — restarting node", node_label, e);
+            eprintln!("[FATAL][PREFLIGHT] checks_failed node_type={} err={}", node_label, e);
             std::process::exit(1);
         }
         std::env::set_var("QNET_PREFLIGHT_DONE", "1");
-        println!("[{}] ✅ Pre-flight checks passed", node_label);
+        if is_info() { println!("[INFO][PREFLIGHT] passed node_type={}", node_label); }
     }
 
     let mut genesis_signal_listener: Option<tokio::net::TcpListener> = None;
 
-    if is_genesis {
+    // v11.1: Skip genesis sync on restart — only run on first network start
+    let has_existing_data = std::path::Path::new(&config.data_dir).join("CURRENT").exists();
+    if has_existing_data && is_genesis {
+        if is_info() { println!("[INFO][GENESIS] skip_genesis_sync reason=existing_data dir={}", config.data_dir.display()); }
+    }
+
+    if is_genesis && !has_existing_data {
 
         // Now bind signal_listener for GENESIS SYNC
         if is_info() { println!("[INFO][GENESIS] signal_listener_start port=8001"); }
