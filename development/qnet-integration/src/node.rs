@@ -11205,7 +11205,8 @@ impl BlockchainNode {
             //   - Solana: genesis snapshot via HTTP
             //   - Cosmos: genesis.json is a required config file
             // ════════════════════════════════════════════════════════════════════════
-            if !is_bootstrap_node && local_height == 0 {
+            // v11.1: ALL nodes (including bootstrap) download genesis via HTTP when resyncing
+            if local_height == 0 {
                 let has_genesis_already = self.storage.load_microblock(0)
                     .map(|opt| opt.is_some())
                     .unwrap_or(false);

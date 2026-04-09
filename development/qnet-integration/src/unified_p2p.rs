@@ -10526,7 +10526,10 @@ impl SimplifiedP2P {
         }
 
         let start_time = std::time::Instant::now();
-        let mut wave_start = current_height + 1;
+        // v11.1: Start from h=0 when genesis block is missing
+        let genesis_in_storage = current_height > 0
+            || storage.load_microblock(0).unwrap_or(None).is_some();
+        let mut wave_start = if genesis_in_storage { current_height + 1 } else { 0 };
         let mut consecutive_empty_waves = 0u32;
         let mut total_downloaded = 0u64;
 
