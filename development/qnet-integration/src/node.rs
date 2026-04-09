@@ -11200,10 +11200,7 @@ impl BlockchainNode {
             // PROBLEM: New nodes joining existing network deadlock in readiness loop
             //   because sync_blocks(0,0) via QUIC fails (genesis not stored as microblock).
             // SOLUTION: Download genesis block via HTTP REST API from any genesis node
-            //   BEFORE entering the readiness loop. This is the standard pattern:
-            //   - Ethereum: genesis.json downloaded out-of-band
-            //   - Solana: genesis snapshot via HTTP
-            //   - Cosmos: genesis.json is a required config file
+            //   BEFORE entering the readiness loop. Standard L1 bootnode pattern.
             // ════════════════════════════════════════════════════════════════════════
             // v11.1: ALL nodes (including bootstrap) download genesis via HTTP when resyncing
             if local_height == 0 {
@@ -11250,7 +11247,36 @@ impl BlockchainNode {
                                     // Try to store as microblock at height 0
                                     match self.storage.save_microblock(0, &block_data) {
                                         Ok(_) => {
-                                            println!("[GENESIS] ✅ Genesis block downloaded from {} ({} bytes)", ip, block_data.len());
+                                            if is_info() {
+                                                println!("[INFO][GEN] http_genesis_saved from={} size={}", ip, block_data.len());
+                                            }
+                                            // v11.1: Apply genesis TXs to state and register PKs.
+                                            // Without this, genesis is stored but PK registrations
+                                            // never processed — Dilithium keys missing, all blocks rejected.
+                                            let storage_for_genesis = self.storage.clone();
+                                            if let Ok(Ok(Some(genesis_mb))) = tokio::task::spawn_blocking(move || {
+                                                storage_for_genesis.load_microblock_auto_format(0)
+                                            }).await {
+                                                {
+                                                    let state_guard = self.state.write().await;
+                                                    match state_guard.apply_block_batch(&genesis_mb.transactions) {
+                                                        Ok(count) => {
+                                                            if is_info() {
+                                                                println!("[INFO][GEN] genesis_tx_applied count={}", count);
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            if is_warn() {
+                                                                println!("[WARN][GEN] genesis_tx_apply_failed err={}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Self::cache_node_registrations_from_transactions(&self.storage, &genesis_mb.transactions);
+                                                if is_info() {
+                                                    println!("[INFO][GEN] genesis_registrations_cached tx_count={}", genesis_mb.transactions.len());
+                                                }
+                                            }
                                             genesis_downloaded = true;
                                             break;
                                         }
@@ -12647,7 +12673,30 @@ impl BlockchainNode {
                             if let Ok(Some(existing_genesis)) = check {
                                 println!("[INFO][GEN] genesis received from network after {} attempts (ts={})",
                                          attempt, existing_genesis.timestamp);
-                                
+
+                                // v11.1: Apply genesis block TXs to state and register PKs.
+                                // Without this, synced genesis is stored but its PK registration
+                                // TXs are never processed — Dilithium keys missing, all blocks rejected.
+                                {
+                                    let state_guard = state.write().await;
+                                    match state_guard.apply_block_batch(&existing_genesis.transactions) {
+                                        Ok(count) => {
+                                            if is_info() {
+                                                println!("[INFO][GEN] genesis_tx_applied count={}", count);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if is_warn() {
+                                                println!("[WARN][GEN] genesis_tx_apply_failed err={}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Self::cache_node_registrations_from_transactions(&storage, &existing_genesis.transactions);
+                                if is_info() {
+                                    println!("[INFO][GEN] genesis_registrations_cached tx_count={}", existing_genesis.transactions.len());
+                                }
+
                                 if let Ok(stored_height) = storage.get_chain_height() {
                                     microblock_height = stored_height;
                                     *height.write().await = stored_height;
@@ -13058,15 +13107,41 @@ impl BlockchainNode {
                         
                         match genesis_check {
                             Ok(Some(genesis_block)) => {
-                                println!("[INFO][GEN] Genesis block received after {} attempts", 
+                                println!("[INFO][GEN] Genesis block received after {} attempts",
                                         genesis_wait_attempts);
+
+                                // v11.1: Apply genesis block TXs to state and register PKs.
+                                // Without this, synced genesis is stored but its PK registration
+                                // TXs are never processed — Dilithium keys missing, all blocks rejected.
+                                {
+                                    let state_guard = state.write().await;
+                                    match state_guard.apply_block_batch(&genesis_block.transactions) {
+                                        Ok(count) => {
+                                            if is_info() {
+                                                println!("[INFO][GEN] genesis_tx_applied count={}", count);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if is_warn() {
+                                                println!("[WARN][GEN] genesis_tx_apply_failed err={}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Self::cache_node_registrations_from_transactions(&storage, &genesis_block.transactions);
+                                if is_info() {
+                                    println!("[INFO][GEN] genesis_registrations_cached tx_count={}", genesis_block.transactions.len());
+                                }
+
                                 // Update height from storage
                                 if let Ok(stored_height) = storage.get_chain_height() {
                                     microblock_height = stored_height;
                                     *height.write().await = stored_height;
-                                    println!("[GENESIS] 📊 Height synchronized to {}", stored_height);
+                                    if is_info() {
+                                        println!("[INFO][GEN] height_synced h={}", stored_height);
+                                    }
                                 }
-                                
+
                                 // CRITICAL FIX v3.15: Update GLOBAL_GENESIS_TIMESTAMP from received Genesis!
                                 // Without this, nodes 002-005 use their LOCAL start time instead of 
                                 // the actual Genesis timestamp from node 001, causing timestamp validation
