@@ -718,7 +718,7 @@ impl PersistentStorage {
             match opened {
                 Some(db) => db,
                 None => {
-                    eprintln!("[FATAL][STORAGE] RocksDB open failed after 10 attempts: {}", last_err);
+                    eprintln!("[CRIT][STORAGE] rocksdb_open_failed attempts=10 err={}", last_err);
                     return Err(IntegrationError::StorageError(
                         format!("RocksDB initialization failed after 10 attempts: {}", last_err)
                     ));
@@ -1286,9 +1286,7 @@ impl PersistentStorage {
         
         if force_reset != "1" || confirm_reset != "YES" {
             println!("[WARN][STORAGE] refusing_chain_height_reset");
-            println!("[Storage]    To reset, set BOTH:");
-            println!("[Storage]    - QNET_FORCE_RESET=1");
-            println!("[Storage]    - QNET_CONFIRM_RESET=YES");
+            println!("[INFO][STORAGE] to_reset set QNET_FORCE_RESET=1 and QNET_CONFIRM_RESET=YES");
             return Err(IntegrationError::StorageError(
                 "Chain height reset blocked - missing confirmation flags".to_string()
             ));
@@ -1297,8 +1295,7 @@ impl PersistentStorage {
         // Additional safety: Log the reset with timestamp
         let timestamp = chrono::Utc::now();
         println!("[WARN][STORAGE] chain_height_reset_initiated");
-        println!("[Storage]    Timestamp: {}", timestamp);
-        println!("[Storage]    Requested by: QNET_FORCE_RESET + QNET_CONFIRM_RESET");
+        println!("[INFO][STORAGE] chain_height_reset timestamp={} requested_by=QNET_FORCE_RESET+QNET_CONFIRM_RESET", timestamp);
         
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
@@ -3720,7 +3717,7 @@ impl Storage {
         let last_micro = macro_number * 90;
         let first_micro = last_micro.saturating_sub(89); // 90 blocks total
         
-        println!("[PRUNING] Macroblock #{} finalizes microblocks {}-{}", 
+        println!("[INFO][STORAGE] macroblock_finalizes macro={} microblocks={}-{}",
                 macro_number, first_micro, last_micro);
         
         // Delete the finalized microblocks
@@ -4560,16 +4557,16 @@ impl Storage {
         if post_cleanup_percentage >= 90.0 {
             println!("[WARN][STORAGE] post_emergency_still_critical pct={:.1}%", post_cleanup_percentage);
             println!("[WARN][STORAGE] admin_action_required urgency=immediate");
-            println!("[Storage]    1. Add more disk space immediately");
-            println!("[Storage]    2. Set QNET_MAX_STORAGE_GB=500 or higher");
-            println!("[Storage]    3. Monitor disk usage closely");
-            println!("[Storage]    4. Consider moving to server with larger storage");
+            println!("[WARN][STORAGE] action_required step=1 msg=add_more_disk_space_immediately");
+            println!("[WARN][STORAGE] action_required step=2 msg=set_QNET_MAX_STORAGE_GB_500_or_higher");
+            println!("[WARN][STORAGE] action_required step=3 msg=monitor_disk_usage_closely");
+            println!("[WARN][STORAGE] action_required step=4 msg=consider_moving_to_larger_storage");
             println!("[WARN][STORAGE] node_storage_critical accept_blocks=degraded");
         } else {
             println!("[INFO][STORAGE] emergency_cleanup_done pct={:.1}%", post_cleanup_percentage);
             println!("[INFO][STORAGE] recommended_actions");
-            println!("[Storage]    1. Consider increasing QNET_MAX_STORAGE_GB=500");
-            println!("[Storage]    2. Plan for long-term storage growth");
+            println!("[INFO][STORAGE] recommended step=1 msg=consider_increasing_QNET_MAX_STORAGE_GB_500");
+            println!("[INFO][STORAGE] recommended step=2 msg=plan_for_long_term_storage_growth");
         }
         
         Ok(())
@@ -6310,7 +6307,7 @@ impl Storage {
         // Apply time-based cleanup
         if old_count > 0 {
             self.persistent.db.write(batch)?;
-            println!("[STORAGE] Cleaned up {} failover events older than 30 days", old_count);
+            println!("[INFO][STORAGE] failover_cleanup count={} older_than_days=30", old_count);
         }
         
         // Second safety check: if still too many events, trim oldest
@@ -6325,7 +6322,7 @@ impl Storage {
             }
             
             self.persistent.db.write(batch)?;
-            println!("[STORAGE] Trimmed {} oldest failover events to maintain {} limit", to_delete, max_events);
+            println!("[INFO][STORAGE] failover_trimmed count={} limit={}", to_delete, max_events);
         }
         
         Ok(())
@@ -7416,7 +7413,7 @@ impl Storage {
                 if pruned_count % 1000 == 0 {
                     self.persistent.db.write(batch)?;
                     batch = WriteBatch::default();
-                    println!("[PRUNING] Pruned {} blocks...", pruned_count);
+                    println!("[INFO][STORAGE] pruning_progress count={}", pruned_count);
             }
         }
         
@@ -7736,7 +7733,7 @@ impl Storage {
                     }
                 }
             },
-            Err(e) => println!("[SNAPSHOT] Failed to query peer {}: {}", peer_addr, e),
+            Err(e) => println!("[WARN][STORAGE] snapshot_peer_query_failed peer={} err={}", peer_addr, e),
         }
         
         Ok(None)
@@ -7972,7 +7969,7 @@ impl Storage {
                 match serde_json::from_slice::<StoredContractInfo>(&data) {
                     Ok(stored) => Ok(Some(stored)),
                     Err(e) => {
-                        println!("[Storage] Failed to deserialize contract info: {:?}", e);
+                        println!("[WARN][STORAGE] contract_info_deserialize_failed err={:?}", e);
                         Ok(None)
                     }
                 }
@@ -8040,7 +8037,7 @@ impl Storage {
                 match String::from_utf8(data) {
                     Ok(value) => Ok(Some(value)),
                     Err(e) => {
-                        println!("[Storage] Failed to decode contract state: {:?}", e);
+                        println!("[WARN][STORAGE] contract_state_decode_failed err={:?}", e);
                         Ok(None)
                     }
                 }

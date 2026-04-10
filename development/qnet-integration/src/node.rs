@@ -445,7 +445,7 @@ pub fn init_global_storage(storage: Arc<Storage>) {
 /// Get reference to global storage (panics if not initialized)
 #[inline]
 pub fn get_storage() -> &'static Arc<Storage> {
-    GLOBAL_STORAGE_INSTANCE.get().expect("[FATAL][STORAGE] not_initialized")
+    GLOBAL_STORAGE_INSTANCE.get().expect("[CRIT][STORAGE] not_initialized")
 }
 
 /// Try to get reference to global storage (returns None if not initialized)
@@ -863,7 +863,7 @@ pub async fn init_global_quantum_crypto() -> Result<(), String> {
 /// For performance-critical paths - avoid Option checks
 #[inline]
 pub fn get_quantum_crypto() -> &'static Arc<crate::quantum_crypto::QNetQuantumCrypto> {
-    GLOBAL_QUANTUM_CRYPTO.get().expect("[FATAL][CRYPTO] not_initialized call=init_global_quantum_crypto")
+    GLOBAL_QUANTUM_CRYPTO.get().expect("[CRIT][CRYPTO] not_initialized call=init_global_quantum_crypto")
 }
 
 /// Try to get reference to global quantum crypto (returns None if not initialized)
@@ -1003,7 +1003,7 @@ pub fn init_global_mempool(mempool: Arc<qnet_mempool::SimpleMempool>) {
 /// Get reference to global mempool (panics if not initialized)
 #[inline]
 pub fn get_mempool() -> &'static Arc<qnet_mempool::SimpleMempool> {
-    GLOBAL_MEMPOOL_INSTANCE.get().expect("[FATAL][MEMPOOL] not_initialized")
+    GLOBAL_MEMPOOL_INSTANCE.get().expect("[CRIT][MEMPOOL] not_initialized")
 }
 
 /// Try to get reference to global mempool (returns None if not initialized)
@@ -1471,6 +1471,19 @@ pub struct BlockchainNode {
     vrf_instance: Option<Arc<crate::crypto::vrf::DilithiumVrf>>,
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// v10.0: BlockApplyResult — returned by apply_block_to_state()
+// Contains merkle root + all deferred side effects for caller persistence.
+// ═══════════════════════════════════════════════════════════════════════
+struct BlockApplyResult {
+    merkle_root: [u8; 32],
+    reward_accruals: Vec<(String, u64)>,
+    deferred_pool3: u64,
+    deferred_registrations: Vec<(String, String, String)>,
+    deferred_emission_mbs: Vec<u64>,
+    deferred_reward_clears: Vec<(String, u64)>,
+}
+
 #[allow(dead_code)]
 impl BlockchainNode {
     /// Get reward manager for RPC integration
@@ -1649,7 +1662,254 @@ impl BlockchainNode {
     pub fn get_deterministic_reputation(&self) -> Arc<ParkingRwLock<DeterministicReputationState>> {
         self.deterministic_reputation.clone()
     }
-    
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // v10.0: SINGLE apply_block_to_state() — used by ALL code paths:
+    //   - Startup replay (TIER 2 incremental, TIER 3 full)
+    //   - Recovery replay (state_root_mismatch fast-forward)
+    //   - Normal block processing (sync from network)
+    //
+    // This eliminates divergence between replay and live processing.
+    // Caller handles: pre-image recording, state_root verification,
+    // rollback, and deferred side effect persistence.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Apply a block's transactions to state. This is the SINGLE source of truth
+    /// for state mutation ordering. All 7 phases are executed in deterministic order:
+    ///
+    ///   Phase 1: emit_rewards for emission TXs + parse reward accruals
+    ///   Phase 2: apply_transaction_lazy + gas_refund (only on success)
+    ///   Phase 3: credit_producer_fees_once
+    ///   Phase 4: accrue_pending_rewards
+    ///   Phase 5: finalize_merkle
+    ///   Phase 6: update chain_state.height
+    ///
+    /// Parameters:
+    ///   - state_guard: write-locked StateManager
+    ///   - microblock: the block to apply
+    ///   - storage: for loading node registrations (producer wallet lookup)
+    ///   - block_snapshot: if Some, pre-images are recorded before each mutation (for rollback)
+    ///   - processed_emission_mbs: if Some, skip emission TXs whose MB index is already in the set
+    ///                             (prevents double emission during normal processing).
+    ///                             If None, all emissions are applied unconditionally (replay mode).
+    fn apply_block_to_state(
+        state_guard: &StateManager,
+        microblock: &MicroBlock,
+        storage: &crate::storage::Storage,
+        mut block_snapshot: Option<&mut qnet_state::BlockSnapshot>,
+        processed_emission_mbs: Option<&std::collections::HashSet<u64>>,
+    ) -> BlockApplyResult {
+        let h = microblock.height;
+
+        let mut result = BlockApplyResult {
+            merkle_root: [0u8; 32],
+            reward_accruals: Vec::new(),
+            deferred_pool3: 0,
+            deferred_registrations: Vec::new(),
+            deferred_emission_mbs: Vec::new(),
+            deferred_reward_clears: Vec::new(),
+        };
+
+        // ── Phase 1: Process emission TXs — update total_supply + parse reward accruals ──
+        const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+        const MICROBLOCKS_PER_MB: u64 = 90;
+
+        for tx in &microblock.transactions {
+            if tx.tx_type != qnet_state::TransactionType::RewardDistribution
+               || tx.from != "system_emission" {
+                continue;
+            }
+
+            // Calculate emission MB index for double-emission check
+            let current_epoch = h / EMISSION_BLOCK_INTERVAL;
+            let emission_mb_index = if current_epoch >= 2 {
+                let rewarding_epoch = current_epoch.saturating_sub(2);
+                let rewarding_epoch_end_block = rewarding_epoch.saturating_add(1).saturating_mul(EMISSION_BLOCK_INTERVAL);
+                rewarding_epoch_end_block / MICROBLOCKS_PER_MB
+            } else {
+                0
+            };
+
+            // Check double-emission (only during normal processing, not replay)
+            let skip = if let Some(processed) = processed_emission_mbs {
+                processed.contains(&emission_mb_index)
+            } else {
+                false
+            };
+
+            if skip {
+                if is_debug() {
+                    println!("[DBG][STATE] emission_skip_dup mb={} h={} (already via MacroBlock)", emission_mb_index, h);
+                }
+            } else {
+                if let Err(e) = state_guard.emit_rewards(tx.amount) {
+                    eprintln!("[WARN][STATE] emission_failed err={}", e);
+                } else {
+                    if is_info() {
+                        let new_supply = state_guard.get_total_supply();
+                        println!("[INFO][STATE] emission_from_tx mb={} amount={} total={} QNC h={}",
+                                 emission_mb_index, tx.amount / 1_000_000_000, new_supply / 1_000_000_000, h);
+                    }
+                    if emission_mb_index > 0 {
+                        result.deferred_emission_mbs.push(emission_mb_index);
+                    }
+                }
+            }
+
+            // Parse per-wallet reward accruals (v7.0 JSON v2 format)
+            if let Some(ref data) = tx.data {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                    if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
+                        if let Some(accruals) = parsed.get("accruals").and_then(|v| v.as_object()) {
+                            for (wallet, amount_val) in accruals {
+                                if let Some(amount) = amount_val.as_u64() {
+                                    if amount > 0 {
+                                        result.reward_accruals.push((wallet.clone(), amount));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Phase 2: Apply all transactions + gas refund on success ──
+        for tx in &microblock.transactions {
+            // Record pre-images BEFORE mutation (for rollback support)
+            if let Some(ref mut snap) = block_snapshot {
+                let affected = tx.get_all_affected_addresses();
+                snap.record_pre_images(&affected, &state_guard.accounts);
+            }
+
+            if let Err(e) = state_guard.apply_transaction_lazy(tx) {
+                if is_debug() {
+                    println!("[DBG][STATE] tx_skip h={} err={}", h, e);
+                }
+            } else {
+                // Record post-mutation pre-image of sender (gas refund will modify it)
+                if let Some(ref mut snap) = block_snapshot {
+                    snap.record_pre_images(&[tx.from.clone()], &state_guard.accounts);
+                }
+                let _ = state_guard.apply_gas_refund(tx, h);
+
+                // Collect deferred side effects from successful TXs
+                match &tx.tx_type {
+                    qnet_state::TransactionType::NodeActivation {
+                        amount,
+                        phase: qnet_state::account::ActivationPhase::Phase2,
+                        ..
+                    } => {
+                        if *amount > 0 {
+                            result.deferred_pool3 = result.deferred_pool3.saturating_add(*amount);
+                        }
+                    }
+                    qnet_state::TransactionType::BatchNodeActivations { activation_data, .. } => {
+                        let total_pool3: u64 = activation_data.iter()
+                            .filter(|d| d.activation_amount > 0)
+                            .map(|d| d.activation_amount)
+                            .sum();
+                        if total_pool3 > 0 {
+                            result.deferred_pool3 = result.deferred_pool3.saturating_add(total_pool3);
+                        }
+                    }
+                    qnet_state::TransactionType::NodeRegistration {
+                        node_id, node_type, wallet_address, ..
+                    } => {
+                        let type_str = match node_type {
+                            qnet_state::NodeType::Super => "super",
+                            qnet_state::NodeType::Light => "light",
+                        };
+                        result.deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone()));
+                    }
+                    qnet_state::TransactionType::NodeActivation { node_type, .. } => {
+                        let type_str = match node_type {
+                            qnet_state::account::NodeType::Super => "super",
+                            qnet_state::account::NodeType::Light => "light",
+                        };
+                        let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
+                        result.deferred_registrations.push((activation_id, type_str.to_string(), tx.from.clone()));
+                    }
+                    _ => {}
+                }
+
+                // Reward claim clears
+                if tx.tx_type == qnet_state::TransactionType::RewardDistribution
+                   && tx.from == "system_rewards_pool" {
+                    if let Some(ref data) = tx.data {
+                        let parts: Vec<&str> = data.split(':').collect();
+                        if parts.len() >= 2 && parts[0] == "reward_claim" {
+                            result.deferred_reward_clears.push((parts[1].to_string(), tx.amount));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Phase 3: Credit producer fees ──
+        if microblock.fees_collected > 0 {
+            let producer_wallet = match storage.load_node_registration(&microblock.producer) {
+                Ok(Some((_, wallet, _))) => wallet,
+                _ => {
+                    if is_warn() {
+                        println!("[WARN][FEES] producer_wallet_not_found producer={} h={}", microblock.producer, h);
+                    }
+                    String::new()
+                }
+            };
+            if !producer_wallet.is_empty() {
+                if let Some(ref mut snap) = block_snapshot {
+                    snap.record_pre_images(&[producer_wallet.clone()], &state_guard.accounts);
+                }
+                match state_guard.credit_producer_fees_once(h, &producer_wallet, microblock.fees_collected) {
+                    Ok(true) => {
+                        if is_info() && microblock.fees_collected > 10_000_000 {
+                            println!("[INFO][FEES] credited producer={} wallet={}... fees={} nanoQNC h={}",
+                                     microblock.producer,
+                                     &producer_wallet[..16.min(producer_wallet.len())],
+                                     microblock.fees_collected, h);
+                        }
+                    }
+                    Ok(false) => {
+                        if is_debug() {
+                            println!("[DBG][FEES] skip_dup h={} (already credited)", h);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[ERR][FEES] credit_failed producer={} wallet={} fees={} err={}",
+                                 microblock.producer, producer_wallet, microblock.fees_collected, e);
+                    }
+                }
+            }
+        }
+
+        // ── Phase 4: Apply reward accruals (affects merkle root) ──
+        if !result.reward_accruals.is_empty() {
+            for (wallet, delta) in &result.reward_accruals {
+                if let Some(ref mut snap) = block_snapshot {
+                    snap.record_pre_images(&[wallet.clone()], &state_guard.accounts);
+                }
+                if let Err(e) = state_guard.accrue_pending_rewards(wallet, *delta) {
+                    eprintln!("[WARN][REWARDS] accrue_fail wallet={}... err={}",
+                             &wallet[..wallet.len().min(16)], e);
+                }
+            }
+        }
+
+        // ── Phase 5: Finalize merkle tree ──
+        result.merkle_root = state_guard.finalize_merkle();
+
+        // ── Phase 6: Update chain_state.height ──
+        {
+            let mut chain_state = state_guard.chain_state.write();
+            if h > chain_state.height {
+                chain_state.height = h;
+            }
+        }
+
+        result
+    }
+
     /// PRODUCTION v2.40: Compute automatic jails
     /// 
     /// ARCHITECTURE DECISION: NO JAIL for commit-without-reveal!
@@ -5208,7 +5468,7 @@ impl BlockchainNode {
                     
                     eprintln!("");
                     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                    eprintln!("🚨 FATAL: PRE-FLIGHT CHECKS FAILED!");
+                    eprintln!("[CRIT][NODE] PRE-FLIGHT CHECKS FAILED");
                     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     eprintln!("{}", e);
                     eprintln!("");
@@ -5385,7 +5645,7 @@ impl BlockchainNode {
                 if is_info() { println!("[INFO][STATE] fork_flag_not_set pending_rewards_in_merkle (pre-v7.1 DB)"); }
             }
             Err(e) => {
-                eprintln!("[WARN][STATE] fork_flag_load_fail err={} — will be determined by replay", e);
+                eprintln!("[WARN][STATE] fork_flag_load_fail err={} fallback=replay", e);
             }
         }
 
@@ -5403,7 +5663,7 @@ impl BlockchainNode {
         match storage.load_latest_state_snapshot().await {
             Ok(Some((snapshot_height, state_root, accounts_data, snap_total_supply))) => {
                 if snapshot_height > pre_snapshot_chain_height {
-                    eprintln!("[WARN][STATE] snapshot_ahead_of_chain snapshot={} chain={} — discarding",
+                    eprintln!("[WARN][STATE] snapshot_ahead_of_chain snapshot_h={} chain_h={} action=discard",
                               snapshot_height, pre_snapshot_chain_height);
                 } else if !accounts_data.is_empty() {
                     // v5.1: Try bincode with allow_trailing_bytes for forward compatibility
@@ -5435,7 +5695,7 @@ impl BlockchainNode {
                                         // v5.2: Legacy v1 snapshot has no total_supply — force full replay
                                         // Clear already-restored accounts to prevent double-counting
                                         state_guard.clear();
-                                        eprintln!("[WARN][STATE] v1_snapshot_no_total_supply height={} — cleared state, falling back to full replay",
+                                        eprintln!("[WARN][STATE] v1_snapshot_no_total_supply height={} action=clear_and_full_replay",
                                                   snapshot_height);
                                         // Don't set restored_snapshot_height → TIER 3 will run
                                     }
@@ -5446,7 +5706,7 @@ impl BlockchainNode {
                                         println!("[INFO][STATE] snapshot_merkle_verified root={}...",
                                                  hex::encode(&state_root[..8]));
                                     } else {
-                                        eprintln!("[WARN][STATE] snapshot_merkle_drift expected={} computed={} — will correct via replay",
+                                        eprintln!("[WARN][STATE] snapshot_merkle_drift expected={} computed={} action=correct_via_replay",
                                                   hex::encode(&state_root[..8]), hex::encode(&computed_merkle[..8]));
                                     }
                                 }
@@ -5509,80 +5769,17 @@ impl BlockchainNode {
                             last_replayed_block_timestamp = microblock.timestamp;
                             let state_guard = state.write().await;
 
-                            // ── Phase 1: Collect deferred reward accruals from emission TXs ──
-                            let mut deferred_reward_accruals: Vec<(String, u64)> = Vec::new();
-                            for tx in &microblock.transactions {
-                                // Process emission TXs: update total_supply
-                                if tx.tx_type == qnet_state::TransactionType::RewardDistribution
-                                   && tx.from == "system_emission" {
-                                    let _ = state_guard.emit_rewards(tx.amount);
-                                }
-                                // Parse per-wallet reward accruals (v7.0 JSON v2 format)
-                                if tx.tx_type == qnet_state::TransactionType::RewardDistribution
-                                   && tx.from == "system_emission" {
-                                    if let Some(ref data) = tx.data {
-                                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                                            if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
-                                                if let Some(accruals) = parsed.get("accruals").and_then(|v| v.as_object()) {
-                                                    for (wallet, amount_val) in accruals {
-                                                        if let Some(amount) = amount_val.as_u64() {
-                                                            if amount > 0 {
-                                                                deferred_reward_accruals.push((wallet.clone(), amount));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // ── Phase 2: Apply all transactions ──
-                            // Gas refund ONLY on successful TX (matches normal block processing)
-                            for tx in &microblock.transactions {
-                                if let Err(e) = state_guard.apply_transaction_lazy(tx) {
-                                    if is_debug() {
-                                        println!("[DBG][REPLAY] tx_skip h={} err={}", h, e);
-                                    }
-                                } else {
-                                    let _ = state_guard.apply_gas_refund(tx, h);
-                                }
-                            }
-
-                            // ── Phase 3: Credit producer fees (affects merkle root!) ──
-                            if microblock.fees_collected > 0 {
-                                let producer_wallet = match storage.load_node_registration(&microblock.producer) {
-                                    Ok(Some((_, wallet, _))) => wallet,
-                                    _ => String::new(),
-                                };
-                                if !producer_wallet.is_empty() {
-                                    let _ = state_guard.credit_producer_fees_once(
-                                        h, &producer_wallet, microblock.fees_collected
-                                    );
-                                }
-                            }
-
-                            // ── Phase 4: Apply reward accruals (affects merkle root!) ──
+                            // v10.0: Use shared apply_block_to_state (replay mode: no snapshot, no emission check)
                             let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
-                            for (wallet, delta) in &deferred_reward_accruals {
-                                let _ = state_guard.accrue_pending_rewards(wallet, *delta);
-                            }
-                            // v7.1: Persist fork flag on first activation
-                            if !fork_was_active && qnet_state::is_pending_rewards_in_merkle() {
+                            let apply_result = Self::apply_block_to_state(
+                                &state_guard, &microblock, &storage, None, None,
+                            );
+
+                            // v7.1: Persist fork flag on first activation during replay
+                            if !fork_was_active && !apply_result.reward_accruals.is_empty()
+                               && qnet_state::is_pending_rewards_in_merkle() {
                                 let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
                                 println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (startup replay h={})", h);
-                            }
-
-                            // ── Phase 5: Finalize merkle tree ──
-                            let _computed_root = state_guard.finalize_merkle();
-
-                            // ── Phase 6: Update chain_state.height for consistency ──
-                            {
-                                let mut chain_state = state_guard.chain_state.write();
-                                if h > chain_state.height {
-                                    chain_state.height = h;
-                                }
                             }
 
                             replayed += 1;
@@ -5756,7 +5953,7 @@ impl BlockchainNode {
                         reason: "Genesis node cannot start with fallback ID".to_string(),
                         recoverable: false,
                     });
-                    panic!("[FATAL] Genesis node cannot start with fallback ID! Check QNET_BOOTSTRAP_ID environment variable!");
+                    panic!("[CRIT][GEN] genesis_fallback_id_fatal msg=check_QNET_BOOTSTRAP_ID");
                 }
             } else {
                 if is_info() { println!("[INFO][NODE] genesis_id_validated id={}", node_id); }
@@ -8646,282 +8843,39 @@ impl BlockchainNode {
                                 }
                             }
                             
-                            // Deferred side effects — applied ONLY after save_microblock succeeds.
-                            // On rollback (state_root mismatch / save failure) these are discarded.
-                            let mut deferred_pool3: u64 = 0;
-                            let mut deferred_registrations: Vec<(String, String, String)> = Vec::new();
-                            let mut deferred_emission_mbs: Vec<u64> = Vec::new();
-                            let mut deferred_reward_clears: Vec<(String, u64)> = Vec::new();
-                            // v7.0: Deferred reward accruals from emission TX — applied to state via block execution
-                            let mut deferred_reward_accruals: Vec<(String, u64)> = Vec::new();
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v10.0: Use shared apply_block_to_state() — SINGLE code path
+                            // for all state mutations. Caller handles snapshot, emission check,
+                            // state_root verification, and deferred side effect persistence.
+                            // ═══════════════════════════════════════════════════════════════════
 
-                            // Apply ALL transactions from block to state
-                            for tx in &microblock.transactions {
-                                // SPECIAL HANDLING: RewardDistribution transactions
-                                // These update total_supply on non-producer nodes
-                                if tx.tx_type == qnet_state::TransactionType::RewardDistribution 
-                                   && tx.from == "system_emission" {
-                                    if is_debug() { println!("[DBG][STATE] emission_tx amount={} block={}", 
-                                             tx.amount / 1_000_000_000, microblock.height); }
-                                    
-                                    // v3.0: CRITICAL FIX - Prevent double emission!
-                                    // emit_rewards is ALREADY called in process_macroblock_heartbeats_deterministic
-                                    // when MacroBlock is processed (by INITIATOR or PARTICIPANT).
-                                    // Emission TX is only for blockchain audit record.
-                                    // Only call emit_rewards here if MacroBlock was NOT processed yet
-                                    // (e.g., node syncing microblocks before macroblocks).
-                                    
-                                    // ARCHITECTURE: DELAYED REWARD by 1 epoch (4 hours)
-                                    // Epochs: epoch = height / 14400
-                                    //   Epoch 0: blocks 0-14399
-                                    //   Epoch 1: blocks 14400-28799
-                                    //   Epoch 2: blocks 28800-43199
-                                    //
-                                    // Emission TX timeline:
-                                    // - Block 14400 (current_epoch=1): NO emission TX (skip)
-                                    // - Block 28800 (current_epoch=2): Emission TX for epoch 0, using MB 160
-                                    // - Block 43200 (current_epoch=3): Emission TX for epoch 1, using MB 320
-                                    //
-                                    // Formula: rewarding_epoch = current_epoch - 2
-                                    //          emission_mb = (rewarding_epoch + 1) * 14400 / 90
-                                    
-                                    const EMISSION_BLOCK_INTERVAL: u64 = 14400;
-                                    const MICROBLOCKS_PER_MB: u64 = 90;
-                                    
-                                    // Calculate which emission MB this TX belongs to (DELAYED REWARD!)
-                                    let current_epoch = microblock.height / EMISSION_BLOCK_INTERVAL;
-                                    let emission_mb_index = if current_epoch >= 2 {
-                                        // Delayed by 1 epoch: rewarding_epoch = current_epoch - 2
-                                        let rewarding_epoch = current_epoch.saturating_sub(2);
-                                        let rewarding_epoch_end_block = rewarding_epoch.saturating_add(1).saturating_mul(EMISSION_BLOCK_INTERVAL);
-                                        rewarding_epoch_end_block / MICROBLOCKS_PER_MB
-                                        // Block 28800: epoch=2, rewarding=0, end=14400, mb=160 ✓
-                                        // Block 43200: epoch=3, rewarding=1, end=28800, mb=320 ✓
-                                    } else {
-                                        // current_epoch < 2: No emission TX should exist
-                                        0  // Will not match any processed MB
-                                    };
-                                    
-                                    // Check if this emission MB was already processed via MacroBlock
-                                    let already_processed = {
-                                        let reward_mgr = reward_manager.read().await;
-                                        let processed = reward_mgr.get_processed_emission_macroblocks();
-                                        processed.contains(&emission_mb_index)
-                                    };
-                                    
-                                    if already_processed {
-                                        // Skip - already processed via MacroBlock (prevents double emission!)
-                                        if is_debug() { 
-                                            println!("[DBG][STATE] emission_skip_dup mb={} block={} (already via MacroBlock)", 
-                                                     emission_mb_index, microblock.height); 
-                                        }
-                                    } else {
-                                        // Not yet processed via MacroBlock - apply from TX
-                                        // This happens during sync when microblocks arrive before macroblocks
-                                    if let Err(e) = state_guard.emit_rewards(tx.amount) {
-                                        eprintln!("[WARN][STATE] emission_failed err={}", e);
-                                    } else {
-                                        let new_supply = state_guard.get_total_supply();
-                                            if is_info() { 
-                                                println!("[INFO][STATE] emission_from_tx mb={} amount={} total={} QNC", 
-                                                         emission_mb_index, tx.amount / 1_000_000_000, new_supply / 1_000_000_000); 
-                                            }
-                                            
-                                            if emission_mb_index > 0 {
-                                                deferred_emission_mbs.push(emission_mb_index);
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                // v7.0: Parse per-wallet accruals from emission TX for deterministic application
-                                if tx.tx_type == qnet_state::TransactionType::RewardDistribution
-                                   && tx.from == "system_emission" {
-                                    if let Some(ref data) = tx.data {
-                                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                                            if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
-                                                if let Some(accruals) = parsed.get("accruals").and_then(|v| v.as_object()) {
-                                                    for (wallet, amount_val) in accruals {
-                                                        if let Some(amount) = amount_val.as_u64() {
-                                                            if amount > 0 {
-                                                                deferred_reward_accruals.push((wallet.clone(), amount));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                // v2.75: Handle CLAIM transactions (from system_rewards_pool)
-                                // When another node claims, remove their pending_reward locally
-                                // This ensures all nodes stay in sync
-                                if tx.tx_type == qnet_state::TransactionType::RewardDistribution 
-                                   && tx.from == "system_rewards_pool" {
-                                    // Extract node_id from tx.data: "reward_claim:{node_id}:{amount}:..."
-                                    if let Some(ref data) = tx.data {
-                                        let parts: Vec<&str> = data.split(':').collect();
-                                        if parts.len() >= 2 && parts[0] == "reward_claim" {
-                                            let claimed_node_id = parts[1];
-                                            deferred_reward_clears.push((claimed_node_id.to_string(), tx.amount));
-                                        }
-                                    }
-                                }
-                                
-                                // Apply transaction to state (updates balances, nonces, etc)
-                                // v3.22: Use lazy Merkle update - finalize once after all TX
-                                // NOTE: apply_transaction_lazy is ALREADY atomic - no rollback needed!
-                                // (it works with local copy, writes to state only on success)
-                                // O(k) journal: capture pre-images of accounts this TX will touch
-                                if let Some(ref mut snap) = block_snapshot {
-                                    let affected = tx.get_all_affected_addresses();
-                                    snap.record_pre_images(&affected, &state_guard.accounts);
-                                }
+                            // Get processed emission MBs for double-emission prevention
+                            let processed_emission_set = {
+                                let reward_mgr = reward_manager.read().await;
+                                reward_mgr.get_processed_emission_macroblocks().clone()
+                            };
 
-                                if let Err(e) = state_guard.apply_transaction_lazy(tx) {
-                                    println!("[WARN][STATE] tx_failed h={} hash={} err={}", 
-                                             microblock.height, &tx.hash[..16.min(tx.hash.len())], e);
-                                } else {
-                                    if let Some(ref mut snap) = block_snapshot {
-                                        snap.record_pre_images(&[tx.from.clone()], &state_guard.accounts);
-                                    }
-                                    let _ = state_guard.apply_gas_refund(tx, microblock.height);
-                                    
-                                    // v3.18: Pool 2 REMOVED - fees go directly to block producer
-                                    // Fee calculation still happens for transparency (fees_collected in block)
-                                    // Actual crediting happens AFTER all TXs are processed (see below)
-                                    
-                                    // POOL #3 INTEGRATION: Collect Phase 2 activation payments
-                                    // Phase 2: QNC from node activation goes to Pool 3 (equal share to all)
-                                    match &tx.tx_type {
-                                        qnet_state::TransactionType::NodeActivation { 
-                                            amount, 
-                                            phase: qnet_state::account::ActivationPhase::Phase2, 
-                                            .. 
-                                        } => {
-                                            if *amount > 0 {
-                                                deferred_pool3 = deferred_pool3.saturating_add(*amount);
-                                            }
-                                        }
-                                        qnet_state::TransactionType::BatchNodeActivations { activation_data, .. } => {
-                                            // Batch activations - sum all activation amounts (Phase 2 = amount > 0)
-                                            // Phase 1: activation_amount = 0 (1DEV burned externally)
-                                            // Phase 2: activation_amount > 0 (QNC to Pool 3)
-                                            let total_pool3: u64 = activation_data.iter()
-                                                .filter(|d| d.activation_amount > 0)  // Phase 2 indicator
-                                                .map(|d| d.activation_amount)
-                                                .sum();
-                                            
-                                            if total_pool3 > 0 {
-                                                deferred_pool3 = deferred_pool3.saturating_add(total_pool3);
-                                            }
-                                        }
-                                        // v2.71: Cache NodeRegistration on block receive for fast wallet lookups
-                                        qnet_state::TransactionType::NodeRegistration { 
-                                            node_id, node_type, wallet_address, .. 
-                                        } => {
-                                            let type_str = match node_type {
-                                                qnet_state::NodeType::Super => "super",
-                                                qnet_state::NodeType::Light => "light",
-                                            };
-                                            deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone()));
-                                        }
-                                        qnet_state::TransactionType::NodeActivation { node_type, .. } => {
-                                            let type_str = match node_type {
-                                                qnet_state::account::NodeType::Super => "super",
-                                                qnet_state::account::NodeType::Light => "light",
-                                            };
-                                            let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
-                                            deferred_registrations.push((activation_id, type_str.to_string(), tx.from.clone()));
-                                        }
-                                        _ => {} // Other transaction types
-                                    }
-                                }
+                            let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
+                            let apply_result = Self::apply_block_to_state(
+                                &state_guard,
+                                &microblock,
+                                &storage,
+                                block_snapshot.as_mut(),
+                                Some(&processed_emission_set),
+                            );
+
+                            // v7.1: Persist fork flag on first activation
+                            if !fork_was_active && !apply_result.reward_accruals.is_empty()
+                               && qnet_state::is_pending_rewards_in_merkle() {
+                                let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
+                                println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (sync h={})", microblock.height);
                             }
-                            
-                            // ═══════════════════════════════════════════════════════════════════
-                            // v3.26: ATOMIC FEE CREDITING - TOP L1 PATTERN
-                            // Uses credit_producer_fees_once() which has built-in race condition protection
-                            // Safe to call multiple times - fees credited EXACTLY ONCE per block
-                            // ═══════════════════════════════════════════════════════════════════
-                            if microblock.fees_collected > 0 {
-                                // Find producer's wallet from node registration
-                                let producer_wallet = match storage.load_node_registration(&microblock.producer) {
-                                    Ok(Some((_, wallet, _))) => wallet,
-                                    _ => {
-                                        // Genesis nodes have node_id like "genesis_node_001"
-                                        // Their wallet should be registered in block 0
-                                        if is_warn() {
-                                            println!("[WARN][FEES] producer_wallet_not_found producer={} h={}", 
-                                                     microblock.producer, microblock.height);
-                                        }
-                                        String::new() // Skip crediting if no wallet found
-                                    }
-                                };
-                                
-                                if !producer_wallet.is_empty() {
-                                    // Journal pre-image of producer account before fee credit
-                                    if let Some(ref mut snap) = block_snapshot {
-                                        snap.record_pre_images(&[producer_wallet.clone()], &state_guard.accounts);
-                                    }
-                                    match state_guard.credit_producer_fees_once(
-                                        microblock.height, 
-                                        &producer_wallet, 
-                                        microblock.fees_collected
-                                    ) {
-                                        Ok(true) => {
-                                            // Fees credited successfully (first time)
-                                            if is_info() && microblock.fees_collected > 10_000_000 {
-                                                println!("[INFO][FEES] credited producer={} wallet={}... fees={} nanoQNC h={}",
-                                                         microblock.producer, 
-                                                         &producer_wallet[..16.min(producer_wallet.len())],
-                                                         microblock.fees_collected, microblock.height);
-                                            }
-                                        }
-                                        Ok(false) => {
-                                            // Already credited (race condition prevented)
-                                            if is_debug() {
-                                                println!("[DBG][FEES] skip_dup h={} (already credited)", microblock.height);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[ERR][FEES] credit_failed producer={} wallet={} fees={} err={}", 
-                                                     microblock.producer, producer_wallet, microblock.fees_collected, e);
-                                        }
-                                    }
-                                }
+                            if is_info() && !apply_result.reward_accruals.is_empty() {
+                                println!("[INFO][REWARDS] sync_accruals_applied count={} h={}",
+                                         apply_result.reward_accruals.len(), microblock.height);
                             }
-                            
-                            // v7.0: Apply reward accruals BEFORE finalize_merkle (deterministic, in-block)
-                            if !deferred_reward_accruals.is_empty() {
-                                let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
-                                for (wallet, delta) in &deferred_reward_accruals {
-                                    if let Some(ref mut snap) = block_snapshot {
-                                        snap.record_pre_images(&[wallet.clone()], &state_guard.accounts);
-                                    }
-                                    if let Err(e) = state_guard.accrue_pending_rewards(wallet, *delta) {
-                                        eprintln!("[WARN][REWARDS] sync_accrue_fail wallet={}... err={}",
-                                                 &wallet[..wallet.len().min(16)], e);
-                                    }
-                                }
-                                // v7.1: Persist fork flag on first activation
-                                if !fork_was_active && qnet_state::is_pending_rewards_in_merkle() {
-                                    let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
-                                    println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (sync h={})", microblock.height);
-                                }
-                                if is_info() {
-                                    println!("[INFO][REWARDS] sync_accruals_applied count={} h={}",
-                                             deferred_reward_accruals.len(), microblock.height);
-                                }
-                            }
-                            
-                            // ═══════════════════════════════════════════════════════════════════
-                            // v3.27: STATE ROOT VERIFICATION - TOP L1 PATTERN
-                            // Finalize Merkle and VERIFY against block's state_root
-                            // If mismatch → REJECT block as invalid (prevents state divergence)
-                            // ═══════════════════════════════════════════════════════════════════
-                            let computed_state_root = state_guard.finalize_merkle();
+
+                            let computed_state_root = apply_result.merkle_root;
                             
                             // Check state root only for v3.27+ blocks (non-zero state_root)
                             // has_state_root already computed above when deciding to create snapshot
@@ -8966,20 +8920,20 @@ impl BlockchainNode {
                                 match storage.save_microblock(received_block.height, &decompressed_data) {
                                     Ok(()) => {
                                         // Block saved — now apply deferred side effects (safe: block is committed)
-                                        if deferred_pool3 > 0 {
+                                        if apply_result.deferred_pool3 > 0 {
                                             if let Some(ref p2p) = unified_p2p {
-                                                p2p.add_to_pool3(deferred_pool3);
+                                                p2p.add_to_pool3(apply_result.deferred_pool3);
                                             }
-                                            if is_debug() { println!("[DBG][POOL3] deferred_pool3_applied amount={}", deferred_pool3); }
+                                            if is_debug() { println!("[DBG][POOL3] deferred_pool3_applied amount={}", apply_result.deferred_pool3); }
                                         }
-                                        for (node_id, type_str, wallet) in &deferred_registrations {
-                                            let _ = storage.save_node_registration(node_id, &type_str, wallet, 1.0);
+                                        for (node_id, type_str, wallet) in &apply_result.deferred_registrations {
+                                            let _ = storage.save_node_registration(node_id, type_str, wallet, 1.0);
                                         }
-                                        if is_debug() && !deferred_registrations.is_empty() {
-                                            println!("[DBG][REG] deferred_registrations_applied count={} h={}", 
-                                                     deferred_registrations.len(), microblock.height);
+                                        if is_debug() && !apply_result.deferred_registrations.is_empty() {
+                                            println!("[DBG][REG] deferred_registrations_applied count={} h={}",
+                                                     apply_result.deferred_registrations.len(), microblock.height);
                                         }
-                                        for mb_idx in &deferred_emission_mbs {
+                                        for mb_idx in &apply_result.deferred_emission_mbs {
                                             let mut reward_mgr = reward_manager.write().await;
                                             let mut processed_set = reward_mgr.get_processed_emission_macroblocks().clone();
                                             processed_set.insert(*mb_idx);
@@ -8989,7 +8943,7 @@ impl BlockchainNode {
                                                 eprintln!("[WARN][STATE] deferred_emission_save_fail mb={} err={}", mb_idx, e);
                                             }
                                         }
-                                        for (node_id, amount) in &deferred_reward_clears {
+                                        for (node_id, amount) in &apply_result.deferred_reward_clears {
                                             {
                                                 let mut reward_mgr = reward_manager.write().await;
                                                 let _ = reward_mgr.clear_pending_reward(node_id);
@@ -9292,7 +9246,7 @@ impl BlockchainNode {
                                     genesis_block.timestamp,
                                     std::sync::atomic::Ordering::Relaxed
                                 );
-                                if is_info() { println!("[INFO][GENESIS] synced_timestamp ts={}", genesis_block.timestamp); }
+                                if is_info() { println!("[INFO][GEN] synced_timestamp ts={}", genesis_block.timestamp); }
                             }
                         }
                     }
@@ -9881,56 +9835,17 @@ impl BlockchainNode {
                                             Ok(Some(mb)) => {
                                                 last_replay_ts = mb.timestamp;
                                                 let sg = state.write().await;
-                                                // Emission TXs: update total_supply + collect reward accruals
-                                                let mut reward_accruals: Vec<(String, u64)> = Vec::new();
-                                                for tx in &mb.transactions {
-                                                    if tx.tx_type == qnet_state::TransactionType::RewardDistribution
-                                                       && tx.from == "system_emission" {
-                                                        let _ = sg.emit_rewards(tx.amount);
-                                                        if let Some(ref data) = tx.data {
-                                                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                                                                if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
-                                                                    if let Some(accruals) = parsed.get("accruals").and_then(|v| v.as_object()) {
-                                                                        for (wallet, av) in accruals {
-                                                                            if let Some(amt) = av.as_u64() {
-                                                                                if amt > 0 { reward_accruals.push((wallet.clone(), amt)); }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                // Apply transactions + gas refunds (only on success)
-                                                for tx in &mb.transactions {
-                                                    if sg.apply_transaction_lazy(tx).is_ok() {
-                                                        let _ = sg.apply_gas_refund(tx, h);
-                                                    }
-                                                }
-                                                // Credit producer fees
-                                                if mb.fees_collected > 0 {
-                                                    if let Ok(Some((_, wallet, _))) = storage.load_node_registration(&mb.producer) {
-                                                        if !wallet.is_empty() {
-                                                            let _ = sg.credit_producer_fees_once(h, &wallet, mb.fees_collected);
-                                                        }
-                                                    }
-                                                }
-                                                // Apply reward accruals
+
+                                                // v10.0: Use shared apply_block_to_state (replay mode)
                                                 let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
-                                                for (wallet, delta) in &reward_accruals {
-                                                    let _ = sg.accrue_pending_rewards(wallet, *delta);
-                                                }
-                                                // v7.1: Persist fork flag on first activation
-                                                if !fork_was_active && qnet_state::is_pending_rewards_in_merkle() {
+                                                let apply_result = Self::apply_block_to_state(
+                                                    &sg, &mb, &storage, None, None,
+                                                );
+
+                                                if !fork_was_active && !apply_result.reward_accruals.is_empty()
+                                                   && qnet_state::is_pending_rewards_in_merkle() {
                                                     let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
                                                     println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (recovery h={})", h);
-                                                }
-                                                let _ = sg.finalize_merkle();
-                                                // Update chain_state.height
-                                                {
-                                                    let mut cs = sg.chain_state.write();
-                                                    if h > cs.height { cs.height = h; }
                                                 }
                                                 replayed += 1;
                                             }
@@ -10963,7 +10878,7 @@ impl BlockchainNode {
         let decompressed_data = match zstd::decode_all(&block.data[..]) {
             Ok(data) => {
                 // Successfully decompressed
-                println!("[BLOCKS] ✅ Decompressed macroblock #{}: {} -> {} bytes", 
+                println!("[INFO][BLOCKS] decompressed h={} raw={}B expanded={}B",
                          block.height, block.data.len(), data.len());
                 data
             },
@@ -11055,7 +10970,7 @@ impl BlockchainNode {
                 let _block_hash = block_hasher.finalize();
                 
                 // Log for monitoring
-                println!("[VALIDATION] 🔍 Checking macroblock #{} integrity", macroblock.height);
+                println!("[INFO][VALIDATION] macroblock_integrity_check h={}", macroblock.height);
             }
         }
         
@@ -11066,7 +10981,7 @@ impl BlockchainNode {
     
     /// Start the blockchain node
     pub async fn start(&mut self) -> Result<(), QNetError> {
-        println!("[Node] Starting blockchain node...");
+        println!("[INFO][NODE] starting");
         
         // PRODUCTION v2.57: Log runtime isolation
         let stats = crate::unified_p2p::get_runtime_stats();
@@ -11089,7 +11004,7 @@ impl BlockchainNode {
 
             let node_clone_unified = self.clone();
             
-            println!("[Node] 🚀 Starting unified RPC+API server on port {} BEFORE P2P", unified_port);
+            println!("[INFO][NODE] rpc_api_start port={} phase=before_p2p", unified_port);
             let rpc_handle = tokio::spawn(async move {
                 crate::rpc::start_rpc_server(node_clone_unified, unified_port).await;
             });
@@ -11098,18 +11013,18 @@ impl BlockchainNode {
             tokio::spawn(async move {
                 match rpc_handle.await {
                     Ok(_) => {
-                        eprintln!("[FATAL][RPC] rpc_server port={} exited unexpectedly — restarting node", unified_port);
+                        eprintln!("[CRIT][RPC] rpc_server port={} exited unexpectedly — restarting node", unified_port);
                         std::process::exit(1);
                     }
                     Err(e) => {
-                        eprintln!("[FATAL][RPC] rpc_server port={} panicked: {:?} — restarting node", unified_port, e);
+                        eprintln!("[CRIT][RPC] rpc_server port={} panicked: {:?} — restarting node", unified_port, e);
                         std::process::exit(1);
                     }
                 }
             });
             
             // Wait for server readiness  
-            println!("[Node] ⏳ Waiting for unified server to be ready...");
+            println!("[INFO][NODE] waiting_for_server");
             // EXISTING: Use same wait time as Genesis coordination (8s for Genesis, 5s for regular)
             let api_wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 8 } else { 5 };
             tokio::time::sleep(std::time::Duration::from_secs(api_wait_time)).await;
@@ -11117,7 +11032,7 @@ impl BlockchainNode {
             // Health check to ensure API is ready
             let api_host = std::env::var("QNET_API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
             let health_check_url = format!("http://{}:{}/api/v1/node/health", api_host, unified_port);
-            println!("[Node] 🏥 Checking API health at {}", health_check_url);
+            println!("[INFO][NODE] api_health_check url={}", health_check_url);
             
             // Try health check with retries
             for attempt in 1..=API_HEALTH_CHECK_RETRIES {
@@ -11128,7 +11043,7 @@ impl BlockchainNode {
                     }
                     _ => {
                         if attempt < API_HEALTH_CHECK_RETRIES {
-                            println!("[Node] ⏳ API not ready yet, retrying in {}s (attempt {}/{})", API_HEALTH_CHECK_DELAY_SECS, attempt, API_HEALTH_CHECK_RETRIES);
+                            println!("[INFO][NODE] api_not_ready retry_delay={}s attempt={}/{}", API_HEALTH_CHECK_DELAY_SECS, attempt, API_HEALTH_CHECK_RETRIES);
                             tokio::time::sleep(std::time::Duration::from_secs(API_HEALTH_CHECK_DELAY_SECS)).await;
                         } else {
                             println!("[WARN][NODE] API health check failed after {} attempts, continuing anyway", API_HEALTH_CHECK_RETRIES);
@@ -11141,7 +11056,7 @@ impl BlockchainNode {
             std::env::set_var("QNET_CURRENT_RPC_PORT", unified_port.to_string());
             std::env::set_var("QNET_CURRENT_API_PORT", unified_port.to_string());
             
-            println!("[Node] 🔌 API server ready on port {}", unified_port);
+            println!("[INFO][NODE] api_ready port={}", unified_port);
             
             // API FIX: Set node start time for uptime calculation
             std::env::set_var("QNET_NODE_START_TIME", chrono::Utc::now().timestamp().to_string());
@@ -11149,13 +11064,13 @@ impl BlockchainNode {
         
         // NOW connect to bootstrap peers AFTER API is ready
         if let Some(unified_p2p) = &self.unified_p2p {
-            println!("[P2P] 🌐 Starting P2P connections AFTER API is ready");
+            println!("[INFO][P2P] connections_start phase=post_api");
             // Bootstrap peers configured (logging removed for performance)
             
             unified_p2p.connect_to_bootstrap_peers(&self.bootstrap_peers);
             
             // Initial blockchain sync
-            println!("[SYNC] ⏳ Waiting for peer connections and blockchain synchronization...");
+            println!("[INFO][SYNC] waiting_for_peers_and_sync");
             
             // EXISTING: Bootstrap peer connections without initial sync delay
             // Sync will happen later after API servers are ready
@@ -11193,7 +11108,7 @@ impl BlockchainNode {
             let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
             let local_height = self.storage.get_chain_height().unwrap_or(0);
             
-            println!("[Node] 🔄 Starting network synchronization (local height: {})...", local_height);
+            println!("[INFO][NODE] network_sync_start local_h={}", local_height);
 
             // ════════════════════════════════════════════════════════════════════════
             // v6.5 FIX: HTTP genesis block download for non-bootstrap nodes
@@ -11209,7 +11124,7 @@ impl BlockchainNode {
                     .unwrap_or(false);
 
                 if !has_genesis_already {
-                    println!("[GENESIS] 📥 Downloading genesis block via HTTP from genesis nodes...");
+                    println!("[INFO][GEN] http_download_start source=genesis_nodes");
 
                     use crate::unified_p2p::get_genesis_bootstrap_ips;
                     let genesis_ips = get_genesis_bootstrap_ips();
@@ -11281,18 +11196,18 @@ impl BlockchainNode {
                                             break;
                                         }
                                         Err(e) => {
-                                            if is_warn() { println!("[WARN][GENESIS] save_failed from={} err={}", ip, e); }
+                                            if is_warn() { println!("[WARN][GEN] save_failed from={} err={}", ip, e); }
                                         }
                                     }
                                 }
                                 Ok(Ok(_)) => {
-                                    if is_debug() { println!("[DBG][GENESIS] empty_response from={} url={}", ip, url); }
+                                    if is_debug() { println!("[DBG][GEN] empty_response from={} url={}", ip, url); }
                                 }
                                 Ok(Err(e)) => {
-                                    if is_debug() { println!("[DBG][GENESIS] http_fail from={} err={}", ip, e); }
+                                    if is_debug() { println!("[DBG][GEN] http_fail from={} err={}", ip, e); }
                                 }
                                 Err(_) => {
-                                    if is_debug() { println!("[DBG][GENESIS] timeout from={}", ip); }
+                                    if is_debug() { println!("[DBG][GEN] timeout from={}", ip); }
                                 }
                             }
                         }
@@ -11300,7 +11215,7 @@ impl BlockchainNode {
 
                     // Fallback: Try to get genesis via QUIC sync if HTTP failed
                     if !genesis_downloaded {
-                        println!("[GENESIS] ⚠️ HTTP download failed, will retry via P2P sync in readiness loop");
+                        println!("[WARN][GEN] http_download_failed fallback=p2p_sync");
                     }
                 }
             }
@@ -11309,7 +11224,7 @@ impl BlockchainNode {
             // This allows other nodes to discover us via gossip during their sync
             if let Some(ref p2p) = self.unified_p2p {
                 if !matches!(self.node_type, NodeType::Light) {
-                    println!("[ACTIVE] 📡 Early registration in global registry (pre-sync)...");
+                    println!("[INFO][ACTIVE] early_registration phase=pre_sync");
                     p2p.register_as_active_node_async().await;
                 }
             }
@@ -11389,19 +11304,19 @@ impl BlockchainNode {
                                 const NETWORK_STABILIZATION_SECS: u64 = 60;
                                 if stabilization_time < NETWORK_STABILIZATION_SECS {
                                     let remaining = NETWORK_STABILIZATION_SECS - stabilization_time;
-                                    println!("[Node] 🌍 Node 001: {} peers connected, waiting {}s for network stabilization...", 
+                                    println!("[INFO][NODE] node_001_stabilizing peers={} remaining={}s",
                                              real_peer_count, remaining);
                                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                     wait_time += 5;
                                     continue;
                                 }
                                 
-                                println!("[Node] 🌍 Node 001: {} peers connected, network stable for {}s", real_peer_count, stabilization_time);
-                                println!("[Node] 🚀 Starting production (Genesis creation pending)!");
+                                println!("[INFO][NODE] node_001_stable peers={} stable={}s", real_peer_count, stabilization_time);
+                                println!("[INFO][NODE] production_start genesis=pending");
                                 break;
                             } else {
                                 // Nodes 002-005 and regular nodes: MUST wait for Genesis
-                                println!("[Node] ⏳ {} peers connected, waiting for Genesis block...", real_peer_count);
+                                println!("[INFO][NODE] waiting_for_genesis peers={}", real_peer_count);
                                 
                                 // CRITICAL: Actively request Genesis from network
                                 if let Err(e) = p2p.sync_blocks(0, 0).await {
@@ -11419,7 +11334,7 @@ impl BlockchainNode {
                                     if wait_time >= MAX_WAIT_SECS {
                                         println!("[WARN][NODE] Genesis node {} still waiting for Genesis block after {}s...", 
                                                  bootstrap_id, wait_time);
-                                        println!("[Node] 🔄 Resetting timer - Genesis nodes MUST have Genesis block!");
+                                        println!("[INFO][NODE] timer_reset reason=genesis_required");
                                         wait_time = 0; // Reset timer - keep waiting indefinitely
                                     }
                                     continue;
@@ -11450,7 +11365,7 @@ impl BlockchainNode {
                             if is_bootstrap_node && stabilization_time < NETWORK_STABILIZATION_SECS {
                                 let remaining = NETWORK_STABILIZATION_SECS - stabilization_time;
                                 if is_info() { println!("[INFO][NODE] net_ready peers={} genesis=yes", real_peer_count); }
-                                println!("[Node] ⏳ Waiting {}s for network stabilization (stabilized: {}s)...", remaining, stabilization_time);
+                                println!("[INFO][NODE] stabilization_wait remaining={}s stabilized={}s", remaining, stabilization_time);
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                 wait_time += 5;
                                 continue;
@@ -11481,10 +11396,10 @@ impl BlockchainNode {
                                         // If not synced yet, defer — will be sent after sync completes.
                                         let node_synced = NODE_IS_SYNCHRONIZED.load(std::sync::atomic::Ordering::Relaxed);
                                         if node_synced {
-                                            println!("[ACTIVATION] 🔑 Activation: node synced, broadcasting NodeRegistration TX...");
+                                            println!("[INFO][ACTIVATION] node_synced broadcasting=NodeRegistration");
                                             match self.save_activation_code(&activation_code, self.node_type).await {
                                                 Ok(_) => {
-                                                    println!("[ACTIVATION] ✅ Activation completed — TX broadcast to network");
+                                                    println!("[INFO][ACTIVATION] activation_complete tx_broadcast=true");
                                                     EARLY_ACTIVATION_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
                                                 }
                                                 Err(e) => {
@@ -11499,7 +11414,7 @@ impl BlockchainNode {
                             }
 
                             if is_info() { println!("[INFO][NODE] net_ready peers={} stable={}s", real_peer_count, stabilization_time); }
-                            println!("[Node] 🚀 Starting production!");
+                            println!("[INFO][NODE] production_start");
 
                             // STATE MACHINE: Ready to produce
                             set_node_state(NodeState::Idle { last_height: 0 });
@@ -11510,13 +11425,13 @@ impl BlockchainNode {
                     
                     // Log progress
                     if is_bootstrap_node {
-                        println!("[Node] ⏳ Genesis node waiting: {} peers (need 4), all connected: {}, Genesis block: {} ({}s elapsed)", 
+                        println!("[INFO][NODE] genesis_node_wait peers={} need=4 all_connected={} genesis={} elapsed={}s",
                                  real_peer_count, genesis_peers_connected,
-                                 if has_genesis { "YES" } else { "NO" }, wait_time);
+                                 if has_genesis { "yes" } else { "no" }, wait_time);
                     } else {
-                        println!("[Node] ⏳ Waiting: {} peers (need {}), Genesis: {} ({}s elapsed)", 
+                        println!("[INFO][NODE] peer_wait peers={} need={} genesis={} elapsed={}s",
                                  real_peer_count, MIN_PEERS_FOR_CONSENSUS - 1,
-                                 if has_genesis { "YES" } else { "NO" }, wait_time);
+                                 if has_genesis { "yes" } else { "no" }, wait_time);
                     }
                     
                     // CRITICAL FIX: Actively try to connect to Genesis peers during wait
@@ -11528,7 +11443,7 @@ impl BlockchainNode {
                             .map(|ip| format!("{}:8001", ip))
                             .collect();
 
-                        println!("[Node] 🔄 Attempting to connect to Genesis peers...");
+                        println!("[INFO][NODE] connecting_genesis_peers");
                         p2p.add_discovered_peers(&genesis_peers);
 
                         // Also re-register to propagate our presence
@@ -11556,7 +11471,7 @@ impl BlockchainNode {
                         if is_bootstrap_node && real_peer_count < MIN_PEERS_FOR_CONSENSUS {
                             println!("[ERR][NODE] CRITICAL: Genesis node timeout with only {} peers!", real_peer_count);
                             println!("[ERR][NODE] Cannot start production - network would split!");
-                            println!("[Node] 🔄 Extending wait time... (Genesis nodes MUST connect)");
+                            println!("[INFO][NODE] extending_wait reason=genesis_nodes_must_connect");
                             
                             // STATE MACHINE: Genesis node waiting for peers
                             set_node_state(NodeState::Error {
@@ -11595,7 +11510,7 @@ impl BlockchainNode {
                             let local_height = self.storage.get_chain_height().unwrap_or(0);
                             if network_height > local_height {
                                 println!("[INFO][NODE] Network is ahead: {} vs local: {}", network_height, local_height);
-                                println!("[[INFO][NODE] {} blocks before production...", network_height.saturating_sub(local_height));
+                                println!("[INFO][NODE] sync_before_production blocks={}", network_height.saturating_sub(local_height));
                                 
                                 // OPTIMIZATION: Use parallel download for faster initial sync
                                 p2p.parallel_download_microblocks(&self.storage, local_height, network_height).await;
@@ -11627,7 +11542,7 @@ impl BlockchainNode {
         // PRODUCTION: Start archive compliance enforcement (mandatory for Super nodes)
         // v3.18: Full node type removed
         if matches!(self.node_type, NodeType::Super) {
-            println!("[Archive] 📋 Starting archive compliance monitoring...");
+            println!("[INFO][ARCHIVE] compliance_monitoring_start");
             self.start_archive_compliance_monitoring().await;
             
             // Check network capacity and rebalance for small networks
@@ -11662,12 +11577,12 @@ impl BlockchainNode {
                 if is_debug() { println!("[DBG][SYNC] h={} net_h={}", current_height, network_height); }
                 
                 if network_height > current_height && network_height > 0 {
-                    println!("[SYNC] 📥 Need to download {} blocks (will happen in background)", network_height - current_height);
+                    println!("[INFO][SYNC] need_download blocks={}", network_height - current_height);
                         } else {
                     if is_info() { println!("[INFO][SYNC] synced_from_cache"); }
                         }
             } else {
-                println!("[SYNC] ⏳ No cached network height yet - background sync will start soon");
+                println!("[INFO][SYNC] no_cached_height background_sync_pending");
                     }
                 }
         
@@ -11709,7 +11624,7 @@ impl BlockchainNode {
                         // Still active - continue
                     }
                     Err(e) => {
-                        println!("⚠️  Device deactivation check failed: {} - continuing", e);
+                        println!("[WARN][ACTIVATION] device_deactivation_check_failed err={}", e);
                     }
                 }
             }
@@ -12621,35 +12536,35 @@ impl BlockchainNode {
             // ARCHITECTURE (v2.19.13): Use load_microblock_auto_format for format-agnostic loading
             // This handles both legacy MicroBlock and new EfficientMicroBlock formats with Zstd compression
             let genesis_check = storage.load_microblock_auto_format(0);
-            println!("[GENESIS] 🔍 DEBUG: load_microblock_auto_format(0) result: {:?}", 
+            println!("[DBG][GEN] load_microblock_auto_format h=0 result={:?}",
                      genesis_check.as_ref().map(|opt| opt.as_ref().map(|b| b.height)));
             
             let genesis_exists = match genesis_check {
                 Ok(Some(ref block)) => {
-                    println!("[GENESIS] 🔍 DEBUG: Genesis block EXISTS and VALID (height={}, producer={})", 
+                    println!("[DBG][GEN] genesis_exists valid=true h={} producer={}",
                              block.height, block.producer);
                     true
                 }
                 Ok(None) => {
-                    println!("[GENESIS] 🔍 DEBUG: Genesis block does NOT exist in storage");
+                    println!("[DBG][GEN] genesis_exists valid=false");
                     false
                 }
                 Err(e) => {
                     println!("[WARN][GEN] DEBUG: Genesis block exists but corrupted/unreadable: {}", e);
-                    println!("[GENESIS] 🗑️ Deleting corrupted Genesis block...");
+                    println!("[WARN][GEN] genesis_corrupted action=delete");
                     let _ = storage.delete_microblock(0);
                     false
                 }
             };
             
             if !genesis_exists {
-                println!("[GENESIS] 🔍 Genesis block not found in storage, checking if we should create it...");
+                println!("[INFO][GEN] genesis_not_found checking_creation");
                 
                 // SCALABILITY: Two modes - Bootstrap (5 nodes) and Production (millions)
                 let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
                 let is_bootstrap_mode = !bootstrap_id.is_empty();
                 
-                println!("[GENESIS] 📊 Bootstrap mode: {}, Bootstrap ID: '{}'", is_bootstrap_mode, bootstrap_id);
+                println!("[INFO][GEN] bootstrap_mode={} bootstrap_id={}", is_bootstrap_mode, bootstrap_id);
                 
                 if is_bootstrap_mode && bootstrap_id == "001" {
                     // v5.0: Before creating genesis, check if network already has one.
@@ -12809,7 +12724,7 @@ impl BlockchainNode {
                                 hasher.update(b"qnet_genesis_block_2024");
                                 hasher.finalize().to_vec()
                             };
-                            println!("[GENESIS] Genesis Block signed with deterministic quantum-resistant signature");
+                            println!("[INFO][GEN] genesis_signed algo=deterministic_qr");
                             
                             // Serialize and save Genesis Block
                             match bincode::serialize(&genesis_microblock) {
@@ -12893,7 +12808,7 @@ impl BlockchainNode {
                                                 // had fully processed the incoming connection, causing Genesis to be lost
                                                 
                                                 // Step 1: Wait 10 seconds for all nodes to initialize
-                                                println!("[GENESIS] ⏳ Waiting 10 seconds for all nodes to initialize QUIC...");
+                                                println!("[INFO][GEN] quic_wait timeout=10s");
                                                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                                                 
                                                 // Step 2: Verify QUIC connections are established with Genesis peers
@@ -12918,7 +12833,7 @@ impl BlockchainNode {
                                                             break;
                                                         }
                                                         
-                                                        println!("[GENESIS] ⏳ Waiting for QUIC: {}/3 Genesis peers ready (attempt {}/{})",
+                                                        println!("[INFO][GEN] quic_waiting peers={}/3 attempt={}/{}",
                                                                  connected_genesis, quic_ready_attempts, MAX_QUIC_READY_ATTEMPTS);
                                                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                                     }
@@ -12936,7 +12851,7 @@ impl BlockchainNode {
                                                     while broadcast_attempts < MAX_GENESIS_ATTEMPTS && !broadcast_successful {
                                                         broadcast_attempts += 1;
                                                         
-                                                        println!("[GENESIS] 📡 Broadcasting Genesis block (attempt {}/{})", 
+                                                        println!("[INFO][GEN] genesis_broadcast attempt={}/{}",
                                                                 broadcast_attempts, MAX_GENESIS_ATTEMPTS);
                                                     
                                                     // Use dedicated Genesis broadcast with extended timeout
@@ -12955,7 +12870,7 @@ impl BlockchainNode {
                                                                     .filter(|p| p.id.starts_with("genesis_node_"))
                                                                     .count();
                                                                 
-                                                                println!("[GENESIS] 📊 Connected to {} Genesis nodes", genesis_peers);
+                                                                println!("[INFO][GEN] genesis_peers_connected count={}", genesis_peers);
                                                                 
                                                                 // PRODUCTION THRESHOLD: 3 out of 5 Genesis nodes connected
                                                                 if genesis_peers >= 3 {
@@ -12965,16 +12880,16 @@ impl BlockchainNode {
                                                                     println!("[WARN][GEN] Only {} Genesis nodes connected, need at least 3", 
                                                                             genesis_peers);
                                                                     if broadcast_attempts < MAX_GENESIS_ATTEMPTS {
-                                                                        println!("[GENESIS] ⏳ Retrying in 3 seconds...");
+                                                                        println!("[INFO][GEN] retry delay=3s reason=insufficient_peers");
                                                                         tokio::time::sleep(Duration::from_secs(3)).await;
                                                                     }
                                                                 }
                                                         }
                                                         Err(e) => {
-                                                                println!("[WARN][GEN] Broadcast attempt {} failed: {}", 
+                                                                println!("[WARN][GEN] Broadcast attempt {} failed: {}",
                                                                         broadcast_attempts, e);
                                                                 if broadcast_attempts < MAX_GENESIS_ATTEMPTS {
-                                                                    println!("[GENESIS] ⏳ Retrying in 3 seconds...");
+                                                                    println!("[INFO][GEN] retry delay=3s reason=broadcast_failed");
                                                                     tokio::time::sleep(Duration::from_secs(3)).await;
                                                                 }
                                                             }
@@ -12982,7 +12897,7 @@ impl BlockchainNode {
                                                     }
                                                     
                                                     if !broadcast_successful {
-                                                        println!("[GENESIS] ❌ Failed to broadcast Genesis after {} attempts", 
+                                                        println!("[ERR][GEN] genesis_broadcast_failed attempts={}",
                                                                 MAX_GENESIS_ATTEMPTS);
                                                         println!("[WARN][GEN] Peers will need to sync via P2P");
                                                     }
@@ -12998,7 +12913,7 @@ impl BlockchainNode {
                                                     println!("[WARN][GEN] Warning: Could not update storage height: {}", e);
                                                 }
                                                 
-                                                println!("[GENESIS] 📍 Height set to 0, next block will be #1");
+                                                println!("[INFO][GEN] height_set h=0 next=1");
                                                 
                                                 // CRITICAL FIX: Broadcast certificate AFTER Genesis creation
                                                 // This ensures Genesis exists before certificate propagation
@@ -13029,8 +12944,8 @@ impl BlockchainNode {
                                                         if let Some(cert) = hybrid.get_current_certificate() {
                                                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
                                                                 // CRITICAL FIX: Wait for all Genesis nodes to be connected
-                                                                println!("[GENESIS] ⏳ Waiting for all peers before certificate broadcast...");
-                                                                
+                                                                println!("[INFO][GEN] cert_broadcast_wait reason=peer_connection");
+
                                                                 // Ensure all 5 Genesis nodes are connected
                                                                 let mut retry_count = 0;
                                                                 while retry_count < 10 {
@@ -13045,7 +12960,7 @@ impl BlockchainNode {
                                                                 // Additional delay to ensure peers are ready to receive
                                                                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                                                                 
-                                                                println!("[WARN][GEN] 🔐 Broadcasting certificate AFTER Genesis creation: {}", cert.serial_number);
+                                                                println!("[INFO][GEN] cert_broadcast_post_creation serial={}", cert.serial_number);
                                                                 if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
                                                                     println!("[WARN][GEN] Certificate broadcast failed: {}", e);
                                                                 } else {
@@ -13059,7 +12974,7 @@ impl BlockchainNode {
                                                 break;
                                             }
                                             Err(e) => {
-                                                println!("[GENESIS] ❌ Attempt {}/{} failed to save Genesis Block: {}", 
+                                                println!("[ERR][GEN] genesis_save_failed attempt={}/{} err={}",
                                                          save_attempts, MAX_SAVE_ATTEMPTS, e);
                                                 
                                                 if save_attempts >= MAX_SAVE_ATTEMPTS {
@@ -13069,7 +12984,7 @@ impl BlockchainNode {
                                                         recoverable: false,
                                                     });
                                                     // FATAL: Cannot continue without Genesis
-                                                    panic!("[GENESIS] FATAL: Cannot save Genesis Block after {} attempts. Node cannot start without Genesis!", MAX_SAVE_ATTEMPTS);
+                                                    panic!("[CRIT][GEN] genesis_save_fatal attempts={} action=panic", MAX_SAVE_ATTEMPTS);
                                                 }
                                                 
                                                 // Wait before retry
@@ -13078,15 +12993,15 @@ impl BlockchainNode {
                                         }
                                     }
                                 }
-                                Err(e) => println!("[GENESIS] ❌ Failed to serialize Genesis Block: {}", e),
+                                Err(e) => println!("[ERR][GEN] genesis_serialize_failed err={}", e),
                             }
                         }
-                        Err(e) => println!("[GENESIS] ❌ Failed to create Genesis Block: {}", e),
+                        Err(e) => println!("[ERR][GEN] genesis_create_failed err={}", e),
                     }
                     } // end of `if !synced_from_network` else block
                 } else if is_bootstrap_mode {
                     // Other bootstrap nodes (002-005) wait for Genesis from node_001
-                    println!("[GENESIS] ⏳ Node {}: Waiting for Genesis block from primary node...", bootstrap_id);
+                    println!("[INFO][GEN] waiting_for_primary node={}", bootstrap_id);
                     
                     // CRITICAL: ACTIVELY request Genesis immediately - don't wait passively!
                     // This ensures fast delivery even if initial broadcast failed
@@ -13195,8 +13110,8 @@ impl BlockchainNode {
                                         if let Some(cert) = hybrid.get_current_certificate() {
                                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
                                                 // CRITICAL FIX: Wait for all Genesis nodes to be connected
-                                                println!("[GENESIS] ⏳ Waiting for all peers before certificate broadcast...");
-                                                
+                                                println!("[INFO][GEN] cert_broadcast_wait reason=peer_connection_reception");
+
                                                 // Ensure all 5 Genesis nodes are connected
                                                 let mut retry_count = 0;
                                                 while retry_count < 10 {
@@ -13211,7 +13126,7 @@ impl BlockchainNode {
                                                 // Additional delay to ensure peers are ready to receive
                                                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                                                 
-                                                println!("[GENESIS] 🔐 Broadcasting certificate AFTER Genesis reception: {}", cert.serial_number);
+                                                println!("[INFO][GEN] cert_broadcast_post_reception serial={}", cert.serial_number);
                                                 if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
                                                     println!("[WARN][GEN] Certificate broadcast failed: {}", e);
                                                 } else {
@@ -13229,7 +13144,7 @@ impl BlockchainNode {
                                 // This is much more aggressive than waiting passively
                                 if let Some(p2p) = &unified_p2p {
                                     if genesis_wait_attempts % 2 == 0 {
-                                        println!("[GENESIS] 🔄 Actively requesting Genesis (attempt {})...", 
+                                        println!("[INFO][GEN] genesis_request attempt={}",
                                                 genesis_wait_attempts / 2);
                                     }
                                     
@@ -13243,7 +13158,7 @@ impl BlockchainNode {
                                 
                                 // Log progress every 10 seconds
                                 if genesis_wait_attempts % 5 == 0 {
-                                    println!("[GENESIS] ⏳ Still waiting... ({}s elapsed)", 
+                                    println!("[INFO][GEN] genesis_waiting elapsed={}s",
                                             genesis_wait_attempts * 2);
                                 }
                                 
@@ -13254,8 +13169,8 @@ impl BlockchainNode {
                 } else {
                     // PRODUCTION: Non-bootstrap nodes join AFTER network starts
                     // They will sync entire blockchain (including Genesis) via normal sync mechanism
-                    println!("[GENESIS] 📡 Non-bootstrap node: Will sync blockchain from network");
-                    println!("[GENESIS] 💡 Genesis phase only involves 5 bootstrap nodes");
+                    println!("[INFO][GEN] non_bootstrap_node sync=network");
+                    println!("[INFO][GEN] genesis_phase bootstrap_only=5");
                     
                     // Check if blockchain already exists (synced from network)
                     if let Ok(stored_height) = storage.get_chain_height() {
@@ -13360,16 +13275,16 @@ impl BlockchainNode {
                 }
             }
             
-            println!("[Microblock] 🚀 Starting production-ready microblock system");
-            println!("[Microblock] ⚡ Target: 100k+ TPS with batch processing");
+            println!("[INFO][MB] production_system_start");
+            println!("[INFO][MB] target_tps=100000 mode=batch");
             
             // CRITICAL: Register as active node immediately at startup
             // This ensures we're in the global registry for producer selection
             if node_type != NodeType::Light {
                 if let Some(ref p2p) = unified_p2p {
-                    println!("[ACTIVE] 📡 Registering in global active node registry...");
+                    println!("[INFO][ACTIVE] registering");
                     p2p.register_as_active_node_async().await;
-                    println!("[ACTIVE] ✅ Registered as active {:?} node", node_type);
+                    println!("[INFO][ACTIVE] registered type={:?}", node_type);
                 }
             }
 
@@ -13584,12 +13499,12 @@ impl BlockchainNode {
                         let mut cert_manager = match p2p.certificate_manager.write() {
                             Ok(guard) => guard,
                             Err(poisoned) => {
-                                println!("[CERTIFICATE] ⚠️ Certificate manager mutex poisoned, recovering...");
+                                println!("[WARN][CERT] mutex_poisoned action=recovering");
                                 poisoned.into_inner()
                             }
                         };
                         cert_manager.cleanup();
-                        println!("[CERTIFICATE] 🧹 Certificate cache cleaned");
+                        println!("[INFO][CERT] cache_cleaned");
                         
                         // ═══════════════════════════════════════════════════════════════════
                         // PRODUCTION FIX v2.30: Persist certificate history every 5 minutes
@@ -13606,11 +13521,11 @@ impl BlockchainNode {
                                 NodeType::Super => crate::unified_p2p::NodeType::Super,
                             };
                             if let Err(e) = std::fs::create_dir_all(&data_dir) {
-                                println!("[CERTIFICATE] ⚠️ Failed to create data dir {}: {}", storage_path, e);
+                                println!("[WARN][CERT] data_dir_create_failed path={} err={}", storage_path, e);
                             } else if let Err(e) = cert_manager.persist_to_disk(&data_dir, unified_node_type) {
-                                println!("[CERTIFICATE] ⚠️ Failed to persist certificates: {}", e);
+                                println!("[WARN][CERT] persist_failed err={}", e);
                             } else {
-                                if is_debug() { println!("[CERTIFICATE] 💾 Certificate history persisted to {}", storage_path); }
+                                if is_debug() { println!("[DBG][CERT] persisted path={}", storage_path); }
                             }
                         }
                         
@@ -13626,7 +13541,7 @@ impl BlockchainNode {
                         // PRODUCTION: Burn percentage is updated by bridge-server.py from Solana RPC
                         let burn_pct = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
                         crate::update_global_pricing_state(burn_pct, active_peers, genesis_ts);
-                        println!("[PRICING] 📊 Global state updated: {} active nodes", active_peers);
+                        println!("[INFO][PRICING] global_state_updated active_nodes={}", active_peers);
                     }
                 }
                 
@@ -13645,7 +13560,7 @@ impl BlockchainNode {
                         
                         // If we don't have all 4 other Genesis peers, try to reconnect
                         if current_peers < 4 {
-                            println!("[P2P] 🔄 GENESIS RECONNECT: Only {} peers, need 4. Attempting reconnection...", current_peers);
+                            println!("[INFO][P2P] genesis_reconnect peers={} need=4", current_peers);
                             
                             // REUSE: Use existing add_discovered_peers method (no code duplication!)
                             use crate::unified_p2p::get_genesis_bootstrap_ips;
@@ -13794,7 +13709,7 @@ impl BlockchainNode {
 
                     if reg_synced {
                         if let Some(ref p2p) = unified_p2p {
-                            if is_info() { println!("[ACTIVE] periodic_registration h={} best={}", reg_our_h, reg_best_h); }
+                            if is_info() { println!("[INFO][ACTIVE] periodic_registration h={} best={}", reg_our_h, reg_best_h); }
                             p2p.register_as_active_node_async().await;
                         }
                     } else {
@@ -13901,9 +13816,9 @@ impl BlockchainNode {
                     if let Some(hybrid) = instances_guard.get(&normalized_id) {
                         if let Some(cert) = hybrid.get_current_certificate() {
                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
-                                println!("[CERTIFICATE] 📢 Periodic broadcast: {}", cert.serial_number);
+                                println!("[INFO][CERT] periodic_broadcast serial={}", cert.serial_number);
                                 if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
-                                    println!("[CERTIFICATE] ⚠️ Broadcast failed: {}", e);
+                                    println!("[WARN][CERT] periodic_broadcast_failed err={}", e);
                                 }
                             }
                         }
@@ -13970,7 +13885,7 @@ impl BlockchainNode {
                         }
                         
                         if can_sync {
-                            println!("[SYNC] ⚡ State machine height {} → {} (all blocks in RocksDB)", 
+                            println!("[INFO][SYNC] state_machine_height_update {} → {} (all blocks in RocksDB)",
                                     microblock_height, canonical_height);
                             
                             let old_height = microblock_height;
@@ -14080,7 +13995,7 @@ impl BlockchainNode {
                         
                         // Clear emergency stop after 10 blocks OR 10 seconds
                         if blocks_passed >= 10 || seconds_passed >= 10 {
-                            println!("[RECOVERY] ✅ Auto-clearing emergency stop in main loop ({}s / {} blocks passed)", 
+                            println!("[INFO][RECOVERY] emergency_stop_cleared elapsed={}s blocks_passed={}",
                                     seconds_passed, blocks_passed);
                             crate::unified_p2p::EMERGENCY_STOP_PRODUCTION.store(false, Ordering::Relaxed);
                             crate::unified_p2p::EMERGENCY_STOP_HEIGHT.store(0, Ordering::Relaxed);
@@ -14088,7 +14003,7 @@ impl BlockchainNode {
                             
                             // CRITICAL: Invalidate producer cache to allow this node to be selected again
                             Self::invalidate_producer_cache();
-                            println!("[RECOVERY] 🚀 Node can now resume block production");
+                            println!("[INFO][RECOVERY] production_resume_ready");
                         }
                     }
                 }
@@ -14102,7 +14017,7 @@ impl BlockchainNode {
                         let thread_count = std::thread::available_parallelism()
                             .map(|n| n.get())
                             .unwrap_or(1);
-                        println!("[CPU] 📊 Node uptime: {}s | Threads: {} | Block: #{}", 
+                        println!("[INFO][NODE] uptime={}s threads={} h={}",
                                 elapsed, thread_count, microblock_height);
                     }
                     
@@ -14111,7 +14026,7 @@ impl BlockchainNode {
                         let stuck_duration = last_production_time.elapsed();
                         // CRITICAL: Use 15 seconds - more than rotation_timeout (10s) but less than first block (20s)
                         if stuck_duration.as_secs() > 15 {
-                            println!("[DEADLOCK] ⚠️ Stuck on height {} for {}s - potential deadlock detected", 
+                            println!("[WARN][NODE] deadlock_suspected h={} stuck={}s",
                                     microblock_height, stuck_duration.as_secs());
                             // Reset timers to prevent spam
                             last_production_time = std::time::Instant::now();
@@ -14717,7 +14632,7 @@ impl BlockchainNode {
                                 let sync_start_time = FAST_SYNC_START_TIME.load(Ordering::Relaxed);
 
                                 if sync_start_time == 0 {
-                                    println!("[SYNC] deadlock: flag set but start_time=0, clearing");
+                                    println!("[WARN][SYNC] deadlock start_time=0 action=clearing");
                                     FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                     SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                                 } else {
@@ -14728,7 +14643,7 @@ impl BlockchainNode {
 
                                     if since_progress >= SYNC_NO_PROGRESS_TIMEOUT {
                                         let sync_elapsed = current_time.saturating_sub(sync_start_time);
-                                        println!("[SYNC] deadlock: no progress {}s (total={}s), clearing",
+                                        println!("[WARN][SYNC] deadlock no_progress={}s total={}s action=clearing",
                                                  since_progress, sync_elapsed);
                                         FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                         FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
@@ -14741,7 +14656,7 @@ impl BlockchainNode {
                             if !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
                                 FAST_SYNC_START_TIME.store(current_time, Ordering::Relaxed);
                                 LAST_SYNC_PROGRESS_TIME.store(current_time, Ordering::Relaxed);
-                                println!("[SYNC] fast_sync_start gap={}", height_difference);
+                                println!("[INFO][SYNC] fast_sync_start gap={}", height_difference);
 
                                 let sync_from_height = if microblock_height == 0 {
                                     0
@@ -14778,7 +14693,7 @@ impl BlockchainNode {
                                         let target = std::cmp::max(target, network_height); // At least initial target
 
                                         if current_from >= target {
-                                            println!("[SYNC] caught_up at {}", current_from);
+                                            println!("[INFO][SYNC] caught_up h={}", current_from);
                                             break;
                                         }
 
@@ -14798,7 +14713,7 @@ impl BlockchainNode {
                                             progress_percent: progress,
                                         });
 
-                                        println!("[SYNC] batch={} from={} to={} remaining={}",
+                                        println!("[INFO][SYNC] batch={} from={} to={} remaining={}",
                                                  batch_num, current_from, target, remaining);
 
                                         // Adaptive timeout: min 60s, ~10 blocks/sec + buffer
@@ -14826,7 +14741,7 @@ impl BlockchainNode {
                                                     Ok(true) => {
                                                         let repaired = storage_clone.get_chain_height().unwrap_or(current_from);
                                                         if repaired > current_from {
-                                                            println!("[SYNC] height_repaired {} -> {}", current_from, repaired);
+                                                            println!("[INFO][SYNC] height_repaired from={} to={}", current_from, repaired);
                                                             current_from = repaired;
                                                         }
                                                     }
@@ -14883,13 +14798,13 @@ impl BlockchainNode {
                                                 // Check if we've caught up (use lowered threshold matching fast sync trigger)
                                                 let new_target = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
                                                 if current_from + 3 >= new_target {
-                                                    println!("[SYNC] fast_sync_complete at {} (network={})", current_from, new_target);
+                                                    println!("[INFO][SYNC] fast_sync_complete h={} network={}", current_from, new_target);
                                                     break;
                                                 }
 
                                                 // Advance from for next batch
                                                 current_from += 1;
-                                                println!("[SYNC] batch {} done, continuing from {}", batch_num, current_from);
+                                                println!("[INFO][SYNC] batch_done batch={} next_from={}", batch_num, current_from);
                                             },
                                             Err(_) => {
                                                 println!("[WARN][SYNC] batch {} timeout after {}s, retrying", batch_num, timeout_secs);
@@ -14965,12 +14880,12 @@ impl BlockchainNode {
                         if total_network_nodes >= 4 {
                             // Only log Byzantine safety MET if not cached (first time or change)  
                             if cached_count != total_network_nodes as u64 {
-                                println!("[NETWORK] ✅ Genesis Byzantine safety MET: {} nodes ≥ 4 (fast check)", total_network_nodes);
+                                println!("[INFO][NODE] byzantine_safety_met nodes={}", total_network_nodes);
                             }
                             total_network_nodes as u64
                         } else {
                             // Always log Byzantine safety violations (critical for monitoring)
-                            println!("[NETWORK] ❌ Genesis Byzantine safety NOT met: {} nodes < 4 (fast check)", total_network_nodes);
+                            println!("[WARN][NODE] byzantine_safety_not_met nodes={} required=4", total_network_nodes);
                             total_network_nodes as u64
                         }
                     } else {
@@ -14990,7 +14905,7 @@ impl BlockchainNode {
                 
                 // PRODUCTION: Log active node count only when it changes or for Byzantine violations
                 if active_node_count < 4 || cached_count != active_node_count {
-                    println!("[DEBUG-FIX] 🔧 Final active_node_count = {}", active_node_count);
+                    println!("[DBG][NODE] active_node_count={}", active_node_count);
                 }
                 
                 // CRITICAL FIX: Coordinated network start for Genesis nodes
@@ -15158,12 +15073,12 @@ impl BlockchainNode {
                             println!("[INFO][GEN] Genesis block found, proceeding with block #1");
                         }
                         _ => {
-                            println!("[GENESIS] ❌ Cannot create block #1 without Genesis block!");
-                            println!("[GENESIS] ⏳ Waiting for Genesis block to be created or synced...");
+                            println!("[ERR][GEN] missing_genesis cannot_create_block=1");
+                            println!("[INFO][GEN] waiting_for_genesis source=create_or_sync");
                             
                             // CRITICAL: Actively request Genesis from network
                             if let Some(p2p) = &unified_p2p {
-                                println!("[GENESIS] 🔄 Requesting Genesis block from network");
+                                println!("[INFO][GEN] requesting_genesis source=network");
                                 if let Err(e) = p2p.sync_blocks(0, 0).await {
                                     println!("[WARN][GEN] Failed to request Genesis: {}", e);
                                 }
@@ -15193,15 +15108,15 @@ impl BlockchainNode {
                     if let Some(ref p2p) = unified_p2p {
                         let registry_count = p2p.get_active_full_super_nodes().len();
                         if registry_count < 5 {
-                            println!("[REGISTRY] ⏳ Waiting for global registry: {}/5 nodes registered", registry_count);
-                            println!("[REGISTRY] 🔄 Re-registering to propagate our presence...");
+                            println!("[INFO][ACTIVE] registry_wait registered={}/5", registry_count);
+                            println!("[INFO][ACTIVE] re_registering");
                             p2p.register_as_active_node_async().await;
                             tokio::time::sleep(Duration::from_secs(2)).await;
                             continue; // Skip this iteration until registry is full
                         }
                         // Registry is full - set flag and never check again
                         REGISTRY_CONFIRMED.store(true, std::sync::atomic::Ordering::Relaxed);
-                        println!("[REGISTRY] ✅ Global registry complete: {}/5 nodes - starting production!", registry_count);
+                        println!("[INFO][ACTIVE] registry_complete registered={}/5", registry_count);
                     }
                 }
                 
@@ -15229,7 +15144,7 @@ impl BlockchainNode {
                     if lag > SYNC_LAG_THRESHOLD && network_height > 0 {
                         println!("[WARN][SYNC] Node is BEHIND network: local={}, network={}, lag={}", 
                                  our_height, network_height, lag);
-                        println!("[SYNC] 🛑 Skipping producer selection - need to catch up first!");
+                        println!("[WARN][SYNC] skipping_producer_selection reason=behind_network");
                         
                         // STATE MACHINE: Update to Syncing
                         let progress = ((our_height as f64 / network_height as f64) * 100.0) as u8;
@@ -15400,7 +15315,7 @@ impl BlockchainNode {
                 
                 // DEBUG: Log producer selection for first blocks
                 if next_block_height <= 5 {
-                    println!("[DEBUG] For block #{}: producer={}, is_my_turn={}", 
+                    println!("[DBG][MB] producer_selection h={} producer={} is_my_turn={}",
                             next_block_height, current_producer, is_my_turn_to_produce);
                 }
                 
@@ -16270,13 +16185,13 @@ impl BlockchainNode {
                     {
                         let mut instances_guard = instances.lock().await;
                         if !instances_guard.contains_key(&normalized_id) {
-                            println!("[CRYPTO] 🔧 Initializing HybridCrypto for producer {} (pre-broadcast)", normalized_id);
+                            println!("[INFO][CERT] hybrid_crypto_init producer={} phase=pre_broadcast", normalized_id);
                             let mut hybrid = HybridCrypto::new(normalized_id.clone());
                             if let Err(e) = hybrid.initialize().await {
                                 println!("[WARN][CRYPTO] Failed to initialize HybridCrypto: {}", e);
                             } else {
                                 instances_guard.insert(normalized_id.clone(), hybrid);
-                                println!("[CRYPTO] ✅ HybridCrypto initialized for producer");
+                                println!("[INFO][CERT] hybrid_crypto_ready");
                             }
                         }
                     }
@@ -16305,7 +16220,7 @@ impl BlockchainNode {
                                             println!("[DBG][PROD] broadcast_flag=true h={}", next_block_height);
                                         }
                                         
-                                        println!("[CERTIFICATE] 🚀 IMMEDIATE TRACKED broadcast as new producer for round {} (block #{}): {}", 
+                                        println!("[INFO][CERT] tracked_broadcast round={} h={} serial={}",
                                             current_round, next_block_height, cert.serial_number);
                                         
                                         // CRITICAL: Use tracked broadcast for producer rotation (Byzantine threshold)
@@ -16313,16 +16228,16 @@ impl BlockchainNode {
                                         // Receiving nodes buffer blocks and retry every 2s until certificate arrives
                                         match p2p.broadcast_certificate_announce_tracked(cert.serial_number.clone(), cert_bytes.clone()).await {
                                             Ok(()) => {
-                                                println!("[CERTIFICATE] ✅ Producer certificate delivered to 2/3+ peers (Byzantine threshold)");
+                                                println!("[INFO][CERT] producer_cert_delivered threshold=byzantine");
                                                 // Mark this round as broadcasted
                                                 last_certificate_broadcast_round = Some(current_round);
                                             }
                                             Err(e) => {
-                                                println!("[CERTIFICATE] ⚠️ Producer certificate Byzantine threshold NOT reached: {}", e);
-                                                println!("[CERTIFICATE] 🔄 Falling back to async re-broadcast");
+                                                println!("[WARN][CERT] byzantine_threshold_not_reached err={}", e);
+                                                println!("[INFO][CERT] fallback=async_rebroadcast");
                                                 // Fallback: async broadcast for remaining peers (gossip will propagate)
                                                 if let Err(e2) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
-                                                    println!("[CERTIFICATE] ❌ Fallback broadcast also failed: {}", e2);
+                                                    println!("[ERR][CERT] fallback_broadcast_failed err={}", e2);
                                                 }
                                             }
                                         }
@@ -16339,17 +16254,17 @@ impl BlockchainNode {
                     // Check sync status before producing
                     let can_produce = if is_emergency_producer {
                         // This branch is never reached (is_emergency_producer = false)
-                        println!("[EMERGENCY] 🚀 Emergency producer activated for block #{}", next_block_height);
+                        println!("[INFO][MB] emergency_producer_activated h={}", next_block_height);
                         
                         // CRITICAL: Check if we're synchronized before emergency production
                         // This prevents creating blocks when node is behind due to fork
                         let local_height = storage.get_chain_height().unwrap_or(0);
                         
                         if local_height < next_block_height - 1 {
-                            println!("[EMERGENCY] ⚠️ Cannot produce block #{} - we are at height #{} (behind!)", 
+                            println!("[WARN][MB] emergency_behind h={} local={}",
                                      next_block_height, local_height);
-                            println!("[EMERGENCY] 🔄 Node is lagging or has fork - clearing emergency flag");
-                            println!("[EMERGENCY] 💡 Background sync will resolve the issue");
+                            println!("[INFO][MB] emergency_cleared reason=lagging_or_fork");
+                            println!("[INFO][MB] recovery=background_sync");
                             
                             // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
                             println!("[INFO][BFT] node_not_synchronized h={}", next_block_height);
@@ -16364,7 +16279,7 @@ impl BlockchainNode {
                             // If block arrives early → cancel emergency immediately
                             // This minimizes fork risk while accommodating Asia-US latency
                             // ═══════════════════════════════════════════════════════════════════════════
-                            println!("[EMERGENCY][WAIT] h={} strategy=continuous_check interval=300ms max_wait=7.5s", 
+                            println!("[INFO][MB] emergency_wait h={} strategy=continuous_check interval=300ms max_wait=7.5s",
                                      next_block_height);
                             
                             let mut block_arrived = false;
@@ -16378,7 +16293,7 @@ impl BlockchainNode {
                                 match storage.load_microblock(next_block_height) {
                                     Ok(Some(_)) => {
                                         let elapsed = (attempt as f32 * check_interval_ms as f32) / 1000.0;
-                                        println!("[EMERGENCY][WAIT] h={} attempt={}/{} status=arrived elapsed={:.1}s action=skip_this_block", 
+                                        println!("[INFO][MB] emergency_wait h={} attempt={}/{} status=arrived elapsed={:.1}s action=skip",
                                                  next_block_height, attempt, max_attempts, elapsed);
                                         
                                         // v4.0: BFT Timeout Protocol handles failover - block arrived from another producer
@@ -16391,14 +16306,14 @@ impl BlockchainNode {
                                         // Log progress every 1.8 seconds (every 6 attempts)
                                         if attempt % 6 == 0 {
                                             let elapsed = (attempt as f32 * check_interval_ms as f32) / 1000.0;
-                                            println!("[EMERGENCY][WAIT] h={} attempt={}/{} status=missing elapsed={:.1}s", 
+                                            println!("[INFO][MB] emergency_wait h={} attempt={}/{} status=missing elapsed={:.1}s",
                                                      next_block_height, attempt, max_attempts, elapsed);
                                         }
                                     },
                                     Err(e) => {
                                         // Storage error - log but continue checking
                                         let elapsed = (attempt as f32 * check_interval_ms as f32) / 1000.0;
-                                        println!("[EMERGENCY][WAIT] h={} attempt={}/{} status=storage_error elapsed={:.1}s error={}", 
+                                        println!("[WARN][MB] emergency_wait h={} attempt={}/{} status=storage_error elapsed={:.1}s err={}",
                                                  next_block_height, attempt, max_attempts, elapsed, e);
                                         
                                         // On storage error, assume block not arrived and continue
@@ -16407,7 +16322,7 @@ impl BlockchainNode {
                             }
                             
                             if !block_arrived {
-                                println!("[EMERGENCY][WAIT] h={} status=timeout max_wait=6s action=proceeding_with_emergency", 
+                                println!("[WARN][MB] emergency_wait h={} status=timeout max_wait=6s action=proceeding",
                                          next_block_height);
                             }
                             
@@ -16825,7 +16740,7 @@ impl BlockchainNode {
                                     if let Some(tx_bytes) = mempool.get_binary_transaction(tx_hash) {
                                         bundle_txs.push((tx_hash.clone(), tx_bytes));
                                     } else {
-                                        println!("[MEV] ⚠️ Bundle {} rejected: TX {} not found in mempool", 
+                                        println!("[WARN][MB] mev_bundle_rejected bundle={} missing_tx={}",
                                                  bundle.bundle_id, tx_hash);
                                         all_txs_exist = false;
                                         break; // Stop checking
@@ -16837,7 +16752,7 @@ impl BlockchainNode {
                                     let bundle_len = bundle_txs.len();
                                     block_txs.extend(bundle_txs);
                                     bundle_tx_count += bundle_len;
-                                    println!("[MEV] ✅ Included bundle {} ({} TXs) at block #{}", 
+                                    println!("[INFO][MB] mev_bundle_included bundle={} txs={} h={}",
                                              bundle.bundle_id, bundle_len, next_block_height);
                                 }
                             } else {
@@ -16858,8 +16773,8 @@ impl BlockchainNode {
                         if bundle_tx_count > 0 {
                             let bundle_percent = (bundle_tx_count as f64 / block_txs.len() as f64) * 100.0;
                             let public_percent = (public_tx_count as f64 / block_txs.len() as f64) * 100.0;
-                            println!("[MEV] 📊 Block #{}: {} bundle TXs ({:.1}%), {} public TXs ({:.1}%), {} total", 
-                                     next_block_height, 
+                            println!("[INFO][MB] mev_stats h={} bundle_txs={} bundle_pct={:.1} public_txs={} public_pct={:.1} total={}",
+                                     next_block_height,
                                      bundle_tx_count,
                                      bundle_percent,
                                      public_tx_count,
@@ -17110,10 +17025,10 @@ impl BlockchainNode {
                         mempool.batch_remove_transactions(&invalid_tx_hashes);
                         // v3.1: Show detailed rejection reasons
                         for (hash, reason) in &rejection_reasons {
-                            eprintln!("[MEMPOOL] 🗑️ TX rejected: hash={}.. reason={}", 
+                            eprintln!("[WARN][MB] tx_rejected hash={}.. reason={}",
                                      &hash[..hash.len().min(16)], reason);
                         }
-                        println!("[MEMPOOL] 🗑️ Removed {} invalid TX", invalid_tx_hashes.len());
+                        println!("[INFO][MB] invalid_tx_removed count={}", invalid_tx_hashes.len());
                     }
                     
                     // v2.68: Log separation
@@ -17128,11 +17043,11 @@ impl BlockchainNode {
                         if !user_txs.is_empty() {
                             match executor.process_transactions(user_txs).await {
                                 Ok(processed) => {
-                                    println!("[ParallelExecutor] ✅ Processed {} user transactions in parallel", processed.len());
+                                    println!("[INFO][MB] parallel_exec_ok txs={}", processed.len());
                                     processed_user_txs = processed;
                                 },
                                 Err(e) => {
-                                    println!("[ParallelExecutor] ⚠️ Parallel processing failed: {}, using fallback", e);
+                                    println!("[WARN][MB] parallel_exec_failed err={} fallback=sequential", e);
                                     // Continue with original user transactions
                                 }
                             }
@@ -17168,12 +17083,12 @@ impl BlockchainNode {
                             match pre_execution.pre_execute_batch(txs.clone(), microblock_height, &node_id).await {
                                 Ok(pre_executed) => {
                                     if !pre_executed.is_empty() {
-                                        println!("[PreExecution] ⚡ Pre-executed {} transactions for future block", pre_executed.len());
+                                        println!("[INFO][MB] pre_exec txs={}", pre_executed.len());
                                     }
                                 },
                                 Err(e) => {
                                     // Pre-execution is optional, continue normally
-                                    println!("[PreExecution] ⚠️ Pre-execution skipped: {}", e);
+                                    println!("[WARN][MB] pre_exec_skipped err={}", e);
                                 }
                             }
                         }
@@ -17350,14 +17265,14 @@ impl BlockchainNode {
                         
                         // Retry mechanism for rotation boundaries ONLY
                         if is_rotation_start && prev_block_result.as_ref().map(|r| r.is_none()).unwrap_or(false) {
-                            println!("[PoH] 🔄 Rotation boundary: waiting for previous block #{}", next_block_height - 1);
+                            println!("[INFO][MB] poh_rotation_wait prev_h={}", next_block_height - 1);
                             
                             // Try up to 3 times with 500ms delay
                             for retry in 1..=3 {
                                 tokio::time::sleep(Duration::from_millis(500)).await;
                                 prev_block_result = storage.load_microblock_auto_format(next_block_height - 1);
                                 if prev_block_result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
-                                    println!("[PoH] ✅ Previous block received after {} retries", retry);
+                                    println!("[INFO][MB] poh_prev_block_received retries={}", retry);
                                     break;
                                 }
                             }
@@ -17372,18 +17287,18 @@ impl BlockchainNode {
                                 // Reset retry counter on success
                                 POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
                                 // Use previous block's PoH as baseline
-                                println!("[PoH] 📊 Using PoH from block #{}: count={}", 
+                                println!("[INFO][MB] poh_baseline h={} count={}",
                                         prev_block.height, prev_block.poh_count);
                                 (prev_block.poh_hash.clone(), prev_block.poh_count)
                             },
                             Ok(None) => {
                                 let retry = POH_WAIT_RETRY.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                                println!("[PoH] ❌ Previous block #{} not found (retry {}/5)", next_block_height - 1, retry);
+                                println!("[WARN][MB] poh_prev_missing h={} retry={}/5", next_block_height - 1, retry);
                                 
                                 if retry >= 5 {
                                     // FALLBACK: Use local PoH to prevent node from getting stuck
                                     POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
-                                    println!("[PoH] ⚠️ FALLBACK: Using local PoH after {} retries - node must continue", retry);
+                                    println!("[WARN][MB] poh_fallback retries={} source=local", retry);
                                     if let Some(ref poh) = quantum_poh {
                                         let (hash, count, _slot) = poh.get_state().await;
                                         (hash, count)
@@ -17399,12 +17314,12 @@ impl BlockchainNode {
                             },
                             Err(e) => {
                                 let retry = POH_WAIT_RETRY.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                                println!("[PoH] ❌ Error loading previous block #{}: {} (retry {}/5)", next_block_height - 1, e, retry);
+                                println!("[ERR][MB] poh_load_err h={} err={} retry={}/5", next_block_height - 1, e, retry);
                                 
                                 if retry >= 5 {
                                     // FALLBACK: Use local PoH to prevent node from getting stuck
                                     POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
-                                    println!("[PoH] ⚠️ FALLBACK: Using local PoH after {} retries", retry);
+                                    println!("[WARN][MB] poh_fallback_on_error retries={}", retry);
                                     if let Some(ref poh) = quantum_poh {
                                         let (hash, count, _slot) = poh.get_state().await;
                                         (hash, count)
@@ -17460,12 +17375,12 @@ impl BlockchainNode {
                                     (Some(vrf_out.output), Some(vrf_out.proof))
                                     }
                                     Err(e) => {
-                                    println!("[FATAL][VRF] eval_failed h={} err={}", next_block_height, e);
+                                    println!("[CRIT][VRF] eval_failed h={} err={}", next_block_height, e);
                                         (None, None)
                                     }
                                 }
                             } else {
-                            println!("[FATAL][VRF] not_initialized h={} — QNET_WALLET_SEED required", next_block_height);
+                            println!("[CRIT][VRF] not_initialized h={} — QNET_WALLET_SEED required", next_block_height);
                                 (None, None)
                         }
                     };
@@ -17473,8 +17388,8 @@ impl BlockchainNode {
                     // CRITICAL v2.32: Block MUST have valid cryptographic proof!
                     // If crypto failed, skip this block - let emergency failover handle it
                     if qrb_output.is_none() || qrb_proof.is_none() {
-                        println!("[FATAL][BLOCK] Cannot produce block #{} - cryptographic proof MISSING!", next_block_height);
-                        println!("[FATAL][BLOCK] Skipping block production - waiting for crypto recovery");
+                        println!("[CRIT][MB] crypto_proof_missing h={}", next_block_height);
+                        println!("[CRIT][MB] production_skipped reason=crypto_recovery");
                         
                         // STATE MACHINE: Error state
                         set_node_state(NodeState::Error {
@@ -17969,14 +17884,14 @@ impl BlockchainNode {
                         let validation_time = validation_start.elapsed();
                         
                         if !all_valid {
-                            println!("[Microblock] ❌ Parallel validation failed in {}ms", validation_time.as_millis());
+                            println!("[ERR][MB] parallel_validation_failed elapsed={}ms", validation_time.as_millis());
                             // v3.4: CRITICAL - Clear broadcast flag before continue
                             crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                             continue;
                         }
                         
                         if validation_time.as_millis() > 100 {
-                            println!("[Microblock] ⚠️  Parallel validation slow: {}ms", validation_time.as_millis());
+                            println!("[WARN][MB] parallel_validation_slow elapsed={}ms", validation_time.as_millis());
                         }
                     }
                     
@@ -18164,16 +18079,16 @@ impl BlockchainNode {
                                 rotation_tracker_clone.check_rotation_complete(height_for_storage).await {
                                 
                                 if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
-                                    println!("[ROTATION] ✅ {} completed full rotation ({}/30 blocks)", 
+                                    println!("[INFO][MB] rotation_complete producer={} blocks={}/30",
                                             rotation_producer, blocks_created);
                                 } else {
-                                    println!("[ROTATION] ⚠️ {} partial rotation ({}/30 blocks)", 
+                                    println!("[WARN][MB] rotation_partial producer={} blocks={}/30",
                                             rotation_producer, blocks_created);
                                 }
                             }
                         });
                     } else {
-                        println!("[Storage] ❌ Failed to save microblock #{}", height_for_storage);
+                        println!("[ERR][NODE] microblock_save_failed h={}", height_for_storage);
                         // Continue anyway - block will be retried
                     }
                     
@@ -18206,7 +18121,7 @@ impl BlockchainNode {
                         // ═══════════════════════════════════════════════════════════════════════════
                         let pending = PENDING_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed);
                         if pending >= MAX_PENDING_BROADCASTS {
-                            println!("[BACKPRESSURE] ⏳ Block #{} waiting - {} broadcasts pending (max={})",
+                            println!("[INFO][P2P] backpressure_wait h={} pending={} max={}",
                                     height_for_broadcast, pending, MAX_PENDING_BROADCASTS);
                             // v2.43.5: Wait up to 10 seconds for broadcast slot
                             // v2.43.4 had 1.5s which was too short for large blocks (5MB+) at 100K TPS
@@ -18221,7 +18136,7 @@ impl BlockchainNode {
                             // Log if we had to wait
                             let waited_ms = wait_start.elapsed().as_millis();
                             if waited_ms > 200 {
-                                println!("[BACKPRESSURE] ⚠️ Block #{} waited {}ms for broadcast slot", 
+                                println!("[WARN][P2P] backpressure_delay h={} waited={}ms",
                                         height_for_broadcast, waited_ms);
                             }
                         }
@@ -18275,7 +18190,7 @@ impl BlockchainNode {
                         // Log that async broadcast started
                         if height_for_broadcast <= 5 || height_for_broadcast % 10 == 0 {
                             let pending_now = PENDING_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-                            println!("[P2P] 🚀 Async broadcast started for block #{} (pending={})", 
+                            println!("[INFO][P2P] async_broadcast h={} pending={}",
                                     height_for_broadcast, pending_now);
                         }
                         
@@ -18379,10 +18294,10 @@ impl BlockchainNode {
                         rotation_tracker.check_rotation_complete(microblock.height).await {
                         
                         if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
-                            println!("[ROTATION] ✅ {} completed full rotation #{} ({}/{} blocks)", 
+                            println!("[INFO][MB] rotation_complete producer={} rotation={} blocks={}/{}",
                                     rotation_producer, microblock.height / ROTATION_INTERVAL_BLOCKS, blocks_created, ROTATION_INTERVAL_BLOCKS);
                         } else {
-                            println!("[ROTATION] ⚠️ {} partial rotation #{} ({}/{} blocks)", 
+                            println!("[WARN][MB] rotation_partial producer={} rotation={} blocks={}/{}",
                                     rotation_producer, microblock.height / ROTATION_INTERVAL_BLOCKS, blocks_created, ROTATION_INTERVAL_BLOCKS);
                         }
                     }
@@ -18404,7 +18319,7 @@ impl BlockchainNode {
                         // This is fast enough to not block production
                         match storage.create_incremental_snapshot(microblock_height).await {
                             Ok(_) => {
-                                println!("[SNAPSHOT] 💾 Created incremental snapshot at height {}", microblock_height);
+                                println!("[INFO][NODE] snapshot_created h={} type=incremental", microblock_height);
                                 
                                 // STORAGE OPTIMIZATION: Trigger pruning after snapshot for non-archive nodes
                                 // This ensures we have a valid snapshot before removing old blocks
@@ -18413,8 +18328,8 @@ impl BlockchainNode {
                                     let storage_for_pruning = Arc::clone(&storage);
                                     tokio::spawn(async move {
                                         match storage_for_pruning.prune_old_blocks() {
-                                            Ok(_) => println!("[PRUNING] ✅ Old blocks pruned after snapshot"),
-                                            Err(e) => println!("[PRUNING] ⚠️ Pruning failed: {:?}", e),
+                                            Ok(_) => println!("[INFO][NODE] blocks_pruned"),
+                                            Err(e) => println!("[WARN][NODE] pruning_failed err={:?}", e),
                                         }
                                     });
                                     
@@ -18422,8 +18337,8 @@ impl BlockchainNode {
                                     let storage_for_recompression = Arc::clone(&storage);
                                     tokio::spawn(async move {
                                         match storage_for_recompression.recompress_old_blocks().await {
-                                            Ok(_) => println!("[COMPRESSION] ✅ Old blocks recompressed with adaptive levels"),
-                                            Err(e) => println!("[COMPRESSION] ⚠️ Recompression failed: {:?}", e),
+                                            Ok(_) => println!("[INFO][NODE] blocks_recompressed"),
+                                            Err(e) => println!("[WARN][NODE] recompression_failed err={:?}", e),
                                         }
                                     });
                                 }
@@ -18434,21 +18349,21 @@ impl BlockchainNode {
                                         // Upload to IPFS synchronously (avoids Send issues)
                                         match storage.upload_snapshot_to_ipfs(microblock_height).await {
                                             Ok(cid) => {
-                                                println!("[IPFS] 🌐 Snapshot uploaded to IPFS: {}", cid);
+                                                println!("[INFO][NODE] ipfs_upload cid={}", cid);
                                                 // Announce to peers
                                                 if let Some(ref p2p) = unified_p2p {
                                                     storage.announce_snapshot_to_peers(microblock_height, &cid, p2p).await;
                                                 }
                                             },
                                             Err(e) => {
-                                                println!("[IPFS] ⚠️ Failed to upload to IPFS: {}", e);
+                                                println!("[WARN][NODE] ipfs_upload_failed err={}", e);
                                             }
                                         }
                                     }
                                 }
                             },
                             Err(e) => {
-                                println!("[SNAPSHOT] ⚠️ Failed to create snapshot: {}", e);
+                                println!("[WARN][NODE] snapshot_failed err={}", e);
                             }
                         }
                     }
@@ -18462,9 +18377,9 @@ impl BlockchainNode {
                     let finality_time = 1.2; // Average finality time in seconds
                     
                     if txs.len() > 0 {
-                        println!("⚡ Block #{} | 🔄 {} tx | 🚀 {:.0} TPS | 🌐 {} peers | 🔐 CRYSTALS-Dilithium: {:.0} sig/s | ⏱️ {:.1}s finality", 
-                                 microblock.height, 
-                                 txs.len(), 
+                        println!("[INFO][BLOCKS] produced height={} tx={} tps={:.0} peers={} quantum_sigs={:.0}/s finality={:.1}s",
+                                 microblock.height,
+                                 txs.len(),
                                  tps,
                                  peer_count,
                                  quantum_sigs_per_sec,
@@ -18472,12 +18387,12 @@ impl BlockchainNode {
                                  
                         // Every 10 blocks show advanced quantum metrics
                         if microblock_height % 10 == 0 {
-                            println!("🔮 QUANTUM STATUS | 💎 Post-Quantum Security: ACTIVE | 🛡️ Resistance: 128-bit | 🚀 Performance: {}% optimal", 
+                            println!("[INFO][BLOCKS] quantum_status security=active resistance=128bit perf={}%",
                                      std::cmp::min(95 + (peer_count * 2), 100));
                         }
                     } else {
                         // Show status for every block to monitor network activity
-                        println!("💤 Block #{} | 👑 Producer: {} | 🔄 {} tx | 🌐 {} peers | 🔐 Quantum-ready | ⏰ Next: {}ms", 
+                        println!("[INFO][BLOCKS] produced height={} producer={} tx={} peers={} quantum=ready next={}ms",
                                 microblock.height,
                                 node_id,
                                 txs.len(),
@@ -18486,7 +18401,7 @@ impl BlockchainNode {
                                 
                         // Show detailed status every 10 blocks
                         if microblock_height % 10 == 0 {
-                            println!("[NETWORK] 📊 Status: Block #{} | Active | Synced | Broadcasting", microblock_height);
+                            println!("[INFO][NODE] status h={} state=active synced=true broadcasting=true", microblock_height);
                         }
                     }
                     
@@ -18568,7 +18483,7 @@ impl BlockchainNode {
                             // CRITICAL FIX: If start_time is 0 but flag is set - sync is stuck!
                             // This can happen if flag was set but task never started
                             if sync_start_time == 0 {
-                                println!("[SYNC] 🔓 DEADLOCK DETECTED: Sync flag set but start_time=0, clearing flag");
+                                println!("[WARN][SYNC] deadlock_detected start_time=0 action=clearing_flag");
                                 SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                             } else {
                                 let sync_elapsed = current_time.saturating_sub(sync_start_time);
@@ -18576,7 +18491,7 @@ impl BlockchainNode {
                                 // CRITICAL FIX v2.21.3: Use >= instead of > to catch exact timeout
                                 // Previous bug: sync_elapsed=30 and timeout=30 → 30>30=false → deadlock not detected!
                                 if sync_elapsed >= BACKGROUND_SYNC_TIMEOUT_SECS {
-                                    println!("[SYNC] 🔓 DEADLOCK DETECTED: Background sync stuck for {}s, clearing flag", sync_elapsed);
+                                    println!("[WARN][SYNC] deadlock_detected bg_sync_stuck={}s action=clearing_flag", sync_elapsed);
                                     // CRITICAL: Must reset flag or node will be stuck forever
                                     // Risk of race condition is better than permanent deadlock
                                     SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
@@ -18630,10 +18545,10 @@ impl BlockchainNode {
                                     // Previous bug: FAST_SYNC only triggered in producer loop
                                     // Non-producers could fall behind without triggering fast recovery
                                     if height_difference > FAST_SYNC_THRESHOLD {
-                                        println!("[SYNC] ⚡ FAST SYNC: {} blocks behind (local: {}, network: {})", 
+                                        println!("[INFO][SYNC] fast_sync_start behind={} local={} network={}",
                                                  height_difference, current_height, network_height);
                                     } else {
-                                        println!("[SYNC] 📥 Background sync: downloading blocks {}-{}", 
+                                        println!("[INFO][SYNC] bg_sync_download blocks={}-{}",
                                                  current_height + 1, network_height);
                                     }
                                     
@@ -18678,7 +18593,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         if is_debug() { println!("[DBG][SYNC] bg_sync producer={}", current_producer); }
                         } else {
                             // SYNC FIX: Skip if sync already in progress
-                            println!("[SYNC] ⏳ Background sync already in progress, skipping");
+                            println!("[INFO][SYNC] bg_sync_in_progress skipping=true");
                         }
                         
                         // CRITICAL: Check if we already have the next block locally
@@ -18785,7 +18700,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     // This prevents FALSE EMERGENCY that causes FORKS.
                                     // ═══════════════════════════════════════════════════════════════════════════
                                     
-                                    println!("[EMERGENCY][FAILOVER] h={} step=check_network strategy=two_level", 
+                                    println!("[INFO][SYNC] failover_check h={} strategy=two_level",
                                              expected_height_timeout);
                                     
                                     let check_result = p2p_check
@@ -18795,11 +18710,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     if check_result.exists() {
                                         match &check_result {
                                             BlockExistenceResult::MajorityHas { peers_with, total_peers } => {
-                                                println!("[EMERGENCY][FAILOVER] h={} result=majority_has peers={}/{} action=sync_attempt", 
+                                                println!("[INFO][SYNC] failover_majority_has h={} peers={}/{} action=sync",
                                                          expected_height_timeout, peers_with, total_peers);
                                             },
                                             BlockExistenceResult::VerifiedExists { peer_addr } => {
-                                                println!("[EMERGENCY][FAILOVER] h={} result=http_verified peer={} action=sync_attempt", 
+                                                println!("[INFO][SYNC] failover_http_verified h={} peer={} action=sync",
                                                          expected_height_timeout, peer_addr);
                                             },
                                             _ => {}
@@ -18832,7 +18747,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                         
                                                         match storage_check.load_microblock(expected_height_timeout) {
                                                             Ok(Some(_)) => {
-                                                                println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} wait={}ms result=success", 
+                                                                println!("[INFO][SYNC] failover_sync h={} attempt={}/{} wait={}ms result=success",
                                                                          expected_height_timeout, sync_attempt, max_sync_attempts, wait_attempt * 100);
                                                                 block_arrived = true;
                                                                 break;
@@ -18845,26 +18760,26 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                         sync_success = true;
                                                         break;
                                                     } else {
-                                                        println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} result=wait_timeout will_retry", 
+                                                        println!("[WARN][SYNC] failover_sync h={} attempt={}/{} result=wait_timeout",
                                                                  expected_height_timeout, sync_attempt, max_sync_attempts);
                                                     }
                                                 },
                                                 Err(e) => {
-                                                    println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} result=failed error={}", 
+                                                    println!("[ERR][SYNC] failover_sync h={} attempt={}/{} err={}",
                                                              expected_height_timeout, sync_attempt, max_sync_attempts, e);
                                                 }
                                             }
                                             
                                             if sync_attempt < max_sync_attempts && !sync_success {
                                                 let backoff_ms = backoff_schedule[sync_attempt - 1];
-                                                println!("[EMERGENCY][FAILOVER] h={} sync_attempt={}/{} backoff={}ms", 
+                                                println!("[INFO][SYNC] failover_backoff h={} attempt={}/{} backoff={}ms",
                                                          expected_height_timeout, sync_attempt, max_sync_attempts, backoff_ms);
                                                 tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                                             }
                                         }
                                         
                                         if sync_success {
-                                            println!("[EMERGENCY][FAILOVER] h={} sync_result=success action=clearing_failover", 
+                                            println!("[INFO][SYNC] failover_resolved h={} action=clearing",
                                                      expected_height_timeout);
                                             FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);
                                             return;
@@ -18899,7 +18814,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 .unwrap_or_default().as_secs();
                                             let stuck_duration = now_ts.saturating_sub(first_ts);
 
-                                            println!("[EMERGENCY][FAILOVER] h={} sync_result=all_failed network_has_block=true fail_count={} stuck_for={}s",
+                                            println!("[ERR][SYNC] failover_all_failed h={} network_has_block=true fail_count={} stuck={}s",
                                                      expected_height_timeout, fail_count, stuck_duration);
 
                                             if fail_count >= 3 {
@@ -18918,7 +18833,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 // This node is in an unrecoverable local state.
                                                 // Self-restart is the safest recovery: Docker will restart the
                                                 // container with clean QUIC connections and fresh state.
-                                                println!("[CRITICAL][FAILOVER] h={} stuck_for={}s action=self_restart",
+                                                println!("[CRIT][FAILOVER] h={} stuck_for={}s action=self_restart",
                                                          expected_height_timeout, stuck_duration);
                                                 std::process::exit(1);
                                             }
@@ -19031,11 +18946,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     let theoretical_tps = blocks_per_second * avg_tx_per_block as f64 * shard_count as f64;
                     
                     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                    println!("🏗️  MACROBLOCK BOUNDARY | Block {} | Consensus finalizing in background", microblock_height);
-                    println!("⚡ MICROBLOCKS CONTINUE | Zero downtime architecture");
-                    println!("📊 PERFORMANCE: {:.0} TPS capacity ({} shards × {} tx/block)", 
+                    println!("[INFO][MB] macroblock_boundary height={} consensus=background", microblock_height);
+                    println!("[INFO][MB] microblocks_continue arch=zero_downtime");
+                    println!("[INFO][MB] tps_capacity={:.0} shards={} tx_per_block={}",
                              theoretical_tps, shard_count, avg_tx_per_block);
-                    println!("🚀 QUANTUM OPTIMIZATIONS: Lock-free + Sharding + Parallel validation");
+                    println!("[INFO][MB] quantum_optimizations lock_free=true sharding=true parallel=true");
                     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     println!("[INFO][MB] consensus_boundary all_nodes");
                     
@@ -19120,7 +19035,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             .unwrap_or(false);
                         
                         if !macroblock_exists {
-                            println!("[PFP] ⚠️ {} blocks without macroblock, attempting progressive recovery", blocks_since_trigger);
+                            println!("[WARN][MB] pfp_recovery blocks_without_mb={}", blocks_since_trigger);
                             
                             let storage_recovery = storage.clone();
                             let consensus_recovery = consensus.clone();
@@ -19137,7 +19052,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 ).await;
                             });
                         } else {
-                            println!("[PFP] ✅ Macroblock #{} found - no recovery needed", expected_macroblock);
+                            println!("[INFO][MB] pfp_ok mb={}", expected_macroblock);
                         }
                     }
                 }
@@ -19156,13 +19071,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         tokio::spawn(async move {
             match production_handle.await {
                 Ok(_) => {
-                    eprintln!("[FATAL][PRODUCTION] production_loop exited normally — zombie prevention");
-                    eprintln!("[FATAL][PRODUCTION] restarting process for clean state");
+                    eprintln!("[CRIT][PRODUCTION] production_loop exited normally — zombie prevention");
+                    eprintln!("[CRIT][PRODUCTION] restarting process for clean state");
                     std::process::exit(1);
                 }
                 Err(e) => {
-                    eprintln!("[FATAL][PRODUCTION] production_loop panicked: {:?}", e);
-                    eprintln!("[FATAL][PRODUCTION] restarting process for clean state");
+                    eprintln!("[CRIT][PRODUCTION] production_loop panicked: {:?}", e);
+                    eprintln!("[CRIT][PRODUCTION] restarting process for clean state");
                     std::process::exit(1);
                 }
             }
@@ -19204,7 +19119,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// PRODUCTION: Initialize only ACTIVE Genesis node reputations discovered via P2P
     /// Prevents phantom candidates for unoperated Genesis nodes
     async fn initialize_genesis_reputations(p2p: &SimplifiedP2P) {
-        println!("[REPUTATION] 🔐 Initializing Genesis node reputations...");
+        println!("[INFO][NODE] genesis_reputation_init");
         
         // CRITICAL FIX: Load saved reputations from storage for all Genesis nodes
         // This ensures reputation persists across restarts
@@ -19214,12 +19129,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Try to load saved reputation first
             if let Some(saved_reputation) = p2p.load_reputation_from_storage(&genesis_id) {
                 p2p.set_node_reputation(&genesis_id, saved_reputation);
-                println!("[REPUTATION] 📂 Loaded saved reputation for {}: {:.1}%", genesis_id, saved_reputation);
+                println!("[INFO][NODE] reputation_loaded node={} rep={:.1}", genesis_id, saved_reputation);
             } else {
                 // If no saved reputation, initialize to INITIAL_REPUTATION
                 use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                 p2p.set_node_reputation(&genesis_id, INITIAL_REPUTATION);
-                println!("[REPUTATION] 🆕 Initialized default reputation for {}: {:.1}%", genesis_id, INITIAL_REPUTATION);
+                println!("[INFO][NODE] reputation_default node={} rep={:.1}", genesis_id, INITIAL_REPUTATION);
             }
         }
         
@@ -19235,18 +19150,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                     if p2p.load_reputation_from_storage(&own_genesis_id).is_none() {
                         p2p.set_node_reputation(&own_genesis_id, INITIAL_REPUTATION);
-                        println!("[REPUTATION] ✅ Own Genesis {} initialized to INITIAL_REPUTATION ({:.0}%)", own_genesis_id, INITIAL_REPUTATION);
+                        println!("[INFO][NODE] own_reputation_init node={} rep={:.0}", own_genesis_id, INITIAL_REPUTATION);
                     }
                 }
                 _ => {
-                    println!("[REPUTATION] ⚠️ Invalid QNET_BOOTSTRAP_ID: {}", bootstrap_id);
+                    println!("[WARN][NODE] invalid_bootstrap_id id={}", bootstrap_id);
                 }
             }
         } else {
-            println!("[REPUTATION] 📝 Non-Genesis node - reputation will be set by P2P discovery");
+            println!("[INFO][NODE] reputation_source=p2p_discovery non_genesis=true");
         }
         
-        println!("[REPUTATION] ✅ Genesis reputation initialization completed");
+        println!("[INFO][NODE] genesis_reputation_init_complete");
     }
     
     /// PRODUCTION v4.0: Select microblock producer using Dilithium3-VRF Secret Leader Election
@@ -19504,8 +19419,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         },
                         _ => {
                             // FATAL: Genesis must exist for network to function
-                            println!("[FATAL] ❌ Genesis block not found - cannot select producer!");
-                            println!("[FATAL] ❌ Network cannot function without Genesis block!");
+                            println!("[CRIT][MB] genesis_missing cannot_select_producer=true");
+                            println!("[CRIT][MB] network_halted reason=no_genesis");
                             [0u8; 32] // Will cause producer selection to fail safely
                         }
                     }
@@ -19867,14 +19782,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     .count();
                 
                 if recent_failures > 0 {
-                    println!("[FAILOVER] 📊 Node {} has {} recent failures in last {} blocks", 
+                    println!("[INFO][MB] failover_history node={} failures={} window={}",
                             node_id, recent_failures, CHECK_RANGE);
                 }
                 
                 recent_failures
             }
             Err(e) => {
-                println!("[FAILOVER] ⚠️ Could not get failover history: {}", e);
+                println!("[WARN][MB] failover_history_err err={}", e);
                 // If we can't get history, assume node is OK (fail-open for availability)
                 0
             }
@@ -19908,7 +19823,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             let mut candidates = Vec::new();
             
-            println!("[EMERGENCY_SELECTION] ℹ️  Failed producer being excluded: {}", failed_producer);
+            println!("[INFO][MB] emergency_exclude producer={}", failed_producer);
             
             // v3.10 BUG 3 FIX: Exclude failed producer globally
             // Blocks from this producer will be ignored for the next rotation cycle
@@ -19924,7 +19839,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             {
                 // ARCHITECTURE: Use SAME calculate_qualified_candidates for determinism
                 // This ensures emergency selection uses same list as normal selection
-                println!("[EMERGENCY_SELECTION] 📋 Using standard qualified candidates");
+                println!("[INFO][MB] emergency_candidates source=standard");
                 
                 // v3.16: Pass current_height for deterministic epoch calculation
                 let qualified = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type, current_height).await;
@@ -20027,7 +19942,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // EMERGENCY MODE: Use existing Progressive Degradation Protocol
                 if false { // Deprecated - no longer using phases
                     // Genesis phase: Try progressively lower reputation thresholds
-                    println!("[FAILOVER] 🚨 EMERGENCY: Activating reputation degradation for Genesis");
+                    println!("[WARN][MB] emergency_degradation mode=genesis");
                     
                     // Get Genesis nodes list
                     let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
@@ -20042,7 +19957,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
                         if reputation >= 0.50 {
                             emergency_candidates.push((peer_node_id.clone(), reputation));
-                            println!("[EMERGENCY] ✅ Found candidate {} at 50% threshold (reputation: {:.1}%)", 
+                            println!("[INFO][MB] emergency_candidate node={} threshold=50 rep={:.1}",
                                      peer_node_id, reputation * 100.0);
                         }
                     }
@@ -20059,20 +19974,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         });
                         
                         let best = &sorted_degraded[0];
-                        println!("[FAILOVER] 🆘 DEGRADED SELECTION: {} (reputation: {:.1}%)", 
+                        println!("[WARN][MB] degraded_selection node={} rep={:.1}",
                                  best.0, best.1 * 100.0);
                         return best.0.clone();
                     }
                     
                     // Last resort: Bootstrap recovery with reputation reset
-                    println!("[FAILOVER] ⚡ CRITICAL: Initiating Genesis bootstrap recovery");
+                    println!("[WARN][MB] genesis_bootstrap_recovery");
                     
                     // Find ANY responding Genesis node
                     for (i, _ip) in genesis_ips.iter().enumerate() {
                         let peer_node_id = format!("genesis_node_{:03}", i + 1);
                         if peer_node_id != failed_producer {
                             // Genesis nodes have fixed 70% reputation in deterministic system
-                            println!("[EMERGENCY] 💊 Selecting Genesis {} for recovery (fixed 70% reputation)", peer_node_id);
+                            println!("[INFO][MB] recovery_candidate node={} rep=70_fixed", peer_node_id);
                             
                             // Check if now eligible
                             let new_reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
@@ -20086,17 +20001,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     for (i, _ip) in genesis_ips.iter().enumerate() {
                         let peer_node_id = format!("genesis_node_{:03}", i + 1);
                         if peer_node_id != failed_producer {
-                            println!("[FAILOVER] 🔥 FORCED RECOVERY: Using {} regardless of reputation", peer_node_id);
+                            println!("[WARN][MB] forced_recovery node={}", peer_node_id);
                             return peer_node_id.clone();
                         }
                     }
                     
                     // If even that fails, use genesis_node_001 as hardcoded fallback
-                    println!("[FAILOVER] 🆘 FINAL FALLBACK: Using genesis_node_001");
+                    println!("[WARN][MB] final_fallback node=genesis_node_001");
                     return "genesis_node_001".to_string();
                 } else {
                     // Production phase: Use Progressive Degradation similar to microblock production
-                    println!("[FAILOVER] 🚨 EMERGENCY: Activating network-wide degradation");
+                    println!("[WARN][MB] emergency_degradation mode=network_wide");
                     
                     // CRITICAL FIX: Maintain 70% minimum for emergency producers to prevent forks
                     // Only degrade if absolutely necessary for network survival
@@ -20115,7 +20030,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
                             if reputation >= *threshold {
                                 emergency_candidates.push((peer_node_id.clone(), reputation));
-                                println!("[EMERGENCY] ✅ Found candidate {} at {:.0}% threshold (reputation: {:.1}%)", 
+                                println!("[INFO][MB] emergency_candidate node={} threshold={:.0} rep={:.1}",
                                          peer_node_id, threshold * 100.0, reputation * 100.0);
                             }
                         }
@@ -20139,7 +20054,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 });
                                 
                                 let selected = eligible[0];
-                                println!("[FAILOVER] 🆘 EMERGENCY SELECTION: {} (reputation: {:.1}%, threshold: {:.0}%)", 
+                                println!("[WARN][MB] emergency_selected node={} rep={:.1} threshold={:.0}",
                                          selected.0, selected.1 * 100.0, threshold * 100.0);
                                 return selected.0.clone();
                             }
@@ -20147,7 +20062,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                     
                     // Critical: Network halt protection - give emergency boost to any responding node
-                    println!("[FAILOVER] ⚡ CRITICAL: Network halt detected - emergency reputation recovery");
+                    println!("[CRIT][MB] network_halt_detected action=emergency_recovery");
                     
                     let mut peers = p2p.get_validated_active_peers();
                     if !peers.is_empty() {
@@ -20158,7 +20073,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         for peer in &peers {
                             if peer.id != failed_producer {
                                 // Reward processed via DeterministicReputationState when block is produced
-                                println!("[EMERGENCY] 💊 Selecting {} for network recovery", peer.id);
+                                println!("[INFO][MB] network_recovery_select node={}", peer.id);
                                 return peer.id.clone();
                             }
                         }
@@ -20167,7 +20082,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     
                     // Ultimate fallback: Return failed producer to prevent complete halt
                     // It might recover or at least keep trying
-                    println!("[FAILOVER] 💀 NETWORK CRITICAL: No alternatives - keeping failed producer {}", failed_producer);
+                    println!("[CRIT][MB] no_alternatives keeping_failed_producer={}", failed_producer);
                     return failed_producer.to_string();
                 }
             }
@@ -20182,7 +20097,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 candidates.clone()
             } else {
                 // PRODUCTION: Deterministic sampling for large networks
-                println!("[EMERGENCY] 📊 Limiting {} candidates to {} for scalability", 
+                println!("[INFO][MB] emergency_candidates_limited from={} to={}",
                         candidates.len(), MAX_EMERGENCY_VALIDATORS);
                 candidates.iter()
                     .take(MAX_EMERGENCY_VALIDATORS)
@@ -20196,7 +20111,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // PRODUCTION: Deterministic SHA3-512 selection for quantum-resistant emergency producer
             // Same cryptographic guarantees as normal producer selection (NIST FIPS 204)
-            println!("[EMERGENCY] 🔐 Using deterministic SHA3-512 for emergency selection at block #{}", current_height);
+            println!("[INFO][MB] emergency_selection h={} algo=sha3_512", current_height);
             
             // CRITICAL FIX v2.25.2: Use FINALITY WINDOW block hash for determinism
             // This ensures ALL synchronized nodes compute IDENTICAL emergency producer
@@ -20221,7 +20136,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
             } else {
-                println!("[EMERGENCY] ⚠️ No storage - using zero entropy (may cause fork!)");
+                println!("[WARN][MB] emergency_zero_entropy risk=fork");
                 [0u8; 32]
             };
             
@@ -20248,7 +20163,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 entropy
             };
             
-            println!("[EMERGENCY] 🔐 Finality block #{} used for deterministic entropy", 
+            println!("[INFO][MB] finality_entropy h={}",
                      current_height.saturating_sub(FINALITY_WINDOW));
             
             // ═══════════════════════════════════════════════════════════════════════════
@@ -20283,8 +20198,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let selection_index = (selection_value as usize) % sorted_candidates.len();
             let emergency_producer = sorted_candidates[selection_index].0.clone();
             
-            println!("[FAILOVER] 🆘 Emergency producer: {} (deterministic SHA3)", emergency_producer);
-            println!("[FAILOVER] 🔐 Quantum-resistant selection (SHA3-512)");
+            println!("[WARN][MB] emergency_producer={} algo=sha3_deterministic", emergency_producer);
+            println!("[INFO][MB] selection=quantum_resistant");
             
             // Save failover event to storage for monitoring
             if let Some(ref storage) = storage {
@@ -20298,7 +20213,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 };
                 
                 if let Err(e) = storage.save_failover_event(&event) {
-                    println!("[FAILOVER] ⚠️ Failed to save failover event: {}", e);
+                    println!("[WARN][MB] failover_save_err err={}", e);
                 }
             }
             
@@ -20321,13 +20236,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let p2p = match unified_p2p.as_ref() {
             Some(p2p) => p2p,
             None => {
-                println!("[PRODUCER_READINESS] ❌ P2P not available - cannot validate readiness");
+                println!("[ERR][NODE] producer_readiness_failed reason=no_p2p");
                 return false;
             }
         };
         let reputation_score = Self::get_node_reputation_score(node_id, p2p).await;
         if reputation_score < 0.70 {
-            println!("[PRODUCER_READINESS] ❌ Insufficient reputation: {:.1}% (required: ≥70%)", reputation_score * 100.0);
+            println!("[ERR][NODE] producer_readiness_failed rep={:.1} required=70", reputation_score * 100.0);
             return false;
         }
         
@@ -20339,7 +20254,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         };
         
         if active_peers < 3 {
-            println!("[PRODUCER_READINESS] ⚠️ Limited network connectivity: {} peers (optimal: ≥3)", active_peers);
+            println!("[WARN][NODE] producer_readiness_limited peers={} optimal=3", active_peers);
             // Still allow production in low-peer scenarios for network bootstrap
         }
         
@@ -20357,9 +20272,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             _ => "EXCELLENT"
         };
         
-        println!("[PRODUCER_READINESS] ✅ Producer validation passed:");
+        println!("[INFO][NODE] producer_readiness_ok");
         println!("  ├── Node ID: {}", node_id);
-        println!("  ├── Reputation: {:.1}% ✅", reputation_score * 100.0);
+        println!("  ├── Reputation: {:.1}%", reputation_score * 100.0);
         println!("  ├── Network Health: {} ({} peers)", network_health, active_peers);
         println!("  ├── Block Height: {}", block_height);
         println!("  └── Ready for Production: YES");
@@ -20700,7 +20615,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             
                             crate::unified_p2p::clear_macroblock_pending_sync(missing_index);
                             
-                            println!("[SYNC] Requesting missing MacroBlock #{} for consensus recovery", missing_index);
+                            println!("[INFO][SYNC] requesting_missing_mb idx={} reason=consensus_recovery", missing_index);
                             if let Err(e) = p2p_clone.sync_macroblocks(missing_index, missing_index).await {
                                 println!("[WARN][SYNC] mb={} sync_failed={}", missing_index, e);
                             }
@@ -20773,7 +20688,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // All nodes must see SAME list to ensure Byzantine consensus
         // Failed nodes will timeout and trigger emergency producer change
         
-        println!("[GENESIS] 🔐 Using DETERMINISTIC Genesis candidate list (all 5 nodes)");
+        println!("[INFO][GEN] deterministic_candidates count=5");
         
         // CRITICAL: Include ALL Genesis nodes for deterministic consensus
         // This ensures all nodes calculate same producer selection
@@ -20808,8 +20723,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             .map(|p| p.id.clone())
             .collect();
         
-        println!("[GENESIS] 📊 Connected Genesis nodes: {:?}", connected_genesis);
-        println!("[GENESIS] 📊 Total candidates: {} (deterministic across all nodes)", all_qualified.len());
+        println!("[INFO][GEN] connected_genesis_nodes={:?}", connected_genesis);
+        println!("[INFO][GEN] total_candidates={} mode=deterministic", all_qualified.len());
         
         // BYZANTINE SAFETY: Verify minimum nodes are actually connected (but DON'T filter candidates!)
         // This check happens AFTER candidate list creation to maintain determinism
@@ -20881,7 +20796,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // ARCHITECTURE: Registry already uses FINALITY_WINDOW internally
         // BlockchainActivationRegistry reads from blockchain with built-in lag
         // This ensures deterministic results across all nodes
-        println!("  ├── 📊 Using BlockchainActivationRegistry (with built-in FINALITY_WINDOW)");
+        println!("  ├── Using BlockchainActivationRegistry (with built-in FINALITY_WINDOW)");
         
         // Get eligible nodes from registry (deterministic via blockchain)
         let registry_candidates = registry.get_eligible_nodes().await;
@@ -20919,7 +20834,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             };
             
             all_qualified.push((own_node_id.to_string(), own_rep));
-            println!("  ├── ✅ Own node added to candidates with real reputation: {:.1}%", own_rep * 100.0);
+            println!("  ├── Own node added to candidates with real reputation: {:.1}%", own_rep * 100.0);
         }
         
         // Add registry candidates
@@ -20991,7 +20906,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // This ensures ALL synchronized nodes select the SAME validators
         let validator_round = finalized_height / ROTATION_INTERVAL_BLOCKS;
         
-        println!("[VALIDATOR-SELECTION] 🎲 Finality Window applied:");
+        println!("[INFO][MB] finality_window_applied");
         println!("  ├── Current height: {}", current_height);
         println!("  ├── Finalized height: {} (lag: {} blocks)", finalized_height, FINALITY_WINDOW);
         println!("  ├── Validator round: {}", validator_round);
@@ -21321,7 +21236,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let mempool_outer = self.mempool.clone();
         
         tokio::spawn(async move {
-            println!("[CONSENSUS-LISTENER] 🎧 Starting EVENT-BASED macroblock consensus listener for node: {}", node_id);
+            println!("[INFO][MB] consensus_listener_start node={}", node_id);
             
             // CRITICAL FIX v2.26.8: Initialize last_consensus_round from storage!
             // Without this, restarted nodes try to create macroblocks that already exist
@@ -21352,7 +21267,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         println!("[WARN][CONSENSUS-LISTENER] finality_capped mb_round={} chain_h={} safe={} — microblocks incomplete",
                                  round, chain_height, safe_finality);
                     }
-                    println!("[CONSENSUS-LISTENER] Initialized from storage: last macroblock #{} round={} finality_h={} (chain height: {})",
+                    println!("[INFO][MB] consensus_init last_mb={} round={} finality_h={} chain_h={}",
                              highest, round, safe_finality, chain_height);
                 }
             }
@@ -21372,12 +21287,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         // Channel full, some events were dropped - this is OK
                         // Just means we missed some intermediate heights
-                        println!("[CONSENSUS-LISTENER] ⚠️ Lagged by {} block events (catching up)", skipped);
+                        println!("[WARN][MB] consensus_lagged skipped={}", skipped);
                         continue; // Wait for next event
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // Channel closed - node is shutting down
-                        println!("[CONSENSUS-LISTENER] 🛑 Block event channel closed - stopping listener");
+                        println!("[WARN][MB] consensus_channel_closed action=stop");
                         break;
                     }
                 };
@@ -21410,7 +21325,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         let is_synchronized = NODE_IS_SYNCHRONIZED.load(std::sync::atomic::Ordering::Relaxed);
                         if !is_synchronized {
 
-                            println!("[CONSENSUS-LISTENER] ⚠️ Node not synchronized - skipping consensus for macroblock #{}", macroblock_index);
+                            println!("[WARN][MB] consensus_skip_unsynced mb={}", macroblock_index);
                             
                             // CRITICAL FIX v2.31: Even unsynchronized nodes MUST receive macroblocks!
                             // Without macroblocks, node cannot do producer selection when it catches up
@@ -21423,15 +21338,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     // Wait for consensus to complete on other nodes
                                     tokio::time::sleep(Duration::from_secs(45)).await;
                                     
-                                    println!("[MACROBLOCK-SYNC] 🔄 Unsync node requesting macroblock #{} after consensus window", mb_idx);
+                                    println!("[INFO][SYNC] mb_request_unsynced mb={}", mb_idx);
                                     
                                     // Request with retries
                                     for attempt in 1..=3 {
                                         if let Err(e) = p2p_for_sync.sync_macroblocks(mb_idx, mb_idx).await {
-                                            println!("[MACROBLOCK-SYNC] ⚠️ Attempt {}/3 failed for macroblock #{}: {}", attempt, mb_idx, e);
+                                            println!("[WARN][SYNC] mb_request_failed attempt={}/3 mb={} err={}", attempt, mb_idx, e);
                                             tokio::time::sleep(Duration::from_secs(5)).await;
                                         } else {
-                                            println!("[MACROBLOCK-SYNC] ✅ Macroblock #{} sync request sent", mb_idx);
+                                            println!("[INFO][SYNC] mb_request_sent mb={}", mb_idx);
                                             break;
                                         }
                                     }
@@ -22525,7 +22440,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if !failed_leader.starts_with("unknown") && !failed_leader.starts_with("no_leader") {
                 let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                 p2p.report_invalid_block(&failed_leader, current_height, [0u8; 32], "Failed macroblock production");
-                println!("[SLASHING] ⚔️ Failed leader {} reported for slashing", failed_leader);
+                println!("[WARN][MB] slashing_report leader={}", failed_leader);
             }
         }
         
@@ -22761,7 +22676,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 if !success {
                                     if let Some(err) = error {
                                         if err.contains("InvalidSignature") {
-                                            println!("[SECURITY] invalid_sig node={}", msg_node_id);
+                                            println!("[WARN][MB] invalid_sig node={}", msg_node_id);
                                             if let Some(ref p2p) = unified_p2p {
                                                 p2p.report_invalid_block(&msg_node_id, current_height, [0u8; 32], "Invalid signature in consensus");
                                             }
@@ -23054,7 +22969,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     received_reveals += 1;
                                 } else if let Some(err) = error {
                                     if err.contains("InvalidSignature") || err.contains("InvalidReveal") {
-                                        println!("[SECURITY] invalid_reveal node={}", msg_node_id);
+                                        println!("[WARN][MB] invalid_reveal node={}", msg_node_id);
                                         if let Some(ref p2p) = unified_p2p {
                                             p2p.report_invalid_block(&msg_node_id, current_height, [0u8; 32], "Invalid reveal in consensus");
                                         }
@@ -23154,7 +23069,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             match bootstrap_id.as_str() {
                 "001" | "002" | "003" | "004" | "005" => {
                     // FULL DECENTRALIZATION: Genesis nodes have NO special protection
-                    println!("[REPUTATION] ⚖️ Genesis node {} - treated equally, no protection", bootstrap_id);
+                    println!("[INFO][NODE] genesis_rep_equal node={}", bootstrap_id);
                     
                     if let Some(p2p) = unified_p2p {
                         // Get reputation from blockchain (v2.21.5)
@@ -23165,17 +23080,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         let final_reputation = p2p_reputation; // Equal treatment
                         
                         if final_reputation < 0.70 {
-                            println!("[REPUTATION] ⚠️ Genesis node {} penalized: {:.1}% (P2P: {:.1}%, below consensus threshold)", 
+                            println!("[WARN][NODE] genesis_penalized node={} rep={:.1} p2p={:.1}",
                                 bootstrap_id, final_reputation * 100.0, p2p_reputation * 100.0);
                         } else if final_reputation < 0.90 {
-                            println!("[REPUTATION] 🟡 Genesis node {} partially penalized: {:.1}% (P2P: {:.1}%)", 
+                            println!("[INFO][NODE] genesis_partial_penalty node={} rep={:.1} p2p={:.1}",
                                 bootstrap_id, final_reputation * 100.0, p2p_reputation * 100.0);
                         }
                         
                         return final_reputation;
                     } else {
                         // No P2P system available - use default
-                        println!("[REPUTATION] 🛡️ Genesis node {} detected - starting at consensus threshold (70%)", bootstrap_id);
+                        println!("[INFO][NODE] genesis_default_rep node={} rep=70", bootstrap_id);
                         return 0.70;
                     }
                 }
@@ -23193,7 +23108,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 let final_reputation = p2p_reputation; // No special protection
                 
                 if final_reputation < 0.70 {
-                    println!("[REPUTATION] ⚠️ Legacy Genesis penalized: {:.1}%", final_reputation * 100.0);
+                    println!("[WARN][NODE] legacy_genesis_penalized rep={:.1}", final_reputation * 100.0);
                 }
                 
                 return final_reputation;
@@ -23228,7 +23143,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if verify_genesis_node_certificate(node_id) {
                     return 0.70; // PRODUCTION: Equal starting reputation for all nodes
                 } else {
-                    println!("[SECURITY] ⚠️ Legacy genesis node {} failed verification", node_id);
+                    println!("[WARN][NODE] legacy_genesis_verify_failed node={}", node_id);
                     return 0.1; // Low reputation for failed verification
                 }
             }
@@ -23278,7 +23193,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 "negative"
             };
             
-            println!("[REPUTATION] 📊 Updated {} reputation: {} behavior", 
+            println!("[INFO][NODE] reputation_updated node={} behavior={}",
                      node_id, behavior_desc);
         }
     }
@@ -23554,7 +23469,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     reason: format!("Cannot init hybrid crypto: {}", e),
                     recoverable: false,
                 });
-                eprintln!("[FATAL][CRYPTO] Cannot init hybrid crypto — restarting node: {}", e);
+                eprintln!("[CRIT][CRYPTO] Cannot init hybrid crypto — restarting node: {}", e);
                 std::process::exit(1);
             }
             instances_guard.insert(normalized_node_id.clone(), hybrid);
@@ -23566,7 +23481,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let commit_bytes = match hex::decode(commit_hash) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!("[FATAL][CRYPTO] Invalid commit hash '{}' — restarting node: {}", commit_hash, e);
+                eprintln!("[CRIT][CRYPTO] Invalid commit hash '{}' — restarting node: {}", commit_hash, e);
                 std::process::exit(1);
             }
         };
@@ -23583,13 +23498,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         format!("compact_bin:{}", base64_data)
                     }
                     Err(e) => {
-                        eprintln!("[FATAL][CRYPTO] Cannot serialize hybrid signature — restarting node: {}", e);
+                        eprintln!("[CRIT][CRYPTO] Cannot serialize hybrid signature — restarting node: {}", e);
                         std::process::exit(1);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[FATAL][CRYPTO] Hybrid signing failed — restarting node: {:?}", e);
+                eprintln!("[CRIT][CRYPTO] Hybrid signing failed — restarting node: {:?}", e);
                 std::process::exit(1);
             }
         }
@@ -23681,7 +23596,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             let is_valid = microblock.signature == expected_signature;
             if is_valid {
-                println!("[CRYPTO] ✅ Genesis block signature verified (deterministic)");
+                println!("[INFO][CERT] genesis_sig_verified mode=deterministic");
             } else {
                 println!("[ERR][CRYPTO] Genesis block signature mismatch!");
             }
@@ -23834,7 +23749,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // dilithium_message_signature removed (redundant - message_hash is in encapsulated_data)
         
         // STEP 1: Get certificate from P2P cache for Ed25519 verification
-        println!("[CRYPTO] 🔐 Verifying compact signature for block #{}", microblock.height);
+        println!("[INFO][CERT] compact_sig_verify h={}", microblock.height);
         
         // STEP 2: Verify Ed25519 signature with certificate
         // For decentralized post-quantum blockchain, we need BOTH signatures valid
@@ -23915,9 +23830,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     &compact_sig.ephemeral_public_key  // Use ephemeral key per NIST/Cisco
                                 ) {
                                     Ok(true) => {
-                                        println!("[CRYPTO] ✅ Ed25519 signature verified with ephemeral key");
-                                        println!("[CRYPTO]    Certificate: {}", certificate.serial_number);
-                                        println!("[CRYPTO]    Producer: {}", certificate.node_id);
+                                        println!("[INFO][CERT] ed25519_verified serial={} producer={}",
+                                                 certificate.serial_number, certificate.node_id);
                                         true
                                     }
                                     Ok(false) => {
@@ -24006,7 +23920,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                 p2p_clone.request_certificate(&producer_id, &cert_serial);
-                                println!("[CRYPTO] 📤 Requested certificate {} from {}", cert_serial, producer_id);
+                                println!("[INFO][CERT] cert_requested serial={} from={}", cert_serial, producer_id);
                             });
                         }
                     }
@@ -24080,10 +23994,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
             Ok(true) => {
-                println!("[CRYPTO] ✅ Signatures verified (Ed25519 + Dilithium key)");
-                println!("[CRYPTO]    Producer: {}", compact_sig.node_id);
-                println!("[CRYPTO]    Certificate: {}", compact_sig.cert_serial);
-                println!("[CRYPTO]    NIST/Cisco: ✅ Post-quantum compliant");
+                println!("[INFO][CERT] sig_verified algo=ed25519+dilithium producer={} serial={} pq=compliant",
+                         compact_sig.node_id, compact_sig.cert_serial);
                 return Ok(true);
             }
             Ok(false) => {
@@ -24130,8 +24042,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 _ => {
                     // CRITICAL: NO FALLBACK! Genesis MUST exist for block #1
                     // If Genesis not found - this is a FATAL error
-                    println!("[FATAL] ❌ Genesis block NOT FOUND when creating block #1!");
-                    println!("[FATAL] ❌ Cannot use fallback - would cause fork!");
+                    println!("[CRIT][GEN] genesis_not_found_for_block_1");
+                    println!("[CRIT][GEN] no_fallback reason=fork_risk");
                     // Return zeros - this will make producer selection fail safely
                     return [0u8; 32];
                 }
@@ -24227,8 +24139,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 // DEBUG: Log entropy source at rotation boundaries for fork detection
                 if current_height > ROTATION_INTERVAL_BLOCKS && (current_height - 1) % ROTATION_INTERVAL_BLOCKS == 0 {
-                    println!("[FINALITY] Entropy from block #{}: producer={}, hash={}", 
-                             entropy_block_height, 
+                    println!("[DBG][SYNC] finality_entropy block={} producer={} hash={}",
+                             entropy_block_height,
                              microblock.producer,
                              hex::encode(&hash[..8]));
                 }
@@ -24239,7 +24151,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // Node not synchronized - cannot participate in production
                 println!("[WARN][FINAL] Cannot get finality block #{} for current height {}", 
                          entropy_block_height, current_height);
-                println!("[FINALITY] 📊 Node must be synchronized to participate in block production");
+                println!("[WARN][SYNC] finality_not_synced msg=must_sync_before_production");
                 [0u8; 32] // Will cause producer selection to naturally exclude this node
             }
         }
@@ -24294,12 +24206,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // Only use compression if it actually reduces size significantly
         if compressed.len() < ((serialized.len() as f64) * 0.9) as usize { // At least 10% reduction
-            println!("[Compression] ✅ Zstd compression applied ({} -> {} bytes, {:.1}% reduction)", 
+            println!("[DBG][MB] zstd_compressed before={} after={} reduction={:.1}%",
                     serialized.len(), compressed.len(),
                     (1.0 - compressed.len() as f64 / serialized.len() as f64) * 100.0);
             Ok(compressed)
         } else {
-            println!("[Compression] ⏭️ Skipping compression (insufficient reduction)");
+            println!("[DBG][MB] zstd_skipped reason=insufficient_reduction");
             Ok(serialized)
         }
     }
@@ -25353,8 +25265,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
                 
-                println!("[REPUTATION] 🏆 Consensus leader {} - reward via macroblock", consensus_data.leader_id);
-                println!("[REPUTATION] ✅ {} participants - rewards via macroblock", consensus_data.participants.len());
+                println!("[INFO][NODE] consensus_leader id={} reward=macroblock", consensus_data.leader_id);
+                println!("[INFO][NODE] consensus_participants count={} reward=macroblock", consensus_data.participants.len());
                 
                 // v3.00: INITIATOR processes emission rewards AFTER MacroBlock creation
                 // Snapshot is saved AFTER broadcast in background task (non-blocking)
@@ -25581,7 +25493,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             },
             Err(e) => {
                 let error_msg = format!("Failed to save macroblock: {}", e);
-                println!("[Macroblock] ❌ {}", error_msg);
+                println!("[ERR][MB] save_failed err={}", error_msg);
                 Err(error_msg)
             }
         }
@@ -25596,13 +25508,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let blocks_per_minute = 60; // Approximate for 1s intervals
         let estimated_tps = blocks_per_minute * 5000; // Assuming 5k tx per block average
         
-        println!("[Performance] 📊 Microblock #{}", microblock_height);
-        println!("              💾 Mempool: {} pending transactions", mempool_size);
-        println!("              ⚡ Estimated TPS: {} (theoretical max: 100k+)", estimated_tps);
-        println!("              🔗 Microblocks since last macroblock: {}", microblock_height % 90);
-        
+        println!("[DBG][NODE] perf_metrics block={} mempool={} tps={} mb_since_macro={}", microblock_height, mempool_size, estimated_tps, microblock_height % 90);
+
         if estimated_tps > 200000 {
-            println!("              🚀 HIGH PERFORMANCE MODE ACTIVE");
+            println!("[INFO][NODE] high_perf_mode tps={}", estimated_tps);
         }
     }
     pub async fn get_height(&self) -> u64 {
@@ -26130,8 +26039,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // QUANTUM v2.25: Log effective gas (includes +50% for Dilithium)
         let effective_gas = tx.effective_gas_price() * tx.gas_limit;
-        let quantum_flag = if tx.is_quantum_signed() { " 🔐QUANTUM" } else { "" };
-        println!("[Transaction] ✅ Validated and submitted: {} (amount: {}, gas: {}{})", 
+        let quantum_flag = if tx.is_quantum_signed() { " quantum=true" } else { "" };
+        println!("[INFO][NODE] tx_validated hash={} amount={} gas={}{}",
                  &tx_hash[..16.min(tx_hash.len())], tx.amount, effective_gas, quantum_flag);
         
         // v2.72: Broadcast PendingTx via WebSocket for real-time explorer updates
@@ -27051,7 +26960,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 // If we're far behind and have a snapshot, use it
                 if current_height < snapshot_height.saturating_sub(1000) {
-                    println!("[SYNC] 📸 Found snapshot at height {}, loading for fast sync...", snapshot_height);
+                    println!("[INFO][SYNC] snapshot_found h={} loading=true", snapshot_height);
                     
                     if let Err(e) = self.storage.load_state_snapshot(snapshot_height).await {
                         println!("[WARN][SYNC] Failed to load snapshot: {}, falling back to normal sync", e);
@@ -27064,7 +26973,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         if let Some(ref p2p) = self.unified_p2p {
                             if let Some(network_height) = p2p.get_cached_network_height() {
                                 if network_height > snapshot_height {
-                                    println!("[SYNC] 📥 Syncing remaining blocks {}-{}", snapshot_height + 1, network_height);
+                                    println!("[INFO][SYNC] post_snapshot_sync blocks={}-{}", snapshot_height + 1, network_height);
                                     return self.sync_blocks(snapshot_height + 1, network_height).await;
                                 }
                             }
@@ -27498,7 +27407,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     pub async fn process_received_macroblock(&self, received: crate::unified_p2p::ReceivedBlock) -> Result<(), QNetError> {
         let index = received.height;  // For macroblocks, height = index
         
-        println!("[MACROBLOCK-SYNC] 📦 Processing received macroblock #{} from {}", 
+        println!("[INFO][SYNC] macroblock_received index={} peer={}",
                  index, received.from_peer);
         
         // Decompress if needed
@@ -27785,7 +27694,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// PRODUCTION: Requests macroblocks from peers and waits for response
     pub async fn sync_macroblocks(&self, from_index: u64, to_index: u64) -> Result<(), QNetError> {
         if let Some(ref p2p) = self.unified_p2p {
-            println!("[MACROBLOCK-SYNC] 🔄 Starting macroblock sync from {} to {}", from_index, to_index);
+            println!("[INFO][SYNC] macroblock_sync_start from={} to={}", from_index, to_index);
             
             // Use batch sync for efficiency (max 10 macroblocks per request)
             let mut current = from_index;
@@ -27793,7 +27702,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 let batch_end = std::cmp::min(current + 9, to_index);
                 
                 if let Err(e) = p2p.sync_macroblocks(current, batch_end).await {
-                    println!("[MACROBLOCK-SYNC] ⚠️ Failed to request macroblocks {}-{}: {}", current, batch_end, e);
+                    println!("[WARN][SYNC] macroblock_request_failed range={}-{} err={}", current, batch_end, e);
                     // Continue with next batch instead of failing completely
                 }
                 
@@ -27803,7 +27712,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             
-            println!("[MACROBLOCK-SYNC] ✅ Macroblock sync requests sent!");
+            println!("[INFO][SYNC] macroblock_sync_requests_sent from={} to={}", from_index, to_index);
             Ok(())
         } else {
             Err(QNetError::NetworkError("P2P system not available".to_string()))
@@ -27840,7 +27749,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // PRODUCTION: If a sync flag has been stuck for > 120 seconds, something is wrong
                 // This is a safety net that should rarely trigger with Guard pattern in place
                 
-                println!("[HEALTH] ✅ Sync health monitor active (checking every 30s)");
+                println!("[INFO][SYNC] health_monitor_active interval=30s");
             }
         });
     }
@@ -27850,7 +27759,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if let Some(ref p2p) = self.unified_p2p {
             // Try to get cached network height first (fast path)
             if let Some(cached_height) = p2p.get_cached_network_height() {
-                println!("[SYNC] 📏 Using cached network height: {}", cached_height);
+                println!("[INFO][SYNC] cached_network_height h={}", cached_height);
                 return Ok(cached_height);
             }
             
@@ -27871,14 +27780,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // Log peer heights for debugging
             for peer in peers.iter().filter(|p| p.last_block_height > 0).take(3) {
-                println!("[SYNC] 📏 Peer {} reports height: {} (cached)", peer.id, peer.last_block_height);
+                println!("[DBG][SYNC] peer_height peer={} h={} source=cache", peer.id, peer.last_block_height);
             }
             
             // Take median height for Byzantine fault tolerance
             if !heights.is_empty() {
                 heights.sort();
                 let median = heights[heights.len() / 2];
-                println!("[SYNC] 📏 Network consensus height (median): {}", median);
+                println!("[INFO][SYNC] network_consensus_height median={}", median);
                 Ok(median)
             } else {
                 println!("[WARN][SYNC] No cached peer heights - waiting for heartbeats, using local height");
@@ -27912,7 +27821,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Auto-detect region from IP geolocation
     pub async fn auto_detect_region() -> Result<Region, String> {
-        println!("🌍 Production auto-region detection using real geolocation services...");
+        println!("[INFO][NODE] region_auto_detect method=geolocation");
         
         // Method 1: Check QNET_REGION environment variable
         if let Ok(region_hint) = std::env::var("QNET_REGION") {
@@ -27929,11 +27838,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // Method 2: Get external IP and use real geolocation services
         if let Ok(external_ip) = Self::get_physical_ip_without_external_services().await {
-            println!("🌍 Using external IP for geolocation: {}", external_ip);
+            println!("[DBG][NODE] geolocation_ip ip={}", external_ip);
             
             // Try multiple geolocation services for accuracy
             if let Ok(region) = Self::detect_region_via_geolocation_api(&external_ip).await {
-                println!("✅ Region detected via geolocation API: {:?}", region);
+                println!("[INFO][NODE] region_detected method=geolocation region={:?}", region);
                 return Ok(region);
             }
         }
@@ -27941,11 +27850,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Method 3: Network latency testing (fallback)
         match Self::simple_latency_region_test().await {
             Ok(region) => {
-                println!("✅ Region detected via latency test: {:?}", region);
+                println!("[INFO][NODE] region_detected method=latency region={:?}", region);
                 return Ok(region);
             }
             Err(e) => {
-                println!("⚠️ Latency test failed: {}", e);
+                println!("[WARN][NODE] latency_test_failed err={}", e);
             }
         }
         
@@ -27955,7 +27864,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Detect region using real geolocation API services
     async fn detect_region_via_geolocation_api(ip: &str) -> Result<Region, String> {
-        println!("🔍 Querying geolocation APIs for IP: {}", ip);
+        println!("[DBG][NODE] geolocation_query ip={}", ip);
         
         // Try multiple geolocation services for reliability
         let geolocation_services = vec![
@@ -27967,11 +27876,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         for service_url in geolocation_services {
             match Self::query_geolocation_service(&service_url).await {
                 Ok(region) => {
-                    println!("✅ Region detected from {}: {:?}", service_url, region);
+                    println!("[INFO][NODE] region_detected service={} region={:?}", service_url, region);
                     return Ok(region);
                 }
                 Err(e) => {
-                    println!("⚠️ Failed to get region from {}: {}", service_url, e);
+                    println!("[WARN][NODE] geolocation_failed service={} err={}", service_url, e);
                     continue;
                 }
             }
@@ -28001,7 +27910,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let json_text = response.text().await
             .map_err(|e| format!("Response read error: {}", e))?;
         
-        println!("🔍 Geolocation API response: {}", json_text);
+        println!("[DBG][NODE] geolocation_response body={}", json_text);
         
         // Parse JSON response
         let json_value: serde_json::Value = serde_json::from_str(&json_text)
@@ -28110,10 +28019,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         
         if is_genesis_code {
-            println!("✅ Genesis bootstrap code detected in node.rs: {}", code);
+            println!("[INFO][ACTIVATION] genesis_bootstrap_code code={}", code);
             // Skip format validation AND ownership check for genesis codes
             // Genesis codes are shared bootstrap codes with IP-based authentication
-            println!("✅ Genesis code - skipping ownership verification (IP-based auth)");
+            println!("[INFO][ACTIVATION] genesis_code_skip_ownership auth=ip_based");
         } else {
             // Check basic format for regular codes (26-char format only)
             if !code.starts_with("QNET-") || code.len() != 25 {
@@ -28164,7 +28073,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             &solana_from_mnemonic[..16.min(solana_from_mnemonic.len())]);
                     }
                     Ok(false) => {
-                        println!("[ERROR][ACTIVATION] mnemonic_mismatch solana_from_seed={}... code_wallet=different",
+                        println!("[ERR][ACTIVATION] mnemonic_mismatch solana_from_seed={}... code_wallet=different",
                             &solana_from_mnemonic[..16.min(solana_from_mnemonic.len())]);
                         return Err(QNetError::ValidationError(
                             "Activation code does not belong to this mnemonic. \
@@ -28180,7 +28089,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             } else {
                 // No env burn data — REQUIRED for non-genesis nodes
-                println!("[ERROR][ACTIVATION] missing_burn_env_vars QNET_BURN_TX_HASH and QNET_BURN_AMOUNT required for super node activation");
+                println!("[ERR][ACTIVATION] missing_burn_env_vars QNET_BURN_TX_HASH and QNET_BURN_AMOUNT required for super node activation");
                 return Err(QNetError::ValidationError(
                     "QNET_BURN_TX_HASH and QNET_BURN_AMOUNT environment variables are required for super node activation. \
                      Get these from your mobile app: Settings > Export Activation Codes.".to_string()
@@ -28208,8 +28117,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 let activation_payload = match self.decrypt_activation_code_full(code).await {
                     Ok(payload) => payload,
                     Err(e) => {
-                        println!("[ERROR][ACTIVATION] decrypt_failed={}", e);
-                        println!("[ERROR][ACTIVATION] Set QNET_BURN_TX_HASH and QNET_BURN_AMOUNT env vars for stateless activation");
+                        println!("[ERR][ACTIVATION] decrypt_failed={}", e);
+                        println!("[ERR][ACTIVATION] Set QNET_BURN_TX_HASH and QNET_BURN_AMOUNT env vars for stateless activation");
                         return Err(QNetError::ValidationError(format!(
                             "Activation code decryption failed: {}. Set QNET_BURN_TX_HASH and QNET_BURN_AMOUNT.", e
                         )));
@@ -28259,11 +28168,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         };
         
-        println!("📋 Activation payload extracted:");
-        println!("   Wallet: {}...", &wallet_address[..16.min(wallet_address.len())]);
-        println!("   Burn TX: {}...", &burn_tx_hash[..16.min(burn_tx_hash.len())]);
-        println!("   Phase: {}", phase);
-        println!("   Burn Amount: {}", burn_amount);
+        println!("[INFO][ACTIVATION] payload_extracted wallet={}... burn_tx={}... phase={} burn_amount={}",
+                 &wallet_address[..16.min(wallet_address.len())],
+                 &burn_tx_hash[..16.min(burn_tx_hash.len())],
+                 phase, burn_amount);
             
         // Create node info for blockchain registry with secure hash (SHA3-256 for NIST compliance)
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(
@@ -28292,10 +28200,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // FIXED: Register activation with device migration support
         // This updates the device_signature in global registry, causing old devices to deactivate
         if let Err(e) = registry.register_or_migrate_device(code, node_info, &self.get_device_signature()).await {
-            println!("⚠️  Warning: Failed to register/migrate device: {}", e);
+            println!("[WARN][ACTIVATION] device_register_failed err={}", e);
             // Continue with local storage only
         } else {
-            println!("✅ Device registered/migrated - old devices will be deactivated automatically");
+            println!("[INFO][ACTIVATION] device_registered migration=auto_deactivate_old");
         }
         
         // Save to local storage
@@ -28305,10 +28213,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // CRITICAL: Save burn_tx_hash for future XOR decryption (e.g., after node restart)
         // This allows the node to re-derive the encryption key without re-querying blockchain
         if let Err(e) = self.storage.save_activation_burn_tx(&burn_tx_hash) {
-            println!("⚠️ Warning: Failed to save burn_tx_hash: {}", e);
+            println!("[WARN][ACTIVATION] burn_tx_save_failed err={}", e);
             // Non-fatal - burn_tx can be retrieved from registry if needed
         } else {
-            println!("✅ Burn TX hash saved for future decryption");
+            println!("[INFO][ACTIVATION] burn_tx_saved");
         }
         
         // Register Full/Super nodes in reward system (not Genesis or Light nodes)
@@ -28503,7 +28411,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             });
         }
         
-        println!("✅ Activation code saved with blockchain registry and cryptographic binding");
+        println!("[INFO][ACTIVATION] code_saved binding=blockchain_registry");
         Ok(())
     }
     
@@ -28528,7 +28436,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 };
                 
                 // Check if activation is still valid (codes never expire - tied to blockchain burns)
-                println!("✅ Found valid activation code with cryptographic binding");
+                println!("[INFO][ACTIVATION] valid_code_loaded binding=crypto");
                 Ok(Some((code, node_type)))
             }
             None => Ok(None),
@@ -28559,7 +28467,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         self.storage.update_activation_for_migration(code, node_type_id, timestamp, new_device_signature)
             .map_err(|e| QNetError::StorageError(e.to_string()))?;
         
-        println!("✅ Device successfully migrated with signature: {}", new_device_signature);
+        println!("[INFO][ACTIVATION] device_migrated sig={}", new_device_signature);
         Ok(())
     }
     
@@ -28582,7 +28490,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // }
         
         // Validate against blockchain records
-        println!("🔐 Validating activation code uniqueness...");
+        println!("[INFO][ACTIVATION] validating_uniqueness");
                     let code_preview = if code.len() >= 8 { &code[..8] } else { code };
             println!("   Code: {}", code_preview);
         
@@ -28681,7 +28589,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         match quantum_crypto.decrypt_activation_code(code).await {
             Ok(payload) => Ok(payload),
             Err(e) => {
-                println!("❌ CRITICAL: Quantum decryption failed in node.rs: {}", e);
+                println!("[ERR][ACTIVATION] quantum_decryption_failed err={}", e);
                 println!("   Code: {}...", &code[..8.min(code.len())]);
                 println!("   This activation code is invalid, corrupted, or crypto system is broken");
                 Err(QNetError::ValidationError(format!("Quantum decryption failed - invalid activation code: {}", e)))
@@ -28751,28 +28659,28 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Gracefully shutdown node due to device migration
     pub async fn graceful_shutdown_due_to_migration(&self) -> Result<(), QNetError> {
-        println!("🛑 Initiating graceful shutdown due to device migration...");
+        println!("[WARN][ACTIVATION] graceful_shutdown reason=device_migration");
         
         // Stop accepting new transactions
-        println!("   📭 Stopped accepting new transactions");
+        println!("[INFO][ACTIVATION] shutdown_step action=stop_tx_accept");
         
         // Finish processing current transactions
-        println!("   ⏳ Finishing current transaction processing");
+        println!("[INFO][ACTIVATION] shutdown_step action=finish_tx_processing");
         
         // Stop QUIC transport gracefully
         if let Some(ref p2p) = self.unified_p2p {
             p2p.stop_quic().await;
-            println!("   🔌 QUIC transport stopped");
+            println!("[INFO][ACTIVATION] shutdown_step action=quic_stopped");
         }
         
         // Clear local activation (so it doesn't restart automatically)
         self.clear_activation_code().await?;
-        println!("   🗑️  Cleared local activation code");
+        println!("[INFO][ACTIVATION] shutdown_step action=cleared_activation");
         
         // Send final status to network
-        println!("   📡 Sending final status to P2P network");
+        println!("[INFO][ACTIVATION] shutdown_step action=final_p2p_status");
         
-        println!("✅ Node gracefully shut down - activation migrated to new device");
+        println!("[INFO][ACTIVATION] shutdown_complete migration=done");
         std::process::exit(0);
     }
     
@@ -28961,7 +28869,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 let ip_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                     if !ip.is_loopback() && !ip.is_private() && !ip.is_link_local() {
-                        println!("✅ External IP detected: {}", ip);
+                        println!("[INFO][NODE] external_ip_detected ip={}", ip);
                         return Ok(ip.to_string());
                     }
                 }
@@ -28981,14 +28889,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 let ip_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                     if !ip.is_loopback() && !ip.is_private() && !ip.is_link_local() {
-                        println!("✅ External IP detected (AWS): {}", ip);
+                        println!("[INFO][NODE] external_ip_detected source=aws ip={}", ip);
                         return Ok(ip.to_string());
                     }
                 }
             }
         }
         
-        println!("⚠️ External IP detection failed, trying local network interfaces...");
+        println!("[WARN][NODE] external_ip_failed fallback=local_interfaces");
         
         // Method 3: Check all network interfaces (fallback)
         #[cfg(target_os = "windows")]
@@ -29001,7 +28909,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             let ip_str = ip_part.trim();
                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                                 if !ip.is_loopback() && !ip.is_link_local() {
-                                    println!("⚠️ Using local IP: {} (may affect region detection)", ip);
+                                    println!("[WARN][NODE] using_local_ip ip={}", ip);
                                     return Ok(ip.to_string());
                                 }
                             }
@@ -29018,7 +28926,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 for ip_str in output_str.split_whitespace() {
                     if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                         if !ip.is_loopback() && !ip.is_link_local() {
-                            println!("⚠️ Using local IP: {} (may affect region detection)", ip);
+                            println!("[WARN][NODE] using_local_ip ip={}", ip);
                             return Ok(ip.to_string());
                         }
                     }
@@ -29034,7 +28942,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         let ip = addr.ip();
                         if let IpAddr::V4(ipv4) = ip {
                             if !ipv4.is_loopback() && !ipv4.is_link_local() {
-                                println!("⚠️ Using socket-detected IP: {} (may affect region detection)", ipv4);
+                                println!("[WARN][NODE] using_socket_ip ip={}", ipv4);
                                 return Ok(ipv4.to_string());
                             }
                         }
@@ -29049,7 +28957,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Simple latency-based region testing (enabled as fallback)
     async fn simple_latency_region_test() -> Result<Region, String> {
-        println!("🔄 Attempting latency-based region detection...");
+        println!("[INFO][NODE] latency_region_detect");
         
         // Test connectivity to known regional endpoints
         let regional_tests = vec![
@@ -29077,22 +28985,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     ).await {
                         Ok(Ok(_)) => {
                             let latency = start.elapsed();
-                            println!("📡 {:?}: {}ms", region, latency.as_millis());
+                            println!("[DBG][NODE] latency_probe region={:?} ms={}", region, latency.as_millis());
                             
                             if latency < best_latency {
                                 best_latency = latency;
                                 best_region = Some(region);
                             }
                         }
-                        _ => println!("📡 {:?}: timeout", region),
+                        _ => println!("[DBG][NODE] latency_probe region={:?} result=timeout", region),
                     }
                 }
-                _ => println!("📡 {:?}: connection failed", region),
+                _ => println!("[DBG][NODE] latency_probe region={:?} result=conn_failed", region),
             }
         }
         
         if let Some(region) = best_region {
-            println!("✅ Best region by latency: {:?} ({}ms)", region, best_latency.as_millis());
+            println!("[INFO][NODE] region_selected region={:?} latency={}ms", region, best_latency.as_millis());
             Ok(region)
         } else {
             Err("All latency tests failed - no regional connectivity".to_string())
@@ -29115,22 +29023,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             loop {
                 interval.tick().await;
                 
-                println!("[Archive] 🔍 Starting compliance check for node {}", node_id);
+                println!("[INFO][ARCHIVE] compliance_check_start node={}", node_id);
                 
                 // Enforce compliance (mandatory, not optional)
                 {
                     let mut manager = archive_manager.write().await;
                     if let Err(e) = manager.enforce_compliance().await {
-                        println!("[Archive] ❌ Compliance enforcement failed: {}", e);
+                        println!("[ERR][ARCHIVE] compliance_enforcement_failed err={}", e);
                     } else {
                         // Get compliance stats for logging
                         match manager.get_archive_stats().await {
                             Ok(stats) => {
-                                println!("[Archive] 📊 Compliance Stats:");
-                                println!("[Archive]   Compliant nodes: {}/{}", stats.compliant_nodes, stats.total_nodes);
-                                println!("[Archive]   Non-compliant nodes: {}", stats.non_compliant_nodes);
-                                println!("[Archive]   Underreplicated chunks: {}", stats.underreplicated_chunks);
-                                println!("[Archive]   Average replicas per chunk: {:.1}", stats.avg_replicas);
+                                println!("[INFO][ARCHIVE] compliance_stats compliant={}/{} non_compliant={} underreplicated={} avg_replicas={:.1}",
+                                         stats.compliant_nodes, stats.total_nodes,
+                                         stats.non_compliant_nodes,
+                                         stats.underreplicated_chunks,
+                                         stats.avg_replicas);
                                 
                                 // Alert if this node is non-compliant
                                 // v3.18: Full node type removed
@@ -29139,18 +29047,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         NodeType::Super => 8,
                                         NodeType::Light => 0,
                                     };
-                                    println!("[Archive] ⚠️  NETWORK COMPLIANCE ISSUE: {} nodes not meeting archive obligations", stats.non_compliant_nodes);
-                                    println!("[Archive] 📋 Required: {} chunks for {:?} nodes", required_chunks, node_type);
+                                    println!("[WARN][ARCHIVE] compliance_issue non_compliant={}", stats.non_compliant_nodes);
+                                    println!("[INFO][ARCHIVE] required_chunks={} node_type={:?}", required_chunks, node_type);
                                 }
                             },
-                            Err(e) => println!("[Archive] ❌ Failed to get stats: {}", e),
+                            Err(e) => println!("[ERR][ARCHIVE] stats_failed err={}", e),
                         }
                     }
                 }
             }
         });
         
-        println!("[Archive] ✅ Archive compliance monitoring started (4-hour intervals)");
+        println!("[INFO][ARCHIVE] compliance_monitoring_started interval=4h");
     }
     
     /// Check network size and rebalance archive quotas for small networks
@@ -29166,20 +29074,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Validate current network capacity
             match manager.validate_network_replication_capacity().await {
                 Ok(true) => {
-                    println!("[Archive] ✅ Network capacity sufficient for current requirements");
+                    println!("[INFO][ARCHIVE] network_capacity_ok");
                 },
                 Ok(false) => {
-                    println!("[Archive] ⚠️ Network capacity insufficient, triggering rebalancing...");
+                    println!("[WARN][ARCHIVE] network_capacity_insufficient action=rebalancing");
                     
                     // Trigger emergency rebalancing
                     if let Err(e) = manager.rebalance_for_small_network().await {
-                        println!("[Archive] ❌ Emergency rebalancing failed: {}", e);
+                        println!("[ERR][ARCHIVE] emergency_rebalancing_failed err={}", e);
                     } else {
-                        println!("[Archive] ✅ Emergency rebalancing completed for small network");
+                        println!("[INFO][ARCHIVE] emergency_rebalancing_complete network=small");
                     }
                 },
                 Err(e) => {
-                    println!("[Archive] ❌ Failed to validate network capacity: {}", e);
+                    println!("[ERR][ARCHIVE] network_capacity_validation_failed err={}", e);
                 }
             }
         });
@@ -29449,7 +29357,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // v3.1: DYNAMIC - If RSS > fatal_mb (default 90% of RAM), graceful shutdown
                 // Better to restart cleanly than be killed by OOM
                 if rss_mb > fatal_mb {
-                    println!("[FATAL][MEMORY] node={} rss_mb={} limit={} OOM_IMMINENT graceful_shutdown", 
+                    println!("[CRIT][MEMORY] node={} rss_mb={} limit={} OOM_IMMINENT graceful_shutdown", 
                              node_id, rss_mb, fatal_mb);
                     
                     // Final flush before exit
@@ -29476,115 +29384,115 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // DOCKER FIX: For Docker environments, retry environment variable access
         // Sometimes Docker env vars are not immediately available
         if std::env::var("DOCKER_ENV").is_ok() {
-            println!("[NODE_ID] 🐳 Docker environment detected, checking for BOOTSTRAP_ID...");
+            println!("[DBG][NODE] docker_env_detected checking=BOOTSTRAP_ID");
             
             // Retry up to 5 times with 100ms delay for Docker env propagation
             for attempt in 1..=5 {
                 if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
-                    println!("[NODE_ID] ✅ Genesis BOOTSTRAP_ID found on attempt {}: {}", attempt, bootstrap_id);
+                    println!("[INFO][NODE] bootstrap_id_found attempt={} id={}", attempt, bootstrap_id);
                     let node_id = format!("genesis_node_{}", bootstrap_id);
-                    println!("[NODE_ID] 🔐 Genesis node ID: {}", node_id);
+                    println!("[INFO][NODE] genesis_node_id id={}", node_id);
                     return node_id;
                 }
                 
                 if attempt < 5 {
-                    println!("[NODE_ID] 🔄 Attempt {}/5: QNET_BOOTSTRAP_ID not found, retrying...", attempt);
+                    println!("[DBG][NODE] bootstrap_id_retry attempt={}/5", attempt);
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
             
             // Docker + no BOOTSTRAP_ID = regular node
-            println!("[NODE_ID] 📦 Docker node without BOOTSTRAP_ID - using regular node ID");
+            println!("[INFO][NODE] docker_no_bootstrap_id using=regular_node_id");
         }
         
         // Priority 1: Use BOOTSTRAP_ID for Genesis nodes (001-005) 
         if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
-            println!("[NODE_ID] 🔐 Genesis node detected: BOOTSTRAP_ID={}", bootstrap_id);
+            println!("[INFO][NODE] genesis_node_detected bootstrap_id={}", bootstrap_id);
             // Using BOOTSTRAP_ID for Genesis node
             return format!("genesis_node_{}", bootstrap_id);
         } else {
-            println!("[DIAGNOSTIC] ❌ Priority 1: QNET_BOOTSTRAP_ID not found");
+            println!("[DBG][NODE] id_priority1_miss var=QNET_BOOTSTRAP_ID");
         }
         
         // Priority 2: Check for Genesis activation code (QNET-BOOT-000X-STRAP)
-        println!("[DIAGNOSTIC] 🔧 Priority 2: Checking QNET_ACTIVATION_CODE");
+        println!("[DBG][NODE] id_priority2_check var=QNET_ACTIVATION_CODE");
         if let Ok(activation_code) = std::env::var("QNET_ACTIVATION_CODE") {
             use crate::genesis_constants::GENESIS_BOOTSTRAP_CODES;
             
             for (i, genesis_code) in GENESIS_BOOTSTRAP_CODES.iter().enumerate() {
                 if activation_code == *genesis_code {
                     let genesis_id = format!("{:03}", i + 1);
-                    println!("[NODE_ID] 🛡️ Genesis activation code {} detected -> genesis_node_{}", genesis_code, genesis_id);
-                    println!("[DIAGNOSTIC] ✅ Priority 2: Using activation code -> genesis_node_{}", genesis_id);
+                    println!("[INFO][NODE] genesis_activation_match code={} id=genesis_node_{}", genesis_code, genesis_id);
+                    println!("[DBG][NODE] id_priority2_hit id=genesis_node_{}", genesis_id);
                     return format!("genesis_node_{}", genesis_id);
                 }
             }
-            println!("[DIAGNOSTIC] ❌ Priority 2: Activation code '{}' not a Genesis code", activation_code);
+            println!("[DBG][NODE] id_priority2_miss code={}", activation_code);
         } else {
-            println!("[DIAGNOSTIC] ❌ Priority 2: QNET_ACTIVATION_CODE not found");
+            println!("[DBG][NODE] id_priority2_miss var=QNET_ACTIVATION_CODE");
         }
         
         // Priority 3: Use Genesis bootstrap flag (legacy support) - FAST MODE
-        println!("[DIAGNOSTIC] 🔧 Priority 3: Checking QNET_GENESIS_BOOTSTRAP");
+        println!("[DBG][NODE] id_priority3_check var=QNET_GENESIS_BOOTSTRAP");
         let genesis_bootstrap = std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default();
         if genesis_bootstrap == "1" {
-            println!("[DIAGNOSTIC] ✅ Priority 3: QNET_GENESIS_BOOTSTRAP=1, checking environment IP first");
+            println!("[DBG][NODE] id_priority3_hit genesis_bootstrap=1");
             
             // FAST MODE: Check environment IP first (no blocking calls)
             if let Ok(env_ip) = std::env::var("QNET_EXTERNAL_IP") {
                 use crate::genesis_constants::GENESIS_NODE_IPS;
                 for (_i, (genesis_ip, genesis_id)) in GENESIS_NODE_IPS.iter().enumerate() {
                     if env_ip == *genesis_ip {
-                        println!("[NODE_ID] 🔐 Genesis node detected by env IP: {}", genesis_id);
-                        println!("[DIAGNOSTIC] ✅ Priority 3: Env IP matched, using genesis_node_{}", genesis_id);
+                        println!("[INFO][NODE] genesis_detected_by_ip id={}", genesis_id);
+                        println!("[DBG][NODE] id_priority3_ip_match id=genesis_node_{}", genesis_id);
                         return format!("genesis_node_{}", genesis_id);
                     }
                 }
-                println!("[DIAGNOSTIC] ❌ Priority 3: Env IP {} not found in GENESIS_NODE_IPS", env_ip);
+                println!("[DBG][NODE] id_priority3_ip_miss ip={}", env_ip);
             }
             
             // Fallback for legacy genesis (avoid external IP detection)
-            println!("[NODE_ID] 🔐 Legacy genesis node (fast mode)");
-            println!("[DIAGNOSTIC] ⚡ Priority 3: Using fast legacy fallback (no external calls)");
+            println!("[INFO][NODE] legacy_genesis_node mode=fast");
+            println!("[DBG][NODE] id_priority3_legacy_fallback");
             return format!("genesis_node_legacy_{}", std::process::id() % 1000);
         } else {
-            println!("[DIAGNOSTIC] ❌ Priority 3: QNET_GENESIS_BOOTSTRAP='{}', not '1'", genesis_bootstrap);
+            println!("[DBG][NODE] id_priority3_miss genesis_bootstrap={}", genesis_bootstrap);
         }
         
         // Priority 4: Use server IP for regular nodes (FAST MODE: env vars first)
-        println!("[DIAGNOSTIC] 🔧 Priority 4: Regular node ID generation (FAST MODE)");
+        println!("[DBG][NODE] id_priority4_check mode=fast");
         
         // Check environment IP first (Docker/Kubernetes deployment)
         if let Ok(external_ip) = std::env::var("QNET_EXTERNAL_IP") {
             let sanitized_ip = external_ip.replace(".", "_").replace(":", "_");
-            println!("[NODE_ID] 📝 Regular node (env IP): {}", sanitized_ip);
-            println!("[DIAGNOSTIC] ✅ Priority 4a: Using env IP -> node_{}", sanitized_ip);
+            println!("[INFO][NODE] regular_node_id source=env_ip id=node_{}", sanitized_ip);
+            println!("[DBG][NODE] id_priority4a_hit id=node_{}", sanitized_ip);
             return format!("node_{}", sanitized_ip);
         }
         
         // Priority 5: Use hostname as immediate fallback (no network calls)
         if let Ok(hostname) = std::env::var("HOSTNAME") {
             let sanitized_hostname = hostname.replace(".", "_");
-            println!("[NODE_ID] 🏠 Hostname-based node: {}", sanitized_hostname);
-            println!("[DIAGNOSTIC] ✅ Priority 5: Using hostname -> node_{}", sanitized_hostname);
+            println!("[INFO][NODE] hostname_node_id id=node_{}", sanitized_hostname);
+            println!("[DBG][NODE] id_priority5_hit id=node_{}", sanitized_hostname);
             return format!("node_{}", sanitized_hostname);
         }
         
         // Priority 6: Network IP detection (only as last resort)
-        println!("[DIAGNOSTIC] 🔧 Priority 6: Last resort - network IP detection");
+        println!("[DBG][NODE] id_priority6_check method=network_ip");
         if let Ok(ip) = Self::get_external_ip().await {
             let sanitized_ip = ip.replace(".", "_").replace(":", "_");
-            println!("[NODE_ID] 🌐 Regular node (detected IP): {}", sanitized_ip);
-            println!("[DIAGNOSTIC] ✅ Priority 6: Using detected IP -> node_{}", sanitized_ip);
+            println!("[INFO][NODE] regular_node_id source=detected_ip id=node_{}", sanitized_ip);
+            println!("[DBG][NODE] id_priority6_hit id=node_{}", sanitized_ip);
             return format!("node_{}", sanitized_ip);
         } else {
-            println!("[DIAGNOSTIC] ❌ Priority 6: Network IP detection failed");
+            println!("[DBG][NODE] id_priority6_miss reason=network_ip_failed");
         }
         
         // Last resort: Process ID + node type (should not happen in production)
         let fallback_id = format!("node_{}_{}", std::process::id(), node_type as u8);
-        println!("[NODE_ID] ⚠️ Fallback node ID: {} (not recommended for production)", fallback_id);
-        println!("[DIAGNOSTIC] ⚡ FINAL FALLBACK: Using process ID -> {}", fallback_id);
+        println!("[WARN][NODE] fallback_node_id id={}", fallback_id);
+        println!("[DBG][NODE] id_final_fallback id={}", fallback_id);
         fallback_id
     }
     
@@ -29596,7 +29504,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if let Ok(external_ip) = std::env::var("QNET_EXTERNAL_IP") {
             // PRIVACY: Don't show raw IP in logs
             let privacy_id = crate::unified_p2p::get_privacy_id_for_addr(&external_ip);
-            println!("[IP] 📝 Using environment IP: {}", privacy_id);
+            println!("[DBG][NODE] ip_source=env id={}", privacy_id);
             return Ok(external_ip);
         }
         
@@ -29604,7 +29512,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if let Ok(local_ip) = std::env::var("SERVER_IP") {
             // PRIVACY: Don't show raw IP in logs  
             let privacy_id = crate::unified_p2p::get_privacy_id_for_addr(&local_ip);
-            println!("[IP] 🖥️ Using server IP: {}", privacy_id);
+            println!("[DBG][NODE] ip_source=server id={}", privacy_id);
             return Ok(local_ip);
         }
         
@@ -29612,14 +29520,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if let Ok(interface_ip) = Self::get_network_interface_ip().await {
             // PRIVACY: Don't show raw IP in logs
             let privacy_id = crate::unified_p2p::get_privacy_id_for_addr(&interface_ip);
-            println!("[IP] 🔌 Using network interface IP: {}", privacy_id);
+            println!("[DBG][NODE] ip_source=interface id={}", privacy_id);
             return Ok(interface_ip);
         }
         
         // Method 4: Use unique localhost fallback BEFORE external services (avoid blocking)
         let unique_fallback = format!("127_0_0_{}", std::process::id() % 254 + 1); // 1-254 range
-        println!("[IP] ⚡ Using fast localhost fallback (avoiding external services): {}", unique_fallback);
-        println!("[IP] 📝 External IP services skipped to prevent startup blocking");
+        println!("[WARN][NODE] ip_fallback id={} reason=no_external_ip", unique_fallback);
+        println!("[DBG][NODE] ip_external_services_skipped");
         Ok(unique_fallback)
         
         // Method 5: Query external service (disabled to prevent blocking)
@@ -29628,12 +29536,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         /*
         match Self::query_external_ip_service().await {
             Ok(ip) => {
-                println!("[IP] 🌐 Detected external IP: {}", ip);
+                println!("[INFO][NODE] external_ip={}", ip);
                 Ok(ip)
             }
             Err(_) => {
                 let unique_fallback = format!("127_0_0_{}", std::process::id() % 254 + 1);
-                println!("[IP] ⚠️ Using unique localhost fallback: {}", unique_fallback);
+                println!("[WARN][NODE] external_ip_fail fallback={}", unique_fallback);
                 Ok(unique_fallback)
             }
         }
@@ -29740,7 +29648,7 @@ fn verify_genesis_node_certificate(node_id: &str) -> bool {
                            std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1";
     
     if is_bootstrap_node {
-        println!("[SECURITY] ✅ Bootstrap node: Allowing {} without certificate verification", node_id);
+        println!("[INFO][NODE] bootstrap_allowed node={} cert_check=skipped", node_id);
         return true; // Trust bootstrap nodes during initial network formation
     }
     
@@ -29753,14 +29661,14 @@ fn verify_genesis_node_certificate(node_id: &str) -> bool {
         Ok(cert) => cert,
         Err(_) => {
             // PRODUCTION: Genesis nodes MUST have certificates (after bootstrap period)
-            println!("[SECURITY] ❌ No certificate found for genesis node: {}", node_id);
+            println!("[ERR][NODE] genesis_cert_missing node={}", node_id);
             return false;
         }
     };
     
     // PRODUCTION: Verify certificate format and cryptographic signature
     if genesis_certificate.len() < 64 || !genesis_certificate.starts_with("genesis_cert_") {
-        println!("[SECURITY] ❌ Invalid certificate format for genesis node: {}", node_id);
+        println!("[ERR][NODE] genesis_cert_invalid node={}", node_id);
         return false;
     }
     
@@ -29791,7 +29699,7 @@ impl BlockchainNode {
                 if let Ok(Some(compressed_data)) = storage.load_raw(&key) {
                     if let Ok(decompressed) = zstd::decode_all(&compressed_data[..]) {
                         if let Ok(entry) = bincode::deserialize::<crate::quantum_poh::PoHEntry>(&decompressed) {
-                            println!("[QuantumPoH] 📂 Loaded checkpoint from index: count={}", entry.num_hashes);
+                            println!("[INFO][NODE] poh_checkpoint_loaded source=index count={}", entry.num_hashes);
                             return Some((entry.hash, entry.num_hashes));
                         }
                     }
@@ -29802,7 +29710,7 @@ impl BlockchainNode {
         // 2. Fallback: Scan for checkpoints (for migration from old format)
         // Scan in 10M increments (checkpoint interval) up to 100B hashes (~55 hours)
         // This covers reasonable network uptime between restarts
-        println!("[QuantumPoH] 🔍 Scanning for checkpoints (no index found)...");
+        println!("[DBG][NODE] poh_checkpoint_scan reason=no_index");
         let mut latest_checkpoint: Option<(Vec<u8>, u64)> = None;
         
         // Scan from high to low, stop at first found (most recent)
@@ -29816,7 +29724,7 @@ impl BlockchainNode {
                 if let Ok(decompressed) = zstd::decode_all(&compressed_data[..]) {
                     if let Ok(entry) = bincode::deserialize::<crate::quantum_poh::PoHEntry>(&decompressed) {
                         latest_checkpoint = Some((entry.hash.clone(), entry.num_hashes));
-                        println!("[QuantumPoH] 📂 Found checkpoint at count: {}", entry.num_hashes);
+                        println!("[INFO][NODE] poh_checkpoint_found count={}", entry.num_hashes);
                         
                         // Save index for next time
                         if let Ok(index_data) = bincode::serialize(&entry.num_hashes) {
