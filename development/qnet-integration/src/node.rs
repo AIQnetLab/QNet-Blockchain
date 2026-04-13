@@ -1130,7 +1130,7 @@ lazy_static::lazy_static! {
     static ref REQUESTED_CERTIFICATES: DashMap<String, u64> = DashMap::new();
 }
 
-use sha3::{Sha3_256, Digest};
+use sha3::{Sha3_256, Sha3_512, Digest};
 use serde_json;
 use bincode::{self, Options};
 use serde::{Serialize, Deserialize};
@@ -1144,7 +1144,6 @@ fn generate_eon_address_from_id(id: &str) -> String {
     let part2 = &hash[19..34];
 
     let checksum_input = format!("{}eon{}", part1, part2);
-    use sha3::{Sha3_256, Digest};
     let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..4]);
 
     format!("{}eon{}{}", part1, part2, checksum)
@@ -2126,7 +2125,6 @@ impl BlockchainNode {
         // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format and Zstd compression
         for height in start_height..=end_height {
             if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
-                use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
                 hasher.update(&block.signature);
                 let result = hasher.finalize();
@@ -2154,7 +2152,6 @@ impl BlockchainNode {
                     if sigs.len() > 1 {
                         // DOUBLE-SIGN DETECTED!
                         use qnet_consensus::deterministic_reputation::SlashingType;
-                        use sha3::{Sha3_512, Digest};
                         
                         let mut hasher = Sha3_512::new();
                         hasher.update(producer.as_bytes());
@@ -2204,7 +2201,6 @@ impl BlockchainNode {
 
         for (eq_height, eq_voter, eq_round) in &equivocation_entries {
             use qnet_consensus::deterministic_reputation::SlashingType;
-            use sha3::{Sha3_512, Digest};
 
             let mut hasher = Sha3_512::new();
             hasher.update(eq_voter.as_bytes());
@@ -2532,7 +2528,6 @@ impl BlockchainNode {
         // node with the same reputation has an equal chance each epoch.
         // Precompute hashes O(n) — same pattern as select_consensus_committee.
         if eligible.len() > MAX_VALIDATORS_PER_EPOCH {
-            use sha3::{Sha3_256, Digest};
 
             let vrf_seed: [u8; 32] = if macroblock_index >= 2 {
                 let n_minus_2 = macroblock_index - 2;
@@ -2648,7 +2643,6 @@ impl BlockchainNode {
             [0u8; 32]
         };
 
-        use sha3::{Sha3_256, Digest};
 
         let mut scored: Vec<(usize, [u8; 32])> = all_candidates.iter().enumerate().map(|(i, _)| {
             let mut hasher = Sha3_256::new();
@@ -2889,17 +2883,23 @@ impl BlockchainNode {
             tx.signature.is_some(), tx.dilithium_signature.is_some(), node_id);
     }
 
-    /// v9.4: Get SHA3-256 hash of macroblock data from storage.
+    /// v12.0: Get consensus hash of macroblock from storage.
+    /// Deserializes MacroBlock and computes hash from struct fields.
     /// Tries mb_index first, falls back to mb_index-1.
     /// Returns empty string if neither available.
     fn get_latest_macroblock_hash(storage: &Arc<Storage>, mb_index: u64) -> String {
-        use sha3::{Sha3_256, Digest};
         for idx in [mb_index, mb_index.saturating_sub(1)] {
             if idx == 0 { continue; }
             if let Ok(Some(data)) = storage.get_macroblock_by_height(idx) {
-                let mut hasher = Sha3_256::new();
-                hasher.update(&data);
-                return hex::encode(hasher.finalize());
+                // Decompress if zstd-compressed
+                let decompressed = if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                    zstd::decode_all(&data[..]).unwrap_or_else(|_| data.to_vec())
+                } else {
+                    data
+                };
+                if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&decompressed) {
+                    return hex::encode(mb.hash());
+                }
             }
         }
         String::new()
@@ -3565,7 +3565,6 @@ impl BlockchainNode {
             // Create deterministic seed
             // OPTIMIZED: SHA3-256 (32 bytes) instead of SHA3-512 (64 bytes)
             // 20% faster, still quantum-resistant (128-bit security against Grover)
-            use sha3::{Sha3_256, Digest};
             let mut seed_hasher = Sha3_256::new();
             seed_hasher.update(b"QNet_Ping_Sampling_v1");
             seed_hasher.update(&entropy_block);
@@ -3587,7 +3586,6 @@ impl BlockchainNode {
             let mut ping_samples = Vec::new();
             for i in 0..sample_size {
                 // Deterministic index selection
-                use sha3::Sha3_256;
                 let mut index_hasher = Sha3_256::new();
                 index_hasher.update(&sample_seed);
                 index_hasher.update(&(i as u32).to_le_bytes());
@@ -3835,7 +3833,6 @@ impl BlockchainNode {
         };
         
         // Create deterministic sample seed
-        use sha3::{Sha3_256, Digest};
         let mut seed_hasher = Sha3_256::new();
         seed_hasher.update(b"QNet_Heartbeat_Sampling_v1");
         seed_hasher.update(self.node_id.as_bytes());
@@ -4051,7 +4048,6 @@ impl BlockchainNode {
         
         // Create Merkle tree and samples (same logic as create_heartbeat_commitment_tx)
         use blake3::Hasher as Blake3Hasher;
-        use sha3::{Sha3_256, Digest};
         
         let heartbeat_hashes: Vec<String> = my_heartbeats.iter().map(|(_, heartbeat_idx, timestamp, block_height, dilithium_sig)| {
             let mut hasher = Blake3Hasher::new();
@@ -4235,7 +4231,6 @@ impl BlockchainNode {
         
         // Create Merkle tree and samples (same logic as create_ping_commitment_tx)
         use blake3::Hasher as Blake3Hasher;
-        use sha3::{Sha3_256, Digest};
         
         let ping_hashes: Vec<String> = my_pings.iter().map(|(light_node_id, _, _, timestamp, block_height)| {
             let mut hasher = Blake3Hasher::new();
@@ -4430,7 +4425,6 @@ impl BlockchainNode {
         // Create Merkle tree of all pings
         let (merkle_root, ping_samples, sample_seed_hex) = if ping_count > 0 {
             use blake3::Hasher as Blake3Hasher;
-            use sha3::{Sha3_256, Digest};
             
             // Compute hash for each ping
             let ping_hashes: Vec<String> = my_pings.iter().map(|(light_node_id, _slot, _pinger, timestamp, block_height)| {
@@ -4877,7 +4871,6 @@ impl BlockchainNode {
     async fn aggregate_commitments_by_shards(
         commitments: HashMap<String, qnet_state::TransactionType>,
     ) -> Result<(Vec<qnet_state::HeartbeatSummary>, Vec<qnet_state::ShardHeartbeatSummary>), QNetError> {
-        use sha3::{Sha3_256, Digest};
         use std::collections::HashMap;
         
         // v2.95: Collect BOTH individual summaries AND shard aggregates
@@ -6758,7 +6751,6 @@ impl BlockchainNode {
                 let genesis_hash = {
                     match storage.load_microblock(0) {
                         Ok(Some(genesis_data)) => {
-                            use sha3::{Sha3_256, Digest};
                             let mut hasher = Sha3_256::new();
                             hasher.update(&genesis_data);
                             let hash_result = hasher.finalize();
@@ -6771,7 +6763,6 @@ impl BlockchainNode {
                         },
                         _ => {
                             let deterministic_seed = "qnet_genesis_block_2024";
-                            use sha3::{Sha3_256, Digest};
                             let mut hasher = Sha3_256::new();
                             hasher.update(deterministic_seed.as_bytes());
                             let hash_result = hasher.finalize();
@@ -8880,14 +8871,16 @@ impl BlockchainNode {
                                         
                                         if is_info() { println!("[INFO][REORG] fork_detected h={} producer={}", fork_height, fork_producer); }
                                         
-                                        // PRODUCTION: Compute our hash BEFORE spawning async task
-                                        let our_hash_for_state = if let Ok(Some(our_block)) = storage.load_microblock(fork_height) {
-                                            use sha3::{Sha3_256, Digest};
-                                            let mut hasher = Sha3_256::new();
-                                            hasher.update(&our_block);
-                                            hex::encode(&hasher.finalize()[0..8])
-                                        } else {
-                                            format!("missing@{}", fork_height)
+                                        // PRODUCTION: Compute our consensus hash BEFORE spawning async task
+                                        // v12.0: Use load_microblock_auto_format + block.hash() — consensus hash from struct fields,
+                                        // not raw storage bytes (which depend on compression/serialization format).
+                                        let our_hash_for_state = {
+                                            let storage_ref = storage.clone();
+                                            let fh = fork_height;
+                                            match tokio::task::spawn_blocking(move || storage_ref.load_microblock_auto_format(fh)).await {
+                                                Ok(Ok(Some(block))) => hex::encode(&block.hash()[0..8]),
+                                                _ => format!("missing@{}", fork_height),
+                                            }
                                         };
                                         
                                         // STATE MACHINE: Resolving fork (with real hash)
@@ -8979,7 +8972,6 @@ impl BlockchainNode {
                                                                 .ok()
                                                                 .and_then(|opt| opt)
                                                                 .map(|block_data| {
-                                                                    use sha3::{Sha3_256, Digest};
                                                                     let mut h = Sha3_256::new();
                                                                     h.update(&block_data);
                                                                     let mut arr = [0u8; 32];
@@ -9387,11 +9379,9 @@ impl BlockchainNode {
 
                                         if attest_synced {
                                         if let Some(ref p2p) = unified_p2p {
-                                            let mut block_hasher = Sha3_256::new();
-                                            block_hasher.update(&decompressed_data);
-                                            let hash_result = block_hasher.finalize();
-                                            let mut attest_hash = [0u8; 32];
-                                            attest_hash.copy_from_slice(&hash_result);
+                                            // v12.0: Attestation hash = consensus hash from struct fields.
+                                            // Previously hashed raw decompressed bytes — depends on serialization format.
+                                            let attest_hash = microblock.hash();
 
                                             // Sign "QNET_ATTEST:{height}:{hash_hex}" with Dilithium3 (same key as block signing)
                                             let attest_msg = format!("QNET_ATTEST:{}:{}", received_block.height, hex::encode(&attest_hash));
@@ -10790,19 +10780,21 @@ impl BlockchainNode {
                     println!("[DBG][VALIDATION] chain_ok h={} via=hash_index", microblock.height);
                 }
             } else {
-                // TIER 2: Fallback — load full block and compute hash
-                let prev_block_result = storage.load_microblock(prev_height);
+                // TIER 2: Fallback — deserialize block, compute hash from struct fields
+                // v12.0: MUST use load_microblock_auto_format + block.hash(), NOT raw bytes SHA3.
+                // Raw bytes depend on storage format (EfficientMicroBlock, zstd), but block hash
+                // is a consensus property computed from block fields (height, ts, prev, merkle, producer).
+                let prev_block_result = storage.load_microblock_auto_format(prev_height);
 
                 match prev_block_result {
-                    Ok(Some(prev_data)) => {
-                        use sha3::{Sha3_256, Digest};
-                        let mut hasher = Sha3_256::new();
-                        hasher.update(&prev_data);
-                        let prev_hash_result = hasher.finalize();
+                    Ok(Some(prev_block)) => {
+                        let prev_hash_computed = prev_block.hash();
 
-                        if microblock.previous_hash != prev_hash_result.as_slice() {
-                            eprintln!("[ERR][VALIDATION] prev_hash_mismatch h={} expected={:?} got={:?} → FORK_DETECTED!",
-                                     microblock.height, &prev_hash_result[0..8], &microblock.previous_hash[0..8]);
+                        if microblock.previous_hash != prev_hash_computed {
+                            eprintln!("[ERR][VALIDATION] prev_hash_mismatch h={} expected={} got={} → FORK_DETECTED!",
+                                     microblock.height,
+                                     hex::encode(&prev_hash_computed[0..8]),
+                                     hex::encode(&microblock.previous_hash[0..8]));
                             return Err(format!(
                                 "FORK_DETECTED:{}:{}",
                                 prev_height,
@@ -10811,13 +10803,13 @@ impl BlockchainNode {
                         }
 
                         // Backfill hash index for this block (future lookups will be O(1))
-                        if let Err(e) = storage.save_microblock_hash(prev_height, &prev_hash_result) {
+                        if let Err(e) = storage.save_microblock_hash(prev_height, &prev_hash_computed) {
                             if crate::node::is_warn() {
-                                println!("[WARN][STORAGE] hash_index_save_failed h={} err={}", prev_height, e);
+                                println!("[WARN][STORAGE] hash_index_backfill_failed h={} err={}", prev_height, e);
                             }
                         }
 
-                        if is_debug() { println!("[DBG][VALIDATION] chain_ok h={} via=full_block+backfill", microblock.height); }
+                        if is_debug() { println!("[DBG][VALIDATION] chain_ok h={} via=block_hash+backfill", microblock.height); }
                     },
                     _ => {
                         // TIER 3: Previous block not found — self-healing
@@ -11054,7 +11046,6 @@ impl BlockchainNode {
                         // different versions → silent fork → entropy divergence → deadlock.
                         // Use block signature hash (includes VRF randomness, non-manipulable)
                         // instead of merkle_root (which a malicious producer could grind).
-                        use sha3::{Sha3_256, Digest as Sha3Digest};
                         let new_sig_hash = Sha3_256::digest(&microblock.signature);
                         let existing_sig_hash = Sha3_256::digest(&existing_block.signature);
                         if new_sig_hash.as_slice() < existing_sig_hash.as_slice() {
@@ -11165,7 +11156,6 @@ impl BlockchainNode {
                             .ok_or_else(|| "Entropy block not found".to_string())?;
                         
                         // OPTIMIZED: SHA3-256 for deterministic seed verification
-                        use sha3::{Sha3_256, Digest};
                         let mut expected_seed_hasher = Sha3_256::new();
                         expected_seed_hasher.update(b"QNet_Ping_Sampling_v1");
                         expected_seed_hasher.update(&entropy_block);
@@ -11449,18 +11439,12 @@ impl BlockchainNode {
             let stored_macro_hash = storage.get_latest_macroblock_hash();
             
             if let Ok(_stored_hash) = stored_macro_hash {
-                // If we have a stored hash and this is the next macroblock
-                // Check continuity (this already done in step 3, but double-check for safety)
-                use sha3::{Sha3_256, Digest};
-                
-                // Also check if trying to replace existing macroblock
-                // This detects database substitution attacks
-                let mut block_hasher = Sha3_256::new();
-                block_hasher.update(&block.data);
-                let _block_hash = block_hasher.finalize();
-                
-                // Log for monitoring
-                println!("[INFO][VALIDATION] macroblock_integrity_check h={}", macroblock.height);
+                // v12.0: Integrity check uses consensus hash from struct fields
+                let _block_hash = macroblock.hash();
+                if is_info() {
+                    println!("[INFO][VALIDATION] macroblock_integrity_check h={} hash={}",
+                             macroblock.height, hex::encode(&_block_hash[..8]));
+                }
             }
         }
         
@@ -11649,12 +11633,14 @@ impl BlockchainNode {
                                 }
                             ).await {
                                 Ok(Ok(block_data)) if !block_data.is_empty() => {
-                                    // Verify genesis block integrity
+                                    // v12.0: Log consensus hash (from struct fields), not raw-byte hash
                                     {
-                                        use sha3::{Sha3_256, Digest};
-                                        let genesis_hash = hex::encode(Sha3_256::digest(&block_data));
-                                        println!("[INFO][NODE] genesis_downloaded hash={}", &genesis_hash[..16]);
-                                        // TODO: In production, verify against hardcoded GENESIS_BLOCK_HASH constant
+                                        if let Ok(genesis_mb) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                            let genesis_hash = hex::encode(genesis_mb.hash());
+                                            println!("[INFO][NODE] genesis_downloaded consensus_hash={}", &genesis_hash[..16]);
+                                        } else {
+                                            println!("[WARN][NODE] genesis_downloaded bytes={} deserialize_failed", block_data.len());
+                                        }
                                     }
                                     // Try to store as microblock at height 0
                                     match self.storage.save_microblock(0, &block_data) {
@@ -13210,7 +13196,6 @@ impl BlockchainNode {
                             // CRITICAL: All nodes must generate IDENTICAL Genesis signature for consensus
                             // DO NOT use Dilithium here as it creates different signatures per node
                             genesis_microblock.signature = {
-                                use sha3::{Sha3_256, Digest};
                                 let mut hasher = Sha3_256::new();
                                 // Deterministic signature based on Genesis content
                                 hasher.update(b"GENESIS_BLOCK_QUANTUM_SIGNATURE");
@@ -13239,7 +13224,24 @@ impl BlockchainNode {
                                         match storage.save_microblock(0, &data) {
                                             Ok(_) => {
                                                 println!("[INFO][GEN] Genesis Block created and saved at height 0");
-                                                
+
+                                                // v12.0: Export genesis.bin for file-based distribution
+                                                // Other nodes (002-005) can load from this file instead of p2p sync
+                                                let genesis_export_path = std::path::PathBuf::from("/app/data/genesis.bin");
+                                                if let Some(parent) = genesis_export_path.parent() {
+                                                    let _ = std::fs::create_dir_all(parent);
+                                                }
+                                                match std::fs::write(&genesis_export_path, &data) {
+                                                    Ok(_) => {
+                                                        println!("[INFO][GEN] genesis_exported path={} bytes={}",
+                                                                 genesis_export_path.display(), data.len());
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("[ERR][GEN] genesis_export_failed path={} err={}",
+                                                                  genesis_export_path.display(), e);
+                                                    }
+                                                }
+
                                                 // CRITICAL FIX v3.2: Cache NodeRegistration TXs from genesis block
                                                 // Without this, genesis creator can't find wallet addresses for rewards!
                                                 Self::cache_node_registrations_from_transactions(&storage, &genesis_microblock.transactions);
@@ -16527,7 +16529,6 @@ impl BlockchainNode {
                                 // DETERMINISTIC fallback selection using SHA3-512
                                 // BFT timeout fallback — used when VRF claims unavailable
                                 // Candidate list is from macroblock snapshot → IDENTICAL on all nodes
-                                use sha3::{Sha3_512, Digest};
                                 let mut selector = Sha3_512::new();
                                 
                                 // Domain separator (different from primary to avoid collision)
@@ -19881,7 +19882,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // Calculate deterministic entropy that ALL nodes will have (no waiting for blocks!)
             let vrf_entropy = {
-            use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
                 
                 // Use ONLY data that ALL nodes have deterministically:
@@ -19920,7 +19920,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         Ok(Some(genesis_data)) => {
                             // Mix Genesis hash with leadership_round for deterministic selection
                             // CRITICAL: All nodes in same round get SAME entropy regardless of local height
-                            use sha3::{Sha3_256, Digest};
                             let mut hasher = Sha3_256::new();
                             hasher.update(&genesis_data);
                             hasher.update(&leadership_round.to_le_bytes()); // Same for entire round!
@@ -19972,7 +19971,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         }
                         match store.load_microblock(0) {
                             Ok(Some(genesis_data)) => {
-                                use sha3::{Sha3_256, Digest};
                                 let mut hasher = Sha3_256::new();
                                 hasher.update(&genesis_data);
                                 let result = hasher.finalize();
@@ -19992,7 +19990,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             Ok(Some(macroblock_data)) => {
                                 // CRITICAL v2.32: Hash ONLY deterministic fields!
                                 // consensus_data.next_leader can differ between nodes = FORK!
-                                use sha3::{Sha3_256, Digest};
                                 let mut hasher = Sha3_256::new();
                                 hasher.update(b"QNet_Deterministic_Entropy_v2.32");
                                 
@@ -20011,9 +20008,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         hasher.update(&mb.poh_count.to_le_bytes());
                                         // NOTE: consensus_data EXCLUDED - contains next_leader!
                                     }
-                                    Err(_) => {
-                                        // Fallback: hash raw data (legacy compatibility)
-                                        hasher.update(&macroblock_data);
+                                    Err(e) => {
+                                        // v12.0: Cannot use raw bytes for entropy — format-dependent = FORK.
+                                        // If MacroBlock deserialization fails, entropy is unreliable.
+                                        println!("[ERR][FINALITY] mb_deserialize_failed mb={} err={}", required_macroblock, e);
+                                        hasher.update(&[0u8; 32]); // Zero entropy signals desync
                                     }
                                 }
                                 
@@ -20636,7 +20635,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // For very early blocks, use genesis
                     match store.load_microblock(0) {
                         Ok(Some(genesis_data)) => {
-                            use sha3::{Sha3_256, Digest};
                             let mut h = Sha3_256::new();
                             h.update(&genesis_data);
                             let r = h.finalize();
@@ -20660,7 +20658,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // - sorted_candidates: All nodes have same list (minus failed_producer)
             // This ensures ALL nodes select SAME emergency producer
             let emergency_entropy = {
-                use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
                 hasher.update(b"EMERGENCY_VRF_ENTROPY_V8"); // Version bump for new algorithm
                 hasher.update(&finality_hash);  // CRITICAL: Finality window block hash!
@@ -20685,7 +20682,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Quantum-resistant via SHA3-512 (2^128 security)
             // ═══════════════════════════════════════════════════════════════════════════
             
-            use sha3::{Sha3_512, Digest};
             let mut selector = Sha3_512::new();
             selector.update(b"QNet_Emergency_Producer_Selection_v6");
             selector.update(&emergency_entropy);
@@ -21384,7 +21380,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         all_qualified: &[(String, f64)],
         max_count: usize,
     ) -> Vec<(String, f64)> {
-        use sha3::{Sha3_256, Digest};
         let mut selected = Vec::new();
         
         if all_qualified.is_empty() || max_count == 0 {
@@ -21571,7 +21566,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // ENTROPY-BASED: Select consensus initiator using blockchain entropy (like microblocks)
         // This ensures true decentralization and unpredictable initiator selection
         // UNIFIED v2.36: SHA3-512 everywhere for maximum security (256-bit quantum resistance)
-        use sha3::{Sha3_512, Digest};
         let mut selection_hasher = Sha3_512::new();
         
         // Get current macroblock round (every 90 blocks)
@@ -21601,7 +21595,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // UNIFIED v2.47: SHA3-512 for max security, first 32 bytes for beacon compatibility
             match storage.load_microblock(0) {
                 Ok(Some(genesis_data)) => {
-                    use sha3::{Sha3_512, Digest};
                     let mut hasher = Sha3_512::new();
                     hasher.update(&genesis_data);
                     let result = hasher.finalize();
@@ -21625,13 +21618,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 // Use randomness_beacon directly (32 bytes)
                                 beacon.to_vec()
                             } else {
-                                // Fallback: hash the entire macroblock if no beacon
-                                println!("[WARN][CONS] MB #{} has no beacon, using block hash", n_minus_2_index);
-                                use sha3::{Sha3_512, Digest};
-                                let mut hasher = Sha3_512::new();
-                                hasher.update(&macroblock_data);
-                                let result = hasher.finalize();
-                                result[..32].to_vec()
+                                // Fallback: use consensus hash if no beacon
+                                // v12.0: Use macroblock.hash() (struct fields), not raw bytes
+                                println!("[WARN][CONS] MB #{} has no beacon, using consensus_hash", n_minus_2_index);
+                                macroblock.hash().to_vec()
                             }
                         }
                         Err(e) => {
@@ -22526,7 +22516,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // ═══════════════════════════════════════════════════════════════════
                 
                 let pfp_leader = {
-                    use sha3::{Sha3_512, Digest};
                     let mut hasher = Sha3_512::new();
                     
                     // ═══════════════════════════════════════════════════════════════════
@@ -22575,12 +22564,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     if let Some(beacon) = macroblock.consensus_data.randomness_beacon {
                                         hasher.update(&beacon);
                                     } else {
-                                        // Fallback: hash block if no beacon
-                                        println!("[WARN][PFP] mb#{} no_beacon using_hash", n_minus_2_index);
-                                        let mut mb_hasher = Sha3_512::new();
-                                        mb_hasher.update(&macroblock_data);
-                                        let result = mb_hasher.finalize();
-                                        hasher.update(&result[..32]);
+                                        // v12.0: Use consensus hash (struct fields), not raw bytes
+                                        println!("[WARN][PFP] mb#{} no_beacon using_consensus_hash", n_minus_2_index);
+                                        hasher.update(&macroblock.hash());
                                     }
                                 }
                                 Err(e) => {
@@ -22764,8 +22750,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         participants: Vec<String>,
         finalization_type: &str,
     ) -> Result<(), String> {
-        use sha3::{Sha3_256, Digest};
-        
         // Validate height
         if height == 0 {
             if is_debug() { println!("[DBG][PFP] skip_genesis h=0"); }
@@ -22796,18 +22780,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let mut state_accumulator = [0u8; 32];
         
         for h in start_height..=end_height.min(height) {
-            if let Ok(Some(block_data)) = storage.load_microblock(h) {
-                let mut hasher = Sha3_256::new();
-                hasher.update(&block_data);
-                let result = hasher.finalize();
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&result);
-                microblock_hashes.push(hash);
-                
-                // Accumulate state
-                for (i, &byte) in result.iter().take(32).enumerate() {
-                    state_accumulator[i] ^= byte;
-                }
+            // v12.0: Use consensus hash from struct fields, not raw storage bytes.
+            // Fast path: O(1) hash index lookup. Slow path: deserialize + block.hash().
+            let block_hash = if let Ok(Some(indexed_hash)) = storage.load_microblock_hash(h) {
+                indexed_hash
+            } else if let Ok(Some(block)) = tokio::task::block_in_place(|| storage.load_microblock_auto_format(h)) {
+                let h_val: [u8; 32] = block.hash();
+                let _ = storage.save_microblock_hash(h, &h_val);
+                h_val
+            } else {
+                continue;
+            };
+            microblock_hashes.push(block_hash);
+
+            // Accumulate state
+            for (i, &byte) in block_hash.iter().enumerate() {
+                state_accumulator[i] ^= byte;
             }
         }
         
@@ -22988,7 +22976,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if is_info() { println!("[INFO][CONS] commit_phase round={}", round_id); }
         if is_debug() { println!("[DBG][CONS] round_check {}%90={}", round_id, round_id % 90); }
         use qnet_consensus::{commit_reveal::Commit, ConsensusError};
-        use sha3::{Sha3_256, Digest};
         
         // PRODUCTION: REAL commit phase - each node generates only OWN commit
         // CRITICAL: Use the validated node_id passed from startup
@@ -23342,7 +23329,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let reveal_message = format!("{}:{}:{}:{}", our_id, reveal_data_hex, nonce_hex, reveal_timestamp);
             
             // Use SHA3-256 hash of message for signing (consistent with commit)
-            use sha3::{Sha3_256, Digest};
             let mut hasher = Sha3_256::new();
             hasher.update(reveal_message.as_bytes());
             let reveal_hash = hex::encode(hasher.finalize());
@@ -23717,7 +23703,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     fn calculate_merkle_root(txs: &[qnet_state::Transaction]) -> [u8; 32] {
         if txs.is_empty() {
             // Return hash of empty for empty block (consistent with merkle.rs)
-            use sha3::{Sha3_256, Digest};
             let hasher = Sha3_256::new();
             let result = hasher.finalize();
             let mut hash = [0u8; 32];
@@ -23745,7 +23730,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     _ => {
                         // FIX L-L3: Log fallback instead of silently degrading
                         println!("[WARN][CRYPTO] merkle_root_fallback reason=hex_decode_failed root_hex_len={}", root_hex.len());
-                        use sha3::{Sha3_256, Digest};
                         let mut hasher = Sha3_256::new();
                         hasher.update(root_hex.as_bytes());
                         let result = hasher.finalize();
@@ -23758,7 +23742,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             Err(e) => {
                 // v3.11: Log error and fallback to simple hash (should not happen in production)
                 eprintln!("[ERR][MERKLE] compute_merkle_root_fail txs={} err={}", txs.len(), e);
-                use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
                 for tx in txs {
                     hasher.update(tx.hash.as_bytes());
@@ -24035,7 +24018,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         _node_id: &str,
         _unified_p2p: Option<&Arc<SimplifiedP2P>>
     ) -> Result<Vec<u8>, String> {
-        use sha3::{Sha3_256, Digest};
         
         // Create deterministic message hash (same on all nodes for verification)
         let mut hasher = Sha3_256::new();
@@ -24091,7 +24073,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         _producer_pubkey: &str,
         p2p: Option<&Arc<SimplifiedP2P>>
     ) -> Result<bool, String> {
-        use sha3::{Sha3_256, Digest};
         
         // CRITICAL FIX: Genesis block uses deterministic hash, not hybrid format
         if microblock.height == 0 && microblock.producer == "genesis" {
@@ -24523,78 +24504,54 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         storage: &Arc<Storage>,
         current_height: u64,
     ) -> [u8; 32] {
-        // CRITICAL FIX: Block #1 should have Genesis Block hash as previous_hash
+        // Genesis block has no previous
         if current_height == 0 {
-            return [0u8; 32]; // Genesis Block has no previous
+            return [0u8; 32];
         }
-        
-        // PRODUCTION FIX: For block #1 ONLY, use Genesis block hash or deterministic seed
-        // All other blocks (2+) MUST use real previous block hash
-        if current_height == 1 {
-            // Block #1 special case - use Genesis block hash
-            // v10.2: Try hash index first
-            if let Ok(Some(indexed_hash)) = storage.load_microblock_hash(0) {
-                return indexed_hash;
-            }
-            match storage.load_microblock(0) {
-                Ok(Some(genesis_data)) => {
-                    use sha3::{Sha3_256, Digest};
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(&genesis_data);
-                    let result = hasher.finalize();
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&result);
-                    // Backfill genesis hash index
-                    if let Err(e) = storage.save_microblock_hash(0, &hash) {
-                        if crate::node::is_warn() {
-                            println!("[WARN][STORAGE] hash_index_save_failed h=0 err={}", e);
-                        }
-                    }
-                    return hash;
-                },
-                _ => {
-                    // CRITICAL: NO FALLBACK! Genesis MUST exist for block #1
-                    // If Genesis not found - this is a FATAL error
-                    println!("[CRIT][GEN] genesis_not_found_for_block_1");
-                    println!("[CRIT][GEN] no_fallback reason=fork_risk");
-                    // Return zeros - this will make producer selection fail safely
-                    return [0u8; 32];
-                }
-            }
-        }
-        
-        // CRITICAL: For ALL blocks >= 2, use REAL block hash ONLY
-        // NO fallback to prevent chain integrity violations
+
         let prev_h = current_height.saturating_sub(1);
 
-        // v10.2: Try O(1) hash index first, fallback to full block load
+        // v12.0: CRITICAL FIX — Use MicroBlock::hash() for ALL blocks.
+        //
+        // Previous code used SHA3_256(raw_storage_bytes) which hashes the serialized
+        // blob (EfficientMicroBlock + zstd compression). But block_pipeline verify
+        // uses MicroBlock::hash() which hashes 5 struct fields. These are completely
+        // different values → hash_chain_break on every block.
+        //
+        // Production L1 rule: block hash = hash of block CONTENT (fields), not
+        // hash of storage representation (bytes). Storage format can change
+        // (compression, efficient format) without affecting consensus.
+
+        // Fast path: O(1) hash index (pre-computed by save path)
         if let Ok(Some(indexed_hash)) = storage.load_microblock_hash(prev_h) {
             return indexed_hash;
         }
 
-        // Fallback: load full block and compute hash (pre-migration blocks)
-        match storage.load_microblock(prev_h) {
-            Ok(Some(microblock_data)) => {
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(&microblock_data);
-                let result = hasher.finalize();
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&result);
+        // Slow path: deserialize block and compute hash from struct fields
+        let storage_clone = storage.clone();
+        let load_result = tokio::task::spawn_blocking(move || {
+            storage_clone.load_microblock_auto_format(prev_h)
+        }).await;
+
+        match load_result {
+            Ok(Ok(Some(block))) => {
+                let hash = block.hash();
 
                 // Backfill hash index for future O(1) lookups
                 if let Err(e) = storage.save_microblock_hash(prev_h, &hash) {
                     if crate::node::is_warn() {
-                        println!("[WARN][STORAGE] hash_index_save_failed h={} err={}", prev_h, e);
+                        println!("[WARN][STORAGE] hash_index_backfill_failed h={} err={}", prev_h, e);
                     }
                 }
 
                 hash
-            },
+            }
             _ => {
-                // No fallback - return zero to signal sync needed
-                println!("[WARN][PROD] prev_hash_unavailable h={} need={}",
-                         current_height, prev_h);
+                if prev_h == 0 {
+                    println!("[CRIT][GEN] genesis_not_found_for_block_1 — cannot produce");
+                } else {
+                    println!("[WARN][PROD] prev_block_unavailable h={} need={}", current_height, prev_h);
+                }
                 [0u8; 32]
             }
         }
@@ -24645,7 +24602,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 // v3.20: Use merkle_root for deterministic entropy (format-independent)
                 // Both EfficientMicroBlock and raw MicroBlock have same merkle_root
-                use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
                 hasher.update(&microblock.merkle_root);
                 hasher.update(&microblock.previous_hash);
@@ -24796,7 +24752,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // CRITICAL: Must match should_initiate_consensus() entropy!
             match storage.load_microblock(0) {
                 Ok(Some(genesis_data)) => {
-                    use sha3::{Sha3_512, Digest};
                     let mut hasher = Sha3_512::new();
                     hasher.update(&genesis_data);
                     let result = hasher.finalize();
@@ -25138,7 +25093,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         println!("[WARN][CONS] fallback_leader_selection");
                         
                         // Fallback: Use deterministic leader selection based on participants
-                        use sha3::{Sha3_256, Digest};
                         let mut hasher = Sha3_256::new();
                         hasher.update(b"MACROBLOCK_FALLBACK");
                         hasher.update(&(end_height / 90).to_le_bytes());
@@ -25242,30 +25196,31 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let mut state_accumulator = [0u8; 32];
         
         for height in start_height..=end_height {
-            match storage.load_microblock(height) {
-                Ok(Some(microblock_data)) => {
-                    // Calculate actual hash from stored data
-                    use sha3::{Sha3_256, Digest};
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(&microblock_data);
-                    let result = hasher.finalize();
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&result);
-                    microblock_hashes.push(hash);
-                    
-                    // Accumulate state changes for state root
-                    for (i, &byte) in result.iter().take(32).enumerate() {
-                        state_accumulator[i] ^= byte;
+            // v12.0: Consensus hash from struct fields, not raw storage bytes.
+            // Fast path: O(1) hash index. Slow path: deserialize + block.hash().
+            let block_hash = if let Ok(Some(indexed_hash)) = storage.load_microblock_hash(height) {
+                indexed_hash
+            } else {
+                match tokio::task::block_in_place(|| storage.load_microblock_auto_format(height)) {
+                    Ok(Some(block)) => {
+                        let h = block.hash();
+                        let _ = storage.save_microblock_hash(height, &h);
+                        h
                     }
-                    
-                    // VRF accumulation moved to spawn_blocking after loop (v3.21)
-                },
-                _ => {
-                    // Should not happen after waiting, but handle gracefully
-                    println!("[ERR][MB] missing_block h={}", height);
-                    return Err(format!("Missing microblock at height {}", height));
+                    _ => {
+                        println!("[ERR][MB] missing_block h={}", height);
+                        return Err(format!("Missing microblock at height {}", height));
+                    }
                 }
+            };
+            microblock_hashes.push(block_hash);
+
+            // Accumulate state changes for state root
+            for (i, &byte) in block_hash.iter().enumerate() {
+                state_accumulator[i] ^= byte;
             }
+
+            // VRF accumulation moved to spawn_blocking after loop (v3.21)
         }
         
         // v3.21 FIX: QRB VRF accumulation in spawn_blocking to avoid 100s block!
@@ -26823,7 +26778,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         .and_then(|v| v.get("code_hash").and_then(|h| h.as_str().map(String::from)))
                         .unwrap_or_else(|| {
                             // Fallback: if data is not JSON (legacy), hash the raw data
-                            use sha3::{Digest, Sha3_256};
                             let mut hasher = Sha3_256::new();
                             hasher.update(data.as_bytes());
                             format!("{:x}", hasher.finalize())
@@ -28700,7 +28654,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     );
                     let code_hash_temp = registry_temp.hash_activation_code_for_blockchain(code)
                         .unwrap_or_else(|_| {
-                            use sha3::{Sha3_256, Digest};
                             format!("{:x}", Sha3_256::digest(code.as_bytes()))
                         });
                     
@@ -28732,7 +28685,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         );
         let code_hash = registry.hash_activation_code_for_blockchain(code)
             .unwrap_or_else(|_| {
-                use sha3::{Sha3_256, Digest};
                 format!("{:x}", Sha3_256::digest(code.as_bytes()))
             });
         
@@ -29055,7 +29007,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// Generate unique node signature for security
     #[allow(dead_code)]
     async fn generate_node_signature(&self) -> Result<String, String> {
-        use sha3::{Sha3_256, Digest};
         
         // Collect node-specific information
         let mut signature_components = Vec::new();
@@ -29089,7 +29040,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Get device signature for blockchain registry
     pub fn get_device_signature(&self) -> String {
-        use sha3::{Sha3_256, Digest};
         
         // Generate consistent device signature based on node characteristics
         let mut hasher = Sha3_256::new();
@@ -29119,7 +29069,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let part1 = &hash[..19];
         let part2 = &hash[19..34];
         // SHA3-256 checksum (4 bytes = 32-bit collision resistance)
-        use sha3::{Sha3_256, Digest};
         let body = format!("{}eon{}", part1, part2);
         let checksum = hex::encode(&Sha3_256::digest(body.as_bytes())[..4]);
         format!("{}eon{}{}", part1, part2, checksum)
@@ -30196,7 +30145,6 @@ pub enum ConfirmationLevel {
 /// Prevents impersonation attacks by validating node identity
 #[allow(dead_code)]
 fn verify_genesis_node_certificate(node_id: &str) -> bool {
-    use sha3::{Sha3_256, Digest};
     use std::env;
     
     // Bootstrap nodes are trusted during initial network formation
@@ -30418,7 +30366,6 @@ mod tests {
     /// Test microblock hash computation
     #[test]
     fn test_microblock_hash_computation() {
-        use sha3::{Sha3_256, Digest};
         
         let test_data = b"test microblock data";
         let mut hasher = Sha3_256::new();

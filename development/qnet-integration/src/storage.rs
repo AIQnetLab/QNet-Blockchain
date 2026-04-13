@@ -1481,24 +1481,46 @@ impl PersistentStorage {
         
         let key = format!("microblock_{}", height);
         
-        // v10.2: Compute block hash and store in index (same WriteBatch = atomic)
-        // This enables O(1) prev_hash validation without loading full block body.
-        // Hash is SHA3-256 of raw stored data — same as get_previous_microblock_hash() in node.rs.
-        use sha3::{Sha3_256, Digest};
-        let mut hasher = Sha3_256::new();
-        hasher.update(data);
-        let block_hash = hasher.finalize();
+        // v12.0: Compute block hash from STRUCT FIELDS (MicroBlock::hash()), not raw bytes.
+        // Block hash = SHA3(height + timestamp + prev_hash + merkle_root + producer) — consensus property.
+        // Raw bytes depend on storage format and compression — must NOT affect consensus hash.
+        let block_hash = match bincode::deserialize::<qnet_state::MicroBlock>(data) {
+            Ok(mb) => mb.hash(),
+            Err(_) => {
+                // Fallback: try decompressing first (zstd)
+                let decompressed = if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                    zstd::decode_all(data).unwrap_or_else(|_| data.to_vec())
+                } else {
+                    data.to_vec()
+                };
+                match bincode::deserialize::<qnet_state::MicroBlock>(&decompressed) {
+                    Ok(mb) => mb.hash(),
+                    Err(_) => {
+                        // Cannot compute struct hash — skip hash index (will be backfilled on read)
+                        println!("[WARN][STORAGE] hash_index_skip h={} reason=deserialize_failed", height);
+                        let mut batch = WriteBatch::default();
+                        batch.put_cf(&microblocks_cf, key.as_bytes(), data);
+                        batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
+                        self.db.write(batch)?;
+                        return Ok(());
+                    }
+                }
+            }
+        };
         let hash_key = format!("microblock_hash_{}", height);
+        // v12.1: Format discriminator — 0x01 = MicroBlock (full format)
+        let fmt_key = format!("microblock_fmt_{}", height);
 
         let mut batch = WriteBatch::default();
         batch.put_cf(&microblocks_cf, key.as_bytes(), data);
         batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
-        batch.put_cf(&metadata_cf, hash_key.as_bytes(), block_hash.as_slice());
+        batch.put_cf(&metadata_cf, hash_key.as_bytes(), &block_hash);
+        batch.put_cf(&metadata_cf, fmt_key.as_bytes(), &[0x01u8]); // 0x01 = MicroBlock
 
         self.db.write(batch)?;
         Ok(())
     }
-    
+
     /// PRODUCTION: Save activation code with AES-256-GCM encryption
     /// Key is derived from activation code and NEVER stored in database
     pub fn save_activation_code(&self, code: &str, node_type: u8, timestamp: u64) -> IntegrationResult<()> {
@@ -1978,8 +2000,9 @@ impl PersistentStorage {
         }
     }
 
-    /// v10.2: Build hash index entry for a single block (used by migration).
-    /// Loads raw block data, computes SHA3-256, stores in metadata CF.
+    /// v12.0: Build hash index entry for a single block (used by migration).
+    /// Deserializes block, computes consensus hash via MicroBlock::hash(), stores in metadata CF.
+    /// Block hash = SHA3(height + timestamp + prev_hash + merkle_root + producer) — consensus property.
     pub fn build_microblock_hash_index(&self, height: u64) -> IntegrationResult<bool> {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks CF not found".to_string()))?;
@@ -1989,12 +2012,23 @@ impl PersistentStorage {
         let block_key = format!("microblock_{}", height);
         match self.db.get_cf(&microblocks_cf, block_key.as_bytes())? {
             Some(data) => {
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(&data);
-                let block_hash = hasher.finalize();
+                // Decompress if zstd-compressed
+                let decompressed = if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                    zstd::decode_all(&data[..]).unwrap_or_else(|_| data.to_vec())
+                } else {
+                    data.to_vec()
+                };
+                // Deserialize and compute consensus hash from struct fields
+                let block_hash = if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&decompressed) {
+                    if mb.height == height { mb.hash() } else { return Ok(false); }
+                } else if let Ok(eb) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&decompressed) {
+                    if eb.height == height { eb.hash() } else { return Ok(false); }
+                } else {
+                    println!("[WARN][STORAGE] hash_index_build_skip h={} reason=deserialize_failed", height);
+                    return Ok(false);
+                };
                 let hash_key = format!("microblock_hash_{}", height);
-                self.db.put_cf(&metadata_cf, hash_key.as_bytes(), block_hash.as_slice())?;
+                self.db.put_cf(&metadata_cf, hash_key.as_bytes(), &block_hash)?;
                 Ok(true)
             }
             None => Ok(false),
@@ -3303,17 +3337,22 @@ impl Storage {
             .ok_or_else(|| IntegrationError::StorageError("poh_state CF not found".to_string()))?;
         let block_key = format!("microblock_{}", height);
 
-        // v10.2: Compute and store block hash in same atomic WriteBatch.
-        // O(1) prev_hash validation — no need to load+decompress full block.
-        use sha3::{Sha3_256, Digest};
-        let mut hasher = Sha3_256::new();
-        hasher.update(&compressed_block);
-        let block_hash = hasher.finalize();
+        // v12.0: Compute block hash from STRUCT FIELDS (MicroBlock::hash()), not raw bytes.
+        // Block hash is a consensus property: SHA3(height + timestamp + prev_hash + merkle_root + producer).
+        // Raw bytes depend on storage format (EfficientMicroBlock, zstd) and must NOT affect consensus hash.
+        let block_hash = microblock.hash();
         let hash_key = format!("microblock_hash_{}", height);
+
+        // v12.1: Format discriminator — explicit metadata key eliminates bincode guessing.
+        // On load, load_microblock_auto_format checks this key to know the exact format,
+        // instead of trying both MicroBlock/EfficientMicroBlock deserializations.
+        // Key: microblock_fmt_{height} → 0x02 (EfficientMicroBlock)
+        let fmt_key = format!("microblock_fmt_{}", height);
 
         batch.put_cf(&microblocks_cf, block_key.as_bytes(), &compressed_block);
         batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
         batch.put_cf(&metadata_cf, hash_key.as_bytes(), block_hash.as_slice());
+        batch.put_cf(&metadata_cf, fmt_key.as_bytes(), &[0x02u8]); // 0x02 = EfficientMicroBlock
         batch.put_cf(&poh_cf, poh_key.as_bytes(), &poh_data);
         self.persistent.db.write(batch)?;
         
@@ -3385,12 +3424,24 @@ impl Storage {
         for h in 0..=chain_height {
             let block_key = format!("microblock_{}", h);
             if let Some(data) = self.persistent.db.get_cf(&microblocks_cf, block_key.as_bytes())? {
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(&data);
-                let block_hash = hasher.finalize();
+                // v12.0: Deserialize block and compute consensus hash from struct fields.
+                // Block hash = SHA3(height + timestamp + prev_hash + merkle_root + producer).
+                // Raw bytes depend on storage format (bincode, zstd) — NOT a consensus property.
+                let decompressed = if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                    zstd::decode_all(&data[..]).unwrap_or_else(|_| data.to_vec())
+                } else {
+                    data.to_vec()
+                };
+                let block_hash = if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&decompressed) {
+                    if mb.height == h { mb.hash() } else { continue; }
+                } else if let Ok(eb) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&decompressed) {
+                    if eb.height == h { eb.hash() } else { continue; }
+                } else {
+                    println!("[WARN][STORAGE] hash_index_migration_skip h={} reason=deserialize_failed", h);
+                    continue;
+                };
                 let hash_key = format!("microblock_hash_{}", h);
-                batch.put_cf(&metadata_cf, hash_key.as_bytes(), block_hash.as_slice());
+                batch.put_cf(&metadata_cf, hash_key.as_bytes(), &block_hash);
                 indexed += 1;
                 batch_count += 1;
 
@@ -4061,136 +4112,180 @@ impl Storage {
         }
     }
     
-    /// Load microblock with automatic format detection (backward compatibility)
-    /// Supports both EfficientMicroBlock (new) and MicroBlock (legacy) formats
-    /// Handles Zstd compression transparently
+    /// Load microblock with automatic format detection.
+    /// v12.1: Uses `microblock_fmt_{height}` metadata key for deterministic format selection.
+    /// Falls back to try-both logic for blocks saved before v12.1 (backward compat).
+    /// Handles Zstd compression transparently.
     pub fn load_microblock_auto_format(&self, height: u64) -> IntegrationResult<Option<qnet_state::MicroBlock>> {
         // Try to load raw microblock data
         let raw_data = match self.load_microblock(height)? {
             Some(data) => data,
             None => return Ok(None),
         };
-        
+
         // CRITICAL: Decompress if Zstd-compressed (magic bytes: 0x28 0xb5 0x2f 0xfd)
-        // Data is compressed in save_microblock_efficient via compress_block_adaptive
         let microblock_data = if raw_data.len() >= 4 && raw_data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
             zstd::decode_all(&raw_data[..])
                 .map_err(|e| IntegrationError::Other(format!("Zstd decompression failed: {}", e)))?
         } else {
             raw_data
         };
-        
-        // First, try to deserialize as EfficientMicroBlock (new format)
-        if let Ok(efficient_block) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&microblock_data) {
-            // Reconstruct full microblock from efficient format
-            // CRITICAL: Load transactions from PERSISTENT RocksDB storage, NOT in-memory pool
-            // This ensures transactions are available even after restart or TTL expiry
-            let mut transactions = Vec::with_capacity(efficient_block.transaction_hashes.len());
-            
-            for tx_hash in &efficient_block.transaction_hashes {
-                let tx_hash_hex = hex::encode(tx_hash);
-                
-                // First try in-memory cache for speed
-                if let Some(tx) = self.transaction_pool.get_transaction(tx_hash) {
-                    transactions.push(tx);
-                    continue;
+
+        // v12.1: Check format discriminator metadata key (deterministic, no guessing).
+        // 0x01 = MicroBlock (full), 0x02 = EfficientMicroBlock (compact).
+        // If key doesn't exist → legacy block, fall through to try-both logic.
+        let fmt_key = format!("microblock_fmt_{}", height);
+        let known_format = self.persistent.db.cf_handle("metadata")
+            .and_then(|cf| self.persistent.db.get_cf(&cf, fmt_key.as_bytes()).ok())
+            .flatten()
+            .and_then(|v| v.first().copied());
+
+        match known_format {
+            Some(0x01) => {
+                // Deterministic: stored as MicroBlock
+                let block = bincode::deserialize::<qnet_state::MicroBlock>(&microblock_data)
+                    .map_err(|e| IntegrationError::SerializationError(
+                        format!("MicroBlock deserialize failed h={}: {}", height, e)))?;
+                if block.height != height {
+                    return Err(IntegrationError::StorageError(
+                        format!("MicroBlock height mismatch: stored={} requested={}", block.height, height)));
                 }
-                
-                // Fallback to persistent RocksDB storage
-                // Use blocking approach since this is a sync function
-                let tx_cf = match self.persistent.db.cf_handle("transactions") {
-                    Some(cf) => cf,
-                    None => {
-                        println!("[WARN][STORAGE] tx_cf_not_found block={}", height);
-                        continue;
-                    }
-                };
-                
-                let tx_key = format!("tx_{}", tx_hash_hex);
-                match self.persistent.db.get_cf(&tx_cf, tx_key.as_bytes()) {
-                    Ok(Some(data)) => {
-                        // Decompress if Zstd-compressed
-                        let tx_data = if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
-                            zstd::decode_all(&data[..]).unwrap_or(data.to_vec())
-                        } else {
-                            data.to_vec()
-                        };
-                        
-                        if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&tx_data) {
-                            // Cache for future use
-                            let _ = self.transaction_pool.store_transaction(*tx_hash, tx.clone());
-                            transactions.push(tx);
-                        } else {
-                            println!("[WARN][STORAGE] tx_deserialize_failed tx={} block={}", tx_hash_hex, height);
+                return Ok(Some(block));
+            }
+            Some(0x02) => {
+                // Deterministic: stored as EfficientMicroBlock — reconstruct full block
+                return self.reconstruct_from_efficient(&microblock_data, height);
+            }
+            _ => {
+                // Legacy block (no format key) — fall through to try-both logic
+            }
+        }
+
+        // ===================================================================
+        // LEGACY FALLBACK: Blocks saved before v12.1 (no format metadata key).
+        // Try MicroBlock FIRST (genesis/broadcast format), then EfficientMicroBlock.
+        // MicroBlock first because bincode can false-positive on wrong format.
+        // Height sanity check catches garbled deserialization.
+        // ===================================================================
+
+        // Priority 1: Full MicroBlock (genesis, broadcast, legacy)
+        if let Ok(full_block) = bincode::deserialize::<qnet_state::MicroBlock>(&microblock_data) {
+            // Sanity check: height must match requested height (catches false-positive deserialize)
+            if full_block.height == height {
+                // Cache transactions for future EfficientMicroBlock lookups
+                for tx in &full_block.transactions {
+                    if let Ok(hash_bytes) = hex::decode(&tx.hash) {
+                        if hash_bytes.len() == 32 {
+                            let mut hash_array = [0u8; 32];
+                            hash_array.copy_from_slice(&hash_bytes);
+                            if let Err(e) = self.transaction_pool.store_transaction(hash_array, tx.clone()) {
+                                println!("[WARN][STORAGE] tx_cache_failed tx={} err={}", hex::encode(hash_array), e);
+                            }
                         }
                     }
-                    Ok(None) => {
-                        println!("[WARN][STORAGE] tx_not_found tx={} block={}", tx_hash_hex, height);
-                    }
-                    Err(e) => {
-                        println!("[WARN][STORAGE] tx_load_err tx={} err={}", tx_hash_hex, e);
-                    }
                 }
+                return Ok(Some(full_block));
             }
-            
-            // v9.0: Verify all transactions loaded. If any are missing, the block
-            // is incomplete and would cause consensus divergence (different nodes see
-            // different TX counts for the same block).
-            let expected_tx_count = efficient_block.transaction_hashes.len();
-            if transactions.len() != expected_tx_count && expected_tx_count > 0 {
-                eprintln!("[ERR][STORAGE] incomplete_block h={} expected_txs={} loaded={}",
-                         height, expected_tx_count, transactions.len());
-                return Err(IntegrationError::StorageError(
-                    format!("Block {} missing {} transactions", height,
-                            expected_tx_count - transactions.len())
-                ));
+        }
+
+        // Priority 2: EfficientMicroBlock (compact storage format, height > 0)
+        if let Ok(_) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&microblock_data) {
+            return self.reconstruct_from_efficient(&microblock_data, height);
+        }
+
+        // Neither format worked
+        Err(IntegrationError::StorageError(
+            format!("Unable to deserialize microblock {} in any known format (bytes={})", height, microblock_data.len())
+        ))
+    }
+
+    /// Reconstruct a full MicroBlock from EfficientMicroBlock binary data.
+    /// Loads transactions from persistent RocksDB storage and in-memory cache.
+    fn reconstruct_from_efficient(&self, data: &[u8], height: u64) -> IntegrationResult<Option<qnet_state::MicroBlock>> {
+        let efficient_block = bincode::deserialize::<qnet_state::EfficientMicroBlock>(data)
+            .map_err(|e| IntegrationError::SerializationError(
+                format!("EfficientMicroBlock deserialize failed h={}: {}", height, e)))?;
+
+        if efficient_block.height != height {
+            return Err(IntegrationError::StorageError(
+                format!("EfficientMicroBlock height mismatch: stored={} requested={}", efficient_block.height, height)));
+        }
+
+        // Reconstruct full microblock: load transactions from persistent + cache
+        let mut transactions = Vec::with_capacity(efficient_block.transaction_hashes.len());
+
+        for tx_hash in &efficient_block.transaction_hashes {
+            let tx_hash_hex = hex::encode(tx_hash);
+
+            // First try in-memory cache for speed
+            if let Some(tx) = self.transaction_pool.get_transaction(tx_hash) {
+                transactions.push(tx);
+                continue;
             }
 
-            // Reconstruct full MicroBlock (including QRB VRF data)
-            let microblock = qnet_state::MicroBlock {
-                height: efficient_block.height,
-                timestamp: efficient_block.timestamp,
-                transactions,
-                producer: efficient_block.producer,
-                signature: efficient_block.signature,
-                previous_hash: efficient_block.previous_hash,
-                merkle_root: efficient_block.merkle_root,
-                poh_hash: efficient_block.poh_hash,
-                poh_count: efficient_block.poh_count,
-                // Quantum Randomness Beacon (QRB) v3.0
-                vrf_output: efficient_block.vrf_output,
-                vrf_proof: efficient_block.vrf_proof,
-                // v3.18: fees_collected for producer rewards
-                fees_collected: efficient_block.fees_collected,
-                // v3.27: state_root for state verification
-                state_root: efficient_block.state_root,
+            // Fallback to persistent RocksDB storage
+            let tx_cf = match self.persistent.db.cf_handle("transactions") {
+                Some(cf) => cf,
+                None => {
+                    println!("[WARN][STORAGE] tx_cf_not_found block={}", height);
+                    continue;
+                }
             };
-            
-            return Ok(Some(microblock));
-        }
-        
-        // Fallback: try to deserialize as legacy MicroBlock format
-        if let Ok(legacy_block) = bincode::deserialize::<qnet_state::MicroBlock>(&microblock_data) {
-            // For backward compatibility, also populate transaction pool with legacy data
-            for tx in &legacy_block.transactions {
-                // Convert string hash to [u8; 32]
-                if let Ok(hash_bytes) = hex::decode(&tx.hash) {
-                    if hash_bytes.len() == 32 {
-                        let mut hash_array = [0u8; 32];
-                        hash_array.copy_from_slice(&hash_bytes);
-                        if let Err(e) = self.transaction_pool.store_transaction(hash_array, tx.clone()) {
-                            println!("[WARN][STORAGE] legacy_tx_cache_failed tx={} err={}", hex::encode(hash_array), e);
-                        }
+
+            let tx_key = format!("tx_{}", tx_hash_hex);
+            match self.persistent.db.get_cf(&tx_cf, tx_key.as_bytes()) {
+                Ok(Some(data)) => {
+                    // Decompress if Zstd-compressed
+                    let tx_data = if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                        zstd::decode_all(&data[..]).unwrap_or(data.to_vec())
+                    } else {
+                        data.to_vec()
+                    };
+
+                    if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&tx_data) {
+                        let _ = self.transaction_pool.store_transaction(*tx_hash, tx.clone());
+                        transactions.push(tx);
+                    } else {
+                        println!("[WARN][STORAGE] tx_deserialize_failed tx={} block={}", tx_hash_hex, height);
                     }
                 }
+                Ok(None) => {
+                    println!("[WARN][STORAGE] tx_not_found tx={} block={}", tx_hash_hex, height);
+                }
+                Err(e) => {
+                    println!("[WARN][STORAGE] tx_load_err tx={} err={}", tx_hash_hex, e);
+                }
             }
-            
-            return Ok(Some(legacy_block));
         }
-        
-        Err(IntegrationError::StorageError(
-            format!("Unable to deserialize microblock {} in any known format", height)
-        ))
+
+        // Verify all transactions loaded
+        let expected_tx_count = efficient_block.transaction_hashes.len();
+        if transactions.len() != expected_tx_count && expected_tx_count > 0 {
+            eprintln!("[ERR][STORAGE] incomplete_block h={} expected_txs={} loaded={}",
+                     height, expected_tx_count, transactions.len());
+            return Err(IntegrationError::StorageError(
+                format!("Block {} missing {} transactions", height,
+                        expected_tx_count - transactions.len())));
+        }
+
+        // Reconstruct full MicroBlock (including QRB VRF data)
+        let microblock = qnet_state::MicroBlock {
+            height: efficient_block.height,
+            timestamp: efficient_block.timestamp,
+            transactions,
+            producer: efficient_block.producer,
+            signature: efficient_block.signature,
+            previous_hash: efficient_block.previous_hash,
+            merkle_root: efficient_block.merkle_root,
+            poh_hash: efficient_block.poh_hash,
+            poh_count: efficient_block.poh_count,
+            vrf_output: efficient_block.vrf_output,
+            vrf_proof: efficient_block.vrf_proof,
+            fees_collected: efficient_block.fees_collected,
+            state_root: efficient_block.state_root,
+        };
+
+        Ok(Some(microblock))
     }
     
     /// Convert legacy microblock to efficient format (migration utility)

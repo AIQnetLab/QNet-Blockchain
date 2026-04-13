@@ -511,22 +511,6 @@ impl NodeReputation {
         }
     }
     
-    /// Check if node is Genesis (exact match only — no prefix matching)
-    fn is_genesis_node(&self, node_id: &str) -> bool {
-        const GENESIS_NODE_IDS: &[&str] = &[
-            "genesis_node_001",
-            "genesis_node_002",
-            "genesis_node_003",
-            "genesis_node_004",
-            "genesis_node_005",
-            "QNET-BOOT-0001-STRAP",
-            "QNET-BOOT-0002-STRAP",
-            "QNET-BOOT-0003-STRAP",
-            "QNET-BOOT-0004-STRAP",
-            "QNET-BOOT-0005-STRAP",
-        ];
-        GENESIS_NODE_IDS.contains(&node_id)
-    }
     
     /// Detect and handle malicious behavior
     pub fn detect_malicious_behavior(&mut self, node_id: &str, evidence: &Evidence) -> bool {

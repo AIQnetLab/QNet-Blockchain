@@ -19,24 +19,23 @@ pub struct GenesisConfig {
 
 impl Default for GenesisConfig {
     fn default() -> Self {
-        // CRITICAL: Use real time for Genesis Block creation
-        // Only node_001 creates Genesis, others receive it with this timestamp
+        // Genesis timestamp: only node 001 calls this to CREATE genesis.
+        // Nodes 002-005 receive the SAME serialized block via QUIC — identical bytes, identical hash.
+        // now() is correct here because genesis is created ONCE by ONE node, not independently by each.
         let genesis_timestamp = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or_else(|| {
-                // Use REAL current time + QUIC_INIT_OFFSET when Genesis is created by node_001
-                // CRITICAL v2.42.1: Add offset to account for QUIC initialization time (10-15 sec)
-                // Without this, first 10-30 blocks are created instantly "catching up" to real time,
+                // Add offset for QUIC initialization time (10-15 sec)
+                // Without this, first blocks are created instantly "catching up" to real time,
                 // overwhelming QUIC and causing block propagation failures
-                // Other nodes receive Genesis and start production at the SAME future timestamp
-                const QUIC_INIT_OFFSET_SECS: u64 = 15; // Time for QUIC connections to establish
+                const QUIC_INIT_OFFSET_SECS: u64 = 15;
                 let real_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
                 let genesis_time = real_time + QUIC_INIT_OFFSET_SECS;
-                println!("[INFO][GEN] genesis_ts={} current={} quic_offset={}s", 
+                println!("[INFO][GEN] genesis_ts={} current={} quic_offset={}s",
                          genesis_time, real_time, QUIC_INIT_OFFSET_SECS);
                 genesis_time
             });
