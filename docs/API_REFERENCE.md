@@ -227,7 +227,7 @@ Content-Type: application/json
 transfer:{from}:{to}:{amount}:{nonce}
 ```
 
-**Address Format**: `{19 hex}eon{15 hex}{4 hex checksum}` (41 characters total)
+**Address Format**: `{19 hex}eon{15 hex}{8 hex SHA3-256 checksum}` (45 characters total)
 
 **Gas Limits** (QNet-optimized):
 | Operation | Gas Limit |

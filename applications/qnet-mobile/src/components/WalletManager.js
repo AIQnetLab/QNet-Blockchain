@@ -2097,16 +2097,16 @@ export class WalletManager {
       const hash = CryptoJS.SHA512(solanaAddress + 'qnet-eon-bridge'); // Use hyphen for consistency
       const fullHash = hash.toString(CryptoJS.enc.Hex);
       
-      // New long format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+      // Format: 19 chars + "eon" + 15 chars + 8 char SHA3-256 checksum = 45 total
       const part1 = fullHash.substring(0, 19).toLowerCase();
       const part2 = fullHash.substring(19, 34).toLowerCase();
-      
-      // Generate SHA3-256 checksum (MUST match server! v4.0 migrated from SHA2 to SHA3)
+
+      // Generate SHA3-256 checksum (MUST match server! 4 bytes = 8 hex chars)
       const { sha3_256 } = require('js-sha3');
       const addressWithoutChecksum = part1 + 'eon' + part2;
       const checksumHex = sha3_256(addressWithoutChecksum);
-      const checksum = checksumHex.substring(0, 4).toLowerCase();
-      
+      const checksum = checksumHex.substring(0, 8).toLowerCase();
+
       return `${part1}eon${part2}${checksum}`;
     } catch (error) {
       // console.error('Error generating QNet address from Solana:', error);
@@ -2274,15 +2274,15 @@ export class WalletManager {
       const addressHash = CryptoJS.SHA512(publicKeyWordArray);
       const fullHash = addressHash.toString(CryptoJS.enc.Hex);
       
-      // Create address format: 19 chars + "eon" + 15 chars + 4 char checksum
+      // Format: 19 chars + "eon" + 15 chars + 8 char SHA3-256 checksum = 45 total
       const part1 = fullHash.substring(0, 19).toLowerCase();
       const part2 = fullHash.substring(19, 34).toLowerCase();
-      
-      // Generate SHA3-256 checksum (MUST match server! v4.0 migrated from SHA2 to SHA3)
+
+      // Generate SHA3-256 checksum (MUST match server! 4 bytes = 8 hex chars)
       const { sha3_256 } = require('js-sha3');
       const addressWithoutChecksum = part1 + 'eon' + part2;
       const checksumHex = sha3_256(addressWithoutChecksum);
-      const checksum = checksumHex.substring(0, 4).toLowerCase();
+      const checksum = checksumHex.substring(0, 8).toLowerCase();
       
       const address = `${part1}eon${part2}${checksum}`;
       
@@ -6185,17 +6185,17 @@ export class WalletManager {
   // Send QNC tokens to another address
   async sendQNC(toAddress, amount, password) {
     try {
-      // Validate inputs - EON address: {19 chars}eon{15 chars}{4 checksum} = 41 chars
+      // Validate inputs - EON address: {19 chars}eon{15 chars}{8 checksum} = 45 chars
       if (!toAddress) {
         throw new Error('Recipient address is required');
       }
-      
-      // Accept EON format (41 chars with 'eon') or hex format (64 chars)
-      const isEonFormat = toAddress.includes('eon') && toAddress.length === 41;
+
+      // Accept EON format (45 chars with 'eon') or hex format (64 chars)
+      const isEonFormat = toAddress.includes('eon') && toAddress.length === 45;
       const isHexFormat = /^[0-9a-fA-F]{64}$/.test(toAddress);
-      
+
       if (!isEonFormat && !isHexFormat) {
-        throw new Error('Invalid address. EON (41 chars) or Hex (64 chars) required.');
+        throw new Error('Invalid address. EON (45 chars) or Hex (64 chars) required.');
       }
       
       if (!amount || amount <= 0) {
@@ -6391,17 +6391,17 @@ export class WalletManager {
         // Check for stored QNet address first
         let qnetAddress = await AsyncStorage.getItem('qnet_address');
         
-        // If no QNet address or it's old format or SHA2→SHA3 checksum migration needed
-        let needsRegen = !qnetAddress || qnetAddress.length < 40;
-        if (!needsRegen && qnetAddress && qnetAddress.length === 41) {
-          // v4.0 migration: verify SHA3-256 checksum (server migrated from SHA2 to SHA3)
+        // v4.1: Force regen if missing or not 45-char format (old 41-char addresses)
+        let needsRegen = !qnetAddress || qnetAddress.length !== 45;
+        if (!needsRegen && qnetAddress) {
+          // Verify SHA3-256 checksum integrity
           try {
             const { sha3_256 } = require('js-sha3');
             const addrBody = qnetAddress.substring(0, 37);
-            const oldChecksum = qnetAddress.substring(37, 41);
-            const correctChecksum = sha3_256(addrBody).substring(0, 4).toLowerCase();
-            if (oldChecksum !== correctChecksum) {
-              console.log('[WALLET] SHA2→SHA3 checksum migration needed');
+            const storedChecksum = qnetAddress.substring(37, 45);
+            const correctChecksum = sha3_256(addrBody).substring(0, 8).toLowerCase();
+            if (storedChecksum !== correctChecksum) {
+              console.log('[WARN][WALLET] checksum_mismatch regen=true');
               needsRegen = true;
             }
           } catch (e) { needsRegen = true; }

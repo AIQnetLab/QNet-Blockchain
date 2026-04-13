@@ -279,15 +279,14 @@ pub fn derive_qnet_address_from_mnemonic(mnemonic: &str) -> Result<String, Strin
     sha512_hasher.update(pubkey_bytes);
     let full_hash = hex::encode(sha512_hasher.finalize());
 
-    // Step 5: Address format: 19 chars + "eon" + 15 chars + 4-char SHA3-256 checksum
+    // Step 5: Address format: 19 chars + "eon" + 15 chars + 8-char SHA3-256 checksum = 45
     let part1 = full_hash[..19].to_lowercase();
     let part2 = full_hash[19..34].to_lowercase();
     let body = format!("{}eon{}", part1, part2);
 
     let mut sha3_hasher = Sha3_256::new();
     sha3_hasher.update(body.as_bytes());
-    let checksum_hex = hex::encode(sha3_hasher.finalize());
-    let checksum = &checksum_hex[..4];
+    let checksum = hex::encode(&sha3_hasher.finalize()[..4]); // 4 bytes = 8 hex chars
 
     Ok(format!("{}eon{}{}", part1, part2, checksum))
 }

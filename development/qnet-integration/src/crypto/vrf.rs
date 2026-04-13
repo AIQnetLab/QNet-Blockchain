@@ -483,7 +483,7 @@ mod tests {
         let a = WalletIdentity::derive_wallet_address("test seed");
         let b = WalletIdentity::derive_wallet_address("test seed");
         assert_eq!(a, b);
-        assert_eq!(a.len(), 41);
+        assert_eq!(a.len(), 45);
         assert!(a.contains("eon"));
     }
 

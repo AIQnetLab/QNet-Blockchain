@@ -664,64 +664,6 @@ fn is_origin_allowed(origin: &str) -> bool {
 
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
-/// SECURITY: Validate legacy Genesis EON address format (backward compatibility)
-/// Format: {19 hex}eon{19 hex} = 41 characters (NO checksum)
-/// Used ONLY for Genesis nodes in genesis_constants.rs
-fn validate_legacy_eon_address(address: &str) -> bool {
-    // Check length: 19 + 3 + 19 = 41 characters
-    if address.len() != 41 {
-        return false;
-    }
-    
-    // Check "eon" marker at position 19
-    if &address[19..22] != "eon" {
-        return false;
-    }
-    
-    // Check all characters are lowercase hex (except "eon")
-    let part1 = &address[0..19];
-    let part2 = &address[22..41];
-    
-    let is_hex = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase());
-    
-    is_hex(part1) && is_hex(part2)
-}
-
-/// SECURITY: Validate QNet EON address format
-/// Format: {19 hex}eon{15 hex}{8 hex checksum} = 45 characters
-/// Checksum: first 4 bytes (32 bits) of SHA3-256 for 1/4B collision resistance
-fn validate_eon_address(address: &str) -> bool {
-    // Check length: 19 + 3 + 15 + 8 = 45 characters
-    if address.len() != 45 {
-        return false;
-    }
-    
-    // Check "eon" marker at position 19
-    if &address[19..22] != "eon" {
-        return false;
-    }
-    
-    // Check all characters are lowercase hex (except "eon")
-    let part1 = &address[0..19];
-    let part2 = &address[22..37];
-    let checksum = &address[37..45];
-
-    let is_hex = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase());
-
-    if !is_hex(part1) || !is_hex(part2) || !is_hex(checksum) {
-        return false;
-    }
-
-    // Verify SHA3-256 checksum (4 bytes = 32-bit collision resistance)
-    let address_without_checksum = format!("{}eon{}", part1, part2);
-    let computed_checksum = {
-        use sha3::{Sha3_256, Digest};
-        hex::encode(&Sha3_256::digest(address_without_checksum.as_bytes())[..4])
-    };
-
-    checksum == computed_checksum
-}
-
 /// SECURITY: Validate address with detailed error
 fn validate_eon_address_with_error(address: &str) -> Result<(), String> {
     if address.len() != 45 {
@@ -9310,32 +9252,14 @@ async fn handle_claim_rewards(
         return Ok(rate_limit_response);
     }
     
-    // SECURITY: Validate EON wallet address format
-    // GENESIS EXCEPTION: Genesis nodes use legacy format {19}eon{19} without checksum
-    // This is for backward compatibility with hardcoded genesis_constants.rs addresses
-    let is_genesis_claim = claim_request.node_id.starts_with("genesis_node_");
-    
-    if is_genesis_claim {
-        // Genesis nodes: Validate legacy format OR new format
-        let is_valid_legacy = validate_legacy_eon_address(&claim_request.wallet_address);
-        let is_valid_new = validate_eon_address(&claim_request.wallet_address);
-        
-        if !is_valid_legacy && !is_valid_new {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Invalid Genesis wallet address format",
-                "details": "Expected format: {19}eon{19} (legacy) or {19}eon{15}{8 checksum} (new)"
-            })));
-        }
-    } else {
-        // Regular nodes: Strict new format validation
-        if let Err(e) = validate_eon_address_with_error(&claim_request.wallet_address) {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Invalid wallet address format",
-                "details": e
-            })));
-        }
+    // SECURITY: Validate EON wallet address format (45-char with SHA3-256 checksum)
+    // All nodes (genesis + super) use the same format: {19}eon{15}{8 checksum}
+    if let Err(e) = validate_eon_address_with_error(&claim_request.wallet_address) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid wallet address format",
+            "details": e
+        })));
     }
     
     // PRODUCTION: Verify Ed25519 signature from client (NOT Dilithium - that's for node consensus only)

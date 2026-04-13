@@ -59,35 +59,35 @@ class GenesisWhitelist:
     
     def _create_default_whitelist(self):
         """Create default whitelist for genesis"""
-        # Genesis validators - 5 bootstrap nodes (format: 19+3+15+4=41 chars)
-        # v2.66: Updated to Ed25519-based addresses
+        # Genesis validators - 5 bootstrap nodes (format: 19+3+15+8=45 chars)
+        # v4.1: Updated to 45-char format with 8-hex SHA3-256 checksum
         genesis_validators = [
             {
-                "address": "f36ff465a0944fd06cdeonfca0ad004ff9db42e16",
+                "address": "f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab",
                 "description": "Genesis Bootstrap Node 1 - Primary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "0bac6225a082de1f659eond0c96f1706cf19cc7ab", 
+                "address": "0bac6225a082de1f659eond0c96f1706cf19cc7abf70a",
                 "description": "Genesis Bootstrap Node 2 - Secondary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "d216bb23fbe7f853636eon3f16b378b919227e009",
-                "description": "Genesis Bootstrap Node 3 - Tertiary", 
+                "address": "d216bb23fbe7f853636eon3f16b378b919227e009fb4f",
+                "description": "Genesis Bootstrap Node 3 - Tertiary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc",
-                "description": "Genesis Bootstrap Node 4 - Quaternary", 
+                "address": "e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc1113",
+                "description": "Genesis Bootstrap Node 4 - Quaternary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb",
+                "address": "02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb74cb",
                 "description": "Genesis Bootstrap Node 5 - Quinary",
                 "free_activations": 1,
                 "priority_access": True

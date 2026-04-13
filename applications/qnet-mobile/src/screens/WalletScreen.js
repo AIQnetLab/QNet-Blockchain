@@ -1347,11 +1347,11 @@ const WalletScreen = () => {
         if (!activatedNodeType && wallet) {
           // v2.66: Updated to Ed25519-based addresses
           const GENESIS_WALLETS = {
-            '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db42e16',
-            '002': '0bac6225a082de1f659eond0c96f1706cf19cc7ab',
-            '003': 'd216bb23fbe7f853636eon3f16b378b919227e009',
-            '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc',
-            '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb',
+            '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab',
+            '002': '0bac6225a082de1f659eond0c96f1706cf19cc7abf70a',
+            '003': 'd216bb23fbe7f853636eon3f16b378b919227e009fb4f',
+            '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc1113',
+            '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb74cb',
           };
           
           const userQNetAddress = (wallet.qnetAddress || wallet.address || '').toLowerCase();
@@ -1620,21 +1620,21 @@ const WalletScreen = () => {
         
         // SECURITY: Genesis nodes have PREDEFINED wallets
         // User's wallet MUST match the hardcoded wallet for this Genesis node
-        // PRODUCTION: Genesis wallet addresses (format: 19+3+15+4=41 chars)
-        // v2.66: Updated to Ed25519-based addresses
+        // PRODUCTION: Genesis wallet addresses (format: 19+3+15+8=45 chars)
+        // v4.1: Updated to 45-char format with 8-hex SHA3-256 checksum
         const GENESIS_WALLETS = {
-          '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db42e16',
-          '002': '0bac6225a082de1f659eond0c96f1706cf19cc7ab',
-          '003': 'd216bb23fbe7f853636eon3f16b378b919227e009',
-          '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc',
-          '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb',
+          '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab',
+          '002': '0bac6225a082de1f659eond0c96f1706cf19cc7abf70a',
+          '003': 'd216bb23fbe7f853636eon3f16b378b919227e009fb4f',
+          '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc1113',
+          '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb74cb',
         };
         
         const expectedWallet = GENESIS_WALLETS[bootstrapId];
         
         // SECURITY: Get user's QNet address for comparison
-        // QNet addresses contain "eon" marker and are 41 characters
-        // Format: 19chars + "eon" + 15chars + 4char_checksum (new)
+        // QNet addresses contain "eon" marker and are 45 characters
+        // Format: 19chars + "eon" + 15chars + 8char_checksum
         const userQNetAddress = wallet.qnetAddress || wallet.address;
         
         if (!userQNetAddress) {
@@ -1656,8 +1656,8 @@ const WalletScreen = () => {
         // with your actual QNet wallet addresses from the mobile app!
         if (normalizedUser !== normalizedExpected) {
           // Check if formats are different but base parts match
-          // Format: 19 hex + "eon" + 15 hex + 4 checksum = 41 chars
-          // Example: f36ff465a0944fd06cdeonfca0ad004ff9db42e16
+          // Format: 19 hex + "eon" + 15 hex + 8 checksum = 45 chars
+          // Example: f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab
           const userPart1 = normalizedUser.substring(0, 19);
           const userEon = normalizedUser.substring(19, 22);
           const expectedPart1 = normalizedExpected.substring(0, 19);
@@ -2054,15 +2054,15 @@ const WalletScreen = () => {
       return;
     }
     
-    // Validate address format for QNet EON: 41 chars with 'eon' in middle
+    // Validate address format for QNet EON: 45 chars with 'eon' marker
     if (sendingToken.network === 'qnet') {
-      const isValidEon = sendAddress.includes('eon') && sendAddress.length === 41;
+      const isValidEon = sendAddress.includes('eon') && sendAddress.length === 45;
       const isValidHex = /^[0-9a-fA-F]{64}$/.test(sendAddress);
-      
+
       if (!isValidEon && !isValidHex) {
-        setTxResult({ 
-          success: false, 
-          error: 'Invalid address format.\nMust be EON (41 chars) or Hex (64 chars)'
+        setTxResult({
+          success: false,
+          error: 'Invalid address format.\nMust be EON (45 chars) or Hex (64 chars)'
         });
         return;
       }
@@ -5487,7 +5487,7 @@ const WalletScreen = () => {
                         console.log('[RECOVER] Found burn TX on Solana:', burnInfo.burnTxHash, 'type:', burnInfo.nodeType);
                         const nodeType = burnInfo.nodeType || 'light';
                         
-                        // Ensure we have QNet EON address (41 chars) for Phase 1 — NOT Solana address (44 chars)
+                        // Ensure we have QNet EON address (45 chars) for Phase 1 — NOT Solana address (44 chars)
                         const qnetEonAddress = wallet.qnetAddress || walletManager.generateQNetAddressFromSolana(wallet.publicKey);
                         
                         // Regenerate code LOCALLY — no server needed, fully deterministic.

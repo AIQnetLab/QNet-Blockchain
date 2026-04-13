@@ -2667,37 +2667,35 @@ class ProductionCrypto {
     }
     
     // Generate QNet address from Solana address (for simple display)
-    // PRODUCTION FORMAT: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+    // PRODUCTION FORMAT: 19 chars + "eon" + 15 chars + 8 char checksum = 45 total
     static generateQNetAddressFromSolana(solanaAddress) {
         try {
             // Generate deterministic QNet address from Solana address
             const encoder = new TextEncoder();
             const data = encoder.encode(solanaAddress + 'qnet_eon_bridge');
-            
+
             // Use SHA-512 hash
             return crypto.subtle.digest('SHA-512', data).then(hashBuffer => {
                 const hash = Array.from(new Uint8Array(hashBuffer));
                 const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
-                
-                // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters (NO underscores!)
+
+                // PRODUCTION FORMAT: 19 + 3 + 15 + 8 = 45 characters
                 const part1 = fullHex.substring(0, 19).toLowerCase();
                 const part2 = fullHex.substring(19, 34).toLowerCase();
-                
-                // Generate SHA-256 checksum (same algorithm as mobile app)
+
+                // Generate checksum (4 bytes = 8 hex chars)
                 const addressWithoutChecksum = part1 + 'eon' + part2;
                 const checksumEncoder = new TextEncoder();
-                
+
                 return crypto.subtle.digest('SHA-256', checksumEncoder.encode(addressWithoutChecksum)).then(checksumBuffer => {
                     const checksumHash = Array.from(new Uint8Array(checksumBuffer));
                     const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 4).toLowerCase();
-                    
-                    // PRODUCTION: No underscores, just part1 + eon + part2 + checksum
+                    const checksum = checksumHex.substring(0, 8).toLowerCase();
+
                     return `${part1}eon${part2}${checksum}`;
                 });
             });
         } catch (error) {
-            // console.error('Error generating QNet address from Solana:', error);
             return null;
         }
     }
@@ -2868,17 +2866,17 @@ class ProductionCrypto {
             const fullHex = addressHash.map(b => b.toString(16).padStart(2, '0')).join('');
             
             // Create deterministic address from hash
-            // Format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+            // Format: 19 chars + "eon" + 15 chars + 8 char checksum = 45 total
             const part1 = fullHex.substring(0, 19).toLowerCase();
             const part2 = fullHex.substring(19, 34).toLowerCase();
-            
-            // Generate SHA-256 checksum from the address parts
+
+            // Generate checksum (4 bytes = 8 hex chars)
             const addressWithoutChecksum = part1 + 'eon' + part2;
             const encoder = new TextEncoder();
             const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
             const checksumHash = Array.from(new Uint8Array(checksumBuffer));
             const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
-            const checksum = checksumHex.substring(0, 4).toLowerCase();
+            const checksum = checksumHex.substring(0, 8).toLowerCase();
             
             const address = `${part1}eon${part2}${checksum}`;
             
@@ -5494,43 +5492,41 @@ async function unlockWallet(password) {
                     const hashArray = Array.from(new Uint8Array(hashBuffer));
                     const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
                     
-                    // New long format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+                    // Format: 19 chars + "eon" + 15 chars + 8 char checksum = 45 total
                     const part1 = hashHex.substring(0, 19).toLowerCase();
                     const part2 = hashHex.substring(19, 34).toLowerCase();
-                    
-                    // Generate SHA-256 checksum
+
+                    // Generate checksum (4 bytes = 8 hex chars)
                     const addressWithoutChecksum = part1 + 'eon' + part2;
                     const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
                     const checksumArray = Array.from(new Uint8Array(checksumBuffer));
                     const checksumHex = checksumArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 4).toLowerCase();
+                    const checksum = checksumHex.substring(0, 8).toLowerCase();
                     
                     walletData.qnetAddress = `${part1}eon${part2}${checksum}`;
                     //console.log('[UnlockWallet] Generated new QNet address');
                 }
-            } else if (walletData.qnetAddress.length < 40) {
-                // Migrate old short format to new long format
-                //console.log('[UnlockWallet] Migrating old short QNet address to new long format');
+            } else if (walletData.qnetAddress.length !== 45) {
+                // Migrate old format (41 or other) to 45-char format
                 const solanaAddr = walletData.solanaAddress || walletData.address || (walletData.accounts && walletData.accounts[0]);
                 if (solanaAddr) {
-                    // Generate new long format
+                    // Regenerate in correct 45-char format
                     const encoder = new TextEncoder();
                     const data = encoder.encode(solanaAddr + 'qnet_eon_bridge');
                     const hashBuffer = await crypto.subtle.digest('SHA-512', data);
                     const hashArray = Array.from(new Uint8Array(hashBuffer));
                     const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    
+
                     const part1 = hashHex.substring(0, 19).toLowerCase();
                     const part2 = hashHex.substring(19, 34).toLowerCase();
-                    
-                    const checksumData = `qnet_${part1}_eon_${part2}`;
-                    const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(checksumData));
+
+                    const addressWithoutChecksum = part1 + 'eon' + part2;
+                    const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
                     const checksumArray = Array.from(new Uint8Array(checksumBuffer));
                     const checksumHex = checksumArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 4);
-                    
-                    walletData.qnetAddress = `qnet_${part1}_eon_${part2}_${checksum}`;
-                    //console.log('[UnlockWallet] Migrated to new QNet address:', walletData.qnetAddress);
+                    const checksum = checksumHex.substring(0, 8).toLowerCase();
+
+                    walletData.qnetAddress = `${part1}eon${part2}${checksum}`;
                 }
             }
             
@@ -6889,7 +6885,7 @@ async function getNetworkAgeYears() {
 
 /**
  * Generate EON address using professional crypto approach
- * New Format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+ * Format: 19 chars + "eon" + 15 chars + 8 char SHA3-256 checksum = 45 total
  */
 function generateEONAddress() {
     const charset = '123456789abcdefghijkmnopqrstuvwxyz'; // Safe chars without confusion
@@ -6914,7 +6910,7 @@ function generateEONAddress() {
         const hashArray = new Uint8Array(hashBuffer);
         
         let checksum = '';
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 8; i++) {
             checksum += charset[hashArray[i] % charset.length];
         }
         return checksum;
@@ -6930,7 +6926,7 @@ function generateEONAddress() {
     }, 0);
     
     let checksum = '';
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 8; i++) {
         checksum += charset[(simpleChecksum + i) % charset.length];
     }
     

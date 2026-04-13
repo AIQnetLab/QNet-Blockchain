@@ -266,27 +266,18 @@ impl NodeReputation {
                 .map(|&last_ping| current_timestamp - last_ping < 3600) // Active if pinged within 1 hour (matches decay_interval)
                 .unwrap_or(false);
             
-            // PRODUCTION: Progressive recovery ONLY for active nodes
+            // PRODUCTION: Linear recovery ONLY for active non-jailed nodes
+            // Rate: +1% per 4 hours = +0.25% per decay_interval (1 hour)
+            // 0% -> 70% takes 280 hours (~11.7 days). Same rate for all node types.
             if current < 70.0 {
                 if was_active {
-                    // Active node: allow recovery towards 70%
-                    // GENESIS PHASE: Moderate recovery boost for bootstrap stability
-                    // FIX R23-R5: Reduced from 5% to 0.5% per check — prevents near-instant
-                    // recovery from slashing (was 0→70% in ~23s, now takes ~4 minutes)
-                    let is_genesis_phase = self.is_genesis_node(&node_id);
-                    let recovery_rate = if is_genesis_phase {
-                        0.005  // Genesis nodes: 0.5% recovery per check (5x faster than regular)
-                    } else {
-                        0.001  // Regular nodes: 0.1% recovery per check
-                    };
-                    let recovery_amount = (70.0 - current) * recovery_rate;
+                    const RECOVERY_PER_TICK: f64 = 0.25; // +0.25% per hour = +1% per 4 hours
+                    let recovery_amount = RECOVERY_PER_TICK.min(70.0 - current); // cap at 70%
                     self.update_reputation(&node_id, recovery_amount);
-                    println!("[REPUTATION] ✅ {} active - recovering +{:.2}% to {:.1}%{}", 
-                            node_id, recovery_amount, current + recovery_amount,
-                            if is_genesis_phase { " (Genesis fast recovery)" } else { "" });
+                    println!("[INFO][REP] recovery node={} +{:.2}% rep={:.1}%",
+                            node_id, recovery_amount, current + recovery_amount);
                 } else {
-                    // Inactive node: no recovery, only decay
-                    println!("[REPUTATION] ⏸️ {} inactive (no ping) - no recovery from {:.1}%", 
+                    println!("[INFO][REP] inactive_no_recovery node={} rep={:.1}%",
                             node_id, current);
                 }
             } else if current > self.config.initial_reputation {

@@ -1137,17 +1137,16 @@ use serde::{Serialize, Deserialize};
 
 /// Generate proper EON address from any string identifier
 /// Format: {19 hex}eon{15 hex}{8 hex checksum} = 45 characters
-/// Used for fallback wallet address generation when real address is not available
+/// Checksum: first 4 bytes of SHA3-256 (32-bit collision resistance)
 fn generate_eon_address_from_id(id: &str) -> String {
     let hash = blake3::hash(id.as_bytes()).to_hex();
     let part1 = &hash[..19];
     let part2 = &hash[19..34];
-    
-    // SHA3-256 checksum (first 8 hex chars / 4 bytes) - 32-bit collision resistance
+
     let checksum_input = format!("{}eon{}", part1, part2);
     use sha3::{Sha3_256, Digest};
     let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..4]);
-    
+
     format!("{}eon{}{}", part1, part2, checksum)
 }
 
