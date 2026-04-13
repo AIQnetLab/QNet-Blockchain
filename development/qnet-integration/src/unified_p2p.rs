@@ -12437,16 +12437,12 @@ impl SimplifiedP2P {
             NetworkMessage::EntropyRequest { block_height, requester_id } => {
                 // Only respond if we actually have the block — silence is better than a
                 // zero-hash that poisons the requester's cache and blocks consensus.
+                // v11.0: Use consensus hash (block.hash()) instead of SHA3(raw_bytes)
+                // to ensure all nodes produce identical hashes regardless of storage format.
                 let maybe_hash: Option<[u8; 32]> = if let Some(storage) = crate::node::try_get_storage() {
-                    match storage.load_microblock(block_height) {
-                        Ok(Some(block_data)) => {
-                            use sha3::{Sha3_256, Digest};
-                            let mut hasher = Sha3_256::new();
-                            hasher.update(&block_data);
-                            let result = hasher.finalize();
-                            let mut hash = [0u8; 32];
-                            hash.copy_from_slice(&result);
-                            Some(hash)
+                    match storage.load_microblock_auto_format(block_height) {
+                        Ok(Some(block)) => {
+                            Some(block.hash())
                         },
                         Ok(None) => None,
                         Err(_) => None,
@@ -12491,15 +12487,12 @@ impl SimplifiedP2P {
             NetworkMessage::ForkCheckRequest { block_height, block_hash: _, requester_id } => {
                 self.update_peer_last_seen(from_peer);
                 // Only respond if we have the block
+                // v11.0: Use consensus hash (block.hash()) instead of SHA3(raw_bytes)
+                // to ensure fork detection compares identical hashes across all nodes.
                 if let Some(storage) = crate::node::try_get_storage() {
-                    match storage.load_microblock(block_height) {
-                        Ok(Some(block_data)) => {
-                            use sha3::{Sha3_256, Digest};
-                            let mut hasher = Sha3_256::new();
-                            hasher.update(&block_data);
-                            let result = hasher.finalize();
-                            let mut hash = [0u8; 32];
-                            hash.copy_from_slice(&result);
+                    match storage.load_microblock_auto_format(block_height) {
+                        Ok(Some(block)) => {
+                            let hash: [u8; 32] = block.hash();
                             let response = NetworkMessage::ForkCheckResponse {
                                 block_height,
                                 block_hash: hash,
