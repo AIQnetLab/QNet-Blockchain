@@ -100,25 +100,27 @@ impl ShardCoordinator {
     }
     
     /// Dynamically adjust shard count based on network growth
+    /// FIX R21-E2: Clamp to MIN_SHARDS to prevent division-by-zero in get_shard()
     pub fn adjust_shard_count(&self, network_size: usize) {
-        let optimal = get_optimal_shard_count(network_size);
+        let optimal = get_optimal_shard_count(network_size).max(MIN_SHARDS);
         let current = self.total_shards.load(Ordering::Relaxed);
         if current != optimal {
-            println!("[SHARDING] Adjusting shards: {} -> {} for {} nodes", current, optimal, network_size);
+            println!("[INFO][SHARDING] adjust shards={} -> {} nodes={}", current, optimal, network_size);
             self.total_shards.store(optimal, Ordering::Relaxed);
-            // Note: In production, this would trigger shard rebalancing
         }
     }
     
     /// Get shard for an address (synchronous for compatibility)
+    /// FIX R21-E2: Guard against division-by-zero if total_shards is 0
     pub fn get_shard(&self, address: &str) -> u32 {
         // Check if account has been reassigned
         if let Some(entry) = self.shard_map.get(address) {
             return *entry;
         }
-        
+
         // Calculate default shard with dynamic total (lock-free read)
-        let total = self.total_shards.load(Ordering::Relaxed);
+        // Safety: .max(1) prevents division-by-zero panic
+        let total = self.total_shards.load(Ordering::Relaxed).max(1);
         let hash = blake3::hash(address.as_bytes());
         let shard = u32::from_le_bytes(hash.as_bytes()[0..4].try_into().expect("Blake3 hash is 32 bytes"));
         shard % total
@@ -260,7 +262,7 @@ impl ShardCoordinator {
         });
         
         // Reset counter if more than an hour has passed
-        if current_time - hot_account.last_activity > 3600 {
+        if current_time.saturating_sub(hot_account.last_activity) > 3600 {
             hot_account.tx_count_last_hour = 0;
         }
         
@@ -614,6 +616,14 @@ impl ShardCoordinator {
     /// # Returns
     /// true if proof is valid and transaction exists in source shard
     pub fn verify_cross_shard_proof(&self, proof: &CrossShardProof) -> bool {
+        // FIX R26-M2: validate shard IDs are within bounds
+        let total = self.total_shards.load(Ordering::Relaxed);
+        if proof.source_shard >= total || proof.target_shard >= total {
+            println!("[WARN][SHARD] cross_shard_proof_invalid_shard_id source={} target={} total={}",
+                     proof.source_shard, proof.target_shard, total);
+            return false;
+        }
+
         // 1. Verify Merkle proof
         if !proof.verify() {
             println!("[WARN][SHARD] cross_shard_proof_invalid merkle_fail source={}", proof.source_shard);
@@ -626,8 +636,8 @@ impl ShardCoordinator {
             .unwrap_or_default()
             .as_secs();
         
-        if now - proof.timestamp > 3600 {
-            println!("[WARN][SHARD] cross_shard_proof_expired age={}s", now - proof.timestamp);
+        if now.saturating_sub(proof.timestamp) > 3600 {
+            println!("[WARN][SHARD] cross_shard_proof_expired age={}s", now.saturating_sub(proof.timestamp));
             return false;
         }
         

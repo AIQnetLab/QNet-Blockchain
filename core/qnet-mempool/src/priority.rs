@@ -26,7 +26,8 @@ pub struct TxPriority {
 impl TxPriority {
     /// Create new priority info
     pub fn new(tx: &Transaction, is_priority: bool) -> Self {
-        let size = bincode::serialize(tx).expect("Transaction must be serializable").len();
+        // FIX C9: Replace expect() with safe fallback — prevent node crash on malformed TX
+        let size = bincode::serialize(tx).map(|b| b.len()).unwrap_or(0);
         let mut priority = Self {
             gas_price: tx.gas_price,
             timestamp: Instant::now(),
@@ -66,9 +67,10 @@ impl TxPriority {
     }
 }
 
+// FIX M10: Use total_cmp for NaN-safe f64 comparison — satisfies Eq contract
 impl PartialEq for TxPriority {
     fn eq(&self, other: &Self) -> bool {
-        self.score == other.score
+        self.score.total_cmp(&other.score) == Ordering::Equal
     }
 }
 
@@ -76,14 +78,13 @@ impl Eq for TxPriority {}
 
 impl PartialOrd for TxPriority {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // Higher score = higher priority
-        self.score.partial_cmp(&other.score)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for TxPriority {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        self.score.total_cmp(&other.score)
     }
 }
 

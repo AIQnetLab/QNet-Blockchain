@@ -242,7 +242,7 @@ impl ArchiveReplicationManager {
                     NodeType::Super => 8,
                 };
                 
-                let actual_chunks = node_info.assigned_chunks.len() as u8;
+                let actual_chunks = node_info.assigned_chunks.len().min(255) as u8;
                 
                 match &node_info.compliance_status {
                     ComplianceStatus::GracePeriod { expires_at } => {
@@ -506,7 +506,7 @@ impl ArchiveReplicationManager {
             }
             
             let new_quota = self.calculate_emergency_quota(&node_info.node_type, total_nodes);
-            let current_chunks = node_info.assigned_chunks.len() as u8;
+            let current_chunks = node_info.assigned_chunks.len().min(255) as u8;
             
             if current_chunks < new_quota {
                 println!("[Archive] 📈 Increasing quota for {} from {} to {} chunks (emergency scaling)", 

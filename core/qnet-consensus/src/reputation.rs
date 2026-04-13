@@ -270,12 +270,14 @@ impl NodeReputation {
             if current < 70.0 {
                 if was_active {
                     // Active node: allow recovery towards 70%
-                    // GENESIS PHASE: Faster recovery for bootstrap stability
+                    // GENESIS PHASE: Moderate recovery boost for bootstrap stability
+                    // FIX R23-R5: Reduced from 5% to 0.5% per check — prevents near-instant
+                    // recovery from slashing (was 0→70% in ~23s, now takes ~4 minutes)
                     let is_genesis_phase = self.is_genesis_node(&node_id);
                     let recovery_rate = if is_genesis_phase {
-                        0.05  // Genesis nodes: 5% recovery per check (every 5 sec = ~1% per sec)
+                        0.005  // Genesis nodes: 0.5% recovery per check (5x faster than regular)
                     } else {
-                        0.01  // Regular nodes: 1% recovery per hour
+                        0.001  // Regular nodes: 0.1% recovery per check
                     };
                     let recovery_amount = (70.0 - current) * recovery_rate;
                     self.update_reputation(&node_id, recovery_amount);
@@ -318,6 +320,9 @@ impl NodeReputation {
             hash.as_bytes()[4], hash.as_bytes()[5], hash.as_bytes()[6], hash.as_bytes()[7],
         ]);
         
+        // NOTE: f64 division by u64::MAX introduces ~10^-15 relative error.
+        // This is acceptable for weighted random selection as the stochastic
+        // nature of the algorithm absorbs sub-nanoscale quantization errors.
         let target = (seed as f64 / u64::MAX as f64) * total_weight;
         let mut accumulated = 0.0;
         
@@ -376,11 +381,17 @@ impl NodeReputation {
     
     /// Jail a node for malicious behavior
     pub fn jail_node(&mut self, node_id: &str, behavior: MaliciousBehavior) {
+        const MAX_VIOLATIONS_PER_NODE: usize = 100;
+
         // Track violation history
-        self.violation_history
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut violations = self.violation_history
             .entry(node_id.to_string())
-            .or_insert_with(Vec::new)
-            .push((behavior.clone(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()));
+            .or_insert_with(Vec::new);
+        if violations.len() >= MAX_VIOLATIONS_PER_NODE {
+            violations.remove(0); // FIFO eviction of oldest
+        }
+        violations.push((behavior.clone(), timestamp));
         
         // CRITICAL: Check for instant max ban offenses
         let is_critical_attack = matches!(behavior, 
@@ -509,21 +520,21 @@ impl NodeReputation {
         }
     }
     
-    /// Check if node is Genesis (helper method)
+    /// Check if node is Genesis (exact match only — no prefix matching)
     fn is_genesis_node(&self, node_id: &str) -> bool {
-        // Check various Genesis node patterns
-        node_id.starts_with("genesis_node_") ||
-        node_id == "genesis_node_001" ||
-        node_id == "genesis_node_002" ||
-        node_id == "genesis_node_003" ||
-        node_id == "genesis_node_004" ||
-        node_id == "genesis_node_005" ||
-        // Legacy patterns
-        node_id == "QNET-BOOT-0001-STRAP" ||
-        node_id == "QNET-BOOT-0002-STRAP" ||
-        node_id == "QNET-BOOT-0003-STRAP" ||
-        node_id == "QNET-BOOT-0004-STRAP" ||
-        node_id == "QNET-BOOT-0005-STRAP"
+        const GENESIS_NODE_IDS: &[&str] = &[
+            "genesis_node_001",
+            "genesis_node_002",
+            "genesis_node_003",
+            "genesis_node_004",
+            "genesis_node_005",
+            "QNET-BOOT-0001-STRAP",
+            "QNET-BOOT-0002-STRAP",
+            "QNET-BOOT-0003-STRAP",
+            "QNET-BOOT-0004-STRAP",
+            "QNET-BOOT-0005-STRAP",
+        ];
+        GENESIS_NODE_IDS.contains(&node_id)
     }
     
     /// Detect and handle malicious behavior

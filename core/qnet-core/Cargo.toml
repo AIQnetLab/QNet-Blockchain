@@ -43,6 +43,9 @@ anyhow = "1.0.79"
 # Logging
 tracing = "0.1.40"
 
+# Synchronization
+parking_lot = "0.12"
+
 # Utils
 rand = "0.8.5"
 chrono = { version = "0.4.31", default-features = false, features = ["clock", "serde"] }

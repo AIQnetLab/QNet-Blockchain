@@ -90,8 +90,8 @@ mod producer_cache {
 }
 
 // PRODUCTION v4.0: Global VRF instance for static access in select_producer
-static GLOBAL_VRF_INSTANCE: std::sync::Mutex<Option<Arc<crate::crypto::vrf::DilithiumVrf>>> =
-    std::sync::Mutex::new(None);
+static GLOBAL_VRF_INSTANCE: parking_lot::Mutex<Option<Arc<crate::crypto::vrf::DilithiumVrf>>> =
+    parking_lot::Mutex::new(None);
 
 use qnet_state::{State as StateManager, MicroBlock};
 use qnet_mempool::SimpleMempool;
@@ -109,7 +109,7 @@ use hex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Safe timestamp getter with fallback
-fn get_timestamp_safe() -> u64 {
+pub fn get_timestamp_safe() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
@@ -190,10 +190,55 @@ pub fn clear_emergency_producer() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // CRITICAL: Global synchronization flags for API access
+// LEGACY: These flags are kept for backward compatibility. New code should use
+// GLOBAL_COORDINATOR.snapshot() for authoritative state.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// L1 ARCHITECTURE: Global coordinator handle for phase-aware decisions
+// Set once during node startup, read from anywhere.
+// ═══════════════════════════════════════════════════════════════════════════════
+lazy_static::lazy_static! {
+    pub static ref GLOBAL_COORDINATOR: parking_lot::RwLock<Option<crate::consensus_state::CoordinatorHandle>> =
+        parking_lot::RwLock::new(None);
+}
+
+/// Check if node is synchronized via coordinator (preferred) or legacy flags (fallback).
+/// Use this instead of reading NODE_IS_SYNCHRONIZED directly.
+#[inline]
+pub fn coordinator_is_synchronized() -> bool {
+    if let Some(ref handle) = *GLOBAL_COORDINATOR.read() {
+        handle.snapshot().is_synchronized()
+    } else {
+        NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed)
+    }
+}
+
+/// Check if node is syncing via coordinator (preferred) or legacy flags (fallback).
+/// Use this instead of reading SYNC_IN_PROGRESS directly.
+#[inline]
+pub fn coordinator_is_syncing() -> bool {
+    if let Some(ref handle) = *GLOBAL_COORDINATOR.read() {
+        handle.snapshot().is_syncing()
+    } else {
+        SYNC_IN_PROGRESS.load(Ordering::Relaxed) || FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+    }
+}
+
+/// Check if node is ready for production via coordinator.
+#[inline]
+pub fn coordinator_is_production_ready() -> bool {
+    if let Some(ref handle) = *GLOBAL_COORDINATOR.read() {
+        handle.snapshot().is_production_ready()
+    } else {
+        NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed)
+            && !SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+            && !FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+    }
+}
 
 // v3.0: Event-driven sync completion (NOT polling!)
 // When process_received_blocks reaches this height, it clears SYNC_IN_PROGRESS
@@ -211,7 +256,7 @@ pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
 // BUG 1 FIX: Track blocks awaiting after consensus passed
 // Key: block_height, Value: (consensus_time, producer_id, requested_count)
 lazy_static::lazy_static! {
-    static ref CONSENSUS_AWAITING_BLOCK: ParkingRwLock<std::collections::HashMap<u64, (std::time::Instant, String, u8)>> = 
+    static ref CONSENSUS_AWAITING_BLOCK: ParkingRwLock<std::collections::HashMap<u64, (std::time::Instant, String, u16)>> =
         ParkingRwLock::new(std::collections::HashMap::new());
 }
 
@@ -316,12 +361,15 @@ static LAST_FORK_RECOVERY: StdAtomicU64 = StdAtomicU64::new(0);
 const FORK_RECOVERY_COOLDOWN_SECS: u64 = 60;
 
 /// v9.5: Check if fork recovery is allowed (respects cooldown)
+/// Uses compare_exchange to prevent TOCTOU race (multiple concurrent triggers)
 pub fn try_fork_recovery() -> bool {
     let now = get_timestamp_safe();
-    let last = LAST_FORK_RECOVERY.load(StdOrdering::Relaxed);
+    let last = LAST_FORK_RECOVERY.load(StdOrdering::Acquire);
     if now.saturating_sub(last) >= FORK_RECOVERY_COOLDOWN_SECS {
-        LAST_FORK_RECOVERY.store(now, StdOrdering::Relaxed);
-        true
+        // Atomic CAS: only one thread wins the race
+        LAST_FORK_RECOVERY.compare_exchange(
+            last, now, StdOrdering::Release, StdOrdering::Relaxed
+        ).is_ok()
     } else {
         false
     }
@@ -331,12 +379,14 @@ pub fn try_fork_recovery() -> bool {
 static LAST_FORK_CHECK: StdAtomicU64 = StdAtomicU64::new(0);
 
 /// BUG 4: Check if runtime fork detection is needed (every 30 seconds)
+/// Uses compare_exchange to prevent TOCTOU race
 pub fn should_check_fork() -> bool {
     let now = get_timestamp_safe();
-    let last = LAST_FORK_CHECK.load(StdOrdering::Relaxed);
-    if now - last >= 30 {
-        LAST_FORK_CHECK.store(now, StdOrdering::Relaxed);
-        true
+    let last = LAST_FORK_CHECK.load(StdOrdering::Acquire);
+    if now.saturating_sub(last) >= 30 {
+        LAST_FORK_CHECK.compare_exchange(
+            last, now, StdOrdering::Release, StdOrdering::Relaxed
+        ).is_ok()
     } else {
         false
     }
@@ -488,6 +538,37 @@ pub static LAST_FINALIZED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 pub static ENTROPY_MISMATCH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static ENTROPY_MISMATCH_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
+/// FIX R23-F3: Weak subjectivity checkpoint — prevents long-range attacks.
+/// A syncing node MUST NOT accept a chain whose tip is below this height.
+/// Updated via env var QNET_WEAK_SUBJECTIVITY_CHECKPOINT or hardcoded after each release.
+/// Genesis/testnet: 0 (no checkpoint). Production: set to recent finalized height.
+pub static WEAK_SUBJECTIVITY_CHECKPOINT: AtomicU64 = AtomicU64::new(0);
+
+/// FIX R23-F3: Initialize weak subjectivity checkpoint from env or config.
+pub fn init_weak_subjectivity_checkpoint() {
+    if let Ok(val) = std::env::var("QNET_WEAK_SUBJECTIVITY_CHECKPOINT") {
+        if let Ok(height) = val.parse::<u64>() {
+            WEAK_SUBJECTIVITY_CHECKPOINT.store(height, std::sync::atomic::Ordering::SeqCst);
+            println!("[INFO][FINALITY] weak_subjectivity_checkpoint={}", height);
+        }
+    }
+}
+
+/// FIX R23-F3: Validate chain tip against weak subjectivity checkpoint.
+/// Called during initial sync to reject chains that are too old.
+pub fn check_weak_subjectivity(chain_tip: u64) -> Result<(), String> {
+    let checkpoint = WEAK_SUBJECTIVITY_CHECKPOINT.load(std::sync::atomic::Ordering::SeqCst);
+    if checkpoint > 0 && chain_tip < checkpoint {
+        Err(format!(
+            "WEAK_SUBJECTIVITY_VIOLATION: chain_tip={} is below checkpoint={}. \
+             This chain may be a long-range attack fork. Update your node or verify the chain.",
+            chain_tip, checkpoint
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// v9.0 BUG-30: Check if rollback to target_height is allowed by finality rules.
 /// LAST_FINALIZED_HEIGHT stores mb_index * 90 = the highest finalized microblock height.
 /// All 8 code paths that set this value use the same mb_index*90 format.
@@ -601,7 +682,9 @@ static METRIC_TIMESTAMP_REJECTIONS: AtomicU64 = AtomicU64::new(0); // Blocks rej
 // NO past check — Ethereum doesn't have one either.
 // This ensures ROLLING UPDATE compatibility: new nodes accept old slot-based timestamps.
 // ═══════════════════════════════════════════════════════════════════════════════
-const TIMESTAMP_FUTURE_TOLERANCE: u64 = 15;  // Block can be max 15 seconds in future (Ethereum standard)
+// FIX R22-T5: Made pub(crate) for unified usage in block_pipeline.rs
+// Single source of truth — prevents inconsistent tolerance windows.
+pub const TIMESTAMP_FUTURE_TOLERANCE: u64 = 15;  // Block can be max 15 seconds in future
 
 /// Get current failover metrics (for Prometheus/Grafana integration)
 pub fn get_failover_metrics() -> (u64, u64, u64, u64) {
@@ -663,7 +746,7 @@ fn update_failover_metrics(slot_delay: u64, timeout_round: u64) {
         .unwrap_or(0);
     let last_reset = METRIC_LAST_RESET.load(Ordering::Relaxed);
     
-    if now - last_reset > 300 {
+    if now.saturating_sub(last_reset) > 300 {
         // Log metrics before reset
         let max_delay = METRIC_SLOT_DELAY_MAX.swap(0, Ordering::Relaxed);
         let max_round = METRIC_TIMEOUT_ROUND_MAX.swap(0, Ordering::Relaxed);
@@ -771,6 +854,11 @@ lazy_static::lazy_static! {
 pub static EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, String), (u64, u64)>> =
     once_cell::sync::Lazy::new(|| DashMap::new());
 
+/// Out-of-turn producer tracking: producer_id -> (window_start_height, count)
+/// If a producer sends >3 blocks out of turn within 100 blocks, reject subsequent ones.
+static OOT_PRODUCER_COUNT: once_cell::sync::Lazy<DashMap<String, (u64, u32)>> =
+    once_cell::sync::Lazy::new(|| DashMap::new());
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MEMORY LEAK FIX v3.20: Periodic cleanup for global DashMaps
 // PROBLEM: ENTROPY_RESPONSES, PRODUCER_VOTES, REQUESTED_CERTIFICATES grow unbounded
@@ -817,6 +905,9 @@ pub fn cleanup_global_hashmaps(current_height: u64) {
     let equivoc_before = EQUIVOCATION_EVIDENCE.len();
     EQUIVOCATION_EVIDENCE.retain(|k, _| k.0 >= min_valid_height);
     let equivoc_removed = equivoc_before.saturating_sub(EQUIVOCATION_EVIDENCE.len());
+
+    // Cleanup OOT producer tracking — remove entries with stale windows
+    OOT_PRODUCER_COUNT.retain(|_, (window_start, _)| *window_start >= min_valid_height);
 
     if (entropy_removed > 0 || votes_removed > 0 || cert_removed > 0 || equivoc_removed > 0) && is_info() {
         println!("[INFO][MEM] cleanup h={} entropy={} votes={} certs={} equivoc={}",
@@ -1045,17 +1136,17 @@ use bincode::{self, Options};
 use serde::{Serialize, Deserialize};
 
 /// Generate proper EON address from any string identifier
-/// Format: {19 hex}eon{15 hex}{4 hex checksum} = 41 characters
+/// Format: {19 hex}eon{15 hex}{8 hex checksum} = 45 characters
 /// Used for fallback wallet address generation when real address is not available
 fn generate_eon_address_from_id(id: &str) -> String {
     let hash = blake3::hash(id.as_bytes()).to_hex();
     let part1 = &hash[..19];
     let part2 = &hash[19..34];
     
-    // SHA3-256 checksum (first 4 hex chars) - v4.0 migrated from SHA2
+    // SHA3-256 checksum (first 8 hex chars / 4 bytes) - 32-bit collision resistance
     let checksum_input = format!("{}eon{}", part1, part2);
     use sha3::{Sha3_256, Digest};
-    let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..2]);
+    let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..4]);
     
     format!("{}eon{}{}", part1, part2, checksum)
 }
@@ -1249,9 +1340,9 @@ impl SignedBlockTracker {
     
     /// Detect invalid blocks
     pub fn detect_invalid_block(&self, block: &MicroBlock) -> Option<Evidence> {
-        // Check timestamp is not too far in future (>5 seconds)
+        // Check timestamp is not too far in future — align with TIMESTAMP_FUTURE_TOLERANCE (15s)
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        if block.timestamp > now + 5 {
+        if block.timestamp > now + TIMESTAMP_FUTURE_TOLERANCE {
             eprintln!("[ERR][SEC] TIME_MANIP future={}s", block.timestamp - now);
             return Some(Evidence {
                 evidence_type: "time_manipulation".to_string(),
@@ -1372,7 +1463,7 @@ pub struct BlockchainNode {
     unified_p2p: Option<Arc<SimplifiedP2P>>,
     
     // PRODUCTION: Channel for receiving consensus messages from P2P
-    consensus_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>,
+    consensus_rx: Option<tokio::sync::mpsc::Receiver<ConsensusMessage>>,
     
     // Node configuration
     node_id: String,
@@ -1437,7 +1528,7 @@ pub struct BlockchainNode {
     // Verifiable Time Sequence (VTS) for time synchronization
     quantum_poh: Option<Arc<crate::quantum_poh::QuantumPoH>>,
     #[allow(dead_code)]
-    quantum_poh_receiver: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::quantum_poh::PoHEntry>>>>,
+    quantum_poh_receiver: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::quantum_poh::PoHEntry>>>>,
     
     // Parallel Executor for parallel transaction execution
     parallel_executor: Option<Arc<crate::parallel_executor::ParallelExecutor>>,
@@ -1469,19 +1560,35 @@ pub struct BlockchainNode {
     // PRODUCTION v4.0: Dilithium3-VRF instance for secret leader election
     // Initialized from wallet_identity's keypair at startup
     vrf_instance: Option<Arc<crate::crypto::vrf::DilithiumVrf>>,
+
+    // ═══════════════════════════════════════════════════════════════════
+    // L1 ARCHITECTURE: Coordinator + Pipeline + SyncManager
+    // Replaces 127 atomic flags with single state machine,
+    // monolithic process_received_blocks with staged pipeline,
+    // ad-hoc sync with wave-based sync manager.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Consensus state coordinator — single source of truth for node phase
+    coordinator_handle: Option<crate::consensus_state::CoordinatorHandle>,
+
+    /// Pipeline ingest handle — submit blocks for decode → verify → apply
+    pipeline_ingest: Option<crate::block_pipeline::PipelineIngest>,
+
+    /// Sync manager handle — wave-based block download coordinator
+    sync_handle: Option<crate::sync_manager::SyncHandle>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // v10.0: BlockApplyResult — returned by apply_block_to_state()
 // Contains merkle root + all deferred side effects for caller persistence.
 // ═══════════════════════════════════════════════════════════════════════
-struct BlockApplyResult {
-    merkle_root: [u8; 32],
-    reward_accruals: Vec<(String, u64)>,
-    deferred_pool3: u64,
-    deferred_registrations: Vec<(String, String, String)>,
-    deferred_emission_mbs: Vec<u64>,
-    deferred_reward_clears: Vec<(String, u64)>,
+pub struct BlockApplyResult {
+    pub merkle_root: [u8; 32],
+    pub reward_accruals: Vec<(String, u64)>,
+    pub deferred_pool3: u64,
+    pub deferred_registrations: Vec<(String, String, String)>,
+    pub deferred_emission_mbs: Vec<u64>,
+    pub deferred_reward_clears: Vec<(String, u64)>,
 }
 
 #[allow(dead_code)]
@@ -1542,7 +1649,8 @@ impl BlockchainNode {
         self.vrf_instance = Some(vrf_arc.clone());
 
         // Set global VRF instance for static access in select_producer
-        if let Ok(mut global) = GLOBAL_VRF_INSTANCE.lock() {
+        {
+            let mut global = GLOBAL_VRF_INSTANCE.lock();
             *global = Some(vrf_arc);
         }
         Ok(())
@@ -1654,6 +1762,20 @@ impl BlockchainNode {
                 }
             }
         }
+
+        // v4.1: Cleanup heartbeat_commitment_tracker (keep last 5 epochs)
+        {
+            const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+            let current_epoch = current_height / EMISSION_BLOCK_INTERVAL;
+            let before = self.heartbeat_commitment_tracker.len();
+            self.heartbeat_commitment_tracker.retain(|epoch, _| {
+                *epoch + 5 >= current_epoch
+            });
+            let removed = before.saturating_sub(self.heartbeat_commitment_tracker.len());
+            if removed > 0 && is_info() {
+                println!("[INFO][CLEANUP] heartbeat_commitment_tracker_cleaned removed={} current_epoch={}", removed, current_epoch);
+            }
+        }
     }
     
     /// Get deterministic reputation system (blockchain-based)
@@ -1692,7 +1814,7 @@ impl BlockchainNode {
     ///   - processed_emission_mbs: if Some, skip emission TXs whose MB index is already in the set
     ///                             (prevents double emission during normal processing).
     ///                             If None, all emissions are applied unconditionally (replay mode).
-    fn apply_block_to_state(
+    pub fn apply_block_to_state(
         state_guard: &StateManager,
         microblock: &MicroBlock,
         storage: &crate::storage::Storage,
@@ -1805,10 +1927,10 @@ impl BlockchainNode {
                         }
                     }
                     qnet_state::TransactionType::BatchNodeActivations { activation_data, .. } => {
+                        // FIX M1: Use saturating_add to prevent wrapping overflow
                         let total_pool3: u64 = activation_data.iter()
                             .filter(|d| d.activation_amount > 0)
-                            .map(|d| d.activation_amount)
-                            .sum();
+                            .fold(0u64, |acc, d| acc.saturating_add(d.activation_amount));
                         if total_pool3 > 0 {
                             result.deferred_pool3 = result.deferred_pool3.saturating_add(total_pool3);
                         }
@@ -1846,8 +1968,23 @@ impl BlockchainNode {
             }
         }
 
-        // ── Phase 3: Credit producer fees ──
+        // ── Phase 3: Credit producer fees (with recalculation) ──
         if microblock.fees_collected > 0 {
+            // Recalculate actual fees from transactions to prevent overclaim
+            let actual_fees: u64 = microblock.transactions.iter()
+                .map(|tx| {
+                    let gas_used = tx.compute_gas_used();
+                    tx.effective_gas_price().saturating_mul(gas_used)
+                })
+                .fold(0u64, |acc, fee| acc.saturating_add(fee));
+            let validated_fees = if microblock.fees_collected > actual_fees {
+                println!("[WARN][VALIDATION] fees_overclaimed h={} claimed={} actual={} producer={}",
+                         h, microblock.fees_collected, actual_fees, microblock.producer);
+                actual_fees
+            } else {
+                microblock.fees_collected
+            };
+
             let producer_wallet = match storage.load_node_registration(&microblock.producer) {
                 Ok(Some((_, wallet, _))) => wallet,
                 _ => {
@@ -1861,13 +1998,13 @@ impl BlockchainNode {
                 if let Some(ref mut snap) = block_snapshot {
                     snap.record_pre_images(&[producer_wallet.clone()], &state_guard.accounts);
                 }
-                match state_guard.credit_producer_fees_once(h, &producer_wallet, microblock.fees_collected) {
+                match state_guard.credit_producer_fees_once(h, &producer_wallet, validated_fees) {
                     Ok(true) => {
-                        if is_info() && microblock.fees_collected > 10_000_000 {
+                        if is_info() && validated_fees > 10_000_000 {
                             println!("[INFO][FEES] credited producer={} wallet={}... fees={} nanoQNC h={}",
                                      microblock.producer,
                                      &producer_wallet[..16.min(producer_wallet.len())],
-                                     microblock.fees_collected, h);
+                                     validated_fees, h);
                         }
                     }
                     Ok(false) => {
@@ -1877,7 +2014,7 @@ impl BlockchainNode {
                     }
                     Err(e) => {
                         eprintln!("[ERR][FEES] credit_failed producer={} wallet={} fees={} err={}",
-                                 microblock.producer, producer_wallet, microblock.fees_collected, e);
+                                 microblock.producer, producer_wallet, validated_fees, e);
                     }
                 }
             }
@@ -2130,14 +2267,23 @@ impl BlockchainNode {
         use crate::genesis_constants::GENESIS_NODE_IPS;
         use qnet_consensus::deterministic_reputation::{INITIAL_REPUTATION, MIN_CONSENSUS_REPUTATION};
         
-        let min_rep = MIN_CONSENSUS_REPUTATION / 100.0;  // 70.0 → 0.70 (threshold)
-        let initial_rep = INITIAL_REPUTATION / 100.0;    // 70.0 → 0.70 (default)
-        
         let current_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
+        // PRODUCTION: Deterministic conversion from 0-100 scale to 0.0-1.0
+        // Uses integer truncation to basis points first, then single f64 division
+        // to guarantee identical results across all platforms.
+        let to_normalized = |rep_0_100: f64| -> f64 {
+            // Truncate to integer basis points: 70.0 → 7000, 85.5 → 8550
+            let bps = (rep_0_100 * 100.0) as u64; // 0-10000
+            let min_bps = (MIN_CONSENSUS_REPUTATION * 100.0) as u64;
+            let clamped_bps = bps.max(min_bps).min(10_000);
+            // Convert to 0.0-1.0 via single deterministic division
+            clamped_bps as f64 / 10_000.0
+        };
+
         // Try to get REAL reputation from DeterministicReputationState
         if let Some(rep_state) = p2p.get_deterministic_reputation() {
             let rep_guard = rep_state.read();
@@ -2145,15 +2291,15 @@ impl BlockchainNode {
                 .map(|(_, id)| {
                     let node_id = format!("genesis_node_{}", id);
                     let real_rep = rep_guard.get_reputation(&node_id, current_ts);
-                    // 0-100 → 0.0-1.0, minimum is MIN_CONSENSUS_REPUTATION
-                    (node_id, (real_rep / 100.0).clamp(min_rep, 1.0))
+                    (node_id, to_normalized(real_rep))
                 })
                 .collect();
         }
-        
+
         // Fallback: use INITIAL_REPUTATION (without P2P access)
+        let initial_norm = to_normalized(INITIAL_REPUTATION);
         GENESIS_NODE_IPS.iter()
-            .map(|(_, id)| (format!("genesis_node_{}", id), initial_rep))
+            .map(|(_, id)| (format!("genesis_node_{}", id), initial_norm))
             .collect()
     }
     
@@ -2395,10 +2541,26 @@ impl BlockchainNode {
                     Ok(Some(data)) => {
                         match bincode::deserialize::<qnet_state::MacroBlock>(&data) {
                             Ok(mb) => mb.consensus_data.randomness_beacon.unwrap_or([0u8; 32]),
-                            Err(_) => [0u8; 32],
+                            Err(e) => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][VRF] seed_deserialize_failed mb={} err={}", n_minus_2, e);
+                                }
+                                [0u8; 32]
+                            }
                         }
                     }
-                    _ => [0u8; 32],
+                    Ok(None) => {
+                        if crate::node::is_warn() {
+                            println!("[WARN][VRF] seed_macroblock_not_found mb={}", n_minus_2);
+                        }
+                        [0u8; 32]
+                    }
+                    Err(e) => {
+                        if crate::node::is_warn() {
+                            println!("[WARN][VRF] seed_storage_error mb={} err={}", n_minus_2, e);
+                        }
+                        [0u8; 32]
+                    }
                 }
             } else {
                 [0u8; 32]
@@ -2415,9 +2577,11 @@ impl BlockchainNode {
                 })
                 .collect();
 
+            // DETERMINISM: Use total_cmp instead of partial_cmp to prevent NaN poisoning
+            // total_cmp provides a total ordering (NaN sorts consistently) ensuring
+            // identical validator sets across all nodes regardless of platform
             eligible.sort_by(|a, b| {
-                b.reputation.partial_cmp(&a.reputation)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                b.reputation.total_cmp(&a.reputation)
                     .then_with(|| {
                         let ha = &vrf_scores[&a.node_id];
                         let hb = &vrf_scores[&b.node_id];
@@ -2460,10 +2624,26 @@ impl BlockchainNode {
                 Ok(Some(data)) => {
                     match bincode::deserialize::<qnet_state::MacroBlock>(&data) {
                         Ok(mb) => mb.consensus_data.randomness_beacon.unwrap_or([0u8; 32]),
-                        Err(_) => [0u8; 32],
+                        Err(e) => {
+                            if crate::node::is_warn() {
+                                println!("[WARN][VRF] seed_deserialize_failed mb={} err={}", n_minus_2, e);
+                            }
+                            [0u8; 32]
+                        }
                     }
                 }
-                _ => [0u8; 32],
+                Ok(None) => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][VRF] seed_macroblock_not_found mb={}", n_minus_2);
+                    }
+                    [0u8; 32]
+                }
+                Err(e) => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][VRF] seed_storage_error mb={} err={}", n_minus_2, e);
+                    }
+                    [0u8; 32]
+                }
             }
         } else {
             [0u8; 32]
@@ -2578,12 +2758,13 @@ impl BlockchainNode {
             data: Some(format!("node_registration:{}:{}:{}:{}", node_id, wallet_address, registration_proof, final_endpoint)),
             dilithium_signature: None,
             dilithium_public_key: None,
+            chain_id: 0,
         };
-        
+
         tx.hash = tx.calculate_hash();
         tx
     }
-    
+
     /// Create NodeRegistration TX for runtime (uses current timestamp)
     /// For Light nodes: api_endpoint is ignored (always empty for privacy)
     /// For Super nodes: pass public API endpoint or empty to hide
@@ -2653,6 +2834,7 @@ impl BlockchainNode {
             )),
             dilithium_signature: None,    // Filled by caller for Super nodes
             dilithium_public_key: None,   // Filled by caller for Super nodes
+            chain_id: 0,
         };
 
         tx.hash = tx.calculate_hash();
@@ -2811,7 +2993,21 @@ impl BlockchainNode {
     /// - Genesis nodes always included (infrastructure backbone)
     pub async fn get_all_public_api_nodes(&self) -> Vec<(String, String, qnet_state::NodeType, f64, u64, bool)> {
         use qnet_state::TransactionType;
-        
+
+        // Cache API node results for 60s to avoid O(N) chain scan on every call
+        static API_NODES_CACHE: once_cell::sync::Lazy<
+            parking_lot::Mutex<(std::time::Instant, Vec<(String, String, qnet_state::NodeType, f64, u64, bool)>)>
+        > = once_cell::sync::Lazy::new(|| {
+            parking_lot::Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(120), Vec::new()))
+        });
+
+        {
+            let cache = API_NODES_CACHE.lock();
+            if cache.0.elapsed().as_secs() < 60 && !cache.1.is_empty() {
+                return cache.1.clone();
+            }
+        }
+
         let mut result = Vec::new();
         let current_height = self.get_height().await;
         let current_time = std::time::SystemTime::now()
@@ -2903,9 +3099,15 @@ impl BlockchainNode {
             }
         }
         
+        // Store in cache before returning
+        {
+            let mut cache = API_NODES_CACHE.lock();
+            *cache = (std::time::Instant::now(), result.clone());
+        }
+
         result
     }
-    
+
     /// Cache node registration for fast lookups
     async fn cache_node_registration(&self, node_id: &str, node_type: qnet_state::NodeType, wallet: String) {
         // Use storage for persistence
@@ -2969,10 +3171,19 @@ impl BlockchainNode {
                     // v4.6: Extract VRF public key from on-chain TX (non-genesis nodes)
                     if let Some(ref pk_hex) = tx.dilithium_public_key {
                         if pk_hex.len() == crate::crypto::vrf::D3_PK_BYTES * 2 {
+                            // Log if registering key from unsigned TX (no proof-of-possession)
+                            if tx.dilithium_signature.is_none() || tx.dilithium_signature.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                                println!("[WARN][VRF] key_registered_without_pop node={}",
+                                         &node_id[..16.min(node_id.len())]);
+                            }
                             if !crate::genesis_constants::has_vrf_key(node_id) {
                                 if let Ok(pk_bytes) = hex::decode(pk_hex) {
                                     crate::genesis_constants::register_vrf_public_key(node_id, &pk_bytes);
-                                    let _ = storage.save_vrf_public_key(node_id, pk_hex);
+                                    if let Err(e) = storage.save_vrf_public_key(node_id, pk_hex) {
+                                        if crate::node::is_warn() {
+                                            println!("[WARN][STORAGE] vrf_pk_save_failed node={} err={}", node_id, e);
+                                        }
+                                    }
                                     if is_info() {
                                         println!("[INFO][VRF-KEY] on_chain_registered node={} pk_hash={}",
                                                  node_id, &pk_hex[..16]);
@@ -2989,7 +3200,11 @@ impl BlockchainNode {
                             if !crate::genesis_constants::has_vrf_key(node_id) {
                                 if let Ok(pk_bytes) = hex::decode(pk_hex) {
                                     crate::genesis_constants::register_vrf_public_key(node_id, &pk_bytes);
-                                    let _ = storage.save_vrf_public_key(node_id, pk_hex);
+                                    if let Err(e) = storage.save_vrf_public_key(node_id, pk_hex) {
+                                        if crate::node::is_warn() {
+                                            println!("[WARN][STORAGE] vrf_pk_save_failed node={} err={}", node_id, e);
+                                        }
+                                    }
                                     if is_info() {
                                         println!("[INFO][VRF-KEY] reactivation_registered node={} pk_hash={}",
                                                  node_id, &pk_hex[..16]);
@@ -3026,7 +3241,7 @@ impl BlockchainNode {
     }
     
     /// Legacy wrapper for backward compatibility (static calls without DashMap)
-    fn cache_node_registrations_from_transactions(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
+    pub fn cache_node_registrations_from_transactions(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
         Self::cache_node_registrations_from_transactions_with_dashmap(storage, transactions, &DashMap::new());
     }
     
@@ -3157,12 +3372,12 @@ impl BlockchainNode {
         
         if attestation_count > CHUNK_SIZE {
             // Large dataset: process in parallel chunks
-            use std::sync::Mutex;
+            use parking_lot::Mutex;
             let all_pings_mutex = Mutex::new(&mut all_pings);
             let reward_manager_mutex = Mutex::new(&mut reward_manager);
-            
+
             // PRODUCTION v2.43.1: Global dedupe set for Light nodes across all chunks
-            let processed_light_nodes: Mutex<std::collections::HashSet<String>> = 
+            let processed_light_nodes: Mutex<std::collections::HashSet<String>> =
                 Mutex::new(std::collections::HashSet::with_capacity(attestation_count));
             
             // Process Light node attestations in parallel chunks
@@ -3176,10 +3391,7 @@ impl BlockchainNode {
                 for (light_node_id, _slot, pinger_id, timestamp, _block_height) in chunk {
                     // DEDUPE: Only process first attestation per Light node
                     {
-                        let mut processed = match processed_light_nodes.lock() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner(),
-                        };
+                        let mut processed = processed_light_nodes.lock();
                         if !processed.insert(light_node_id.clone()) {
                             continue; // Already processed this node
                         }
@@ -3201,13 +3413,7 @@ impl BlockchainNode {
                 
                 // Batch update reward manager (single lock acquisition)
                 {
-                    let mut rm = match reward_manager_mutex.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => {
-                            if is_warn() { println!("[WARN][REWARDS] reward_manager_mutex_poisoned recovering"); }
-                            poisoned.into_inner()
-                        }
-                    };
+                    let mut rm = reward_manager_mutex.lock();
                     for (node_id, wallet) in chunk_registrations {
                         let _ = rm.register_node(node_id.clone(), RewardNodeType::Light, wallet);
                         let _ = rm.record_ping_attempt(&node_id, true, 0);
@@ -3216,13 +3422,7 @@ impl BlockchainNode {
                 
                 // Batch add pings
                 {
-                    let mut pings = match all_pings_mutex.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => {
-                            if is_warn() { println!("[WARN][PINGS] mutex_poisoned recovering"); }
-                            poisoned.into_inner()
-                        }
-                    };
+                    let mut pings = all_pings_mutex.lock();
                     pings.extend(chunk_pings);
                 }
             }
@@ -3453,12 +3653,13 @@ impl BlockchainNode {
                                  total_pings, successful_pings, &merkle_root[..16])),
                 dilithium_signature: None,   // System TX - no quantum sig
                 dilithium_public_key: None,
+                chain_id: 0,
             };
-            
+
             // Calculate hash
             let mut commitment_tx = commitment_tx;
             commitment_tx.hash = commitment_tx.calculate_hash();
-            
+
             // Add to mempool
             if let Err(e) = self.add_transaction_to_mempool(commitment_tx).await {
                 eprintln!("[WARN][REWARDS] ping_commitment_mempool_fail err={}", e);
@@ -3545,10 +3746,11 @@ impl BlockchainNode {
                         }).to_string()),
                         dilithium_signature: None,
                         dilithium_public_key: None,
+                        chain_id: 0,
                     };
-                    
+
                     emission_tx.hash = emission_tx.calculate_hash();
-                    
+
                     // Add emission transaction to mempool for blockchain record
                     // v2.65: CRITICAL - if TX fails to add, return error (not just warning)
                     // This prevents "emission created" log when TX actually failed
@@ -3616,7 +3818,7 @@ impl BlockchainNode {
             )
             .map_err(|e| QNetError::ConsensusError(format!("Failed to compute Merkle root: {}", e)))?;
         
-        let heartbeat_count = heartbeat_data.len() as u8;
+        let heartbeat_count = heartbeat_data.len().min(255) as u8;
         
         if heartbeat_count == 0 {
             if is_warn() {
@@ -3699,11 +3901,12 @@ impl BlockchainNode {
             )),
             dilithium_signature: None,
             dilithium_public_key: None,
+            chain_id: 0,
         };
-        
+
         // Calculate hash
         commitment_tx.hash = commitment_tx.calculate_hash();
-        
+
         // Add to mempool
         if let Err(e) = self.add_transaction_to_mempool(commitment_tx).await {
             eprintln!("[ERR][HEARTBEAT-COMMITMENT] mempool_add_failed node={} epoch={} err={}",
@@ -3834,7 +4037,7 @@ impl BlockchainNode {
             .filter(|(sender_id, _, _, _, _)| sender_id == node_id)
             .collect();
         
-        let heartbeat_count = my_heartbeats.len() as u8;
+        let heartbeat_count = my_heartbeats.len().min(255) as u8;
         
         if is_info() {
             println!("[INFO][HB-COMMIT-CREATE] Filtered to {} heartbeats for node={}", heartbeat_count, node_id);
@@ -3936,6 +4139,7 @@ impl BlockchainNode {
             data: Some(format!("Heartbeat Commitment: {} heartbeats, epoch {}", heartbeat_count, current_epoch)),
             dilithium_signature: None,   // Will be filled with Dilithium signature
             dilithium_public_key: None,  // Node ID used for pubkey lookup
+            chain_id: 0,
         };
         
         // PRODUCTION v2.82: Add HYBRID signature (Ed25519 + Dilithium) for L1 security
@@ -4117,6 +4321,7 @@ impl BlockchainNode {
             data: Some(format!("Ping Commitment: {} pings, epoch {}", ping_count, current_epoch)),
             dilithium_signature: None,   // Will be filled with Dilithium signature
             dilithium_public_key: None,  // Node ID used for pubkey lookup
+            chain_id: 0,
         };
         
         // PRODUCTION v2.82: Add HYBRID signature (Ed25519 + Dilithium) for L1 security
@@ -4331,11 +4536,12 @@ impl BlockchainNode {
             )),
             dilithium_signature: None,
             dilithium_public_key: None,
+            chain_id: 0,
         };
-        
+
         // Calculate hash
         commitment_tx.hash = commitment_tx.calculate_hash();
-        
+
         // Add to mempool
         if let Err(e) = self.add_transaction_to_mempool(commitment_tx).await {
             eprintln!("[ERR][PING-COMMITMENT] mempool_add_failed node={} epoch={} err={}",
@@ -4422,13 +4628,14 @@ impl BlockchainNode {
                               eligible_count, total_assigned, epoch)),
             dilithium_signature: None,
             dilithium_public_key: None,
+            chain_id: 0,
         };
-        
+
         tx.hash = tx.calculate_hash();
-        
+
         Ok(tx)
     }
-    
+
     /// PRODUCTION v2.77: Collect HeartbeatCommitment TXs from blockchain with SHARD AGGREGATION
     /// Reads all HeartbeatCommitment TXs from blocks and aggregates by 256 shards
     /// 
@@ -4473,7 +4680,27 @@ impl BlockchainNode {
         // CRITICAL FIX v2.99: Use load_microblock_auto_format() instead of load_microblock()
         // EfficientMicroBlock stores TX hashes only - full TXs are in separate CF
         // load_microblock_auto_format() reconstructs full block WITH transactions
-        for height in window_start_height..=window_end_height {
+        //
+        // SCALABILITY: HeartbeatCommitment TXs are submitted near epoch boundaries
+        // (within last ~500 blocks of each epoch). Skip early blocks that cannot contain them.
+        // This reduces scan from 14400 to ~500 blocks in typical case.
+        let optimized_start = if window_end_height > window_start_height + 500 {
+            // HeartbeatCommitments are submitted after heartbeats accumulate (late in epoch)
+            // Scan last 2000 blocks to be safe (covers late submissions + reorgs)
+            let skip_to = window_end_height.saturating_sub(2000);
+            if skip_to > window_start_height {
+                if is_info() {
+                    println!("[INFO][HEARTBEAT-COLLECTION] optimized_scan skipping_to={} saved_blocks={}",
+                             skip_to, skip_to - window_start_height);
+                }
+                skip_to
+            } else {
+                window_start_height
+            }
+        } else {
+            window_start_height
+        };
+        for height in optimized_start..=window_end_height {
             // v2.99: Auto-format loader handles both EfficientMicroBlock and legacy MicroBlock
             if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
                     blocks_scanned += 1;
@@ -4935,15 +5162,10 @@ impl BlockchainNode {
         Ok(bitmap_eligible)
     }
     
-    /// v2.68: Process reward window and RETURN emission TX (don't add to mempool)
-    /// 
-    /// Uses process_reward_window_internal() which does all the heavy lifting:
-    /// - Collects heartbeats/attestations from gossip-synced data
-    /// - Calculates rewards for eligible nodes  
-    /// - Calls emit_rewards() to update total_supply
-    /// - Saves pending_rewards for lazy claiming
-    /// 
-    /// This function just creates TX WITHOUT adding to mempool (direct to block)
+    /// DEPRECATED: This function is unused. Use process_reward_window_internal() instead.
+    /// Retained for reference only — will be removed in a future cleanup.
+    #[allow(dead_code)]
+    #[deprecated(note = "Use process_reward_window_internal instead")]
     pub async fn process_reward_window_v2(&self, emission_block_height: u64) -> Result<Option<qnet_state::Transaction>, QNetError> {
         if is_info() { println!("[INFO][REWARDS] v2_processing h={}", emission_block_height); }
         
@@ -5006,15 +5228,16 @@ impl BlockchainNode {
                              total_supply / 1_000_000_000)),
             dilithium_signature: None,
             dilithium_public_key: None,
+            chain_id: 0,
         };
-        
+
         emission_tx.hash = emission_tx.calculate_hash();
-        
-        if is_info() { 
-            println!("[INFO][REWARDS] v2_emission_tx_created amount={} (direct to block)", 
-                    emission_amount / 1_000_000_000); 
+
+        if is_info() {
+            println!("[INFO][REWARDS] v2_emission_tx_created amount={} (direct to block)",
+                    emission_amount / 1_000_000_000);
         }
-        
+
         Ok(Some(emission_tx))
     }
     
@@ -5248,10 +5471,11 @@ impl BlockchainNode {
                 }).to_string()),
                 dilithium_signature: None,
                 dilithium_public_key: None,
+                chain_id: 0,
             };
-            
+
             emission_tx.hash = emission_tx.calculate_hash();
-            
+
             if let Err(e) = self.add_transaction_to_mempool(emission_tx).await {
                 eprintln!("[ERR][REWARDS] emission_tx_mempool_fail err={}", e);
                 return Err(QNetError::ConsensusError(format!("Emission TX failed to add to mempool: {}", e)));
@@ -5259,7 +5483,7 @@ impl BlockchainNode {
                 if is_info() { println!("[INFO][REWARDS] emission_tx_added_to_mempool"); }
             }
         }
-        
+
         Ok(actual_emission)
     }
     
@@ -5283,7 +5507,7 @@ impl BlockchainNode {
                         .flatten()
                         .map(|(_, wallet, _)| wallet)
                         .unwrap_or_else(|| {
-                            // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters
+                            // PRODUCTION FORMAT: 19 + 3 + 15 + 8 = 45 characters
                             generate_eon_address_from_id(&node_id)
                         });
                     
@@ -5700,14 +5924,18 @@ impl BlockchainNode {
                                         // Don't set restored_snapshot_height → TIER 3 will run
                                     }
 
-                                    // Verify merkle root matches snapshot (uses finalize_merkle, not calculate_state_root)
+                                    // FIX R23-S10: Verify merkle root matches snapshot — REJECT on mismatch.
+                                    // A corrupted or tampered snapshot could poison the entire state.
                                     let computed_merkle = state_guard.finalize_merkle();
                                     if computed_merkle == state_root {
                                         println!("[INFO][STATE] snapshot_merkle_verified root={}...",
                                                  hex::encode(&state_root[..8]));
                                     } else {
-                                        eprintln!("[WARN][STATE] snapshot_merkle_drift expected={} computed={} action=correct_via_replay",
+                                        eprintln!("[ERR][STATE] snapshot_merkle_mismatch expected={} computed={} action=clear_and_full_replay",
                                                   hex::encode(&state_root[..8]), hex::encode(&computed_merkle[..8]));
+                                        // Clear corrupted state — TIER 3 full replay will rebuild correctly
+                                        state_guard.clear();
+                                        restored_snapshot_height = 0;
                                     }
                                 }
                                 Err(e) => {
@@ -5746,7 +5974,11 @@ impl BlockchainNode {
                 // v7.1: Reset fork flags (memory + DB) for clean replay — will be
                 // re-activated at the correct block by accrue_pending_rewards()
                 qnet_state::reset_pending_rewards_in_merkle();
-                let _ = storage.save_fork_flag("pending_rewards_in_merkle", false);
+                if let Err(e) = storage.save_fork_flag("pending_rewards_in_merkle", false) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][STORAGE] fork_flag_save_failed key=pending_rewards_in_merkle val=false err={}", e);
+                    }
+                }
                 0
             };
 
@@ -5778,7 +6010,11 @@ impl BlockchainNode {
                             // v7.1: Persist fork flag on first activation during replay
                             if !fork_was_active && !apply_result.reward_accruals.is_empty()
                                && qnet_state::is_pending_rewards_in_merkle() {
-                                let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
+                                if let Err(e) = storage.save_fork_flag("pending_rewards_in_merkle", true) {
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][STORAGE] fork_flag_save_failed key=pending_rewards_in_merkle val=true err={}", e);
+                                    }
+                                }
                                 println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (startup replay h={})", h);
                             }
 
@@ -5924,7 +6160,11 @@ impl BlockchainNode {
         
         let mempool_config = qnet_mempool::SimpleMempoolConfig {
             max_size: auto_mempool_size,
-            min_gas_price: 1,
+            min_gas_price: 100_000, // SECURITY: 0.0001 QNC minimum — prevents near-free TX spam
+            max_per_sender: std::env::var("QNET_MAX_PER_SENDER")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10_000),
         };
         
         // CRITICAL v2.26: No outer RwLock - SimpleMempool is already thread-safe (DashMap + parking_lot)
@@ -5953,7 +6193,8 @@ impl BlockchainNode {
                         reason: "Genesis node cannot start with fallback ID".to_string(),
                         recoverable: false,
                     });
-                    panic!("[CRIT][GEN] genesis_fallback_id_fatal msg=check_QNET_BOOTSTRAP_ID");
+                    eprintln!("[CRIT][GEN] genesis_fallback_id_fatal msg=check_QNET_BOOTSTRAP_ID");
+                    std::process::exit(1);
                 }
             } else {
                 if is_info() { println!("[INFO][NODE] genesis_id_validated id={}", node_id); }
@@ -6125,27 +6366,24 @@ impl BlockchainNode {
             Region::Oceania => UnifiedRegion::Oceania,
         };
         
-        // PRODUCTION: Create consensus message channel
-        let (consensus_tx, consensus_rx) = tokio::sync::mpsc::unbounded_channel();
-        
-        // PRODUCTION: Create block processing channel
-        let (block_tx, block_rx) = tokio::sync::mpsc::unbounded_channel();
-        
-        // Create sync request channel for handling block requests
+        // FIX H1: Bounded channels with backpressure — prevents OOM under flood
+        // Capacity sized for burst tolerance: 10K consensus msgs, 5K blocks, 50K txs
+        let (consensus_tx, consensus_rx) = tokio::sync::mpsc::channel(10_000);
+
+        let (block_tx, mut block_rx) = tokio::sync::mpsc::channel(5_000);
+
         // v5.6: Extended with from_peer_addr so responses reach unregistered new nodes
-        let (sync_request_tx, mut sync_request_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, String, String)>();
-        
+        let (sync_request_tx, mut sync_request_rx) = tokio::sync::mpsc::channel::<(u64, u64, String, String)>(1_000);
+
         // PRODUCTION v2.19.12: Create macroblock sync channels
-        let (macroblock_tx, mut macroblock_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (macroblock_sync_tx, mut macroblock_sync_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, String)>();
-        
+        let (macroblock_tx, mut macroblock_rx) = tokio::sync::mpsc::channel(1_000);
+        let (macroblock_sync_tx, mut macroblock_sync_rx) = tokio::sync::mpsc::channel::<(u64, u64, String)>(1_000);
+
         // PRODUCTION v2.19.22: Create QUIC message channel for full message processing
-        // All QUIC messages are routed through this to use same handle_message() logic
-        let (quic_message_tx, mut quic_message_rx) = tokio::sync::mpsc::unbounded_channel::<(String, crate::unified_p2p::NetworkMessage)>();
-        
+        let (quic_message_tx, mut quic_message_rx) = tokio::sync::mpsc::channel::<(String, crate::unified_p2p::NetworkMessage)>(10_000);
+
         // PRODUCTION v2.19.25: Create transaction processing channel
-        // Enables full transaction propagation from P2P to mempool
-        let (transaction_tx, mut transaction_rx) = tokio::sync::mpsc::unbounded_channel::<crate::unified_p2p::ReceivedTransaction>();
+        let (transaction_tx, mut transaction_rx) = tokio::sync::mpsc::channel::<crate::unified_p2p::ReceivedTransaction>(50_000);
         
         if is_debug() { println!("[DBG][P2P] simplified_p2p_create"); }
         let mut unified_p2p_instance = SimplifiedP2P::new(
@@ -6184,7 +6422,8 @@ impl BlockchainNode {
             let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
             let data_dir = std::path::Path::new(&storage_path);
             if data_dir.exists() {
-                if let Ok(mut cert_manager) = unified_p2p_instance.certificate_manager.write() {
+                {
+                    let mut cert_manager = unified_p2p_instance.certificate_manager.write();
                     match cert_manager.load_from_disk(data_dir) {
                         Ok(_) => { if is_info() { println!("[INFO][NODE] cert_history_loaded path={}", storage_path); } }
                         Err(e) => { if is_warn() { println!("[WARN][NODE] cert_load_fail err={}", e); } }
@@ -6433,7 +6672,11 @@ impl BlockchainNode {
                                         };
                                         reward_manager_guard.restore_pending_reward(node_id.clone(), reward);
                                         if let Some(r) = reward_manager_guard.get_pending_reward(node_id) {
-                                            let _ = storage.save_pending_reward(node_id, r);
+                                            if let Err(e) = storage.save_pending_reward(node_id, r) {
+                                                if crate::node::is_warn() {
+                                                    println!("[WARN][STORAGE] pending_reward_save_failed node={} err={}", node_id, e);
+                                                }
+                                            }
                                         }
                                         recovered += 1;
                                         if is_info() {
@@ -6508,7 +6751,7 @@ impl BlockchainNode {
         // Light nodes do NOT run PoH - they are mobile devices with limited resources
         // =========================================================================
         // v3.18: Full node type removed
-        let (quantum_poh, poh_receiver): (Option<Arc<crate::quantum_poh::QuantumPoH>>, Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::quantum_poh::PoHEntry>>>>) = 
+        let (quantum_poh, poh_receiver): (Option<Arc<crate::quantum_poh::QuantumPoH>>, Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::quantum_poh::PoHEntry>>>>) =
             if matches!(node_type, NodeType::Super) {
                 if is_info() { println!("[INFO][POH] init type={:?}", node_type); }
                 
@@ -6763,6 +7006,10 @@ impl BlockchainNode {
             node_registration_cache: Arc::new(DashMap::new()),
             wallet_identity: None,
             vrf_instance: None,
+            // L1 architecture: initialized in start() after storage/state ready
+            coordinator_handle: None,
+            pipeline_ingest: None,
+            sync_handle: None,
         };
         
         // v4.3: Initialize global P2P instance for TX broadcast from activation_validation.rs
@@ -6861,58 +7108,97 @@ impl BlockchainNode {
         
         // ═══════════════════════════════════════════════════════════════════════
         // BLOCKCHAIN REPLAY: Restore reputation from stored blocks (v2.21.5)
+        // SCALABILITY: Find latest reputation snapshot, replay only from there
+        // At height 100K without optimization: ~100K block reads = minutes
+        // With snapshot skip: typically only last ~1000 blocks = milliseconds
         // ═══════════════════════════════════════════════════════════════════════
         {
             let current_height = *blockchain.height.read().await;
             if current_height > 0 {
                 if is_info() { println!("[INFO][REP] replay_start blocks={}", current_height); }
-                
+
                 {
                     let mut rep_state = blockchain.deterministic_reputation.write();
                     let start_time = std::time::Instant::now();
                     let mut blocks_processed = 0;
                     let mut macroblocks_processed = 0;
-                    
-                    // Process rotation blocks (every 30 blocks give +2% to producer)
-                    // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
-                    for height in (30..=current_height).step_by(30) {
-                        if let Ok(Some(microblock)) = blockchain.storage.load_microblock_auto_format(height) {
-                            // Count blocks by this producer in this rotation
-                            let rotation_start = height.saturating_sub(29);
-                            let mut blocks_by_producer = 0u32;
-                            for h in rotation_start..=height {
-                                if let Ok(Some(mb)) = blockchain.storage.load_microblock_auto_format(h) {
-                                    if mb.producer == microblock.producer {
-                                        blocks_by_producer += 1;
+
+                    // SCALABILITY: Find latest macroblock WITH reputation snapshot
+                    // Replay only from that point instead of scanning from genesis
+                    let total_macroblocks = current_height / 90;
+                    let mut snapshot_applied_at: u64 = 0; // macroblock index where snapshot was found
+
+                    // Scan macroblocks in REVERSE to find latest snapshot quickly
+                    for mb_idx in (1..=total_macroblocks).rev() {
+                        if let Ok(Some(raw_data)) = blockchain.storage.get_macroblock_by_height(mb_idx) {
+                            if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&raw_data) {
+                                if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
+                                    if !snapshot_data.is_empty() {
+                                        if let Ok(count) = rep_state.apply_snapshot(snapshot_data) {
+                                            snapshot_applied_at = mb_idx;
+                                            if is_info() {
+                                                println!("[INFO][REP] snapshot_found mb={} nodes={} skipped_mbs={}",
+                                                         mb_idx, count, mb_idx.saturating_sub(1));
+                                            }
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                            
-                            let block_data = BlockData {
-                                height,
-                                producer: microblock.producer.clone(),
-                                timestamp: microblock.timestamp,
-                                is_valid: true,
-                                blocks_in_rotation: blocks_by_producer,
-                            };
-                            rep_state.process_block(&block_data);
-                            blocks_processed += 1;
                         }
                     }
-                    
-                    // Process macroblocks (every 90 blocks)
-                    for macroblock_index in 1..=(current_height / 90) {
+
+                    // Replay rotation blocks only AFTER the snapshot point
+                    let replay_start_height = if snapshot_applied_at > 0 {
+                        (snapshot_applied_at * 90) + 1 // Start after snapshot macroblock
+                    } else {
+                        30 // No snapshot — replay from genesis
+                    };
+
+                    // Process rotation blocks (every 30 blocks give +2% to producer)
+                    if replay_start_height <= current_height {
+                        let first_rotation = ((replay_start_height + 29) / 30) * 30; // Round up to next rotation
+                        for height in (first_rotation..=current_height).step_by(30) {
+                            if let Ok(Some(microblock)) = blockchain.storage.load_microblock_auto_format(height) {
+                                // Count blocks by this producer in this rotation
+                                let rotation_start = height.saturating_sub(29);
+                                let mut blocks_by_producer = 0u32;
+                                for h in rotation_start..=height {
+                                    if let Ok(Some(mb)) = blockchain.storage.load_microblock_auto_format(h) {
+                                        if mb.producer == microblock.producer {
+                                            blocks_by_producer += 1;
+                                        }
+                                    }
+                                }
+
+                                let block_data = BlockData {
+                                    height,
+                                    producer: microblock.producer.clone(),
+                                    timestamp: microblock.timestamp,
+                                    is_valid: true,
+                                    blocks_in_rotation: blocks_by_producer,
+                                };
+                                rep_state.process_block(&block_data);
+                                blocks_processed += 1;
+                            }
+                        }
+                    }
+
+                    // Process macroblocks only AFTER the snapshot point
+                    let replay_start_mb = snapshot_applied_at + 1;
+                    use std::collections::HashSet;
+                    use qnet_consensus::deterministic_reputation::{MacroBlockConsensus, MacroBlockData, SlashingEvent, SlashingType, AutomaticJail};
+
+                    for macroblock_index in replay_start_mb..=total_macroblocks {
                         if let Ok(Some(raw_data)) = blockchain.storage.get_macroblock_by_height(macroblock_index) {
                             let macroblock: qnet_state::MacroBlock = match bincode::deserialize(&raw_data) {
                                 Ok(mb) => mb,
                                 Err(_) => continue,
                             };
-                            use std::collections::HashSet;
-                            use qnet_consensus::deterministic_reputation::{MacroBlockConsensus, MacroBlockData, SlashingEvent, SlashingType, AutomaticJail};
-                            
+
                             let commit_participants: HashSet<String> = macroblock.consensus_data.commits.keys().cloned().collect();
                             let reveal_participants: HashSet<String> = macroblock.consensus_data.reveals.keys().cloned().collect();
-                            
+
                             // Deserialize slashing events from blockchain
                             let slashing_events: Vec<SlashingEvent> = macroblock.consensus_data.slashing_events_data
                                 .as_ref()
@@ -6926,7 +7212,7 @@ impl BlockchainNode {
                                     evidence_hash: e.evidence_hash,
                                 }).collect())
                                 .unwrap_or_default();
-                            
+
                             // Deserialize automatic jails from blockchain
                             let automatic_jails: Vec<AutomaticJail> = macroblock.consensus_data.automatic_jails_data
                                 .as_ref()
@@ -6940,7 +7226,7 @@ impl BlockchainNode {
                                     evidence_hash: [0u8; 32],
                                 }).collect())
                                 .unwrap_or_default();
-                            
+
                             let macro_consensus = MacroBlockConsensus {
                                 index: macroblock_index,
                                 commit_participants,
@@ -6949,17 +7235,17 @@ impl BlockchainNode {
                                 automatic_jails,
                                 timestamp: macroblock.timestamp,
                             };
-                            
+
                             let macro_data = MacroBlockData {
                                 index: macroblock_index,
                                 consensus: macro_consensus,
                             };
-                            
-                            // v2.24: Apply reputation snapshot if present
+
+                            // Apply reputation snapshot if present (unlikely — we already found the latest)
                             if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
                                 if !snapshot_data.is_empty() {
                                     if let Ok(count) = rep_state.apply_snapshot(snapshot_data) {
-                                        if is_debug() { println!("[DBG][REP] snapshot_applied mb={} nodes={}", 
+                                        if is_debug() { println!("[DBG][REP] snapshot_applied mb={} nodes={}",
                                                  macroblock_index, count); }
                                     }
                                 } else {
@@ -6973,9 +7259,9 @@ impl BlockchainNode {
                     }
 
                     let elapsed = start_time.elapsed();
-                    if is_info() { println!("[INFO][REP] replay_complete rotations={} macroblocks={} time={:?}",
-                             blocks_processed, macroblocks_processed, elapsed); }
-                    
+                    if is_info() { println!("[INFO][REP] replay_complete snapshot_at_mb={} rotations={} macroblocks={} time={:?}",
+                             snapshot_applied_at, blocks_processed, macroblocks_processed, elapsed); }
+
                     // Log current reputation state
                     let stats = rep_state.get_stats();
                     if is_info() { println!("[INFO][REP] state nodes={} eligible={} jailed={}",
@@ -6986,35 +7272,107 @@ impl BlockchainNode {
             }
         }
         
-        // PRODUCTION: Start block processing handler with blockchain's height and P2P
-        let storage_for_blocks = blockchain.storage.clone();
-        let height_for_blocks = blockchain.height.clone();
-        let p2p_for_blocks = blockchain.unified_p2p.clone();
-        let poh_for_blocks = blockchain.quantum_poh.clone();
-        let state_for_blocks = blockchain.state.clone();
-        let node_id_for_blocks = blockchain.node_id.clone();
-        let node_type_for_blocks = blockchain.node_type;
-        let block_event_tx_for_blocks = blockchain.block_event_tx.clone();
-        let reward_manager_for_blocks = blockchain.reward_manager.clone();
-        let reputation_for_blocks = blockchain.deterministic_reputation.clone();
-        let mempool_for_blocks = blockchain.mempool.clone();
-        let wallet_identity_for_blocks = blockchain.wallet_identity.clone();
+        // ═══════════════════════════════════════════════════════════════════
+        // L1 ARCHITECTURE: ConsensusCoordinator + BlockPipeline + SyncManager
+        // Replaces monolithic process_received_blocks and ad-hoc sync
+        // ═══════════════════════════════════════════════════════════════════
+
+        // 1. Start ConsensusCoordinator — single state machine for all phases
+        let initial_height = blockchain.storage.get_chain_height().unwrap_or(0);
+        let (coordinator, coordinator_handle) = crate::consensus_state::ConsensusCoordinator::new(1024);
+        // Set initial height from storage
+        if initial_height > 0 {
+            coordinator_handle.try_send(crate::consensus_state::ConsensusEvent::BlockApplied {
+                height: initial_height,
+                producer: "restored".to_string(),
+                timestamp: get_timestamp_safe(),
+            });
+        }
+        blockchain.coordinator_handle = Some(coordinator_handle.clone());
+        *GLOBAL_COORDINATOR.write() = Some(coordinator_handle.clone());
+        tokio::spawn(coordinator.run());
+        if is_info() { println!("[INFO][COORD] started initial_height={}", initial_height); }
+
+        // 2. Genesis loading via file-based config (no p2p deadlock possible)
+        {
+            let genesis_config = crate::genesis_config::GenesisConfig::from_env();
+            match crate::genesis_config::load_genesis(&blockchain.storage, &genesis_config).await {
+                crate::genesis_config::GenesisResult::Loaded { block, source } => {
+                    if is_info() { println!("[INFO][GENESIS] loaded source={} txs={}", source, block.transactions.len()); }
+                    // Apply genesis state (PK registrations, initial balances)
+                    crate::genesis_config::apply_genesis_state(&block, &blockchain.state, &blockchain.storage).await;
+                    coordinator_handle.try_send(crate::consensus_state::ConsensusEvent::GenesisLoaded {
+                        timestamp: block.timestamp,
+                    });
+                    // Export genesis file for other nodes
+                    let export_path = std::path::PathBuf::from("/app/data/genesis.bin");
+                    let _ = crate::genesis_config::export_genesis(&blockchain.storage, &export_path).await;
+                }
+                crate::genesis_config::GenesisResult::NeedsCreation => {
+                    if is_info() { println!("[INFO][GENESIS] node_001_creation_mode"); }
+                    // Node 001 will create genesis in the production loop
+                }
+                crate::genesis_config::GenesisResult::NotAvailable { tried } => {
+                    eprintln!("[WARN][GENESIS] not_available tried={:?} — will wait for p2p sync", tried);
+                    // Genesis will arrive via sync — not fatal
+                }
+            }
+        }
+
+        // 3. Start BlockPipeline with full apply context
+        let pipeline_config = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+            crate::block_pipeline::PipelineConfig::genesis()
+        } else {
+            crate::block_pipeline::PipelineConfig::production()
+        };
+
+        let apply_ctx = crate::block_pipeline::ApplyContext {
+            storage: blockchain.storage.clone(),
+            state: blockchain.state.clone(),
+            coordinator: coordinator_handle.clone(),
+            height: blockchain.height.clone(),
+            reward_manager: blockchain.reward_manager.clone(),
+            unified_p2p: blockchain.unified_p2p.clone(),
+            block_event_tx: blockchain.block_event_tx.clone(),
+            node_id: blockchain.node_id.clone(),
+        };
+
+        let pipeline_ingest = crate::block_pipeline::BlockPipeline::start(pipeline_config, apply_ctx);
+        blockchain.pipeline_ingest = Some(pipeline_ingest.clone());
+        if is_info() { println!("[INFO][PIPELINE] started stages=3"); }
+
+        // 4. Start SyncManager (wave-based block download)
+        if let Some(ref p2p) = blockchain.unified_p2p {
+            let sync_config = crate::sync_manager::SyncConfig::default();
+            let (sync_manager, sync_handle) = crate::sync_manager::SyncManager::new(
+                sync_config,
+                blockchain.storage.clone(),
+                p2p.clone(),
+                pipeline_ingest.clone(),
+                coordinator_handle.clone(),
+            );
+            blockchain.sync_handle = Some(sync_handle.clone());
+            tokio::spawn(sync_manager.run());
+            if is_info() { println!("[INFO][SYNC] manager_started"); }
+        }
+
+        // 5. Pipeline ingest is routed via block_rx → pipeline legacy drain below
+        //    P2P sends blocks via block_tx, which are drained into PipelineIngest
+
+        // LEGACY: Keep old block_rx alive but drain it into pipeline
+        // This handles any code that still uses the old block_tx channel
+        let pipeline_for_legacy = pipeline_ingest.clone();
         tokio::spawn(async move {
-            Self::process_received_blocks(
-                block_rx,
-                storage_for_blocks,
-                state_for_blocks,
-                height_for_blocks,
-                p2p_for_blocks,
-                poh_for_blocks,
-                node_id_for_blocks,
-                node_type_for_blocks,
-                block_event_tx_for_blocks,
-                reward_manager_for_blocks,
-                reputation_for_blocks,
-                mempool_for_blocks,
-                wallet_identity_for_blocks,
-            ).await;
+            while let Some(received_block) = block_rx.recv().await {
+                let ingest = crate::block_pipeline::IngestBlock {
+                    height: received_block.height,
+                    data: received_block.data,
+                    block_type: received_block.block_type,
+                    from_peer: received_block.from_peer,
+                    received_at: received_block.timestamp,
+                };
+                pipeline_for_legacy.submit(ingest);
+            }
         });
         
         // MEV PROTECTION: Start periodic bundle cleanup task
@@ -7087,7 +7445,8 @@ impl BlockchainNode {
                             recoverable: false,
                         });
                         // Genesis nodes MUST have predefined wallets
-                        panic!("FATAL: No predefined wallet for Genesis node {} - check GENESIS_WALLETS in genesis_constants.rs", bootstrap_id);
+                        eprintln!("[CRIT][WALLET] genesis_node={} wallet=missing action=exit", bootstrap_id);
+                        std::process::exit(1);
                     }
                 };
                 
@@ -7308,33 +7667,67 @@ impl BlockchainNode {
             }
         });
         
-        // CRITICAL FIX: Perform initial sync with network on startup
-        // This prevents nodes from getting stuck on old blocks
+        // ═══════════════════════════════════════════════════════════════════
+        // L1 SYNC: Use SyncManager for initial sync (wave-based, adaptive)
+        // Replaces ad-hoc sync chunk loop with production-grade sync manager
+        // ═══════════════════════════════════════════════════════════════════
         if is_info() { println!("[INFO][SYNC] initial_sync_start"); }
-        
-        // CRITICAL FIX v3.0: Set sync flag BEFORE spawning task
-        // This allows certificate expiry check to be skipped for historical blocks
-        // Without this, nodes cannot sync blocks older than certificate TTL (5 min)
         SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
         
-        let blockchain_for_sync = blockchain.clone();
+        // Delegate sync to SyncManager (replaces 400+ lines of ad-hoc sync)
+        let sync_handle_for_init = blockchain.sync_handle.clone();
+        let coordinator_for_sync = coordinator_handle.clone();
+        let storage_for_sync_check = blockchain.storage.clone();
         tokio::spawn(async move {
-            // v3.0: NO GUARD HERE - flag cleared by process_received_blocks when target reached
-            // This is event-driven, not polling!
-            
-            // Wait a bit for P2P connections to establish
+            // Wait for P2P connections to establish
             tokio::time::sleep(Duration::from_secs(3)).await;
 
-            if let Some(p2p) = &blockchain_for_sync.unified_p2p {
-                // v7.2: RELIABLE NETWORK HEIGHT DETECTION
-                // Heartbeat cache may be cold at startup (updates every 30s).
-                // If cached height looks stale (< 100), probe bootstrap nodes
-                // via direct HTTP to get the real network height.
-                let mut network_height = match p2p.sync_blockchain_height().await {
-                    Ok(h) => h,
-                    Err(_) => 0,
-                };
+            // Trigger initial sync via sync manager
+            if let Some(ref sh) = sync_handle_for_init {
+                sh.sync_to_network().await;
+                // Wait for sync to complete (polls progress)
+                let mut last_progress = 0u64;
+                let mut stall_count = 0u32;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if !sh.is_active() {
+                        break;
+                    }
+                    let (progress, target) = sh.progress();
+                    if progress == last_progress {
+                        stall_count += 1;
+                        if stall_count > 30 { // 60 seconds stall
+                            if is_warn() { println!("[WARN][SYNC] stalled h={} target={}", progress, target); }
+                            break;
+                        }
+                    } else {
+                        stall_count = 0;
+                        last_progress = progress;
+                    }
+                }
+            }
 
+            // Sync done — update flags
+            let stored_h = storage_for_sync_check.get_chain_height().unwrap_or(0);
+            SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+            SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
+            NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
+            coordinator_for_sync.try_send(crate::consensus_state::ConsensusEvent::SyncComplete {
+                height: stored_h,
+            });
+            if is_info() { println!("[INFO][SYNC] initial_sync_complete h={}", stored_h); }
+        });
+        // ═══════════════════════════════════════════════════════════════════════════
+        // NOTE: Legacy sync code (400+ lines) REMOVED — replaced by SyncManager.
+        // See git history for the old ad-hoc sync logic.
+        // ═══════════════════════════════════════════════════════════════════════════
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.31: Periodic macroblock integrity check
+        // (lines between here were legacy sync code — deleted, see git history)
+        // ═══════════════════════════════════════════════════════════════════════════
+
+        /* DELETED: ~400 lines of legacy sync code — replaced by SyncManager above
                 if network_height < 100 {
                     if is_info() {
                         println!("[INFO][SYNC] heartbeat_cache_cold height={} probing_bootstrap_nodes", network_height);
@@ -7492,13 +7885,10 @@ impl BlockchainNode {
                             // Gap detection in handle_shred_protocol_chunk sets these atomics
                             // Process immediately without waiting for 10-block threshold
                             // ═══════════════════════════════════════════════════════════════════════════
-                            let gap_from = crate::unified_p2p::PENDING_GAP_SYNC.load(std::sync::atomic::Ordering::Relaxed);
-                            let gap_to = crate::unified_p2p::PENDING_GAP_SYNC_TO.load(std::sync::atomic::Ordering::Relaxed);
-                            
+                            // FIX R22-CC4: Atomic pair read+clear via Mutex — no torn reads
+                            let (gap_from, gap_to) = crate::unified_p2p::take_pending_gap_sync();
+
                             if gap_from > 0 && gap_to >= gap_from && gap_from > local_height {
-                                // Clear pending gap
-                                crate::unified_p2p::PENDING_GAP_SYNC.store(0, std::sync::atomic::Ordering::Relaxed);
-                                crate::unified_p2p::PENDING_GAP_SYNC_TO.store(0, std::sync::atomic::Ordering::Relaxed);
                                 
                                 println!("[INFO][GAP_SYNC] processing from={} to={}", gap_from, gap_to);
                                 
@@ -7756,7 +8146,8 @@ impl BlockchainNode {
             }
             // v3.0: Flag NOT cleared here - cleared by process_received_blocks when target reached
         });
-        
+        END OF DELETED LEGACY SYNC CODE */
+
         // ═══════════════════════════════════════════════════════════════════════════
         // PRODUCTION v2.31: Periodic macroblock integrity check
         // Runs every 60 seconds to ensure recent macroblocks are present
@@ -7854,7 +8245,7 @@ impl BlockchainNode {
     
     /// Process received blocks from P2P network 
     async fn process_received_blocks(
-        mut block_rx: tokio::sync::mpsc::UnboundedReceiver<crate::unified_p2p::ReceivedBlock>,
+        mut block_rx: tokio::sync::mpsc::Receiver<crate::unified_p2p::ReceivedBlock>,
         storage: Arc<Storage>,
         state: Arc<RwLock<StateManager>>,
         height: Arc<RwLock<u64>>,
@@ -7870,7 +8261,7 @@ impl BlockchainNode {
     ) {
         // CRITICAL FIX: Buffer for out-of-order blocks
         // Key: block height, Value: (block data, retry count, timestamp)
-        let mut pending_blocks: std::collections::HashMap<u64, (crate::unified_p2p::ReceivedBlock, u8, std::time::Instant)> =
+        let mut pending_blocks: std::collections::HashMap<u64, (crate::unified_p2p::ReceivedBlock, u16, std::time::Instant)> =
             std::collections::HashMap::new();
 
         // CRITICAL: Separate timers for retry (fast) and cleanup (slow)
@@ -7878,7 +8269,7 @@ impl BlockchainNode {
         let mut last_cleanup_check = std::time::Instant::now(); // Cleanup expired every 30s
 
         // CRITICAL FIX: Create channel for re-queuing blocks
-        let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<crate::unified_p2p::ReceivedBlock>();
+        let (retry_tx, mut retry_rx) = tokio::sync::mpsc::channel::<crate::unified_p2p::ReceivedBlock>(1000);
 
         // ═══════════════════════════════════════════════════════════════════════
         // v10.0 CRITICAL FIX: ORDERED SYNC BUFFER
@@ -7904,7 +8295,7 @@ impl BlockchainNode {
 
         // DDoS PROTECTION: Track requested blocks to avoid duplicate requests
         // Key: block height, Value: (request timestamp, retry count)
-        let mut requested_blocks: std::collections::HashMap<u64, (std::time::Instant, u8)> =
+        let mut requested_blocks: std::collections::HashMap<u64, (std::time::Instant, u16)> =
             std::collections::HashMap::new();
         const MAX_CONCURRENT_REQUESTS: usize = 10; // Limit concurrent block requests
         // ADAPTIVE SYNC: Fast mode for catching up, normal mode for steady state
@@ -7964,12 +8355,11 @@ impl BlockchainNode {
 
             // v10.0: Periodic flush — when tick fires with no block, just flush buffer
             if received_block_opt.is_none() {
-                let is_sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed)
-                    || FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
+                let is_sync_active = coordinator_is_syncing();
                 if !is_sync_active && !sync_order_buffer.is_empty() {
                     let flushed = sync_order_buffer.len();
                     for (_, block) in std::mem::take(&mut sync_order_buffer) {
-                        let _ = retry_tx.send(block);
+                        let _ = retry_tx.try_send(block);
                     }
                     println!("[INFO][SYNC-BUF] periodic_flush={} blocks_to_retry", flushed);
                 }
@@ -7991,14 +8381,17 @@ impl BlockchainNode {
                                      timer_drained.first().map(|b| b.height).unwrap_or(0),
                                      timer_drained.last().map(|b| b.height).unwrap_or(0));
                             for block in timer_drained {
-                                let _ = retry_tx.send(block);
+                                let _ = retry_tx.try_send(block);
                             }
                         }
                     }
                 }
                 continue;
             }
-            let received_block = received_block_opt.unwrap();
+            let received_block = match received_block_opt {
+                Some(b) => b,
+                None => continue, // Safety: should not reach here after continue above
+            };
 
             // DIAGNOSTIC: Log retry attempts
             if is_retry {
@@ -8015,8 +8408,7 @@ impl BlockchainNode {
             // This converts O(n * retry_delay) sync into O(n) — blocks are never
             // rejected for ordering, only for actual validation errors.
             // ═══════════════════════════════════════════════════════════════════════
-            let is_sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed)
-                || FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
+            let is_sync_active = coordinator_is_syncing();
 
             // Collect blocks to process: either from sync buffer drain or single block
             let blocks_to_process: Vec<(crate::unified_p2p::ReceivedBlock, bool)>;
@@ -8084,7 +8476,7 @@ impl BlockchainNode {
             if !is_sync_active && !sync_order_buffer.is_empty() {
                 let flushed = sync_order_buffer.len();
                 for (_, block) in std::mem::take(&mut sync_order_buffer) {
-                    let _ = retry_tx.send(block);
+                    let _ = retry_tx.try_send(block);
                 }
                 if flushed > 0 {
                     println!("[INFO][SYNC-BUF] sync_complete flush={} blocks_to_retry", flushed);
@@ -8093,6 +8485,11 @@ impl BlockchainNode {
 
             for (received_block, is_retry) in blocks_to_process {
 
+            // PERF: Decompress block data once and reuse across all processing stages
+            // Avoids 3x redundant zstd decompression (producer check, storage, WS broadcast, mempool)
+            let cached_decompressed: Vec<u8> = zstd::decode_all(&received_block.data[..])
+                .unwrap_or_else(|_| received_block.data.clone());
+
             // ═══════════════════════════════════════════════════════════════════
             // v4.1: Ignore blocks from self-excluded producers (entropy_fork_detected only)
             // v3.10 origin: was also used by emergency_failover, now removed (caused FORKS)
@@ -8100,13 +8497,10 @@ impl BlockchainNode {
             // ═══════════════════════════════════════════════════════════════════
             {
                 let current_height = *height.read().await;
-                
+
                 // Extract producer from block data (if available)
-                // v3.15 FIX: Decompress before deserializing - data may be Zstd-compressed
                 let block_producer: Option<String> = {
-                    let decompressed = zstd::decode_all(&received_block.data[..])
-                        .unwrap_or_else(|_| received_block.data.clone());
-                    if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&decompressed) {
+                    if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&cached_decompressed) {
                         Some(microblock.producer.clone())
                     } else {
                         None
@@ -8245,13 +8639,12 @@ impl BlockchainNode {
                             // which may take 10-30s after connection is established.
                             // Live mode: 5 retries (cert race is short-lived)
                             // Sync mode: 30 retries (need to wait for heartbeat with VRF pubkey)
-                            let is_sync_mode = FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed)
-                                || SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+                            let is_sync_mode = coordinator_is_syncing()
                                 || {
                                     let local_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
                                     local_h + 50 < received_block.height
                                 };
-                            let max_cert_retries: u8 = if is_sync_mode { 30 } else { 5 };
+                            let max_cert_retries: u16 = if is_sync_mode { 30 } else { 5 };
                             
                             if retry_count < max_cert_retries {
                                 if is_debug() { println!("[DBG][BLOCK] buffer h={} retry={} wait_cert={}", 
@@ -8765,13 +9158,18 @@ impl BlockchainNode {
                             // to sync mode (skips monotonicity check). Auto-clear after 30s.
                             static TIMESTAMP_FAIL_COUNTS: once_cell::sync::Lazy<dashmap::DashMap<u64, u32>> =
                                 once_cell::sync::Lazy::new(|| dashmap::DashMap::new());
+                            // Bound: evict old entries if map grows beyond 500 (prevents OOM under attack)
+                            if TIMESTAMP_FAIL_COUNTS.len() > 500 {
+                                let local_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+                                TIMESTAMP_FAIL_COUNTS.retain(|h, _| *h + 200 > local_h);
+                            }
                             let fail_count = {
                                 let mut entry = TIMESTAMP_FAIL_COUNTS.entry(received_block.height).or_insert(0);
                                 *entry += 1;
                                 *entry
                             };
 
-                            if fail_count >= 3 && !FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed) {
+                            if fail_count >= 3 && !coordinator_is_syncing() {
                                 eprintln!("[WARN][TIMESTAMP] escalation h={} fails={} — forcing sync-mode bypass for 30s",
                                          received_block.height, fail_count);
                                 FAST_SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
@@ -8798,12 +9196,9 @@ impl BlockchainNode {
                         continue;
                     }
                     
-                    // CRITICAL FIX: Decompress before saving (validation already checked it's valid)
-                    // Storage will apply its own adaptive compression
-                    let decompressed_data = match zstd::decode_all(&received_block.data[..]) {
-                        Ok(data) => data,
-                        Err(_) => received_block.data.clone(), // Not compressed - use as-is
-                    };
+                    // PERF: Reuse cached decompressed data from producer extraction above
+                    // Avoids redundant zstd decompression (was done at block reception)
+                    let decompressed_data = cached_decompressed.clone();
                     
                     // CRITICAL: Apply transactions from block to state BEFORE saving
                     // This ensures state consistency across all nodes
@@ -8867,7 +9262,11 @@ impl BlockchainNode {
                             // v7.1: Persist fork flag on first activation
                             if !fork_was_active && !apply_result.reward_accruals.is_empty()
                                && qnet_state::is_pending_rewards_in_merkle() {
-                                let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
+                                if let Err(e) = storage.save_fork_flag("pending_rewards_in_merkle", true) {
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][STORAGE] fork_flag_save_failed key=pending_rewards_in_merkle val=true err={}", e);
+                                    }
+                                }
                                 println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (sync h={})", microblock.height);
                             }
                             if is_info() && !apply_result.reward_accruals.is_empty() {
@@ -8927,7 +9326,9 @@ impl BlockchainNode {
                                             if is_debug() { println!("[DBG][POOL3] deferred_pool3_applied amount={}", apply_result.deferred_pool3); }
                                         }
                                         for (node_id, type_str, wallet) in &apply_result.deferred_registrations {
-                                            let _ = storage.save_node_registration(node_id, type_str, wallet, 1.0);
+                                            if let Err(e) = storage.save_node_registration(node_id, type_str, wallet, 1.0) {
+                                                eprintln!("[ERR][STORAGE] save_node_registration failed node={} err={}", node_id, e);
+                                            }
                                         }
                                         if is_debug() && !apply_result.deferred_registrations.is_empty() {
                                             println!("[DBG][REG] deferred_registrations_applied count={} h={}",
@@ -8983,10 +9384,7 @@ impl BlockchainNode {
                                         // A syncing node at h=100 broadcasting attestations for old blocks
                                         // is useless noise that wastes bandwidth. With 30000 nodes, thousands
                                         // syncing simultaneously would flood network with stale attestations.
-                                        let attest_our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                                        let attest_best_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                                        let attest_synced = NODE_IS_SYNCHRONIZED.load(std::sync::atomic::Ordering::Relaxed)
-                                            && (attest_best_h == 0 || attest_our_h + 20 >= attest_best_h);
+                                        let attest_synced = coordinator_is_production_ready();
 
                                         if attest_synced {
                                         if let Some(ref p2p) = unified_p2p {
@@ -9002,8 +9400,7 @@ impl BlockchainNode {
                                                 use pqcrypto_mldsa::mldsa65 as dilithium3;
                                                 use pqcrypto_traits::sign::SecretKey as SkTrait;
                                                 use pqcrypto_traits::sign::DetachedSignature as SigTrait;
-                                                GLOBAL_VRF_INSTANCE.lock().ok()
-                                                    .and_then(|g| g.clone())
+                                                GLOBAL_VRF_INSTANCE.lock().clone()
                                                     .and_then(|vrf| vrf.get_secret_key_bytes())
                                                     .and_then(|sk_bytes| {
                                                         dilithium3::SecretKey::from_bytes(&sk_bytes).ok()
@@ -9221,9 +9618,9 @@ impl BlockchainNode {
                     }
                     
                     // v2.72: Broadcast NewBlock via WebSocket for real-time explorer updates
+                    // PERF: Reuse cached decompressed data instead of re-decompressing
                     if received_block.block_type == "micro" {
-                        let decompressed = zstd::decode_all(&received_block.data[..]).unwrap_or_else(|_| received_block.data.clone());
-                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&decompressed) {
+                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&cached_decompressed) {
                             crate::rpc::broadcast_ws_event(crate::rpc::WsEvent::NewBlock {
                                 height: mb.height,
                                 hash: hex::encode(mb.hash()),
@@ -9386,7 +9783,11 @@ impl BlockchainNode {
                                             println!("[INFO][REACTIVATION] TX in mempool hash={}", &tx_hash[..16]);
                                             // Broadcast to network (same as NodeRegistration line 27300)
                                             if let Some(ref p2p) = unified_p2p {
-                                                let _ = p2p.broadcast_transaction(tx_bytes);
+                                                if let Err(e) = p2p.broadcast_transaction(tx_bytes) {
+                                                    if crate::node::is_warn() {
+                                                        println!("[WARN][P2P] tx_broadcast_failed err={}", e);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -9402,10 +9803,9 @@ impl BlockchainNode {
                     // This prevents TX duplication when THIS node becomes producer
                     // Problem: TX stays in mempool after being included in block by OTHER node
                     // Result: Same TX gets included again when THIS node produces a block
+                    // PERF: Reuse cached decompressed data instead of re-decompressing
                     if received_block.block_type == "micro" {
-                        let decompressed_for_mempool = zstd::decode_all(&received_block.data[..])
-                            .unwrap_or_else(|_| received_block.data.clone());
-                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&decompressed_for_mempool) {
+                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&cached_decompressed) {
                             let tx_hashes: Vec<String> = mb.transactions.iter()
                                 .map(|tx| tx.hash.clone())
                                 .collect();
@@ -9719,7 +10119,7 @@ impl BlockchainNode {
                         if is_debug() { println!("[DBG][BLOCK] fast_forward count={} after={}", 
                                  blocks_to_retry.len(), received_block.height); }
                         for pending_block in blocks_to_retry {
-                            if let Err(e) = retry_tx.send(pending_block) {
+                            if let Err(e) = retry_tx.try_send(pending_block) {
                                 println!("[WARN][BLOCK] requeue_failed err={:?}", e);
                             }
                         }
@@ -9821,7 +10221,11 @@ impl BlockchainNode {
                                     drop(sg);
                                     qnet_state::clear_credited_fees_cache();
                                     qnet_state::reset_pending_rewards_in_merkle();
-                                    let _ = storage.save_fork_flag("pending_rewards_in_merkle", false);
+                                    if let Err(e) = storage.save_fork_flag("pending_rewards_in_merkle", false) {
+                                        if crate::node::is_warn() {
+                                            println!("[WARN][STORAGE] fork_flag_save_failed key=pending_rewards_in_merkle val=false err={}", e);
+                                        }
+                                    }
                                     if is_info() {
                                         println!("[INFO][STATE] recovery_state_cleared for full replay from genesis");
                                     }
@@ -9844,7 +10248,11 @@ impl BlockchainNode {
 
                                                 if !fork_was_active && !apply_result.reward_accruals.is_empty()
                                                    && qnet_state::is_pending_rewards_in_merkle() {
-                                                    let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
+                                                    if let Err(e) = storage.save_fork_flag("pending_rewards_in_merkle", true) {
+                                                        if crate::node::is_warn() {
+                                                            println!("[WARN][STORAGE] fork_flag_save_failed key=pending_rewards_in_merkle val=true err={}", e);
+                                                        }
+                                                    }
                                                     println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (recovery h={})", h);
                                                 }
                                                 replayed += 1;
@@ -9905,7 +10313,9 @@ impl BlockchainNode {
                                                 println!("[ERR][STATE] finality_blocks_rollback: {}", reason);
                                             } else if crate::storage::start_rollback_protection(rb_target) {
                                                 for h in (rb_target + 1)..=received_block.height {
-                                                    let _ = storage.delete_microblock(h);
+                                                    if let Err(e) = storage.delete_microblock(h) {
+                                                        eprintln!("[ERR][STORAGE] rollback_delete_failed h={} err={}", h, e);
+                                                    }
                                                 }
                                                 // v10.2: DISK FIRST, RAM SECOND (crash-safe order)
                                                 if let Err(e) = storage.set_chain_height(rb_target) {
@@ -10018,7 +10428,7 @@ impl BlockchainNode {
                             // Increment retry count
                             pending_blocks.entry(height).and_modify(|(_, cnt, _)| *cnt += 1);
                             
-                            if let Err(e) = retry_tx.send(pending_block) {
+                            if let Err(e) = retry_tx.try_send(pending_block) {
                                 println!("[WARN][BLOCK] requeue_failed h={} err={:?}", height, e);
                             } else {
                                 RETRY_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -10132,8 +10542,8 @@ impl BlockchainNode {
                                      missing_height, height, retry_count, phase, backoff_secs); }
                             
                             // Update request tracking
-                            // SECURITY: Use saturating_add to prevent overflow at u8::MAX (255)
-                            requested_blocks.insert(missing_height, (std::time::Instant::now(), (retry_count as u8).saturating_add(1)));
+                            // SECURITY: Use saturating_add to prevent overflow, capped at 1000
+                            requested_blocks.insert(missing_height, (std::time::Instant::now(), (retry_count as u16).min(1000).saturating_add(1)));
                             
                             // v3.7: CRITICAL FIX - Request BATCH of blocks, not just one!
                             // v3.34: Dedup — skip if sync for this height is already in-flight
@@ -10228,9 +10638,18 @@ impl BlockchainNode {
         // Blocks are compressed during broadcast to save ~20% bandwidth
         let decompressed_data = match zstd::decode_all(&block.data[..]) {
             Ok(data) => {
+                // SECURITY: Bound decompressed size to prevent zstd bombs (max 50MB)
+                const MAX_DECOMPRESSED_SIZE: usize = 50 * 1024 * 1024;
+                if data.len() > MAX_DECOMPRESSED_SIZE {
+                    if is_warn() {
+                        println!("[WARN][BLOCK] zstd_bomb_rejected h={} compressed={} decompressed={} max={}",
+                                 block.height, block.data.len(), data.len(), MAX_DECOMPRESSED_SIZE);
+                    }
+                    return Err("Decompressed block exceeds maximum size limit".to_string());
+                }
                 // Successfully decompressed - block was compressed
                 if block.height % 10 == 0 {
-                    if is_debug() { println!("[DBG][BLOCK] decompressed h={} from={} to={}", 
+                    if is_debug() { println!("[DBG][BLOCK] decompressed h={} from={} to={}",
                              block.height, block.data.len(), data.len()); }
                 }
                 data
@@ -10270,12 +10689,9 @@ impl BlockchainNode {
                 // Detect sync mode
                 const SYNC_MODE_THRESHOLD: u64 = 50;
                 let local_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
-                let fast_sync_active = FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
-                let sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed);
                 let sync_target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
                 let is_consensus_confirmed = sync_target > 0 && microblock.height <= sync_target;
-                let is_syncing = fast_sync_active
-                    || sync_active
+                let is_syncing = coordinator_is_syncing()
                     || is_consensus_confirmed
                     || local_height + SYNC_MODE_THRESHOLD < microblock.height;
 
@@ -10396,7 +10812,11 @@ impl BlockchainNode {
                         }
 
                         // Backfill hash index for this block (future lookups will be O(1))
-                        let _ = storage.save_microblock_hash(prev_height, &prev_hash_result);
+                        if let Err(e) = storage.save_microblock_hash(prev_height, &prev_hash_result) {
+                            if crate::node::is_warn() {
+                                println!("[WARN][STORAGE] hash_index_save_failed h={} err={}", prev_height, e);
+                            }
+                        }
 
                         if is_debug() { println!("[DBG][VALIDATION] chain_ok h={} via=full_block+backfill", microblock.height); }
                     },
@@ -10411,7 +10831,7 @@ impl BlockchainNode {
                         let stored_height = storage.get_chain_height().unwrap_or(0);
                         let is_post_snapshot_first_block = stored_height > 0
                             && microblock.height == stored_height + 1
-                            && SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+                            && coordinator_is_syncing();
 
                         if is_post_snapshot_first_block {
                             println!("[INFO][VALIDATION] post_snapshot_trust h={} snap_h={} prev_hash_skip=trusted",
@@ -10459,7 +10879,7 @@ impl BlockchainNode {
         // v9.0 BUG-20: Verify merkle_root matches actual transactions.
         // Without this, a producer could include a valid signature but fake transactions
         // (e.g., extra transfers) while keeping the merkle_root from a different TX set.
-        if !microblock.transactions.is_empty() && microblock.merkle_root != [0u8; 32] {
+        if !microblock.transactions.is_empty() {
             let computed_merkle = Self::calculate_merkle_root(&microblock.transactions);
             if computed_merkle != microblock.merkle_root {
                 eprintln!("[ERR][SEC] merkle_root_mismatch h={} expected={} computed={}",
@@ -10540,6 +10960,31 @@ impl BlockchainNode {
             }
         }
         
+        // FIX R22-B5: Validate cumulative block gas against BLOCK_GAS_LIMIT
+        // Defense-in-depth: prevents malicious producers from stuffing blocks with
+        // high-gas transactions that pass byte-size limit but exceed computation budget.
+        {
+            let mut cumulative_gas: u64 = 0;
+            let gas_activation = qnet_state::GAS_METERING_ACTIVATION_HEIGHT;
+            for tx in &microblock.transactions {
+                if !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
+                    let tx_gas = if microblock.height >= gas_activation {
+                        tx.compute_gas_used()
+                    } else {
+                        tx.gas_limit
+                    };
+                    cumulative_gas = cumulative_gas.saturating_add(tx_gas);
+                }
+            }
+            if cumulative_gas > qnet_state::gas_limits::BLOCK_GAS_LIMIT {
+                return Err(format!(
+                    "BLOCK_GAS_LIMIT_EXCEEDED:h={}:gas={}:limit={}:producer={}",
+                    microblock.height, cumulative_gas,
+                    qnet_state::gas_limits::BLOCK_GAS_LIMIT, microblock.producer
+                ));
+            }
+        }
+
         // Producer validation: log mismatch but ACCEPT.
         // Individual nodes may have different timeout_round during transitions
         // (rolling updates, sync delays, network partitions). Rejecting blocks
@@ -10548,10 +10993,25 @@ impl BlockchainNode {
         // a block cannot be finalized without supermajority agreement.
         if let Some((expected_producer, expected_round)) = get_expected_producer(microblock.height) {
             if microblock.producer != expected_producer {
+                // Track out-of-turn production per producer within sliding window
+                let mut entry = OOT_PRODUCER_COUNT.entry(microblock.producer.clone())
+                    .or_insert((microblock.height, 0));
+                if microblock.height.saturating_sub(entry.0) < 100 {
+                    entry.1 += 1;
+                    if entry.1 > 3 {
+                        return Err(format!(
+                            "[ERR][VALIDATION] producer_banned_oot producer={} count={} window_start={}",
+                            &microblock.producer[..16.min(microblock.producer.len())], entry.1, entry.0
+                        ));
+                    }
+                } else {
+                    // Reset window
+                    *entry = (microblock.height, 1);
+                }
                 if is_warn() {
                     println!(
-                        "[WARN][SEC] producer_mismatch h={} expected={} got={} round={} — accepted (BFT protected)",
-                        microblock.height, expected_producer, microblock.producer, expected_round
+                        "[WARN][VALIDATION] producer_oot h={} expected={} got={} round={} count={}",
+                        microblock.height, expected_producer, microblock.producer, expected_round, entry.1
                     );
                 }
             }
@@ -10593,10 +11053,14 @@ impl BlockchainNode {
                         // v10.0: DETERMINISTIC FORK CHOICE — all nodes pick the same block.
                         // Without this, nodes that receive blocks in different order keep
                         // different versions → silent fork → entropy divergence → deadlock.
-                        // Rule: lowest merkle_root wins (deterministic, no coordination needed).
-                        if microblock.merkle_root < existing_block.merkle_root {
+                        // Use block signature hash (includes VRF randomness, non-manipulable)
+                        // instead of merkle_root (which a malicious producer could grind).
+                        use sha3::{Sha3_256, Digest as Sha3Digest};
+                        let new_sig_hash = Sha3_256::digest(&microblock.signature);
+                        let existing_sig_hash = Sha3_256::digest(&existing_block.signature);
+                        if new_sig_hash.as_slice() < existing_sig_hash.as_slice() {
                             // New block wins — replace existing. Will be saved below.
-                            println!("[INFO][SEC] fork_choice h={} winner=new — replacing existing block (lower merkle)",
+                            println!("[INFO][SEC] fork_choice h={} winner=new — replacing existing block (lower sig_hash)",
                                      microblock.height);
                             // Invalidate caches for this height since block changes
                             ENTROPY_RESPONSES.retain(|k, _| k.0 < microblock.height);
@@ -10605,7 +11069,7 @@ impl BlockchainNode {
                             // Fall through to save the new block
                         } else {
                             // Existing block wins — keep it, still signal fork for awareness
-                            println!("[INFO][SEC] fork_choice h={} winner=existing — keeping current block (lower merkle)",
+                            println!("[INFO][SEC] fork_choice h={} winner=existing — keeping current block (lower sig_hash)",
                                      microblock.height);
                             return Err(format!(
                                 "FORK_DETECTED:{}:{}",
@@ -10877,6 +11341,12 @@ impl BlockchainNode {
         // PRODUCTION FIX: Decompress macroblock data if compressed
         let decompressed_data = match zstd::decode_all(&block.data[..]) {
             Ok(data) => {
+                // SECURITY: Bound decompressed size to prevent zstd bombs (max 50MB)
+                const MAX_DECOMPRESSED_SIZE: usize = 50 * 1024 * 1024;
+                if data.len() > MAX_DECOMPRESSED_SIZE {
+                    return Err(format!("Decompressed macroblock exceeds max size: {} > {}",
+                                       data.len(), MAX_DECOMPRESSED_SIZE));
+                }
                 // Successfully decompressed
                 println!("[INFO][BLOCKS] decompressed h={} raw={}B expanded={}B",
                          block.height, block.data.len(), data.len());
@@ -10939,16 +11409,37 @@ impl BlockchainNode {
                     macroblock.height
                 ));
             }
+            // FIX L-M3: Defensive logging for macroblock chain continuity verification
+            // get_latest_macroblock_hash() is safe here because macroblocks are processed in order
+            println!("[DBG][VALIDATION] macroblock_chain_check h={} prev_hash_ok=true", macroblock.height);
         }
         
-        // 4. Verify consensus participation (at least 3f+1 signatures)
-        let required_signatures = 3; // For 5 nodes: need at least 3
-        let validator_count = macroblock.consensus_data.reveals.len();
-        if validator_count < required_signatures {
+        // 4. Verify consensus participation (BFT 2/3+1 threshold)
+        let committee_size = if !macroblock.consensus_data.commits.is_empty() {
+            macroblock.consensus_data.commits.len()
+        } else {
+            macroblock.consensus_data.reveals.len()
+        };
+
+        // FIX M2: Enforce minimum committee size from network state
+        // For genesis bootstrap (height <= 5), allow minimum 3
+        // For production (height > 5), require at least 5 or known active validators
+        let min_committee = if macroblock.height <= 5 { 3 } else { 5 };
+        if committee_size < min_committee {
             return Err(format!(
-                "Insufficient consensus! Only {} validators, need at least {}",
-                validator_count,
-                required_signatures
+                "[ERR][MB] committee_too_small size={} min={} h={}",
+                committee_size, min_committee, macroblock.height
+            ));
+        }
+
+        let required_signatures = min_committee.max(committee_size * 2 / 3 + 1);
+        let reveal_count = macroblock.consensus_data.reveals.len();
+        if reveal_count < required_signatures {
+            return Err(format!(
+                "[ERR][MB] insufficient_consensus reveals={} required={} committee={}",
+                reveal_count,
+                required_signatures,
+                committee_size
             ));
         }
         
@@ -10974,8 +11465,8 @@ impl BlockchainNode {
             }
         }
         
-        println!("[INFO][VALIDATION] macroblock_validated h={} validators={}", 
-                 macroblock.height, validator_count);
+        println!("[INFO][VALIDATION] macroblock_validated h={} reveals={} required={}",
+                 macroblock.height, reveal_count, required_signatures);
         Ok(())
     }
     
@@ -11159,6 +11650,13 @@ impl BlockchainNode {
                                 }
                             ).await {
                                 Ok(Ok(block_data)) if !block_data.is_empty() => {
+                                    // Verify genesis block integrity
+                                    {
+                                        use sha3::{Sha3_256, Digest};
+                                        let genesis_hash = hex::encode(Sha3_256::digest(&block_data));
+                                        println!("[INFO][NODE] genesis_downloaded hash={}", &genesis_hash[..16]);
+                                        // TODO: In production, verify against hardcoded GENESIS_BLOCK_HASH constant
+                                    }
                                     // Try to store as microblock at height 0
                                     match self.storage.save_microblock(0, &block_data) {
                                         Ok(_) => {
@@ -11394,7 +11892,7 @@ impl BlockchainNode {
                                     if !activation_code.is_empty() {
                                         // v9.7: Check if node is synchronized before sending activation TX.
                                         // If not synced yet, defer — will be sent after sync completes.
-                                        let node_synced = NODE_IS_SYNCHRONIZED.load(std::sync::atomic::Ordering::Relaxed);
+                                        let node_synced = coordinator_is_synchronized();
                                         if node_synced {
                                             println!("[INFO][ACTIVATION] node_synced broadcasting=NodeRegistration");
                                             match self.save_activation_code(&activation_code, self.node_type).await {
@@ -12552,7 +13050,9 @@ impl BlockchainNode {
                 Err(e) => {
                     println!("[WARN][GEN] DEBUG: Genesis block exists but corrupted/unreadable: {}", e);
                     println!("[WARN][GEN] genesis_corrupted action=delete");
-                    let _ = storage.delete_microblock(0);
+                    if let Err(e) = storage.delete_microblock(0) {
+                        eprintln!("[ERR][STORAGE] genesis_delete_failed err={}", e);
+                    }
                     false
                 }
             };
@@ -12984,7 +13484,8 @@ impl BlockchainNode {
                                                         recoverable: false,
                                                     });
                                                     // FATAL: Cannot continue without Genesis
-                                                    panic!("[CRIT][GEN] genesis_save_fatal attempts={} action=panic", MAX_SAVE_ATTEMPTS);
+                                                    eprintln!("[CRIT][GEN] genesis_save_fatal attempts={} action=exit", MAX_SAVE_ATTEMPTS);
+                                                    std::process::exit(1);
                                                 }
                                                 
                                                 // Wait before retry
@@ -13313,7 +13814,11 @@ impl BlockchainNode {
                             println!("[INFO][REACTIVATION] startup TX in mempool hash={}", &tx_hash[..16]);
                             // Broadcast to network (same as NodeRegistration line 27300)
                             if let Some(ref p2p) = unified_p2p {
-                                let _ = p2p.broadcast_transaction(tx_bytes);
+                                if let Err(e) = p2p.broadcast_transaction(tx_bytes) {
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][P2P] tx_broadcast_failed err={}", e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -13496,39 +14001,30 @@ impl BlockchainNode {
                     
                     // Cleanup old certificates from cache
                     if let Some(ref p2p) = unified_p2p {
-                        let mut cert_manager = match p2p.certificate_manager.write() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => {
-                                println!("[WARN][CERT] mutex_poisoned action=recovering");
-                                poisoned.into_inner()
+                        {
+                            let mut cert_manager = p2p.certificate_manager.write();
+                            cert_manager.cleanup();
+                            println!("[INFO][CERT] cache_cleaned");
+
+                            // PRODUCTION FIX v2.30: Persist certificate history every 5 minutes
+                            // ONLY for Full/Super nodes - Light nodes don't participate in consensus!
+                            if node_type != NodeType::Light {
+                                let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
+                                let data_dir = std::path::Path::new(&storage_path);
+                                let unified_node_type = match node_type {
+                                    NodeType::Light => crate::unified_p2p::NodeType::Light,
+                                    NodeType::Super => crate::unified_p2p::NodeType::Super,
+                                };
+                                if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                                    println!("[WARN][CERT] data_dir_create_failed path={} err={}", storage_path, e);
+                                } else if let Err(e) = cert_manager.persist_to_disk(&data_dir, unified_node_type) {
+                                    println!("[WARN][CERT] persist_failed err={}", e);
+                                } else {
+                                    if is_debug() { println!("[DBG][CERT] persisted path={}", storage_path); }
+                                }
                             }
-                        };
-                        cert_manager.cleanup();
-                        println!("[INFO][CERT] cache_cleaned");
-                        
-                        // ═══════════════════════════════════════════════════════════════════
-                        // PRODUCTION FIX v2.30: Persist certificate history every 5 minutes
-                        // ONLY for Full/Super nodes - Light nodes don't participate in consensus!
-                        // ═══════════════════════════════════════════════════════════════════
-                        if node_type != NodeType::Light {
-                            // Use QNET_STORAGE_PATH (set during init) with fallback to "data"
-                            let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
-                            let data_dir = std::path::Path::new(&storage_path);
-                            // Convert node::NodeType to unified_p2p::NodeType
-                            // v3.18: Full node type removed
-                            let unified_node_type = match node_type {
-                                NodeType::Light => crate::unified_p2p::NodeType::Light,
-                                NodeType::Super => crate::unified_p2p::NodeType::Super,
-                            };
-                            if let Err(e) = std::fs::create_dir_all(&data_dir) {
-                                println!("[WARN][CERT] data_dir_create_failed path={} err={}", storage_path, e);
-                            } else if let Err(e) = cert_manager.persist_to_disk(&data_dir, unified_node_type) {
-                                println!("[WARN][CERT] persist_failed err={}", e);
-                            } else {
-                                if is_debug() { println!("[DBG][CERT] persisted path={}", storage_path); }
-                            }
-                        }
-                        
+                        } // cert_manager write lock released
+
                         // CRITICAL: Cleanup stale nodes from active registry
                         // This prevents selecting offline nodes as producers
                         // Nodes not seen for >15 minutes are removed
@@ -13610,15 +14106,13 @@ impl BlockchainNode {
                                     use crate::quic_transport::QUIC_PORT_OFFSET;
                                     use crate::unified_p2p::{GLOBAL_QUIC_TRANSPORT, GLOBAL_NODE_ID, NetworkMessage};
                                     
-                                    let quic_transport = match GLOBAL_QUIC_TRANSPORT.read() {
-                                        Ok(guard) => guard.clone(),
-                                        Err(_) => None,
-                                    };
+                                    let quic_transport = GLOBAL_QUIC_TRANSPORT.read().clone();
                                     
                                     if let Some(ref transport_arc) = quic_transport {
-                                        let our_node_id = GLOBAL_NODE_ID.read()
-                                            .map(|g| g.clone())
-                                            .unwrap_or_else(|_| node_id.clone());
+                                        let our_node_id = {
+                                            let guard = GLOBAL_NODE_ID.read();
+                                            if guard.is_empty() { node_id.clone() } else { guard.clone() }
+                                        };
                                         
                                         use crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT;
                                     let our_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
@@ -13701,11 +14195,9 @@ impl BlockchainNode {
                     //
                     // With 30000 nodes, thousands may be syncing at any moment. Without this gate,
                     // VRF selects unsynced node → can't produce → 5s timeout → throughput drops.
+                    let reg_synced = coordinator_is_production_ready();
                     let reg_our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                     let reg_best_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                    let is_node_synced = NODE_IS_SYNCHRONIZED.load(std::sync::atomic::Ordering::Relaxed);
-                    let height_ok = reg_best_h == 0 || reg_our_h + 20 >= reg_best_h;
-                    let reg_synced = is_node_synced && height_ok;
 
                     if reg_synced {
                         if let Some(ref p2p) = unified_p2p {
@@ -13714,8 +14206,8 @@ impl BlockchainNode {
                         }
                     } else {
                         if is_info() {
-                            println!("[INFO][ACTIVE] registration_skipped_unsynced our_h={} best_h={} gap={} synced={}",
-                                     reg_our_h, reg_best_h, reg_best_h.saturating_sub(reg_our_h), is_node_synced);
+                            println!("[INFO][ACTIVE] registration_skipped_unsynced our_h={} best_h={} gap={}",
+                                     reg_our_h, reg_best_h, reg_best_h.saturating_sub(reg_our_h));
                         }
 
                         // v9.8: DESYNC MONITOR — detect post-sync desynchronization.
@@ -13727,7 +14219,7 @@ impl BlockchainNode {
                             let live_h = p2p.get_max_peer_height();
                             if live_h > reg_our_h { live_h } else { 0 }
                         } else { 0 };
-                        if is_node_synced && desync_net_h > 0 && reg_our_h + 50 < desync_net_h {
+                        if coordinator_is_synchronized() && desync_net_h > 0 && reg_our_h + 50 < desync_net_h {
                             NODE_IS_SYNCHRONIZED.store(false, std::sync::atomic::Ordering::SeqCst);
                             let gap = desync_net_h.saturating_sub(reg_our_h);
                             if is_warn() { println!("[WARN][DESYNC] detected our={} best={} gap={}", reg_our_h, desync_net_h, gap); }
@@ -14409,8 +14901,7 @@ impl BlockchainNode {
                                     // Without this guard, fork detection triggers destructive rollback
                                     // on every cooldown cycle, creating an infinite rollback→resync loop
                                     // that prevents the node from ever catching up.
-                                    let sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed)
-                                        || FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
+                                    let sync_active = coordinator_is_syncing();
 
                                     if height_gap > dynamic_threshold && (now_secs - last_rollback) > rollback_cooldown && !sync_active {
                                         LAST_ROLLBACK_TIME.store(now_secs, std::sync::atomic::Ordering::Relaxed);
@@ -14628,7 +15119,7 @@ impl BlockchainNode {
                             // DEADLOCK DETECTION: Clear stuck sync flag
                             let current_time = get_timestamp_safe();
 
-                            if FAST_SYNC_IN_PROGRESS.load(Ordering::SeqCst) {
+                            if coordinator_is_syncing() {
                                 let sync_start_time = FAST_SYNC_START_TIME.load(Ordering::Relaxed);
 
                                 if sync_start_time == 0 {
@@ -15229,10 +15720,9 @@ impl BlockchainNode {
                 // Prevents producing blocks at stale height while sync is still running.
                 // Node must be fully synchronized AND production unlocked (first network block received).
                 if is_my_turn_to_produce {
-                    let sync_active = SYNC_IN_PROGRESS.load(Ordering::Relaxed)
-                        || FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed);
+                    let sync_active = coordinator_is_syncing();
                     let prod_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
-                    let node_synced = NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed);
+                    let node_synced = coordinator_is_synchronized();
 
                     if sync_active || (!prod_unlocked && microblock_height > 5) || !node_synced {
                         if is_info() {
@@ -16576,14 +17066,15 @@ impl BlockchainNode {
                                                     gas_price: u64::MAX, // MAX priority - FIRST in block
                                                     gas_limit: 0,
                                                     nonce: 0,
-                                                    data: Some(format!("Emission Block {}: {} QNC distributed to {} eligible nodes (Full/Super={} Light={})", 
-                                                                     next_block_height, 
+                                                    data: Some(format!("Emission Block {}: {} QNC distributed to {} eligible nodes (Full/Super={} Light={})",
+                                                                     next_block_height,
                                                                      total_emission / 1_000_000_000,
                                                                      total_eligible_count,
                                                                      eligible_full_super_count,
                                                                      eligible_light_count)),
                                                     dilithium_signature: None,
                                                     dilithium_public_key: None,
+                                                    chain_id: 0,
                                                 };
                                                 
                                                 // PRODUCTION v2.78: Process Full/Super + Light node rewards via unified deterministic path
@@ -16814,7 +17305,7 @@ impl BlockchainNode {
                     // MAX_BLOCK_SIZE = 80MB (v4.1: 2x increase, less than ShredProtocol max of 87MB)
                     // This prevents deadlock where block is created but cannot be transmitted
                     const MAX_BLOCK_SIZE_BYTES: usize = 80_000_000; // 80MB hard limit (v4.1: was 40MB)
-                    
+
                     let mut accumulated_size: usize = 0;
                     let original_tx_count = tx_bytes_list.len();
                     let tx_bytes_list: Vec<(String, Vec<u8>)> = tx_bytes_list
@@ -16829,12 +17320,16 @@ impl BlockchainNode {
                             }
                         })
                         .collect();
-                    
+
                     if tx_bytes_list.len() < original_tx_count {
                         println!("[INFO][BLOCK] size_limit_applied original_tx={} included_tx={} size_mb={:.2} max_mb=80",
-                                 original_tx_count, tx_bytes_list.len(), 
+                                 original_tx_count, tx_bytes_list.len(),
                                  accumulated_size as f64 / 1_000_000.0);
                     }
+
+                    // FIX R22-B5: Track cumulative block gas for BLOCK_GAS_LIMIT enforcement
+                    // Applied AFTER size filter, BEFORE TX validation — early rejection of gas overflow
+                    let block_gas_limit = qnet_state::gas_limits::BLOCK_GAS_LIMIT;
                     
                     // CRITICAL v2.26: Track TX hashes for mempool cleanup after block
                     // IMPORTANT: Use the SAME hash from mempool, not recalculated!
@@ -16931,7 +17426,9 @@ impl BlockchainNode {
                                 
                                 let balance_valid = if let qnet_state::TransactionType::Transfer { .. } = &tx.tx_type {
                                     let balance = state_snapshot.get_balance(&tx.from);
-                                    let total_cost = tx.amount + (tx.effective_gas_price() * tx.gas_limit);
+                                    // SECURITY: checked arithmetic to prevent overflow → false balance_valid
+                                    let gas_cost = tx.effective_gas_price().saturating_mul(tx.gas_limit);
+                                    let total_cost = tx.amount.saturating_add(gas_cost);
                                     balance >= total_cost
                                 } else {
                                     true
@@ -17409,7 +17906,9 @@ impl BlockchainNode {
                     // Fees go directly to producer (Pool 2 removed)
                     // ═══════════════════════════════════════════════════════════════════
                     let mut block_fees_collected: u64 = 0;
-                    for tx in &txs {
+                    let mut block_gas_used: u64 = 0;
+                    let mut gas_limited_idx: Option<usize> = None;
+                    for (idx, tx) in txs.iter().enumerate() {
                         // QUANTUM v2.25: Use effective_gas_price() for +50% Dilithium TX fee
                         // v3.36: Use compute_gas_used() for metered blocks (EIP-1559 gas refund)
                         if !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
@@ -17418,9 +17917,24 @@ impl BlockchainNode {
                             } else {
                                 tx.gas_limit
                             };
-                            let fee_amount = tx.effective_gas_price() * charged_gas;
+                            // FIX R22-B5: Enforce cumulative BLOCK_GAS_LIMIT
+                            let new_gas = block_gas_used.saturating_add(charged_gas);
+                            if new_gas > block_gas_limit {
+                                gas_limited_idx = Some(idx);
+                                break;
+                            }
+                            block_gas_used = new_gas;
+                            let fee_amount = tx.effective_gas_price().saturating_mul(charged_gas);
                             block_fees_collected = block_fees_collected.saturating_add(fee_amount);
                         }
+                    }
+                    // FIX R22-B5: Truncate TX list if block gas limit exceeded
+                    if let Some(limit_idx) = gas_limited_idx {
+                        if is_info() {
+                            println!("[INFO][BLOCK] gas_limit_applied total_tx={} included_tx={} gas_used={} max_gas={}",
+                                     txs.len(), limit_idx, block_gas_used, block_gas_limit);
+                        }
+                        txs.truncate(limit_idx);
                     }
                     
                     let mut microblock = qnet_state::MicroBlock {
@@ -17515,7 +18029,11 @@ impl BlockchainNode {
                         }
                         // v7.1: Persist fork flag on first activation
                         if !fork_was_active && qnet_state::is_pending_rewards_in_merkle() {
-                            let _ = storage.save_fork_flag("pending_rewards_in_merkle", true);
+                            if let Err(e) = storage.save_fork_flag("pending_rewards_in_merkle", true) {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][STORAGE] fork_flag_save_failed key=pending_rewards_in_merkle val=true err={}", e);
+                                }
+                            }
                             println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (producer h={})", next_block_height);
                         }
 
@@ -18476,10 +18994,10 @@ impl BlockchainNode {
                         let current_time = get_timestamp_safe();
                         let initial_sync_target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
                         
-                        if SYNC_IN_PROGRESS.load(Ordering::SeqCst) && initial_sync_target == 0 {
+                        if coordinator_is_syncing() && initial_sync_target == 0 {
                             // Only run deadlock detection for background sync, not initial sync
                             let sync_start_time = SYNC_START_TIME.load(Ordering::Relaxed);
-                            
+
                             // CRITICAL FIX: If start_time is 0 but flag is set - sync is stuck!
                             // This can happen if flag was set but task never started
                             if sync_start_time == 0 {
@@ -18487,21 +19005,17 @@ impl BlockchainNode {
                                 SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                             } else {
                                 let sync_elapsed = current_time.saturating_sub(sync_start_time);
-                                
-                                // CRITICAL FIX v2.21.3: Use >= instead of > to catch exact timeout
-                                // Previous bug: sync_elapsed=30 and timeout=30 → 30>30=false → deadlock not detected!
+
                                 if sync_elapsed >= BACKGROUND_SYNC_TIMEOUT_SECS {
                                     println!("[WARN][SYNC] deadlock_detected bg_sync_stuck={}s action=clearing_flag", sync_elapsed);
-                                    // CRITICAL: Must reset flag or node will be stuck forever
-                                    // Risk of race condition is better than permanent deadlock
                                     SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                     SYNC_START_TIME.store(0, Ordering::Relaxed);
                                 }
                             }
                         }
-                        
+
                         // Only start new sync if not already running
-                        if !SYNC_IN_PROGRESS.load(Ordering::SeqCst) {
+                        if !coordinator_is_syncing() {
                         // PRODUCTION: Background sync without blocking microblock timing
                         let p2p_clone = p2p.clone();
                         let storage_clone = storage.clone();
@@ -18919,8 +19433,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
                 
                 // ARCHITECTURE FIX: Check node synchronization before starting consensus
-                // Use existing NODE_IS_SYNCHRONIZED flag (set by background sync monitor)
-                let is_synchronized = NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed);
+                let is_synchronized = coordinator_is_synchronized();
                     
                 // REMOVED: Consensus is now handled by start_macroblock_consensus_listener()
                 // This prevents duplicate consensus attempts and ensures ALL validators participate
@@ -19686,7 +20199,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     fn get_vrf_static() -> Option<Arc<crate::crypto::vrf::DilithiumVrf>> {
         // Access via global node reference if available
         // Phase 1: Returns None if VRF not initialized (falls back to SHA3 selection)
-        GLOBAL_VRF_INSTANCE.lock().ok().and_then(|g| g.clone())
+        GLOBAL_VRF_INSTANCE.lock().clone()
     }
     
     /// CRITICAL FIX: Invalidate producer cache during emergency failover
@@ -21224,7 +21737,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         p2p: Option<Arc<SimplifiedP2P>>,
         node_id: String,
         node_type: NodeType,
-        consensus_rx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>,
+        consensus_rx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ConsensusMessage>>>>,
     ) {
         // Subscribe to block events (event-based, not polling!)
         let mut block_event_rx = self.block_event_tx.subscribe();
@@ -21322,7 +21835,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Check if this is a new consensus round
                     if macroblock_index > last_finalized_mb {
                         // Check if node is synchronized before participating
-                        let is_synchronized = NODE_IS_SYNCHRONIZED.load(std::sync::atomic::Ordering::Relaxed);
+                        let is_synchronized = coordinator_is_synchronized();
                         if !is_synchronized {
 
                             println!("[WARN][MB] consensus_skip_unsynced mb={}", macroblock_index);
@@ -22460,7 +22973,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         nonce_storage: &Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>,
         node_id: &str,
-        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>,
+        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ConsensusMessage>>>>,
     ) {
         // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
@@ -22766,7 +23279,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         nonce_storage: &Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>,
         node_id: &str,
-        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>,
+        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ConsensusMessage>>>>,
     ) {
         // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
@@ -23231,7 +23744,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         hash
                     }
                     _ => {
-                        // Fallback: hash the hex string if decode fails
+                        // FIX L-L3: Log fallback instead of silently degrading
+                        println!("[WARN][CRYPTO] merkle_root_fallback reason=hex_decode_failed root_hex_len={}", root_hex.len());
                         use sha3::{Sha3_256, Digest};
                         let mut hasher = Sha3_256::new();
                         hasher.update(root_hex.as_bytes());
@@ -23540,8 +24054,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // Sign with VRF instance (Dilithium3 detached signature)
         // VRF instance holds the persistent keypair loaded from DilithiumKeyManager at startup
-        let global_vrf = GLOBAL_VRF_INSTANCE.lock()
-            .map_err(|e| format!("[ERR][SIGN] vrf_lock err={}", e))?;
+        let global_vrf = GLOBAL_VRF_INSTANCE.lock();
         
         let vrf_ref = global_vrf.as_ref()
             .ok_or("[ERR][SIGN] VRF not initialized — QNET_WALLET_SEED required")?;
@@ -23574,7 +24087,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     /// PRODUCTION: Verify HYBRID signature for received microblock (supports compact)
-    async fn verify_microblock_signature(
+    pub async fn verify_microblock_signature(
         microblock: &qnet_state::MicroBlock, 
         _producer_pubkey: &str,
         p2p: Option<&Arc<SimplifiedP2P>>
@@ -23762,13 +24275,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let ed25519_verified = if let Some(p2p_ref) = p2p {
             // Step 1: Get certificate with minimal lock time
             let cert_data_option = {
-                let mut cert_manager = match p2p_ref.certificate_manager.write() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => {
-                        println!("[WARN][CRYPTO] Certificate manager mutex poisoned, recovering...");
-                        poisoned.into_inner()
-                    }
-                };
+                let mut cert_manager = p2p_ref.certificate_manager.write();
                 cert_manager.get_and_mark_used(&compact_sig.cert_serial)
                 // Lock released here - BEFORE any heavy processing!
             };
@@ -23803,8 +24310,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         // 2. Node must be in sync mode - prevents abuse during live production
                         let block_age = now.saturating_sub(microblock.timestamp);
                         let is_historical = block_age > 300; // Blocks older than 5 minutes
-                        let is_sync_mode = SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed) || 
-                                           FAST_SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+                        let is_sync_mode = coordinator_is_syncing();
                         let skip_expiry_for_sync = is_historical && is_sync_mode;
                         
                         if !skip_expiry_for_sync && now > expires_with_grace {
@@ -23862,35 +24368,39 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // vrf_proof contains ML-DSA-65 detached signature (~3309 bytes)
                 // Verified against producer's registered VRF public key
                 // ═══════════════════════════════════════════════════════════════════
-                
-                let _cert_from_vrf_proof: Option<crate::hybrid_crypto::HybridCertificate> = {
-                    // v4.0: Verify VRF proof using Dilithium3 (no HybridCrypto)
+                let has_registered_vrf = crate::genesis_constants::has_vrf_key(&microblock.producer);
+                let vrf_verified = if microblock.vrf_proof.is_some() {
                     match Self::verify_block_vrf_proof(microblock) {
                         Ok(true) => {
                             if microblock.height % 100 == 0 {
                                 println!("[INFO][VRF] block_proof_verified h={} producer={}",
                                          microblock.height, microblock.producer);
                             }
+                            true
                         }
                         Ok(false) => {
-                            println!("[WARN][VRF] block_proof_invalid h={} producer={}",
-                                     microblock.height, microblock.producer);
+                            if has_registered_vrf {
+                                println!("[WARN][VRF] block_rejected_invalid_proof producer={} h={}",
+                                         &microblock.producer[..16.min(microblock.producer.len())], microblock.height);
+                                return Ok(false);
+                            }
+                            false
                         }
                         Err(e) => {
-                            println!("[WARN][VRF] proof_verify_err h={} err={}", microblock.height, e);
+                            if has_registered_vrf {
+                                println!("[WARN][VRF] block_rejected_proof_error producer={} h={} err={}",
+                                         &microblock.producer[..16.min(microblock.producer.len())], microblock.height, e);
+                                return Ok(false);
+                            }
+                            false
                         }
                     }
-                    // NOTE: cert_from_vrf_proof is None — legacy HybridCertificate no longer used
-                    // Block signature verification below uses Dilithium3 directly
-                    None
+                } else {
+                    false
                 };
-                
-                // v4.0: VRF proof verified above via Dilithium3
-                // Legacy HybridCertificate extraction removed — no Ed25519 fallback
-                
-                // v4.0: VRF proof already verified via Dilithium3 above
-                // If block has VRF proof and producer is in registry → already verified
-                if microblock.vrf_proof.is_some() && crate::genesis_constants::has_vrf_key(&microblock.producer) {
+
+                // v4.0: If VRF proof verified via Dilithium3, proceed
+                if vrf_verified && has_registered_vrf {
                     true // Dilithium3-VRF verified, proceed
                 } else {
                     // No vrf_proof - request from online producer (legacy fallback)
@@ -24036,7 +24546,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     let mut hash = [0u8; 32];
                     hash.copy_from_slice(&result);
                     // Backfill genesis hash index
-                    let _ = storage.save_microblock_hash(0, &hash);
+                    if let Err(e) = storage.save_microblock_hash(0, &hash) {
+                        if crate::node::is_warn() {
+                            println!("[WARN][STORAGE] hash_index_save_failed h=0 err={}", e);
+                        }
+                    }
                     return hash;
                 },
                 _ => {
@@ -24070,7 +24584,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 hash.copy_from_slice(&result);
 
                 // Backfill hash index for future O(1) lookups
-                let _ = storage.save_microblock_hash(prev_h, &hash);
+                if let Err(e) = storage.save_microblock_hash(prev_h, &hash) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][STORAGE] hash_index_save_failed h={} err={}", prev_h, e);
+                    }
+                }
 
                 hash
             },
@@ -24236,7 +24754,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         p2p: &Arc<SimplifiedP2P>,
         node_id: &str,
         node_type: NodeType,
-        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>,
+        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ConsensusMessage>>>>,
     ) -> Result<(), String> {
         let macroblock_index = end_height / 90;
         
@@ -24437,7 +24955,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         p2p: &Arc<SimplifiedP2P>,
         node_id: &str,
         node_type: NodeType,
-        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>,
+        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ConsensusMessage>>>>,
         state_manager: Arc<RwLock<StateManager>>, // v2.99: For emission processing
         reward_manager: Arc<RwLock<qnet_consensus::PhaseAwareRewardManager>>, // v2.99: For emission processing
     ) -> Result<(), String> {
@@ -25612,12 +26130,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         producer == self.node_id && is_synchronized
     }
     
-    /// Check if node is currently syncing
+    /// Check if node is currently syncing.
+    /// Uses coordinator state machine (preferred) with legacy flag fallback.
     pub fn is_syncing(&self) -> bool {
-        // Node is syncing if any sync operation is in progress OR node is not synchronized
-        SYNC_IN_PROGRESS.load(Ordering::Relaxed) || 
-        FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed) || 
-        !NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed)
+        coordinator_is_syncing() || !coordinator_is_synchronized()
     }
     
     /// Handle incoming EntropyResponse from peer
@@ -25805,7 +26321,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if let Err(validation_error) = tx.validate() {
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
         }
-        
+
+        // FIX R23-M1: Chain ID validation — reject cross-chain replay attempts.
+        // chain_id=0 is accepted for backward compat with pre-R23 TXs.
+        // Non-zero chain_id MUST match this node's configured chain_id.
+        {
+            let expected_chain_id = crate::network_config::QNetNetworkConfig::from_env().chain_id;
+            if tx.chain_id != 0 && tx.chain_id != expected_chain_id {
+                return Err(QNetError::ValidationError(format!(
+                    "Chain ID mismatch: TX has chain_id={} but this node expects chain_id={} (cross-chain replay rejected)",
+                    tx.chain_id, expected_chain_id
+                )));
+            }
+        }
+
         // DECENTRALIZED: System transactions don't need signature
         // validated through deterministic consensus rules, not crypto signature
         // v2.53: Added PingCommitmentWithSampling to system transactions
@@ -26034,9 +26563,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Broadcast to network only after successful validation
         // PRODUCTION v2.25: bincode for network (10-20x faster than JSON)
         if let Some(unified_p2p) = &self.unified_p2p {
-            let _ = unified_p2p.broadcast_transaction(tx_bytes);
+            if let Err(e) = unified_p2p.broadcast_transaction(tx_bytes) {
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] tx_broadcast_failed err={}", e);
+                }
+            }
         }
-        
+
         // QUANTUM v2.25: Log effective gas (includes +50% for Dilithium)
         let effective_gas = tx.effective_gas_price() * tx.gas_limit;
         let quantum_flag = if tx.is_quantum_signed() { " quantum=true" } else { "" };
@@ -26617,9 +27150,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if let qnet_state::TransactionType::Transfer { .. } = &tx.tx_type {
             let state = self.state.read().await;
             let balance = state.get_balance(&tx.from);
+            // SECURITY: checked arithmetic to prevent overflow attacks
             // QUANTUM v2.25: Use effective_gas_price() for +50% Dilithium TX fee
-            let total_cost = tx.amount + (tx.effective_gas_price() * tx.gas_limit);
-            
+            let effective_gas = tx.effective_gas_price();
+            let gas_cost = effective_gas.checked_mul(tx.gas_limit)
+                .ok_or_else(|| QNetError::ValidationError(
+                    format!("Gas calculation overflow: {} * {}", effective_gas, tx.gas_limit)
+                ))?;
+            let total_cost = tx.amount.checked_add(gas_cost)
+                .ok_or_else(|| QNetError::ValidationError(
+                    format!("Balance calculation overflow: {} + {}", tx.amount, gas_cost)
+                ))?;
+
             if balance < total_cost {
                 return Err(QNetError::ValidationError(format!(
                     "Insufficient balance: {} < {} (need {} + gas)",
@@ -26683,9 +27225,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // With QNET_BENCHMARK_MODE=true, benchmark accounts have real balances in genesis
         // so TX are valid on ALL nodes → realistic distributed test
         if let Some(unified_p2p) = &self.unified_p2p {
-            let _ = unified_p2p.broadcast_transaction(tx_bytes);
+            if let Err(e) = unified_p2p.broadcast_transaction(tx_bytes) {
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] tx_broadcast_failed err={}", e);
+                }
+            }
         }
-        
+
         // PRODUCTION v2.26: Return SHA3(bincode) hash for consistency with mempool
         Ok(tx_hash)
     }
@@ -26761,7 +27307,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Single QUIC message for entire batch - reduces stream overhead
         if let Some(unified_p2p) = &self.unified_p2p {
                 if !tx_data_for_broadcast.is_empty() {
-                    let _ = unified_p2p.broadcast_transaction_batch(tx_data_for_broadcast);
+                    if let Err(e) = unified_p2p.broadcast_transaction_batch(tx_data_for_broadcast) {
+                        if crate::node::is_warn() {
+                            println!("[WARN][P2P] tx_batch_broadcast_failed err={}", e);
+                        }
+                    }
                 }
             }
         }
@@ -26870,7 +27420,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // P2P broadcast — same as Ed25519 path
             if let Some(unified_p2p) = &self.unified_p2p {
                 if !tx_data_for_broadcast.is_empty() {
-                    let _ = unified_p2p.broadcast_transaction_batch(tx_data_for_broadcast);
+                    if let Err(e) = unified_p2p.broadcast_transaction_batch(tx_data_for_broadcast) {
+                        if crate::node::is_warn() {
+                            println!("[WARN][P2P] tx_batch_broadcast_failed err={}", e);
+                        }
+                    }
                 }
             }
         }
@@ -28565,10 +29119,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let hash = blake3::hash(self.node_id.as_bytes()).to_hex();
         let part1 = &hash[..19];
         let part2 = &hash[19..34];
-        // SHA3-256 checksum (replaced SHA2)
+        // SHA3-256 checksum (4 bytes = 32-bit collision resistance)
         use sha3::{Sha3_256, Digest};
         let body = format!("{}eon{}", part1, part2);
-        let checksum = hex::encode(&Sha3_256::digest(body.as_bytes())[..2]);
+        let checksum = hex::encode(&Sha3_256::digest(body.as_bytes())[..4]);
         format!("{}eon{}{}", part1, part2, checksum)
     }
     
@@ -29361,7 +29915,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                              node_id, rss_mb, fatal_mb);
                     
                     // Final flush before exit
-                    let _ = storage.flush_all();
+                    if let Err(e) = storage.flush_all() {
+                        if crate::node::is_warn() {
+                            println!("[WARN][STORAGE] flush_failed err={}", e);
+                        }
+                    }
                     println!("[INFO][MEMORY] final_flush_complete");
                     
                     // Give time for logs to be written
@@ -29728,7 +30286,11 @@ impl BlockchainNode {
                         
                         // Save index for next time
                         if let Ok(index_data) = bincode::serialize(&entry.num_hashes) {
-                            let _ = storage.save_raw("poh_checkpoint_latest", &index_data);
+                            if let Err(e) = storage.save_raw("poh_checkpoint_latest", &index_data) {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][STORAGE] poh_checkpoint_save_failed err={}", e);
+                                }
+                            }
                         }
                         
                         // Found most recent (scanning from high to low), no need to continue
@@ -29750,7 +30312,7 @@ impl Clone for BlockchainNode {
             mempool: self.mempool.clone(),
             consensus: self.consensus.clone(),
             unified_p2p: self.unified_p2p.clone(),
-            consensus_rx: None, // Cannot clone UnboundedReceiver - use None for cloned instances
+            consensus_rx: None, // Cannot clone Receiver - use None for cloned instances
             node_id: self.node_id.clone(),
             node_type: self.node_type,
             region: self.region,
@@ -29788,6 +30350,10 @@ impl Clone for BlockchainNode {
             pre_execution: self.pre_execution.clone(),
             block_event_tx: self.block_event_tx.clone(),
             deterministic_reputation: self.deterministic_reputation.clone(),
+            // L1 architecture handles (clone-friendly)
+            coordinator_handle: self.coordinator_handle.clone(),
+            pipeline_ingest: self.pipeline_ingest.clone(),
+            sync_handle: self.sync_handle.clone(),
         }
     }
 }

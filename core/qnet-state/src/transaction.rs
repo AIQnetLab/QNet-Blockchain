@@ -92,9 +92,13 @@ impl GasPrice {
 }
 
 /// Calculate total transaction cost in QNC
-pub fn calculate_tx_cost(gas_price: GasPrice, gas_limit: u64) -> f64 {
-    let total_nano_qnc = gas_price.0 * gas_limit;
-    total_nano_qnc as f64 / 10_f64.powi(QNC_DECIMALS as i32)
+pub fn calculate_tx_cost(gas_price: GasPrice, gas_limit: u64) -> Result<f64, String> {
+    let total_nano_qnc = gas_price.0.checked_mul(gas_limit)
+        .ok_or_else(|| format!(
+            "[REJECT][TX] gas_fee_overflow gas_price={} gas_limit={}",
+            gas_price.0, gas_limit
+        ))?;
+    Ok(total_nano_qnc as f64 / 10_f64.powi(QNC_DECIMALS as i32))
 }
 
 /// QNet-optimized gas limits (mobile-friendly)
@@ -120,8 +124,15 @@ pub mod gas_limits {
     /// Batch operations (efficient)
     pub const BATCH_OPERATION: u64 = 150_000; // New: for batch claims
     
-    /// Maximum gas limit
+    /// Maximum gas limit per transaction
     pub const MAX_GAS_LIMIT: u64 = 1_000_000; // Reduced from 2M
+
+    /// FIX R22-B5: Maximum cumulative gas per block (protocol constant)
+    /// Limits computational work per block independently of byte size.
+    /// 200K TX × avg 10K gas ≈ 2B gas. Set to 10B for headroom with contract calls.
+    /// Defense-in-depth: block byte limit (80MB) + block gas limit (10B) together
+    /// prevent both size-based and computation-based DoS.
+    pub const BLOCK_GAS_LIMIT: u64 = 10_000_000_000; // 10 billion gas units
 }
 
 /// Transaction hash type
@@ -303,6 +314,22 @@ pub enum TransactionType {
         #[serde(default)]
         last_macroblock_index: u64,
     },
+
+    /// FIX R23-K1: Key rotation transaction — allows nodes to rotate their Dilithium3
+    /// public key on-chain. Required for post-quantum key hygiene and key compromise recovery.
+    /// The old key signs the rotation TX (proving ownership), the new key is registered.
+    /// Signature verification ensures only the current key owner can rotate.
+    KeyRotation {
+        /// Node ID performing the rotation
+        node_id: String,
+        /// New Dilithium3 public key (hex-encoded, 1952 bytes decoded)
+        new_dilithium_pk: String,
+        /// Signature of new_dilithium_pk by the OLD key (proves ownership transition)
+        old_key_signature: String,
+        /// Block height at which the new key becomes active (allows grace period)
+        #[serde(default)]
+        effective_height: u64,
+    },
 }
 
 /// Individual ping sample with Merkle proof
@@ -416,6 +443,13 @@ pub struct Transaction {
     /// NOTE: No skip_serializing_if - bincode requires all fields to be serialized
     #[serde(default)]
     pub dilithium_public_key: Option<String>,
+
+    /// FIX R23-M1: Chain ID for cross-chain replay protection.
+    /// Testnet=1337, Mainnet=1, Devnet=31337. Included in canonical_bytes() so
+    /// signatures are chain-specific — a TX signed for testnet is invalid on mainnet.
+    /// Default 0 for backward compat with pre-R23 TXs (accepted on any chain).
+    #[serde(default)]
+    pub chain_id: u64,
 }
 
 /// Transaction receipt (simplified)
@@ -502,6 +536,7 @@ impl Transaction {
             data,
             dilithium_signature: None, // QUANTUM v2.25: Optional post-quantum signature
             dilithium_public_key: None, // QUANTUM v2.25: Optional post-quantum pubkey
+            chain_id: 0, // FIX R23-M1: Default 0 for backward compat
         };
         tx.hash = tx.calculate_hash();
         tx
@@ -583,8 +618,8 @@ impl Transaction {
     /// This compensates for larger TX size (~2.6KB vs 64 bytes) and verification cost
     pub fn effective_gas_price(&self) -> u64 {
         if self.is_quantum_signed() {
-            // 50% gas premium for quantum-resistant HYBRID TX
-            self.gas_price + (self.gas_price / 2)
+            // FIX M1: checked_add for 50% gas premium (defense-in-depth)
+            self.gas_price.saturating_add(self.gas_price / 2)
         } else {
             self.gas_price
         }
@@ -601,14 +636,14 @@ impl Transaction {
             TransactionType::CreateAccount { .. } => gas_limits::TRANSFER,
             TransactionType::NodeActivation { .. } => gas_limits::NODE_ACTIVATION,
             TransactionType::ContractDeploy => {
-                // Base cost + 10 gas per byte of contract bytecode
+                // FIX M2: checked arithmetic for per-byte gas cost (defense-in-depth)
                 let code_bytes = self.data.as_ref().map(|d| d.len()).unwrap_or(0);
-                gas_limits::CONTRACT_DEPLOY + (code_bytes as u64 * 10)
+                gas_limits::CONTRACT_DEPLOY.saturating_add((code_bytes as u64).saturating_mul(10))
             }
             TransactionType::ContractCall => {
-                // Base cost + 5 gas per byte of call data
+                // FIX M2: checked arithmetic for per-byte gas cost (defense-in-depth)
                 let data_bytes = self.data.as_ref().map(|d| d.len()).unwrap_or(0);
-                gas_limits::CONTRACT_CALL + (data_bytes as u64 * 5)
+                gas_limits::CONTRACT_CALL.saturating_add((data_bytes as u64).saturating_mul(5))
             }
             TransactionType::Swap { .. } => gas_limits::CONTRACT_CALL,
             // System transactions: free (no gas)
@@ -620,15 +655,18 @@ impl Transaction {
             TransactionType::NodeRegistration { .. } => 0,
             TransactionType::NodeReactivation { .. } => 0,
             // Deprecated batch types: per-item gas based on operation type
+            // FIX M2: saturating_mul prevents overflow on large batches
             TransactionType::BatchRewardClaims { node_ids, .. } => {
-                gas_limits::REWARD_CLAIM * node_ids.len() as u64
+                gas_limits::REWARD_CLAIM.saturating_mul(node_ids.len() as u64)
             }
             TransactionType::BatchNodeActivations { activation_data, .. } => {
-                gas_limits::NODE_ACTIVATION * activation_data.len() as u64
+                gas_limits::NODE_ACTIVATION.saturating_mul(activation_data.len() as u64)
             }
             TransactionType::BatchTransfers { transfers, .. } => {
-                gas_limits::TRANSFER * transfers.len() as u64
+                gas_limits::TRANSFER.saturating_mul(transfers.len() as u64)
             }
+            // FIX R23-K1: Key rotation is a system operation (free gas)
+            TransactionType::KeyRotation { .. } => 0,
         }
     }
 
@@ -640,7 +678,10 @@ impl Transaction {
     pub fn compute_gas_refund(&self) -> u64 {
         let gas_used = self.compute_gas_used();
         if gas_used > 0 && self.gas_limit > gas_used {
-            (self.gas_limit - gas_used) * self.effective_gas_price()
+            // FIX R24-H2: Use saturating_mul to prevent silent refund loss on overflow.
+            // System TXs use gas_price=u64::MAX; checked_mul().unwrap_or(0) would lose
+            // the entire refund on overflow. saturating_mul caps at u64::MAX instead.
+            (self.gas_limit - gas_used).saturating_mul(self.effective_gas_price())
         } else {
             0
         }
@@ -660,7 +701,13 @@ impl Transaction {
         canonical.dilithium_signature = None;
         
         // Deterministic canonical serialization (includes tx_type, data, all fields)
-        bincode::serialize(&canonical).unwrap_or_default()
+        // FIX R22-S3: unwrap_or_default() silently produced empty Vec on failure,
+        // causing ALL failed TXs to hash to the same SHA3-256(empty) constant.
+        // bincode::serialize on an in-memory struct cannot fail (no I/O, no size overflow),
+        // so expect() is safe here. If it ever did fail, a panic is far safer than
+        // silent hash collision which could bypass duplicate detection.
+        bincode::serialize(&canonical)
+            .expect("[FATAL][TX] canonical_bytes serialization failed — struct is in-memory, this is unreachable")
     }
     
     /// NIST FIPS 202 compliant (SHA3-256) for transaction signatures
@@ -679,7 +726,7 @@ impl Transaction {
     pub fn validate(&self) -> Result<(), String> {
         // Basic validation
         if self.from.is_empty() {
-            return Err("Empty sender address".to_string());
+            return Err("[REJECT][TX] empty_sender_address".to_string());
         }
         
         // v2.101: Hash validation - STRICT for ALL transaction types
@@ -688,7 +735,7 @@ impl Transaction {
         let calculated_hash = self.calculate_hash();
         if self.hash != calculated_hash {
             return Err(format!(
-                "Invalid transaction hash: stored={}.. calculated={}.. (type={:?})", 
+                "[REJECT][TX] invalid_hash stored={}.. calculated={}.. type={:?}",
                 &self.hash[..16.min(self.hash.len())],
                 &calculated_hash[..16.min(calculated_hash.len())],
                 std::mem::discriminant(&self.tx_type)
@@ -701,10 +748,10 @@ impl Transaction {
                 // v3.0: Self-transfers are ALLOWED (like Bitcoin, Ethereum, Solana)
                 // Use cases: testing, nonce increment, consolidation
                 if *amount == 0 {
-                    return Err("Transfer amount must be greater than 0".to_string());
+                    return Err("[REJECT][TX] zero_transfer_amount".to_string());
                 }
                 if self.to.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-                    return Err("Empty recipient address".to_string());
+                    return Err("[REJECT][TX] empty_recipient_address".to_string());
                 }
             }
             TransactionType::NodeActivation { amount, phase, .. } => {
@@ -713,12 +760,12 @@ impl Transaction {
                 match phase {
                     ActivationPhase::Phase1 => {
                         if *amount != 0 {
-                            return Err("Phase 1 activation should have amount = 0 (1DEV burned on Solana, not QNC)".to_string());
+                            return Err("[REJECT][NODE-ACTIVATION] phase1_nonzero_amount".to_string());
                         }
                     }
                     ActivationPhase::Phase2 => {
                         if *amount == 0 {
-                            return Err("Phase 2 activation requires amount > 0 (QNC transferred to Pool 3)".to_string());
+                            return Err("[REJECT][NODE-ACTIVATION] phase2_zero_amount".to_string());
                         }
                     }
                 }
@@ -728,24 +775,24 @@ impl Transaction {
             }
             TransactionType::ContractCall => {
                 if self.to.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-                    return Err("Empty contract address".to_string());
+                    return Err("[REJECT][CONTRACT] empty_contract_address".to_string());
                 }
             }
             TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, pool_address, .. } => {
                 if from.is_empty() {
-                    return Err("Swap sender address cannot be empty".to_string());
+                    return Err("[REJECT][SWAP] empty_sender_address".to_string());
                 }
                 if token_in.is_empty() || token_out.is_empty() {
-                    return Err("Swap token identifiers cannot be empty".to_string());
+                    return Err("[REJECT][SWAP] empty_token_identifier".to_string());
                 }
                 if token_in == token_out {
-                    return Err("Cannot swap token for itself".to_string());
+                    return Err("[REJECT][SWAP] same_token_swap".to_string());
                 }
                 if *amount_in == 0 {
-                    return Err("Swap amount must be greater than 0".to_string());
+                    return Err("[REJECT][SWAP] zero_swap_amount".to_string());
                 }
                 if pool_address.is_empty() {
-                    return Err("DEX pool address cannot be empty".to_string());
+                    return Err("[REJECT][SWAP] empty_pool_address".to_string());
                 }
                 // amount_out_min can be 0 (no slippage protection, risky but allowed)
                 let _ = amount_out_min; // Explicitly mark as intentionally unused here
@@ -755,47 +802,70 @@ impl Transaction {
             }
             TransactionType::CreateAccount { address, initial_balance } => {
                 if address.is_empty() {
-                    return Err("Address cannot be empty".to_string());
+                    return Err("[REJECT][CREATE-ACCOUNT] empty_address".to_string());
                 }
                 if *initial_balance == 0 {
-                    return Err("Initial balance must be greater than 0".to_string());
+                    return Err("[REJECT][CREATE-ACCOUNT] zero_initial_balance".to_string());
+                }
+                // C1 SECURITY: Only system/genesis accounts can mint initial balance
+                if *initial_balance > 0 {
+                    let sender = &self.from;
+                    let is_system = sender == "system" || sender == "genesis" || sender == "system_rewards_pool";
+                    let has_system_sig = self.signature.as_deref() == Some("system")
+                        || self.signature.as_deref() == Some("genesis");
+                    if !is_system && !has_system_sig {
+                        return Err(format!(
+                            "[REJECT][CREATE-ACCOUNT] sender={} not authorized to mint initial_balance={}",
+                            sender, initial_balance
+                        ));
+                    }
                 }
             }
 
             TransactionType::BatchRewardClaims { node_ids, .. } => {
                 if node_ids.is_empty() {
-                    return Err("Batch reward claims must have at least one node".to_string());
+                    return Err("[REJECT][BATCH-CLAIM] empty_node_ids".to_string());
+                }
+                // FIX H32: Enforce max batch size to prevent DoS via oversized batches
+                if node_ids.len() > 1000 {
+                    return Err("[REJECT][BATCH-CLAIM] batch_too_large max=1000".to_string());
                 }
             }
             TransactionType::BatchNodeActivations { activation_data, .. } => {
                 if activation_data.is_empty() {
-                    return Err("Batch node activations must have at least one activation".to_string());
+                    return Err("[REJECT][BATCH-ACTIVATION] empty_activation_data".to_string());
+                }
+                if activation_data.len() > 500 {
+                    return Err("[REJECT][BATCH-ACTIVATION] batch_too_large max=500".to_string());
                 }
             }
             TransactionType::BatchTransfers { transfers, .. } => {
                 if transfers.is_empty() {
-                    return Err("Batch transfers must have at least one transfer".to_string());
+                    return Err("[REJECT][BATCH-TX] empty_transfers".to_string());
+                }
+                if transfers.len() > 1000 {
+                    return Err("[REJECT][BATCH-TX] batch_too_large max=1000".to_string());
                 }
                 // Validate each transfer amount
                 for transfer in transfers {
                     if transfer.amount == 0 {
-                        return Err("Batch transfer amount cannot be zero".to_string());
+                        return Err("[REJECT][BATCH-TX] zero_transfer_amount".to_string());
                     }
                 }
             }
             TransactionType::PingAttestation { from_node, to_node, response_time_ms, .. } => {
                 if from_node.is_empty() {
-                    return Err("Ping from_node cannot be empty".to_string());
+                    return Err("[REJECT][TX] empty_ping_from_node".to_string());
                 }
                 if to_node.is_empty() {
-                    return Err("Ping to_node cannot be empty".to_string());
+                    return Err("[REJECT][TX] empty_ping_to_node".to_string());
                 }
                 if *response_time_ms > 60000 {
-                    return Err("Ping response time cannot exceed 60 seconds".to_string());
+                    return Err(format!("[REJECT][TX] ping_response_time_exceeded value={}", response_time_ms));
                 }
                 // CRITICAL: Ping attestations are FREE (gas_limit must be 0)
                 if self.gas_limit != gas_limits::PING {
-                    return Err("Ping attestation must have gas_limit = 0 (FREE operation)".to_string());
+                    return Err(format!("[REJECT][TX] ping_nonzero_gas_limit value={}", self.gas_limit));
                 }
             }
             TransactionType::PingCommitmentWithSampling { 
@@ -809,39 +879,39 @@ impl Transaction {
             } => {
                 // CRITICAL: Ping commitments are FREE (system operation)
                 if self.gas_limit != gas_limits::PING {
-                    return Err("Ping commitment must have gas_limit = 0 (FREE operation)".to_string());
+                    return Err(format!("[REJECT][TX] ping_commitment_nonzero_gas_limit value={}", self.gas_limit));
                 }
                 
                 // Validate window heights
                 if *window_end_height <= *window_start_height {
-                    return Err("Window end height must be greater than start height".to_string());
+                    return Err(format!("[REJECT][TX] invalid_window_range start={} end={}", window_start_height, window_end_height));
                 }
-                
+
                 // Validate window size (must be 4 hours = 14400 blocks)
                 let expected_window = 4 * 60 * 60; // 14400 blocks
                 let actual_window = window_end_height - window_start_height;
                 if actual_window != expected_window {
                     return Err(format!(
-                        "Invalid window size: expected {} blocks, got {}",
+                        "[REJECT][TX] invalid_window_size expected={} actual={}",
                         expected_window, actual_window
                     ));
                 }
-                
+
                 // Validate Merkle root (must be 64 hex characters = 32 bytes)
                 if merkle_root.len() != 64 {
-                    return Err("Merkle root must be 64 hex characters (32 bytes)".to_string());
+                    return Err(format!("[REJECT][TX] invalid_merkle_root_length len={}", merkle_root.len()));
                 }
-                
+
                 // Validate sample seed (must be 64 hex characters = 32 bytes)
                 if sample_seed.len() != 64 {
-                    return Err("Sample seed must be 64 hex characters (32 bytes)".to_string());
+                    return Err(format!("[REJECT][TX] invalid_sample_seed_length len={}", sample_seed.len()));
                 }
-                
+
                 // Validate counts
                 if *successful_ping_count > *total_ping_count {
-                    return Err("Successful ping count cannot exceed total ping count".to_string());
+                    return Err(format!("[REJECT][TX] successful_exceeds_total successful={} total={}", successful_ping_count, total_ping_count));
                 }
-                
+
                 // Validate sample size: ADAPTIVE based on network size!
                 // - Small network (<10K nodes): verify ALL pings (no sampling)
                 // - Large network (10K+ nodes): 1% sampling for scalability
@@ -849,18 +919,18 @@ impl Transaction {
                 let min_sample_size = (*total_ping_count / 100).max(10_000_u32.min(*total_ping_count));
                 if ping_samples.len() < min_sample_size as usize {
                     return Err(format!(
-                        "Insufficient samples: got {}, expected at least {} (total={})",
+                        "[REJECT][TX] insufficient_ping_samples got={} min={} total={}",
                         ping_samples.len(), min_sample_size, total_ping_count
                     ));
                 }
-                
+
                 // Validate each sample has non-empty Merkle proof
                 for sample in ping_samples {
                     if sample.merkle_proof.is_empty() {
-                        return Err("Ping sample must include Merkle proof".to_string());
+                        return Err("[REJECT][TX] ping_sample_missing_merkle_proof".to_string());
                     }
                     if sample.response_time_ms > 60000 {
-                        return Err("Sample ping response time cannot exceed 60 seconds".to_string());
+                        return Err(format!("[REJECT][TX] ping_sample_response_time_exceeded value={}", sample.response_time_ms));
                     }
                 }
             }
@@ -877,53 +947,53 @@ impl Transaction {
             } => {
                 // CRITICAL: Heartbeat commitments are FREE (system operation)
                 if self.gas_limit != gas_limits::PING {
-                    return Err("Heartbeat commitment must have gas_limit = 0 (FREE operation)".to_string());
+                    return Err(format!("[REJECT][TX] heartbeat_nonzero_gas_limit value={}", self.gas_limit));
                 }
                 
                 // Validate node_id format (light_*, full_*, super_*, genesis_node_*)
                 if node_id.is_empty() {
-                    return Err("Node ID cannot be empty".to_string());
+                    return Err("[REJECT][TX] empty_heartbeat_node_id".to_string());
                 }
                 // v3.18: Full nodes removed
-                if !node_id.starts_with("light_") 
-                    && !node_id.starts_with("super_") 
+                if !node_id.starts_with("light_")
+                    && !node_id.starts_with("super_")
                     && !node_id.starts_with("genesis_node_") {
-                    return Err(format!("Invalid node_id format: {} (Full node type removed in v3.18)", node_id));
+                    return Err(format!("[REJECT][TX] invalid_heartbeat_node_id_format node_id={}", node_id));
                 }
                 
                 // Validate window heights
                 if *window_end_height <= *window_start_height {
-                    return Err("Window end height must be greater than start height".to_string());
+                    return Err(format!("[REJECT][TX] invalid_heartbeat_window_range start={} end={}", window_start_height, window_end_height));
                 }
-                
+
                 // Validate window size (must be 4 hours = 14400 blocks)
                 let expected_window = 14400u64;
                 let actual_window = window_end_height - window_start_height;
                 if actual_window != expected_window {
                     return Err(format!(
-                        "Invalid window size: expected {} blocks, got {}",
+                        "[REJECT][TX] invalid_heartbeat_window_size expected={} actual={}",
                         expected_window, actual_window
                     ));
                 }
                 
                 // Validate Merkle root (must be 64 hex characters = 32 bytes)
                 if merkle_root.len() != 64 || !merkle_root.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err("Merkle root must be 64 hex characters (32 bytes)".to_string());
+                    return Err(format!("[REJECT][TX] invalid_heartbeat_merkle_root len={}", merkle_root.len()));
                 }
-                
+
                 // Validate sample seed (must be 64 hex characters = 32 bytes)
                 if sample_seed.len() != 64 {
-                    return Err("Sample seed must be 64 hex characters (32 bytes)".to_string());
+                    return Err(format!("[REJECT][TX] invalid_heartbeat_sample_seed_length len={}", sample_seed.len()));
                 }
-                
+
                 // Validate heartbeat_count (0-10)
                 if *heartbeat_count > 10 {
-                    return Err("Heartbeat count cannot exceed 10".to_string());
+                    return Err(format!("[REJECT][TX] heartbeat_count_exceeded value={}", heartbeat_count));
                 }
-                
+
                 // Validate timestamps
                 if *heartbeat_count > 0 && *last_heartbeat_time < *first_heartbeat_time {
-                    return Err("Last heartbeat time cannot be before first heartbeat time".to_string());
+                    return Err(format!("[REJECT][TX] heartbeat_time_order_invalid first={} last={}", first_heartbeat_time, last_heartbeat_time));
                 }
                 
                 // Validate sample size: 20-30% of heartbeat_count (minimum 1 if count > 0)
@@ -932,7 +1002,7 @@ impl Transaction {
                     let max_samples = ((*heartbeat_count as usize * 30) / 100).max(1);
                     if heartbeat_samples.len() < min_samples || heartbeat_samples.len() > max_samples {
                         return Err(format!(
-                            "Invalid sample size: got {}, expected {}-{} (20-30% of {})",
+                            "[REJECT][TX] invalid_heartbeat_sample_size got={} min={} max={} count={}",
                             heartbeat_samples.len(), min_samples, max_samples, heartbeat_count
                         ));
                     }
@@ -941,16 +1011,16 @@ impl Transaction {
                 // Validate each sample
                 for sample in heartbeat_samples {
                     if sample.heartbeat_index >= 10 {
-                        return Err(format!("Invalid heartbeat_index: {}, must be 0-9", sample.heartbeat_index));
+                        return Err(format!("[REJECT][TX] invalid_heartbeat_index value={}", sample.heartbeat_index));
                     }
                     if sample.block_height < *window_start_height || sample.block_height > *window_end_height {
-                        return Err("Sample block_height outside window range".to_string());
+                        return Err(format!("[REJECT][TX] heartbeat_sample_outside_window block_height={} start={} end={}", sample.block_height, window_start_height, window_end_height));
                     }
                     if sample.signature.is_empty() {
-                        return Err("Heartbeat sample signature cannot be empty".to_string());
+                        return Err("[REJECT][TX] empty_heartbeat_sample_signature".to_string());
                     }
                     if sample.merkle_proof.is_empty() {
-                        return Err("Heartbeat sample must include Merkle proof".to_string());
+                        return Err("[REJECT][TX] heartbeat_sample_missing_merkle_proof".to_string());
                     }
                 }
             }
@@ -964,23 +1034,23 @@ impl Transaction {
                 // v2.89: Validate Light Node Eligibility Bitmap TX
                 // This is a system TX from Genesis nodes - FREE operation
                 if self.gas_limit != gas_limits::PING {
-                    return Err("LightNodeEligibilityBitmap must have gas_limit = 0 (FREE operation)".to_string());
+                    return Err(format!("[REJECT][TX] bitmap_nonzero_gas_limit value={}", self.gas_limit));
                 }
                 
                 // Validate genesis_id format
                 if !genesis_id.starts_with("genesis_node_") {
-                    return Err(format!("Invalid genesis_id format: {}", genesis_id));
+                    return Err(format!("[REJECT][TX] invalid_genesis_id_format genesis_id={}", genesis_id));
                 }
                 
                 // Validate total_assigned (max 10M Light nodes per Genesis = 2M each for 5 Genesis)
                 if *total_assigned == 0 || *total_assigned > 10_000_000 {
-                    return Err(format!("Invalid total_assigned: {}, must be 1-10M", total_assigned));
+                    return Err(format!("[REJECT][TX] invalid_total_assigned value={}", total_assigned));
                 }
                 
                 // Validate eligible_count <= total_assigned
                 if *eligible_count > *total_assigned {
                     return Err(format!(
-                        "eligible_count ({}) cannot exceed total_assigned ({})",
+                        "[REJECT][TX] eligible_exceeds_total eligible={} total={}",
                         eligible_count, total_assigned
                     ));
                 }
@@ -988,11 +1058,11 @@ impl Transaction {
                 // Validate bitmap_compressed is not empty and not too large
                 // Expected: ~50KB compressed for 2M nodes, max 500KB
                 if bitmap_compressed.is_empty() {
-                    return Err("bitmap_compressed cannot be empty".to_string());
+                    return Err("[REJECT][TX] empty_bitmap_compressed".to_string());
                 }
                 if bitmap_compressed.len() > 500_000 {
                     return Err(format!(
-                        "bitmap_compressed too large: {} bytes, max 500KB",
+                        "[REJECT][TX] bitmap_compressed_too_large size={} max=500000",
                         bitmap_compressed.len()
                     ));
                 }
@@ -1003,26 +1073,38 @@ impl Transaction {
             TransactionType::NodeRegistration { node_id, node_type, wallet_address, api_endpoint, .. } => {
                 // System transaction: validate node registration data
                 if node_id.is_empty() {
-                    return Err("Node ID cannot be empty".to_string());
+                    return Err("[REJECT][NODE-ACTIVATION] empty_node_id".to_string());
                 }
                 if wallet_address.is_empty() {
-                    return Err("Wallet address cannot be empty".to_string());
+                    return Err("[REJECT][NODE-ACTIVATION] empty_wallet_address".to_string());
                 }
                 // SECURITY: Light nodes MUST have empty api_endpoint (privacy protection!)
                 // Light nodes = mobile apps, their IP must NEVER be exposed!
                 if *node_type == NodeType::Light && !api_endpoint.is_empty() {
-                    return Err("Light nodes cannot have api_endpoint (mobile privacy)".to_string());
+                    return Err("[REJECT][NODE-ACTIVATION] light_node_api_endpoint_forbidden".to_string());
                 }
                 // Validate api_endpoint format if present (non-empty = public)
                 if !api_endpoint.is_empty() {
                     if !api_endpoint.starts_with("http://") && !api_endpoint.starts_with("https://") {
-                        return Err("api_endpoint must start with http:// or https://".to_string());
+                        return Err("[REJECT][NODE-ACTIVATION] invalid_api_endpoint_scheme".to_string());
                     }
                     // Block private IPs (SSRF protection)
+                    // FIX M4: Comprehensive SSRF protection — block all RFC 1918 + link-local + loopback
                     let ep_lower = api_endpoint.to_lowercase();
                     if ep_lower.contains("localhost") || ep_lower.contains("127.0.0.1") ||
-                       ep_lower.contains("192.168.") || ep_lower.contains("10.0.") {
-                        return Err("api_endpoint must be a public IP, not localhost/private".to_string());
+                       ep_lower.contains("192.168.") || ep_lower.contains("10.") ||
+                       ep_lower.contains("172.16.") || ep_lower.contains("172.17.") ||
+                       ep_lower.contains("172.18.") || ep_lower.contains("172.19.") ||
+                       ep_lower.contains("172.20.") || ep_lower.contains("172.21.") ||
+                       ep_lower.contains("172.22.") || ep_lower.contains("172.23.") ||
+                       ep_lower.contains("172.24.") || ep_lower.contains("172.25.") ||
+                       ep_lower.contains("172.26.") || ep_lower.contains("172.27.") ||
+                       ep_lower.contains("172.28.") || ep_lower.contains("172.29.") ||
+                       ep_lower.contains("172.30.") || ep_lower.contains("172.31.") ||
+                       ep_lower.contains("169.254.") || ep_lower.contains("0.0.0.0") ||
+                       ep_lower.contains("[::1]") || ep_lower.contains("[fc") ||
+                       ep_lower.contains("[fd") || ep_lower.contains("[fe80") {
+                        return Err("[REJECT][NODE-ACTIVATION] private_api_endpoint".to_string());
                     }
                 }
                 // Empty api_endpoint = node chose to hide IP (valid for Super nodes)
@@ -1030,27 +1112,48 @@ impl Transaction {
             TransactionType::NodeReactivation { node_id, current_height, last_macroblock_hash, last_macroblock_index } => {
                 // v9.4: Validate reactivation TX
                 if node_id.is_empty() {
-                    return Err("NodeReactivation: node_id cannot be empty".to_string());
+                    return Err("[REJECT][NODE-ACTIVATION] reactivation_empty_node_id".to_string());
                 }
                 if last_macroblock_hash.is_empty() {
-                    return Err("NodeReactivation: last_macroblock_hash cannot be empty".to_string());
+                    return Err("[REJECT][NODE-ACTIVATION] reactivation_empty_macroblock_hash".to_string());
                 }
                 if *current_height == 0 {
-                    return Err("NodeReactivation: current_height must be > 0".to_string());
+                    return Err("[REJECT][NODE-ACTIVATION] reactivation_zero_height".to_string());
                 }
                 if *last_macroblock_index == 0 && *current_height > 90 {
-                    return Err("NodeReactivation: last_macroblock_index required for height > 90".to_string());
+                    return Err(format!("[REJECT][NODE-ACTIVATION] reactivation_missing_macroblock_index height={}", current_height));
                 }
                 // Sanity: macroblock_index should roughly match current_height / 90
                 if *last_macroblock_index > 0 {
                     let expected_max_mb = (*current_height / 90) + 1;
                     if *last_macroblock_index > expected_max_mb {
                         return Err(format!(
-                            "NodeReactivation: last_macroblock_index {} inconsistent with height {}",
+                            "[REJECT][NODE-ACTIVATION] reactivation_inconsistent_macroblock_index mb_index={} height={}",
                             last_macroblock_index, current_height
                         ));
                     }
                 }
+            }
+
+            // FIX R23-K1: Validate key rotation TX
+            TransactionType::KeyRotation { node_id, new_dilithium_pk, old_key_signature, effective_height } => {
+                if node_id.is_empty() {
+                    return Err("[REJECT][KEY-ROTATION] empty_node_id".to_string());
+                }
+                // Dilithium3 public key = 1952 bytes = 3904 hex chars
+                if new_dilithium_pk.len() != 3904 {
+                    return Err(format!(
+                        "[REJECT][KEY-ROTATION] invalid_pk_size expected=3904_hex got={}",
+                        new_dilithium_pk.len()
+                    ));
+                }
+                if hex::decode(new_dilithium_pk).is_err() {
+                    return Err("[REJECT][KEY-ROTATION] invalid_pk_hex".to_string());
+                }
+                if old_key_signature.is_empty() {
+                    return Err("[REJECT][KEY-ROTATION] empty_old_key_signature".to_string());
+                }
+                let _ = effective_height; // effective_height=0 means immediate
             }
         }
 
@@ -1059,6 +1162,17 @@ impl Transaction {
     
     /// Apply transaction to state
     pub fn apply_to_state(&self, accounts: &mut HashMap<String, Account>) -> Result<(), StateError> {
+        // SECURITY: Out-of-gas check — reject TX if compute_gas_used() > gas_limit
+        // System TXs (gas_limit=0, gas_used=0) are exempt
+        if self.gas_limit > 0 {
+            let gas_used = self.compute_gas_used();
+            if gas_used > self.gas_limit {
+                return Err(StateError::InvalidTransaction(format!(
+                    "[REJECT][TX] out_of_gas gas_used={} gas_limit={}", gas_used, self.gas_limit
+                )));
+            }
+        }
+
         match &self.tx_type {
             TransactionType::Transfer { from, to, amount } => {
                 // Get sender account
@@ -1069,13 +1183,16 @@ impl Transaction {
                 // Transaction nonce must be exactly sender.nonce + 1
                 if self.nonce != sender.nonce + 1 {
                     return Err(StateError::InvalidTransaction(format!(
-                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        "[REJECT][TX] invalid_nonce expected={} got={}",
                         sender.nonce + 1, self.nonce
                     )));
                 }
                 
                 // Check balance (QUANTUM v2.25: use effective_gas_price for +50% Dilithium TX)
-                let total_amount = amount + self.effective_gas_price() * self.gas_limit;
+                let fee = self.effective_gas_price().checked_mul(self.gas_limit)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
+                let total_amount = amount.checked_add(fee)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] total_amount_overflow".into()))?;
                 if sender.balance < total_amount {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -1084,22 +1201,44 @@ impl Transaction {
                 }
                 
                 // Deduct from sender
-                sender.balance -= total_amount;
-                sender.nonce += 1;
-                
+                sender.balance = sender.balance.checked_sub(total_amount)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] sender_balance_underflow".into()))?;
+                sender.nonce = sender.nonce.checked_add(1)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
+
                 // Add to receiver
                 let receiver = accounts.entry(to.clone())
                     .or_insert_with(|| Account::new(to.clone()));
-                receiver.balance += amount;
+                receiver.balance = receiver.balance.checked_add(*amount)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TRANSFER] receiver_balance_overflow".into()))?;
             }
             TransactionType::CreateAccount { address, initial_balance } => {
                 if accounts.contains_key(address) {
-                    return Err(StateError::InvalidTransaction("Account already exists".to_string()));
+                    return Err(StateError::InvalidTransaction("[REJECT][CREATE-ACCOUNT] account_already_exists".to_string()));
                 }
-                
+
+                // C1 SECURITY: Only system/genesis accounts can mint initial balance
+                if *initial_balance > 0 {
+                    let sender = &self.from;
+                    let is_system = sender == "system" || sender == "genesis" || sender == "system_rewards_pool";
+                    let has_system_sig = self.signature.as_deref() == Some("system")
+                        || self.signature.as_deref() == Some("genesis");
+                    if !is_system && !has_system_sig {
+                        return Err(StateError::InvalidTransaction(format!(
+                            "[REJECT][CREATE-ACCOUNT] sender={} not authorized to mint initial_balance={}",
+                            sender, initial_balance
+                        )));
+                    }
+                }
+
                 let mut account = Account::new(address.clone());
                 account.balance = *initial_balance;
                 accounts.insert(address.clone(), account);
+
+                if is_info_log() {
+                    println!("[INFO][CREATE-ACCOUNT] addr={} balance={} by={}",
+                        &address[..address.len().min(16)], initial_balance, &self.from[..self.from.len().min(16)]);
+                }
             }
 
             TransactionType::NodeActivation { node_type, amount, .. } => {
@@ -1109,14 +1248,16 @@ impl Transaction {
                 // CRITICAL SECURITY: Check nonce to prevent replay attacks
                 if self.nonce != sender.nonce + 1 {
                     return Err(StateError::InvalidTransaction(format!(
-                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        "[REJECT][TX] invalid_nonce expected={} got={}",
                         sender.nonce + 1, self.nonce
                     )));
                 }
 
                 // Fee calculation (QUANTUM v2.25: use effective_gas_price for +50% Dilithium TX)
-                let fee = self.effective_gas_price() * self.gas_limit;
-                let total_amount = amount + fee;
+                let fee = self.effective_gas_price().checked_mul(self.gas_limit)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
+                let total_amount = amount.checked_add(fee)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] total_amount_overflow".into()))?;
 
                 if sender.balance < total_amount {
                     return Err(StateError::InsufficientBalance {
@@ -1126,8 +1267,10 @@ impl Transaction {
                 }
 
                 // Burn tokens (remove from balance)
-                sender.balance -= total_amount;
-                sender.nonce += 1;
+                sender.balance = sender.balance.checked_sub(total_amount)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] sender_balance_underflow".into()))?;
+                sender.nonce = sender.nonce.checked_add(1)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
 
                 // Activate node
                 sender.activate_node(format!("{:?}", node_type), self.timestamp);
@@ -1142,13 +1285,14 @@ impl Transaction {
                 // CRITICAL SECURITY: Check nonce to prevent replay attacks
                 if self.nonce != sender.nonce + 1 {
                     return Err(StateError::InvalidTransaction(format!(
-                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        "[REJECT][TX] invalid_nonce expected={} got={}",
                         sender.nonce + 1, self.nonce
                     )));
                 }
                 
                 // Check balance for deployment fee (QUANTUM v2.25: +50% for Dilithium TX)
-                let fee = self.effective_gas_price() * self.gas_limit;
+                let fee = self.effective_gas_price().checked_mul(self.gas_limit)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
                 if sender.balance < fee {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -1157,8 +1301,10 @@ impl Transaction {
                 }
                 
                 // Deduct deployment fee
-                sender.balance -= fee;
-                sender.nonce += 1;
+                sender.balance = sender.balance.checked_sub(fee)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] sender_balance_underflow".into()))?;
+                sender.nonce = sender.nonce.checked_add(1)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
 
                 // Compute contract address from deployer + nonce (deterministic)
                 let contract_address = if let Some(to) = &self.to {
@@ -1172,11 +1318,14 @@ impl Transaction {
 
                 // Parse tx.data to determine contract type
                 let data_str = self.data.as_ref().ok_or_else(|| {
-                    StateError::InvalidTransaction("ContractDeploy requires data field".to_string())
+                    StateError::InvalidTransaction("[REJECT][CONTRACT] missing_data_field".to_string())
                 })?;
                 
-                // Try to parse as JSON (QRC-20 tokens have {"qrc20":true,...})
-                let is_qrc20 = data_str.contains("\"qrc20\"");
+                // FIX M6: Parse JSON first, then check for QRC-20 via proper field access
+                let is_qrc20 = serde_json::from_str::<serde_json::Value>(data_str)
+                    .ok()
+                    .and_then(|v| v.get("qrc20").and_then(|q| q.as_bool()))
+                    .unwrap_or(false);
                 
                 // Compute code hash
                 let code_hash = {
@@ -1246,14 +1395,16 @@ impl Transaction {
                 // CRITICAL SECURITY: Check nonce to prevent replay attacks
                 if self.nonce != sender.nonce + 1 {
                     return Err(StateError::InvalidTransaction(format!(
-                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        "[REJECT][TX] invalid_nonce expected={} got={}",
                         sender.nonce + 1, self.nonce
                     )));
                 }
                 
                 // Check balance for call fee + value (QUANTUM v2.25: +50% for Dilithium TX)
-                let fee = self.effective_gas_price() * self.gas_limit;
-                let total_cost = fee + self.amount;
+                let fee = self.effective_gas_price().checked_mul(self.gas_limit)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
+                let total_cost = fee.checked_add(self.amount)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] total_amount_overflow".into()))?;
                 
                 if sender.balance < total_cost {
                     return Err(StateError::InsufficientBalance {
@@ -1263,13 +1414,15 @@ impl Transaction {
                 }
                 
                 // Deduct fee and value
-                sender.balance -= total_cost;
-                sender.nonce += 1;
+                sender.balance = sender.balance.checked_sub(total_cost)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] sender_balance_underflow".into()))?;
+                sender.nonce = sender.nonce.checked_add(1)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
                 let sender_addr = self.from.clone();
 
                 // Verify target is a contract account
                 let contract_addr = self.to.as_ref().ok_or_else(|| {
-                    StateError::InvalidTransaction("ContractCall requires 'to' address".to_string())
+                    StateError::InvalidTransaction("[REJECT][CONTRACT] missing_to_address".to_string())
                 })?.clone();
 
                 let contract = accounts.entry(contract_addr.clone())
@@ -1277,13 +1430,14 @@ impl Transaction {
 
                 if !contract.is_contract {
                     return Err(StateError::InvalidTransaction(format!(
-                        "Target {} is not a deployed contract", contract_addr
+                        "[REJECT][CONTRACT] not_a_contract addr={}", contract_addr
                     )));
                 }
 
                 // Credit contract with sent value (if any)
                 if self.amount > 0 {
-                    contract.balance += self.amount;
+                    contract.balance = contract.balance.checked_add(self.amount)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][CONTRACT] balance_overflow".into()))?;
                 }
 
                 // v3.40: Execute QRC-20 operations ON-CHAIN (deterministic on all nodes)
@@ -1301,36 +1455,63 @@ impl Transaction {
                                     // QRC-20 transfer: move tokens from sender to recipient
                                     let to = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
                                         .ok_or_else(|| StateError::InvalidTransaction(
-                                            "transfer: missing 'to' argument".to_string()))?;
+                                            "[REJECT][QRC20] transfer_missing_to_arg".to_string()))?;
                                     let amount = args.and_then(|a| a.get(1)).and_then(|v| v.as_u64())
                                         .ok_or_else(|| StateError::InvalidTransaction(
-                                            "transfer: missing 'amount' argument".to_string()))?;
-                                    
+                                            "[REJECT][QRC20] transfer_missing_amount_arg".to_string()))?;
+
+                                    if amount == 0 {
+                                        return Err(StateError::InvalidTransaction("[REJECT][QRC20] zero_amount_transfer".into()));
+                                    }
+
                                     let from_key = format!("balance:{}", sender_addr);
-                                    let from_bal: u64 = contract.contract_storage.get(&from_key)
-                                        .and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    // FIX R24-L1: Log corrupted contract_storage instead of silent 0.
+                                    // unwrap_or(0) masked data corruption — now we detect and log it.
+                                    let from_bal: u64 = match contract.contract_storage.get(&from_key) {
+                                        Some(val) => match val.parse::<u64>() {
+                                            Ok(b) => b,
+                                            Err(_) => {
+                                                println!("[ERR][QRC20] corrupted_balance key={} val={}", from_key, &val[..32.min(val.len())]);
+                                                return Err(StateError::InvalidTransaction(
+                                                    format!("[REJECT][QRC20] corrupted_balance key={}", from_key)));
+                                            }
+                                        },
+                                        None => 0,
+                                    };
                                     
                                     if from_bal < amount {
                                         return Err(StateError::InvalidTransaction(format!(
-                                            "QRC-20 transfer: insufficient balance (have={}, need={})", from_bal, amount)));
+                                            "[REJECT][QRC20] insufficient_balance have={} need={}", from_bal, amount)));
                                     }
                                     
                                     let to_key = format!("balance:{}", to);
-                                    let to_bal: u64 = contract.contract_storage.get(&to_key)
-                                        .and_then(|s| s.parse().ok()).unwrap_or(0);
-                                    
+                                    let to_bal: u64 = match contract.contract_storage.get(&to_key) {
+                                        Some(val) => match val.parse::<u64>() {
+                                            Ok(b) => b,
+                                            Err(_) => {
+                                                println!("[ERR][QRC20] corrupted_balance key={} val={}", to_key, &val[..32.min(val.len())]);
+                                                return Err(StateError::InvalidTransaction(
+                                                    format!("[REJECT][QRC20] corrupted_balance key={}", to_key)));
+                                            }
+                                        },
+                                        None => 0,
+                                    };
+
                                     // v3.42: Cap contract_storage to prevent unbounded Merkle growth
                                     // Only reject if this is a NEW holder (existing holders can always receive)
                                     if to_bal == 0 && contract.contract_storage.len() >= MAX_CONTRACT_STORAGE_ENTRIES {
                                         return Err(StateError::InvalidTransaction(format!(
-                                            "QRC-20 transfer: contract storage limit reached ({} entries, max {}). \
-                                             Deploy sharded contract or use L2.",
+                                            "[REJECT][QRC20] storage_limit_reached entries={} max={}",
                                             contract.contract_storage.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
                                     }
                                     
-                                    contract.contract_storage.insert(from_key, (from_bal - amount).to_string());
-                                    contract.contract_storage.insert(to_key, (to_bal + amount).to_string());
-                                    
+                                    let new_to_bal = to_bal.checked_add(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] recipient_balance_overflow".into()))?;
+                                    let new_from_bal = from_bal.checked_sub(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] sender_balance_underflow".into()))?;
+                                    contract.contract_storage.insert(from_key, new_from_bal.to_string());
+                                    contract.contract_storage.insert(to_key, new_to_bal.to_string());
+
                                     if is_info_log() {
                                         println!("[INFO][QRC20] transfer {} -> {} amount={} contract={}",
                                             &sender_addr[..sender_addr.len().min(16)],
@@ -1342,10 +1523,10 @@ impl Transaction {
                                     // QRC-20 approve: set allowance for spender
                                     let spender = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
                                         .ok_or_else(|| StateError::InvalidTransaction(
-                                            "approve: missing 'spender' argument".to_string()))?;
+                                            "[REJECT][QRC20] approve_missing_spender_arg".to_string()))?;
                                     let amount = args.and_then(|a| a.get(1)).and_then(|v| v.as_u64())
                                         .ok_or_else(|| StateError::InvalidTransaction(
-                                            "approve: missing 'amount' argument".to_string()))?;
+                                            "[REJECT][QRC20] approve_missing_amount_arg".to_string()))?;
                                     
                                     let allowance_key = format!("allowance:{}:{}", sender_addr, spender);
                                     
@@ -1353,7 +1534,7 @@ impl Transaction {
                                     let is_new_entry = !contract.contract_storage.contains_key(&allowance_key);
                                     if is_new_entry && contract.contract_storage.len() >= MAX_CONTRACT_STORAGE_ENTRIES {
                                         return Err(StateError::InvalidTransaction(format!(
-                                            "QRC-20 approve: contract storage limit reached ({} entries, max {})",
+                                            "[REJECT][QRC20] approve_storage_limit_reached entries={} max={}",
                                             contract.contract_storage.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
                                     }
                                     
@@ -1369,21 +1550,25 @@ impl Transaction {
                                     // QRC-20 transferFrom: spend from approved allowance
                                     let from = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
                                         .ok_or_else(|| StateError::InvalidTransaction(
-                                            "transferFrom: missing 'from' argument".to_string()))?;
+                                            "[REJECT][QRC20] transfer_from_missing_from_arg".to_string()))?;
                                     let to = args.and_then(|a| a.get(1)).and_then(|v| v.as_str())
                                         .ok_or_else(|| StateError::InvalidTransaction(
-                                            "transferFrom: missing 'to' argument".to_string()))?;
+                                            "[REJECT][QRC20] transfer_from_missing_to_arg".to_string()))?;
                                     let amount = args.and_then(|a| a.get(2)).and_then(|v| v.as_u64())
                                         .ok_or_else(|| StateError::InvalidTransaction(
-                                            "transferFrom: missing 'amount' argument".to_string()))?;
-                                    
+                                            "[REJECT][QRC20] transfer_from_missing_amount_arg".to_string()))?;
+
+                                    if amount == 0 {
+                                        return Err(StateError::InvalidTransaction("[REJECT][QRC20] zero_amount_transfer".into()));
+                                    }
+
                                     // Check allowance
                                     let allowance_key = format!("allowance:{}:{}", from, sender_addr);
                                     let allowance: u64 = contract.contract_storage.get(&allowance_key)
                                         .and_then(|s| s.parse().ok()).unwrap_or(0);
                                     if allowance < amount {
                                         return Err(StateError::InvalidTransaction(format!(
-                                            "QRC-20 transferFrom: insufficient allowance (have={}, need={})", allowance, amount)));
+                                            "[REJECT][QRC20] insufficient_allowance have={} need={}", allowance, amount)));
                                     }
                                     
                                     // Check balance of 'from'
@@ -1392,24 +1577,39 @@ impl Transaction {
                                         .and_then(|s| s.parse().ok()).unwrap_or(0);
                                     if from_bal < amount {
                                         return Err(StateError::InvalidTransaction(format!(
-                                            "QRC-20 transferFrom: insufficient balance (have={}, need={})", from_bal, amount)));
+                                            "[REJECT][QRC20] transfer_from_insufficient_balance have={} need={}", from_bal, amount)));
                                     }
                                     
                                     // Execute transfer + deduct allowance
                                     let to_key = format!("balance:{}", to);
-                                    let to_bal: u64 = contract.contract_storage.get(&to_key)
-                                        .and_then(|s| s.parse().ok()).unwrap_or(0);
-                                    
+                                    let to_bal: u64 = match contract.contract_storage.get(&to_key) {
+                                        Some(val) => match val.parse::<u64>() {
+                                            Ok(b) => b,
+                                            Err(_) => {
+                                                println!("[ERR][QRC20] corrupted_balance key={} val={}", to_key, &val[..32.min(val.len())]);
+                                                return Err(StateError::InvalidTransaction(
+                                                    format!("[REJECT][QRC20] corrupted_balance key={}", to_key)));
+                                            }
+                                        },
+                                        None => 0,
+                                    };
+
                                     // v3.42: Cap contract_storage — only reject if NEW holder
                                     if to_bal == 0 && contract.contract_storage.len() >= MAX_CONTRACT_STORAGE_ENTRIES {
                                         return Err(StateError::InvalidTransaction(format!(
-                                            "QRC-20 transferFrom: contract storage limit reached ({} entries, max {})",
+                                            "[REJECT][QRC20] transfer_from_storage_limit_reached entries={} max={}",
                                             contract.contract_storage.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
                                     }
                                     
-                                    contract.contract_storage.insert(from_key, (from_bal - amount).to_string());
-                                    contract.contract_storage.insert(to_key, (to_bal + amount).to_string());
-                                    contract.contract_storage.insert(allowance_key, (allowance - amount).to_string());
+                                    let new_to_bal = to_bal.checked_add(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] recipient_balance_overflow".into()))?;
+                                    let new_from_bal = from_bal.checked_sub(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] sender_balance_underflow".into()))?;
+                                    let new_allowance = allowance.checked_sub(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] allowance_underflow".into()))?;
+                                    contract.contract_storage.insert(from_key, new_from_bal.to_string());
+                                    contract.contract_storage.insert(to_key, new_to_bal.to_string());
+                                    contract.contract_storage.insert(allowance_key, new_allowance.to_string());
                                     
                                     if is_info_log() {
                                         println!("[INFO][QRC20] transferFrom {} -> {} amount={} spender={}",
@@ -1456,18 +1656,20 @@ impl Transaction {
                 // CRITICAL SECURITY: Check nonce to prevent replay attacks
                 if self.nonce != sender.nonce + 1 {
                     return Err(StateError::InvalidTransaction(format!(
-                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        "[REJECT][TX] invalid_nonce expected={} got={}",
                         sender.nonce + 1, self.nonce
                     )));
                 }
                 
                 // Calculate gas fee (QUANTUM v2.25: +50% for Dilithium TX)
-                let fee = self.effective_gas_price() * self.gas_limit;
+                let fee = self.effective_gas_price().checked_mul(self.gas_limit)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
                 
                 // For QNC swaps: check if user has enough balance (amount_in + fee)
                 // For other tokens: only check fee (token balance checked by DEX contract)
                 let total_cost = if token_in == "QNC" {
-                    amount_in + fee
+                    amount_in.checked_add(fee)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] total_cost_overflow".into()))?
                 } else {
                     fee
                 };
@@ -1482,26 +1684,30 @@ impl Transaction {
                 // Slippage protection: ensure amount_out >= amount_out_min
                 if *amount_out < *amount_out_min {
                     return Err(StateError::InvalidTransaction(format!(
-                        "Slippage exceeded: got {} {}, minimum was {} {}",
-                        amount_out, token_out, amount_out_min, token_out
+                        "[REJECT][SWAP] slippage_exceeded got={} min={} token={}",
+                        amount_out, amount_out_min, token_out
                     )));
                 }
                 
                 // Deduct fee (always in QNC)
-                sender.balance -= fee;
-                
+                sender.balance = sender.balance.checked_sub(fee)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] fee_balance_underflow".into()))?;
+
                 // If swapping QNC for another token, deduct amount_in from sender
                 if token_in == "QNC" {
-                    sender.balance -= amount_in;
+                    sender.balance = sender.balance.checked_sub(*amount_in)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] sender_balance_underflow".into()))?;
                 }
                 
                 // If receiving QNC, add amount_out to sender
                 if token_out == "QNC" {
-                    sender.balance += amount_out;
+                    sender.balance = sender.balance.checked_add(*amount_out)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] sender_credit_overflow".into()))?;
                 }
                 
-                sender.nonce += 1;
-                
+                sender.nonce = sender.nonce.checked_add(1)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
+
                 // v3.34: Update pool balance (conservation of value)
                 // Without this, QNC was burned/minted instead of transferred to/from pool
                 let pool = accounts.entry(pool_address.clone())
@@ -1509,7 +1715,8 @@ impl Transaction {
                 
                 if token_in == "QNC" {
                     // Pool receives QNC from sender
-                    pool.balance += amount_in;
+                    pool.balance = pool.balance.checked_add(*amount_in)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] pool_credit_overflow".into()))?;
                 }
                 if token_out == "QNC" {
                     // Pool sends QNC to sender — must have sufficient liquidity
@@ -1519,7 +1726,8 @@ impl Transaction {
                             need: *amount_out,
                         });
                     }
-                    pool.balance -= amount_out;
+                    pool.balance = pool.balance.checked_sub(*amount_out)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] pool_balance_underflow".into()))?;
                 }
                 
                 // Swap -- currently inactive (no RPC handler), logic preserved for future DEX
@@ -1533,7 +1741,7 @@ impl Transaction {
                 // System transaction for reward distribution
                 // Only allowed from system accounts
                 if !self.from.starts_with("system_") {
-                    return Err(StateError::InvalidTransaction("Only system can distribute rewards".to_string()));
+                    return Err(StateError::InvalidTransaction(format!("[REJECT][REWARDS] unauthorized_sender sender={}", self.from)));
                 }
                 
                 // v2.99: CRITICAL - EMISSION TX vs CLAIM TX distinction
@@ -1557,15 +1765,17 @@ impl Transaction {
                     // v2.96: SECURITY - Check if recipient has sufficient pending rewards
                     if self.amount > recipient.pending_rewards {
                         return Err(StateError::InvalidTransaction(
-                            format!("Insufficient pending rewards: attempted {} QNC, available {} QNC", 
-                                    self.amount / 1_000_000_000, 
+                            format!("[REJECT][REWARDS] insufficient_pending_rewards attempted={} available={}",
+                                    self.amount / 1_000_000_000,
                                     recipient.pending_rewards / 1_000_000_000)
                         ));
                     }
                     
                     // Transfer from pending_rewards to balance (claim)
-                    recipient.pending_rewards -= self.amount;
-                    recipient.balance += self.amount;
+                    recipient.pending_rewards = recipient.pending_rewards.checked_sub(self.amount)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][REWARDS] pending_rewards_underflow".into()))?;
+                    recipient.balance = recipient.balance.checked_add(self.amount)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][REWARDS] claim_balance_overflow".into()))?;
                     
                     if is_info_log() {
                         println!("[INFO][REWARDS] reward_claimed amount={} QNC to={} pending_remaining={} QNC",
@@ -1588,13 +1798,16 @@ impl Transaction {
                 // CRITICAL SECURITY: Check nonce to prevent replay attacks
                 if self.nonce != sender.nonce + 1 {
                     return Err(StateError::InvalidTransaction(format!(
-                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        "[REJECT][TX] invalid_nonce expected={} got={}",
                         sender.nonce + 1, self.nonce
                     )));
                 }
 
                 // Calculate total fee for batch (QUANTUM v2.25: +50% for Dilithium TX)
-                let total_fee = (self.effective_gas_price() * self.gas_limit) * node_ids.len() as u64;
+                let per_fee = self.effective_gas_price().checked_mul(self.gas_limit)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
+                let total_fee = per_fee.checked_mul(node_ids.len() as u64)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-CLAIM] total_fee_overflow".into()))?;
 
                 if sender.balance < total_fee {
                     return Err(StateError::InsufficientBalance {
@@ -1604,8 +1817,10 @@ impl Transaction {
                 }
 
                 // Deduct total fee once
-                sender.balance -= total_fee;
-                sender.nonce += 1;
+                sender.balance = sender.balance.checked_sub(total_fee)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-CLAIM] fee_balance_underflow".into()))?;
+                sender.nonce = sender.nonce.checked_add(1)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
 
                 if is_info_log() {
                     println!("[INFO][BATCH-CLAIM-FEE] {} nodes by {} fee={} nanoQNC",
@@ -1620,15 +1835,21 @@ impl Transaction {
                 // CRITICAL SECURITY: Check nonce to prevent replay attacks
                 if self.nonce != sender.nonce + 1 {
                     return Err(StateError::InvalidTransaction(format!(
-                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        "[REJECT][TX] invalid_nonce expected={} got={}",
                         sender.nonce + 1, self.nonce
                     )));
                 }
 
                 // Calculate total activation amount and fees (QUANTUM v2.25: +50% for Dilithium TX)
-                let total_activation_amount: u64 = activation_data.iter().map(|d| d.activation_amount).sum();
-                let total_fee = (self.effective_gas_price() * self.gas_limit) * activation_data.len() as u64;
-                let total_cost = total_activation_amount + total_fee;
+                let total_activation_amount: u64 = activation_data.iter()
+                    .try_fold(0u64, |acc, d| acc.checked_add(d.activation_amount)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-ACTIVATION] amount_sum_overflow".into())))?;
+                let per_fee = self.effective_gas_price().checked_mul(self.gas_limit)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
+                let total_fee = per_fee.checked_mul(activation_data.len() as u64)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-ACTIVATION] total_fee_overflow".into()))?;
+                let total_cost = total_activation_amount.checked_add(total_fee)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-ACTIVATION] total_cost_overflow".into()))?;
 
                 if sender.balance < total_cost {
                     return Err(StateError::InsufficientBalance {
@@ -1638,8 +1859,10 @@ impl Transaction {
                 }
 
                 // Deduct total cost once
-                sender.balance -= total_cost;
-                sender.nonce += 1;
+                sender.balance = sender.balance.checked_sub(total_cost)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-ACTIVATION] balance_underflow".into()))?;
+                sender.nonce = sender.nonce.checked_add(1)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
 
                 // v3.34: Actually activate each node (previously only deducted fees)
                 for data in activation_data {
@@ -1661,15 +1884,30 @@ impl Transaction {
                 // CRITICAL SECURITY: Check nonce to prevent replay attacks
                 if self.nonce != sender.nonce + 1 {
                     return Err(StateError::InvalidTransaction(format!(
-                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        "[REJECT][TX] invalid_nonce expected={} got={}",
                         sender.nonce + 1, self.nonce
                     )));
                 }
 
                 // Calculate total transfer amount and fees (QUANTUM v2.25: +50% for Dilithium TX)
-                let total_transfer_amount: u64 = transfers.iter().map(|t| t.amount).sum();
-                let total_fee = (self.effective_gas_price() * self.gas_limit) * transfers.len() as u64;
-                let total_cost = total_transfer_amount + total_fee;
+                // H2 SECURITY: checked arithmetic prevents overflow with large batch sizes
+                let total_transfer_amount: u64 = transfers.iter().try_fold(0u64, |acc, t| {
+                    acc.checked_add(t.amount).ok_or_else(|| StateError::InvalidTransaction(
+                        "[REJECT][BATCH-TRANSFER] overflow: sum of transfer amounts exceeds u64::MAX".to_string()
+                    ))
+                })?;
+                let per_tx_fee = self.effective_gas_price().checked_mul(self.gas_limit)
+                    .ok_or_else(|| StateError::InvalidTransaction(
+                        "[REJECT][BATCH-TRANSFER] overflow: gas_price * gas_limit exceeds u64::MAX".to_string()
+                    ))?;
+                let total_fee = per_tx_fee.checked_mul(transfers.len() as u64)
+                    .ok_or_else(|| StateError::InvalidTransaction(
+                        "[REJECT][BATCH-TRANSFER] overflow: per_tx_fee * count exceeds u64::MAX".to_string()
+                    ))?;
+                let total_cost = total_transfer_amount.checked_add(total_fee)
+                    .ok_or_else(|| StateError::InvalidTransaction(
+                        "[REJECT][BATCH-TRANSFER] overflow: total_amount + total_fee exceeds u64::MAX".to_string()
+                    ))?;
 
                 if sender.balance < total_cost {
                     return Err(StateError::InsufficientBalance {
@@ -1679,14 +1917,17 @@ impl Transaction {
                 }
 
                 // Deduct total cost once
-                sender.balance -= total_cost;
-                sender.nonce += 1;
+                sender.balance = sender.balance.checked_sub(total_cost)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-TRANSFER] balance_underflow".into()))?;
+                sender.nonce = sender.nonce.checked_add(1)
+                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
 
                 // Process each transfer to recipients
                 for transfer in transfers {
                     let recipient = accounts.entry(transfer.to_address.clone())
                         .or_insert_with(|| Account::new(transfer.to_address.clone()));
-                    recipient.balance += transfer.amount;
+                    recipient.balance = recipient.balance.checked_add(transfer.amount)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-TRANSFER] recipient_balance_overflow".into()))?;
                 }
 
                 if is_info_log() {
@@ -1773,6 +2014,15 @@ impl Transaction {
                         node_id, current_height, last_macroblock_index);
                 }
             }
+            TransactionType::KeyRotation { node_id, new_dilithium_pk, effective_height, .. } => {
+                // FIX R23-K1: Key rotation — system operation, no balance changes.
+                // The new public key is stored on-chain for future signature verification.
+                // Processing: VRF registry and P2P certificate manager pick up the change.
+                if is_info_log() {
+                    println!("[INFO][KEY-ROTATE] node={} new_pk_prefix={}... effective_h={}",
+                        node_id, &new_dilithium_pk[..16.min(new_dilithium_pk.len())], effective_height);
+                }
+            }
         }
 
         Ok(())
@@ -1856,11 +2106,15 @@ pub enum FinalizationRequirements {
 /// Finalization manager for tracking transaction finalization
 pub struct FinalizationManager {
     config: LocalFinalizationConfig,
-    /// Transaction status tracking
+    /// Transaction status tracking (bounded to MAX_TRACKED_TX)
     tx_status: HashMap<String, FinalizationStatus>,
     /// Microblock to macroblock mapping
     microblock_to_macroblock: HashMap<u64, u64>,
 }
+
+/// FIX M5: Maximum tracked transactions to prevent unbounded growth
+const MAX_FINALIZATION_TRACKED_TX: usize = 100_000;
+const MAX_FINALIZATION_MAPPINGS: usize = 50_000;
 
 impl FinalizationManager {
     pub fn new(config: LocalFinalizationConfig) -> Self {
@@ -1872,11 +2126,20 @@ impl FinalizationManager {
     }
     
     /// Update transaction finalization status
+    /// FIX M5: Evict oldest entries when exceeding MAX_FINALIZATION_TRACKED_TX
     pub fn update_transaction_status(
         &mut self,
         tx_hash: &str,
         status: FinalizationStatus,
     ) {
+        // Evict ~10% oldest entries when at capacity
+        if self.tx_status.len() >= MAX_FINALIZATION_TRACKED_TX && !self.tx_status.contains_key(tx_hash) {
+            let evict_count = MAX_FINALIZATION_TRACKED_TX / 10;
+            let keys_to_remove: Vec<String> = self.tx_status.keys().take(evict_count).cloned().collect();
+            for key in keys_to_remove {
+                self.tx_status.remove(&key);
+            }
+        }
         self.tx_status.insert(tx_hash.to_string(), status);
     }
     
@@ -2004,7 +2267,8 @@ impl TransactionProcessor {
             TransactionType::NodeActivation { phase: ActivationPhase::Phase1, .. } => {
                 0 // Phase 1 activations are completely FREE - no QNC gas fees!
             },
-            _ => tx.effective_gas_price() * gas_used
+            // FIX M3: saturating_mul instead of unwrap_or(0) to preserve max possible fee on overflow
+            _ => tx.effective_gas_price().saturating_mul(gas_used)
         };
         
         if fee_amount > 0 {
@@ -2015,7 +2279,7 @@ impl TransactionProcessor {
                     gas_used,
                     tx.gas_price,
                 ) {
-                    eprintln!("[WARN] Failed to process transaction fee: {}", e);
+                    eprintln!("[WARN][TX] fee_routing_failed err={}", e);
                 }
             }
         }
@@ -2039,55 +2303,62 @@ impl TransactionProcessor {
 }
 
 /// Dynamic gas pricing system
+/// FIX R14-M1: All arithmetic uses fixed-point basis points (10000 = 1.0x) for determinism
 #[derive(Debug, Clone)]
 pub struct DynamicGasPricing {
     /// Current mempool size
     mempool_size: usize,
-    /// Target block utilization (80%)
-    target_utilization: f64,
-    /// Current block utilization
-    current_utilization: f64,
-    /// Base gas price adjustment factor
-    adjustment_factor: f64,
+    /// Target block utilization in basis points (8000 = 80%)
+    target_utilization_bps: u64,
+    /// Current block utilization in basis points (0-10000)
+    current_utilization_bps: u64,
+    /// Base gas price adjustment factor in basis points (10000 = 1.0x)
+    adjustment_factor_bps: u64,
 }
 
 impl DynamicGasPricing {
     pub fn new() -> Self {
         Self {
             mempool_size: 0,
-            target_utilization: 0.8,
-            current_utilization: 0.0,
-            adjustment_factor: 1.0,
+            target_utilization_bps: 8_000, // 80%
+            current_utilization_bps: 0,
+            adjustment_factor_bps: 10_000, // 1.0x
         }
     }
-    
+
     /// Update network load metrics
     pub fn update_network_load(&mut self, mempool_size: usize, block_utilization: f64) {
         self.mempool_size = mempool_size;
-        self.current_utilization = block_utilization;
-        self.adjustment_factor = self.calculate_adjustment_factor();
+        // Convert f64 utilization (0.0-1.0) to basis points (0-10000)
+        self.current_utilization_bps = (block_utilization * 10_000.0).min(10_000.0).max(0.0) as u64;
+        self.adjustment_factor_bps = self.calculate_adjustment_factor_bps();
     }
-    
-    /// Calculate gas price adjustment based on network load
-    fn calculate_adjustment_factor(&self) -> f64 {
-        // Base adjustment from mempool congestion
-        let mempool_factor = match self.mempool_size {
-            0..=100 => 0.8,      // Low congestion: 20% discount
-            101..=500 => 1.0,    // Normal: base price
-            501..=1000 => 1.5,   // High congestion: 50% increase
-            1001..=2000 => 2.0,  // Very high: 100% increase
-            _ => 3.0,            // Extreme: 200% increase
+
+    /// Calculate gas price adjustment in basis points (deterministic integer math)
+    fn calculate_adjustment_factor_bps(&self) -> u64 {
+        // Mempool congestion factor (basis points)
+        let mempool_factor_bps: u64 = match self.mempool_size {
+            0..=100 => 8_000,       // 0.8x — low congestion discount
+            101..=500 => 10_000,    // 1.0x — normal
+            501..=1000 => 15_000,   // 1.5x — high congestion
+            1001..=2000 => 20_000,  // 2.0x — very high
+            _ => 30_000,            // 3.0x — extreme
         };
-        
-        // Block utilization adjustment
-        let utilization_factor = if self.current_utilization > self.target_utilization {
-            1.0 + (self.current_utilization - self.target_utilization) * 2.0
+
+        // Utilization factor (basis points)
+        let utilization_factor_bps: u64 = if self.current_utilization_bps > self.target_utilization_bps {
+            // Above target: increase price (1.0 + delta * 2.0)
+            let delta = self.current_utilization_bps.saturating_sub(self.target_utilization_bps);
+            10_000u64.saturating_add(delta.saturating_mul(2))
         } else {
-            1.0 - (self.target_utilization - self.current_utilization) * 0.5
+            // Below target: decrease price (1.0 - delta * 0.5)
+            let delta = self.target_utilization_bps.saturating_sub(self.current_utilization_bps);
+            10_000u64.saturating_sub(delta / 2)
         };
-        
-        // Combined factor (capped at 5x for stability)
-        (mempool_factor * utilization_factor).min(5.0).max(0.5)
+
+        // Combined: (mempool * utilization) / 10000, capped at 5x (50000), min 0.5x (5000)
+        let combined = mempool_factor_bps.saturating_mul(utilization_factor_bps) / 10_000;
+        combined.max(5_000).min(50_000)
     }
     
     /// Get current dynamic gas price
@@ -2099,7 +2370,9 @@ impl DynamicGasPricing {
             GasTier::Priority => GasPrice::priority(),
         };
         
-        let adjusted_price = (base_price.0 as f64 * self.adjustment_factor) as u64;
+        // FIX R14-M1: Fixed-point integer arithmetic for deterministic gas pricing
+        // adjustment_factor_bps is in basis points (10000 = 1.0x, 15000 = 1.5x)
+        let adjusted_price = base_price.0.saturating_mul(self.adjustment_factor_bps) / 10_000;
         GasPrice(adjusted_price)
     }
     

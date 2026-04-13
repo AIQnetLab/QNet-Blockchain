@@ -2,7 +2,8 @@
 //! Enables 1M+ TPS through state and transaction sharding
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::Arc;
+use parking_lot::{RwLock, Mutex};
 use sha3::{Sha3_256, Digest};
 use serde::{Serialize, Deserialize};
 
@@ -112,17 +113,19 @@ impl ProductionShardManager {
     /// Determine which shard an account belongs to
     pub fn get_account_shard(&self, address: &str) -> u32 {
         // Check cache first
-        if let Ok(cache) = self.assignment_cache.read() {
+        {
+            let cache = self.assignment_cache.read();
             if let Some(&shard_id) = cache.get(address) {
                 return shard_id;
             }
         }
-        
+
         // Calculate shard using deterministic hash
         let shard_id = self.calculate_shard(address);
-        
+
         // Update cache
-        if let Ok(mut cache) = self.assignment_cache.write() {
+        {
+            let mut cache = self.assignment_cache.write();
             cache.insert(address.to_string(), shard_id);
         }
         
@@ -162,10 +165,7 @@ impl ProductionShardManager {
         }
         
         // Process transaction within shard
-        let mut states = match self.shard_states.write() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut states = self.shard_states.write();
         let shard_state = states.get_mut(&shard_id)
             .ok_or(ShardError::ShardNotFound(shard_id))?;
         
@@ -205,7 +205,7 @@ impl ProductionShardManager {
         };
         
         // Add to cross-shard queue
-        match self.cross_shard_queue.lock() { Ok(g) => g, Err(p) => p.into_inner() }.push(cross_tx);
+        self.cross_shard_queue.lock().push(cross_tx);
         
         // Process if we manage source shard
         if self.config.managed_shards.contains(&from_shard) {
@@ -234,20 +234,23 @@ impl ProductionShardManager {
             return Err(ShardError::InvalidNonce);
         }
         
-        // Validate balance
+        // FIX R24-H5: Use checked_sub for all balance operations.
+        // Even though we check above, checked_sub is defense-in-depth
+        // against any TOCTOU race in concurrent shard access.
         if from_account.balance < amount {
             return Err(ShardError::InsufficientBalance);
         }
-        
+
         // Update sender
-        from_account.balance -= amount;
+        from_account.balance = from_account.balance.checked_sub(amount)
+            .ok_or(ShardError::InsufficientBalance)?;
         from_account.nonce = nonce;
         from_account.last_activity = self.current_timestamp();
         
         // Update receiver
         let to_account = shard_state.accounts.entry(to.to_string())
             .or_insert_with(|| ShardAccount::new(to, shard_state.shard_id));
-        to_account.balance += amount;
+        to_account.balance = to_account.balance.saturating_add(amount);
         to_account.last_activity = self.current_timestamp();
         
         // Update shard state
@@ -262,7 +265,7 @@ impl ProductionShardManager {
     /// Initiate cross-shard send (lock funds)
     /// v6.2: Automatic rollback if destination shard notification fails
     fn initiate_cross_shard_send(&self, tx_id: &str) -> Result<(), ShardError> {
-        let mut queue = match self.cross_shard_queue.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut queue = self.cross_shard_queue.lock();
         let cross_tx = queue.iter_mut()
             .find(|tx| tx.tx_id == tx_id)
             .ok_or(ShardError::TransactionNotFound)?;
@@ -271,10 +274,7 @@ impl ProductionShardManager {
             return Err(ShardError::ShardNotManaged(cross_tx.from_shard));
         }
         
-        let mut states = match self.shard_states.write() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut states = self.shard_states.write();
         let shard_state = states.get_mut(&cross_tx.from_shard)
             .ok_or(ShardError::ShardNotFound(cross_tx.from_shard))?;
         
@@ -287,12 +287,14 @@ impl ProductionShardManager {
         }
         
         let locked_amount = cross_tx.amount;
-        from_account.balance -= locked_amount;
+        // FIX R24-H5: checked_sub for cross-shard lock — same defense-in-depth
+        from_account.balance = from_account.balance.checked_sub(locked_amount)
+            .ok_or(ShardError::InsufficientBalance)?;
         cross_tx.status = CrossShardTxStatus::Locked;
         
         if let Err(e) = self.notify_destination_shard(cross_tx) {
             // ROLLBACK: restore balance, mark as Reverted
-            from_account.balance += locked_amount;
+            from_account.balance = from_account.balance.saturating_add(locked_amount);
             cross_tx.status = CrossShardTxStatus::Reverted;
             println!("[WARN][SHARD] cross_shard_rollback tx={} amount={} reason={}",
                      tx_id, locked_amount, e);
@@ -304,7 +306,7 @@ impl ProductionShardManager {
     
     /// Complete cross-shard transaction
     pub fn complete_cross_shard_transaction(&self, tx_id: &str) -> Result<(), ShardError> {
-        let mut queue = match self.cross_shard_queue.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut queue = self.cross_shard_queue.lock();
         let cross_tx = queue.iter_mut()
             .find(|tx| tx.tx_id == tx_id && tx.status == CrossShardTxStatus::Locked)
             .ok_or(ShardError::TransactionNotFound)?;
@@ -314,17 +316,16 @@ impl ProductionShardManager {
         }
         
         // Credit funds in destination shard
-        let mut states = match self.shard_states.write() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut states = self.shard_states.write();
         let shard_state = states.get_mut(&cross_tx.to_shard)
             .ok_or(ShardError::ShardNotFound(cross_tx.to_shard))?;
         
         let to_account = shard_state.accounts.entry(cross_tx.to_address.clone())
             .or_insert_with(|| ShardAccount::new(&cross_tx.to_address, cross_tx.to_shard));
         
-        to_account.balance += cross_tx.amount;
+        // FIX R26-H1: checked arithmetic on cross-shard receive (send side uses checked_sub)
+        to_account.balance = to_account.balance.checked_add(cross_tx.amount)
+            .ok_or(ShardError::InvalidTransaction("cross_shard_receive_overflow".to_string()))?;
         to_account.last_activity = self.current_timestamp();
         
         // Update shard state
@@ -341,7 +342,8 @@ impl ProductionShardManager {
     pub fn get_shard_stats(&self) -> HashMap<u32, ShardStats> {
         let mut stats = HashMap::new();
         
-        if let Ok(states) = self.shard_states.read() {
+        {
+            let states = self.shard_states.read();
             for (&shard_id, state) in states.iter() {
                 stats.insert(shard_id, ShardStats {
                     shard_id,
@@ -359,7 +361,7 @@ impl ProductionShardManager {
     
     /// Get cross-shard transaction statistics
     pub fn get_cross_shard_stats(&self) -> CrossShardStats {
-        let queue = match self.cross_shard_queue.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let queue = self.cross_shard_queue.lock();
         
         let mut pending = 0;
         let mut locked = 0;
@@ -428,10 +430,7 @@ impl ProductionShardManager {
     /// Notify destination shard about incoming cross-shard transfer.
     /// v6.2: Validates destination shard exists and is reachable before confirming lock.
     fn notify_destination_shard(&self, cross_tx: &CrossShardTransaction) -> Result<(), ShardError> {
-        let topology = match self.network_topology.read() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let topology = self.network_topology.read();
         
         // Destination shard must have at least one node assigned in the topology
         match topology.shard_node_map.get(&cross_tx.to_shard) {

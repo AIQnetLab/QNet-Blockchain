@@ -4,7 +4,8 @@
 //! No complex intelligent switching - just regional awareness with failover.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 use dashmap::{DashMap, DashSet};
@@ -48,6 +49,16 @@ const MAX_ACTIVE_NODES_SIZE: usize = 10_000;
 /// SCALABILITY: 1000 peers × ~200 bytes = ~200KB RAM
 /// LRU eviction when limit reached
 const MAX_CONNECTED_PEERS: usize = 1000;
+
+/// FIX R23-P1: Minimum reserved outbound slots — prevents eclipse attacks.
+/// Inbound connections cannot fill more than (MAX_CONNECTED_PEERS - MIN_OUTBOUND_SLOTS) slots,
+/// ensuring we always maintain at least this many self-initiated connections.
+const MIN_OUTBOUND_SLOTS: usize = 8;
+
+/// FIX R23-P2: Minimum reputation to accept a new inbound peer.
+/// Prevents Sybil nodes (default reputation) from connecting before proving on-chain activity.
+/// Genesis nodes and bootstrap peers bypass this check.
+const MIN_INBOUND_PEER_REPUTATION: f64 = 50.0;
 
 /// Stale node timeout (15 minutes without heartbeat/announcement)
 #[allow(dead_code)]
@@ -112,10 +123,7 @@ impl CacheActor {
     }
     
     fn increment_epoch(&self) -> u64 {
-        let mut epoch = match self.epoch_counter.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner()
-        };
+        let mut epoch = self.epoch_counter.write();
         *epoch += 1;
         *epoch
     }
@@ -156,8 +164,25 @@ pub static BEST_PEER_HEIGHT: AtomicU64 = AtomicU64::new(0);
 // PRODUCTION v2.54: Gap detection pending sync queue
 // When gap detected in handle_shred_protocol_chunk, store here for background sync
 // node.rs sync loop will pick up and process these gaps
-pub static PENDING_GAP_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static PENDING_GAP_SYNC_TO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// FIX R22-CC4: Packed into single Mutex to guarantee atomic read/write of the pair.
+// Two separate AtomicU64 could produce torn reads (from=100, to=400 instead of from=100, to=200).
+// parking_lot::Mutex — sub-microsecond hold, no async inside critical section.
+pub static PENDING_GAP_SYNC: parking_lot::Mutex<(u64, u64)> = parking_lot::Mutex::new((0, 0));
+
+/// Atomically set pending gap sync range (from, to)
+pub fn set_pending_gap_sync(from: u64, to: u64) {
+    *PENDING_GAP_SYNC.lock() = (from, to);
+}
+
+/// Atomically read and clear pending gap sync range. Returns (0,0) if none pending.
+pub fn take_pending_gap_sync() -> (u64, u64) {
+    let mut guard = PENDING_GAP_SYNC.lock();
+    let pair = *guard;
+    if pair.0 > 0 {
+        *guard = (0, 0);
+    }
+    pair
+}
 
 // CRITICAL FIX: Deduplicate failover messages to prevent spam
 // Store processed failover events: (block_height, failed_producer, new_producer)
@@ -870,13 +895,13 @@ pub fn get_runtime_stats() -> RuntimeStats {
 // Set during SimplifiedP2P initialization, used by download_block_range_static
 // ARCHITECTURE: Enables QUIC-based sync without passing &self to static methods
 // SCALABILITY: Single shared transport handles 100K+ nodes efficiently
-pub static GLOBAL_QUIC_TRANSPORT: Lazy<std::sync::RwLock<Option<Arc<tokio::sync::RwLock<crate::quic_transport::QuicTransport>>>>> = 
-    Lazy::new(|| std::sync::RwLock::new(None));
+pub static GLOBAL_QUIC_TRANSPORT: Lazy<parking_lot::RwLock<Option<Arc<tokio::sync::RwLock<crate::quic_transport::QuicTransport>>>>> =
+    Lazy::new(|| parking_lot::RwLock::new(None));
 
 // v2.24.3: Global node ID for static sync methods
 // Set during SimplifiedP2P initialization
-pub static GLOBAL_NODE_ID: Lazy<std::sync::RwLock<String>> = 
-    Lazy::new(|| std::sync::RwLock::new("unknown".to_string()));
+pub static GLOBAL_NODE_ID: Lazy<parking_lot::RwLock<String>> =
+    Lazy::new(|| parking_lot::RwLock::new("unknown".to_string()));
 
 // SECURITY: Track invalid blocks from each node for malicious behavior detection
 // Format: node_id -> (invalid_count, first_invalid_time)
@@ -1203,6 +1228,13 @@ pub struct PeerInfo {
     // Enables QUIC-only sync without HTTP height queries
     #[serde(default)]
     pub last_block_height: u64,
+
+    // FIX R23-P1: Track connection direction for eclipse protection.
+    // true = we initiated the connection (outbound), false = they connected to us (inbound).
+    // Outbound slots are reserved to prevent eclipse attacks where an attacker
+    // fills all our peer slots via inbound connections.
+    #[serde(default)]
+    pub is_outbound: bool,
 }
 
 fn default_reputation_70() -> f64 {
@@ -1435,14 +1467,14 @@ pub struct SimplifiedP2P {
     deterministic_reputation: Arc<parking_lot::RwLock<Option<Arc<parking_lot::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>>>>,
     
     /// Consensus message channel
-    consensus_tx: Option<tokio::sync::mpsc::UnboundedSender<ConsensusMessage>>,
+    consensus_tx: Option<tokio::sync::mpsc::Sender<ConsensusMessage>>,
     
     /// Block processing channel - CRITICAL: Must be Arc for sharing between clones!
-    block_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>>>,
+    block_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ReceivedBlock>>>>,
     
     /// Sync request channel for requesting blocks from storage
     /// v5.6: Extended with from_peer address so responses can reach unregistered peers
-    sync_request_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64, String, String)>>,
+    sync_request_tx: Option<tokio::sync::mpsc::Sender<(u64, u64, String, String)>>,
     
     /// ShredProtocol block assembly states
     shred_protocol_assemblies: Arc<DashMap<u64, ShredProtocolBlockAssembly>>,
@@ -1493,11 +1525,11 @@ pub struct SimplifiedP2P {
     
     /// PRODUCTION: Macroblock sync request channel
     /// Used for requesting macroblocks from storage (similar to sync_request_tx)
-    macroblock_sync_request_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>>,
+    macroblock_sync_request_tx: Option<tokio::sync::mpsc::Sender<(u64, u64, String)>>,
     
     /// PRODUCTION: Macroblock processing channel
     /// Received macroblocks are sent here for validation and storage
-    macroblock_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>>>,
+    macroblock_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ReceivedBlock>>>>,
     
     /// PRODUCTION v2.19.21: QUIC transport for high-performance P2P
     /// High-performance transport with persistent connections
@@ -1510,12 +1542,12 @@ pub struct SimplifiedP2P {
     /// PRODUCTION v2.19.22: QUIC message channel for full message processing
     /// All QUIC messages are sent here and processed via handle_message()
     /// This ensures QUIC messages use same logic as HTTP (no duplication)
-    quic_message_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, NetworkMessage)>>>>,
+    quic_message_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<(String, NetworkMessage)>>>>,
     
     /// PRODUCTION v2.19.25: Transaction processing channel
     /// Received transactions from P2P are sent here for validation and mempool
     /// This enables full transaction propagation across the network
-    transaction_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedTransaction>>>>,
+    transaction_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ReceivedTransaction>>>>,
     
     /// GULF STREAM v2.25: Current block producer for TX forwarding
     /// TX is sent directly to producer (0 hops) + backup gossip (reliability)
@@ -2182,6 +2214,11 @@ pub struct ShredProtocolChunk {
     /// ~3KB overhead only in first chunk, but guarantees atomic block+cert delivery
     #[serde(default)]
     pub certificate: Option<ProducerCertificate>,
+    /// FIX R23-P3: SHA3-256 hash of the original block data, set by the producer.
+    /// After reconstruction, the receiver verifies H(reconstructed_block) == block_hash
+    /// to detect chunk corruption/tampering before expensive full-block validation.
+    #[serde(default)]
+    pub block_hash: Option<[u8; 32]>,
 }
 
 /// v2.26: Producer certificate for block signature verification
@@ -2209,6 +2246,8 @@ struct ShredProtocolBlockAssembly {
     retransmit_requested_at: Option<Instant>,  // When last retransmit was requested
     /// v2.26: Certificate received from chunk #0 (eliminates race condition)
     certificate: Option<ProducerCertificate>,
+    /// FIX R23-P3: Expected block hash from producer for post-reconstruction verification
+    expected_block_hash: Option<[u8; 32]>,
 }
 
 /// PRODUCTION v2.21.3: Cache entry for chunk retransmit
@@ -2399,38 +2438,29 @@ impl SimplifiedP2P {
     }
 
     /// PRODUCTION: Set consensus message channel for real integration
-    pub fn set_consensus_channel(&mut self, consensus_tx: tokio::sync::mpsc::UnboundedSender<ConsensusMessage>) {
+    pub fn set_consensus_channel(&mut self, consensus_tx: tokio::sync::mpsc::Sender<ConsensusMessage>) {
         self.consensus_tx = Some(consensus_tx);
         if crate::node::is_info() { println!("[INFO][P2P] Consensus integration channel established"); }
     }
     
     /// PRODUCTION: Set block processing channel for storage integration
-    pub fn set_block_channel(&mut self, block_tx: tokio::sync::mpsc::UnboundedSender<ReceivedBlock>) {
-        let mut guard = match self.block_tx.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner()
-        };
+    pub fn set_block_channel(&mut self, block_tx: tokio::sync::mpsc::Sender<ReceivedBlock>) {
+        let mut guard = self.block_tx.lock();
         *guard = Some(block_tx);
         if crate::node::is_info() { println!("[INFO][P2P] Block processing channel established"); }
     }
     
     /// PRODUCTION: Set macroblock processing channel for storage integration (v2.19.12)
-    pub fn set_macroblock_channel(&mut self, macroblock_tx: tokio::sync::mpsc::UnboundedSender<ReceivedBlock>) {
-        let mut guard = match self.macroblock_tx.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner()
-        };
+    pub fn set_macroblock_channel(&mut self, macroblock_tx: tokio::sync::mpsc::Sender<ReceivedBlock>) {
+        let mut guard = self.macroblock_tx.lock();
         *guard = Some(macroblock_tx);
         if crate::node::is_info() { println!("[INFO][P2P] Macroblock processing channel established"); }
     }
     
     /// PRODUCTION v2.19.25: Set transaction processing channel for mempool integration
     /// Enables full transaction propagation across the network
-    pub fn set_transaction_channel(&mut self, tx_channel: tokio::sync::mpsc::UnboundedSender<ReceivedTransaction>) {
-        let mut guard = match self.transaction_tx.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner()
-        };
+    pub fn set_transaction_channel(&mut self, tx_channel: tokio::sync::mpsc::Sender<ReceivedTransaction>) {
+        let mut guard = self.transaction_tx.lock();
         *guard = Some(tx_channel);
         if crate::node::is_info() { println!("[INFO][P2P] Transaction processing channel established"); }
     }
@@ -2439,14 +2469,12 @@ impl SimplifiedP2P {
     /// Called by node.rs after each block to update producer info
     /// TX will be forwarded directly to producer for minimal latency
     pub fn set_current_producer(&self, producer_id: &str, producer_addr: &str) {
-        if let Ok(mut guard) = self.current_producer_info.write() {
-            *guard = Some((producer_id.to_string(), producer_addr.to_string()));
-        }
+        *self.current_producer_info.write() = Some((producer_id.to_string(), producer_addr.to_string()));
     }
     
     /// GULF STREAM v2.25: Get current producer info for TX forwarding
     pub fn get_current_producer(&self) -> Option<(String, String)> {
-        self.current_producer_info.read().ok().and_then(|g| g.clone())
+        self.current_producer_info.read().clone()
     }
     
     /// GULF STREAM v2.25: Get producer address by node_id from connected peers
@@ -2468,24 +2496,21 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION: Set macroblock sync request channel (v2.19.12)
-    pub fn set_macroblock_sync_channel(&mut self, sync_tx: tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>) {
+    pub fn set_macroblock_sync_channel(&mut self, sync_tx: tokio::sync::mpsc::Sender<(u64, u64, String)>) {
         self.macroblock_sync_request_tx = Some(sync_tx);
         if crate::node::is_info() { println!("[INFO][P2P] Macroblock sync request channel established"); }
     }
     
     /// Set sync request channel for handling block requests
     /// v5.6: Extended with from_peer address for routing responses to unregistered peers
-    pub fn set_sync_request_channel(&mut self, sync_request_tx: tokio::sync::mpsc::UnboundedSender<(u64, u64, String, String)>) {
+    pub fn set_sync_request_channel(&mut self, sync_request_tx: tokio::sync::mpsc::Sender<(u64, u64, String, String)>) {
         self.sync_request_tx = Some(sync_request_tx);
     }
     
     /// PRODUCTION v2.19.22: Set QUIC message channel for full message processing
     /// All QUIC messages are routed through this channel to handle_message()
-    pub fn set_quic_message_channel(&mut self, quic_message_tx: tokio::sync::mpsc::UnboundedSender<(String, NetworkMessage)>) {
-        let mut guard = match self.quic_message_tx.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner()
-        };
+    pub fn set_quic_message_channel(&mut self, quic_message_tx: tokio::sync::mpsc::Sender<(String, NetworkMessage)>) {
+        let mut guard = self.quic_message_tx.lock();
         *guard = Some(quic_message_tx);
         if crate::node::is_info() { println!("[INFO][QUIC] Message processing channel established"); }
     }
@@ -2533,19 +2558,15 @@ impl SimplifiedP2P {
             
             // CRITICAL: Send ALL messages through channel for full processing
             // This calls handle_message() which has complete logic for all message types
-            if let Ok(tx_guard) = quic_message_tx.lock() {
-                if let Some(ref tx) = *tx_guard {
-                    if let Err(e) = tx.send((peer_str.clone(), msg)) {
-                        if crate::node::is_warn() { println!("[WARN][QUIC] Failed to queue message from {}: {}", peer_str, e); }
-                    }
-                } else {
-                    // Channel not set yet - this is a CRITICAL startup race condition!
-                    // Log this as it means messages are being lost
-                    if crate::node::is_warn() { println!("[WARN][QUIC] Message from {} dropped - channel not initialized yet!", peer_str); }
+            let tx_guard = quic_message_tx.lock();
+            if let Some(ref tx) = *tx_guard {
+                if let Err(e) = tx.try_send((peer_str.clone(), msg)) {
+                    if crate::node::is_warn() { println!("[WARN][QUIC] Failed to queue message from {}: {}", peer_str, e); }
                 }
             } else {
-                // Mutex poisoned - log error
-                if crate::node::is_warn() { println!("[WARN][QUIC] Failed to acquire quic_message_tx lock - message dropped!"); }
+                // Channel not set yet - this is a CRITICAL startup race condition!
+                // Log this as it means messages are being lost
+                if crate::node::is_warn() { println!("[WARN][QUIC] Message from {} dropped - channel not initialized yet!", peer_str); }
             }
         });
         
@@ -2561,15 +2582,14 @@ impl SimplifiedP2P {
         
         // v2.24.3: Set global QUIC transport for static sync methods
         // This enables QUIC-based block sync without passing &self
-        if let Ok(mut guard) = GLOBAL_QUIC_TRANSPORT.write() {
+        {
+            let mut guard = GLOBAL_QUIC_TRANSPORT.write();
             *guard = Some(quic_arc);
             if crate::node::is_info() { println!("[INFO][QUIC] Global QUIC transport registered for sync"); }
         }
-        
+
         // v2.24.3: Set global node ID for sync requests
-        if let Ok(mut guard) = GLOBAL_NODE_ID.write() {
-            *guard = self.node_id.clone();
-        }
+        *GLOBAL_NODE_ID.write() = self.node_id.clone();
         
         if crate::node::is_info() { println!("[INFO][QUIC] Transport + Server initialized on port {}", quic_port); }
         if crate::node::is_info() { println!("[INFO][QUIC] Timeouts: connect=3s, idle=90s, keepalive=30s (aligned with HTTP)"); }
@@ -2803,23 +2823,14 @@ impl SimplifiedP2P {
             Some(_) => {},
             None => {},
         }
-        let block_tx_guard = match self.block_tx.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner()
-        };
+        let block_tx_guard = self.block_tx.lock();
         match &*block_tx_guard {
             Some(_) => println!("[INFO][P2P] Block channel: AVAILABLE"),
             None => println!("[ERR][P2P] Block channel: MISSING - blocks will be discarded!"),
         }
         
-        // SECURITY: Safe mutex locking with error handling instead of panic
-        match self.is_running.lock() {
-            Ok(mut running) => *running = true,
-            Err(poisoned) => {
-                if crate::node::is_warn() { println!("[WARN][P2P] Mutex poisoned, recovering..."); }
-                *poisoned.into_inner() = true;
-            }
-        }
+        // SECURITY: Safe mutex locking
+        *self.is_running.lock() = true;
         
         // Start load balancing health monitor
         self.start_load_balancing_monitor();
@@ -3277,8 +3288,9 @@ impl SimplifiedP2P {
             successful_pings: 0,
             failed_pings: 0,
             last_block_height: 0,
+            is_outbound: false,
         };
-        
+
         // Add peer using existing safe method
         if self.add_peer_safe(peer_info) {
             if crate::node::is_info() { println!("[INFO][P2P] AUTO-ADDED peer {} ({}) - received message proves connectivity", 
@@ -3403,10 +3415,7 @@ impl SimplifiedP2P {
         
         // CRITICAL: Prevent self-connection at the earliest stage
         let peer_ip = peer_info.addr.split(':').next().unwrap_or("");
-        let external_ip_guard = match self.external_ip.read() {
-            Ok(g) => g,
-            Err(p) => p.into_inner()
-        };
+        let external_ip_guard = self.external_ip.read();
         let is_self_by_ip = if let Some(ref our_ip) = *external_ip_guard {
             peer_ip == our_ip
         } else {
@@ -3414,11 +3423,40 @@ impl SimplifiedP2P {
         };
         
         if peer_info.id == self.node_id || is_self_by_ip {
-            if crate::node::is_info() { println!("[INFO][P2P] add_peer_lockfree: Rejecting self-connection {}", 
+            if crate::node::is_info() { println!("[INFO][P2P] add_peer_lockfree: Rejecting self-connection {}",
                      get_privacy_id_for_addr(&peer_info.addr)); }
             return false;
         }
-        
+
+        // FIX R23-P1: Eclipse protection — reserve outbound slots.
+        // If this is an inbound connection, check that we're not using up outbound-reserved slots.
+        if !peer_info.is_outbound {
+            let inbound_count = self.connected_peers_lockfree.iter()
+                .filter(|entry| !entry.value().is_outbound)
+                .count();
+            let max_inbound = MAX_CONNECTED_PEERS.saturating_sub(MIN_OUTBOUND_SLOTS);
+            if inbound_count >= max_inbound {
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] inbound_slot_full inbound={} max={} outbound_reserved={}",
+                             inbound_count, max_inbound, MIN_OUTBOUND_SLOTS);
+                }
+                return false;
+            }
+        }
+
+        // FIX R23-P2: Sybil protection — require minimum reputation for inbound peers.
+        // Genesis nodes always accepted. Outbound connections always accepted (we chose them).
+        if !peer_info.is_outbound {
+            let is_genesis_ip = crate::genesis_constants::get_genesis_id_by_ip(peer_ip).is_some();
+            if !is_genesis_ip && peer_info.reputation < MIN_INBOUND_PEER_REPUTATION {
+                if crate::node::is_info() {
+                    println!("[INFO][P2P] sybil_reject peer={} rep={:.1} min={:.1}",
+                             get_privacy_id_for_addr(&peer_info.addr), peer_info.reputation, MIN_INBOUND_PEER_REPUTATION);
+                }
+                return false;
+            }
+        }
+
         // Calculate shard and Kademlia bucket
         let mut hasher = Sha3_256::new();
         hasher.update(peer_info.id.as_bytes());
@@ -3487,11 +3525,8 @@ impl SimplifiedP2P {
         }
         
         // CRITICAL FIX: Get our own IP to filter out self-connections
-        let our_ip = match self.external_ip.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        
+        let our_ip = self.external_ip.read().clone();
+
         if crate::node::is_info() { println!("[INFO][P2P] Connecting to {} bootstrap peers (filtering self: {:?})", peers.len(), our_ip); }
         
         let mut successful_parses = 0;
@@ -3630,9 +3665,7 @@ impl SimplifiedP2P {
         
         // Update connection count (v2.51: lock-free)
         let peer_count = self.connected_peers_lockfree.len();
-        if let Ok(mut count) = self.connection_count.lock() {
-            *count = peer_count;
-        }
+        *self.connection_count.lock() = peer_count;
         
         if new_connections > 0 {
             if crate::node::is_info() { println!("[INFO][P2P] Successfully added {} new peers to P2P network", new_connections); }
@@ -3736,10 +3769,7 @@ impl SimplifiedP2P {
             let external_ip = match Self::get_our_ip_address().await {
                 Ok(ip) => {
                     // Store our external IP to prevent self-connection
-                    let mut guard = match external_ip_store.write() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner()
-                    };
+                    let mut guard = external_ip_store.write();
                     *guard = Some(ip.clone());
                     ip
                 },
@@ -3962,8 +3992,9 @@ impl SimplifiedP2P {
                                 successful_pings: 0,
                                 failed_pings: 0,
                                 last_block_height: 0,  // v2.24.3
+                                is_outbound: true,  // Outbound - we initiated discovery
                             };
-                            
+
                             discovered_peers.push(peer_info);
                             break;
                         }
@@ -3998,10 +4029,7 @@ impl SimplifiedP2P {
             
             // Add validated peers to regional map
             {
-                let mut regional_peers = match regional_peers.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner()
-                };
+                let mut regional_peers = regional_peers.lock();
                 for peer in validated_peers.iter() {
                     regional_peers
                         .entry(peer.region.clone())
@@ -4097,10 +4125,7 @@ impl SimplifiedP2P {
                         
                         // Update new cache actor
                         let epoch = CACHE_ACTOR.increment_epoch();
-                        let mut height_cache_guard = match CACHE_ACTOR.height_cache.write() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner()
-                        };
+                        let mut height_cache_guard = CACHE_ACTOR.height_cache.write();
                         *height_cache_guard = Some(CachedData {
                             data: consensus_height,
                             epoch,
@@ -4109,9 +4134,7 @@ impl SimplifiedP2P {
                         });
                         
                         // Also update old cache for backward compatibility
-                        if let Ok(mut cache) = CACHED_BLOCKCHAIN_HEIGHT.lock() {
-                            *cache = (consensus_height, Instant::now());
-                        }
+                        *CACHED_BLOCKCHAIN_HEIGHT.lock() = (consensus_height, Instant::now());
                     }
                 } else {
                     if crate::node::is_warn() { println!("[WARN][SYNC] Background: No peer responses - cache not updated"); }
@@ -4995,10 +5018,7 @@ impl SimplifiedP2P {
                     .collect();
                 
                 // CRITICAL: Get our IP to skip self-broadcasts
-                let our_ip = match self.external_ip.read() {
-                    Ok(guard) => guard.clone(),
-                    Err(p) => p.into_inner().clone(),
-                };
+                let our_ip = self.external_ip.read().clone();
                 
                 // ═══════════════════════════════════════════════════════════════════════════
                 // CRITICAL FIX v2.93: PARALLEL broadcast to all peers
@@ -5284,10 +5304,7 @@ impl SimplifiedP2P {
         // v2.26: Get producer certificate to include in chunk #0
         // This eliminates race condition where block arrives before certificate
         let producer_certificate: Option<ProducerCertificate> = {
-            let cert_manager = match self.certificate_manager.read() { 
-                Ok(g) => g, 
-                Err(p) => p.into_inner() 
-            };
+            let cert_manager = self.certificate_manager.read();
             // Get local certificate (we are the producer)
             if let Some((serial, cert_bytes)) = cert_manager.get_local_cert_with_serial() {
                 Some(ProducerCertificate {
@@ -5308,6 +5325,17 @@ impl SimplifiedP2P {
         
         // CRITICAL: Store original block size BEFORE splitting
         let original_block_size = block_data.len();
+
+        // FIX R23-P3: Compute block hash for chunk authentication
+        let block_hash: [u8; 32] = {
+            use sha3::{Sha3_256, Digest};
+            let mut hasher = Sha3_256::new();
+            hasher.update(&block_data);
+            let result = hasher.finalize();
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&result);
+            arr
+        };
 
         // Split block into chunks
         let chunks = self.split_into_chunks(&block_data);
@@ -5396,16 +5424,17 @@ impl SimplifiedP2P {
                 is_macroblock,  // PRODUCTION: Tag block type
                 // v2.26: Certificate only in chunk #0 (saves bandwidth, still atomic)
                 certificate: if chunk_index == 0 { producer_certificate.clone() } else { None },
+                block_hash: Some(block_hash),  // FIX R23-P3
             };
-            
+
             let target_peers = self.select_shred_protocol_targets(&routing_tree, chunk_index, shred_protocol_fanout);
             let msg = NetworkMessage::ShredProtocolChunk { chunk: shred_protocol_chunk };
-            
+
             for peer in target_peers {
                 chunk_sends.push((peer, msg.clone()));
             }
         }
-        
+
         // Collect parity chunks (no certificate - only in data chunk #0)
         for (parity_index, parity_data) in parity_chunks.into_iter().enumerate() {
             let shred_protocol_chunk = ShredProtocolChunk {
@@ -5417,6 +5446,7 @@ impl SimplifiedP2P {
                 original_block_size,  // CRITICAL: Include original size
                 is_macroblock,  // PRODUCTION: Tag block type
                 certificate: None,  // v2.26: Certificate only in data chunk #0
+                block_hash: Some(block_hash),  // FIX R23-P3
             };
             
             let target_peers = self.select_shred_protocol_targets(&routing_tree, total_chunks + parity_index, shred_protocol_fanout);
@@ -5839,8 +5869,8 @@ impl SimplifiedP2P {
                 let to_height = height.saturating_sub(1);
                 
                 // Signal gap to global pending queue (processed by node.rs sync loop)
-                PENDING_GAP_SYNC.store(from_height, std::sync::atomic::Ordering::Relaxed);
-                PENDING_GAP_SYNC_TO.store(to_height, std::sync::atomic::Ordering::Relaxed);
+                // FIX R22-CC4: Atomic pair write via Mutex — no torn reads possible
+                set_pending_gap_sync(from_height, to_height);
                 
                 if crate::node::is_info() {
                     println!("[INFO][GAP] detected local={} incoming={} gap={} pending_sync={}-{}", 
@@ -5924,8 +5954,16 @@ impl SimplifiedP2P {
                     retransmit_attempts: 0,  // v2.21.3
                     retransmit_requested_at: None,  // v2.21.3
                     certificate: None,  // v2.26: Will be populated from chunk #0
+                    expected_block_hash: None,  // FIX R23-P3: Will be populated from first chunk
                 });
-            
+
+            // FIX R23-P3: Store block_hash from first chunk that carries it
+            if assembly.expected_block_hash.is_none() {
+                if let Some(bh) = chunk.block_hash {
+                    assembly.expected_block_hash = Some(bh);
+                }
+            }
+
             // v2.26: Extract certificate from chunk #0 (eliminates race condition!)
             // Certificate is included in data chunk #0 by producer
             if !chunk.is_parity && chunk.chunk_index == 0 {
@@ -5939,10 +5977,10 @@ impl SimplifiedP2P {
                         
                         // CRITICAL: Store certificate in certificate_manager immediately!
                         // This ensures it's available when block validation needs it
-                        let cert_manager_result = self.certificate_manager.write();
-                        if let Ok(mut cert_manager) = cert_manager_result {
+                        {
+                            let mut cert_manager = self.certificate_manager.write();
                             cert_manager.store_remote_certificate(
-                                cert.serial_number.clone(), 
+                                cert.serial_number.clone(),
                                 cert.certificate_bytes.clone()
                             );
                             if crate::node::is_info() {
@@ -6232,10 +6270,7 @@ impl SimplifiedP2P {
         let shred_protocol_fanout = self.get_shred_protocol_fanout();
         
         // Get our external IP for additional self-check
-        let our_ip = match self.external_ip.read() {
-            Ok(guard) => guard.clone(),
-            Err(p) => p.into_inner().clone(),
-        };
+        let our_ip = self.external_ip.read().clone();
         let our_node_id = self.node_id.clone();
         
         let forward_targets: Vec<_> = routing_tree.iter()
@@ -6672,9 +6707,7 @@ impl SimplifiedP2P {
         // ═══════════════════════════════════════════════════════════════════════════
         if error_count > 0 && error_count >= total_responses / 2 {
             // Get node ID for rate limiting
-            let node_id = GLOBAL_NODE_ID.read()
-                .map(|g| g.clone())
-                .unwrap_or_else(|_| "unknown".to_string());
+            let node_id = GLOBAL_NODE_ID.read().clone();
             
             // PRIORITY 1: Rate limit check (max 10/min per node)
             if !quic_fallback_rate_check(&node_id) {
@@ -6692,10 +6725,7 @@ impl SimplifiedP2P {
                 QUIC_FALLBACK_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 
                 // Get QUIC transport
-                let quic_transport = match GLOBAL_QUIC_TRANSPORT.read() {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => None,
-                };
+                let quic_transport = GLOBAL_QUIC_TRANSPORT.read().clone();
                 
                 if let Some(ref transport_arc) = quic_transport {
                     use crate::quic_transport::QUIC_PORT_OFFSET;
@@ -7211,13 +7241,32 @@ impl SimplifiedP2P {
         );
         
         let mut block_data = Vec::new();
-        
+
         for chunk_opt in assembly.chunks_received {
             if let Some(chunk) = chunk_opt {
                 block_data.extend(chunk);
             }
         }
-        
+
+        // Trim padding back to original size
+        if block_data.len() > assembly.original_block_size {
+            block_data.truncate(assembly.original_block_size);
+        }
+
+        // FIX R23-P3: Verify block hash after reconstruction — detect chunk tampering
+        if let Some(expected_hash) = assembly.expected_block_hash {
+            use sha3::{Sha3_256, Digest};
+            let mut hasher = Sha3_256::new();
+            hasher.update(&block_data);
+            let computed = hasher.finalize();
+            if computed.as_slice() != &expected_hash[..] {
+                eprintln!("[ERR][SHRED] block_hash_mismatch h={} expected={} computed={} action=discard",
+                         height, hex::encode(&expected_hash[..8]), hex::encode(&computed[..8]));
+                self.processed_shred_blocks.remove(&height);
+                return;
+            }
+        }
+
         let elapsed = assembly.started_at.elapsed();
         if height % 10 == 0 {
             if crate::node::is_info() {
@@ -7225,12 +7274,9 @@ impl SimplifiedP2P {
                          height, assembly.total_chunks, elapsed, producer_id);
             }
         }
-        
+
         // Send reconstructed block through normal block channel
-        let block_tx_guard = match self.block_tx.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner()
-        };
+        let block_tx_guard = self.block_tx.lock();
         
         // PRODUCTION: Use correct block_type based on chunk metadata
         let block_type = if assembly.is_macroblock { "macro".to_string() } else { "micro".to_string() };
@@ -7251,7 +7297,7 @@ impl SimplifiedP2P {
                     .as_secs(),
             };
             
-            if let Err(_) = block_tx.send(received_block) {
+            if let Err(_) = block_tx.try_send(received_block) {
                 clear_block_pending_sync(height); // Clear on error
             }
         } else {
@@ -7371,7 +7417,9 @@ impl SimplifiedP2P {
             // Assemble reconstructed block from data shards
             // CRITICAL FIX: Use original_block_size instead of rposition
             // rposition incorrectly removes trailing zeros which corrupts bincode data!
-            let original_size = assembly.original_block_size;
+            // SECURITY: cap allocation to max possible shred payload (防OOM from untrusted peer)
+            let max_block_bytes = SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE;
+            let original_size = assembly.original_block_size.min(max_block_bytes);
             let mut block_data = Vec::with_capacity(original_size);
             
             for shard_opt in shards.iter().take(data_count) {
@@ -7407,10 +7455,7 @@ impl SimplifiedP2P {
             let block_type = if assembly.is_macroblock { "macro".to_string() } else { "micro".to_string() };
             
             // Send reconstructed block through normal block channel
-            let block_tx_guard = match self.block_tx.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner()
-            };
+            let block_tx_guard = self.block_tx.lock();
             if let Some(ref block_tx) = &*block_tx_guard {
                 // v11.1: Track pending (not a gate) — storage-level dedup in node.rs
                 mark_block_pending_sync(height);
@@ -7427,13 +7472,13 @@ impl SimplifiedP2P {
                         .as_secs(),
                 };
                 
-                if let Err(_) = block_tx.send(received_block) {
+                if let Err(_) = block_tx.try_send(received_block) {
                     clear_block_pending_sync(height); // Clear on error
                 }
             }
         }
     }
-    
+
     /// Send a single ShredProtocol chunk to a peer
     // REMOVED v2.19.21: send_shred_protocol_chunk replaced by async QUIC broadcast in broadcast_block_shred_protocol
     
@@ -7468,10 +7513,7 @@ impl SimplifiedP2P {
         }
         
         // Get QUIC transport
-        let quic_transport = match GLOBAL_QUIC_TRANSPORT.read() {
-            Ok(guard) => guard.clone(),
-            Err(_) => None,
-        };
+        let quic_transport = GLOBAL_QUIC_TRANSPORT.read().clone();
         
         let Some(ref transport_arc) = quic_transport else {
             if is_debug() { println!("[DBG][SHRED_SYNC] no_quic_transport h={}", height); }
@@ -7504,6 +7546,17 @@ impl SimplifiedP2P {
         let target_size = data_chunk_count * SHRED_PROTOCOL_CHUNK_SIZE;
         padded_data.resize(target_size, 0);
         
+        // FIX R23-P3: Compute block hash for chunk authentication
+        let block_hash: [u8; 32] = {
+            use sha3::{Sha3_256, Digest};
+            let mut hasher = Sha3_256::new();
+            hasher.update(&block_data);
+            let result = hasher.finalize();
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&result);
+            arr
+        };
+
         // Split into data chunks
         let mut data_chunks: Vec<Vec<u8>> = Vec::with_capacity(data_chunk_count);
         for i in 0..data_chunk_count {
@@ -7511,22 +7564,22 @@ impl SimplifiedP2P {
             let end = start + SHRED_PROTOCOL_CHUNK_SIZE;
             data_chunks.push(padded_data[start..end].to_vec());
         }
-        
+
         // Generate Reed-Solomon parity chunks
         let parity_data = self.generate_parity_chunks(&data_chunks, parity_chunk_count);
         let chunk_time = start_time.elapsed();
-        
+
         if is_debug() {
-            println!("[DBG][SHRED_SYNC] chunked h={} data={} parity={} ms={}", 
+            println!("[DBG][SHRED_SYNC] chunked h={} data={} parity={} ms={}",
                      height, data_chunk_count, parity_chunk_count, chunk_time.as_millis());
         }
-        
+
         // Send chunks with pacing (5ms between chunks)
         const CHUNK_PACING_MS: u64 = 5;
         let mut sent_count = 0;
-        
+
         let transport = transport_arc.read().await;
-        
+
         // Send data chunks
         for (i, chunk_data) in data_chunks.into_iter().enumerate() {
             let chunk = ShredProtocolChunk {
@@ -7538,17 +7591,18 @@ impl SimplifiedP2P {
                 original_block_size,
                 is_macroblock,
                 certificate: None,
+                block_hash: Some(block_hash),
             };
-            
+
             let msg = NetworkMessage::ShredProtocolChunk { chunk };
-            
+
             if transport.broadcast_to(quic_addr, &msg).await.is_ok() {
                 sent_count += 1;
             }
-            
+
             tokio::time::sleep(std::time::Duration::from_millis(CHUNK_PACING_MS)).await;
         }
-        
+
         // Send parity chunks
         for (i, parity_chunk_data) in parity_data.into_iter().enumerate() {
             let chunk = ShredProtocolChunk {
@@ -7560,6 +7614,7 @@ impl SimplifiedP2P {
                 original_block_size,
                 is_macroblock,
                 certificate: None,
+                block_hash: Some(block_hash),
             };
             
             let msg = NetworkMessage::ShredProtocolChunk { chunk };
@@ -7588,10 +7643,7 @@ impl SimplifiedP2P {
     /// v2.26.1: Added fallback to max(peer.last_block_height) from HealthPing data
     pub fn get_cached_network_height(&self) -> Option<u64> {
         // Check cache actor first
-        let height_cache_guard = match CACHE_ACTOR.height_cache.read() {
-            Ok(g) => g,
-            Err(p) => p.into_inner()
-        };
+        let height_cache_guard = CACHE_ACTOR.height_cache.read();
         if let Some(cached_data) = height_cache_guard.as_ref() {
             let age = Instant::now().duration_since(cached_data.timestamp);
             // CRITICAL: Cache TTL reduced to 1 second for 1 block/sec target
@@ -7602,10 +7654,7 @@ impl SimplifiedP2P {
         }
         
         // Fallback to old cache
-        let cache = match CACHED_BLOCKCHAIN_HEIGHT.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let cache = CACHED_BLOCKCHAIN_HEIGHT.lock();
         let age = Instant::now().duration_since(cache.1);
         // CRITICAL: Same 1 second TTL for consistency
         if age.as_secs() < 1 && cache.0 > 0 {
@@ -7665,7 +7714,7 @@ impl SimplifiedP2P {
         // IMPROVED: Check both cache systems for compatibility
         {
             // Try new cache actor first
-            if let Some(cached_data) = match CACHE_ACTOR.height_cache.read() { Ok(g) => g, Err(p) => p.into_inner() }.as_ref() {
+            if let Some(cached_data) = CACHE_ACTOR.height_cache.read().as_ref() {
                 let age = Instant::now().duration_since(cached_data.timestamp);
                 // QUANTUM: Minimal cache for decentralized quantum blockchain
                 let cache_duration = if cached_data.data == 0 {
@@ -7684,10 +7733,7 @@ impl SimplifiedP2P {
             }
             
             // Fallback to old cache
-            let cache = match CACHED_BLOCKCHAIN_HEIGHT.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let cache = CACHED_BLOCKCHAIN_HEIGHT.lock();
             let age = Instant::now().duration_since(cache.1);
             // QUANTUM: Same minimal cache for old system
             let cache_duration = if cache.0 == 0 { 1 } else { 0 };
@@ -7772,7 +7818,7 @@ impl SimplifiedP2P {
         {
             // Update new cache actor
             let epoch = CACHE_ACTOR.increment_epoch();
-            *match CACHE_ACTOR.height_cache.write() { Ok(g) => g, Err(p) => p.into_inner() } = Some(CachedData {
+            *CACHE_ACTOR.height_cache.write() = Some(CachedData {
                 data: consensus_height,
                 epoch,
                 timestamp: Instant::now(),
@@ -7780,9 +7826,7 @@ impl SimplifiedP2P {
             });
             
             // Also update old cache for backward compatibility
-            if let Ok(mut cache) = CACHED_BLOCKCHAIN_HEIGHT.lock() {
-                *cache = (consensus_height, Instant::now());
-            }
+            *CACHED_BLOCKCHAIN_HEIGHT.lock() = (consensus_height, Instant::now());
         }
         
         Ok(consensus_height)
@@ -8020,7 +8064,7 @@ impl SimplifiedP2P {
     pub fn filter_working_genesis_nodes_static(nodes: Vec<String>) -> Vec<String> {
         use std::net::{TcpStream, SocketAddr};
         use std::time::Duration;
-        use std::sync::Mutex;
+        use parking_lot::Mutex;
         use std::collections::HashMap;
         
         // Cache connectivity results to prevent repeated probes
@@ -8035,7 +8079,8 @@ impl SimplifiedP2P {
         let current_time = std::time::SystemTime::now();
         
         // Check cache first
-        if let Ok(cache) = connectivity_cache.lock() {
+        {
+            let cache = connectivity_cache.lock();
             if let Some((cached_working_nodes, cached_time)) = cache.get(&cache_key) {
                 if let Ok(cache_age) = current_time.duration_since(*cached_time) {
                     let cache_ttl = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
@@ -8043,7 +8088,7 @@ impl SimplifiedP2P {
                     } else {
                         45 // Regular nodes: 45 seconds
                     };
-                    
+
                     if cache_age.as_secs() < cache_ttl {
                         if crate::node::is_debug() {
                             println!("[INFO][P2P] cached peers={} age={}s ttl={}s",
@@ -8133,17 +8178,16 @@ impl SimplifiedP2P {
                 if crate::node::is_warn() {
                     println!("[WARN][CONNECTIVITY] no_peers_reachable fallback=all_configured");
                 }
-                if let Ok(mut cache) = connectivity_cache.lock() {
-                    cache.insert(cache_key, (nodes.clone(), current_time));
-                }
+                connectivity_cache.lock().insert(cache_key, (nodes.clone(), current_time));
                 return nodes;
             }
         }
         
         // Cache results
-        if let Ok(mut cache) = connectivity_cache.lock() {
+        {
+            let mut cache = connectivity_cache.lock();
             cache.insert(cache_key, (working_nodes.clone(), current_time));
-            
+
             if cache.len() > 5 {
                 let mut keys_to_remove = Vec::new();
                 let cutoff_time = current_time - Duration::from_secs(300);
@@ -8203,7 +8247,8 @@ impl SimplifiedP2P {
         
         // GULF STREAM: Forward directly to current producer (priority path)
         let mut sent_to_producer = false;
-        if let Ok(guard) = self.current_producer_info.read() {
+        {
+            let guard = self.current_producer_info.read();
             if let Some((producer_id, producer_addr)) = &*guard {
                 // Don't send to self
                 if producer_id != &self.node_id {
@@ -8237,11 +8282,8 @@ impl SimplifiedP2P {
         
         // PRODUCTION v2.25.2: Skip broadcast if WE are the current producer
         // TX is already in our mempool - no need to send anywhere
-        let we_are_producer = if let Ok(guard) = self.current_producer_info.read() {
-            guard.as_ref().map_or(false, |(producer_id, _)| producer_id == &self.node_id)
-        } else {
-            false
-        };
+        let we_are_producer = self.current_producer_info.read()
+            .as_ref().map_or(false, |(producer_id, _)| producer_id == &self.node_id);
         
         if we_are_producer {
             // We're the producer - TX already in our mempool, skip network
@@ -8258,7 +8300,8 @@ impl SimplifiedP2P {
         
         // GULF STREAM: Forward batch to current producer first
         let mut sent_to_producer = false;
-        if let Ok(guard) = self.current_producer_info.read() {
+        {
+            let guard = self.current_producer_info.read();
             if let Some((producer_id, producer_addr)) = &*guard {
                 if producer_id != &self.node_id {
                     self.send_network_message(producer_addr, batch_msg.clone());
@@ -8452,9 +8495,10 @@ impl SimplifiedP2P {
             successful_pings: 0,
             failed_pings: 0,
             last_block_height: 0,  // v2.24.3
+            is_outbound: false,
         })
     }
-    
+
     /// CRITICAL: Verify all Genesis nodes are actually connected for bootstrap
     /// This prevents split brain during initial network formation
     /// 
@@ -8637,9 +8681,7 @@ impl SimplifiedP2P {
     /// CACHE FIX: Invalidate peer cache when topology changes
     fn invalidate_peer_cache(&self) {
         let new_epoch = CACHE_ACTOR.increment_epoch();
-        if let Ok(mut peers_cache) = CACHE_ACTOR.peers_cache.write() {
-            *peers_cache = None;
-        }
+        *CACHE_ACTOR.peers_cache.write() = None;
         if crate::node::is_info() {
             println!("[INFO][P2P] peer_cache_invalidated epoch={}", new_epoch);
         }
@@ -8668,7 +8710,7 @@ impl SimplifiedP2P {
         
         // Store our own certificate first
         {
-            let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut cert_manager = self.certificate_manager.write();
             cert_manager.set_local_certificate(cert_serial.clone(), certificate);
         }
         
@@ -8786,7 +8828,7 @@ impl SimplifiedP2P {
         
         // Store locally first (immediate availability)
         {
-            let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut cert_manager = self.certificate_manager.write();
             cert_manager.set_local_certificate(cert_serial.clone(), certificate.clone());
         }
         
@@ -9073,6 +9115,7 @@ impl SimplifiedP2P {
                                     successful_pings: 0,
                                     failed_pings: 0,
                                     last_block_height: 0,
+                                    is_outbound: true,  // Outbound - we connect to genesis
                                 };
                                 genesis_peers.push(peer_info);
                             } else {
@@ -9102,7 +9145,7 @@ impl SimplifiedP2P {
         // Check actor cache (single source of truth)
         let should_refresh = {
             // Try new cache actor first
-            if let Some(cached_data) = match CACHE_ACTOR.peers_cache.read() { Ok(g) => g, Err(p) => p.into_inner() }.as_ref() {
+            if let Some(cached_data) = CACHE_ACTOR.peers_cache.read().as_ref() {
             let now = Instant::now();
                 let age = now.duration_since(cached_data.timestamp);
                 
@@ -9123,7 +9166,7 @@ impl SimplifiedP2P {
         if should_refresh {
             // RACE CONDITION FIX: Double-check actor cache before expensive validation
             // Another thread might have refreshed while we were checking
-            if let Some(cached_data) = match CACHE_ACTOR.peers_cache.read() { Ok(g) => g, Err(p) => p.into_inner() }.as_ref() {
+            if let Some(cached_data) = CACHE_ACTOR.peers_cache.read().as_ref() {
                 let age = Instant::now().duration_since(cached_data.timestamp);
                 let topology_hash = CacheActor::get_topology_hash(&peer_addrs);
                 if age < validation_interval && cached_data.topology_hash == topology_hash {
@@ -9140,7 +9183,7 @@ impl SimplifiedP2P {
             {
                 let epoch = CACHE_ACTOR.increment_epoch();
                 let topology_hash = CacheActor::get_topology_hash(&fresh_peers.iter().map(|p| p.addr.clone()).collect::<Vec<_>>());
-                *match CACHE_ACTOR.peers_cache.write() { Ok(g) => g, Err(p) => p.into_inner() } = Some(CachedData {
+                *CACHE_ACTOR.peers_cache.write() = Some(CachedData {
                     data: fresh_peers.clone(),
                     epoch,
                     timestamp: Instant::now(),
@@ -9272,9 +9315,7 @@ impl SimplifiedP2P {
     /// CRITICAL: Force peer cache refresh for Byzantine safety checks (Producer nodes)
     pub fn force_peer_cache_refresh(&self) {
         let new_epoch = CACHE_ACTOR.increment_epoch();
-        if let Ok(mut peers_cache) = CACHE_ACTOR.peers_cache.write() {
-            *peers_cache = None;
-        }
+        *CACHE_ACTOR.peers_cache.write() = None;
         if crate::node::is_info() {
             println!("[INFO][P2P] peer_cache_forced_refresh epoch={}", new_epoch);
         }
@@ -9435,15 +9476,7 @@ impl SimplifiedP2P {
     /// Stop P2P network
     pub fn stop(&self) {
         // SECURITY: Safe mutex locking for shutdown
-        match self.is_running.lock() {
-            Ok(mut running) => *running = false,
-            Err(poisoned) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][P2P] Mutex poisoned during shutdown, forcing stop...");
-                }
-                *poisoned.into_inner() = false;
-            }
-        }
+        *self.is_running.lock() = false;
         if crate::node::is_info() {
             println!("[INFO][P2P] Simplified P2P network stopped");
         }
@@ -9588,20 +9621,13 @@ impl SimplifiedP2P {
             successful_pings: 0,
             failed_pings: 0,
             last_block_height: 0,
+            is_outbound: false,
         })
     }
-    
+
     /// Add peer to regional map
     fn add_peer_to_region(&self, peer: PeerInfo) {
-        let mut regional_peers = match self.regional_peers.lock() {
-            Ok(peers) => peers,
-            Err(poisoned) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][P2P] Regional peers mutex poisoned during peer addition");
-                }
-                poisoned.into_inner()
-            }
-        };
+        let mut regional_peers = self.regional_peers.lock();
         regional_peers
             .entry(peer.region.clone())
             .or_insert_with(Vec::new)
@@ -9634,15 +9660,7 @@ impl SimplifiedP2P {
                 println!("[INFO][P2P] Starting regional connection establishment (background)...");
             }
             
-            let regional_peers_data = match regional_peers.lock() {
-                Ok(peers) => peers.clone(), // Clone the data to avoid lifetime issues
-                Err(poisoned) => {
-                    if crate::node::is_warn() {
-                        println!("[WARN][P2P] Regional peers mutex poisoned during connection establishment");
-                    }
-                    poisoned.into_inner().clone()
-                }
-            };
+            let regional_peers_data = regional_peers.lock().clone();
             
             // v2.51: Lock-free peer operations
             // Connect to primary region first - WITH REAL connectivity validation
@@ -9682,12 +9700,12 @@ impl SimplifiedP2P {
                                 use crate::quic_transport::QUIC_PORT_OFFSET;
                                 let quic_port: u16 = 8001 + QUIC_PORT_OFFSET;
                                 if let Ok(quic_addr) = format!("{}:{}", ip, quic_port).parse::<std::net::SocketAddr>() {
-                                    let transport_arc_opt = GLOBAL_QUIC_TRANSPORT.read().ok()
-                                        .and_then(|g| g.as_ref().map(|a| a.clone()));
+                                    let transport_arc_opt = GLOBAL_QUIC_TRANSPORT.read()
+                                        .as_ref().map(|a| a.clone());
                                     if let Some(transport_arc) = transport_arc_opt {
                                         let transport = transport_arc.read().await;
                                         let ping = NetworkMessage::HealthPing {
-                                            from: GLOBAL_NODE_ID.read().map(|g| g.clone()).unwrap_or_default(),
+                                            from: GLOBAL_NODE_ID.read().clone(),
                                             timestamp: std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
                                                 .unwrap_or_default()
@@ -9842,14 +9860,8 @@ impl SimplifiedP2P {
     
     /// Intelligent peer selection with load balancing
     pub fn select_optimal_peers(&self, required_count: usize) -> Vec<PeerInfo> {
-        let regional_peers = match self.regional_peers.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let metrics = match self.regional_metrics.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let regional_peers = self.regional_peers.lock();
+        let metrics = self.regional_metrics.lock();
         let mut selected_peers = Vec::new();
         
         // Get regions sorted by capacity (best first)
@@ -9930,10 +9942,7 @@ impl SimplifiedP2P {
     
     /// Update regional load balancing metrics (v2.51: lock-free)
     fn update_regional_metrics(&self) {
-        let mut metrics = match self.regional_metrics.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut metrics = self.regional_metrics.lock();
         
         for region in &[Region::NorthAmerica, Region::Europe, Region::Asia, Region::SouthAmerica, Region::Africa, Region::Oceania] {
             let region_peers: Vec<PeerInfo> = self.connected_peers_lockfree
@@ -9961,7 +9970,7 @@ impl SimplifiedP2P {
     
     /// Rebalance connections based on load
     pub fn rebalance_connections(&self) -> bool {
-        let mut last_rebalance = match self.last_rebalance.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut last_rebalance = self.last_rebalance.lock();
         let now = Instant::now();
         
         // Check if enough time has passed since last rebalance
@@ -9977,10 +9986,7 @@ impl SimplifiedP2P {
         }
         
         // Get current load metrics
-        let metrics = match self.regional_metrics.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let metrics = self.regional_metrics.lock();
         let overloaded_regions: Vec<Region> = metrics
             .iter()
             .filter(|(_, metric)| {
@@ -10036,10 +10042,10 @@ impl SimplifiedP2P {
         let _regional_metrics = self.regional_metrics.clone();
         
         thread::spawn(move || {
-            while *match is_running.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
+            while *is_running.lock() {
                 thread::sleep(Duration::from_secs(30)); // Check every 30 seconds
                 
-                *match last_check.lock() { Ok(g) => g, Err(p) => p.into_inner() } = Instant::now();
+                *last_check.lock() = Instant::now();
                 
                 // PRODUCTION: Collect real metrics from connected peers via HTTP (v2.51: lock-free)
                 for mut entry in connected_peers.iter_mut() {
@@ -10065,7 +10071,7 @@ impl SimplifiedP2P {
         let _node_id = self.node_id.clone();
         
         thread::spawn(move || {
-            while *match is_running.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
+            while *is_running.lock() {
                 thread::sleep(Duration::from_secs(60)); // Rebalance every minute
                 
                 // In production: call self.rebalance_connections() (silently)
@@ -10076,17 +10082,14 @@ impl SimplifiedP2P {
     
     /// Get load balancing statistics
     pub fn get_load_balancing_stats(&self) -> HashMap<String, serde_json::Value> {
-        let metrics = match self.regional_metrics.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let metrics = self.regional_metrics.lock();
         
         let mut stats = HashMap::new();
         
         // v2.51: Lock-free peer count
         stats.insert("total_peers".to_string(), serde_json::Value::Number(self.connected_peers_lockfree.len().into()));
-        stats.insert("total_bytes_sent".to_string(), serde_json::Value::Number((*match self.total_bytes_sent.lock() { Ok(g) => g, Err(p) => p.into_inner() }).into()));
-        stats.insert("total_bytes_received".to_string(), serde_json::Value::Number((*match self.total_bytes_received.lock() { Ok(g) => g, Err(p) => p.into_inner() }).into()));
+        stats.insert("total_bytes_sent".to_string(), serde_json::Value::Number((*self.total_bytes_sent.lock()).into()));
+        stats.insert("total_bytes_received".to_string(), serde_json::Value::Number((*self.total_bytes_received.lock()).into()));
         
         // Regional breakdown
         let mut regional_stats = serde_json::Map::new();
@@ -10121,7 +10124,8 @@ impl SimplifiedP2P {
         let quic_addr = format!("{}:{}", ip, quic_port);
         if let Ok(quic_socket_addr) = quic_addr.parse::<SocketAddr>() {
             // Check if QUIC transport already has a connection to this peer
-            if let Ok(guard) = GLOBAL_QUIC_TRANSPORT.read() {
+            {
+                let guard = GLOBAL_QUIC_TRANSPORT.read();
                 if let Some(ref transport_arc) = *guard {
                     // Use try_read to avoid blocking on async RwLock from sync context
                     if let Ok(transport) = transport_arc.try_read() {
@@ -10237,7 +10241,7 @@ impl SimplifiedP2P {
             }
             
             // Regional clustering logic
-            while *match is_running.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
+            while *is_running.lock() {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 
                 // Rebalance regional connections
@@ -10774,14 +10778,9 @@ impl SimplifiedP2P {
         use crate::quic_transport::QUIC_PORT_OFFSET;
         
         // Get global QUIC transport (set during node initialization)
-        let quic_transport = match GLOBAL_QUIC_TRANSPORT.read() {
-            Ok(guard) => guard.clone(),
-            Err(_) => None,
-        };
+        let quic_transport = GLOBAL_QUIC_TRANSPORT.read().clone();
         
-        let node_id = GLOBAL_NODE_ID.read()
-            .map(|g| g.clone())
-            .unwrap_or_else(|_| "unknown".to_string());
+        let node_id = GLOBAL_NODE_ID.read().clone();
         
         if let Some(ref transport_arc) = quic_transport {
             // Create RequestBlocks message
@@ -11580,10 +11579,7 @@ impl SimplifiedP2P {
                 // Microblocks: No Byzantine check needed - quantum signature validation in block processing
                 
                 // PRODUCTION: Silent diagnostic check for scalability  
-                let block_tx_guard = match self.block_tx.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner()
-                };
+                let block_tx_guard = self.block_tx.lock();
                 match &*block_tx_guard {
                     Some(_) => {},
                     None => { if crate::node::is_warn() { println!("[WARN][P2P] block_channel_missing"); } },
@@ -11605,12 +11601,12 @@ impl SimplifiedP2P {
                             .as_secs(),
                     };
                     
-                    match block_tx.send(received_block.clone()) {
+                    match block_tx.try_send(received_block.clone()) {
                         Ok(_) => {
                             if crate::node::is_info() {
                                 println!("[INFO][P2P] {} block #{} queued for processing", block_type, height);
                             }
-                            
+
                             // GOSSIP RE-BROADCAST v2.19.18: Forward received blocks to other peers
                             // This improves block propagation reliability across the network
                             // Only re-broadcast microblocks (macroblocks have their own consensus)
@@ -11622,11 +11618,11 @@ impl SimplifiedP2P {
                                     data: received_block.data.clone(),
                                     block_type: block_type.clone(),
                                 };
-                                
+
                                 // Forward to 2 random peers (gossip fanout)
                                 // Low fanout to avoid network spam while ensuring propagation
                                 self.gossip_to_random_peers(gossip_msg, 2);
-                                
+
                                 if height % 30 == 0 {
                                     if crate::node::is_info() {
                                         println!("[INFO][P2P] Re-broadcasted block #{} to 2 random peers", height);
@@ -11681,10 +11677,7 @@ impl SimplifiedP2P {
                 self.seen_tx_hashes.insert(tx_hash.clone());
                 
                 // PRODUCTION v2.19.25: Full transaction processing
-                let tx_guard = match self.transaction_tx.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner()
-                };
+                let tx_guard = self.transaction_tx.lock();
                 
                 if let Some(ref tx_sender) = *tx_guard {
                     // Create received transaction for processing
@@ -11699,10 +11692,10 @@ impl SimplifiedP2P {
                     };
                     
                     // Send to node for validation and mempool addition
-                    match tx_sender.send(received_tx) {
+                    match tx_sender.try_send(received_tx) {
                         Ok(_) => {
                             if crate::node::is_info() {
-                                println!("[INFO][P2P] Transaction {} from {} queued for processing", 
+                                println!("[INFO][P2P] Transaction {} from {} queued for processing",
                                          &tx_hash[..tx_hash.len().min(16)], from_peer);
                             }
                         }
@@ -11737,6 +11730,15 @@ impl SimplifiedP2P {
                         println!("[WARN][ANTI-STORM] seen_tx_hashes emergency_clear cap=1M");
                     }
                 }
+                // SECURITY: Cap batch size to prevent OOM from oversized P2P batches
+                const MAX_TX_BATCH_SIZE: usize = 10_000;
+                if transactions.len() > MAX_TX_BATCH_SIZE {
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] tx_batch_oversized count={} cap={} peer={}",
+                                transactions.len(), MAX_TX_BATCH_SIZE, from_peer);
+                    }
+                    return;
+                }
                 let mut new_txs: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
                 for tx_data in &transactions {
                     let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_data));
@@ -11751,10 +11753,7 @@ impl SimplifiedP2P {
                     return;
                 }
                 
-                let tx_guard = match self.transaction_tx.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner()
-                };
+                let tx_guard = self.transaction_tx.lock();
                 
                 if let Some(ref tx_sender) = *tx_guard {
                     let mut processed = 0usize;
@@ -11772,7 +11771,7 @@ impl SimplifiedP2P {
                                 .as_secs(),
                         };
                         
-                        if tx_sender.send(received_tx).is_ok() {
+                        if tx_sender.try_send(received_tx).is_ok() {
                             processed += 1;
                         }
                     }
@@ -12133,7 +12132,7 @@ impl SimplifiedP2P {
                 };
                 
                 // Queue macroblock for processing via macroblock_tx channel
-                if let Some(ref macroblock_tx) = &*match self.macroblock_tx.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
+                if let Some(ref macroblock_tx) = &*self.macroblock_tx.lock() {
                     // v3.1: DEDUPLICATION for macroblock broadcast
                     // Same macroblock can arrive from multiple peers
                     if !mark_macroblock_pending_sync(index) {
@@ -12154,7 +12153,7 @@ impl SimplifiedP2P {
                             .as_secs(),
                     };
                     
-                    if let Err(e) = macroblock_tx.send(received_macroblock) {
+                    if let Err(e) = macroblock_tx.try_send(received_macroblock) {
                         clear_macroblock_pending_sync(index); // Clear on error
                         if crate::node::is_warn() {
                             println!("[ERR][MB-RX] queue failed idx={}: {}", index, e);
@@ -12725,7 +12724,7 @@ impl SimplifiedP2P {
                 // OPTIMISTIC: Save certificate to pending cache IMMEDIATELY
                 // This prevents race conditions where blocks arrive before verification completes
                 {
-                    let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let mut cert_manager = self.certificate_manager.write();
                     let now = self.current_timestamp();
                     
                     // Check if already in pending or verified
@@ -12823,7 +12822,7 @@ impl SimplifiedP2P {
  // expires_at > now
                             // ═══════════════════════════════════════════════════════════════════
                             {
-                                let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                                let mut cert_manager = cert_manager_clone.write();
                                 
                                 // ATOMIC MOVE: First add to verified, THEN remove from pending
                                 // This prevents race condition where cert is in neither cache
@@ -12847,16 +12846,14 @@ impl SimplifiedP2P {
                             }
                             
                             // CRITICAL: Remove invalid certificate from pending cache
-                            let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                            let mut cert_manager = cert_manager_clone.write();
                             cert_manager.pending_certificates.remove(&cert_serial_clone);
                             if crate::node::is_info() {
                                 println!("[INFO][CERT] removed serial={} reason=invalid", cert_serial_clone);
                             }
                             
                             // Apply reputation penalty
-                            if let Ok(mut rep) = reputation_system_clone.lock() {
-                                rep.update_reputation(&node_id_clone, -10.0);
-                            }
+                            reputation_system_clone.lock().update_reputation(&node_id_clone, -10.0);
                         }
                         Err(e) => {
                             if crate::node::is_warn() {
@@ -12864,7 +12861,7 @@ impl SimplifiedP2P {
                             }
                             
                             // Remove failed certificate from pending cache
-                            let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                            let mut cert_manager = cert_manager_clone.write();
                             cert_manager.pending_certificates.remove(&cert_serial_clone);
                             if crate::node::is_info() {
                                 println!("[INFO][CERT] removed serial={} reason=verification_failed", cert_serial_clone);
@@ -12873,7 +12870,7 @@ impl SimplifiedP2P {
                     }
                     
                     // CLEANUP: Clean expired pending certificates periodically
-                    let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let mut cert_manager = cert_manager_clone.write();
                     if cert_manager.pending_certificates.len() > 50 {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -12908,7 +12905,7 @@ impl SimplifiedP2P {
                 
                 // Check if we have the certificate and send response
                 // MUST use write lock to track usage_count for proper LRU
-                let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                let mut cert_manager = self.certificate_manager.write();
                 if let Some(certificate) = cert_manager.get_and_mark_used(&cert_serial) {
                     drop(cert_manager); // Release lock before network operations
                     
@@ -12977,7 +12974,7 @@ impl SimplifiedP2P {
                 }
                 
                 // Store received certificate
-                let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                let mut cert_manager = self.certificate_manager.write();
                 cert_manager.store_remote_certificate(cert_serial.clone(), certificate);
                 if crate::node::is_info() {
                     println!("[INFO][P2P] Received certificate {} cached", cert_serial);
@@ -13007,7 +13004,7 @@ impl SimplifiedP2P {
                 
                 // DEDUPE: Check if already in registry
                 {
-                    let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let registry = self.light_node_registry.read();
                     if let Some(existing) = registry.get(&node_id) {
                         // Already have this registration
                         // SECURITY: Only accept updates with newer timestamp
@@ -13080,7 +13077,7 @@ impl SimplifiedP2P {
                 
                 // Store in local registry with LRU eviction
                 {
-                    let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let mut registry = self.light_node_registry.write();
                     
                     // LRU eviction: Remove oldest entries if at capacity
                     if registry.len() >= MAX_LIGHT_NODE_REGISTRY_SIZE {
@@ -13165,7 +13162,7 @@ impl SimplifiedP2P {
                 // Collect registrations newer than or equal to last_sync_timestamp
                 // FIX: Use >= to include nodes registered at exactly last_sync_timestamp
                 let registrations: Vec<LightNodeRegistrationData> = {
-                    let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let registry = self.light_node_registry.read();
                     registry.values()
                         .filter(|r| r.registered_at >= last_sync_timestamp)
                         .cloned()
@@ -13173,7 +13170,7 @@ impl SimplifiedP2P {
                 };
                 
                 let total_count = {
-                    let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let registry = self.light_node_registry.read();
                     registry.len() as u64
                 };
                 
@@ -13200,7 +13197,7 @@ impl SimplifiedP2P {
                 // Merge into local registry
                 let mut added = 0;
                 {
-                    let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let mut registry = self.light_node_registry.write();
                     for reg in registrations {
                         if !registry.contains_key(&reg.node_id) {
                             registry.insert(reg.node_id.clone(), reg);
@@ -13229,7 +13226,7 @@ impl SimplifiedP2P {
                 // DEDUPE: Check if we already have attestation for this slot
                 let attestation_key = format!("{}:{}", light_node_id, slot);
                 {
-                    let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let attestations = self.light_node_attestations.read();
                     if attestations.contains_key(&attestation_key) {
                         // Already have attestation for this Light node in this slot
                         return;
@@ -13260,7 +13257,7 @@ impl SimplifiedP2P {
                 
                 // VERIFY: Light node must be in registry
                 {
-                    let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let registry = self.light_node_registry.read();
                     if !registry.contains_key(&light_node_id) {
                         if crate::node::is_info() {
                             println!("[ERR][P2P] Unknown Light node {}", light_node_id);
@@ -13281,7 +13278,7 @@ impl SimplifiedP2P {
                 
                 // Store attestation with capacity check
                 {
-                    let mut attestations = match self.light_node_attestations.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let mut attestations = self.light_node_attestations.write();
                     
                     // Capacity check: cleanup oldest if at limit
                     if attestations.len() >= MAX_ATTESTATIONS_SIZE {
@@ -13889,7 +13886,15 @@ impl SimplifiedP2P {
             _ => return false,
         };
         
-        let verifying_key = match VerifyingKey::from_bytes(&pubkey_bytes.try_into().unwrap_or([0u8; 32])) {
+        // FIX R26-H2: reject on conversion failure instead of zero-key fallback
+        let pubkey_array: [u8; 32] = match pubkey_bytes.try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                println!("[WARN][P2P] sig_verify_pubkey_conversion_fail wallet={}...", &wallet_address[..8.min(wallet_address.len())]);
+                return false;
+            }
+        };
+        let verifying_key = match VerifyingKey::from_bytes(&pubkey_array) {
             Ok(key) => key,
             Err(_) => return false,
         };
@@ -15042,7 +15047,7 @@ impl SimplifiedP2P {
                         // Check if we already sent this heartbeat for current epoch
                         let heartbeat_key = format!("{}:{}:{}", node_id, index, current_epoch);
                         let already_sent = {
-                            let history = match p2p.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
+                            let history = p2p.heartbeat_history.read();
                             history.contains_key(&heartbeat_key)
                         };
                         
@@ -15104,7 +15109,7 @@ impl SimplifiedP2P {
                             // Record locally in RAM (for HeartbeatCommitment TX creation)
                             // v2.59: Include block_height for reliable epoch-based filtering
                             {
-                                let mut history = match p2p.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                                let mut history = p2p.heartbeat_history.write();
                                 history.insert(heartbeat_key.clone(), HeartbeatRecord {
                                     node_id: node_id.clone(),
                                     timestamp: now,
@@ -15141,7 +15146,7 @@ impl SimplifiedP2P {
                     if block_height > *target_height + 10 && block_height <= *target_height + 50 {
                         let heartbeat_key = format!("{}:{}:{}", node_id, index, current_epoch);
                         let already_sent = {
-                            let history = match p2p.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
+                            let history = p2p.heartbeat_history.read();
                             history.contains_key(&heartbeat_key)
                         };
                         
@@ -15185,7 +15190,7 @@ impl SimplifiedP2P {
                             
                             // Record locally in RAM
                             {
-                                let mut history = match p2p.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                                let mut history = p2p.heartbeat_history.write();
                                 history.insert(heartbeat_key.clone(), HeartbeatRecord {
                                     node_id: node_id.clone(),
                                     timestamp: now,
@@ -15451,7 +15456,7 @@ impl SimplifiedP2P {
         
         // Only cleanup once per hour
         {
-            let mut last_cleanup = match self.last_heartbeat_cleanup.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut last_cleanup = self.last_heartbeat_cleanup.lock();
             if now - *last_cleanup < 3600 {
                 return;
             }
@@ -15462,7 +15467,7 @@ impl SimplifiedP2P {
         let mut removed = 0;
         
         {
-            let mut history = match self.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut history = self.heartbeat_history.write();
             history.retain(|_, record| {
                 if record.timestamp < cutoff {
                     removed += 1;
@@ -15522,10 +15527,7 @@ impl SimplifiedP2P {
         
         // CRITICAL: Read from RAM (heartbeat_history) which contains ALL nodes' heartbeats via gossip
         // This is the CORRECT approach - gossip ensures all nodes receive heartbeats
-        let history = match self.heartbeat_history.read() { 
-            Ok(g) => g, 
-            Err(p) => p.into_inner() 
-        };
+        let history = self.heartbeat_history.read();
         
         for (_, record) in history.iter() {
             // CRITICAL FIX v2.59: Filter by block_height instead of timestamp
@@ -15637,10 +15639,7 @@ impl SimplifiedP2P {
         // Light nodes need only 1 attestation per epoch to be eligible for rewards.
         // ═══════════════════════════════════════════════════════════════════════════
         {
-            let attestations = match self.light_node_attestations.read() { 
-                Ok(g) => g, 
-                Err(p) => p.into_inner() 
-            };
+            let attestations = self.light_node_attestations.read();
             
             // Group attestations by light_node_id, filtered by block_height
             let mut light_node_attestations_map: std::collections::HashMap<String, Vec<u64>> = 
@@ -15763,10 +15762,7 @@ impl SimplifiedP2P {
         use blake3::Hasher;
         
         // Collect node's own heartbeats from RAM
-        let history = match self.heartbeat_history.read() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let history = self.heartbeat_history.read();
         
         // Filter heartbeats for this epoch and this node
         let mut node_heartbeats: Vec<_> = history.iter()
@@ -15905,14 +15901,14 @@ impl SimplifiedP2P {
     
     /// Get Light Node registry (for ping service)
     pub fn get_light_node_registry(&self) -> HashMap<String, LightNodeRegistrationData> {
-        match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() }.clone()
+        self.light_node_registry.read().clone()
     }
     
     /// Register Light node locally and gossip to network
     pub fn register_light_node(&self, registration: LightNodeRegistrationData) {
         // Store locally
         {
-            let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut registry = self.light_node_registry.write();
             registry.insert(registration.node_id.clone(), registration.clone());
         }
         
@@ -15950,7 +15946,7 @@ impl SimplifiedP2P {
     /// This is the GUARANTEED path — gossip sync is supplementary.
     pub fn restore_light_nodes_from_storage(&self, nodes: Vec<(String, String, String, u64)>) -> usize {
         let mut added = 0;
-        let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut registry = self.light_node_registry.write();
         
         for (node_id, wallet_address, _node_type, registered_at) in nodes {
             if !registry.contains_key(&node_id) {
@@ -15995,10 +15991,7 @@ impl SimplifiedP2P {
         &self,
         storage: &crate::storage::Storage,
     ) {
-        let mut registry = match self.light_node_registry.write() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut registry = self.light_node_registry.write();
 
         let mut updated = 0usize;
         for node in registry.values_mut() {
@@ -16031,7 +16024,7 @@ impl SimplifiedP2P {
         
         // Get oldest registration timestamp we have
         let last_sync = {
-            let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+            let registry = self.light_node_registry.read();
             registry.values()
                 .map(|r| r.registered_at)
                 .max()
@@ -16063,7 +16056,7 @@ impl SimplifiedP2P {
         // Count successful heartbeats in current 4h window
         let mut count = 0u8;
         {
-            let history = match self.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
+            let history = self.heartbeat_history.read();
             for i in 0..10 {
                 let key = format!("{}:{}", node_id, i);
                 if let Some(record) = history.get(&key) {
@@ -16259,7 +16252,7 @@ impl SimplifiedP2P {
     /// Check if attestation already exists for Light node in current slot
     pub fn has_attestation(&self, light_node_id: &str, slot: u64) -> bool {
         let key = format!("{}:{}", light_node_id, slot);
-        let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let attestations = self.light_node_attestations.read();
         attestations.contains_key(&key)
     }
 
@@ -16273,7 +16266,7 @@ impl SimplifiedP2P {
         let current_window = Self::get_current_window_number();
         let primary_slot = Self::calculate_randomized_slot(light_node_id, current_window);
         let window_start = current_window * 4 * 60 * 60;
-        let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let attestations = self.light_node_attestations.read();
 
         [primary_slot, (primary_slot + 1) % 240, (primary_slot + 2) % 240]
             .iter()
@@ -16297,7 +16290,7 @@ impl SimplifiedP2P {
             .position(|(node_id, _, _)| node_id == our_node_id)
             .unwrap_or(0);
         
-        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let registry = self.light_node_registry.read();
         
         registry.values()
             .filter(|node| {
@@ -16351,7 +16344,7 @@ impl SimplifiedP2P {
         
         // Get all Light nodes from registry SORTED for consistent linear sharding
         // v2.89 CRITICAL: Must use same ordering as bitmap creation!
-        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let registry = self.light_node_registry.read();
         let mut all_nodes: Vec<_> = registry.values().cloned().collect();
         all_nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id)); // Sort by node_id
         let total_light_nodes = all_nodes.len();
@@ -16397,7 +16390,7 @@ impl SimplifiedP2P {
     /// Mark Light node as failed (no response to ping)
     /// After 5 consecutive failures, node is marked inactive
     pub fn mark_light_node_ping_failed(&self, node_id: &str) {
-        let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut registry = self.light_node_registry.write();
         if let Some(node) = registry.get_mut(node_id) {
             node.consecutive_failures = node.consecutive_failures.saturating_add(1);
             
@@ -16413,7 +16406,7 @@ impl SimplifiedP2P {
     
     /// Update push_type + last_seen for a light node (called on token-refresh).
     pub fn update_light_node_push_type(&self, node_id: &str, push_type_str: &str, timestamp: u64) {
-        let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut registry = self.light_node_registry.write();
         if let Some(node) = registry.get_mut(node_id) {
             node.push_type = match push_type_str {
                 "fcm"         => PushType::FCM,
@@ -16432,7 +16425,7 @@ impl SimplifiedP2P {
             .unwrap_or_default()
             .as_secs();
             
-        let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut registry = self.light_node_registry.write();
         if let Some(node) = registry.get_mut(node_id) {
             let was_inactive = !node.is_active;
             
@@ -16462,7 +16455,7 @@ impl SimplifiedP2P {
             .position(|(node_id, _, _)| node_id == our_node_id)
             .unwrap_or(0);
         
-        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let registry = self.light_node_registry.read();
         
         registry.values()
             .filter(|node| {
@@ -16494,7 +16487,7 @@ impl SimplifiedP2P {
         // Store locally first
         let key = format!("{}:{}", attestation.light_node_id, attestation.slot);
         {
-            let mut attestations = match self.light_node_attestations.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut attestations = self.light_node_attestations.write();
             attestations.insert(key, attestation);
         }
         
@@ -16504,20 +16497,14 @@ impl SimplifiedP2P {
     
     /// v2.89: Get total registered Light node count
     pub fn get_light_node_count(&self) -> usize {
-        let registry = match self.light_node_registry.read() { 
-            Ok(g) => g, 
-            Err(p) => p.into_inner() 
-        };
+        let registry = self.light_node_registry.read();
         registry.len()
     }
     
     /// v2.89: Get Light node index by ID (for bitmap creation)
     /// Returns deterministic index based on sorted order of node IDs
     pub fn get_light_node_index(&self, node_id: &str) -> Option<u32> {
-        let registry = match self.light_node_registry.read() { 
-            Ok(g) => g, 
-            Err(p) => p.into_inner() 
-        };
+        let registry = self.light_node_registry.read();
         
         // Get sorted list of all node IDs for deterministic ordering
         let mut ids: Vec<_> = registry.keys().collect();
@@ -16532,10 +16519,7 @@ impl SimplifiedP2P {
     /// This ensures bitmap indices are consistent between creation and reading.
     /// Inactive nodes simply have bit=0 in bitmap (no reward).
     pub fn get_all_light_node_ids_sorted(&self) -> Vec<String> {
-        let registry = match self.light_node_registry.read() { 
-            Ok(g) => g, 
-            Err(p) => p.into_inner() 
-        };
+        let registry = self.light_node_registry.read();
         
         // Return ALL node IDs, sorted for deterministic ordering
         // NO FILTER - this must match get_light_node_index() ordering!
@@ -16874,7 +16858,7 @@ impl SimplifiedP2P {
         
         let cutoff = now - (24 * 60 * 60);  // 24 hours ago
         
-        let mut attestations = match self.light_node_attestations.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut attestations = self.light_node_attestations.write();
         let before = attestations.len();
         attestations.retain(|_, v| v.timestamp > cutoff);
         let removed = before - attestations.len();
@@ -16900,7 +16884,7 @@ impl SimplifiedP2P {
         // Count attestations in current 4h window
         let mut count = 0u8;
         {
-            let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
+            let attestations = self.light_node_attestations.read();
             for slot in window_start_slot..=window_end_slot {
                 let key = format!("{}:{}", light_node_id, slot);
                 if attestations.contains_key(&key) {
@@ -16923,7 +16907,7 @@ impl SimplifiedP2P {
     pub fn get_attestations_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u64, String, u64)> {
         let window_end = window_start_timestamp + (4 * 60 * 60);
         
-        let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let attestations = self.light_node_attestations.read();
         attestations.values()
             .filter(|a| a.timestamp >= window_start_timestamp && a.timestamp < window_end)
             .map(|a| (a.light_node_id.clone(), a.slot, a.pinger_id.clone(), a.timestamp))
@@ -16933,7 +16917,7 @@ impl SimplifiedP2P {
     /// v2.64: Get Light node attestations filtered by BLOCK HEIGHT (deterministic!)
     /// Returns Vec<(light_node_id, slot, pinger_id, timestamp, block_height)>
     pub fn get_attestations_for_block_range(&self, start_height: u64, end_height: u64) -> Vec<(String, u64, String, u64, u64)> {
-        let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let attestations = self.light_node_attestations.read();
         
         let result: Vec<_> = attestations.values()
             .filter(|a| a.block_height >= start_height && a.block_height < end_height)
@@ -16955,7 +16939,7 @@ impl SimplifiedP2P {
     /// - Ensures 100% coverage of ONLINE Light nodes only
     /// Returns Vec of active Light node IDs currently in registry
     pub fn get_all_light_node_ids(&self) -> Vec<String> {
-        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let registry = self.light_node_registry.read();
         registry.values()
             .filter(|node| {
                 // PRODUCTION: Only active nodes
@@ -16981,7 +16965,7 @@ impl SimplifiedP2P {
     ) {
         let attestation_key = format!("{}:{}", light_node_id, slot);
         
-        let mut attestations = match self.light_node_attestations.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut attestations = self.light_node_attestations.write();
         
         attestations.insert(attestation_key, LightNodeAttestation {
             light_node_id,
@@ -17001,7 +16985,7 @@ impl SimplifiedP2P {
     pub fn get_heartbeats_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u8, u64)> {
         let window_end = window_start_timestamp + (4 * 60 * 60);
         
-        let heartbeats = match self.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let heartbeats = self.heartbeat_history.read();
         heartbeats.values()
             .filter(|h| h.timestamp >= window_start_timestamp && h.timestamp < window_end)
             .map(|h| (h.node_id.clone(), h.heartbeat_index, h.timestamp))
@@ -17012,7 +16996,7 @@ impl SimplifiedP2P {
     /// This ensures all nodes see the same heartbeats regardless of when they process the emission
     /// Block height epoch is deterministic, unlike UTC timestamps which depend on network start time
     pub fn get_heartbeats_for_block_range(&self, start_height: u64, end_height: u64) -> Vec<(String, u8, u64, u64)> {
-        let heartbeats = match self.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let heartbeats = self.heartbeat_history.read();
         
         let result: Vec<_> = heartbeats.values()
             .filter(|h| h.block_height >= start_height && h.block_height < end_height && h.verified)
@@ -17091,7 +17075,7 @@ impl SimplifiedP2P {
     /// DEPRECATED: Use get_eligible_light_nodes_by_height for deterministic emission
     pub fn get_eligible_light_nodes(&self, window_start_timestamp: u64) -> Vec<(String, String)> {
         let attestations = self.get_attestations_for_window(window_start_timestamp);
-        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let registry = self.light_node_registry.read();
         
         // Dedupe by node_id (only need 1 attestation per Light node)
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -17111,7 +17095,7 @@ impl SimplifiedP2P {
     /// v2.64: Get eligible Light nodes by BLOCK HEIGHT (deterministic!)
     pub fn get_eligible_light_nodes_by_height(&self, start_height: u64, end_height: u64) -> Vec<(String, String)> {
         let attestations = self.get_attestations_for_block_range(start_height, end_height);
-        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let registry = self.light_node_registry.read();
         
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut eligible = Vec::new();
@@ -17214,7 +17198,7 @@ impl SimplifiedP2P {
     
     /// Get Light node wallet address from registry
     pub fn get_light_node_wallet(&self, node_id: &str) -> Option<String> {
-        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let registry = self.light_node_registry.read();
         registry.get(node_id).map(|r| r.wallet_address.clone())
     }
 }
@@ -17391,7 +17375,7 @@ impl SimplifiedP2P {
         // CRITICAL FIX: Send sync request to node.rs where storage is available
         // v5.6: Include from_peer address so response can reach unregistered peers
         if let Some(ref sync_tx) = self.sync_request_tx {
-            if let Err(e) = sync_tx.send((from_height, actual_to, requester_id.clone(), from_peer.to_string())) {
+            if let Err(e) = sync_tx.try_send((from_height, actual_to, requester_id.clone(), from_peer.to_string())) {
                 if crate::node::is_warn() {
                     println!("[WARN][SYNC] request_forward_failed err={}", e);
                 }
@@ -17478,7 +17462,7 @@ impl SimplifiedP2P {
         };
         
         // CRITICAL: Send blocks to block receiver for processing
-        if let Some(ref block_tx) = &*match self.block_tx.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
+        if let Some(ref block_tx) = &*self.block_tx.lock() {
             let mut queued = 0u32;
             let mut skipped_exists = 0u32;
             let skipped_pending = 0u32;
@@ -17510,7 +17494,7 @@ impl SimplifiedP2P {
                 };
                 
                 // Send to block processor
-                if let Err(e) = block_tx.send(received_block) {
+                if let Err(e) = block_tx.try_send(received_block) {
                     clear_block_pending_sync(height); // Remove from pending on error
                     if crate::node::is_warn() {
                         println!("[WARN][SYNC] queue_fail h={} err={}", height, e);
@@ -17653,7 +17637,7 @@ impl SimplifiedP2P {
         
         // CRITICAL: Send macroblock sync request to node.rs where storage is available
         if let Some(ref sync_tx) = self.macroblock_sync_request_tx {
-            if let Err(e) = sync_tx.send((from_index, actual_to, requester_id.clone())) {
+            if let Err(e) = sync_tx.try_send((from_index, actual_to, requester_id.clone())) {
                 if crate::node::is_info() {
                     println!("[ERR][SYNC] Failed to send sync request to node: {}", e);
                 }
@@ -17694,7 +17678,7 @@ impl SimplifiedP2P {
         self.update_peer_last_seen(&sender_id);
         
         // CRITICAL: Send macroblocks to macroblock receiver for processing
-        if let Some(ref macroblock_tx) = &*match self.macroblock_tx.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
+        if let Some(ref macroblock_tx) = &*self.macroblock_tx.lock() {
             let mut queued = 0;
             let mut skipped_dup = 0;
             
@@ -17718,7 +17702,7 @@ impl SimplifiedP2P {
                 };
                 
                 // Send to macroblock processor
-                if let Err(e) = macroblock_tx.send(received_macroblock) {
+                if let Err(e) = macroblock_tx.try_send(received_macroblock) {
                     clear_macroblock_pending_sync(index); // Clear on error
                     if crate::node::is_info() {
                         println!("[ERR][SYNC] Failed to queue macroblock {} for processing: {}", index, e);
@@ -18683,9 +18667,7 @@ impl SimplifiedP2P {
                         if added_count > 0 {
                             // Invalidate actor-based cache (primary)
                             let new_epoch = CACHE_ACTOR.increment_epoch();
-                            if let Ok(mut peers_cache) = CACHE_ACTOR.peers_cache.write() {
-                                *peers_cache = None;
-                            }
+                            *CACHE_ACTOR.peers_cache.write() = None;
 
                             if crate::node::is_info() {
                                 println!("[INFO][P2P] peer_cache_invalidated after_exchange added={} epoch={}", added_count, new_epoch);
@@ -18788,8 +18770,7 @@ impl SimplifiedP2P {
             .map_err(|e| format!("Invalid addr: {}", e))?;
 
         let transport_arc = {
-            let guard = GLOBAL_QUIC_TRANSPORT.read()
-                .map_err(|e| format!("QUIC lock: {}", e))?;
+            let guard = GLOBAL_QUIC_TRANSPORT.read();
             match &*guard {
                 Some(arc) => arc.clone(),
                 None => return Err("QUIC not initialized".to_string()),
@@ -18797,10 +18778,7 @@ impl SimplifiedP2P {
         };
 
         let request = NetworkMessage::PeerListRequest {
-            requester_id: match GLOBAL_NODE_ID.read() {
-                Ok(g) => g.clone(),
-                Err(_) => String::new(),
-            },
+            requester_id: GLOBAL_NODE_ID.read().clone(),
         };
 
         let transport = transport_arc.read().await;
@@ -20709,7 +20687,7 @@ impl SimplifiedP2P {
                 timestamp,
             };
             
-            if let Err(e) = consensus_tx.send(consensus_msg) {
+            if let Err(e) = consensus_tx.try_send(consensus_msg) {
                 if crate::node::is_info() {
                     println!("[ERR][CONS] Failed to forward commit to consensus engine: {}", e);
                 }
@@ -20852,7 +20830,7 @@ impl SimplifiedP2P {
                 signature,  // v2.48: Dilithium signature for Byzantine safety
             };
             
-            if let Err(e) = consensus_tx.send(consensus_msg) {
+            if let Err(e) = consensus_tx.try_send(consensus_msg) {
                 if crate::node::is_info() {
                     println!("[ERR][CONS] Failed to forward reveal to consensus engine: {}", e);
                 }
@@ -22563,13 +22541,12 @@ impl SimplifiedP2P {
         use std::sync::Arc;
         
         // Get current reputation state and jail statuses
-        let (reputation_updates, jail_updates) = if let Ok(reputation) = self.reputation_system.lock() {
+        let (reputation_updates, jail_updates) = {
+            let reputation = self.reputation_system.lock();
             (
                 reputation.get_all_reputations().into_iter().collect::<Vec<_>>(),
                 reputation.get_all_jail_statuses()
             )
-        } else {
-            return Err("Failed to lock reputation system".to_string());
         };
         
         if reputation_updates.is_empty() {
@@ -22720,18 +22697,14 @@ impl SimplifiedP2P {
                 iteration += 1;
                 
                 // Get current reputation state and jail statuses
-                let (reputation_updates, jail_updates) = if let Ok(reputation) = reputation_system.lock() {
+                let (reputation_updates, jail_updates) = {
+                    let reputation = reputation_system.lock();
                     let all_reps = reputation.get_all_reputations();
                     let all_jails = reputation.get_all_jail_statuses();
                     if all_reps.is_empty() && all_jails.is_empty() {
                         continue; // Nothing to sync
                     }
                     (all_reps.into_iter().collect::<Vec<_>>(), all_jails)
-                } else {
-                    if crate::node::is_info() {
-                        println!("[WARN][REP] Failed to lock reputation system");
-                    }
-                    continue;
                 };
                 
                 // Create signature for updates

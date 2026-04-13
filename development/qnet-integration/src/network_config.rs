@@ -75,7 +75,7 @@ impl QNetNetworkConfig {
             _ => NetworkEnvironment::Testnet, // Default to testnet
         };
         
-        println!("рџЊђ Network environment: {:?}", environment);
+        println!("[INFO][CONFIG] network_environment={:?}", environment);
         Self::for_environment(environment)
     }
     
@@ -104,15 +104,30 @@ impl QNetNetworkConfig {
         }
     }
     
-    /// Mainnet configuration 
+    /// Mainnet configuration
+    /// FIX R24-M3: Fail-fast if mainnet launched with TBD placeholder addresses.
+    /// Prevents silent activation bypass where burn verification uses literal "TBD" strings.
     fn mainnet_config() -> Self {
+        let onedev_mint = std::env::var("QNET_MAINNET_1DEV_MINT")
+            .unwrap_or_else(|_| "MAINNET_1DEV_MINT_ADDRESS_TBD".to_string());
+        let burn_contract = std::env::var("QNET_MAINNET_BURN_CONTRACT")
+            .unwrap_or_else(|_| "MAINNET_BURN_CONTRACT_TBD".to_string());
+
+        if onedev_mint.contains("TBD") || burn_contract.contains("TBD") {
+            eprintln!("[CRITICAL][CONFIG] mainnet_tbd_detected mint={} burn={}",
+                      &onedev_mint[..20.min(onedev_mint.len())],
+                      &burn_contract[..20.min(burn_contract.len())]);
+            eprintln!("[CRITICAL][CONFIG] set QNET_MAINNET_1DEV_MINT and QNET_MAINNET_BURN_CONTRACT env vars");
+            std::process::exit(1);
+        }
+
         Self {
             environment: NetworkEnvironment::Mainnet,
             network_id: "qnet-mainnet-v1".to_string(),
             chain_id: 1,
             endpoints: NetworkEndpoints {
                 qnet_rpc: "https://rpc.qnet.io".to_string(),
-                qnet_api: "".to_string(), // Direct node connections - no central API
+                qnet_api: "".to_string(),
                 bridge_api: "https://bridge.qnet.io".to_string(),
                 wallet_url: "https://wallet.qnet.io".to_string(),
                 explorer_url: "https://explorer.qnet.io".to_string(),
@@ -120,12 +135,12 @@ impl QNetNetworkConfig {
             },
             solana: SolanaConfig {
                 rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
-                onedev_mint: "MAINNET_1DEV_MINT_ADDRESS_TBD".to_string(),
-                burn_contract: "MAINNET_BURN_CONTRACT_TBD".to_string(),
+                onedev_mint,
+                burn_contract,
                 burn_address: "1nc1nerator11111111111111111111111111111111".to_string(),
                 commitment: "finalized".to_string(),
             },
-            genesis_timestamp: None, // Will be set when mainnet launches
+            genesis_timestamp: None,
         }
     }
     

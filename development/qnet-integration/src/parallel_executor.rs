@@ -240,17 +240,26 @@ impl ParallelExecutor {
         while !remaining.is_empty() {
             let mut batch = Vec::new();
             let mut batch_writes = HashSet::new();
-            
+            let mut batch_reads = HashSet::new();
+
             for &idx in remaining.iter() {
                 let ctx = &contexts[idx];
-                
+
                 // Check if this transaction conflicts with current batch
-                let has_conflict = ctx.reads.intersection(&batch_writes).count() > 0 ||
-                                  ctx.writes.intersection(&batch_writes).count() > 0;
-                
+                let has_raw = ctx.reads.intersection(&batch_writes).count() > 0;  // RAW
+                let has_waw = ctx.writes.intersection(&batch_writes).count() > 0; // WAW
+                let has_war = ctx.writes.intersection(&batch_reads).count() > 0;  // WAR
+                let has_conflict = has_raw || has_waw || has_war;
+
+                if has_war && !has_raw && !has_waw {
+                    let conflicting: Vec<_> = ctx.writes.intersection(&batch_reads).cloned().collect();
+                    log::debug!("[DEBUG][PARALLEL] war_conflict tx={} conflicting_keys={}", idx, conflicting.join(","));
+                }
+
                 if !has_conflict {
                     batch.push(idx);
                     batch_writes.extend(ctx.writes.clone());
+                    batch_reads.extend(ctx.reads.clone());
                 }
             }
             

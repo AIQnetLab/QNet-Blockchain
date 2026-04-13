@@ -100,11 +100,29 @@ impl ForkChoice {
     
     /// Add new block
     pub fn add_block(&mut self, block: BlockInfo) -> Result<(), ForkError> {
-        // Check parent exists
-        if !self.blocks.contains_key(&block.parent) {
-            return Err(ForkError::UnknownParent);
+        // SECURITY: Idempotent — reject duplicate block hashes
+        if self.blocks.contains_key(&block.hash) {
+            return Ok(()); // Already known, silently accept
         }
-        
+
+        // Check parent exists
+        let parent = self.blocks.get(&block.parent)
+            .ok_or(ForkError::UnknownParent)?;
+
+        // Validate block height is exactly parent + 1
+        if block.height != parent.height + 1 {
+            println!("[REJECT][FORK] invalid_height block_h={} parent_h={} expected={}",
+                     block.height, parent.height, parent.height + 1);
+            return Err(ForkError::InvalidBlockHeight);
+        }
+
+        // Validate block timestamp is not before parent
+        if block.timestamp < parent.timestamp {
+            println!("[REJECT][FORK] invalid_timestamp block_ts={} parent_ts={}",
+                     block.timestamp, parent.timestamp);
+            return Err(ForkError::InvalidTimestamp);
+        }
+
         // Add to tree
         self.blocks.insert(block.hash, block.clone());
         self.children.entry(block.parent)
@@ -167,18 +185,17 @@ impl ForkChoice {
             .ok_or(ForkError::UnknownBlock)?;
         
         // Base score from subtree weight
-        let weight = self.calculate_subtree_weight(block_hash)?;
+        let weight = self.calculate_subtree_weight(block_hash, 0)?;
         
         // Reputation bonus (already in 0-100 scale)
         let reputation_bonus = block.proposer_reputation;
         
-        // Time penalty for old blocks (reduced impact for tests)
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let age_penalty = if block.timestamp > 0 && current_time > block.timestamp {
-            ((current_time - block.timestamp) as f64 / 3600.0).min(1.0) // Max 1.0 penalty, 1 hour scale
+        // Deterministic age penalty: use chain tip timestamp, not wall clock
+        let chain_tip_time = self.blocks.get(&self.head)
+            .map(|b| b.timestamp)
+            .unwrap_or(0);
+        let age_penalty = if block.timestamp > 0 && chain_tip_time > block.timestamp {
+            ((chain_tip_time - block.timestamp) as f64 / 3600.0).min(1.0) // Max 1.0 penalty, 1 hour scale
         } else {
             0.0
         };
@@ -187,15 +204,18 @@ impl ForkChoice {
     }
     
     /// Calculate total weight of subtree
-    fn calculate_subtree_weight(&self, root: BlockHash) -> Result<u64, ForkError> {
+    fn calculate_subtree_weight(&self, root: BlockHash, depth: u32) -> Result<u64, ForkError> {
+        if depth > 10_000 {
+            return Ok(1); // prevent stack overflow on extremely deep chains
+        }
         let mut weight = 1; // Self weight
-        
+
         if let Some(children) = self.children.get(&root) {
             for &child in children {
-                weight += self.calculate_subtree_weight(child)?;
+                weight += self.calculate_subtree_weight(child, depth + 1)?;
             }
         }
-        
+
         Ok(weight)
     }
     
@@ -410,6 +430,12 @@ pub enum ForkError {
     
     #[error("Invalid state")]
     InvalidState,
+
+    #[error("Invalid block height")]
+    InvalidBlockHeight,
+
+    #[error("Invalid timestamp")]
+    InvalidTimestamp,
 }
 
 /// Fork information

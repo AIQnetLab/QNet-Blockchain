@@ -87,6 +87,45 @@
 use base64::{Engine as _, engine::general_purpose};
 use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SignedMessage as PQSignedMessage};
 
+// ============================================================================
+// FIX H14: Consensus-layer PK registry for node identity binding
+// ============================================================================
+// Prevents self-attested PK attacks: verify_with_real_dilithium() extracts PK
+// from the signature itself, so we cross-check against this trusted registry.
+// Registry is populated by the P2P/integration layer during node registration.
+// ============================================================================
+
+lazy_static::lazy_static! {
+    /// Trusted PK registry: node_id -> dilithium3 public key bytes
+    /// Populated by integration layer via register_consensus_pk()
+    static ref CONSENSUS_PK_REGISTRY: parking_lot::RwLock<std::collections::HashMap<String, Vec<u8>>> =
+        parking_lot::RwLock::new(std::collections::HashMap::new());
+}
+
+/// Maximum registry size to prevent unbounded growth (scalable for thousands of nodes)
+const MAX_CONSENSUS_PK_REGISTRY: usize = 50_000;
+
+/// Register a node's public key for consensus-layer identity binding.
+/// Called by the P2P/integration layer after verifying node identity.
+pub fn register_consensus_pk(node_id: &str, pk_bytes: &[u8]) {
+    if pk_bytes.len() != 1952 {
+        eprintln!("[WARN][CONSENSUS] pk_register_invalid_size node={} size={}", node_id, pk_bytes.len());
+        return;
+    }
+    let mut registry = CONSENSUS_PK_REGISTRY.write();
+    if registry.len() >= MAX_CONSENSUS_PK_REGISTRY && !registry.contains_key(node_id) {
+        eprintln!("[WARN][CONSENSUS] pk_registry_full size={}", registry.len());
+        return;
+    }
+    registry.insert(node_id.to_string(), pk_bytes.to_vec());
+    println!("[INFO][CONSENSUS] pk_registered node={} total={}", node_id, registry.len());
+}
+
+/// Check if a node has a registered PK in the consensus layer.
+pub fn has_consensus_pk(node_id: &str) -> bool {
+    CONSENSUS_PK_REGISTRY.read().contains_key(node_id)
+}
+
 /// Verify consensus signature using hybrid cryptography
 pub async fn verify_consensus_signature(
     node_id: &str,
@@ -742,13 +781,10 @@ async fn verify_hybrid_signature(
             }
         }
         
-        // Legacy: structure-only validation (for backwards compatibility)
-        // This should be deprecated in production
-        println!("[WARN][CONSENSUS_CRYPTO] hybrid_sig_without_dilithium mode=legacy");
-        if has_certificate && has_message_sig {
-            println!("[INFO][CONSENSUS_CRYPTO] hybrid_signature_structure_valid mode=legacy");
-            return true;
-        }
+        // SECURITY: Legacy bypass REMOVED — Dilithium verification is MANDATORY
+        // Hybrid signatures without valid Dilithium fields are rejected
+        println!("[WARN][CONSENSUS_CRYPTO] hybrid_sig_rejected reason=missing_dilithium_fields");
+        return false;
     }
     
     println!("[ERR][CONSENSUS_CRYPTO] invalid_hybrid_signature_structure");
@@ -889,6 +925,24 @@ async fn verify_with_real_dilithium(
     let signed_message_bytes = &signature_bytes[4..4 + signed_len];
     let public_key_bytes = &signature_bytes[pk_start..pk_start + pk_len];
 
+    // FIX H14: Verify extracted PK matches registered key for this node
+    // The PK is extracted from the signature itself (self-attested), so we must
+    // cross-check against a trusted registry populated at the P2P layer
+    {
+        let registry = CONSENSUS_PK_REGISTRY.read();
+        if let Some(registered_pk) = registry.get(node_id) {
+            if registered_pk != public_key_bytes {
+                eprintln!("[ERR][CONSENSUS] pk_mismatch node={} registered={}.. extracted={}..{}",
+                         node_id,
+                         hex::encode(&registered_pk[..8]),
+                         hex::encode(&public_key_bytes[..8]),
+                         " REJECTING");
+                return false;
+            }
+        }
+        // If no key registered yet, allow (first-seen) — binding enforced after registration
+    }
+
     // Parse ML-DSA-65 public key
     let public_key = match dilithium3::PublicKey::from_bytes(public_key_bytes) {
         Ok(pk) => pk,
@@ -929,12 +983,22 @@ async fn verify_with_real_dilithium(
     }
 }
 
-/// Constant-time byte slice comparison — prevents timing side-channel attacks.
+/// Constant-time byte slice comparison -- prevents timing side-channel attacks.
 /// Returns true only if slices are equal in length and content.
+/// FIX L-C2ct: Also constant-time for length to prevent length-based timing leaks.
 #[inline(never)]
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
-        return false;
+        // Still do full comparison to avoid timing leak on length mismatch
+        let max_len = a.len().max(b.len());
+        let mut result: u8 = 1; // Start with "not equal" since lengths differ
+        for i in 0..max_len {
+            let byte_a = a.get(i).copied().unwrap_or(0);
+            let byte_b = b.get(i).copied().unwrap_or(0);
+            result |= byte_a ^ byte_b;
+        }
+        std::hint::black_box(result);
+        return false; // Always false for different lengths, but took constant time
     }
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {

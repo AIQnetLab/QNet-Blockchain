@@ -83,10 +83,10 @@ pub struct PoHEntry {
 }
 
 /// Thread-safe PoH state
-/// 
+///
 /// DESIGN: Uses separate locks for hash and count to allow concurrent reads
 /// while preventing race conditions during updates.
-/// 
+///
 /// INVARIANT: hash_count MUST always increase monotonically
 #[derive(Debug)]
 pub struct QuantumPoH {
@@ -97,19 +97,23 @@ pub struct QuantumPoH {
     /// Current slot number (atomic for fast reads)
     current_slot: Arc<AtomicU64>,
     /// Channel for PoH entries
-    entry_sender: mpsc::UnboundedSender<PoHEntry>,
+    entry_sender: mpsc::Sender<PoHEntry>,
     /// Running flag (atomic for lock-free check)
     is_running: Arc<AtomicBool>,
     /// Performance metrics
     hashes_per_second: Arc<AtomicU64>,
     /// Mutex to serialize hash updates (prevents race between generator and mix_transaction)
     update_mutex: Arc<Mutex<()>>,
+    /// Timestamp of last backward sync (epoch seconds, for rate limiting)
+    last_backward_sync: Arc<AtomicU64>,
+    /// Count of backward syncs performed (for diagnostics)
+    backward_sync_count: Arc<AtomicU64>,
 }
 
 impl QuantumPoH {
     /// Create new Quantum VTS instance from genesis hash
-    pub fn new(genesis_hash: Vec<u8>) -> (Self, mpsc::UnboundedReceiver<PoHEntry>) {
-        let (entry_sender, entry_receiver) = mpsc::unbounded_channel();
+    pub fn new(genesis_hash: Vec<u8>) -> (Self, mpsc::Receiver<PoHEntry>) {
+        let (entry_sender, entry_receiver) = mpsc::channel(10_000); // Bounded: 10K PoH entries max
         
         let mut hash_bytes = [0u8; 64];
         let copy_len = genesis_hash.len().min(64);
@@ -123,14 +127,16 @@ impl QuantumPoH {
             is_running: Arc::new(AtomicBool::new(false)),
             hashes_per_second: Arc::new(AtomicU64::new(0)),
             update_mutex: Arc::new(Mutex::new(())),
+            last_backward_sync: Arc::new(AtomicU64::new(0)),
+            backward_sync_count: Arc::new(AtomicU64::new(0)),
         };
-        
+
         (poh, entry_receiver)
     }
     
     /// Create new Quantum VTS instance from a checkpoint
-    pub fn new_from_checkpoint(hash: Vec<u8>, count: u64) -> (Self, mpsc::UnboundedReceiver<PoHEntry>) {
-        let (entry_sender, entry_receiver) = mpsc::unbounded_channel();
+    pub fn new_from_checkpoint(hash: Vec<u8>, count: u64) -> (Self, mpsc::Receiver<PoHEntry>) {
+        let (entry_sender, entry_receiver) = mpsc::channel(10_000); // Bounded: 10K PoH entries max
         
         let mut hash_bytes = [0u8; 64];
         let copy_len = hash.len().min(64);
@@ -147,34 +153,56 @@ impl QuantumPoH {
             is_running: Arc::new(AtomicBool::new(false)),
             hashes_per_second: Arc::new(AtomicU64::new(0)),
             update_mutex: Arc::new(Mutex::new(())),
+            last_backward_sync: Arc::new(AtomicU64::new(0)),
+            backward_sync_count: Arc::new(AtomicU64::new(0)),
         };
-        
-        println!("[QuantumPoH] 🔄 Initialized from checkpoint: count={}, slot={}", count, slot);
+
+        println!("[INFO][POH] checkpoint_init count={} slot={}", count, slot);
         
         (poh, entry_receiver)
     }
     
     /// Synchronize PoH state with a network checkpoint
-    /// 
+    ///
     /// CRITICAL: This is called when receiving blocks from other nodes.
     /// The network consensus is the source of truth, so we sync to it
     /// even if it means "going backward" (local PoH drifted ahead).
-    /// 
+    ///
     /// THREAD SAFETY: Acquires update_mutex to prevent race with generator
     pub async fn sync_from_checkpoint(&self, hash: &[u8], count: u64) {
         // Acquire mutex to prevent race with generator
         let _guard = self.update_mutex.lock().await;
-        
+
         let current_count = self.hash_count.load(Ordering::SeqCst);
-        
-        // Only skip if checkpoint is VERY old (indicates stale block during resync)
-        // 25M hashes = ~50 seconds at 500K/sec (less than 1 macroblock)
-        const MAX_ACCEPTABLE_DRIFT: u64 = 25_000_000;
-        
+
+        // Reduced drift window: ~10 seconds at 500K/sec (was ~50 seconds)
+        const MAX_ACCEPTABLE_DRIFT: u64 = 5_000_000;
+
+        // Rate limit backward syncs: at most one per 60 seconds
+        const BACKWARD_SYNC_COOLDOWN_SECS: u64 = 60;
+
         if count < current_count && (current_count - count) > MAX_ACCEPTABLE_DRIFT {
-            println!("[QuantumPoH] ⚠️ Skipping very old checkpoint: {} (current: {}, drift: {})", 
+            println!("[WARN][POH] checkpoint_too_old count={} current={} drift={}",
                     count, current_count, current_count - count);
             return;
+        }
+
+        // Rate-limit backward syncs to prevent manipulation
+        if count < current_count {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let last_sync = self.last_backward_sync.load(Ordering::SeqCst);
+            if last_sync > 0 && now_secs.saturating_sub(last_sync) < BACKWARD_SYNC_COOLDOWN_SECS {
+                let sync_count = self.backward_sync_count.load(Ordering::SeqCst);
+                println!("[WARN][POH] backward_sync_rate_limited count={} drift={} cooldown_remaining={}s",
+                        sync_count, current_count - count, BACKWARD_SYNC_COOLDOWN_SECS - (now_secs - last_sync));
+                return;
+            }
+            self.last_backward_sync.store(now_secs, Ordering::SeqCst);
+            let sync_count = self.backward_sync_count.fetch_add(1, Ordering::SeqCst) + 1;
+            println!("[WARN][POH] backward_sync count={} drift={}", sync_count, current_count - count);
         }
         
         // Update hash
@@ -200,8 +228,8 @@ impl QuantumPoH {
         
         if diff > 100_000 {
             let direction = if count >= current_count { "forward" } else { "resync" };
-            println!("[QuantumPoH] 🔄 Synchronized: count={}, slot={} ({} from {}, diff: {})", 
-                    count, count / HASHES_PER_SLOT, direction, current_count, diff);
+            println!("[INFO][POH] sync direction={} count={} slot={} prev={} diff={}",
+                    direction, count, count / HASHES_PER_SLOT, current_count, diff);
         }
     }
     
@@ -284,9 +312,16 @@ impl QuantumPoH {
                         .as_micros() as u64,
                 };
                 
-                if entry_sender.send(entry).is_err() {
-                    println!("[QuantumPoH] ❌ Entry channel closed");
-                    break;
+                match entry_sender.try_send(entry) {
+                    Ok(()) => {},
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        println!("[WARN][POH] entry_channel_full capacity=10000");
+                        // Drop entry rather than block the PoH generator
+                    },
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        println!("[ERROR][POH] entry_channel_closed");
+                        break;
+                    },
                 }
                 
                 // Update Prometheus metrics
@@ -391,9 +426,12 @@ impl QuantumPoH {
                 .as_micros() as u64,
         };
         
-        // Send entry (mutex still held, but send is non-blocking)
-        self.entry_sender.send(entry.clone())
-            .map_err(|_| "Failed to send entry".to_string())?;
+        // Send entry (mutex still held, try_send is non-blocking)
+        self.entry_sender.try_send(entry.clone())
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => "PoH entry channel full (10K limit)".to_string(),
+                mpsc::error::TrySendError::Closed(_) => "PoH entry channel closed".to_string(),
+            })?;
         
         Ok(entry)
     }

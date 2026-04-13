@@ -92,18 +92,24 @@ impl StateDB {
                 )));
             }
             
-            // Calculate total cost including gas
-            let gas_cost = tx.gas_price * tx.gas_limit;
-            let total_cost = tx.amount + gas_cost;
-            
+            // SECURITY: checked arithmetic to prevent overflow bypass
+            let gas_cost = tx.gas_price.checked_mul(tx.gas_limit)
+                .ok_or_else(|| StateError::InvalidTransaction(
+                    format!("Gas calculation overflow: {} * {}", tx.gas_price, tx.gas_limit)
+                ))?;
+            let total_cost = tx.amount.checked_add(gas_cost)
+                .ok_or_else(|| StateError::InvalidTransaction(
+                    format!("Total cost overflow: {} + {}", tx.amount, gas_cost)
+                ))?;
+
             if sender.balance < total_cost {
                 return Err(StateError::InsufficientBalance {
                     have: sender.balance,
                     need: total_cost,
                 });
             }
-            
-            // Execute transaction
+
+            // Execute transaction (safe: balance >= total_cost verified above)
             sender.balance -= total_cost;
             sender.nonce += 1;
             
@@ -131,7 +137,7 @@ impl StateDB {
                 }
             });
             
-            recipient.balance += tx.amount;
+            recipient.balance = recipient.balance.saturating_add(tx.amount);
             // Update recipient activity
             recipient.touch(timestamp);
             

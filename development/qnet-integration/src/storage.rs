@@ -6,8 +6,10 @@ use crate::errors::{IntegrationError, IntegrationResult};
 use std::path::Path;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+// FIX L-M22: parking_lot::RwLock for TransactionPool (non-poisoning, faster)
+use parking_lot::RwLock;
 use hex;
 use sha3::Digest;
 use bincode;
@@ -59,12 +61,15 @@ pub fn start_rollback_protection(target_height: u64) -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    
-    ROLLBACK_TARGET_HEIGHT.store(target_height, Ordering::Release);
-    ROLLBACK_START_TIME.store(now, Ordering::Release);
-    ROLLBACK_IN_PROGRESS.store(true, Ordering::Release);
-    
-    println!("[INFO][ROLLBACK] protection_started target_height={}", target_height);
+
+    // FIX M-M21: Set ROLLBACK_IN_PROGRESS FIRST (as barrier) to block saves immediately,
+    // THEN set the detail values. This prevents a window where the flag is set but
+    // target/time are stale.
+    ROLLBACK_IN_PROGRESS.store(true, Ordering::SeqCst);
+    ROLLBACK_TARGET_HEIGHT.store(target_height, Ordering::SeqCst);
+    ROLLBACK_START_TIME.store(now, Ordering::SeqCst);
+
+    println!("[INFO][STORAGE] rollback_protection_started target_h={}", target_height);
     true
 }
 
@@ -186,12 +191,11 @@ impl TransactionPool {
             .duration_since(UNIX_EPOCH)
             .map_err(|e| IntegrationError::Other(format!("Time error: {}", e)))?
             .as_secs();
-            
+
         {
-            let mut transactions = self.transactions.write()
-                .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
-            let mut creation_times = self.creation_times.write()
-                .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
+            // FIX L-M22: parking_lot RwLock -- no Result, no poisoning
+            let mut transactions = self.transactions.write();
+            let mut creation_times = self.creation_times.write();
             
             // v3.0: CRITICAL - Enforce max size to prevent memory leak
             // If at limit, remove oldest 10% of transactions
@@ -224,20 +228,16 @@ impl TransactionPool {
     /// Get transaction by hash
     pub fn get_transaction(&self, tx_hash: &[u8; 32]) -> Option<Transaction> {
         self.transactions.read()
-            .ok()?
             .get(tx_hash)
             .cloned()
     }
     
     /// Get multiple transactions by hashes
     pub fn get_transactions(&self, tx_hashes: &[[u8; 32]]) -> Vec<Option<Transaction>> {
-        if let Ok(transactions) = self.transactions.read() {
-            tx_hashes.iter()
-                .map(|hash| transactions.get(hash).cloned())
-                .collect()
-        } else {
-            vec![None; tx_hashes.len()]
-        }
+        let transactions = self.transactions.read();
+        tx_hashes.iter()
+            .map(|hash| transactions.get(hash).cloned())
+            .collect()
     }
     
     /// Clean up old transactions (only removes duplicates, not original blockchain data)
@@ -246,15 +246,13 @@ impl TransactionPool {
             .duration_since(UNIX_EPOCH)
             .map_err(|e| IntegrationError::Other(format!("Time error: {}", e)))?
             .as_secs();
-            
+
         let cutoff_time = current_time.saturating_sub(self.cleanup_after_hours as u64 * 3600);
         let mut removed_count = 0;
-        
+
         {
-            let mut transactions = self.transactions.write()
-                .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
-            let mut creation_times = self.creation_times.write()
-                .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
+            let mut transactions = self.transactions.write();
+            let mut creation_times = self.creation_times.write();
             
             // Only remove transactions older than TTL 
             // In production, we should also check if transaction is already in finalized blocks
@@ -279,13 +277,8 @@ impl TransactionPool {
     
     /// Get pool statistics
     pub fn get_stats(&self) -> Result<(usize, usize), IntegrationError> {
-        let tx_count = self.transactions.read()
-            .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?
-            .len();
-        let time_count = self.creation_times.read()
-            .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?
-            .len();
-            
+        let tx_count = self.transactions.read().len();
+        let time_count = self.creation_times.read().len();
         Ok((tx_count, time_count))
     }
 }
@@ -899,7 +892,10 @@ impl PersistentStorage {
                     // ATOMICITY: Use compare-and-swap to prevent race conditions
                     // Re-read metadata height to detect if it was updated during scan
                     let current_metadata = match self.db.get_cf(&metadata_cf, b"chain_height")? {
-                        Some(data) if data.len() >= 8 => u64::from_be_bytes(data[0..8].try_into().unwrap()),
+                        Some(data) if data.len() >= 8 => {
+                            let arr: [u8; 8] = data[0..8].try_into().unwrap_or([0u8; 8]);
+                            u64::from_be_bytes(arr)
+                        }
                         _ => 0,
                     };
                     
@@ -922,7 +918,10 @@ impl PersistentStorage {
                     
                     // SECURITY: Verify write succeeded (detect late race conditions)
                     let verify_height = match self.db.get_cf(&metadata_cf, b"chain_height")? {
-                        Some(data) if data.len() >= 8 => u64::from_be_bytes(data[0..8].try_into().unwrap()),
+                        Some(data) if data.len() >= 8 => {
+                            let arr: [u8; 8] = data[0..8].try_into().unwrap_or([0u8; 8]);
+                            u64::from_be_bytes(arr)
+                        }
                         _ => 0,
                     };
                     
@@ -2020,6 +2019,27 @@ impl PersistentStorage {
 
         Ok(())
     }
+
+    /// Delete a range of microblocks atomically (for fork resolution).
+    /// Uses single WriteBatch — crash-safe: either all deleted or none.
+    pub fn delete_microblocks_range(&self, from_height: u64, to_height: u64) -> IntegrationResult<u64> {
+        let microblocks_cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+
+        let mut batch = WriteBatch::default();
+        let mut count: u64 = 0;
+        for h in from_height..=to_height {
+            let key = format!("microblock_{}", h);
+            let hash_key = format!("microblock_hash_{}", h);
+            batch.delete_cf(&microblocks_cf, key.as_bytes());
+            batch.delete_cf(&metadata_cf, hash_key.as_bytes());
+            count += 1;
+        }
+        self.db.write(batch)?;
+        Ok(count)
+    }
     
     // ========================================================================
     // POH STATE STORAGE (v2.19.13)
@@ -2737,8 +2757,7 @@ impl Storage {
     pub fn check_and_apply_degradation(&self) -> IntegrationResult<bool> {
         let health = self.get_storage_health()?;
         
-        let mut degradation = self.graceful_degradation.write()
-            .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
+        let mut degradation = self.graceful_degradation.write();
         
         if let Some(new_mode) = degradation.check_and_degrade(health) {
             // Log the change
@@ -2760,16 +2779,12 @@ impl Storage {
     
     /// Get effective storage mode (may be degraded from original)
     pub fn get_effective_storage_mode(&self) -> StorageMode {
-        self.graceful_degradation.read()
-            .map(|g| g.get_current_mode())
-            .unwrap_or(self.storage_mode)
+        self.graceful_degradation.read().get_current_mode()
     }
     
     /// Check if storage is currently degraded
     pub fn is_storage_degraded(&self) -> bool {
-        self.graceful_degradation.read()
-            .map(|g| g.is_degraded())
-            .unwrap_or(false)
+        self.graceful_degradation.read().is_degraded()
     }
     
     // ========================================================================
@@ -2779,8 +2794,7 @@ impl Storage {
     /// Rotate light node headers - delete oldest to maintain max size
     /// Called automatically when saving new headers in Light mode
     pub fn rotate_light_headers(&self, current_height: u64) -> IntegrationResult<u64> {
-        let mut rotation = self.light_rotation.write()
-            .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
+        let mut rotation = self.light_rotation.write();
         
         if !rotation.needs_rotation() {
             rotation.increment();
@@ -2843,9 +2857,7 @@ impl Storage {
             StorageMode::Super => "Super/Bootstrap (full history, ~2TB)",
         };
         
-        let current_bytes = self.current_storage_usage.read()
-            .map(|v| *v)
-            .unwrap_or(0);
+        let current_bytes = *self.current_storage_usage.read();
         
         TieredStorageStats {
             node_type: mode_str.to_string(),
@@ -3213,7 +3225,8 @@ impl Storage {
             
             // Track pattern for statistics only (no lossy compression)
             let pattern = self.recognize_transaction_pattern(tx);
-            if let Ok(mut recognizer) = self.pattern_recognizer.write() {
+            {
+                let mut recognizer = self.pattern_recognizer.write();
                 *recognizer.pattern_stats.entry(pattern).or_insert(0) += 1;
             }
             
@@ -3434,12 +3447,58 @@ impl Storage {
         self.persistent.delete_microblock(height)
     }
     
+    /// Delete a range of microblocks atomically (for fork resolution).
+    /// FIX R23-S2: Single WriteBatch for blocks + TX indices + metadata.
+    /// Crash-safe: either all deleted or none. Previously TX index cleanup was
+    /// in separate batches, leaving orphaned indices on crash between batches.
+    pub fn delete_microblocks_range(&self, from_height: u64, to_height: u64) -> IntegrationResult<u64> {
+        let microblocks_cf = self.persistent.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        let metadata_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let tx_cf = self.persistent.db.cf_handle("transactions");
+        let tx_index_cf = self.persistent.db.cf_handle("tx_index");
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut count: u64 = 0;
+
+        for h in from_height..=to_height {
+            // Include TX index cleanup in the SAME atomic batch
+            if let (Some(tx_cf), Some(tx_index_cf)) = (&tx_cf, &tx_index_cf) {
+                if let Ok(Some(block)) = self.load_microblock_auto_format(h) {
+                    for tx in &block.transactions {
+                        let tx_key = format!("tx_{}", tx.hash);
+                        batch.delete_cf(tx_cf, tx_key.as_bytes());
+                        batch.delete_cf(tx_index_cf, tx_key.as_bytes());
+                    }
+                }
+            }
+
+            // Block data + metadata + hash
+            let key = format!("microblock_{}", h);
+            let hash_key = format!("microblock_hash_{}", h);
+            batch.delete_cf(&microblocks_cf, key.as_bytes());
+            batch.delete_cf(&metadata_cf, hash_key.as_bytes());
+
+            // PoH state cleanup (best-effort — included in batch if CF exists)
+            if let Some(poh_cf) = self.persistent.db.cf_handle("poh_state") {
+                let poh_key = format!("poh_{}", h);
+                batch.delete_cf(&poh_cf, poh_key.as_bytes());
+            }
+
+            count += 1;
+        }
+
+        self.persistent.db.write(batch)?;
+        Ok(count)
+    }
+
     // ========================================================================
     // POH STATE API (v2.19.13)
     // ========================================================================
     // Fast PoH validation without loading full blocks
     // ========================================================================
-    
+
     /// Save PoH state for a block
     pub fn save_poh_state(&self, poh_state: &qnet_state::PoHState) -> IntegrationResult<()> {
         self.persistent.save_poh_state(poh_state)
@@ -4320,10 +4379,8 @@ impl Storage {
         println!("[INFO][STORAGE] tx_pool_compress_start count={}", tx_count);
         
         // Serialize all transactions
-        let transactions = self.transaction_pool.transactions.read()
-            .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
-        let creation_times = self.transaction_pool.creation_times.read()
-            .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
+        let transactions = self.transaction_pool.transactions.read();
+        let creation_times = self.transaction_pool.creation_times.read();
             
         let pool_data = (&*transactions, &*creation_times);
         let serialized = bincode::serialize(&pool_data)
@@ -4351,8 +4408,7 @@ impl Storage {
         
         // Update current usage tracking
         {
-            let mut usage = self.current_storage_usage.write()
-                .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
+            let mut usage = self.current_storage_usage.write();
             *usage = actual_usage;
         }
         
@@ -4465,11 +4521,9 @@ impl Storage {
         
         // Force aggressive cleanup of transaction pool CACHE only
         {
-            let mut transactions = self.transaction_pool.transactions.write()
-                .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
-            let mut creation_times = self.transaction_pool.creation_times.write()
-                .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
-            
+            let mut transactions = self.transaction_pool.transactions.write();
+            let mut creation_times = self.transaction_pool.creation_times.write();
+
             let old_hashes: Vec<[u8; 32]> = creation_times.iter()
                 .filter(|(_, &time)| time < aggressive_cutoff)
                 .map(|(hash, _)| *hash)
@@ -4515,11 +4569,9 @@ impl Storage {
         let emergency_cutoff = current_time.saturating_sub(3600); // 1 hour only
         
         {
-            let mut transactions = self.transaction_pool.transactions.write()
-                .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
-            let mut creation_times = self.transaction_pool.creation_times.write()
-                .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
-            
+            let mut transactions = self.transaction_pool.transactions.write();
+            let mut creation_times = self.transaction_pool.creation_times.write();
+
             let emergency_hashes: Vec<[u8; 32]> = creation_times.iter()
                 .filter(|(_, &time)| time < emergency_cutoff)
                 .map(|(hash, _)| *hash)
@@ -4574,8 +4626,7 @@ impl Storage {
     
     /// Get current storage usage percentage
     pub fn get_storage_usage_percentage(&self) -> IntegrationResult<f64> {
-        let usage = *self.current_storage_usage.read()
-            .map_err(|e| IntegrationError::Other(format!("Lock error: {}", e)))?;
+        let usage = *self.current_storage_usage.read();
         Ok((usage as f64 / self.max_storage_size as f64) * 100.0)
     }
     

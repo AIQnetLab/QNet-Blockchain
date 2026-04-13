@@ -3,7 +3,8 @@
 //! v3.18: Pool 2 removed - transaction fees go directly to block producer
 //! Activation QNC goes to Pool 3
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use crate::lazy_rewards::{PhaseAwareRewardManager, QNetPhase, NodeType};
 use crate::errors::ConsensusError;
@@ -129,7 +130,7 @@ impl RewardIntegrationManager {
     pub fn process_node_activation(&mut self, node_id: String, node_type: NodeType, wallet_address: String, activation_amount: u64, tx_hash: String) -> Result<(), ConsensusError> {
         // Get current phase
         let current_phase = {
-            let reward_manager = match self.reward_manager.read() { Ok(g) => g, Err(p) => p.into_inner() };
+            let reward_manager = self.reward_manager.read();
             reward_manager.get_network_phase()
         };
         
@@ -155,14 +156,14 @@ impl RewardIntegrationManager {
                 
                 // Just register the node for rewards
                 {
-                    let mut reward_manager = match self.reward_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let mut reward_manager = self.reward_manager.write();
                     reward_manager.register_node(node_id.clone(), node_type, wallet_address.clone())?;
                 }
             },
             QNetPhase::Phase2 => {
                 // Phase 2: Add QNC to Pool 3
                 {
-                    let mut reward_manager = match self.reward_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let mut reward_manager = self.reward_manager.write();
                     
                     // Register node
                     reward_manager.register_node(node_id.clone(), node_type, wallet_address.clone())?;
@@ -172,7 +173,7 @@ impl RewardIntegrationManager {
                 }
                 
                 // Update statistics
-                self.pool_stats.pool3_total_activations += activation_amount;
+                self.pool_stats.pool3_total_activations = self.pool_stats.pool3_total_activations.saturating_add(activation_amount);
                 
                 println!("[RewardIntegration] ✅ Phase 2: Node activation {} → {} QNC to Pool 3", node_id, activation_amount);
             }
@@ -190,7 +191,7 @@ impl RewardIntegrationManager {
     
     /// Update phase transition parameters
     pub fn update_phase_parameters(&mut self, dev_burn_percentage: f64, _years_since_launch: u64) {
-        let mut reward_manager = match self.reward_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut reward_manager = self.reward_manager.write();
         reward_manager.update_phase_parameters(dev_burn_percentage, 0); // years parameter is now ignored
         
         // Get actual years since genesis from reward manager
@@ -205,7 +206,7 @@ impl RewardIntegrationManager {
     
     /// Get current pool statistics
     pub fn get_pool_statistics(&self) -> PoolStatistics {
-        let reward_manager = match self.reward_manager.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let reward_manager = self.reward_manager.read();
         let stats = reward_manager.get_reward_stats();
         
         PoolStatistics {
@@ -225,25 +226,25 @@ impl RewardIntegrationManager {
     
     /// Process ping result
     pub fn process_ping_result(&mut self, node_id: String, success: bool, response_time_ms: u32) -> Result<(), ConsensusError> {
-        let mut reward_manager = match self.reward_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut reward_manager = self.reward_manager.write();
         reward_manager.record_ping_attempt(&node_id, success, response_time_ms)
     }
     
     /// Claim rewards for a node
     pub fn claim_node_rewards(&mut self, node_id: &str) -> Result<crate::lazy_rewards::RewardClaimResult, ConsensusError> {
-        let mut reward_manager = match self.reward_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut reward_manager = self.reward_manager.write();
         Ok(reward_manager.claim_rewards(node_id, "unknown_wallet"))
     }
     
     /// Get pending rewards for a node
     pub fn get_pending_rewards(&self, node_id: &str) -> Option<crate::lazy_rewards::PhaseAwareReward> {
-        let reward_manager = match self.reward_manager.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let reward_manager = self.reward_manager.read();
         reward_manager.get_pending_reward(node_id).cloned()
     }
     
     /// Get comprehensive reward information
     pub fn get_reward_info(&self, node_id: &str) -> RewardInfo {
-        let reward_manager = match self.reward_manager.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let reward_manager = self.reward_manager.read();
         let pending = reward_manager.get_pending_reward(node_id);
         let ping_history = reward_manager.get_ping_history(node_id);
         let stats = reward_manager.get_reward_stats();
@@ -262,7 +263,7 @@ impl RewardIntegrationManager {
     
     /// Force process current reward window (for testing)
     pub fn force_process_rewards(&mut self) -> Result<(), ConsensusError> {
-        let mut reward_manager = match self.reward_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut reward_manager = self.reward_manager.write();
         reward_manager.force_process_window()
     }
     
@@ -317,7 +318,7 @@ impl RewardIntegrationCallback for RewardIntegrationCallbackImpl {
             _ => return Err(format!("Invalid node type: {}", node_type)),
         };
         
-        // FIXED: Use placeholder wallet since treiт doesn't provide it
+        // FIXED: Use placeholder wallet since trait doesn't provide it
         self.manager.process_node_activation(node_id, node_type_enum, "unknown_wallet".to_string(), amount, tx_hash)
             .map_err(|e| format!("Failed to process node activation: {:?}", e))
     }
@@ -339,7 +340,7 @@ impl Clone for RewardIntegrationManager {
     fn clone(&self) -> Self {
         // Create a new manager with the same configuration
         let _genesis_timestamp = {
-            let reward_manager = match self.reward_manager.read() { Ok(g) => g, Err(p) => p.into_inner() };
+            let reward_manager = self.reward_manager.read();
             reward_manager.get_genesis_timestamp()
         };
         

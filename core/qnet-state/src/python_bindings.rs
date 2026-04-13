@@ -202,11 +202,15 @@ impl PyTransaction {
                 amount,
             },
             data: None,
+            public_key: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: 0,
         };
         tx.hash = tx.calculate_hash();
         Self { inner: tx }
     }
-    
+
     /// Create node activation transaction
     #[staticmethod]
     fn node_activation(from: String, node_type: String, amount: u64, nonce: u64, gas_price: u64, gas_limit: u64) -> Self {
@@ -241,6 +245,10 @@ impl PyTransaction {
                 phase,
             },
             data: Some(serde_json::json!({ "node_type": node_type }).to_string()),
+            public_key: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: 0,
         };
         tx.hash = tx.calculate_hash();
         Self { inner: tx }

@@ -73,9 +73,11 @@ pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, CryptoError> {
     })
 }
 
-/// Zeroize sensitive data
+/// Zeroize sensitive data using volatile writes (compiler cannot optimize away)
+/// FIX H18: Use write_volatile + black_box to guarantee zeroization
 pub fn zeroize(data: &mut [u8]) {
     for byte in data.iter_mut() {
-        *byte = 0;
+        unsafe { core::ptr::write_volatile(byte, 0u8); }
     }
+    core::hint::black_box(data);
 } 

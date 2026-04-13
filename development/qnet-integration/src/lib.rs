@@ -22,6 +22,10 @@ pub mod network_config;
 pub mod archive_manager;
 pub mod genesis_constants;
 pub mod reward_sharding;
+pub mod consensus_state;   // L1 consensus state machine (single coordinator)
+pub mod block_pipeline;    // Staged block processing pipeline (ingest → decode → verify → apply)
+pub mod genesis_config;    // File-based genesis loader (not p2p)
+pub mod sync_manager;      // Block download coordinator (sequential waves, ordered buffer)
 pub mod p2p_extensions;
 pub mod contract_vm;
 pub mod quic_transport;    // PRODUCTION v2.19.21: QUIC transport layer
@@ -147,6 +151,10 @@ impl QNetBlockchain {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(200_000), // Production default: 200k (v4.1)
             min_gas_price: 1,
+            max_per_sender: std::env::var("QNET_MAX_PER_SENDER")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10_000),
         };
         
         let mempool = Arc::new(qnet_mempool::SimpleMempool::new(mempool_config));

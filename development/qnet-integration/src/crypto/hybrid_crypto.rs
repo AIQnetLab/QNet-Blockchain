@@ -367,9 +367,34 @@ struct CachedCertificate {
 // ═══════════════════════════════════════════════════════════════════════════════
 use dashmap::DashMap;
 
+/// Maximum number of entries in the certificate cache before eviction
+const MAX_CERTIFICATE_CACHE_SIZE: usize = 50_000;
+
+/// Percentage of cache entries to evict when limit is reached (10%)
+const CACHE_EVICTION_PERCENT: usize = 10;
+
 /// Global certificate cache - lock-free concurrent access
-static CERTIFICATE_CACHE: once_cell::sync::Lazy<DashMap<String, CachedCertificate>> = 
+static CERTIFICATE_CACHE: once_cell::sync::Lazy<DashMap<String, CachedCertificate>> =
     once_cell::sync::Lazy::new(|| DashMap::new());
+
+/// Evict oldest entries from certificate cache when it exceeds the maximum size.
+/// Removes ~10% of entries sorted by `verified_at` timestamp (oldest first).
+fn evict_certificate_cache_if_needed() {
+    if CERTIFICATE_CACHE.len() < MAX_CERTIFICATE_CACHE_SIZE {
+        return;
+    }
+    let evict_count = CERTIFICATE_CACHE.len() * CACHE_EVICTION_PERCENT / 100;
+    // Collect keys with timestamps for eviction ordering
+    let mut entries: Vec<(String, u64)> = CERTIFICATE_CACHE.iter()
+        .map(|entry| (entry.key().clone(), entry.value().verified_at))
+        .collect();
+    entries.sort_by_key(|(_k, ts)| *ts);
+    let to_remove = entries.into_iter().take(evict_count).collect::<Vec<_>>();
+    for (key, _) in &to_remove {
+        CERTIFICATE_CACHE.remove(key);
+    }
+    println!("[INFO][CRYPTO] certificate_cache_eviction removed={} remaining={}", to_remove.len(), CERTIFICATE_CACHE.len());
+}
 
 /// Hybrid Cryptography System for QNet
 pub struct HybridCrypto {
@@ -719,8 +744,14 @@ impl HybridCrypto {
     }
     
     /// Cache certificate for O(1) verification
+    /// Cache key includes a hash of the Dilithium signature to prevent cache poisoning
     async fn cache_certificate(&self, certificate: &HybridCertificate) {
-        let cache_key = format!("{}_{}", certificate.node_id, certificate.serial_number);
+        let sig_hash = {
+            let mut hasher = Sha3_256::new();
+            hasher.update(certificate.dilithium_signature.as_bytes());
+            hex::encode(&hasher.finalize()[..8])
+        };
+        let cache_key = format!("{}_{}_{}", certificate.node_id, certificate.serial_number, sig_hash);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
@@ -733,7 +764,8 @@ impl HybridCrypto {
             is_valid: true,
         };
         
-        // PRODUCTION v2.51: Lock-free cache insert
+        // PRODUCTION v2.51: Lock-free cache insert (with eviction check)
+        evict_certificate_cache_if_needed();
         CERTIFICATE_CACHE.insert(cache_key, cached);
     }
     
@@ -749,23 +781,30 @@ impl HybridCrypto {
         // v2.64: 60 second grace period for network propagation delays
         const CERTIFICATE_GRACE_PERIOD_SECS: u64 = 60;
         if now > signature.certificate.expires_at + CERTIFICATE_GRACE_PERIOD_SECS {
-            println!("❌ Certificate expired (beyond {}s grace period)", CERTIFICATE_GRACE_PERIOD_SECS);
+            println!("[WARN][CRYPTO] cert_expired=true grace_period={}s node={}", CERTIFICATE_GRACE_PERIOD_SECS, signature.certificate.node_id);
             return Ok(false);
         }
         
         // OPTIMIZATION: Check certificate cache first
-        let cache_key = format!("{}_{}", 
-            signature.certificate.node_id, 
-            signature.certificate.serial_number);
+        // Cache key includes signature fingerprint to prevent cache poisoning
+        let sig_hash = {
+            let mut hasher = Sha3_256::new();
+            hasher.update(signature.certificate.dilithium_signature.as_bytes());
+            hex::encode(&hasher.finalize()[..8])
+        };
+        let cache_key = format!("{}_{}_{}",
+            signature.certificate.node_id,
+            signature.certificate.serial_number,
+            sig_hash);
         
         // PRODUCTION v2.51: Lock-free cache check
         // v2.64: Use grace period for cache check too
         let cert_is_valid = if let Some(cached) = CERTIFICATE_CACHE.get(&cache_key) {
             if cached.is_valid && now <= signature.certificate.expires_at + CERTIFICATE_GRACE_PERIOD_SECS {
-                println!("✅ Certificate verified from cache (O(1) performance)");
+                println!("[DEBUG][CRYPTO] cache_hit=true node={} serial={}", signature.certificate.node_id, signature.certificate.serial_number);
                 true // Certificate is valid from cache
             } else if !cached.is_valid {
-                println!("❌ Certificate known to be invalid (cached)");
+                println!("[WARN][CRYPTO] cache_hit=true valid=false node={} serial={}", signature.certificate.node_id, signature.certificate.serial_number);
                 return Ok(false);
             } else {
                 false // Need to verify
@@ -802,6 +841,7 @@ impl HybridCrypto {
             if !cert_valid {
                 println!("❌ Invalid Dilithium signature on certificate");
                 // PRODUCTION v2.51: Lock-free cache negative result
+                evict_certificate_cache_if_needed();
                 CERTIFICATE_CACHE.insert(cache_key.clone(), CachedCertificate {
                     certificate: signature.certificate.clone(),
                     verified_at: now,
@@ -812,7 +852,8 @@ impl HybridCrypto {
             }
             
             // PRODUCTION v2.51: Lock-free cache valid certificate
-            println!("✅ Certificate verified and cached");
+            println!("[INFO][CRYPTO] certificate_verified_and_cached");
+            evict_certificate_cache_if_needed();
             CERTIFICATE_CACHE.insert(cache_key, CachedCertificate {
                 certificate: signature.certificate.clone(),
                 verified_at: now,

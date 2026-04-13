@@ -9,6 +9,7 @@ fn create_test_mempool() -> Arc<RwLock<SimpleMempool>> {
     let config = SimpleMempoolConfig {
         max_size: 1000,
         min_gas_price: 100_000, // 0.0001 QNC
+        max_per_sender: 10_000,
     };
     Arc::new(RwLock::new(SimpleMempool::new(config)))
 }
@@ -263,6 +264,7 @@ async fn test_mempool_priority_integration() {
     let config = SimpleMempoolConfig {
         max_size: 1000,
         min_gas_price: 100_000,
+        max_per_sender: 10_000,
     };
     let mempool = SimpleMempool::new(config);
     

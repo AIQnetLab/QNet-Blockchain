@@ -49,6 +49,10 @@ fn create_test_transaction(id: u64, size: usize) -> Transaction {
             amount: 1000 + id,
         },
         data,
+        public_key: None,
+        dilithium_signature: None,
+        dilithium_public_key: None,
+        chain_id: 0,
     }
 }
 
@@ -57,7 +61,7 @@ fn create_test_microblock(height: u64, tx_count: usize) -> MicroBlock {
     let transactions: Vec<Transaction> = (0..tx_count)
         .map(|i| create_test_transaction(height * 1000 + i as u64, 500))
         .collect();
-    
+
     MicroBlock {
         height,
         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),

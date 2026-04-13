@@ -72,7 +72,8 @@ pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Maximum concurrent streams per connection
-pub const MAX_STREAMS_PER_CONN: u32 = 100;
+/// Must match quic_transport::MAX_STREAMS_PER_CONN
+pub const MAX_STREAMS_PER_CONN: u32 = 500;
 
 /// QUIC port offset from API port (8001 -> 10876)
 /// NOTE: peer.addr contains API port (8001), so offset = 10876 - 8001 = 2875

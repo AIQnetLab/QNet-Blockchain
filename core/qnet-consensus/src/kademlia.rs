@@ -5,7 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::time::{interval};
@@ -20,11 +21,19 @@ const KEY_SIZE: usize = 32;       // 256-bit keys (32 bytes)
 const REPLICATION_FACTOR: usize = 20; // Number of nodes to replicate to
 #[allow(dead_code)]
 const EXPIRATION_TIME: u64 = 86400; // 24 hours in seconds
+const MAX_STORE_VALUE_SIZE: usize = 65536; // 64KB max per stored value
+const MAX_STORED_ENTRIES: usize = 100_000; // Max total entries in DHT storage
 
 /// Node ID is a 256-bit hash
 pub type NodeId = [u8; KEY_SIZE];
 
-/// Generate a random node ID
+/// Generate a random node ID.
+///
+/// [SECURITY] node_id MUST be validated against stake/activation records at the
+/// integration layer before a peer is admitted to the routing table. The DHT
+/// layer applies rate-limiting by socket address (not node_id) as a baseline
+/// Sybil-resistance measure, but cryptographic identity binding is the
+/// responsibility of the caller (see `qnet-integration` node admission logic).
 pub fn generate_node_id() -> NodeId {
     let mut id = [0u8; KEY_SIZE];
     use rand::rngs::OsRng;
@@ -188,7 +197,7 @@ pub struct KademliaDht {
     pub pending_requests: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<KademliaRpc>>>>,
     pub socket: Arc<UdpSocket>,
     pub peer_scores: Arc<RwLock<HashMap<NodeId, PeerScore>>>,
-    pub rate_limiters: Arc<RwLock<HashMap<NodeId, TokenBucket>>>,
+    pub rate_limiters: Arc<RwLock<HashMap<String, TokenBucket>>>,
 }
 
 impl KademliaDht {
@@ -263,27 +272,44 @@ impl KademliaDht {
     
     /// Handle incoming RPC messages
     async fn handle_message(&self, message: KademliaRpc, src: std::net::SocketAddr) {
-        // Check rate limiting
-        if !self.check_rate_limit(&extract_node_id(&message)).await {
+        // Rate-limit by socket address (not node_id) to prevent Sybil-based bypass
+        if !self.check_rate_limit(&src).await {
             return;
         }
-        
+
         match message {
             KademliaRpc::Ping { node_id } => {
                 let response = KademliaRpc::Pong { node_id: self.node_id };
                 self.send_response(response, src).await;
                 self.add_node_to_buckets(KademliaNode::new(node_id, src.ip().to_string(), src.port())).await;
             }
-            
+
             KademliaRpc::FindNode { node_id, target } => {
                 let nodes = self.find_closest_nodes(&target, K_BUCKET_SIZE).await;
                 let response = KademliaRpc::FindNodeResponse { node_id: self.node_id, nodes };
                 self.send_response(response, src).await;
                 self.add_node_to_buckets(KademliaNode::new(node_id, src.ip().to_string(), src.port())).await;
             }
-            
+
             KademliaRpc::Store { node_id, key, value } => {
+                // Reject oversized values
+                if value.len() > MAX_STORE_VALUE_SIZE {
+                    log::warn!("[REJECT][DHT] store_too_large size={} max={}", value.len(), MAX_STORE_VALUE_SIZE);
+                    let response = KademliaRpc::StoreResponse { node_id: self.node_id, success: false };
+                    self.send_response(response, src).await;
+                    return;
+                }
+
                 let mut storage = self.storage.write().await;
+
+                // Reject if storage is full (unless key already exists)
+                if storage.len() >= MAX_STORED_ENTRIES && !storage.contains_key(&key) {
+                    log::warn!("[REJECT][DHT] storage_full entries={} max={}", storage.len(), MAX_STORED_ENTRIES);
+                    let response = KademliaRpc::StoreResponse { node_id: self.node_id, success: false };
+                    self.send_response(response, src).await;
+                    return;
+                }
+
                 let dht_value = DhtValue::new(value, EXPIRATION_TIME);
                 storage.insert(key, dht_value);
                 let response = KademliaRpc::StoreResponse { node_id: self.node_id, success: true };
@@ -404,7 +430,7 @@ impl KademliaDht {
         let request_id = format!("{}:{}", node.addr, node.port);
         
         {
-            let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut pending = self.pending_requests.lock();
             pending.insert(request_id.clone(), tx);
         }
         
@@ -421,7 +447,7 @@ impl KademliaDht {
             Ok(Ok(KademliaRpc::FindNodeResponse { nodes, .. })) => Ok(nodes),
             _ => {
                 // Remove from pending requests on timeout/error
-                let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                let mut pending = self.pending_requests.lock();
                 pending.remove(&request_id);
                 Err("Request timeout or error".into())
             }
@@ -462,7 +488,7 @@ impl KademliaDht {
         let request_id = format!("{}:{}", node.addr, node.port);
         
         {
-            let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut pending = self.pending_requests.lock();
             pending.insert(request_id.clone(), tx);
         }
         
@@ -478,7 +504,7 @@ impl KademliaDht {
         match response {
             Ok(Ok(KademliaRpc::StoreResponse { success: true, .. })) => Ok(()),
             _ => {
-                let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                let mut pending = self.pending_requests.lock();
                 pending.remove(&request_id);
                 Err("Store request failed".into())
             }
@@ -538,7 +564,7 @@ impl KademliaDht {
         let request_id = format!("{}:{}", node.addr, node.port);
         
         {
-            let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut pending = self.pending_requests.lock();
             pending.insert(request_id.clone(), tx);
         }
         
@@ -554,7 +580,7 @@ impl KademliaDht {
             Ok(Ok(KademliaRpc::FindValueResponse { value: Some(data), .. })) => Ok(Some(data)),
             Ok(Ok(KademliaRpc::FindValueResponse { value: None, .. })) => Ok(None),
             _ => {
-                let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                let mut pending = self.pending_requests.lock();
                 pending.remove(&request_id);
                 Err("Find value request failed".into())
             }
@@ -612,22 +638,65 @@ impl KademliaDht {
                 storage.retain(|_, value| !value.is_expired());
             }
         });
+
+        // FIX H7: Periodic cleanup of rate_limiters to prevent unbounded growth
+        let rate_limiters = self.rate_limiters.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(1800)); // 30 minutes
+            loop {
+                interval.tick().await;
+                let mut limiters = rate_limiters.write().await;
+                if limiters.len() > 10_000 {
+                    let remove_count = limiters.len() - 10_000;
+                    let keys_to_remove: Vec<String> = limiters.keys().take(remove_count).cloned().collect();
+                    for key in keys_to_remove {
+                        limiters.remove(&key);
+                    }
+                    log::info!("[INFO][DHT] rate_limiters_cleanup removed={} remaining={}", remove_count, limiters.len());
+                }
+            }
+        });
+
+        // FIX R25-H3: Periodic cleanup of pending_requests to prevent unbounded growth
+        // Timed-out requests may leave entries if oneshot channel drops without response
+        let pending_requests = self.pending_requests.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(60)); // Every 60 seconds
+            loop {
+                interval.tick().await;
+                let mut pending = pending_requests.lock();
+                let before = pending.len();
+                // Remove entries whose oneshot sender is closed (receiver dropped = timed out)
+                pending.retain(|_, sender| !sender.is_closed());
+                let removed = before.saturating_sub(pending.len());
+                if removed > 0 {
+                    println!("[INFO][DHT] pending_requests_cleanup removed={} remaining={}", removed, pending.len());
+                }
+            }
+        });
     }
     
 
     
-    /// Check rate limit for a node
-    async fn check_rate_limit(&self, node_id: &NodeId) -> bool {
+    /// Check rate limit by source socket address (IP:port).
+    /// Uses the actual network address instead of self-reported node_id
+    /// to prevent Sybil-based rate-limit bypass.
+    async fn check_rate_limit(&self, src: &std::net::SocketAddr) -> bool {
+        let addr_key = src.ip().to_string();
         let mut rate_limiters = self.rate_limiters.write().await;
-        let rate_limiter = rate_limiters.entry(*node_id).or_insert_with(|| {
+        let rate_limiter = rate_limiters.entry(addr_key).or_insert_with(|| {
             TokenBucket::new(100, 10) // 100 tokens, 10 tokens per second
         });
-        rate_limiter.try_consume(1)
+        if !rate_limiter.try_consume(1) {
+            log::warn!("[WARN][DHT] rate_limited addr={}", src);
+            return false;
+        }
+        true
     }
     
     /// Remove pending request
     async fn remove_pending_request(&self, request_id: &str) -> Option<tokio::sync::oneshot::Sender<KademliaRpc>> {
-        let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut pending = self.pending_requests.lock();
         pending.remove(request_id)
     }
     

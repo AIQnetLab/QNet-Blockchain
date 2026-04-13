@@ -388,7 +388,8 @@ fn test_connection_quick(addr: &str) -> bool {
     use std::time::Duration;
     
     match std::net::TcpStream::connect_timeout(
-        &addr.parse().unwrap_or_else(|_| "127.0.0.1:9876".parse().unwrap()),
+        // FIX R24-L2: Remove nested unwrap — use const parsed at compile time
+        &addr.parse().unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9876))),
         Duration::from_secs(2)
     ) {
         Ok(_) => true,
@@ -2000,7 +2001,8 @@ fn is_qnet_node_running(addr: &str) -> bool {
     
     // Quick connection test with short timeout
     match TcpStream::connect_timeout(
-        &addr.parse().unwrap_or("127.0.0.1:9876".parse().unwrap()),
+        // FIX R24-L2: Remove nested unwrap
+        &addr.parse().unwrap_or(std::net::SocketAddr::from(([127, 0, 0, 1], 9876))),
         Duration::from_millis(100)
     ) {
         Ok(_) => {
@@ -2646,6 +2648,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("No activation code provided".into());
     }
     
+    // FIX R23-F3: Initialize weak subjectivity checkpoint from env
+    qnet_integration::node::init_weak_subjectivity_checkpoint();
+
     // PRODUCTION: Load network configuration based on QNET_NETWORK env
     let network_config = qnet_integration::network_config::get_network_config();
     println!("🌐 Network: {}", network_config.network_name());
@@ -3068,7 +3073,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let data_dir = std::path::Path::new(&storage_path);
                 if let Err(e) = std::fs::create_dir_all(&data_dir) {
                     println!("[WARN][SHUTDOWN] create_dir fail: {}", e);
-                } else if let Ok(mut cert_manager) = p2p.certificate_manager.write() {
+                } else {
+                    let mut cert_manager = p2p.certificate_manager.write();
                     let unified_node_type = match node_type {
                         NodeType::Light => qnet_integration::unified_p2p::NodeType::Light,
                         NodeType::Super => qnet_integration::unified_p2p::NodeType::Super,

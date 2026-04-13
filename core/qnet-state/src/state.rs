@@ -23,15 +23,15 @@ static PENDING_REWARDS_IN_MERKLE: AtomicBool = AtomicBool::new(false);
 /// Called ONCE when the first v7.0 emission accrual is applied to state.
 /// After this point, all hash_account() calls include pending_rewards.
 pub fn activate_pending_rewards_in_merkle() {
-    if !PENDING_REWARDS_IN_MERKLE.load(Ordering::Relaxed) {
-        PENDING_REWARDS_IN_MERKLE.store(true, Ordering::SeqCst);
+    if !PENDING_REWARDS_IN_MERKLE.load(Ordering::Acquire) {
+        PENDING_REWARDS_IN_MERKLE.store(true, Ordering::Release);
         println!("[INFO][STATE] v7.0 FORK ACTIVATED: pending_rewards now included in Merkle state root");
     }
 }
 
 /// v7.0: Check if pending_rewards is included in Merkle hash.
 pub fn is_pending_rewards_in_merkle() -> bool {
-    PENDING_REWARDS_IN_MERKLE.load(Ordering::Relaxed)
+    PENDING_REWARDS_IN_MERKLE.load(Ordering::Acquire)
 }
 
 /// v7.0: Reset pending_rewards flag for full state replay from genesis.
@@ -356,7 +356,7 @@ impl StateMerkleTree {
         // v7.0: pending_rewards included in hash AFTER fork activation.
         // Gated by AtomicBool to preserve backward compat with pre-v7.0 state_roots.
         // Activated when the first v7.0 emission accrual is applied to state.
-        if PENDING_REWARDS_IN_MERKLE.load(Ordering::Relaxed) {
+        if PENDING_REWARDS_IN_MERKLE.load(Ordering::Acquire) {
             hasher.update(&account.pending_rewards.to_le_bytes());
         }
         // EXCLUDED from hash (non-deterministic or metadata-only):
@@ -474,6 +474,10 @@ pub struct BalanceProof {
     pub balance: u64,
     /// Nonce
     pub nonce: u64,
+    /// FIX R23-C2: Include pending_rewards so verify_balance_proof can reconstruct
+    /// the correct Account hash after v7.0 fork (PENDING_REWARDS_IN_MERKLE=true).
+    /// Without this, all proofs for accounts with pending_rewards > 0 fail verification.
+    pub pending_rewards: u64,
     /// Merkle proof (sibling_hash, is_right)
     pub proof: Vec<([u8; HASH_SIZE], bool)>,
     /// State root this proof is valid for
@@ -787,6 +791,7 @@ impl StateManager {
             address: address.to_string(),
             balance: account.balance,
             nonce: account.nonce,
+            pending_rewards: account.pending_rewards,  // FIX R23-C2
             proof,
             state_root,
             block_height: chain_state.height,
@@ -794,14 +799,14 @@ impl StateManager {
     }
     
     /// Verify a balance proof (static method for Light clients)
+    /// FIX R23-C2: Uses pending_rewards from proof (not hardcoded 0) so verification
+    /// works correctly after v7.0 fork when PENDING_REWARDS_IN_MERKLE is active.
     pub fn verify_balance_proof(proof: &BalanceProof) -> bool {
-        // Reconstruct account from proof data
-        // Note: Only balance/nonce are verified, other fields use defaults
         let account = Account {
             address: proof.address.clone(),
             balance: proof.balance,
             nonce: proof.nonce,
-            pending_rewards: 0,
+            pending_rewards: proof.pending_rewards,
             is_node: false,
             node_type: None,
             reputation: 0.70, // Default reputation
@@ -1314,7 +1319,11 @@ impl StateManager {
         
         // Credit fees to producer (if any)
         if fees_collected > 0 && !producer_wallet.is_empty() {
-            let _ = self.credit_producer_fees_once(block_height, producer_wallet, fees_collected);
+            if let Err(e) = self.credit_producer_fees_once(block_height, producer_wallet, fees_collected) {
+                println!("[ERR][STATE] credit_producer_fees_failed h={} wallet={} fees={} err={:?}",
+                         block_height, producer_wallet, fees_collected, e);
+                return Err(e);
+            }
         }
         
         // Finalize Merkle tree

@@ -16,6 +16,7 @@ use qnet_state::Transaction;
 pub struct SimpleMempoolConfig {
     pub max_size: usize,
     pub min_gas_price: u64,
+    pub max_per_sender: usize,
 }
 
 impl Default for SimpleMempoolConfig {
@@ -23,6 +24,7 @@ impl Default for SimpleMempoolConfig {
         Self {
             max_size: 500_000, // Production default: 500k transactions
             min_gas_price: 100_000, // PRODUCTION: 0.0001 QNC (BASE_FEE_NANO_QNC from qnet-state)
+            max_per_sender: 10_000, // v2.26.5: per-sender spam limit
         }
     }
 }
@@ -47,6 +49,14 @@ pub struct SimpleMempool {
     // Analogous to processed transaction signatures - standard L1 mechanism
     // Prevents race condition: TX removed from mempool by block → re-arrives via P2P → re-added
     included_tx_hashes: Arc<DashSet<String>>,
+    /// Timestamp when each TX was added (for TTL eviction)
+    tx_timestamps: DashMap<String, std::time::Instant>,
+    /// Per-sender TX count for spam protection
+    tx_count_by_sender: DashMap<String, u32>,
+    /// FIX R24-M2: Track tx_hash → sender for decrementing count on removal
+    tx_sender_map: DashMap<String, String>,
+    /// Max transactions per sender
+    max_per_sender: u32,
 }
 
 impl SimpleMempool {
@@ -55,12 +65,17 @@ impl SimpleMempool {
     pub fn new(config: SimpleMempoolConfig) -> Self {
         // Use binary for large mempools (>100k)
         let use_binary = config.max_size > 100_000;
+        let max_per_sender = config.max_per_sender.try_into().unwrap_or(10_000);
         Self {
             config,
             transactions: Arc::new(DashMap::new()),
             by_gas_price: Arc::new(RwLock::new(BTreeMap::new())),
             use_binary,
             included_tx_hashes: Arc::new(DashSet::new()),
+            tx_timestamps: DashMap::new(),
+            tx_count_by_sender: DashMap::new(),
+            tx_sender_map: DashMap::new(),
+            max_per_sender,
         }
     }
     
@@ -71,11 +86,40 @@ impl SimpleMempool {
     /// 
     /// v2.67: CRITICAL FIX - Atomic add to both structures under single lock
     pub fn add_raw_transaction(&self, tx_json: String, hash: String, gas_price: u64) -> bool {
-        // v2.66: Diagnostic logging for mempool issues
-        if self.transactions.len() >= self.config.max_size {
-            eprintln!("[WARN][MEMPOOL] full size={} max={} hash={}", 
-                     self.transactions.len(), self.config.max_size, &hash[..16.min(hash.len())]);
+        // FIX M-M15: Enforce minimum gas price
+        if gas_price < self.config.min_gas_price {
+            println!("[WARN][MEMPOOL] below_min_gas gas={} min={}", gas_price, self.config.min_gas_price);
             return false;
+        }
+
+        // FIX M-H15: Evict lowest-priority TX when mempool is full
+        // NOTE L-M10: Benign TOCTOU race between len() check and write lock acquisition.
+        // Concurrent callers may both pass this check before either acquires the lock,
+        // causing minor temporary over-capacity (at most +N concurrent callers). This is
+        // acceptable: the priority queue remains consistent and the next eviction corrects it.
+        if self.transactions.len() >= self.config.max_size {
+            let mut priority_queue = self.by_gas_price.write();
+            if let Some(mut lowest_entry) = priority_queue.first_entry() {
+                let lowest_gas = *lowest_entry.key();
+                if gas_price > lowest_gas {
+                    if let Some(tx_hash) = lowest_entry.get().front().cloned() {
+                        // Remove evicted TX from both structures
+                        lowest_entry.get_mut().pop_front();
+                        if lowest_entry.get().is_empty() {
+                            lowest_entry.remove();
+                        }
+                        self.transactions.remove(&tx_hash);
+                        self.tx_timestamps.remove(&tx_hash);
+                        println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={}", lowest_gas, gas_price);
+                    }
+                } else {
+                    println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={}", self.transactions.len(), gas_price);
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            drop(priority_queue);
         }
         
         // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
@@ -94,15 +138,31 @@ impl SimpleMempool {
             Ok(tx) => {
                 let canonical_bytes = tx.canonical_bytes();
                 let computed_hash = format!("{:x}", Sha3_256::digest(&canonical_bytes));
-                
+
                 if computed_hash != hash {
-                    eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}", 
+                    eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}",
                              &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
                     return false; // Reject tampered transaction
                 }
+
+                // FIX L-M9: Per-sender limit defense-in-depth
+                // Transaction.from is available after deserialization — enforce per-sender cap
+                if !tx.from.is_empty() {
+                    let mut sender_count = self.tx_count_by_sender
+                        .entry(tx.from.clone())
+                        .or_insert(0);
+                    if *sender_count >= self.max_per_sender {
+                        println!("[WARN][MEMPOOL] per_sender_limit sender={} count={} max={}",
+                                 &tx.from[..16.min(tx.from.len())], *sender_count, self.max_per_sender);
+                        return false;
+                    }
+                    *sender_count += 1;
+                    // FIX R24-M2: Track hash→sender for decrement on removal
+                    self.tx_sender_map.insert(hash.clone(), tx.from.clone());
+                }
             }
             Err(e) => {
-                eprintln!("[ERR][MEMPOOL] parse_failed hash={} error={}", 
+                eprintln!("[ERR][MEMPOOL] parse_failed hash={} error={}",
                          &hash[..16.min(hash.len())], e);
                 return false; // Reject malformed transaction
             }
@@ -125,15 +185,16 @@ impl SimpleMempool {
             }
             
             self.transactions.insert(hash.clone(), storage);
+            self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
             priority_queue
                 .entry(gas_price)
                 .or_insert_with(VecDeque::new)
                 .push_back(hash);
         }
-        
+
         true
     }
-    
+
     /// Add binary transaction directly with priority
     /// PRODUCTION: Priority-based insertion for spam protection
     /// gas_price: Transaction gas price for priority sorting (higher = earlier processing)
@@ -142,11 +203,35 @@ impl SimpleMempool {
     /// v2.67: CRITICAL FIX - Add to priority queue FIRST, then to transactions
     /// This ensures get_pending_transactions_with_hashes always sees consistent state
     pub fn add_binary_transaction(&self, tx_bytes: Vec<u8>, hash: String, gas_price: u64) -> bool {
-        // v2.66: Diagnostic logging for mempool issues
-        if self.transactions.len() >= self.config.max_size {
-            eprintln!("[WARN][MEMPOOL] full size={} max={} hash={}", 
-                     self.transactions.len(), self.config.max_size, &hash[..16.min(hash.len())]);
+        // FIX M-M15: Enforce minimum gas price
+        if gas_price < self.config.min_gas_price {
+            println!("[WARN][MEMPOOL] below_min_gas gas={} min={}", gas_price, self.config.min_gas_price);
             return false;
+        }
+
+        // FIX M-H15: Evict lowest-priority TX when mempool is full
+        if self.transactions.len() >= self.config.max_size {
+            let mut priority_queue = self.by_gas_price.write();
+            if let Some(mut lowest_entry) = priority_queue.first_entry() {
+                let lowest_gas = *lowest_entry.key();
+                if gas_price > lowest_gas {
+                    if let Some(tx_hash) = lowest_entry.get().front().cloned() {
+                        lowest_entry.get_mut().pop_front();
+                        if lowest_entry.get().is_empty() {
+                            lowest_entry.remove();
+                        }
+                        self.transactions.remove(&tx_hash);
+                        self.tx_timestamps.remove(&tx_hash);
+                        println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={}", lowest_gas, gas_price);
+                    }
+                } else {
+                    println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={}", self.transactions.len(), gas_price);
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            drop(priority_queue);
         }
         
         // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
@@ -166,15 +251,29 @@ impl SimpleMempool {
             Ok(tx) => {
                 let canonical_bytes = tx.canonical_bytes();
                 let computed_hash = format!("{:x}", Sha3_256::digest(&canonical_bytes));
-                
+
                 if computed_hash != hash {
-                    eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}", 
+                    eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}",
                              &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
                     return false; // Reject tampered transaction
                 }
+
+                // Per-sender limit (defense in depth)
+                let sender = &tx.from;
+                if !sender.is_empty() {
+                    let mut sender_count = self.tx_count_by_sender.entry(sender.clone()).or_insert(0);
+                    if *sender_count >= self.max_per_sender {
+                        println!("[WARN][MEMPOOL] per_sender_limit sender={}.. count={}",
+                                 &sender[..16.min(sender.len())], *sender_count);
+                        return false;
+                    }
+                    *sender_count += 1;
+                    // FIX R24-M2: Track hash→sender for decrement on removal
+                    self.tx_sender_map.insert(hash.clone(), sender.clone());
+                }
             }
             Err(e) => {
-                eprintln!("[ERR][MEMPOOL] deserialize_failed hash={} error={}", 
+                eprintln!("[ERR][MEMPOOL] deserialize_failed hash={} error={}",
                          &hash[..16.min(hash.len())], e);
                 return false; // Reject malformed transaction
             }
@@ -192,7 +291,8 @@ impl SimpleMempool {
             
             // Add to transactions first
             self.transactions.insert(hash.clone(), TxStorage::Binary(tx_bytes));
-            
+            self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
+
             // Then add to priority queue (same lock scope)
             priority_queue
                 .entry(gas_price)
@@ -231,39 +331,36 @@ impl SimpleMempool {
         if transactions.is_empty() {
             return 0;
         }
-        
+
         let available_space = self.config.max_size.saturating_sub(self.transactions.len());
         if available_space == 0 {
             return 0;
         }
-        
+
         let mut added = 0usize;
-        let mut batch_for_priority: Vec<(String, u64)> = Vec::with_capacity(transactions.len());
-        
-        // Phase 1: Add to DashMap (lock-free)
+
+        // CRITICAL: Acquire priority queue lock BEFORE inserting into DashMap
+        // This makes both insertions atomic, preventing the race condition where
+        // a TX is visible in transactions but missing from the priority queue
+        let mut priority_queue = self.by_gas_price.write();
+
         for (tx_bytes, hash, gas_price) in transactions.into_iter().take(available_space) {
             // Skip duplicates
             if self.transactions.contains_key(&hash) {
                 continue;
             }
-            
+
             // TRUSTED: Skip hash verification - caller guarantees correctness
+            // Insert into BOTH structures within the same lock scope
             self.transactions.insert(hash.clone(), TxStorage::Binary(tx_bytes));
-            batch_for_priority.push((hash, gas_price));
+            self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
+            priority_queue
+                .entry(gas_price)
+                .or_insert_with(VecDeque::new)
+                .push_back(hash);
             added += 1;
         }
-        
-        // Phase 2: Batch add to priority queue (SINGLE lock for all)
-        if !batch_for_priority.is_empty() {
-            let mut priority_queue = self.by_gas_price.write();
-            for (hash, gas_price) in batch_for_priority {
-                priority_queue
-                    .entry(gas_price)
-                    .or_insert_with(VecDeque::new)
-                    .push_back(hash);
-            }
-        }
-        
+
         added
     }
     
@@ -331,13 +428,18 @@ impl SimpleMempool {
     /// CRITICAL: Maintains consistency between storage and priority queue
     pub fn remove_transaction(&self, hash: &str) -> bool {
         if self.transactions.remove(hash).is_some() {
+            self.tx_timestamps.remove(hash);
+            // FIX R24-M2: Decrement per-sender count on removal
+            if let Some((_, sender)) = self.tx_sender_map.remove(hash) {
+                if let Some(mut count) = self.tx_count_by_sender.get_mut(&sender) {
+                    *count = count.saturating_sub(1);
+                }
+            }
             // CRITICAL: Also remove from priority queue
-            // Iterate all gas_price levels to find and remove this hash
             let mut priority_queue = self.by_gas_price.write();
             for (_gas_price, hashes) in priority_queue.iter_mut() {
                 hashes.retain(|h| h != hash);
             }
-            // OPTIMIZATION: Remove empty gas_price entries to save memory
             priority_queue.retain(|_, hashes| !hashes.is_empty());
             true
         } else {
@@ -350,6 +452,8 @@ impl SimpleMempool {
     pub fn clear(&self) {
         self.transactions.clear();
         self.by_gas_price.write().clear();
+        self.tx_sender_map.clear();
+        self.tx_count_by_sender.clear();
     }
     
     /// Get mempool size
@@ -380,6 +484,7 @@ impl SimpleMempool {
         let mut removed_count = 0;
         for hash in hashes {
             if self.transactions.remove(hash).is_some() {
+                self.tx_timestamps.remove(hash.as_str());
                 removed_count += 1;
             }
         }
@@ -396,6 +501,8 @@ impl SimpleMempool {
         }
         
         if removed_count > 0 {
+            // FIX L-M16: Reset sender counts after bulk removal
+            self.reset_sender_counts();
             println!("[INFO][MEMPOOL] block_cleanup removed={} included_set={}", removed_count, self.included_tx_hashes.len());
         }
     }
@@ -409,16 +516,20 @@ impl SimpleMempool {
     }
     
     /// Periodic cleanup of included_tx_hashes to prevent unbounded growth
-    /// Safe to call periodically - removes oldest entries when set exceeds threshold
+    /// Safe to call periodically - evicts ~50% when set exceeds threshold
     /// ARCHITECTURE: 100K entries ≈ 100K blocks worth of TXs (at ~1 TX/block avg)
     /// At 1 block/sec that's ~28 hours of history - more than enough for gossip delay
+    /// FIX L-M17: More aggressive cleanup -- retain ~25% to favor recent entries
+    /// Uses 2-bit mask for probabilistic retention (deterministic per hash)
     pub fn cleanup_included_tx_hashes(&self) {
         const MAX_INCLUDED_SIZE: usize = 100_000;
         let current_size = self.included_tx_hashes.len();
         if current_size > MAX_INCLUDED_SIZE {
-            // Clear entire set - TXs older than this are no longer gossiped
-            self.included_tx_hashes.clear();
-            println!("[INFO][MEMPOOL] included_set_cleanup cleared={}", current_size);
+            // Retain ~25% by hash prefix (2-bit mask)
+            self.included_tx_hashes.retain(|hash| {
+                hash.as_bytes().first().map(|b| b & 3 == 0).unwrap_or(false)
+            });
+            println!("[INFO][MEMPOOL] included_set_cleanup before={} after={}", current_size, self.included_tx_hashes.len());
         }
     }
     
@@ -468,6 +579,58 @@ impl SimpleMempool {
         result
     }
     
+    /// Remove transactions older than TTL (default 30 minutes)
+    pub fn cleanup_expired_transactions(&self, ttl_secs: u64) -> usize {
+        let mut expired_hashes = Vec::new();
+        self.tx_timestamps.retain(|hash, added_at| {
+            if added_at.elapsed().as_secs() > ttl_secs {
+                expired_hashes.push(hash.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        if !expired_hashes.is_empty() {
+            // IMPORTANT: Do NOT use batch_remove_transactions here!
+            // That method adds hashes to included_tx_hashes, which would
+            // incorrectly block re-submission of expired (never-confirmed) TXs.
+            for hash in &expired_hashes {
+                self.transactions.remove(hash);
+            }
+            // Remove from priority queue
+            let expired_set: std::collections::HashSet<&String> = expired_hashes.iter().collect();
+            let mut priority_queue = self.by_gas_price.write();
+            for (_gas_price, hashes) in priority_queue.iter_mut() {
+                hashes.retain(|h| !expired_set.contains(h));
+            }
+            priority_queue.retain(|_, hashes| !hashes.is_empty());
+
+            // FIX L-M16: Reset sender counts after bulk removal to stay accurate
+            // Without per-TX sender tracking, a full reset is the safest approach
+            self.reset_sender_counts();
+        }
+
+        expired_hashes.len()
+    }
+
+    /// Add binary transaction with sender tracking for spam protection
+    pub fn add_binary_transaction_with_sender(&self, tx_bytes: Vec<u8>, hash: String, gas_price: u64, sender: &str) -> bool {
+        // Check per-sender limit
+        let sender_count = self.tx_count_by_sender.get(sender).map(|v| *v).unwrap_or(0);
+        if sender_count >= self.max_per_sender {
+            return false;
+        }
+        // Note: add_binary_transaction() already increments tx_count_by_sender
+        self.add_binary_transaction(tx_bytes, hash, gas_price)
+    }
+
+    /// Reset per-sender counts (call periodically, e.g., every block)
+    pub fn reset_sender_counts(&self) {
+        self.tx_count_by_sender.clear();
+        self.tx_sender_map.clear();
+    }
+
     /// v2.67: Debug method to check mempool consistency
     pub fn debug_check_consistency(&self) -> (usize, usize, bool) {
         let tx_count = self.transactions.len();

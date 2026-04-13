@@ -9,7 +9,8 @@ use crate::{
 };
 use qnet_consensus::lazy_rewards::{PhaseAwareReward, PhaseAwareRewardManager};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use tokio::sync::Semaphore;
 use futures::future::join_all;
 use serde::{Serialize, Deserialize};
@@ -83,8 +84,8 @@ impl ShardedRewardManager {
     
     /// Assign nodes to shards based on hash distribution
     pub async fn assign_nodes_to_shards(&self, node_ids: Vec<String>) -> IntegrationResult<()> {
-        let mut shards = match self.shards.write() { Ok(g) => g, Err(p) => p.into_inner() };
-        let mut assignments = match self.shard_assignments.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut shards = self.shards.write();
+        let mut assignments = self.shard_assignments.write();
         
         // Clear previous assignments
         for shard in shards.iter_mut() {
@@ -102,7 +103,7 @@ impl ShardedRewardManager {
         
         // Log distribution
         for shard in shards.iter() {
-            println!("[SHARDING] Shard {}: {} nodes assigned", 
+            println!("[DEBUG][REWARDS] shard_assigned shard={} nodes={}",
                      shard.shard_id, shard.node_ids.len());
         }
         
@@ -130,10 +131,10 @@ impl ShardedRewardManager {
         &self, 
         reward_manager: Arc<RwLock<PhaseAwareRewardManager>>
     ) -> IntegrationResult<u64> {
-        let shards = match self.shards.read() { Ok(g) => g, Err(p) => p.into_inner() }.clone();
+        let shards = self.shards.read().clone();
         let mut futures = Vec::new();
         
-        println!("[SHARDING] Starting parallel processing of {} shards", shards.len());
+        println!("[INFO][REWARDS] processing_start shards={}", shards.len());
         
         // FIRST PASS: Count eligible nodes BY TYPE across all shards
         let mut total_eligible_nodes = 0usize;
@@ -153,7 +154,7 @@ impl ShardedRewardManager {
             }
         }
         
-        println!("[SHARDING] Eligible nodes: {}", total_eligible_nodes);
+        println!("[INFO][REWARDS] eligible_nodes total={}", total_eligible_nodes);
         
         // SECOND PASS: Process shards with correct reward amount
         for shard in shards {
@@ -168,7 +169,7 @@ impl ShardedRewardManager {
                 let _permit = match sem.acquire().await {
                     Ok(p) => p,
                     Err(_) => { 
-                        println!("[REWARDS] ⚠️ Semaphore closed"); 
+                        println!("[ERROR][REWARDS] semaphore_closed");
                         return Err(IntegrationError::ValidationError("Semaphore closed".to_string())); 
                     }
                 };
@@ -176,33 +177,126 @@ impl ShardedRewardManager {
             }));
         }
         
-        // Wait for all shards to complete
+        // Wait for all shards to complete and track failures atomically
         let results = join_all(futures).await;
-        
+
         let mut total_rewards = 0u64;
-        let mut failed_shards = 0;
-        
-        for result in results {
+        let mut failed_shard_ids: Vec<usize> = Vec::new();
+
+        for (idx, result) in results.into_iter().enumerate() {
             match result {
-                Ok(Ok(rewards)) => total_rewards += rewards,
+                Ok(Ok(rewards)) => total_rewards = total_rewards.saturating_add(rewards),
                 Ok(Err(e)) => {
-                    eprintln!("[SHARDING] Shard processing error: {}", e);
-                    failed_shards += 1;
+                    println!("[ERROR][REWARDS] shard_error shard={} error={}", idx, e);
+                    failed_shard_ids.push(idx);
                 },
                 Err(e) => {
-                    eprintln!("[SHARDING] Task join error: {}", e);
-                    failed_shards += 1;
+                    println!("[ERROR][REWARDS] shard_join_error shard={} error={}", idx, e);
+                    failed_shard_ids.push(idx);
                 }
             }
         }
-        
-        if failed_shards > 0 {
-            eprintln!("[SHARDING] {} shards failed processing", failed_shards);
+
+        // FIX R20-H3: Retry failed shards (max 1 retry per shard)
+        // Prevents permanent reward loss for ~6% of nodes on transient failures
+        if !failed_shard_ids.is_empty() {
+            println!("[WARN][REWARDS] shard_failures count={} shards={:?} retrying...",
+                     failed_shard_ids.len(), failed_shard_ids);
+
+            let shards_snapshot = self.shards.read().clone();
+            let mut retry_futures = Vec::new();
+
+            for &shard_idx in &failed_shard_ids {
+                if shard_idx < shards_snapshot.len() {
+                    let shard = shards_snapshot[shard_idx].clone();
+                    let storage = self.storage.clone();
+                    let sem = self.processing_sem.clone();
+                    let rm = reward_manager.clone();
+                    let node_counts = NodeTypeCounts {
+                        total: total_eligible_nodes,
+                    };
+
+                    retry_futures.push((shard_idx, tokio::spawn(async move {
+                        let _permit = match sem.acquire().await {
+                            Ok(p) => p,
+                            Err(_) => return Err(IntegrationError::ValidationError(
+                                "Semaphore closed on retry".to_string()
+                            )),
+                        };
+                        Self::process_shard_with_counts(shard, storage, rm, node_counts).await
+                    })));
+                }
+            }
+
+            let mut still_failed: Vec<usize> = Vec::new();
+            for (shard_idx, future) in retry_futures {
+                match future.await {
+                    Ok(Ok(rewards)) => {
+                        total_rewards = total_rewards.saturating_add(rewards);
+                        println!("[INFO][REWARDS] shard_retry_ok shard={} rewards={}", shard_idx, rewards);
+                    }
+                    Ok(Err(e)) => {
+                        println!("[ERROR][REWARDS] shard_retry_failed shard={} error={}", shard_idx, e);
+                        still_failed.push(shard_idx);
+                    }
+                    Err(e) => {
+                        println!("[ERROR][REWARDS] shard_retry_join_failed shard={} error={}", shard_idx, e);
+                        still_failed.push(shard_idx);
+                    }
+                }
+            }
+
+            if !still_failed.is_empty() {
+                println!("[ERROR][REWARDS] shard_permanent_failures count={} shards={:?}",
+                         still_failed.len(), still_failed);
+            }
         }
-        
-        println!("[SHARDING] Processed total rewards: {} QNC across all shards", 
-                 total_rewards as f64 / 1_000_000_000.0);
-        
+
+        // FIX R20-H2: Compute global remainder ONCE and carry forward via reward_manager
+        // Each shard divides total_emission / total_nodes — the truncation remainder
+        // must be tracked to prevent nanoQNC token loss over time
+        if total_eligible_nodes > 0 {
+            // Reconstruct the same emission calculation used in shards
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let genesis_timestamp = {
+                let rm = reward_manager.read();
+                rm.get_genesis_timestamp()
+            };
+            let years_since_genesis = if now > genesis_timestamp {
+                (now - genesis_timestamp) / (365 * 24 * 60 * 60)
+            } else {
+                0
+            };
+            let halving_cycles = years_since_genesis / 4;
+            const BASE_EMISSION_NANO: u64 = 251_432_340_000_000;
+            let total_emission_nano: u64 = if halving_cycles >= 50 {
+                0
+            } else if halving_cycles == 5 {
+                BASE_EMISSION_NANO / 160
+            } else if halving_cycles > 5 {
+                let normal_halvings = halving_cycles.saturating_sub(5);
+                let divisor = 160u64.saturating_mul(1u64 << normal_halvings.min(63));
+                BASE_EMISSION_NANO / divisor.max(1)
+            } else {
+                BASE_EMISSION_NANO >> halving_cycles.min(63)
+            };
+
+            let node_count = total_eligible_nodes as u64;
+            let global_remainder = total_emission_nano % node_count;
+            if global_remainder > 0 {
+                let mut rm = reward_manager.write();
+                rm.add_pool1_remainder(global_remainder);
+                println!("[INFO][REWARDS] shard_remainder_carried remainder={} nodes={}",
+                         global_remainder, node_count);
+            }
+        }
+
+        println!("[INFO][REWARDS] processing_complete total_nano={} total_qnc={}",
+                 total_rewards, total_rewards / 1_000_000_000);
+
         Ok(total_rewards)
     }
     
@@ -302,7 +396,7 @@ impl ShardedRewardManager {
                         
                         // Get actual genesis timestamp from reward_manager
                         let genesis_timestamp = {
-                            let rm = match reward_manager.read() { Ok(g) => g, Err(p) => p.into_inner() };
+                            let rm = reward_manager.read();
                             rm.get_genesis_timestamp()
                         };
                         
@@ -316,33 +410,42 @@ impl ShardedRewardManager {
                         let halving_cycles = years_since_genesis / 4;
                         
                         // Apply halving (with sharp drop at year 20)
-                        let base_emission_qnc = if halving_cycles == 5 {
-                            // Year 20-24: Sharp drop by 10x
-                            251_432.34 / (2.0_f64.powi(4) * 10.0)
+                        // Pure integer math: 251,432.34 QNC = 251_432_340_000_000 nanoQNC
+                        const BASE_EMISSION_NANO: u64 = 251_432_340_000_000;
+
+                        // FIX R14-M3: checked pow to prevent overflow at extreme halving cycles
+                        let total_emission_nano: u64 = if halving_cycles == 5 {
+                            // Year 20-24: Sharp drop by 2^4 * 10 = 160x
+                            BASE_EMISSION_NANO / (16 * 10)
                         } else if halving_cycles > 5 {
-                            // After year 24: Continue normal halving
-                            let normal_halvings = halving_cycles - 5;
-                            251_432.34 / (2.0_f64.powi(4) * 10.0 * 2.0_f64.powi(normal_halvings as i32))
+                            // After year 24: Continue normal halving from year-20 base
+                            let normal_halvings = halving_cycles.saturating_sub(5);
+                            // Cap shift to prevent overflow (>63 would overflow u64)
+                            if normal_halvings >= 50 {
+                                0 // Emission effectively zero after ~200+ years
+                            } else {
+                                let divisor = 160u64.saturating_mul(1u64 << normal_halvings.min(63));
+                                BASE_EMISSION_NANO / divisor.max(1)
+                            }
                         } else {
-                            // First 20 years: Normal halving every 4 years
-                            251_432.34 / 2.0_f64.powi(halving_cycles as i32)
+                            // First 20 years: Normal halving every 4 years (bit shift)
+                            BASE_EMISSION_NANO >> halving_cycles.min(63)
                         };
                         
-                        // Convert to nanoQNC (9 decimals)
-                        let total_emission_nano = (base_emission_qnc * 1_000_000_000.0) as u64;
-                        
                         // v2.64: Divide emission by total eligible nodes (NO FALLBACK!)
-                        // If node_counts is None, node is not eligible for rewards
+                        // FIX R20-H2: Remainder is now tracked globally in process_all_shards()
+                        // and carried forward via reward_manager.add_pool1_remainder()
                         let base_reward = if let Some(ref counts) = node_counts {
                             if counts.total > 0 {
-                                total_emission_nano / counts.total as u64
+                                let node_count = counts.total as u64;
+                                total_emission_nano / node_count
                             } else {
-                                0 // No eligible nodes - no reward
+                                0u64
                             }
                         } else {
                             // v2.64: No fallback! If we don't know eligible count, reward is 0
-                            println!("[WARN][SHARDING] node_counts=None, cannot calculate reward for node");
-                            0
+                            println!("[WARN][REWARDS] node_counts=None node={}", node_id);
+                            0u64
                         };
                         // v3.18: Pool 2 REMOVED - fees go directly to block producer
                         let pool2_share = 0_u64; // v3.18: Pool 2 removed
@@ -352,7 +455,7 @@ impl ShardedRewardManager {
                             pool1_base_emission: base_reward,
                             pool2_transaction_fees: pool2_share,
                             pool3_activation_bonus: 0, // Phase 1 - no Pool #3
-                            total_reward: current_amount + base_reward + pool2_share,
+                            total_reward: current_amount.saturating_add(base_reward).saturating_add(pool2_share),
                         };
                         
                         // Save to storage
@@ -369,10 +472,10 @@ impl ShardedRewardManager {
             .unwrap_or_default()
             .as_secs();
         
-        println!("[SHARDING] Shard {} completed: {} nodes, {} QNC total", 
-                 shard.shard_id, 
+        println!("[INFO][REWARDS] shard_complete shard={} nodes={} reward_nano={}",
+                 shard.shard_id,
                  shard.node_ids.len(),
-                 total_rewards as f64 / 1_000_000_000.0);
+                 total_rewards);
         
         Ok(total_rewards)
     }
@@ -381,7 +484,7 @@ impl ShardedRewardManager {
     pub fn get_shard_stats(&self) -> HashMap<String, serde_json::Value> {
         use serde_json::json;
         
-        let shards = match self.shards.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let shards = self.shards.read();
         let mut stats = HashMap::new();
         
         for shard in shards.iter() {
@@ -409,8 +512,8 @@ impl ShardedRewardManager {
     
     /// Rebalance shards if load is uneven
     pub async fn rebalance_shards(&self) -> IntegrationResult<()> {
-        let shards = match self.shards.read() { Ok(g) => g, Err(p) => p.into_inner() };
-        
+        let shards = self.shards.read();
+
         // Calculate average load
         let total_nodes: usize = shards.iter().map(|s| s.node_ids.len()).sum();
         let avg_load = total_nodes / NUM_REWARD_SHARDS;
@@ -423,7 +526,7 @@ impl ShardedRewardManager {
         });
         
         if needs_rebalancing {
-            println!("[SHARDING] Rebalancing shards due to uneven load distribution");
+            println!("[INFO][REWARDS] rebalancing_shards reason=uneven_load");
             
             // Collect all nodes
             let mut all_nodes = Vec::new();

@@ -5,7 +5,8 @@ use prometheus::{
     CounterVec, GaugeVec, HistogramVec,
 };
 use lazy_static::lazy_static;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 
 lazy_static! {
     /// Counter for consensus rounds

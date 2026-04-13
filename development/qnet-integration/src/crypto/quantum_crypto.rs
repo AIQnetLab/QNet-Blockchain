@@ -9,7 +9,7 @@ use base64::{Engine as _, engine::general_purpose};
 use anyhow::{Result, anyhow};
 use crate::node::NodeType;
 use std::sync::Arc;
-use std::sync::RwLock as StdRwLock;  // For performance_stats (non-async)
+use parking_lot::RwLock as StdRwLock;  // For performance_stats (non-async, non-poisoning)
 use blake3;
 use dashmap::DashMap;
 
@@ -473,28 +473,25 @@ impl QNetQuantumCrypto {
     }
 
     fn record_cache_hit(&self) {
-        if let Ok(mut stats) = self.performance_stats.write() {
-            stats.cache_hits += 1;
-            stats.total_operations += 1;
-        }
+        let mut stats = self.performance_stats.write();
+        stats.cache_hits += 1;
+        stats.total_operations += 1;
     }
 
     fn record_cache_miss(&self) {
-        if let Ok(mut stats) = self.performance_stats.write() {
-            stats.cache_misses += 1;
-            stats.total_operations += 1;
-        }
+        let mut stats = self.performance_stats.write();
+        stats.cache_misses += 1;
+        stats.total_operations += 1;
     }
 
     fn record_decrypt_time(&self, time_ms: u64) {
-        if let Ok(mut stats) = self.performance_stats.write() {
-            stats.total_decrypt_time_ms += time_ms;
-        }
+        let mut stats = self.performance_stats.write();
+        stats.total_decrypt_time_ms += time_ms;
     }
 
     /// Get performance status (removed code verification - system always generates correct codes)
     pub fn get_status(&self) -> QuantumCryptoStatus {
-        let stats = match self.performance_stats.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let stats = self.performance_stats.read();
         let zero_copy_ops = self.zero_copy_counter.load(std::sync::atomic::Ordering::Relaxed);
         
         let cache_hit_rate = if stats.total_operations > 0 {
@@ -739,13 +736,13 @@ impl QNetQuantumCrypto {
             let wallet_address = crate::genesis_constants::get_genesis_wallet_by_id(&bootstrap_id_str)
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| {
-                    // Fallback: Generate proper EON address format: {19}eon{15}{4 checksum} = 41 chars
+                    // Fallback: Generate proper EON address format: {19}eon{15}{8 checksum} = 45 chars
                     use sha3::{Sha3_256, Digest};
                     let hash = blake3::hash(genesis_node_id.as_bytes()).to_hex();
                     let part1 = &hash[..19];
                     let part2 = &hash[19..34];
                     let checksum_input = format!("{}eon{}", part1, part2);
-                    let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..2]);
+                    let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..4]);
                     format!("{}eon{}{}", part1, part2, checksum)
                 });
             
@@ -802,7 +799,7 @@ impl QNetQuantumCrypto {
         let tx_hash = format!("0x{}", &encoded_data[2..]);
         
         // Generate wallet address from activation code
-        // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters
+        // PRODUCTION FORMAT: 19 + 3 + 15 + 8 = 45 characters
         let wallet_hash = {
             let mut hasher = Sha3_256::new();
             hasher.update(code.as_bytes());
@@ -811,10 +808,10 @@ impl QNetQuantumCrypto {
         let full_hex = hex::encode(&wallet_hash);
         let part1 = &full_hex[..19];
         let part2 = &full_hex[19..34];
-        // SHA3-256 checksum (v4.0: migrated from SHA2)
+        // SHA3-256 checksum (4 bytes = 32-bit collision resistance)
         let checksum_input = format!("{}eon{}", part1, part2);
         use sha3::{Sha3_256, Digest};
-        let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..2]);
+        let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..4]);
         let wallet_address = format!("{}eon{}{}", part1, part2, checksum);
 
         // Calculate amount based on phase and node type (EXISTING ECONOMIC LOGIC)

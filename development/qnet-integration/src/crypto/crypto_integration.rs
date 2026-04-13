@@ -1,7 +1,8 @@
 //! Crypto Integration Module for QNet
 //! Integrates production-ready post-quantum cryptography into the main system
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use once_cell::sync::OnceCell;
 
@@ -123,13 +124,13 @@ impl CryptoService {
         
         // Store in key store
         {
-            let mut store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut store = self.key_store.lock();
             store.node_keys.insert(key_id.clone(), node_keys);
         }
         
         // Update metrics
         {
-            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut metrics = self.metrics.lock();
             metrics.key_pairs_generated += 1;
         }
         
@@ -153,13 +154,13 @@ impl CryptoService {
         
         // Store in key store
         {
-            let mut store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut store = self.key_store.lock();
             store.validator_keys.insert(validator_id.to_string(), validator_keys);
         }
         
         // Update metrics
         {
-            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut metrics = self.metrics.lock();
             metrics.key_pairs_generated += 1;
         }
         
@@ -180,13 +181,13 @@ impl CryptoService {
         
         // Store in key store
         {
-            let mut store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut store = self.key_store.lock();
             store.wallet_keys.insert(address.to_string(), wallet_keys);
         }
         
         // Update metrics
         {
-            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut metrics = self.metrics.lock();
             metrics.key_pairs_generated += 1;
         }
         
@@ -199,7 +200,7 @@ impl CryptoService {
         
         // Get node keys
         let secret_key = {
-            let store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let store = self.key_store.lock();
             let key_id = format!("node_{}", node_id);
             
             store.node_keys.get(&key_id)
@@ -216,7 +217,7 @@ impl CryptoService {
         
         // Update metrics
         {
-            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut metrics = self.metrics.lock();
             metrics.signatures_created += 1;
             
             let duration_ms = start_time.elapsed().as_millis() as f64;
@@ -234,7 +235,7 @@ impl CryptoService {
         
         // Get validator keys
         let secret_key = {
-            let store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let store = self.key_store.lock();
             
             store.validator_keys.get(validator_id)
                 .filter(|keys| keys.is_active)
@@ -251,7 +252,7 @@ impl CryptoService {
         
         // Update metrics
         {
-            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut metrics = self.metrics.lock();
             metrics.signatures_created += 1;
         }
         
@@ -264,7 +265,7 @@ impl CryptoService {
         
         // Get wallet keys
         let secret_key = {
-            let mut store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut store = self.key_store.lock();
             
             let wallet_keys = store.wallet_keys.get_mut(address)
                 .ok_or_else(|| CryptoError {
@@ -284,7 +285,7 @@ impl CryptoService {
         
         // Update metrics
         {
-            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut metrics = self.metrics.lock();
             metrics.signatures_created += 1;
         }
         
@@ -295,15 +296,17 @@ impl CryptoService {
     pub fn verify_signature(&self, message: &[u8], signature: &Signature, public_key: &PublicKey) -> Result<bool, CryptoError> {
         let start_time = std::time::Instant::now();
         
-        // Check cache first
+        // FIX R24-H1: Include public_key in cache key to prevent cross-key cache bypass.
+        // Without pubkey, a signature verified under key K1 would return cached true
+        // when later verified under different key K2 — bypassing actual verification.
         let message_hash = self.hash_message(message);
-        let cache_key = format!("{:?}_{:?}", message_hash, signature.as_bytes());
-        
+        let cache_key = format!("{:?}_{:?}_{:?}", message_hash, signature.as_bytes(), public_key.as_bytes());
+
         {
-            let cache = match self.signature_cache.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let cache = self.signature_cache.lock();
             if let Some(cached) = cache.get(&cache_key) {
                 if cached.message_hash == message_hash {
-                    let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                    let mut metrics = self.metrics.lock();
                     metrics.cache_hits += 1;
                     return Ok(true);
                 }
@@ -322,14 +325,29 @@ impl CryptoService {
                 created_at: current_timestamp(),
                 uses: 1,
             };
-            
-            let mut cache = match self.signature_cache.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+
+            let mut cache = self.signature_cache.lock();
+            // FIX R24-M1: Enforce cache size limit to prevent unbounded memory growth.
+            // Evict oldest 25% entries when cache exceeds 50,000 entries (scaled for
+            // thousands of super nodes producing signatures each epoch).
+            const SIG_CACHE_MAX: usize = 50_000;
+            if cache.len() >= SIG_CACHE_MAX {
+                let evict_count = SIG_CACHE_MAX / 4;
+                let mut entries: Vec<(String, u64)> = cache.iter()
+                    .map(|(k, v)| (k.clone(), v.created_at))
+                    .collect();
+                entries.sort_by(|a, b| a.1.cmp(&b.1));
+                for (key, _) in entries.iter().take(evict_count) {
+                    cache.remove(key);
+                }
+                println!("[INFO][CRYPTO] sig_cache_eviction evicted={} remaining={}", evict_count, cache.len());
+            }
             cache.insert(cache_key, cached_sig);
         }
         
         // Update metrics
         {
-            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut metrics = self.metrics.lock();
             if is_valid {
                 metrics.signatures_verified += 1;
             } else {
@@ -348,32 +366,32 @@ impl CryptoService {
     
     /// Get public key for node
     pub fn get_node_public_key(&self, node_id: &str) -> Option<PublicKey> {
-        let store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let store = self.key_store.lock();
         let key_id = format!("node_{}", node_id);
         store.node_keys.get(&key_id).map(|keys| keys.public_key.clone())
     }
     
     /// Get public key for validator
     pub fn get_validator_public_key(&self, validator_id: &str) -> Option<PublicKey> {
-        let store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let store = self.key_store.lock();
         store.validator_keys.get(validator_id).map(|keys| keys.public_key.clone())
     }
     
     /// Get public key for wallet
     pub fn get_wallet_public_key(&self, address: &str) -> Option<PublicKey> {
-        let store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let store = self.key_store.lock();
         store.wallet_keys.get(address).map(|keys| keys.public_key.clone())
     }
     
     /// Get crypto service metrics
     pub fn get_metrics(&self) -> CryptoMetrics {
-        match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() }.clone()
+        self.metrics.lock().clone()
     }
     
     /// Clean old cached signatures
     pub fn clean_signature_cache(&self, max_age_seconds: u64) {
         let current_time = current_timestamp();
-        let mut cache = match self.signature_cache.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut cache = self.signature_cache.lock();
         
         cache.retain(|_, cached| {
             current_time - cached.created_at < max_age_seconds
@@ -387,7 +405,7 @@ impl CryptoService {
         
         // Update validator keys
         {
-            let mut store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut store = self.key_store.lock();
             if let Some(validator_keys) = store.validator_keys.get_mut(validator_id) {
                 validator_keys.public_key = new_public_key;
                 validator_keys.secret_key = new_secret_key;
@@ -417,7 +435,7 @@ impl CryptoService {
     
     fn clear_validator_cache(&self, _validator_id: &str) {
         // In production, would selectively clear cache entries for this validator
-        let mut cache = match self.signature_cache.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut cache = self.signature_cache.lock();
         cache.clear(); // Simplified for now
     }
 
@@ -431,7 +449,7 @@ impl CryptoService {
             loop {
                 interval.tick().await;
                 
-                let metrics = match metrics_clone.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                let metrics = metrics_clone.lock();
                 println!("🔐 Crypto Performance:");
                 println!("   Signatures: {}", metrics.signatures_created);
                 println!("   Verifications: {}", metrics.signatures_verified);

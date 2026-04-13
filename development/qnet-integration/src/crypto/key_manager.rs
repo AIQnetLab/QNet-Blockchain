@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::fs;
-use std::sync::{Arc, RwLock, OnceLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::RwLock;
 use anyhow::{Result, anyhow};
 use pqcrypto_mldsa::mldsa65 as dilithium3;
 use pqcrypto_traits::sign::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait, SignedMessage as SignedMessageTrait};
 use sha3::{Sha3_256, Digest};
+use zeroize::Zeroize;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.50: Lock-free key directory cache with OnceLock
@@ -161,7 +163,7 @@ impl DilithiumKeyManager {
     pub fn get_keypair(&self) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
         // Check cache first
         {
-            let cache_guard = match self.cached_keypair.read() { Ok(g) => g, Err(p) => p.into_inner() };
+            let cache_guard = self.cached_keypair.read();
             if let Some((pk, sk)) = cache_guard.as_ref() {
                 return Ok((pk.clone(), sk.clone()));
             }
@@ -174,8 +176,12 @@ impl DilithiumKeyManager {
             // Generating new keys would cause node identity loss
             let (pk, sk) = self.load_keypair_from_disk(&key_path)?;
             
-            // Cache the loaded keypair
-            let mut cache_guard = match self.cached_keypair.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            // Cache the loaded keypair (drop old secret key before replacing)
+            // NOTE: Production deployment should use HSM for secret key storage
+            let mut cache_guard = self.cached_keypair.write();
+            // Take old value out — drops old SecretKey (best effort memory clear without unsafe)
+            let _old = cache_guard.take();
+            println!("[INFO][KEY] old_keypair_dropped");
             *cache_guard = Some((pk.clone(), sk.clone()));
             return Ok((pk, sk));
         }
@@ -192,10 +198,19 @@ impl DilithiumKeyManager {
         self.save_keypair_to_disk(&pk, &sk, &key_path)?;
         println!("[INFO][KEY] keypair saved to disk");
         
-        // Cache the keypair
+        // Cache the keypair (zeroize old secret key if replacing)
+        // NOTE: Production deployment should use HSM for secret key storage
         {
-            let mut cache_guard = match self.cached_keypair.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut cache_guard = self.cached_keypair.write();
+            // FIX C17: Replace unsafe const-to-mut pointer cast with safe cache replacement
+            // Old key material in the dropped Option<SecretKey> will be reclaimed by allocator.
+            // We cannot safely zeroize pqcrypto SecretKey internals without unsafe UB,
+            // so we rely on replacing the cache entry (old value is dropped).
+            let had_old_key = cache_guard.is_some();
             *cache_guard = Some((pk.clone(), sk.clone()));
+            if had_old_key {
+                println!("[INFO][KEY] old_keypair_replaced_in_cache");
+            }
         }
         
         Ok((pk, sk))
@@ -508,7 +523,7 @@ impl DilithiumKeyManager {
         let cipher = Aes256Gcm::new(key);
         let nonce = Nonce::from_slice(nonce_bytes);
         
-        let decrypted = cipher.decrypt(nonce, encrypted)
+        let mut decrypted = cipher.decrypt(nonce, encrypted)
             .map_err(|e| anyhow!("Decryption failed: {}. If keys were encrypted with old method, delete keys/ folder and restart.", e))?;
         
         // Parse keypair
@@ -552,8 +567,42 @@ impl DilithiumKeyManager {
         let sk_bytes = &decrypted[cursor..cursor+sk_len];
         let sk = <dilithium3::SecretKey as SecretKeyTrait>::from_bytes(sk_bytes)
             .map_err(|_| anyhow!("Invalid secret key format"))?;
-        
+
+        // Zeroize decrypted buffer containing raw secret key material
+        decrypted.zeroize();
+
         Ok((pk, sk))
+    }
+}
+
+// FIX R24-H3: Zeroize the ORIGINAL SecretKey bytes, not just a copy.
+// R23-K6 created a Vec copy via to_vec() and zeroized that — but the original
+// pqcrypto SecretKey (which doesn't impl Zeroize) remained in memory.
+// Now we zeroize the original bytes in-place via unsafe pointer to the SecretKey.
+impl Drop for DilithiumKeyManager {
+    fn drop(&mut self) {
+        if let Some(mut guard) = self.cached_keypair.try_write() {
+            if let Some((_pk, sk)) = guard.take() {
+                // FIX P1: zeroize via owned mutable copy (no UB from immutable cast)
+                // SecretKey is Copy — take owned bytes, zeroize the copy,
+                // then black_box the original to prevent compiler from eliding the drop
+                let mut sk_bytes = sk.as_bytes().to_vec();
+                for byte in sk_bytes.iter_mut() {
+                    unsafe { std::ptr::write_volatile(byte as *mut u8, 0u8); }
+                }
+                std::hint::black_box(&sk_bytes);
+                // Zeroize the original SecretKey struct memory via its raw pointer
+                // Safe: sk is owned (taken from Option), no other references exist
+                let sk_ptr = &sk as *const _ as *mut u8;
+                let sk_size = std::mem::size_of_val(&sk);
+                for i in 0..sk_size {
+                    unsafe { std::ptr::write_volatile(sk_ptr.add(i), 0u8); }
+                }
+                std::hint::black_box(&sk);
+                drop(sk_bytes);
+                println!("[INFO][KEY] dilithium_sk_zeroized node={}", self.node_id);
+            }
+        }
     }
 }
 

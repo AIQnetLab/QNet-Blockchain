@@ -56,28 +56,36 @@ pub fn compute_merkle_root(transaction_hashes: &[String]) -> Result<String, Box<
 /// 4. Pre-allocated buffer for hash concatenation
 fn compute_merkle_root_optimized(hashes: &[String]) -> Result<String, Box<dyn Error>> {
     // Step 1: Decode all hex strings to bytes (one-time cost)
+    // FIX R23-K3: Domain-separated hashing — leaf nodes prefixed with 0x00,
+    // internal nodes with 0x01. Prevents second-preimage attacks where an
+    // attacker crafts a leaf that equals an internal hash(left||right).
     let mut current_level: Vec<[u8; HASH_SIZE]> = Vec::with_capacity(hashes.len());
-    
+
     for hash_str in hashes {
         let bytes = hex::decode(hash_str)
             .map_err(|e| format!("Invalid hex in merkle input: {}", e))?;
-        
+
         if bytes.len() != HASH_SIZE {
             return Err(format!("Invalid hash length: expected {}, got {}", HASH_SIZE, bytes.len()).into());
         }
-        
+
+        // FIX R23-K3: Leaf domain separation — H(0x00 || leaf_data)
+        let mut hasher = Sha3_256::new();
+        hasher.update(&[0x00u8]); // LEAF_PREFIX
+        hasher.update(&bytes);
+        let result = hasher.finalize();
         let mut arr = [0u8; HASH_SIZE];
-        arr.copy_from_slice(&bytes);
+        arr.copy_from_slice(&result);
         current_level.push(arr);
     }
-    
+
     // Step 2: Build tree iteratively (no recursion)
     // Pre-allocate buffer for concatenation (64 bytes = 2 hashes)
     let mut concat_buffer = [0u8; HASH_SIZE * 2];
-    
+
     while current_level.len() > 1 {
         let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
-        
+
         for i in (0..current_level.len()).step_by(2) {
             let left = &current_level[i];
             // If no right child, duplicate left
@@ -86,21 +94,22 @@ fn compute_merkle_root_optimized(hashes: &[String]) -> Result<String, Box<dyn Er
             } else {
                 left
             };
-            
+
             // Concatenate into pre-allocated buffer (no allocation!)
             concat_buffer[..HASH_SIZE].copy_from_slice(left);
             concat_buffer[HASH_SIZE..].copy_from_slice(right);
-            
-            // Hash the concatenation
+
+            // FIX R23-K3: Internal node domain separation — H(0x01 || left || right)
             let mut hasher = Sha3_256::new();
+            hasher.update(&[0x01u8]); // INTERNAL_PREFIX
             hasher.update(&concat_buffer);
             let result = hasher.finalize();
-            
+
             let mut arr = [0u8; HASH_SIZE];
             arr.copy_from_slice(&result);
             next_level.push(arr);
         }
-        
+
         current_level = next_level;
     }
     
@@ -144,28 +153,34 @@ fn generate_merkle_proof_optimized(
     tx_index: usize
 ) -> Result<Vec<(String, bool)>, Box<dyn Error>> {
     // Step 1: Decode all hex strings to bytes
+    // FIX R23-K3: Apply leaf domain separation (same as compute_merkle_root_optimized)
     let mut current_level: Vec<[u8; HASH_SIZE]> = Vec::with_capacity(hashes.len());
-    
+
     for hash_str in hashes {
         let bytes = hex::decode(hash_str)
             .map_err(|e| format!("Invalid hex: {}", e))?;
-        
+
         if bytes.len() != HASH_SIZE {
             return Err(format!("Invalid hash length: {}", bytes.len()).into());
         }
-        
+
+        // FIX R23-K3: Leaf domain separation — H(0x00 || leaf_data)
+        let mut hasher = Sha3_256::new();
+        hasher.update(&[0x00u8]);
+        hasher.update(&bytes);
+        let result = hasher.finalize();
         let mut arr = [0u8; HASH_SIZE];
-        arr.copy_from_slice(&bytes);
+        arr.copy_from_slice(&result);
         current_level.push(arr);
     }
-    
+
     let mut proof = Vec::new();
     let mut current_index = tx_index;
     let mut concat_buffer = [0u8; HASH_SIZE * 2];
-    
+
     while current_level.len() > 1 {
         let pair_index = current_index ^ 1; // XOR with 1 to get sibling
-        
+
         if pair_index < current_level.len() {
             let is_left = pair_index < current_index;
             proof.push((hex::encode(current_level[pair_index]), is_left));
@@ -173,10 +188,10 @@ fn generate_merkle_proof_optimized(
             // No sibling (odd count) - use self
             proof.push((hex::encode(current_level[current_index]), false));
         }
-        
+
         // Build next level
         let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
-        
+
         for i in (0..current_level.len()).step_by(2) {
             let left = &current_level[i];
             let right = if i + 1 < current_level.len() {
@@ -184,23 +199,25 @@ fn generate_merkle_proof_optimized(
             } else {
                 left
             };
-            
+
             concat_buffer[..HASH_SIZE].copy_from_slice(left);
             concat_buffer[HASH_SIZE..].copy_from_slice(right);
-            
+
+            // FIX R23-K3: Internal node domain separation — H(0x01 || left || right)
             let mut hasher = Sha3_256::new();
+            hasher.update(&[0x01u8]);
             hasher.update(&concat_buffer);
             let result = hasher.finalize();
-            
+
             let mut arr = [0u8; HASH_SIZE];
             arr.copy_from_slice(&result);
             next_level.push(arr);
         }
-        
+
         current_index /= 2;
         current_level = next_level;
     }
-    
+
     Ok(proof)
 }
 
@@ -240,20 +257,27 @@ fn verify_merkle_proof_optimized(
     if tx_bytes.len() != HASH_SIZE {
         return Err("Invalid tx_hash length".into());
     }
-    
+
+    // FIX R23-K3: Apply leaf domain separation to the starting hash — H(0x00 || tx_hash)
     let mut current_hash = [0u8; HASH_SIZE];
-    current_hash.copy_from_slice(&tx_bytes);
-    
+    {
+        let mut hasher = Sha3_256::new();
+        hasher.update(&[0x00u8]); // LEAF_PREFIX
+        hasher.update(&tx_bytes);
+        let result = hasher.finalize();
+        current_hash.copy_from_slice(&result);
+    }
+
     // Pre-allocate buffer
     let mut concat_buffer = [0u8; HASH_SIZE * 2];
-    
+
     // Apply each proof element
     for (proof_hash_str, is_left) in merkle_proof {
         let proof_bytes = hex::decode(proof_hash_str)?;
         if proof_bytes.len() != HASH_SIZE {
             return Err("Invalid proof hash length".into());
         }
-        
+
         // Concatenate in correct order
         if *is_left {
             concat_buffer[..HASH_SIZE].copy_from_slice(&proof_bytes);
@@ -262,14 +286,15 @@ fn verify_merkle_proof_optimized(
             concat_buffer[..HASH_SIZE].copy_from_slice(&current_hash);
             concat_buffer[HASH_SIZE..].copy_from_slice(&proof_bytes);
         }
-        
-        // Hash
+
+        // FIX R23-K3: Internal node domain separation — H(0x01 || left || right)
         let mut hasher = Sha3_256::new();
+        hasher.update(&[0x01u8]); // INTERNAL_PREFIX
         hasher.update(&concat_buffer);
         let result = hasher.finalize();
         current_hash.copy_from_slice(&result);
     }
-    
+
     // Compare with merkle root
     let root_bytes = hex::decode(merkle_root)?;
     Ok(current_hash[..] == root_bytes[..])

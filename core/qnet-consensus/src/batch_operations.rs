@@ -103,13 +103,13 @@ pub struct BatchTransferResult {
 /// Batch operations manager
 pub struct BatchOperationsManager {
     /// Reward integration for processing rewards
-    reward_integration: std::sync::Arc<std::sync::Mutex<RewardIntegrationManager>>,
-    
+    reward_integration: std::sync::Arc<parking_lot::Mutex<RewardIntegrationManager>>,
+
     /// Performance metrics
-    batch_metrics: std::sync::Arc<std::sync::RwLock<BatchMetrics>>,
-    
+    batch_metrics: std::sync::Arc<parking_lot::RwLock<BatchMetrics>>,
+
     /// Current batch processing
-    active_batches: std::sync::Arc<std::sync::RwLock<HashMap<String, BatchStatus>>>,
+    active_batches: std::sync::Arc<parking_lot::RwLock<HashMap<String, BatchStatus>>>,
 }
 
 /// Batch processing status
@@ -134,11 +134,11 @@ pub struct BatchMetrics {
 
 impl BatchOperationsManager {
     /// Create new batch operations manager
-    pub fn new(reward_integration: std::sync::Arc<std::sync::Mutex<RewardIntegrationManager>>) -> Self {
+    pub fn new(reward_integration: std::sync::Arc<parking_lot::Mutex<RewardIntegrationManager>>) -> Self {
         Self {
             reward_integration,
-            batch_metrics: std::sync::Arc::new(std::sync::RwLock::new(BatchMetrics::default())),
-            active_batches: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            batch_metrics: std::sync::Arc::new(parking_lot::RwLock::new(BatchMetrics::default())),
+            active_batches: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -155,7 +155,7 @@ impl BatchOperationsManager {
         
         // Mark batch as processing
         {
-            let mut batches = match self.active_batches.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut batches = self.active_batches.write();
             batches.insert(request.batch_id.clone(), BatchStatus::Processing);
         }
         
@@ -165,14 +165,14 @@ impl BatchOperationsManager {
         
         // Process each reward claim
         {
-            let mut reward_integration = match self.reward_integration.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut reward_integration = self.reward_integration.lock();
             
             for node_id in &request.node_ids {
                 match reward_integration.claim_node_rewards(node_id) {
                     Ok(claim_result) => {
                         if claim_result.success {
                             if let Some(reward) = claim_result.reward {
-                                total_claimed += reward.total_reward;
+                                total_claimed = total_claimed.saturating_add(reward.total_reward);
                                 successful_claims.insert(node_id.clone(), reward);
                             }
                         } else {
@@ -190,7 +190,7 @@ impl BatchOperationsManager {
         
         // Update batch status
         {
-            let mut batches = match self.active_batches.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut batches = self.active_batches.write();
             batches.insert(request.batch_id.clone(), BatchStatus::Completed);
         }
         
@@ -222,7 +222,7 @@ impl BatchOperationsManager {
         
         // Mark batch as processing
         {
-            let mut batches = match self.active_batches.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut batches = self.active_batches.write();
             batches.insert(request.batch_id.clone(), BatchStatus::Processing);
         }
         
@@ -232,7 +232,7 @@ impl BatchOperationsManager {
         
         // Process each node activation
         {
-            let mut reward_integration = match self.reward_integration.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut reward_integration = self.reward_integration.lock();
             
             for activation in &request.activations {
                 match reward_integration.process_node_activation(
@@ -244,7 +244,7 @@ impl BatchOperationsManager {
                 ) {
                     Ok(()) => {
                         successful_activations.push(activation.node_id.clone());
-                        total_pool3_contributions += activation.activation_amount;
+                        total_pool3_contributions = total_pool3_contributions.saturating_add(activation.activation_amount);
                     },
                     Err(e) => {
                         failed_activations.insert(activation.node_id.clone(), e.to_string());
@@ -257,7 +257,7 @@ impl BatchOperationsManager {
         
         // Update batch status
         {
-            let mut batches = match self.active_batches.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut batches = self.active_batches.write();
             batches.insert(request.batch_id.clone(), BatchStatus::Completed);
         }
         
@@ -289,7 +289,7 @@ impl BatchOperationsManager {
         
         // Mark batch as processing
         {
-            let mut batches = match self.active_batches.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut batches = self.active_batches.write();
             batches.insert(request.batch_id.clone(), BatchStatus::Processing);
         }
         
@@ -320,15 +320,15 @@ impl BatchOperationsManager {
             // In production, this would create actual transactions
             // For now, we simulate success
             successful_transfers.push(transfer_id);
-            total_amount_transferred += transfer.amount;
-            total_fees_paid += 1000; // Simulated fee
+            total_amount_transferred = total_amount_transferred.saturating_add(transfer.amount);
+            total_fees_paid = total_fees_paid.saturating_add(1000); // Simulated fee
         }
         
         let processing_time_ms = start_time.elapsed().as_millis() as u64;
         
         // Update batch status
         {
-            let mut batches = match self.active_batches.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut batches = self.active_batches.write();
             batches.insert(request.batch_id.clone(), BatchStatus::Completed);
         }
         
@@ -350,7 +350,8 @@ impl BatchOperationsManager {
 
     /// Update batch metrics
     fn update_batch_metrics(&self, operation_type: BatchOperationType, processing_time_ms: u64, operation_count: usize) {
-        if let Ok(mut metrics) = self.batch_metrics.write() {
+        {
+            let mut metrics = self.batch_metrics.write();
             metrics.total_batches_processed += 1;
             
             match operation_type {
@@ -372,18 +373,18 @@ impl BatchOperationsManager {
 
     /// Get batch status
     pub fn get_batch_status(&self, batch_id: &str) -> Option<BatchStatus> {
-        let batches = match self.active_batches.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let batches = self.active_batches.read();
         batches.get(batch_id).cloned()
     }
 
     /// Get batch metrics
     pub fn get_batch_metrics(&self) -> BatchMetrics {
-        match self.batch_metrics.read() { Ok(g) => g, Err(p) => p.into_inner() }.clone()
+        self.batch_metrics.read().clone()
     }
 
     /// Clear completed batches (cleanup)
     pub fn cleanup_completed_batches(&self) {
-        let mut batches = match self.active_batches.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut batches = self.active_batches.write();
         batches.retain(|_, status| !matches!(status, BatchStatus::Completed));
     }
 }

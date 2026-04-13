@@ -23,6 +23,25 @@ const DOMAIN_EVAL: &[u8] = b"QNet_Dilithium3_VRF_Eval_v4";
 const DOMAIN_OUTPUT: &[u8] = b"QNet_Dilithium3_VRF_Output_v4";
 const DOMAIN_SLOT: &[u8] = b"QNet_VRF_SlotSeed_v4";
 
+// FIX R24-H4: Auto-zeroizing Vec wrapper for secret key material.
+// Ensures Dilithium SK bytes are write_volatile-cleared on drop,
+// preventing key material from lingering in process memory.
+pub struct ZeroizingVec(pub Vec<u8>);
+
+impl std::ops::Deref for ZeroizingVec {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { &self.0 }
+}
+
+impl Drop for ZeroizingVec {
+    fn drop(&mut self) {
+        for byte in self.0.iter_mut() {
+            unsafe { std::ptr::write_volatile(byte, 0u8); }
+        }
+        std::hint::black_box(&self.0);
+    }
+}
+
 /// ML-DSA-65 (FIPS 204) sizes — CTILDEBYTES=48
 pub const D3_PK_BYTES: usize = 1952;
 pub const D3_SK_BYTES: usize = 4032;
@@ -120,10 +139,11 @@ impl DilithiumVrf {
         self.pk.as_ref().map(|pk| hex::encode(pk))
     }
 
-    /// Get secret key bytes (for block signing)
-    /// SECURITY: Only call from trusted signing code paths
-    pub fn get_secret_key_bytes(&self) -> Option<Vec<u8>> {
-        self.sk.clone()
+    /// Returns secret key bytes wrapped in ZeroizingVec for auto-zeroization on drop.
+    /// FIX R24-H4: Previously returned raw Vec<u8> without auto-zeroization.
+    /// Now returns ZeroizingVec that write_volatile-zeroizes all bytes when dropped.
+    pub fn get_secret_key_bytes(&self) -> Option<ZeroizingVec> {
+        self.sk.as_ref().map(|sk| ZeroizingVec(sk.clone()))
     }
 
     // ── Core VRF ─────────────────────────────────────────────────────────
@@ -207,11 +227,30 @@ impl DilithiumVrf {
 
     /// Election threshold: P(elected) = EXPECTED_WINNERS * (rep / total_rep)
     /// Guarantees ~EXPECTED_WINNERS claims per round regardless of network size.
-    /// P(0 winners) ~ e^(-EXPECTED_WINNERS) ~ 2e-9 — practically impossible.
+    /// P(0 winners) ~ e^(-EXPECTED_WINNERS) ~ 2e-9 -- practically impossible.
+    ///
+    /// FIX M-M20: Integer-only arithmetic to ensure cross-platform determinism.
+    /// All nodes must compute identical thresholds -- f64 precision varies by platform.
     pub fn calculate_threshold(rep: f64, total_rep: f64) -> u128 {
         if total_rep <= 0.0 || rep <= 0.0 { return 0; }
-        let p = (Self::EXPECTED_WINNERS * rep / total_rep).min(1.0);
-        (u128::MAX as f64 * p).min(u128::MAX as f64) as u128
+
+        // Scale to integer arithmetic: multiply by 1_000_000 to preserve 6 decimal places
+        let rep_scaled = (rep * 1_000_000.0) as u128;
+        let total_scaled = (total_rep * 1_000_000.0) as u128;
+        if total_scaled == 0 { return 0; }
+
+        let expected = (Self::EXPECTED_WINNERS * 1_000_000.0) as u128;
+
+        // p_scaled = expected * rep / total (in millionths)
+        let p_scaled = expected.saturating_mul(rep_scaled) / total_scaled;
+
+        // If probability >= 1.0 (in millionths), saturate to MAX
+        if p_scaled >= 1_000_000 {
+            return u128::MAX;
+        }
+
+        // threshold = u128::MAX * p_scaled / 1_000_000
+        (u128::MAX / 1_000_000).saturating_mul(p_scaled)
     }
 
     /// Pick winner: lowest VRF output (deterministic tiebreaker)
@@ -254,12 +293,19 @@ impl DilithiumVrf {
 
     // ── Internal helpers ─────────────────────────────────────────────────
 
-    /// v4: key-bound domain hash — H(domain || pk_fingerprint || input)
-    /// pk_fingerprint = SHA3-256(pk)[..16] — 128 bits, sufficient for domain binding
+    /// v4.1: key-bound + chain-bound domain hash
+    /// H(domain || chain_id || pk_fingerprint || input)
+    /// FIX R24-M4: Include chain_id to prevent cross-network VRF output collisions.
+    /// pk_fingerprint = SHA3-256(pk)[..16] — 128 bits for domain binding.
     fn hash_input_keyed(input: &[u8], pk: &[u8]) -> Vec<u8> {
+        let chain_id: u64 = std::env::var("QNET_CHAIN_ID")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1337); // default testnet
         let pk_fp = Sha3_256::digest(pk);
         let mut h = Sha3_256::new();
         h.update(DOMAIN_EVAL);
+        h.update(&chain_id.to_le_bytes());
         h.update(&pk_fp[..16]);
         h.update(input);
         h.finalize().to_vec()
@@ -308,7 +354,7 @@ impl WalletIdentity {
 
     /// Derive EON wallet address from mnemonic seed phrase.
     /// Uses BIP44 m/44'/9999'/0'/0'/0' to match mobile app WalletManager.js exactly.
-    /// Format: {19hex}eon{15hex}{4hex SHA3-256 checksum} = 41 chars
+    /// Format: {19hex}eon{15hex}{8hex SHA3-256 checksum} = 45 chars
     pub fn derive_wallet_address(seed: &str) -> String {
         // Try BIP44 derivation first (matches mobile app)
         match crate::crypto::solana_derivation::derive_qnet_address_from_mnemonic(seed) {
@@ -320,7 +366,7 @@ impl WalletIdentity {
                 let p1 = &hex_str[..19];
                 let p2 = &hex_str[19..34];
                 let body = format!("{}eon{}", p1, p2);
-                let ck = hex::encode(&Sha3_256::digest(body.as_bytes())[..2]);
+                let ck = hex::encode(&Sha3_256::digest(body.as_bytes())[..4]);
                 format!("{}eon{}{}", p1, p2, ck)
             }
         }
@@ -373,12 +419,32 @@ impl WalletIdentity {
     pub fn pk_hex(&self) -> String { hex::encode(&self.dilithium_pk) }
 
     /// Return raw secret key bytes for VRF key announce broadcast.
+    /// SECURITY: Returns a reference — caller MUST NOT persist or clone
+    /// without zeroing the copy after use (Vec is NOT auto-zeroed on drop).
     pub fn sk_bytes(&self) -> &[u8] { &self.dilithium_sk }
+}
+
+impl Drop for DilithiumVrf {
+    fn drop(&mut self) {
+        // FIX L-M19: Compiler-proof secret key zeroing via write_volatile + black_box
+        if let Some(ref mut sk) = self.sk {
+            for byte in sk.iter_mut() {
+                unsafe { core::ptr::write_volatile(byte, 0u8); }
+            }
+            std::hint::black_box(&sk);
+        }
+        println!("[INFO][CRYPTO] vrf_key_zeroed");
+    }
 }
 
 impl Drop for WalletIdentity {
     fn drop(&mut self) {
-        for b in self.dilithium_sk.iter_mut() { *b = 0; }
+        // FIX L-M19: Compiler-proof secret key zeroing via write_volatile + black_box
+        for byte in self.dilithium_sk.iter_mut() {
+            unsafe { core::ptr::write_volatile(byte, 0u8); }
+        }
+        std::hint::black_box(&self.dilithium_sk);
+        println!("[INFO][CRYPTO] wallet_key_zeroed");
     }
 }
 
@@ -437,9 +503,12 @@ mod tests {
 
         // 1000 nodes, equal rep -> P(elected) = 20/1000 = 0.02
         let t1000 = DilithiumVrf::calculate_threshold(1.0, 1000.0);
-        let expected = (u128::MAX as f64 * 0.02) as u128;
+        // Integer-only: threshold = (u128::MAX / 1_000_000) * 20_000
+        let expected_int = (u128::MAX / 1_000_000).saturating_mul(20_000);
         assert!(t1000 > 0);
-        assert!((t1000 as f64 - expected as f64).abs() / (expected as f64) < 0.01);
+        // Allow small integer rounding difference
+        let diff = if t1000 > expected_int { t1000 - expected_int } else { expected_int - t1000 };
+        assert!(diff < u128::MAX / 1_000_000, "threshold diff too large");
 
         // Zero rep -> 0
         assert_eq!(DilithiumVrf::calculate_threshold(0.0, 100.0), 0);

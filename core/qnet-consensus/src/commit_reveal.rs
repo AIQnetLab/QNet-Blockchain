@@ -128,6 +128,9 @@ pub struct RoundState {
 /// Maximum number of rounds to keep in memory (cleanup older ones)
 pub const MAX_ROUNDS_TO_KEEP: usize = 5;
 
+/// Maximum allowed size for reveal data (4 KB)
+pub const MAX_REVEAL_DATA_SIZE: usize = 4096;
+
 /// Per-round data storage (independent of other rounds)
 #[derive(Debug, Clone)]
 pub struct RoundData {
@@ -262,7 +265,9 @@ impl CommitRevealConsensus {
             self.cleanup_old_rounds(round_number);
         }
         
-        self.rounds.get_mut(&round_number).unwrap()
+        // FIX R14-L1: defensive — round guaranteed to exist after insert above
+        self.rounds.get_mut(&round_number)
+            .expect("[BUG][CONSENSUS] round missing immediately after insert")
     }
     
     /// Get round data (immutable) for specific round
@@ -433,8 +438,16 @@ impl CommitRevealConsensus {
     // No more "round_override" problems!
     // ═══════════════════════════════════════════════════════════════════════════════
     pub async fn process_commit(&mut self, commit: Commit, block_height: u64) -> Result<(), ConsensusError> {
+        // Security: Validate node_id format to prevent delimiter injection
+        if commit.node_id.is_empty() || commit.node_id.len() > 128
+            || commit.node_id.contains(':') || commit.node_id.contains('\0')
+            || !commit.node_id.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') {
+            println!("[REJECT][COMMIT-REVEAL] invalid_node_id node_id_len={}", commit.node_id.len());
+            return Err(ConsensusError::InvalidCommit("Invalid node_id format".into()));
+        }
+
         let epoch = block_height / 90;
-        
+
         // v2.62: Check if round exists in per-round storage
         // If not, we can still accept commits for rounds within ±1 epoch
         if !self.rounds.contains_key(&block_height) {
@@ -461,19 +474,38 @@ impl CommitRevealConsensus {
             ));
         }
         
-        // Get round data (guaranteed to exist now)
-        let round_data = self.rounds.get_mut(&block_height).unwrap();
-        
+        // Get round data (guaranteed to exist after get_or_create_round above)
+        let round_data = match self.rounds.get_mut(&block_height) {
+            Some(rd) => rd,
+            None => return Err(ConsensusError::NoActiveRound),
+        };
+
         // Check if already finalized
         if round_data.is_finalized {
             println!("[INFO][CONS] commit_round_finalized round={} node={}", block_height, commit.node_id);
             return Ok(());
         }
         
-        // Check for duplicate
-        if round_data.commits.contains_key(&commit.node_id) {
-            println!("[INFO][CONS] commit_duplicate node={} round={}", commit.node_id, block_height);
-            return Ok(());
+        // FIX R23-F5: Check for equivocation (same node, different commit_hash).
+        // A duplicate commit with the SAME hash is benign (network retransmit).
+        // A commit with a DIFFERENT hash is EQUIVOCATION — cryptographic proof of malice.
+        if let Some(existing_commit) = round_data.commits.get(&commit.node_id) {
+            if existing_commit.commit_hash == commit.commit_hash {
+                // Benign duplicate — same commit retransmitted
+                return Ok(());
+            } else {
+                // EQUIVOCATION DETECTED — two different commits from the same node!
+                println!("[CRITICAL][CONS] equivocation_detected node={} round={} hash_a={} hash_b={}",
+                         commit.node_id, block_height,
+                         &existing_commit.commit_hash[..16.min(existing_commit.commit_hash.len())],
+                         &commit.commit_hash[..16.min(commit.commit_hash.len())]);
+                // Apply slashing penalty via reputation system
+                self.reputation.update_reputation(&commit.node_id, -30.0);
+                return Err(ConsensusError::InvalidCommit(
+                    format!("EQUIVOCATION: node {} sent two different commits in round {}",
+                            commit.node_id, block_height)
+                ));
+            }
         }
         
         // Store commit in per-round storage
@@ -534,8 +566,34 @@ impl CommitRevealConsensus {
     // No more "round_override" data loss!
     // ═══════════════════════════════════════════════════════════════════════════════
     pub async fn submit_reveal(&mut self, reveal: Reveal, block_height: u64) -> Result<(), ConsensusError> {
+        // Security: Validate node_id format to prevent delimiter injection in format strings
+        if reveal.node_id.is_empty() || reveal.node_id.len() > 128
+            || reveal.node_id.contains(':') || reveal.node_id.contains('\0')
+            || !reveal.node_id.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') {
+            println!("[REJECT][COMMIT-REVEAL] invalid_node_id node_id_len={}", reveal.node_id.len());
+            return Err(ConsensusError::InvalidReveal("Invalid node_id format".into()));
+        }
+
         let epoch = block_height / 90;
-        
+
+        // Security: Reject unsigned reveals
+        if reveal.signature.is_empty() {
+            println!("[REJECT][COMMIT-REVEAL] unsigned_reveal node={}", reveal.node_id);
+            return Err(ConsensusError::InvalidSignature(
+                format!("Unsigned reveal rejected from node {}", reveal.node_id)
+            ));
+        }
+
+        // Security: Reject oversized reveal data
+        if reveal.reveal_data.len() > MAX_REVEAL_DATA_SIZE {
+            println!("[REJECT][COMMIT-REVEAL] reveal_data_too_large node={} size={} max={}",
+                     reveal.node_id, reveal.reveal_data.len(), MAX_REVEAL_DATA_SIZE);
+            return Err(ConsensusError::InvalidReveal(
+                format!("Reveal data too large from node {}: {} bytes (max {})",
+                        reveal.node_id, reveal.reveal_data.len(), MAX_REVEAL_DATA_SIZE)
+            ));
+        }
+
         // v2.62: Check if round exists in per-round storage
         if !self.rounds.contains_key(&block_height) {
             // Check if round is within acceptable range
@@ -553,43 +611,45 @@ impl CommitRevealConsensus {
             let _ = self.get_or_create_round(block_height, vec![reveal.node_id.clone()]);
         }
         
-        // Verify hybrid signature if present
-        if !reveal.signature.is_empty() {
+        // Verify hybrid signature cryptographically
+        {
             // CRITICAL FIX v2.52: Message format MUST match generation in node.rs
             // Format: node_id:reveal_data_hex:nonce_hex:timestamp (4 fields)
             // Then SHA3-256 hash before verification (same as signing)
-            let reveal_message = format!("{}:{}:{}:{}", 
-                reveal.node_id, 
+            let reveal_message = format!("{}:{}:{}:{}",
+                reveal.node_id,
                 hex::encode(&reveal.reveal_data),
                 hex::encode(&reveal.nonce),
-                reveal.timestamp  // v2.52: Include timestamp to match generation
+                reveal.timestamp
             );
-            
-            // SHA3-256 hash (same as generation in node.rs:12947-12950)
+
+            // SHA3-256 hash (same as generation in node.rs)
             use sha3::{Sha3_256, Digest};
             let mut hasher = Sha3_256::new();
             hasher.update(reveal_message.as_bytes());
             let reveal_hash = hex::encode(hasher.finalize());
-            
+
             // Verify the HASH (not plain message) for L1-grade security
             let signature_valid = self.verify_signature(
-                &reveal.node_id, 
-                &reveal_hash, 
+                &reveal.node_id,
+                &reveal_hash,
                 &reveal.signature
             ).await;
-            
+
             if !signature_valid {
+                println!("[REJECT][COMMIT-REVEAL] invalid_signature node={}", reveal.node_id);
                 return Err(ConsensusError::InvalidSignature(
                     format!("Invalid hybrid reveal signature for node {}", reveal.node_id)
                 ));
             }
-        } else {
-            println!("[WARN][CONS] reveal_no_signature node={} accepting_legacy", reveal.node_id);
         }
         
-        // Get round data (guaranteed to exist now)
-        let round_data = self.rounds.get_mut(&block_height).unwrap();
-        
+        // Get round data (guaranteed to exist after auto-create above)
+        let round_data = match self.rounds.get_mut(&block_height) {
+            Some(rd) => rd,
+            None => return Err(ConsensusError::NoActiveRound),
+        };
+
         // Check if already finalized
         if round_data.is_finalized {
             println!("[INFO][CONS] reveal_round_finalized round={} node={}", block_height, reveal.node_id);
@@ -761,12 +821,32 @@ impl CommitRevealConsensus {
         println!("[INFO][CONS] finalize_ok round={} epoch={} valid={}/{} leader={}", 
                  round_number, epoch, valid_reveals, byzantine_threshold, leader);
         
+        // FIX R23-F4: Detect and log nodes that committed but withheld their reveal.
+        // This is the last-revealer bias vector — a node can see all other reveals
+        // and choose to withhold its own to influence the beacon. Penalty via reputation
+        // makes the attack costly: each withheld reveal costs reputation, limiting
+        // how many rounds an attacker can bias before being excluded from consensus.
+        {
+            let committed_ids: std::collections::HashSet<&String> = round_data.commits.keys().collect();
+            let revealed_ids: std::collections::HashSet<&String> = round_data.reveals.keys().collect();
+            let withheld: Vec<&&String> = committed_ids.difference(&revealed_ids).collect();
+            if !withheld.is_empty() {
+                for node_id in &withheld {
+                    println!("[WARN][CONS] commit_without_reveal round={} node={} action=reputation_penalty",
+                             round_number, node_id);
+                    // Apply reputation penalty via existing system — cost of withholding
+                    self.reputation.update_reputation(node_id, -5.0);
+                }
+                println!("[INFO][CONS] withheld_reveals round={} count={}", round_number, withheld.len());
+            }
+        }
+
         // Mark round as finalized
         if let Some(round) = self.rounds.get_mut(&round_number) {
             round.is_finalized = true;
             round.finalized_leader = Some(leader.clone());
         }
-        
+
         // Legacy compatibility: update current_round if needed
         if self.active_round == Some(round_number) {
             if let Some(ref mut legacy) = self.current_round {
@@ -1076,10 +1156,29 @@ impl CommitRevealConsensus {
                         println!("[CRITICAL][CONS] double_sign_detected node={} round={}", node_id, round_number);
                         
                         // PRODUCTION: Use EXISTING reputation system for slashing
+                        // commit_hash is a hex String (64 chars) — decode to [u8;32] with validation
+                        let hash_a_vec = hex::decode(&existing_commit.commit_hash).unwrap_or_default();
+                        let hash_b_vec = hex::decode(message_hash).unwrap_or_default();
+
+                        // Validate decoded hash lengths before constructing evidence
+                        if hash_a_vec.len() != 32 || hash_b_vec.len() != 32 {
+                            println!("[CRITICAL][CONS] double_sign_hash_decode_failed node={} len_a={} len_b={}",
+                                     node_id, hash_a_vec.len(), hash_b_vec.len());
+                            return Err(ConsensusError::DoubleSigningDetected(
+                                format!("Node {} double signed round {} - hash decode failed (a={} b={})",
+                                        node_id, round_number, hash_a_vec.len(), hash_b_vec.len())
+                            ));
+                        }
+
+                        let mut hash_a = [0u8; 32];
+                        let mut hash_b = [0u8; 32];
+                        hash_a.copy_from_slice(&hash_a_vec);
+                        hash_b.copy_from_slice(&hash_b_vec);
+
                         let evidence = DoubleSignEvidence {
                             round: round_number,
-                            hash_a: existing_commit.commit_hash.as_bytes().try_into().unwrap_or([0u8; 32]),
-                            hash_b: message_hash.as_bytes().try_into().unwrap_or([0u8; 32]),
+                            hash_a,
+                            hash_b,
                             offender: node_id.to_string(),
                             detected_at: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1241,8 +1340,10 @@ impl CommitRevealConsensus {
             
             selected.push(remaining.remove(selected_index));
             
-            // Update RNG for next iteration
-            rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+            // FIX H23: Replace weak LCG with blake3-based deterministic PRNG
+            // Each iteration re-hashes for cryptographic unpredictability
+            let rng_bytes = blake3::hash(&rng.to_le_bytes()).as_bytes()[..8].try_into().unwrap_or([0u8; 8]);
+            rng = u64::from_le_bytes(rng_bytes);
         }
         
         selected

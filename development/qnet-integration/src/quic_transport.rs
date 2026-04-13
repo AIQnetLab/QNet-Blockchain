@@ -739,6 +739,17 @@ impl QuicTransport {
                 
                 let peer_addr = incoming.remote_address();
 
+                // FIX R23-P5: Global connection limit check BEFORE TLS handshake.
+                // Previously only checked post-handshake (line ~910), wasting TLS CPU.
+                const MAX_TOTAL_CONNECTIONS: usize = 500;
+                if connections.len() >= MAX_TOTAL_CONNECTIONS {
+                    incoming.refuse();
+                    if crate::node::is_warn() {
+                        println!("[WARN][QUIC] pre_tls_max_connections={} refusing", MAX_TOTAL_CONNECTIONS);
+                    }
+                    continue;
+                }
+
                 // v2.96: Three-tier per-IP connection limit — reject before TLS handshake to save CPU.
                 // Tier 1 (Genesis): unlimited — consensus must never be blocked.
                 // Tier 2 (Known): 200 — peers that completed handshake before.

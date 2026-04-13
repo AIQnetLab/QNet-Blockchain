@@ -2,9 +2,11 @@
 
 /// Genesis bootstrap activation codes (PRODUCTION)
 /// These are the ONLY 5 codes that can bootstrap the QNet blockchain
+/// Security: codes are protected by IP whitelist + wallet binding + Dilithium3 signature,
+/// so the sequential pattern is not a vulnerability.
 pub const GENESIS_BOOTSTRAP_CODES: &[&str] = &[
     "QNET-BOOT-0001-STRAP",
-    "QNET-BOOT-0002-STRAP", 
+    "QNET-BOOT-0002-STRAP",
     "QNET-BOOT-0003-STRAP",
     "QNET-BOOT-0004-STRAP",
     "QNET-BOOT-0005-STRAP",
@@ -12,7 +14,7 @@ pub const GENESIS_BOOTSTRAP_CODES: &[&str] = &[
 
 /// Genesis node wallet addresses (PRODUCTION)
 /// These are the predefined wallet addresses for Genesis nodes
-/// Format: 19 hex + "eon" + 15 hex + 4 hex checksum = 41 chars
+/// Format: 19 hex + "eon" + 15 hex + 8 hex checksum = 45 chars
 /// v2.66: Updated to use proper Ed25519 public keys (was SHA256, now curve25519)
 pub const GENESIS_WALLETS: &[(&str, &str)] = &[
     ("001", "f36ff465a0944fd06cdeonfca0ad004ff9db42e16"), // Genesis Node #1
@@ -84,6 +86,12 @@ pub fn get_genesis_region_by_ip(ip: &str) -> Option<&'static str> {
     }
 }
 
+/// Get all genesis node IPs as a Vec<String>.
+/// Used by genesis_config and sync_manager for HTTP fallback.
+pub fn get_genesis_ips() -> Vec<String> {
+    GENESIS_NODE_IPS.iter().map(|(ip, _)| ip.to_string()).collect()
+}
+
 /// Get Genesis wallet address by bootstrap ID (001-005)
 pub fn get_genesis_wallet_by_id(bootstrap_id: &str) -> Option<&'static str> {
     for (id, wallet) in GENESIS_WALLETS {
@@ -102,14 +110,16 @@ pub fn get_genesis_wallet_by_id(bootstrap_id: &str) -> Option<&'static str> {
 // =========================================================================
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 lazy_static::lazy_static! {
     /// Global registry: node_id → dilithium3_pk_hex
     /// Thread-safe, updated on node registration
-    pub static ref VRF_PK_REGISTRY: RwLock<HashMap<String, Vec<u8>>> =
-        RwLock::new(HashMap::new());
+    pub static ref VRF_PK_REGISTRY: parking_lot::RwLock<HashMap<String, Vec<u8>>> =
+        parking_lot::RwLock::new(HashMap::new());
 }
+
+/// FIX L-G1: Maximum VRF registry size to prevent unbounded growth
+const MAX_VRF_REGISTRY_SIZE: usize = 50_000;
 
 /// Register a node's VRF public key
 pub fn register_vrf_public_key(node_id: &str, pk_bytes: &[u8]) {
@@ -117,28 +127,28 @@ pub fn register_vrf_public_key(node_id: &str, pk_bytes: &[u8]) {
         println!("[WARN][VRF_REG] invalid pk_size={} node={}", pk_bytes.len(), node_id);
         return;
     }
-    if let Ok(mut registry) = VRF_PK_REGISTRY.write() {
-        registry.insert(node_id.to_string(), pk_bytes.to_vec());
-        println!("[INFO][VRF_REG] pk_registered node={} total={}", node_id, registry.len());
+    // PRODUCTION: Single write lock to eliminate TOCTOU race condition
+    let mut registry = VRF_PK_REGISTRY.write();
+    if registry.len() >= MAX_VRF_REGISTRY_SIZE && !registry.contains_key(node_id) {
+        println!("[WARN][VRF_REG] registry_full size={}", registry.len());
+        return;
     }
+    registry.insert(node_id.to_string(), pk_bytes.to_vec());
+    println!("[INFO][VRF_REG] pk_registered node={} total={}", node_id, registry.len());
 }
 
 /// Get a node's VRF public key for proof verification
 pub fn get_vrf_public_key(node_id: &str) -> Option<Vec<u8>> {
-    VRF_PK_REGISTRY.read().ok()?.get(node_id).cloned()
+    VRF_PK_REGISTRY.read().get(node_id).cloned()
 }
 
 /// Check if node has registered VRF key
 pub fn has_vrf_key(node_id: &str) -> bool {
-    VRF_PK_REGISTRY.read().ok()
-        .map(|r| r.contains_key(node_id))
-        .unwrap_or(false)
+    VRF_PK_REGISTRY.read().contains_key(node_id)
 }
 
 /// Get all registered VRF public keys (for full election verification)
 pub fn get_all_vrf_keys() -> HashMap<String, Vec<u8>> {
-    VRF_PK_REGISTRY.read().ok()
-        .map(|r| r.clone())
-        .unwrap_or_default()
+    VRF_PK_REGISTRY.read().clone()
 }
 

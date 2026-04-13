@@ -5,7 +5,7 @@
 //! Pool 2: REMOVED in v3.18 - transaction fees go directly to block producer
 //! Pool 3: Activation pool (ONLY in Phase 2)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use crate::errors::ConsensusError;
@@ -168,7 +168,8 @@ pub struct PhaseAwareRewardManager {
     wallet_nodes_index: HashMap<String, Vec<String>>,
     
     /// Pending rewards by node_id (in-memory cache, synced with RocksDB when available)
-    pending_rewards: HashMap<String, PhaseAwareReward>,
+    /// PRODUCTION: BTreeMap for deterministic iteration order across all nodes
+    pending_rewards: BTreeMap<String, PhaseAwareReward>,
     
     /// Last claim time by node_id
     last_claim_time: HashMap<String, u64>,
@@ -215,7 +216,8 @@ pub struct PhaseAwareRewardManager {
     /// Keyed by node_id, value is the nanoQNC added in THIS epoch only.
     /// Used to populate the emission TX data field so all nodes apply
     /// identical reward accruals through deterministic block execution.
-    last_epoch_accruals: HashMap<String, u64>,
+    /// PRODUCTION: BTreeMap for deterministic iteration order in emission TX
+    last_epoch_accruals: BTreeMap<String, u64>,
     
     // ═══════════════════════════════════════════════════════════════════════════
     // v2.90: PREVENT DOUBLE-PROCESSING OF EMISSION MACROBLOCKS
@@ -227,6 +229,9 @@ pub struct PhaseAwareRewardManager {
     /// Set of processed emission MacroBlock indices (160, 320, 480, 640...)
     /// Prevents double-processing on node restart or MacroBlock re-sync
     processed_emission_macroblocks: HashSet<u64>,
+
+    /// Last cleanup timestamp for stale node entries
+    last_stale_cleanup: u64,
 }
 
 impl PhaseAwareRewardManager {
@@ -240,7 +245,7 @@ impl PhaseAwareRewardManager {
             ping_histories: HashMap::new(),
             node_ownership: HashMap::new(),
             wallet_nodes_index: HashMap::new(), // v2.43.1: Inverted index
-            pending_rewards: HashMap::new(),
+            pending_rewards: BTreeMap::new(),
             last_claim_time: HashMap::new(),
             storage_path: None,
             pool2_transaction_fees: 0,
@@ -255,9 +260,10 @@ impl PhaseAwareRewardManager {
             // v2.84: Track current epoch emission separately
             last_epoch_emission: 0,
             // v7.0: Per-node delta accruals for emission TX
-            last_epoch_accruals: HashMap::new(),
+            last_epoch_accruals: BTreeMap::new(),
             // v2.90: Track processed emission MacroBlocks to prevent duplicates
             processed_emission_macroblocks: HashSet::new(),
+            last_stale_cleanup: 0,
         }
     }
     
@@ -294,26 +300,40 @@ impl PhaseAwareRewardManager {
     }
 
     /// Calculate dynamic Pool 1 base emission with sharp drop halving
+    /// PRODUCTION: Pure integer arithmetic for cross-platform determinism.
+    /// 251,432.34 QNC = 251_432_340_000_000 nanoQNC (10^9 precision)
     fn calculate_pool1_base_emission(&self) -> u64 {
         let years_since_genesis = self.calculate_years_since_genesis();
-        
         let halving_cycles = years_since_genesis / 4;
-        
-        // Sharp drop halving model
-        let base_rate = if halving_cycles == 5 {
-            // 5th halving (year 20-24): Sharp drop by 10x instead of 2x
-            251_432.34 / (2.0_f64.powi(4) * 10.0) // Previous 4 halvings (÷2) then sharp drop (÷10)
+
+        // Base emission in nanoQNC: 251,432.34 QNC × 10^9
+        const BASE_EMISSION_NANO: u128 = 251_432_340_000_000;
+
+        // FIX R20-L1: Correct branch ordering — >= 50 check BEFORE > 5
+        // to ensure zero-emission safety net is reachable after ~200 years
+        let emission_nano: u128 = if halving_cycles >= 50 {
+            // Emission effectively zero after ~200+ years (integer division
+            // already yields 0 well before this, but explicit guard is cleaner)
+            0
+        } else if halving_cycles == 5 {
+            // 5th halving (year 20-24): Sharp drop — ÷16 (4 halvings) then ÷10
+            // Divisor = 2^4 × 10 = 160
+            BASE_EMISSION_NANO / 160
         } else if halving_cycles > 5 {
-            // After sharp drop: Resume normal halving from new low base
-            let normal_halvings = halving_cycles - 5;
-            251_432.34 / (2.0_f64.powi(4) * 10.0 * 2.0_f64.powi(normal_halvings as i32))
+            // After sharp drop: Resume normal halving from low base
+            // Divisor = 160 × 2^(cycles-5)
+            let normal_halvings = (halving_cycles - 5).min(63);
+            let divisor = 160u128.saturating_mul(1u128 << normal_halvings);
+            BASE_EMISSION_NANO / divisor.max(1)
         } else {
-            // Normal halving for first 5 cycles (20 years) - CORRECTED to match whitepaper
-            251_432.34 / (2.0_f64.powi(halving_cycles as i32))
+            // Normal halving for first 5 cycles (0-20 years)
+            // Divisor = 2^halving_cycles
+            let divisor = 1u128 << halving_cycles.min(63);
+            BASE_EMISSION_NANO / divisor
         };
-        
-        // Convert to nanoQNC (10^9 precision)
-        (base_rate * 1_000_000_000.0) as u64
+
+        // Safe downcast: max value 251T nanoQNC << u64::MAX (18.4E)
+        emission_nano as u64
     }
     
     /// Determine current QNet phase
@@ -362,10 +382,13 @@ impl PhaseAwareRewardManager {
         self.node_ownership.insert(node_id.clone(), wallet_address.clone());
         
         // PRODUCTION v2.43.1: Update inverted index for O(1) wallet->nodes lookup
-        self.wallet_nodes_index
+        // FIX R23-R3: Dedup — prevent duplicate node_id entries on re-registration
+        let nodes = self.wallet_nodes_index
             .entry(wallet_address.clone())
-            .or_insert_with(Vec::new)
-            .push(node_id.clone());
+            .or_insert_with(Vec::new);
+        if !nodes.contains(&node_id) {
+            nodes.push(node_id.clone());
+        }
         
         // Create ping history for this node
         let ping_history = NodePingHistory::new(node_id.clone(), node_type, window_start);
@@ -429,7 +452,7 @@ impl PhaseAwareRewardManager {
     
     /// Add transaction fees to Pool 2
     pub fn add_transaction_fees(&mut self, amount: u64) {
-        self.pool2_transaction_fees += amount;
+        self.pool2_transaction_fees = self.pool2_transaction_fees.saturating_add(amount);
     }
     
     /// Add activation QNC to Pool 3 (ONLY works in Phase 2)
@@ -441,7 +464,7 @@ impl PhaseAwareRewardManager {
             },
             QNetPhase::Phase2 => {
                 // Pool 3 enabled in Phase 2
-                self.pool3_activation_pool += amount;
+                self.pool3_activation_pool = self.pool3_activation_pool.saturating_add(amount);
                 Ok(())
             }
         }
@@ -506,7 +529,16 @@ impl PhaseAwareRewardManager {
                     };
                 }
                 // Remove only after validation passed
-                self.pending_rewards.remove(node_id).expect("Reward exists from match above")
+                // FIX R14-L2: defensive — should exist from match above
+                match self.pending_rewards.remove(node_id) {
+                    Some(reward) => reward,
+                    None => return RewardClaimResult {
+                        success: false,
+                        reward: None,
+                        message: "[ERR][REWARDS] pending_reward_disappeared".to_string(),
+                        next_claim_time: current_time + self.min_claim_interval.as_secs(),
+                    },
+                }
             },
             None => {
                 return RewardClaimResult {
@@ -605,7 +637,7 @@ impl PhaseAwareRewardManager {
     pub fn get_reward_stats(&self) -> PhaseAwareRewardStats {
         let total_pending = self.pending_rewards.values()
             .map(|r| r.total_reward)
-            .sum::<u64>();
+            .fold(0u64, |acc, r| acc.saturating_add(r));
         
         let current_phase = self.get_current_phase();
         let pool1_current_emission = self.calculate_pool1_base_emission();
@@ -644,6 +676,12 @@ impl PhaseAwareRewardManager {
         self.pool1_remainder + self.pool2_full_remainder + self.pool2_super_remainder + self.pool3_remainder
     }
     
+    /// FIX R20-H2: Add external remainder from shard processing
+    /// Called by reward_sharding to carry forward truncation remainders
+    pub fn add_pool1_remainder(&mut self, amount: u64) {
+        self.pool1_remainder = self.pool1_remainder.saturating_add(amount);
+    }
+
     /// Reset all remainders (for testing only - production should never reset!)
     #[cfg(test)]
     pub fn reset_remainders(&mut self) {
@@ -681,7 +719,7 @@ impl PhaseAwareRewardManager {
     /// v7.0: Get per-node delta accruals for the last processed emission epoch.
     /// Returns node_id → delta_nanoQNC. Used by block producer to include in
     /// emission TX data for deterministic block-level application.
-    pub fn get_last_epoch_accruals(&self) -> &HashMap<String, u64> {
+    pub fn get_last_epoch_accruals(&self) -> &BTreeMap<String, u64> {
         &self.last_epoch_accruals
     }
     
@@ -697,6 +735,83 @@ impl PhaseAwareRewardManager {
         println!("[INFO][REWARDS] loaded_processed_macroblocks count={}", self.processed_emission_macroblocks.len());
     }
     
+    /// Cleanup stale entries from unbounded HashMaps.
+    /// Removes nodes that have no pending rewards AND no recent ping history.
+    /// Called periodically (every 24h) to prevent memory growth over months/years.
+    /// PRODUCTION: Safe for thousands of nodes — only removes truly inactive entries.
+    pub fn cleanup_stale_entries(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Run at most once per 24 hours
+        const CLEANUP_INTERVAL_SECS: u64 = 86_400;
+        if now.saturating_sub(self.last_stale_cleanup) < CLEANUP_INTERVAL_SECS {
+            return;
+        }
+        self.last_stale_cleanup = now;
+
+        // Stale threshold: nodes not seen for 7 days with zero pending rewards
+        const STALE_THRESHOLD_SECS: u64 = 7 * 86_400;
+
+        // Collect stale node IDs: no pending reward AND no recent ping
+        let stale_nodes: Vec<String> = self.node_ownership.keys()
+            .filter(|node_id| {
+                // Keep if has pending rewards
+                if self.pending_rewards.get(*node_id)
+                    .map(|r| r.total_reward > 0)
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+                // Keep if has recent ping history (window_start within threshold)
+                if let Some(history) = self.ping_histories.get(*node_id) {
+                    if now.saturating_sub(history.window_start) < STALE_THRESHOLD_SECS {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        if stale_nodes.is_empty() {
+            return;
+        }
+
+        let count = stale_nodes.len();
+        for node_id in &stale_nodes {
+            // Remove from all maps
+            self.node_ownership.remove(node_id);
+            self.ping_histories.remove(node_id);
+            self.pending_rewards.remove(node_id);
+            self.last_claim_time.remove(node_id);
+
+            // Remove from wallet_nodes_index
+            // Find wallet first, then remove from its node list
+            // (we iterate wallet_nodes_index to find entries containing this node_id)
+        }
+
+        // Cleanup wallet_nodes_index: remove stale node_ids from vectors
+        let stale_set: HashSet<&String> = stale_nodes.iter().collect();
+        self.wallet_nodes_index.retain(|_wallet, nodes| {
+            nodes.retain(|nid| !stale_set.contains(nid));
+            !nodes.is_empty()
+        });
+
+        // Bound processed_emission_macroblocks: keep only last 1000
+        if self.processed_emission_macroblocks.len() > 1000 {
+            let mut sorted: Vec<u64> = self.processed_emission_macroblocks.iter().copied().collect();
+            sorted.sort_unstable();
+            let keep_from = sorted[sorted.len() - 1000];
+            self.processed_emission_macroblocks.retain(|&idx| idx >= keep_from);
+        }
+
+        println!("[INFO][REWARDS] stale_cleanup removed={} remaining_ownership={} remaining_pending={}",
+                 count, self.node_ownership.len(), self.pending_rewards.len());
+    }
+
     /// Get wallet address for a node
     pub fn get_node_wallet_address(&self, node_id: &str) -> Option<String> {
         self.node_ownership.get(node_id).cloned()
@@ -816,7 +931,7 @@ impl PhaseAwareRewardManager {
         // Use MacroBlock values if provided, otherwise fall back to local (legacy)
         // v2.51.1: Add accumulated remainders from previous period
         let pool3_activations = pool3_total.unwrap_or(self.pool3_activation_pool)
-            + self.pool3_remainder;
+            .saturating_add(self.pool3_remainder);
         
         // Count eligible nodes from MacroBlock data
         let mut eligible_light_nodes = 0u32;
@@ -836,14 +951,19 @@ impl PhaseAwareRewardManager {
         let total_eligible_nodes = eligible_light_nodes + eligible_super_nodes;
         
         if total_eligible_nodes == 0 {
-            println!("[INFO][REWARDS] macroblock_heartbeats no_eligible_nodes pool3_carried={}",
-                     pool3_activations);
-            // Keep remainders for next period (no nodes to distribute to)
-            // v3.18: Pool 2 removed - all remainders are 0
+            // FIX R20-M3: Carry forward ALL pool remainders when no eligible nodes
+            // Previously Pool 1 emission was lost (remainder zeroed). Now carry forward
+            // so emission is deferred, not discarded.
+            let pool1_emission = self.calculate_pool1_base_emission();
+            let pool1_carry = pool1_emission.saturating_add(self.pool1_remainder);
+            self.pool1_remainder = pool1_carry;
+            // v3.18: Pool 2 removed — fees go to block producer, no remainder needed
             self.pool2_full_remainder = 0;
             self.pool2_super_remainder = 0;
             self.pool3_remainder = pool3_activations;
-            // v2.96: Return true = processed (even though no rewards distributed)
+            println!("[WARN][REWARDS] no_eligible_nodes pool1_carried={} pool3_carried={}",
+                     pool1_carry, pool3_activations);
+            // v2.96: Return true = processed (emission deferred, not lost)
             return Ok(true);
         }
         
@@ -857,7 +977,7 @@ impl PhaseAwareRewardManager {
         let total_count = total_eligible_nodes as u64;
         
         // Pool 1: Base emission with remainder
-        let pool1_total = self.calculate_pool1_base_emission() + self.pool1_remainder;
+        let pool1_total = self.calculate_pool1_base_emission().saturating_add(self.pool1_remainder);
         let pool1_per_node = if total_count > 0 { pool1_total / total_count } else { 0 };
         let pool1_new_remainder = if total_count > 0 { pool1_total % total_count } else { pool1_total };
         
@@ -908,7 +1028,7 @@ impl PhaseAwareRewardManager {
                     QNetPhase::Phase2 => pool3_per_node,
                 };
                 
-                let total_reward = pool1_per_node + pool2_reward + pool3_reward;
+                let total_reward = pool1_per_node.saturating_add(pool2_reward).saturating_add(pool3_reward);
                 
                 let reward = PhaseAwareReward {
                     current_phase: current_phase.clone(),
@@ -919,7 +1039,7 @@ impl PhaseAwareRewardManager {
                 };
                 
                 // v2.84: Track emission for THIS EPOCH (before accumulation)
-                epoch_emission += total_reward;
+                epoch_emission = epoch_emission.saturating_add(total_reward);
                 
                 // v7.0: Track per-node DELTA for emission TX
                 self.last_epoch_accruals.insert(summary.node_id.clone(), total_reward);
@@ -929,10 +1049,10 @@ impl PhaseAwareRewardManager {
                 self.pending_rewards
                     .entry(summary.node_id.clone())
                     .and_modify(|existing| {
-                        existing.pool1_base_emission += reward.pool1_base_emission;
-                        existing.pool2_transaction_fees += reward.pool2_transaction_fees;
-                        existing.pool3_activation_bonus += reward.pool3_activation_bonus;
-                        existing.total_reward += reward.total_reward;
+                        existing.pool1_base_emission = existing.pool1_base_emission.saturating_add(reward.pool1_base_emission);
+                        existing.pool2_transaction_fees = existing.pool2_transaction_fees.saturating_add(reward.pool2_transaction_fees);
+                        existing.pool3_activation_bonus = existing.pool3_activation_bonus.saturating_add(reward.pool3_activation_bonus);
+                        existing.total_reward = existing.total_reward.saturating_add(reward.total_reward);
                         existing.current_phase = reward.current_phase.clone();
                         
                         println!("[INFO][REWARDS] accumulated node={} new={} total={}", 
@@ -976,6 +1096,9 @@ impl PhaseAwareRewardManager {
                      macroblock_index, self.processed_emission_macroblocks.len());
         }
         
+        // Periodic cleanup of stale node entries (runs at most once per 24h)
+        self.cleanup_stale_entries();
+
         // v2.96: Return true = processed successfully (caller should update supply/storage)
         Ok(true)
     }

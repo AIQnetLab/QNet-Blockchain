@@ -1,7 +1,8 @@
 //! Sharded Consensus Implementation for QNet
 //! Integrates sharding with consensus mechanism for 1M+ TPS
 
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::Arc;
+use parking_lot::{RwLock, Mutex};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use serde::{Serialize, Deserialize};
@@ -57,6 +58,11 @@ pub struct ShardedConsensusConfig {
     pub cross_shard_tx_timeout: Duration,
 }
 
+/// Maximum pending cross-shard transactions before eviction
+const MAX_PENDING_CROSS_SHARD: usize = 10_000;
+/// Maximum active cross-shard consensus rounds
+const MAX_ACTIVE_ROUNDS: usize = 1_000;
+
 /// Cross-shard transaction coordinator
 struct CrossShardCoordinator {
     /// Pending cross-shard transactions
@@ -77,7 +83,7 @@ struct CrossShardConsensusItem {
     pub consensus_round: u64,
     pub phase: CrossShardPhase,
     pub votes: HashMap<String, CrossShardVote>,
-    pub started_at: Instant,
+    pub started_at: u64,
 }
 
 /// Cross-shard consensus phases
@@ -106,7 +112,7 @@ struct CrossShardRound {
     pub transactions: Vec<String>, // TX IDs
     pub participating_shards: Vec<u32>,
     pub consensus_state: CrossShardConsensusState,
-    pub started_at: Instant,
+    pub started_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,7 +128,7 @@ enum CrossShardConsensusState {
 struct CompletedCrossShardTx {
     pub tx_id: String,
     pub success: bool,
-    pub completion_time: Instant,
+    pub completion_time: u64,
 }
 
 /// Performance metrics for sharded consensus
@@ -203,7 +209,7 @@ impl ShardedConsensusManager {
         
         // Get consensus instance for shard
         let consensus = {
-            let shard_consensus = match self.shard_consensus.read() { Ok(g) => g, Err(p) => p.into_inner() };
+            let shard_consensus = self.shard_consensus.read();
             shard_consensus.get(&shard_id)
                 .ok_or(ShardError::ShardNotFound(shard_id))?
                 .clone()
@@ -231,7 +237,7 @@ impl ShardedConsensusManager {
         
         // Update metrics
         {
-            let mut metrics = match self.metrics.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut metrics = self.metrics.write();
             metrics.intra_shard_rounds += 1;
             
             let duration_ms = start_time.elapsed().as_millis() as f64;
@@ -274,20 +280,23 @@ impl ShardedConsensusManager {
             consensus_round: self.get_next_consensus_round(),
             phase: CrossShardPhase::Lock,
             votes: HashMap::new(),
-            started_at: start_time,
+            started_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
         };
         
         {
-            let mut coordinator = match self.cross_shard_coordinator.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut coordinator = self.cross_shard_coordinator.lock();
+            if coordinator.pending_transactions.len() >= MAX_PENDING_CROSS_SHARD {
+                coordinator.pending_transactions.pop_front(); // evict oldest
+            }
             coordinator.pending_transactions.push_back(consensus_item);
         }
-        
+
         // Execute cross-shard consensus protocol
         let result = self.execute_cross_shard_consensus(&cross_tx.tx_id).await?;
         
         // Update metrics
         {
-            let mut metrics = match self.metrics.write() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut metrics = self.metrics.write();
             metrics.cross_shard_rounds += 1;
             
             let duration_ms = start_time.elapsed().as_millis() as f64;
@@ -401,11 +410,11 @@ impl ShardedConsensusManager {
         
         // Mark as completed in coordinator
         {
-            let mut coordinator = match self.cross_shard_coordinator.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let mut coordinator = self.cross_shard_coordinator.lock();
             coordinator.pending_finalization.push_back(CompletedCrossShardTx {
                 tx_id: tx_id.to_string(),
                 success: true,
-                completion_time: Instant::now(),
+                completion_time: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             });
         }
         
@@ -428,13 +437,13 @@ impl ShardedConsensusManager {
     
     /// Get total TPS across all shards
     pub fn get_total_tps(&self) -> f64 {
-        let metrics = match self.metrics.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let metrics = self.metrics.read();
         metrics.per_shard_tps.values().sum()
     }
     
     /// Get consensus metrics
     pub fn get_metrics(&self) -> ShardedConsensusMetrics {
-        match self.metrics.read() { Ok(g) => g, Err(p) => p.into_inner() }.clone()
+        self.metrics.read().clone()
     }
     
     /// Run consensus coordinator (background task)
@@ -457,7 +466,7 @@ impl ShardedConsensusManager {
     // Helper methods
     async fn process_pending_cross_shard(&self) {
         let pending_count = {
-            let coordinator = match self.cross_shard_coordinator.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            let coordinator = self.cross_shard_coordinator.lock();
             coordinator.pending_transactions.len()
         };
         
@@ -469,15 +478,15 @@ impl ShardedConsensusManager {
     }
     
     async fn cleanup_completed_transactions(&self) {
-        let mut coordinator = match self.cross_shard_coordinator.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut coordinator = self.cross_shard_coordinator.lock();
         
         // Remove old completed transactions
-        let cutoff_time = Instant::now() - Duration::from_secs(300); // 5 minutes
+        let cutoff_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().saturating_sub(300); // 5 minutes
         coordinator.pending_finalization.retain(|tx| tx.completion_time > cutoff_time);
     }
     
     async fn update_performance_metrics(&self) {
-        let mut metrics = match self.metrics.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut metrics = self.metrics.write();
         
         // Calculate total TPS
         metrics.total_tps = metrics.per_shard_tps.values().sum();
@@ -486,7 +495,7 @@ impl ShardedConsensusManager {
     }
     
     fn get_cross_shard_transaction(&self, tx_id: &str) -> Result<CrossShardTransaction, ShardError> {
-        let coordinator = match self.cross_shard_coordinator.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let coordinator = self.cross_shard_coordinator.lock();
         
         coordinator.pending_transactions.iter()
             .find(|item| item.tx_id == tx_id)
@@ -495,12 +504,9 @@ impl ShardedConsensusManager {
     }
     
     fn get_next_consensus_round(&self) -> u64 {
-        // Simple incrementing counter
-        static mut ROUND_COUNTER: u64 = 0;
-        unsafe {
-            ROUND_COUNTER += 1;
-            ROUND_COUNTER
-        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ROUND_COUNTER: AtomicU64 = AtomicU64::new(0);
+        ROUND_COUNTER.fetch_add(1, Ordering::SeqCst) + 1
     }
 }
 
@@ -557,6 +563,20 @@ impl CrossShardCoordinator {
             active_rounds: HashMap::new(),
             pending_finalization: VecDeque::new(),
         }
+    }
+
+    /// Insert a round, evicting oldest entries if over capacity
+    fn insert_round(&mut self, round_id: String, round: CrossShardRound) {
+        if self.active_rounds.len() >= MAX_ACTIVE_ROUNDS {
+            // Evict oldest round by started_at timestamp
+            if let Some(oldest_key) = self.active_rounds.iter()
+                .min_by_key(|(_, r)| r.started_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.active_rounds.remove(&oldest_key);
+            }
+        }
+        self.active_rounds.insert(round_id, round);
     }
 }
 

@@ -334,6 +334,7 @@ pub fn generate_hybrid_transaction_from_snapshot(
         },
         dilithium_signature: None,
         dilithium_public_key: None,
+        chain_id: 0,
     };
 
     tx.hash = tx.calculate_hash();
@@ -678,11 +679,12 @@ impl BenchmarkManager {
             },
             dilithium_signature: None,   // Benchmark TX - no quantum sig
             dilithium_public_key: None,
+            chain_id: 0,
         };
-        
+
         // Calculate hash
         tx.hash = tx.calculate_hash();
-        
+
         // Sign with Ed25519 — MUST match build_canonical_verify_message() in node.rs
         // Transfer canonical: "transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}"
         let message = format!(
@@ -751,11 +753,12 @@ impl BenchmarkManager {
             },
             dilithium_signature: None,
             dilithium_public_key: None,
+            chain_id: 0,
         };
-        
+
         // Calculate hash (real SHA3-256)
         tx.hash = tx.calculate_hash();
-        
+
         // Sign with Ed25519 - MUST match verify format in node.rs verify_ed25519_tx_signature
         // Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp
         let message = format!(

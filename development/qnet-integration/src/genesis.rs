@@ -1,4 +1,8 @@
 //! Genesis block creation
+//!
+//! [SECURITY] Genesis block (height=0) uses protocol-level authorization.
+//! Signature strings "system"/"genesis" are ONLY valid at block height 0.
+//! All subsequent blocks require full cryptographic (Dilithium) signatures.
 
 use qnet_state::{Block, Transaction, TransactionType};
 use crate::errors::IntegrationResult;
@@ -42,14 +46,19 @@ impl Default for GenesisConfig {
         let benchmark_mode = std::env::var("QNET_BENCHMARK_MODE")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        
+
         let accounts = if benchmark_mode {
-            // Add 1000 benchmark accounts with 1M QNC each for load testing
-            // Total: 1B QNC reserved for benchmarks (doesn't affect Fair Launch economics)
-            println!("[INFO][GEN] benchmark_mode accounts=1000 balance=1M_QNC");
-            let one_million_qnc = 1_000_000_000_000_000u64; // 1M QNC in nanoQNC
-            (0..1000)
-                .map(|i| (format!("EON1benchmark{:06}", i), one_million_qnc))
+            // [WARN] Benchmark mode — reduced to 100 accounts x 10K QNC = 1M total
+            println!("[WARN][GENESIS] BENCHMARK_MODE_ACTIVE — NOT FOR PRODUCTION");
+            println!("[WARN][GENESIS] benchmark_accounts=100 balance=10K_QNC total=1M_QNC");
+            let ten_k_qnc = 10_000_000_000_000u64; // 10K QNC in nanoQNC
+            (0..100)
+                .map(|i| {
+                    // Deterministic but non-obvious addresses via blake3 hash derivation
+                    let hash = blake3::hash(format!("bench_{}", i).as_bytes());
+                    let wallet = format!("EON1bench_{}", hex::encode(&hash.as_bytes()[..8]));
+                    (wallet, ten_k_qnc)
+                })
                 .collect()
         } else {
             // FAIR LAUNCH: Empty genesis - all QNC through Pool 1 Base Emission
@@ -74,6 +83,12 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
     // This account is the source for all initial token distributions
     // Without this, Transfer TX fail with "Account not found: genesis"
     let total_distribution: u64 = config.accounts.iter().map(|(_, amt)| amt).sum();
+    // [SECURITY] Genesis transactions use protocol-level authorization (signature="system"/"genesis")
+    // These are valid ONLY in block height 0. The genesis block hash serves as the root of trust.
+    // Cryptographic signatures are not required because:
+    // 1. Genesis block is deterministic — all nodes produce identical genesis from the same config
+    // 2. The genesis block hash is hardcoded/verified by all peers on first sync
+    // 3. No private key exists for "system"/"genesis" — these are protocol-reserved identifiers
     let mut genesis_account_tx = Transaction {
         hash: String::new(),
         from: "system".to_string(), // System creates genesis account
@@ -92,6 +107,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
         data: Some("Genesis account - source of initial token distribution".to_string()),
         dilithium_signature: None,
         dilithium_public_key: None,
+        chain_id: 0,
     };
     // CRITICAL: Calculate SHA3-256 hash for transaction
     genesis_account_tx.hash = genesis_account_tx.calculate_hash();
@@ -120,6 +136,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
         data: Some("System rewards pool for lazy rewards distribution".to_string()),
         dilithium_signature: None,   // Genesis TX - no quantum sig
         dilithium_public_key: None,
+        chain_id: 0,
     };
     // CRITICAL: Calculate SHA3-256 hash for transaction
     rewards_pool_tx.hash = rewards_pool_tx.calculate_hash();
@@ -148,6 +165,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
             data: Some(format!("Genesis allocation to {}", address)),
             dilithium_signature: None,   // Genesis TX - no quantum sig
             dilithium_public_key: None,
+            chain_id: 0,
         };
         // CRITICAL: Calculate SHA3-256 hash for transaction
         tx.hash = tx.calculate_hash();

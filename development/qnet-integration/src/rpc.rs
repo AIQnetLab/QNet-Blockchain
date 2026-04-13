@@ -15,7 +15,7 @@ use sha3::{Sha3_256, Digest}; // Add missing Digest trait
 use hex;
 use base64::Engine;
 use std::time::{SystemTime, UNIX_EPOCH};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use once_cell::sync::Lazy;
 use futures::{StreamExt, SinkExt};
 use tokio::sync::broadcast;
@@ -127,7 +127,7 @@ pub enum WsEvent {
 /// Global WebSocket event broadcaster
 /// All connected clients receive events through this channel
 pub static WS_BROADCASTER: Lazy<broadcast::Sender<WsEvent>> = Lazy::new(|| {
-    let (tx, _) = broadcast::channel(1000); // Buffer 1000 events
+    let (tx, _) = broadcast::channel(10_000); // Scaled for 10K+ WS clients
     tx
 });
 
@@ -143,12 +143,12 @@ pub fn broadcast_ws_event(event: WsEvent) {
 
 /// Cache for Pool2/Pool3 accumulated stats (10 second TTL)
 /// Reduces load when multiple clients poll for epoch stats
-static REWARD_POOLS_CACHE: Lazy<std::sync::RwLock<(RewardPoolsCache, std::time::Instant)>> = 
-    Lazy::new(|| std::sync::RwLock::new((RewardPoolsCache::default(), std::time::Instant::now())));
+static REWARD_POOLS_CACHE: Lazy<parking_lot::RwLock<(RewardPoolsCache, std::time::Instant)>> =
+    Lazy::new(|| parking_lot::RwLock::new((RewardPoolsCache::default(), std::time::Instant::now())));
 
 /// Cache for network-wide reward statistics (30 second TTL)
-static REWARD_NETWORK_STATS_CACHE: Lazy<std::sync::RwLock<(serde_json::Value, std::time::Instant)>> = 
-    Lazy::new(|| std::sync::RwLock::new((serde_json::json!({}), std::time::Instant::now())));
+static REWARD_NETWORK_STATS_CACHE: Lazy<parking_lot::RwLock<(serde_json::Value, std::time::Instant)>> =
+    Lazy::new(|| parking_lot::RwLock::new((serde_json::json!({}), std::time::Instant::now())));
 
 /// Cache for node summary statistics (60 second TTL per node)
 /// Key: node_id, Value: (summary_json, last_update)
@@ -306,6 +306,7 @@ impl ApiRateLimiter {
         let tx_rate: u32 = std::env::var("QNET_API_RATE_LIMIT")
             .ok()
             .and_then(|v| v.parse().ok())
+            .map(|v: u32| v.clamp(1, 10_000)) // SECURITY: Enforce sane bounds
             .unwrap_or(100);
         
         configs.insert("transaction".to_string(), RateLimitConfig {
@@ -337,6 +338,27 @@ impl ApiRateLimiter {
             window_seconds: 3600,
             block_duration: 1800,
         });
+
+        // v10.0: Consensus endpoints — higher limit for peer communication (60/min)
+        configs.insert("consensus".to_string(), RateLimitConfig {
+            max_requests: 60,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+
+        // v10.0: MEV bundle endpoints (30/min)
+        configs.insert("mev_bundle".to_string(), RateLimitConfig {
+            max_requests: 30,
+            window_seconds: 60,
+            block_duration: 120,
+        });
+
+        // v10.0: Benchmark endpoints — very restricted (5/min)
+        configs.insert("benchmark".to_string(), RateLimitConfig {
+            max_requests: 5,
+            window_seconds: 60,
+            block_duration: 300,
+        });
         
         // v8.1: General and read-only also scale with tx_rate
         let general_rate = std::cmp::max(tx_rate, 100);
@@ -367,6 +389,24 @@ impl ApiRateLimiter {
     
     /// Check if request is allowed, returns (allowed, retry_after_seconds)
     fn check_rate_limit(&self, ip: IpAddr, endpoint_type: &str) -> (bool, u64) {
+        // SCALABILITY: Periodic cleanup of stale IP entries (every 1000 calls)
+        static CLEANUP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = CLEANUP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count % 1000 == 0 && self.ip_states.len() > 1000 {
+            let cutoff = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(600); // 10 minutes ago
+            self.ip_states.retain(|_, endpoints| {
+                // Keep IP if any endpoint has recent activity (last 10 minutes)
+                endpoints.iter().any(|entry| {
+                    entry.value().requests.last().map(|&ts| ts > cutoff).unwrap_or(false)
+                })
+            });
+            println!("[INFO][RPC] rate_limiter_cleanup ip_count={}", self.ip_states.len());
+        }
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -397,7 +437,7 @@ impl ApiRateLimiter {
         // Check if limit exceeded
         if state.requests.len() >= config.max_requests as usize {
             state.blocked_until = now + config.block_duration;
-            println!("[RATE LIMIT] ⛔ IP {} blocked for {} seconds on endpoint '{}'", 
+            println!("[WARN][RPC] rate_limit_blocked ip={} duration={}s endpoint={}",
                      ip, config.block_duration, endpoint_type);
             return (false, config.block_duration);
         }
@@ -458,11 +498,13 @@ static API_KEYS: Lazy<std::collections::HashSet<String>> = Lazy::new(|| {
         }
     }
     
-    // Default keys for development (CHANGE IN PRODUCTION!)
+    // DEV keys loaded from environment only, never hardcoded
     #[cfg(debug_assertions)]
     {
-        keys.insert("dev_explorer_key_2024".to_string()); // 20 chars - OK
-        keys.insert("dev_admin_key_2024".to_string());    // 18 chars - OK
+        if let Ok(dev_key) = std::env::var("QNET_DEV_API_KEY") {
+            keys.insert(dev_key);
+        }
+        println!("[INFO][RPC] debug_mode api_keys_from_env_only=true");
     }
     
     if !keys.is_empty() {
@@ -506,6 +548,43 @@ fn has_valid_api_key(api_key: Option<&str>) -> bool {
 /// Check if IP is whitelisted
 fn is_ip_whitelisted(ip: IpAddr) -> bool {
     WHITELIST_IPS.contains(&ip)
+}
+
+/// v10.0 SECURITY: Check if IP is internal (localhost, private network, or whitelisted)
+/// Used to restrict consensus/P2P endpoints to trusted peers only.
+fn is_internal_ip(ip_str: &str) -> bool {
+    if ip_str.is_empty() {
+        return false;
+    }
+    // Localhost
+    if ip_str == "127.0.0.1" || ip_str == "::1" || ip_str == "localhost" {
+        return true;
+    }
+    // FIX R25-M3: IPv6 link-local (fe80::/10) and unique-local (fc00::/7)
+    if ip_str.starts_with("fe80:") || ip_str.starts_with("fc") || ip_str.starts_with("fd") {
+        return true;
+    }
+    // Parse and check against whitelist
+    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+        if WHITELIST_IPS.contains(&ip) {
+            return true;
+        }
+    }
+    // Private networks: 10.x.x.x, 172.16-31.x.x, 192.168.x.x
+    if ip_str.starts_with("10.") || ip_str.starts_with("192.168.") {
+        return true;
+    }
+    if ip_str.starts_with("172.") {
+        if let Some(second_octet_str) = ip_str.split('.').nth(1) {
+            if let Ok(second_octet) = second_octet_str.parse::<u8>() {
+                if (16..=31).contains(&second_octet) {
+                    return true;
+                }
+            }
+        }
+    }
+    // Docker bridge networks (common: 172.17.x.x covered above)
+    false
 }
 
 /// Helper function to check rate limit and return error response if exceeded
@@ -609,11 +688,11 @@ fn validate_legacy_eon_address(address: &str) -> bool {
 }
 
 /// SECURITY: Validate QNet EON address format
-/// Format: {19 hex}eon{15 hex}{4 hex checksum} = 41 characters
-/// Example: a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2
+/// Format: {19 hex}eon{15 hex}{8 hex checksum} = 45 characters
+/// Checksum: first 4 bytes (32 bits) of SHA3-256 for 1/4B collision resistance
 fn validate_eon_address(address: &str) -> bool {
-    // Check length: 19 + 3 + 15 + 4 = 41 characters
-    if address.len() != 41 {
+    // Check length: 19 + 3 + 15 + 8 = 45 characters
+    if address.len() != 45 {
         return false;
     }
     
@@ -625,28 +704,28 @@ fn validate_eon_address(address: &str) -> bool {
     // Check all characters are lowercase hex (except "eon")
     let part1 = &address[0..19];
     let part2 = &address[22..37];
-    let checksum = &address[37..41];
-    
+    let checksum = &address[37..45];
+
     let is_hex = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase());
-    
+
     if !is_hex(part1) || !is_hex(part2) || !is_hex(checksum) {
         return false;
     }
-    
-    // Verify SHA-256 checksum (for wallet compatibility)
+
+    // Verify SHA3-256 checksum (4 bytes = 32-bit collision resistance)
     let address_without_checksum = format!("{}eon{}", part1, part2);
     let computed_checksum = {
         use sha3::{Sha3_256, Digest};
-        hex::encode(&Sha3_256::digest(address_without_checksum.as_bytes())[..2])
+        hex::encode(&Sha3_256::digest(address_without_checksum.as_bytes())[..4])
     };
-    
+
     checksum == computed_checksum
 }
 
 /// SECURITY: Validate address with detailed error
 fn validate_eon_address_with_error(address: &str) -> Result<(), String> {
-    if address.len() != 41 {
-        return Err(format!("Invalid address length: expected 41, got {}", address.len()));
+    if address.len() != 45 {
+        return Err(format!("Invalid address length: expected 45, got {}", address.len()));
     }
     
     if &address[19..22] != "eon" {
@@ -655,10 +734,10 @@ fn validate_eon_address_with_error(address: &str) -> Result<(), String> {
     
     let part1 = &address[0..19];
     let part2 = &address[22..37];
-    let checksum = &address[37..41];
-    
+    let checksum = &address[37..45];
+
     let is_hex = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase());
-    
+
     if !is_hex(part1) {
         return Err("Invalid address: part1 contains non-hex characters".to_string());
     }
@@ -668,12 +747,12 @@ fn validate_eon_address_with_error(address: &str) -> Result<(), String> {
     if !is_hex(checksum) {
         return Err("Invalid address: checksum contains non-hex characters".to_string());
     }
-    
-    // Verify SHA-256 checksum (for wallet compatibility)
+
+    // Verify SHA3-256 checksum (4 bytes = 32-bit collision resistance)
     let address_without_checksum = format!("{}eon{}", part1, part2);
     let computed_checksum = {
         use sha3::{Sha3_256, Digest};
-        hex::encode(&Sha3_256::digest(address_without_checksum.as_bytes())[..2])
+        hex::encode(&Sha3_256::digest(address_without_checksum.as_bytes())[..4])
     };
     
     if checksum != computed_checksum {
@@ -763,6 +842,12 @@ struct NodeReactivationRequest {
     last_macroblock_hash: String,
     /// Index of the latest macroblock
     last_macroblock_index: u64,
+    /// v10.0: Ed25519 signature over "reactivate:{node_id}:{current_height}" (required for remote requests)
+    #[serde(default)]
+    signature: Option<String>,
+    /// v10.0: Ed25519 public key of the node (required when signature is provided)
+    #[serde(default)]
+    public_key: Option<String>,
 }
 
 /// v6.0: Client-created NodeRegistration TX submit request
@@ -873,7 +958,7 @@ struct GenerateActivationCodeRequest {
     /// Phase 2: QNet EON address (for both burn and rewards)
     wallet_address: String,
     /// QNet EON address for rewards (REQUIRED for Phase 1, optional for Phase 2)
-    /// Format: {19 hex}eon{15 hex}{4 checksum} = 41 chars
+    /// Format: {19 hex}eon{15 hex}{8 checksum} = 45 chars
     #[serde(default)]
     qnet_reward_wallet: Option<String>,
     burn_tx_hash: String,
@@ -1043,16 +1128,18 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
         .and_then(|request: RpcRequest, remote_addr: Option<std::net::SocketAddr>, api_key: Option<String>, blockchain: Arc<BlockchainNode>| async move {
-            // Rate limit heavy RPC methods (bypass with valid API key)
+            // SECURITY: Rate limit ALL JSON-RPC methods (bypass with valid API key)
             let method = &request.method;
-            if method == "chain_getBlocks" || method == "chain_getBlock" {
-                if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, "read_only") {
-                    return Ok::<_, Rejection>(rate_limit_response.into_response());
-                }
+            let limit_category = match method.as_str() {
+                "tx_submit" | "tx_sendTransaction" | "mempool_submit" | "device_migration" => "write",
+                _ => "read_only",
+            };
+            if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, limit_category) {
+                return Ok::<_, Rejection>(rate_limit_response.into_response());
             }
             handle_rpc(request, blockchain).await.map(|r| r.into_response())
         });
-    
+
     let root_path = warp::path::end()
         .and(warp::post())
         .and(warp::body::content_length_limit(1024 * 1024)) // 1MB max
@@ -1061,12 +1148,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
         .and_then(|request: RpcRequest, remote_addr: Option<std::net::SocketAddr>, api_key: Option<String>, blockchain: Arc<BlockchainNode>| async move {
-            // Rate limit heavy RPC methods (bypass with valid API key)
+            // SECURITY: Rate limit ALL JSON-RPC methods (bypass with valid API key)
             let method = &request.method;
-            if method == "chain_getBlocks" || method == "chain_getBlock" {
-                if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, "read_only") {
-                    return Ok::<_, Rejection>(rate_limit_response.into_response());
-                }
+            let limit_category = match method.as_str() {
+                "tx_submit" | "tx_sendTransaction" | "mempool_submit" | "device_migration" => "write",
+                _ => "read_only",
+            };
+            if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, limit_category) {
+                return Ok::<_, Rejection>(rate_limit_response.into_response());
             }
             handle_rpc(request, blockchain).await.map(|r| r.into_response())
         });
@@ -1164,13 +1253,12 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                     ))
                 },
                 Err(e) => {
-                    // Storage or deserialization error
-                    println!("[API] ❌ Error loading microblock {}: {}", height, e);
+                    println!("[WARN][RPC] api_error endpoint=microblock height={} err={}", height, e);
                     Ok::<_, Rejection>(warp::reply::with_status(
                         warp::reply::json(&json!({
                             "error": "Failed to load block",
                             "height": height,
-                            "message": e.to_string()
+                            "message": "internal error"
                         })),
                         warp::http::StatusCode::INTERNAL_SERVER_ERROR
                     ))
@@ -1187,6 +1275,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and_then(|params: std::collections::HashMap<String, String>, blockchain: Arc<BlockchainNode>| async move {
             let from = params.get("from").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             let to = params.get("to").and_then(|s| s.parse::<u64>().ok()).unwrap_or(from);
+            let to = to.min(from.saturating_add(100)); // Cap range to 100 blocks max
             let mut items = Vec::new();
             for h in from..=to {
                 if let Ok(Some(data)) = blockchain.load_microblock_bytes(h) {
@@ -1317,15 +1406,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("latest"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_latest);
-    
+
     // GET /api/v1/snapshot/{height} - Download snapshot binary
     let snapshot_download = api_v1
         .and(warp::path("snapshot"))
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_download);
 
@@ -1336,6 +1427,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("manifest"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_manifest);
 
@@ -1347,6 +1439,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<usize>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_chunk);
 
@@ -1412,6 +1505,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::addr::remote())
+        .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_mempool_transactions);
     
@@ -1424,23 +1518,26 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(256 * 1024)) // 256 KB max bundle payload
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_bundle_submit);
-    
+
     let bundle_status = api_v1
         .and(warp::path("bundle"))
         .and(warp::path::param::<String>())
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_bundle_status);
-    
+
     let bundle_cancel = api_v1
         .and(warp::path("bundle"))
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::delete())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_bundle_cancel);
     
@@ -1564,6 +1661,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("claim-rewards"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -1581,47 +1679,58 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and_then(handle_batch_transfer);
     
     // Node discovery endpoints
+    // FIX M13: Add rate limiting to discovery/health endpoints
     let node_discovery = api_v1
         .and(warp::path("nodes"))
         .and(warp::path("discovery"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_node_discovery);
-    
+
     let node_health = api_v1
         .and(warp::path("node"))
         .and(warp::path("health"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_node_health);
 
     // Gas recommendation endpoints
+    // FIX M13: Add rate limiting to gas recommendations
     let gas_recommendations = api_v1
         .and(warp::path("gas"))
         .and(warp::path("recommendations"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_gas_recommendations);
     
     // P2P Authentication endpoint for quantum-secure peer verification
+    // FIX M13: Add rate limiting to auth challenge (write category)
     let auth_challenge = api_v1
         .and(warp::path("auth"))
         .and(warp::path("challenge"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_auth_challenge);
 
     // Network ping endpoint for reward system (quantum-secure)
+    // FIX M13: Add rate limiting to ping (write category — triggers signing)
     let network_ping = api_v1
         .and(warp::path("ping"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_network_ping);
 
@@ -1631,6 +1740,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("register"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -1651,6 +1761,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("ping-response"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
@@ -1661,6 +1772,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("reactivate"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_reactivate);
@@ -1710,6 +1822,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("claim"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -1767,6 +1880,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("batch"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -1799,6 +1913,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("nodes"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024))
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -1819,6 +1934,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("generate-activation-code"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -1834,51 +1950,59 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and_then(handle_verify_activation_onchain);
 
     // v4.9: Node device check — used by super nodes to detect migration
-    // GET /api/v1/node-device?node_id=xxx → returns current device_id from RocksDB
+    // GET /api/v1/node-device?node_id=xxx (v10.0: rate-limited)
     let node_device_check = api_v1
         .and(warp::path("node-device"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_node_device_check);
 
     // v4.9: Register device_id for node (called by super nodes on startup)
-    // POST /api/v1/register-device { node_id, device_id }
+    // POST /api/v1/register-device { node_id, device_id } (v10.0: rate-limited)
     let register_device = api_v1
         .and(warp::path("register-device"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_register_device);
 
-    // Graceful shutdown endpoint for node replacement
+    // FIX L-L7: Graceful shutdown endpoint — IP restriction + rate limiting
     let graceful_shutdown = api_v1
         .and(warp::path("shutdown"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(4 * 1024)) // 4KB max
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_graceful_shutdown);
 
     // ===== MONITORING AND DIAGNOSTIC ENDPOINTS =====
     
     // Failover history endpoint
+    // FIX R25-M1: add remote_addr + rate limiting to failover endpoints
     let failover_history = api_v1
         .and(warp::path("failovers"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_failover_history);
-    
+
     // Network failovers endpoint (alias for compatibility)
     let network_failovers = api_v1
         .and(warp::path("network"))
         .and(warp::path("failovers"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_failover_history);
@@ -1937,95 +2061,106 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_activation_price);
     
-    // Network diagnostics endpoint
+    // Network diagnostics endpoint (rate-limited)
     let network_diagnostics = api_v1
         .and(warp::path("diagnostics"))
         .and(warp::path("network"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_network_diagnostics);
-    
-    // Block production statistics
+
+    // Block production statistics (rate-limited)
     let block_stats = api_v1
         .and(warp::path("blocks"))
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_block_statistics);
-    
-    // Shred Protocol metrics endpoint
+
+    // Shred Protocol metrics endpoint (rate-limited)
     let shred_protocol_metrics = api_v1
         .and(warp::path("shred-protocol"))
         .and(warp::path("metrics"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_shred_protocol_metrics);
-    
-    // Quantum VTS status endpoint
+
+    // Quantum VTS status endpoint (rate-limited)
     let poh_status = api_v1
         .and(warp::path("poh"))
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_poh_status);
-    
-    // Parallel Executor pipeline metrics endpoint
+
+    // Parallel Executor pipeline metrics endpoint (rate-limited)
     let parallel_executor_metrics = api_v1
         .and(warp::path("parallel-executor"))
         .and(warp::path("metrics"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_parallel_executor_metrics);
-    
-    // Pre-execution cache status endpoint
+
+    // Pre-execution cache status endpoint (rate-limited)
     let pre_execution_status = api_v1
         .and(warp::path("pre-execution"))
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_pre_execution_status);
-    
-    // Adaptive BFT timeout info endpoint
+
+    // Adaptive BFT timeout info endpoint (rate-limited)
     let adaptive_bft_info = api_v1
         .and(warp::path("adaptive-bft"))
         .and(warp::path("timeouts"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_adaptive_bft_timeouts);
-    
-    // Node performance metrics
+
+    // Node performance metrics (rate-limited)
     let performance_metrics = api_v1
         .and(warp::path("metrics"))
         .and(warp::path("performance"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_performance_metrics);
     
-    // Reputation history endpoint
+    // Reputation history endpoint (rate-limited)
     let reputation_history = api_v1
         .and(warp::path("reputation"))
         .and(warp::path("history"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_reputation_history);
 
-    // Macroblock consensus endpoints
+    // Macroblock consensus endpoints (v10.0: IP-restricted + rate-limited)
     let consensus_commit = api_v1
         .and(warp::path("consensus"))
         .and(warp::path("commit"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(128 * 1024))
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_consensus_commit);
 
@@ -2034,16 +2169,20 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("reveal"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(128 * 1024))
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_consensus_reveal);
 
+    // FIX R20-H4: Add remote_addr for internal-IP auth check
     let consensus_round_status = api_v1
         .and(warp::path("consensus"))
         .and(warp::path("round"))
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_consensus_round_status);
 
@@ -2052,16 +2191,19 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("sync"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(256 * 1024))
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_consensus_sync);
     
-    // PRODUCTION: P2P message handling endpoint 
+    // PRODUCTION: P2P message handling endpoint
     let p2p_message = api_v1
         .and(warp::path("p2p"))
         .and(warp::path("message"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(2 * 1024 * 1024))
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -2075,6 +2217,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("deploy"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(2 * 1024 * 1024)) // 2MB max (WASM bytecode)
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -2086,21 +2229,22 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("call"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_call);
     
-    // Get contract info by address
+    // FIX M13: Add rate limiting to contract endpoints
     let contract_info = api_v1
         .and(warp::path("contract"))
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_info);
-    
-    // Get contract state
+
     let contract_state = api_v1
         .and(warp::path("contract"))
         .and(warp::path::param::<String>())
@@ -2108,16 +2252,19 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<ContractStateQuery>())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_state);
-    
-    // Estimate gas for contract operation
+
+    // Estimate gas for contract operation (write category)
     let contract_estimate_gas = api_v1
         .and(warp::path("contract"))
         .and(warp::path("estimate-gas"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_estimate_gas);
     
@@ -2127,6 +2274,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("deploy"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -2166,46 +2314,52 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     // BENCHMARK ENDPOINTS - Real Transaction Load Testing
     // ============================================================================
     
-    // POST /api/v1/benchmark/start - Start benchmark with config
+    // POST /api/v1/benchmark/start - Start benchmark with config (v10.0: rate-limited + auth)
     let benchmark_start = api_v1
         .and(warp::path("benchmark"))
         .and(warp::path("start"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_benchmark_start);
-    
-    // GET /api/v1/benchmark/status - Get current benchmark status
+
+    // GET /api/v1/benchmark/status - Get current benchmark status (v10.0: rate-limited)
     let benchmark_status = api_v1
         .and(warp::path("benchmark"))
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and_then(handle_benchmark_status);
-    
-    // GET /api/v1/benchmark/results - Get benchmark results
+
+    // GET /api/v1/benchmark/results - Get benchmark results (v10.0: rate-limited)
     let benchmark_results = api_v1
         .and(warp::path("benchmark"))
         .and(warp::path("results"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and_then(handle_benchmark_results);
-    
-    // POST /api/v1/benchmark/stop - Stop benchmark
+
+    // POST /api/v1/benchmark/stop - Stop benchmark (v10.0: auth + rate-limited)
     let benchmark_stop = api_v1
         .and(warp::path("benchmark"))
         .and(warp::path("stop"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::addr::remote())
         .and_then(handle_benchmark_stop);
-    
-    // GET /api/v1/benchmark/presets - Get available presets
+
+    // GET /api/v1/benchmark/presets - Get available presets (v10.0: rate-limited)
     let benchmark_presets = api_v1
         .and(warp::path("benchmark"))
         .and(warp::path("presets"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and_then(handle_benchmark_presets);
     
     // Combine benchmark routes
@@ -2223,14 +2377,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         warp::cors()
             .allow_any_origin()
             .allow_methods(vec!["POST", "GET", "OPTIONS", "PUT", "DELETE"])
-            .allow_headers(vec!["Content-Type", "Authorization", "User-Agent", "X-Requested-With"])
+            .allow_headers(vec!["Content-Type", "Authorization", "User-Agent", "X-Requested-With", "X-API-Key"])
             .max_age(3600)
     } else {
-        println!("🔒 CORS: Production mode - restricted origins");
+        println!("[INFO][RPC] cors_mode=production restricted_origins=true");
         warp::cors()
             .allow_origins(ALLOWED_ORIGINS.iter().map(|s| *s))
             .allow_methods(vec!["POST", "GET", "OPTIONS"])
-            .allow_headers(vec!["Content-Type", "Authorization", "User-Agent"])
+            .allow_headers(vec!["Content-Type", "Authorization", "User-Agent", "X-API-Key"])
             .max_age(86400) // 24 hours cache
     };
     
@@ -2299,11 +2453,13 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(activation_price);
         
     // SECURE: Node information endpoint with activation code (for wallet extensions)
+    // v10.0: Auth via Authorization header (query param deprecated)
     let node_secure_info = api_v1
         .and(warp::path("node"))
         .and(warp::path("secure-info"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
         .and(warp::query::<std::collections::HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_node_secure_info);
@@ -2315,6 +2471,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::post())
         .and(warp::addr::remote())
+        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(blockchain_filter.clone())
         .and_then(handle_internal_fcm_token_sync);
@@ -2326,6 +2483,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::post())
         .and(warp::addr::remote())
+        .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
         .and(blockchain_filter.clone())
         .and_then(|remote_addr: Option<std::net::SocketAddr>, body: TokenRefreshRequest, bc: Arc<BlockchainNode>| async move {
@@ -2667,10 +2825,13 @@ async fn chain_get_block(
             code: -32000,
             message: format!("Block {} not found", height),
         }),
-        Err(e) => Err(RpcError {
-            code: -32000,
-            message: e.to_string(),
-        }),
+        Err(e) => {
+            println!("[WARN][RPC] rpc_error method=chain_get_block height={} err={}", height, e);
+            Err(RpcError {
+                code: -32000,
+                message: "internal error".to_string(),
+            })
+        }
     }
 }
 
@@ -2711,11 +2872,20 @@ async fn tx_submit(
         code: -32602,
         message: "Missing to".to_string(),
     })?;
-    
-    let amount = params["amount"].as_f64().ok_or_else(|| RpcError {
+
+    // SECURITY: Validate EON address format (consistent with REST endpoint)
+    if let Err(e) = validate_eon_address_with_error(from) {
+        return Err(RpcError { code: -32602, message: format!("Invalid 'from' address: {}", e) });
+    }
+    if let Err(e) = validate_eon_address_with_error(to) {
+        return Err(RpcError { code: -32602, message: format!("Invalid 'to' address: {}", e) });
+    }
+
+    // SECURITY: Use as_u64() directly — as_f64()→as u64 causes precision loss for large values
+    let amount = params["amount"].as_u64().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing amount".to_string(),
-    })? as u64;
+        message: "Missing or invalid amount (must be unsigned integer)".to_string(),
+    })?;
     
     let gas_price = params["gas_price"].as_u64().unwrap_or(1);
     let gas_limit = params["gas_limit"].as_u64().unwrap_or(10_000); // QNet TRANSFER gas limit
@@ -2764,19 +2934,23 @@ async fn tx_submit(
         data: None, // no data for simple transfer
         dilithium_signature,      // QUANTUM v2.25: Optional post-quantum signature
         dilithium_public_key,     // QUANTUM v2.25: Optional post-quantum pubkey
+        chain_id: 0,
     };
-    
+
     // Calculate hash
     tx.hash = tx.calculate_hash();
-    
+
     match blockchain.submit_transaction(tx).await {
         Ok(hash) => Ok(json!({
             "hash": hash
         })),
-        Err(e) => Err(RpcError {
-            code: -32000,
-            message: e.to_string(),
-        }),
+        Err(e) => {
+            println!("[WARN][RPC] rpc_error method=tx_submit err={}", e);
+            Err(RpcError {
+                code: -32000,
+                message: "request failed".to_string(),
+            })
+        }
     }
 }
 
@@ -2834,10 +3008,13 @@ async fn tx_get(
             code: -32000,
             message: format!("Transaction {} not found", tx_hash),
         }),
-        Err(e) => Err(RpcError {
-            code: -32000,
-            message: e.to_string(),
-        }),
+        Err(e) => {
+            println!("[WARN][RPC] rpc_error method=tx_get hash={} err={}", tx_hash, e);
+            Err(RpcError {
+                code: -32000,
+                message: "internal error".to_string(),
+            })
+        }
     }
 }
 
@@ -2921,8 +3098,9 @@ async fn mempool_submit(
             data: None, // no data for simple transfer
             dilithium_signature: None,   // Batch TX - no quantum sig by default
             dilithium_public_key: None,
+            chain_id: 0,
         };
-        
+
         // Calculate hash
         tx.hash = tx.calculate_hash();
         all_transactions.push(tx);
@@ -2932,7 +3110,10 @@ async fn mempool_submit(
     for tx in all_transactions {
         match blockchain.submit_transaction(tx).await {
             Ok(hash) => results.push(json!({ "hash": hash, "success": true })),
-            Err(e) => results.push(json!({ "hash": "", "success": false, "error": e.to_string() })),
+            Err(e) => {
+                println!("[WARN][RPC] rpc_error method=tx_submit_batch err={}", e);
+                results.push(json!({ "hash": "", "success": false, "error": "request failed" }));
+            }
         }
     }
     
@@ -2992,10 +3173,13 @@ async fn account_get_balance(
         Ok(balance) => Ok(json!({
             "balance": balance
         })),
-        Err(e) => Err(RpcError {
-            code: -32000,
-            message: e.to_string(),
-        }),
+        Err(e) => {
+            println!("[WARN][RPC] rpc_error method=account_get_balance address={} err={}", address, e);
+            Err(RpcError {
+                code: -32000,
+                message: "internal error".to_string(),
+            })
+        }
     }
 }
 
@@ -3072,20 +3256,26 @@ async fn qrb_get_randomness(
                         "algorithm": "XOR(VRF_Dilithium3_1...VRF_Dilithium3_N)"
                     }))
                 }
-                Err(e) => Err(RpcError {
-                    code: -32000,
-                    message: format!("Failed to deserialize macroblock: {}", e),
-                }),
+                Err(e) => {
+                    println!("[WARN][RPC] rpc_error method=qrb_get_macroblock_randomness err={}", e);
+                    Err(RpcError {
+                        code: -32000,
+                        message: "internal error".to_string(),
+                    })
+                }
             }
         }
         Ok(None) => Err(RpcError {
             code: -32001,
             message: format!("Epoch {} not yet finalized", epoch),
         }),
-        Err(e) => Err(RpcError {
-            code: -32000,
-            message: format!("Storage error: {:?}", e),
-        }),
+        Err(e) => {
+            println!("[WARN][RPC] rpc_error method=qrb_get_macroblock err={:?}", e);
+            Err(RpcError {
+                code: -32000,
+                message: "internal error".to_string(),
+            })
+        }
     }
 }
 
@@ -3170,24 +3360,34 @@ async fn qrb_get_randomness_with_seed(
                         "algorithm": "SHA3-256(beacon || seed)"
                     }))
                 }
-                Err(e) => Err(RpcError {
-                    code: -32000,
-                    message: format!("Failed to deserialize macroblock: {}", e),
-                }),
+                Err(e) => {
+                    println!("[WARN][RPC] rpc_error method=qrb_get_latest_randomness err={}", e);
+                    Err(RpcError {
+                        code: -32000,
+                        message: "internal error".to_string(),
+                    })
+                }
             }
         }
         Ok(None) => Err(RpcError {
             code: -32001,
             message: format!("Epoch {} not yet finalized", epoch),
         }),
-        Err(e) => Err(RpcError {
-            code: -32000,
-            message: format!("Storage error: {:?}", e),
-        }),
+        Err(e) => {
+            println!("[WARN][RPC] rpc_error method=qrb_get_latest_randomness err={:?}", e);
+            Err(RpcError {
+                code: -32000,
+                message: "internal error".to_string(),
+            })
+        }
     }
 }
 
 /// Migrate device (same wallet, different device)
+/// FIX R22-N6: Added Dilithium3 signature verification to prevent unauthorized migration.
+/// Without this, anyone with an activation code could migrate a node to their device.
+/// Now requires: activation_code + dilithium_signature + dilithium_public_key
+/// The signature must be over "migrate:{activation_code}:{new_device_signature}"
 async fn device_migration(
     blockchain: Arc<BlockchainNode>,
     params: Option<Value>,
@@ -3196,19 +3396,46 @@ async fn device_migration(
         code: -32602,
         message: "Invalid params".to_string(),
     })?;
-    
+
     let activation_code = params["activation_code"].as_str().ok_or_else(|| RpcError {
         code: -32602,
         message: "Missing activation_code parameter".to_string(),
     })?;
-    
+
     let new_device_signature = params["new_device_signature"].as_str().ok_or_else(|| RpcError {
         code: -32602,
         message: "Missing new_device_signature parameter".to_string(),
     })?;
-    
+
+    // FIX R22-N6: Require Dilithium3 signature proving ownership of the node's keypair
+    let dilithium_sig = params["dilithium_signature"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing dilithium_signature — cryptographic proof required for device migration".to_string(),
+    })?;
+    let dilithium_pk_hex = params["dilithium_public_key"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing dilithium_public_key — required for signature verification".to_string(),
+    })?;
+
+    // Verify Dilithium3/ML-DSA-65 signature over migration payload
+    // Reuses existing verify_mobile_dilithium_signature() which supports both
+    // mobile format ("dilithium_sig_...") and raw hex format.
+    {
+        let message = format!("migrate:{}:{}", activation_code, new_device_signature);
+        if !verify_mobile_dilithium_signature(&message, dilithium_sig, dilithium_pk_hex) {
+            println!("[WARN][MIGRATE] dilithium_verify_failed code={}...",
+                     &activation_code[..16.min(activation_code.len())]);
+            return Err(RpcError {
+                code: -32003,
+                message: "Dilithium3 signature verification failed — unauthorized migration attempt".to_string(),
+            });
+        }
+        println!("[INFO][MIGRATE] dilithium_verified code={}...",
+                 &activation_code[..16.min(activation_code.len())]);
+    }
+
     let node_type = blockchain.get_node_type();
-    
+
     match blockchain.migrate_device(activation_code, node_type, new_device_signature).await {
         Ok(_) => Ok(json!({
             "success": true,
@@ -3313,9 +3540,10 @@ async fn handle_account_balance(
             "balance": balance
         }))),
         Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=get_balance address={} err={}", address, e);
             let error_response = json!({
                 "error": "Failed to get balance",
-                "details": e.to_string()
+                "details": "internal error"
             });
             Ok(warp::reply::json(&error_response))
         }
@@ -3376,6 +3604,7 @@ async fn handle_account_balance_with_proof(
         }
         Err(e) => {
             // Account not found - return empty balance with proof
+            println!("[WARN][RPC] api_error endpoint=balance_proof address={} err={}", address, e);
             Ok(warp::reply::json(&json!({
                 "address": address,
                 "balance": 0,
@@ -3383,7 +3612,7 @@ async fn handle_account_balance_with_proof(
                 "merkle_proof": [],
                 "state_root": "",
                 "block_height": 0,
-                "error": e.to_string(),
+                "error": "account not found",
                 "proof_valid": false
             })))
         }
@@ -3698,7 +3927,7 @@ async fn handle_transaction_history(
                     "timestamp": tx.timestamp,
                     "gas_price": tx.gas_price,
                     "gas_limit": tx.gas_limit,
-                    "gas_used": tx.effective_gas_price() * tx.gas_limit,
+                    "gas_used": tx.effective_gas_price().saturating_mul(tx.gas_limit),
                     "is_quantum_signed": tx.is_quantum_signed(),
                     "nonce": tx.nonce,
                     "type": tx_type_str,
@@ -3822,9 +4051,10 @@ async fn handle_block_latest(
             Ok(warp::reply::json(&error_response))
         }
         Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=latest_block err={}", e);
             let error_response = json!({
                 "error": "Failed to get latest block",
-                "details": e.to_string()
+                "details": "internal error"
             });
             Ok(warp::reply::json(&error_response))
         }
@@ -3861,9 +4091,10 @@ async fn handle_block_by_height(
             Ok(warp::reply::json(&error_response))
         }
         Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=block_by_height height={} err={}", height, e);
             let error_response = json!({
                 "error": "Failed to get block",
-                "details": e.to_string()
+                "details": "internal error"
             });
             Ok(warp::reply::json(&error_response))
         }
@@ -4002,9 +4233,10 @@ async fn handle_macroblock_by_index(
             Ok(warp::reply::json(&error_response))
         }
         Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=macroblock err={}", e);
             let error_response = json!({
                 "error": "Failed to get macroblock",
-                "details": e.to_string()
+                "details": "internal error"
             });
             Ok(warp::reply::json(&error_response))
         }
@@ -4018,8 +4250,12 @@ async fn handle_macroblock_by_index(
 /// GET /api/v1/snapshot/latest - Get latest available snapshot info
 /// Used by new nodes to find snapshots for fast sync
 async fn handle_snapshot_latest(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
     match blockchain.get_latest_snapshot_height() {
         Ok(Some(height)) => {
             // Get IPFS CID if available
@@ -4049,9 +4285,10 @@ async fn handle_snapshot_latest(
             Ok(warp::reply::json(&response))
         }
         Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=snapshot_info err={}", e);
             let error_response = json!({
                 "error": "Failed to get snapshot info",
-                "details": e.to_string()
+                "details": "internal error"
             });
             Ok(warp::reply::json(&error_response))
         }
@@ -4062,8 +4299,16 @@ async fn handle_snapshot_latest(
 /// Returns compressed binary snapshot for the specified height
 async fn handle_snapshot_download(
     height: u64,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    if let Err(_) = check_api_rate_limit(remote_addr, "read_only") {
+        let body = serde_json::to_vec(&json!({"error": "Rate limit exceeded"})).unwrap_or_default();
+        return Ok(warp::reply::with_header(
+            warp::reply::with_header(body, "Content-Type", "application/json"),
+            "Content-Disposition", ""
+        ));
+    }
     match blockchain.get_snapshot_data(height) {
         Ok(Some(data)) => {
             // Return binary data with appropriate headers
@@ -4094,9 +4339,10 @@ async fn handle_snapshot_download(
             ))
         }
         Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=snapshot_download err={}", e);
             let error_response = json!({
                 "error": "Failed to get snapshot",
-                "details": e.to_string()
+                "details": "internal error"
             });
             Ok(warp::reply::with_header(
                 warp::reply::with_header(
@@ -4114,15 +4360,20 @@ async fn handle_snapshot_download(
 /// v5.0: GET /api/v1/snapshot/{height}/manifest — chunk manifest for parallel download
 async fn handle_snapshot_manifest(
     height: u64,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
     match blockchain.get_storage().get_snapshot_manifest(height) {
         Ok(Some(manifest)) => Ok(warp::reply::json(&manifest)),
         Ok(None) => {
             Ok(warp::reply::json(&json!({ "error": "Snapshot not found", "height": height })))
         }
         Err(e) => {
-            Ok(warp::reply::json(&json!({ "error": "Manifest error", "details": e.to_string() })))
+            println!("[WARN][RPC] api_error endpoint=snapshot_manifest height={} err={}", height, e);
+            Ok(warp::reply::json(&json!({ "error": "Manifest error", "details": "internal error" })))
         }
     }
 }
@@ -4131,8 +4382,16 @@ async fn handle_snapshot_manifest(
 async fn handle_snapshot_chunk(
     height: u64,
     chunk_index: usize,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    if let Err(_) = check_api_rate_limit(remote_addr, "read_only") {
+        let body = serde_json::to_vec(&json!({"error": "Rate limit exceeded"})).unwrap_or_default();
+        return Ok(warp::reply::with_header(
+            warp::reply::with_header(body, "Content-Type", "application/json"),
+            "Content-Disposition", ""
+        ));
+    }
     match blockchain.get_storage().get_snapshot_chunk(height, chunk_index as u64) {
         Ok(Some(data)) => {
             Ok(warp::reply::with_header(
@@ -4157,9 +4416,10 @@ async fn handle_snapshot_chunk(
             ))
         }
         Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=snapshot_chunk err={}", e);
             Ok(warp::reply::with_header(
                 warp::reply::with_header(
-                    serde_json::to_vec(&json!({"error": e.to_string()})).unwrap_or_default(),
+                    serde_json::to_vec(&json!({"error": "internal error"})).unwrap_or_default(),
                     "Content-Type",
                     "application/json"
                 ),
@@ -4335,17 +4595,18 @@ async fn handle_transaction_submit(
                     let error_response = json!({
                         "success": false,
                         "error": "Failed to add transaction to mempool",
-                        "details": e.to_string()
+                        "details": "request failed"
                     });
                     Ok(warp::reply::json(&error_response))
                 }
             }
         }
         Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=submit_tx err={}", e);
             let error_response = json!({
                 "success": false,
                 "error": "Failed to serialize transaction",
-                "details": e.to_string()
+                "details": "request failed"
             });
             Ok(warp::reply::json(&error_response))
         }
@@ -4375,7 +4636,7 @@ async fn handle_transaction_get(
         Ok(Some(tx)) => {
             // QUANTUM v2.25.2: Include quantum signature info in explorer
             let is_quantum = tx.is_quantum_signed();
-            let effective_gas = tx.effective_gas_price() * tx.gas_limit;
+            let effective_gas = tx.effective_gas_price().saturating_mul(tx.gas_limit);
             
             let mut transaction_data = json!({
                 "hash": tx.hash,
@@ -4474,18 +4735,33 @@ async fn handle_mempool_status(
 
 async fn handle_mempool_transactions(
     remote_addr: Option<std::net::SocketAddr>,
+    query_params: HashMap<String, String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     // v3.19: Rate limiting for DDoS protection
     if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
         return Ok(rate_limit_response);
     }
-    
-    let txs = blockchain.get_mempool_transactions().await;
-    
+
+    // v10.0: Pagination support to prevent unbounded responses
+    let limit = query_params.get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(1000); // max 1000
+    let offset = query_params.get("offset")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let all_txs = blockchain.get_mempool_transactions().await;
+    let total_count = all_txs.len();
+    let txs: Vec<_> = all_txs.into_iter().skip(offset).take(limit).collect();
+
     let response = json!({
         "transactions": txs,
         "count": txs.len(),
+        "total_count": total_count,
+        "offset": offset,
+        "limit": limit,
         "node_id": blockchain.get_public_display_name()
     });
     Ok(warp::reply::json(&response))
@@ -4500,8 +4776,13 @@ async fn handle_mempool_transactions(
 /// ARCHITECTURE: Flashbots-style bundles with 0-20% dynamic allocation
 async fn handle_bundle_submit(
     bundle_request: serde_json::Value,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v10.0: Rate limit bundle submissions
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "mev_bundle") {
+        return Ok(rate_limit_response);
+    }
     use qnet_mempool::TxBundle;
     use std::time::{SystemTime, UNIX_EPOCH};
     
@@ -4614,6 +4895,18 @@ async fn handle_bundle_submit(
     // Add bundle to MEV mempool
     match mev_mempool.add_bundle(bundle, submitter_reputation, current_time).await {
         Ok(bundle_id) => {
+            // v10.0: Track submitter IP for cancel authorization
+            let submitter_ip = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+            BUNDLE_SUBMITTER_IPS.insert(bundle_id.clone(), submitter_ip);
+            // Periodic cleanup: remove entries for expired/non-existent bundles
+            if BUNDLE_SUBMITTER_IPS.len() > 500 {
+                let keys: Vec<String> = BUNDLE_SUBMITTER_IPS.iter().map(|e| e.key().clone()).collect();
+                for key in keys {
+                    if mev_mempool.get_bundle(&key).is_none() {
+                        BUNDLE_SUBMITTER_IPS.remove(&key);
+                    }
+                }
+            }
             let response = json!({
                 "success": true,
                 "bundle_id": bundle_id,
@@ -4635,10 +4928,16 @@ async fn handle_bundle_submit(
 /// Get status of a submitted bundle
 async fn handle_bundle_status(
     bundle_id: String,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
+    // v10.0: Rate limit bundle status queries
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "mev_bundle") {
+        return Ok(rate_limit_response);
+    }
+
     // Check if MEV mempool is enabled
     let mev_mempool = match blockchain.get_mev_mempool() {
         Some(pool) => pool,
@@ -4688,8 +4987,14 @@ async fn handle_bundle_status(
 /// Cancel a submitted bundle
 async fn handle_bundle_cancel(
     bundle_id: String,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v10.0: Rate limit bundle cancellations
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "mev_bundle") {
+        return Ok(rate_limit_response);
+    }
+
     // Check if MEV mempool is enabled
     let mev_mempool = match blockchain.get_mev_mempool() {
         Some(pool) => pool,
@@ -4701,9 +5006,23 @@ async fn handle_bundle_cancel(
             return Ok(warp::reply::json(&error_response));
         }
     };
-    
+
+    // v10.0 SECURITY: Verify cancel request comes from the original submitter IP
+    let caller_ip = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    if let Some(submitter_ip) = BUNDLE_SUBMITTER_IPS.get(&bundle_id) {
+        if submitter_ip.value() != &caller_ip && !is_internal_ip(&caller_ip) {
+            println!("[WARN][RPC] bundle_cancel_rejected bundle={} caller_ip={} submitter_ip={}",
+                     &bundle_id[..16.min(bundle_id.len())], caller_ip, submitter_ip.value());
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Unauthorized: bundle can only be cancelled by the original submitter"
+            })));
+        }
+    }
+
     // Remove bundle
     if mev_mempool.remove_bundle(&bundle_id) {
+        BUNDLE_SUBMITTER_IPS.remove(&bundle_id);
         let response = json!({
             "success": true,
             "message": "Bundle cancelled successfully"
@@ -4834,11 +5153,44 @@ async fn handle_batch_claim_rewards(
         }
     }
 
+    // FIX R23-R1: CLAIM_IN_PROGRESS guard for batch claims — prevents concurrent
+    // batch claims for the same wallet from double-spending pending rewards.
+    // Uses same CLAIM_IN_PROGRESS DashSet as single claims for unified protection.
+    {
+        let batch_key = format!("batch_{}", request.owner_address);
+        if !CLAIM_IN_PROGRESS.insert(batch_key.clone()) {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Batch claim already in progress for this wallet",
+                "hint": "Wait for the current batch claim to complete"
+            })));
+        }
+        // Also check individual node claims in progress
+        for node_id in &request.node_ids {
+            if CLAIM_IN_PROGRESS.contains(node_id) {
+                CLAIM_IN_PROGRESS.remove(&batch_key);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": format!("Individual claim already in progress for node {}", node_id),
+                    "hint": "Wait for the current claim to complete"
+                })));
+            }
+        }
+    }
+    // RAII guard: remove batch claim lock on ANY exit path
+    let _batch_guard = {
+        struct BatchClaimGuard(String);
+        impl Drop for BatchClaimGuard {
+            fn drop(&mut self) { CLAIM_IN_PROGRESS.remove(&self.0); }
+        }
+        BatchClaimGuard(format!("batch_{}", request.owner_address))
+    };
+
     // PRODUCTION: Process real batch reward claims
     let mut total_rewards = 0u64;
     let mut processed_nodes = Vec::new();
     let mut failed_nodes: Vec<serde_json::Value> = Vec::new();
-    
+
     // Process each node's reward claim
     for node_id in &request.node_ids {
         // SECURITY v6.1: Verify owner_address matches on-chain registered wallet for this node.
@@ -4904,14 +5256,12 @@ async fn handle_batch_claim_rewards(
                     eprintln!("[WARN][CLAIM] batch_amount_mismatch node={} blockchain={} reward_mgr={}", 
                              node_id, blockchain_pending, reward.total_reward);
                 }
-                total_rewards += reward_amount;
+                // FIX R26-M1: checked arithmetic on batch reward accumulation
+                total_rewards = total_rewards.saturating_add(reward_amount);
+                // FIX R25-L1: don't leak exact reward amounts in response — return status only
                 processed_nodes.push(json!({
                     "node_id": node_id,
-                    "reward_amount": reward_amount,
                     "status": "success",
-                    "pool1_base": reward.pool1_base_emission,
-                    "pool2_fees": reward.pool2_transaction_fees,
-                    "pool3_activation": reward.pool3_activation_bonus,
                     "phase": format!("{:?}", reward.current_phase)
                 }));
                 println!("[INFO][CLAIM] batch_claimed node={} amount={} QNC wallet={}...", 
@@ -4953,8 +5303,9 @@ async fn handle_batch_claim_rewards(
                     data: Some(format!("reward_claim:{}:{}:batch", node_id, reward_amount)), // v3.33: Match sync handler format
                     dilithium_signature: None,
                     dilithium_public_key: None,
+                    chain_id: 0,
                 };
-                
+
                 // Calculate hash using SHA3-256 (NIST compliant)
                 reward_tx.hash = reward_tx.calculate_hash();
                 
@@ -5054,7 +5405,7 @@ async fn handle_batch_transfer(
     }
     
     // PRODUCTION: Process real batch transfers via blockchain transaction
-    let total_amount: u64 = request.transfers.iter().map(|t| t.amount).sum();
+    let total_amount: u64 = request.transfers.iter().map(|t| t.amount).fold(0u64, |acc, a| acc.saturating_add(a));
     
     // v3.34: Read correct sequential nonce from StateManager
     // Previously used timestamp as nonce which ALWAYS failed nonce check (nonce != sender.nonce + 1)
@@ -5139,11 +5490,11 @@ async fn handle_batch_transfer(
             Ok(warp::reply::json(&response))
         }
         Err(e) => {
-            println!("[BATCH] ❌ Batch transfer failed: {}", e);
+            println!("[WARN][RPC] api_error endpoint=batch_transfer batch_id={} err={}", request.batch_id, e);
             let response = json!({
                 "success": false,
                 "batch_id": request.batch_id,
-                "error": e.to_string(),
+                "error": "request failed",
                 "transfer_count": request.transfers.len(),
                 "total_amount": total_amount,
                 "message": "Batch transfer failed to submit"
@@ -5154,8 +5505,13 @@ async fn handle_batch_transfer(
 }
 
 async fn handle_node_discovery(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // FIX M13: Rate limit node discovery
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
     let peers = blockchain.get_connected_peers().await.unwrap_or_default();
     
     // v3.19: Get reputation from blockchain, not P2P cache!
@@ -5166,28 +5522,56 @@ async fn handle_node_discovery(
         .unwrap_or_default()
         .as_secs();
     
+    // FIX R20-M2: Mask peer IPs for external callers to prevent network topology mapping
+    let caller_ip = remote_addr
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let caller_is_internal = is_internal_ip(&caller_ip);
+
     let peer_nodes: Vec<Value> = peers.iter().map(|peer| {
         let real_reputation = rep_guard.get_reputation(&peer.id, current_time);
-        json!({
-            "node_id": peer.id,
-            "address": peer.address,
-            "api_port": 8001,
-            "node_type": peer.node_type,
-            "region": peer.region,
-            "last_seen": peer.last_seen,
-            "reputation": real_reputation, // v3.19: From blockchain!
-            "api_endpoint": format!("http://{}:8001/api/v1/", peer.address)
-        })
+        if caller_is_internal {
+            // Internal nodes: full peer info for P2P synchronization
+            json!({
+                "node_id": peer.id,
+                "address": peer.address,
+                "api_port": 8001,
+                "node_type": peer.node_type,
+                "region": peer.region,
+                "last_seen": peer.last_seen,
+                "reputation": real_reputation,
+                "api_endpoint": format!("http://{}:8001/api/v1/", peer.address)
+            })
+        } else {
+            // External callers: no IP/address exposure, only public metadata
+            json!({
+                "node_id": peer.id,
+                "node_type": peer.node_type,
+                "region": peer.region,
+                "reputation": real_reputation
+            })
+        }
     }).collect();
     
-    let response = json!({
-        "current_node": {
+    // FIX R20-M2: Mask current node IP for external callers
+    let current_node_info = if caller_is_internal {
+        json!({
             "node_id": blockchain.get_public_display_name(),
             "node_type": format!("{:?}", blockchain.get_node_type()),
             "region": format!("{:?}", blockchain.get_region()),
             "api_endpoint": format!("http://{}:8001/api/v1/",
                 std::env::var("QNET_PUBLIC_IP").unwrap_or_else(|_| "0.0.0.0".to_string()))
-        },
+        })
+    } else {
+        json!({
+            "node_id": blockchain.get_public_display_name(),
+            "node_type": format!("{:?}", blockchain.get_node_type()),
+            "region": format!("{:?}", blockchain.get_region())
+        })
+    };
+
+    let response = json!({
+        "current_node": current_node_info,
         "available_nodes": peer_nodes,
         "total_nodes": peer_nodes.len() + 1,
         "network_status": "healthy"
@@ -5196,8 +5580,13 @@ async fn handle_node_discovery(
 }
 
 async fn handle_node_health(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // FIX M13: Rate limit node health
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
     let height = blockchain.get_height().await;
     let peer_count = blockchain.get_peer_count().await.unwrap_or(0);
     let mempool_size = blockchain.get_mempool_size().await.unwrap_or(0);
@@ -5282,8 +5671,13 @@ async fn handle_node_health(
 }
 
 async fn handle_gas_recommendations(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // FIX M13: Rate limit gas recommendations
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
     // PRODUCTION: Calculate real gas recommendations based on mempool and network state
     let mempool_size = blockchain.get_mempool_size().await.unwrap_or(0);
     let current_height = blockchain.get_height().await;
@@ -5357,8 +5751,13 @@ async fn handle_gas_recommendations(
 
 async fn handle_network_ping(
     ping_request: Value,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // FIX M13: Rate limit ping (write category — triggers signing)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "write") {
+        return Ok(rate_limit_response);
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     
     let start_time = SystemTime::now();
@@ -5430,10 +5829,9 @@ async fn verify_ed25519_client_signature(
 ) -> bool {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     
-    // v2.66: Detailed logging for debugging signature issues
-    println!("[CRYPTO] Ed25519 verify for context={}", context);
-    println!("[CRYPTO]   message={}", message);
-    println!("[CRYPTO]   sig_len={} pubkey_len={}", signature_hex.len(), public_key_hex.len());
+    // v2.66: Concise crypto logging (message content redacted for security)
+    println!("[DBG][CRYPTO] ed25519_verify context={} msg_len={} sig_len={} pk_len={}",
+             context, message.len(), signature_hex.len(), public_key_hex.len());
     
     // Basic validation
     if signature_hex.len() != 128 {  // 64 bytes = 128 hex chars
@@ -5495,13 +5893,11 @@ async fn verify_ed25519_client_signature(
     // Verify signature
     match verifying_key.verify(message_bytes, &signature) {
         Ok(_) => {
-            println!("[CRYPTO] ✅ Ed25519 signature verified (msg: {}...)", 
-                    &message[..20.min(message.len())]);
+            println!("[DBG][CRYPTO] ed25519_verified context={} msg_len={}", context, message.len());
             true
         }
         Err(e) => {
-            println!("[CRYPTO] ❌ Ed25519 signature verification failed: {}", e);
-            println!("[CRYPTO]    Message was: {}", message);
+            println!("[WARN][CRYPTO] ed25519_verify_failed context={} err={} msg_len={}", context, e, message.len());
             false
         }
     }
@@ -5922,7 +6318,7 @@ async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
 }
 
 // PRODUCTION: Light Node Registry (persistent storage with in-memory cache)
-use std::sync::Mutex;
+use parking_lot::Mutex as ParkingMutex;
 
 
 // Import lazy rewards system
@@ -5944,12 +6340,12 @@ lazy_static::lazy_static! {
     /// The P2P registry (unified_p2p::light_node_registry) is the authoritative in-memory
     /// registry for light node liveness/connectivity, synchronized via gossip + restored from
     /// RocksDB on startup (v4.3). This Mutex cache manages per-device state only.
-    static ref LIGHT_NODE_REGISTRY: Mutex<HashMap<String, LightNodeInfo>> = Mutex::new(HashMap::new());
-    
+    static ref LIGHT_NODE_REGISTRY: ParkingMutex<HashMap<String, LightNodeInfo>> = ParkingMutex::new(HashMap::new());
+
     /// Pending challenges for polling-based Light nodes
     /// Key: node_id, Value: PendingChallenge
     /// Cleaned up automatically when challenge expires or is answered
-    static ref PENDING_CHALLENGES: Mutex<HashMap<String, PendingChallenge>> = Mutex::new(HashMap::new());
+    static ref PENDING_CHALLENGES: ParkingMutex<HashMap<String, PendingChallenge>> = ParkingMutex::new(HashMap::new());
     
     /// TEMPORARY IN-MEMORY CACHE for activation codes (wallet → code mapping).
     /// NOT persisted across restarts. NOT replicated between nodes.
@@ -5977,8 +6373,20 @@ lazy_static::lazy_static! {
     static ref WALLET_REG_FAIL_TIMESTAMPS: dashmap::DashMap<String, Vec<u64>> =
         dashmap::DashMap::new();
 
+    // FIX R20-M1: Per-node claim lock to prevent double-claim race condition
+    // Key: node_id, Value: claim-in-progress timestamp (unix seconds)
+    // Two concurrent claims for same node_id will be serialized
+    static ref CLAIM_IN_PROGRESS: DashSet<String> =
+        DashSet::new();
+
     // REMOVED: REWARD_MANAGER was causing desync issues
     // Now using blockchain.get_reward_manager() everywhere for proper synchronization
+
+    /// v10.0: Bundle submitter IP tracking for cancel authorization
+    /// Key: bundle_id, Value: submitter IP address string
+    /// Cleaned up when bundles expire (checked during cancel)
+    static ref BUNDLE_SUBMITTER_IPS: dashmap::DashMap<String, String> =
+        dashmap::DashMap::new();
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -6122,7 +6530,7 @@ async fn handle_internal_fcm_token_sync(
         Err(e) => {
             println!("[WARN][LIGHT] fcm_token_sync_save_failed pseudonym={} err={}", req.pseudonym, e);
             Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({"success": false, "error": e.to_string()})),
+                warp::reply::json(&serde_json::json!({"success": false, "error": "internal error"})),
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             ))
         }
@@ -6363,7 +6771,7 @@ async fn handle_light_node_register(
             "success": false,
             "error": "Invalid QNet EON wallet address",
             "details": e,
-            "hint": "Wallet address must be in EON format: {19 hex}eon{15 hex}{4 checksum} = 41 chars"
+            "hint": "Wallet address must be in EON format: {19 hex}eon{15 hex}{8 checksum} = 45 chars"
         })));
     }
 
@@ -6395,10 +6803,7 @@ async fn handle_light_node_register(
         // network has already gossipped the registration. Prevents duplicate registrations
         // when the requesting node is unsynced (e.g. after a data wipe + restart).
         {
-            let registry = match LIGHT_NODE_REGISTRY.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let registry = LIGHT_NODE_REGISTRY.lock();
             if registry.contains_key(&pseudonym) {
                 let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&pseudonym);
                 println!("[INFO][LIGHT] registration_rejected reason=already_in_gossip_registry pseudonym={}", pseudonym);
@@ -6783,10 +7188,7 @@ async fn handle_light_node_register(
     
     // Register Light node or add device to existing node using pseudonym
     let registration_result = {
-        let mut registry = match LIGHT_NODE_REGISTRY.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut registry = LIGHT_NODE_REGISTRY.lock();
         
         if let Some(existing_node) = registry.get_mut(&light_node_pseudonym) {
             // Check device limit (max 3 devices per Light node)
@@ -6806,6 +7208,19 @@ async fn handle_light_node_register(
             existing_node.devices.push(new_device);
             "device_added"
         } else {
+            // v10.0 SCALABILITY: Bound registry to 100K entries; evict oldest if full
+            const MAX_LIGHT_NODE_REGISTRY: usize = 100_000;
+            if registry.len() >= MAX_LIGHT_NODE_REGISTRY {
+                // Evict the entry with the oldest last_ping
+                if let Some(oldest_key) = registry.iter()
+                    .min_by_key(|(_, v)| v.last_ping)
+                    .map(|(k, _)| k.clone())
+                {
+                    registry.remove(&oldest_key);
+                    println!("[INFO][RPC] light_node_registry_evicted oldest_node={} registry_size={}",
+                             &oldest_key[..16.min(oldest_key.len())], registry.len());
+                }
+            }
             // Create new Light node using privacy-preserving pseudonym
             let light_node = LightNodeInfo {
                 node_id: light_node_pseudonym.clone(),
@@ -6870,10 +7285,7 @@ async fn handle_light_node_register(
         
         // Get device token hash from local registry
         let device_token_hash = {
-            let registry = match LIGHT_NODE_REGISTRY.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let registry = LIGHT_NODE_REGISTRY.lock();
             registry.get(&light_node_pseudonym)
                 .and_then(|n| n.devices.first())
                 .map(|d| d.device_token_hash.clone())
@@ -6995,10 +7407,40 @@ async fn handle_light_node_register(
 }
 
 /// SECURE: Handle node info with activation code for authenticated wallet extensions
+/// v10.0: Auth via Authorization header preferred; query param is deprecated (backward compat)
 async fn handle_node_secure_info(
-    _params: HashMap<String, String>,
+    auth_header: Option<String>,
+    params: HashMap<String, String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // SECURITY: Require admin secret for sensitive node information
+    let admin_secret = std::env::var("QNET_ADMIN_SECRET").unwrap_or_default();
+    if !admin_secret.is_empty() {
+        // v10.0: Prefer Authorization header (Bearer <secret>)
+        let header_secret = auth_header.as_deref()
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .unwrap_or("");
+
+        // Backward compatibility: check query param but log deprecation warning
+        let query_secret = params.get("admin_secret").map(|s| s.as_str()).unwrap_or("");
+
+        let provided = if !header_secret.is_empty() {
+            header_secret
+        } else if !query_secret.is_empty() {
+            println!("[WARN][API] secure_info_deprecated_query_param ip=unknown reason=admin_secret_in_url_is_deprecated");
+            query_secret
+        } else {
+            ""
+        };
+
+        if provided != admin_secret {
+            if is_warn() {
+                println!("[WARN][API] secure_info_rejected reason=invalid_or_missing_admin_secret");
+            }
+            return Ok(warp::reply::json(&json!({"error": "unauthorized", "message": "Admin secret required. Use Authorization: Bearer <secret> header."})));
+        }
+    }
+
     // Get basic node info first
     let height = blockchain.get_height().await;
     let peer_count = blockchain.get_peer_count().await.unwrap_or(0);
@@ -7019,16 +7461,19 @@ async fn handle_node_secure_info(
         crate::node::Region::Oceania => "oceania",
     };
     
-    // SECURE: Try to get activation code from local storage (only for this node)
-    let activation_code = match std::env::var("QNET_ACTIVATION_CODE") {
+    // SECURE: Activation code is no longer exposed via API
+    let _activation_code_exists = match std::env::var("QNET_ACTIVATION_CODE") {
         Ok(code) if !code.is_empty() => {
-            // SECURITY: Mask the code for logs but return full code for wallet
-            println!("🔐 Secure info request: returning activation code {}...", &code[..8.min(code.len())]);
-            Some(code)
+            if is_info() {
+                println!("[INFO][API] secure_info_request activation_code=present");
+            }
+            true
         }
         _ => {
-            println!("⚠️  Secure info request: no activation code available");
-            None
+            if is_info() {
+                println!("[INFO][API] secure_info_request activation_code=absent");
+            }
+            false
         }
     };
     
@@ -7058,7 +7503,8 @@ async fn handle_node_secure_info(
         "node_type": node_type,
         "region": region,
         "status": "active",
-        "activation_code": activation_code,
+        // SECURITY: Don't expose activation code via API
+        "activation_code": null,
         "uptime": current_time,
         "pending_rewards": pending_rewards,
         "last_seen": current_time
@@ -7068,7 +7514,10 @@ async fn handle_node_secure_info(
 }
 
 // Handler for Shred Protocol metrics
-async fn handle_shred_protocol_metrics(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+async fn handle_shred_protocol_metrics(remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
     // PRODUCTION: Get real-time Shred Protocol metrics from P2P network
     let (fanout, producers, latency) = if let Some(unified_p2p) = blockchain.get_unified_p2p() {
         let fanout = unified_p2p.get_shred_protocol_fanout();
@@ -7096,7 +7545,10 @@ async fn handle_shred_protocol_metrics(blockchain: Arc<BlockchainNode>) -> Resul
 }
 
 // Handler for Quantum VTS status
-async fn handle_poh_status(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+async fn handle_poh_status(remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
     // CRITICAL FIX: Get real hash rate from PoH instance
     let (enabled, hash_rate_str, status) = if let Some(poh) = blockchain.get_quantum_poh() {
         let hash_rate = poh.get_performance().await;
@@ -7123,7 +7575,10 @@ async fn handle_poh_status(blockchain: Arc<BlockchainNode>) -> Result<impl warp:
 }
 
 // Handler for Parallel Executor metrics
-async fn handle_parallel_executor_metrics(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+async fn handle_parallel_executor_metrics(remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
     let metrics = json!({
         "enabled": blockchain.get_parallel_executor().is_some(),
         "pipeline_stages": 5,
@@ -7136,7 +7591,10 @@ async fn handle_parallel_executor_metrics(blockchain: Arc<BlockchainNode>) -> Re
 }
 
 // Handler for Pre-execution status
-async fn handle_pre_execution_status(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+async fn handle_pre_execution_status(remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
     let metrics = blockchain.get_pre_execution().get_metrics().await;
     
     let status = json!({
@@ -7155,7 +7613,10 @@ async fn handle_pre_execution_status(blockchain: Arc<BlockchainNode>) -> Result<
 }
 
 // Handler for Adaptive BFT timeouts
-async fn handle_adaptive_bft_timeouts(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+async fn handle_adaptive_bft_timeouts(remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
     let current_height = blockchain.get_height().await;
     
     let timeout_block_1 = blockchain.get_adaptive_bft().get_timeout(1, 0).await;
@@ -7337,10 +7798,7 @@ async fn handle_light_node_ping_response(
             } else {
                 // Level 2: Local device cache (populated on direct API calls only)
                 let from_local = {
-            let registry = match LIGHT_NODE_REGISTRY.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let registry = LIGHT_NODE_REGISTRY.lock();
                     registry.get(&node_id)
                         .and_then(|n| n.devices.first().map(|d| d.wallet_address.clone()))
                 };
@@ -7355,14 +7813,14 @@ async fn handle_light_node_ping_response(
         };
         
         let wallet_addr = wallet_address.unwrap_or_else(|| {
-            // Generate proper EON address: {19}eon{15}{4 checksum} = 41 chars
+            // Generate proper EON address: {19}eon{15}{8 checksum} = 45 chars
             let hash = blake3::hash(node_id.as_bytes()).to_hex();
             let part1 = &hash[..19];
             let part2 = &hash[19..34];
             let checksum_input = format!("{}eon{}", part1, part2);
             let mut hasher = Sha3_256::new();
             hasher.update(checksum_input.as_bytes());
-            let checksum = hex::encode(&hasher.finalize()[..2]);
+            let checksum = hex::encode(&hasher.finalize()[..4]);
             format!("{}eon{}{}", part1, part2, checksum)
         });
         
@@ -7383,9 +7841,8 @@ async fn handle_light_node_ping_response(
     
     // Clear pending challenge if exists (for polling nodes)
     {
-        if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
-            challenges.remove(&node_id);
-        }
+        let mut challenges = PENDING_CHALLENGES.lock();
+        challenges.remove(&node_id);
     }
     
     Ok(warp::reply::json(&json!({
@@ -7480,10 +7937,7 @@ async fn handle_light_node_pending_challenge(
     
     // Check for pending challenge
     let pending = {
-        let mut challenges = match PENDING_CHALLENGES.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut challenges = PENDING_CHALLENGES.lock();
         
         // Clean up expired challenges
         challenges.retain(|_, c| c.expires_at > now);
@@ -7527,13 +7981,12 @@ async fn handle_light_node_pending_challenge(
                 
                 // Store pending challenge
                 {
-                    if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
-                        challenges.insert(node_id.clone(), PendingChallenge {
-                            challenge: challenge.clone(),
-                            created_at: now,
-                            expires_at,
-                        });
-                    }
+                    let mut challenges = PENDING_CHALLENGES.lock();
+                    challenges.insert(node_id.clone(), PendingChallenge {
+                        challenge: challenge.clone(),
+                        created_at: now,
+                        expires_at,
+                    });
                 }
                 
                 println!("[POLLING] 🎯 Generated challenge for {} (polling mode)", node_id);
@@ -7861,7 +8314,7 @@ async fn handle_server_node_status(
                     .filter(|(id, _, _)| id == found_id)
                     .collect();
                 
-                let heartbeat_count = node_heartbeats.len() as u8;
+                let heartbeat_count = node_heartbeats.len().min(255) as u8;
                 
                 // Determine required heartbeats based on node type (case-insensitive)
                 // v3.18: Only Super nodes (Full removed)
@@ -8551,12 +9004,24 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_secs();
-                                        if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
-                                            challenges.insert(light_node.node_id.clone(), PendingChallenge {
-                                                challenge: challenge.clone(),
-                                                created_at: now,
-                                                expires_at: now + 180,
-                                            });
+                                        {
+                                            let mut challenges = PENDING_CHALLENGES.lock();
+                                            // v10.0: Bound PENDING_CHALLENGES to 10K; cleanup expired before insert
+                                            const MAX_PENDING_CHALLENGES: usize = 10_000;
+                                            if challenges.len() >= MAX_PENDING_CHALLENGES {
+                                                challenges.retain(|_, c| c.expires_at > now);
+                                                // If still full after cleanup, skip insert
+                                                if challenges.len() >= MAX_PENDING_CHALLENGES {
+                                                    println!("[WARN][RPC] pending_challenges_full size={}", challenges.len());
+                                                }
+                                            }
+                                            if challenges.len() < MAX_PENDING_CHALLENGES {
+                                                challenges.insert(light_node.node_id.clone(), PendingChallenge {
+                                                    challenge: challenge.clone(),
+                                                    created_at: now,
+                                                    expires_at: now + 180,
+                                                });
+                                            }
                                         }
                                         if crate::node::is_debug() {
                                             println!("[DBG][LIGHT] fcm_token_missing role={} node={} action=polling_fallback",
@@ -8619,7 +9084,13 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                         .as_secs();
                                     
                                     {
-                                        if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
+                                        let mut challenges = PENDING_CHALLENGES.lock();
+                                        // v10.0: Bound PENDING_CHALLENGES to 10K
+                                        const MAX_PENDING_CHALLENGES: usize = 10_000;
+                                        if challenges.len() >= MAX_PENDING_CHALLENGES {
+                                            challenges.retain(|_, c| c.expires_at > now);
+                                        }
+                                        if challenges.len() < MAX_PENDING_CHALLENGES {
                                             challenges.insert(light_node.node_id.clone(), PendingChallenge {
                                                 challenge: challenge.clone(),
                                                 created_at: now,
@@ -8627,8 +9098,8 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                             });
                                         }
                                     }
-                                    
-                                    println!("[LIGHT] 📥 {} stored challenge for {} slot {} (polling mode)", 
+
+                                    println!("[INFO][LIGHT] challenge_stored role={} node={} slot={}",
                                              role_str, light_node.node_id, current_slot);
                                 }
                             }
@@ -8768,10 +9239,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             
             // Clean up inactive devices from all Light nodes
             {
-                let mut registry = match LIGHT_NODE_REGISTRY.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
+                let mut registry = LIGHT_NODE_REGISTRY.lock();
                 
                 for (node_id, light_node) in registry.iter_mut() {
                     let devices_before = light_node.devices.len();
@@ -8856,7 +9324,7 @@ async fn handle_claim_rewards(
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "Invalid Genesis wallet address format",
-                "details": "Expected format: {19}eon{19} (legacy) or {19}eon{15}{4 checksum} (new)"
+                "details": "Expected format: {19}eon{19} (legacy) or {19}eon{15}{8 checksum} (new)"
             })));
         }
     } else {
@@ -8970,24 +9438,36 @@ async fn handle_claim_rewards(
         }
     };
     
+    // FIX R20-M1: Per-node claim lock — prevent double-claim race condition
+    // If another request for the same node_id is already in progress, reject immediately
+    if !CLAIM_IN_PROGRESS.insert(claim_request.node_id.clone()) {
+        println!("[WARN][CLAIM] concurrent_claim_blocked node={}", claim_request.node_id);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Claim already in progress for this node. Please wait and retry."
+        })));
+    }
+    // RAII guard: remove from CLAIM_IN_PROGRESS on ANY exit (success, error, early return)
+    struct ClaimGuard(String);
+    impl Drop for ClaimGuard {
+        fn drop(&mut self) { CLAIM_IN_PROGRESS.remove(&self.0); }
+    }
+    let _claim_guard = ClaimGuard(claim_request.node_id.clone());
+
     // v2.96: CRITICAL SECURITY FIX - Check pending rewards from BLOCKCHAIN (not memory/RocksDB)!
     // This is the ONLY source of truth that all nodes agree on
     let reward_amount = {
-        // Use wallet_address from previous check (already verified with fallback for Genesis)
-        // No need to call load_node_registration again - we already have verified wallet!
-        
-        // Read pending_rewards from blockchain state
         let state = blockchain.get_state_manager();
         let state_guard = state.read().await;
         let amount = (*state_guard).get_pending_rewards(&wallet_address);
-        
+
         if amount == 0 {
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "No pending rewards available"
             })));
         }
-        
+
         amount
     };
     
@@ -9021,8 +9501,9 @@ async fn handle_claim_rewards(
         // v2.70: Pass through Dilithium signature if provided (quantum-safe claim)
         dilithium_signature: claim_request.dilithium_signature.clone(),
         dilithium_public_key: claim_request.dilithium_public_key.clone(),
+        chain_id: 0,
     };
-    
+
     // v2.90: CRITICAL - Calculate BLAKE3 hash BEFORE submit!
     // ARCHITECTURE: submit_transaction() calls tx.validate() FIRST (line 16789)
     // tx.validate() checks: self.hash != self.calculate_hash() (line 431)
@@ -9436,7 +9917,7 @@ async fn handle_get_reward_pools(
     let (accumulated_pool2, accumulated_pool3) = {
         // Check cache and extract values in one lock scope
         let cached_values = {
-            let cache = REWARD_POOLS_CACHE.read().unwrap();
+            let cache = REWARD_POOLS_CACHE.read();
             if cache.1.elapsed().as_secs() < REWARD_POOLS_CACHE_TTL_SECS && cache.0.epoch == current_epoch {
                 Some((cache.0.pool2_fees, cache.0.pool3_activations))
             } else {
@@ -9455,7 +9936,7 @@ async fn handle_get_reward_pools(
             };
             
             // Update cache
-            let mut cache = REWARD_POOLS_CACHE.write().unwrap();
+            let mut cache = REWARD_POOLS_CACHE.write();
             cache.0 = RewardPoolsCache {
                 pool2_fees: p2,
                 pool3_activations: p3,
@@ -9771,7 +10252,7 @@ async fn handle_get_reward_network_stats(
     
     // Check cache first (30 sec TTL)
     {
-        let cache = REWARD_NETWORK_STATS_CACHE.read().unwrap();
+        let cache = REWARD_NETWORK_STATS_CACHE.read();
         if cache.1.elapsed().as_secs() < REWARD_NETWORK_STATS_CACHE_TTL_SECS {
             return Ok(warp::reply::json(&cache.0));
         }
@@ -9854,7 +10335,7 @@ async fn handle_get_reward_network_stats(
     
     // Update cache
     {
-        let mut cache = REWARD_NETWORK_STATS_CACHE.write().unwrap();
+        let mut cache = REWARD_NETWORK_STATS_CACHE.write();
         *cache = (stats.clone(), std::time::Instant::now());
     }
     
@@ -10001,6 +10482,14 @@ async fn handle_get_reward_summary(
         "cache_ttl_seconds": REWARD_SUMMARY_CACHE_TTL_SECS
     });
     
+    // SCALABILITY: Bound cache size
+    const MAX_REWARD_SUMMARY_CACHE: usize = 5000;
+    if REWARD_SUMMARY_CACHE.len() > MAX_REWARD_SUMMARY_CACHE {
+        // Evict expired entries (TTL = 60s)
+        REWARD_SUMMARY_CACHE.retain(|_, (_, ts)| ts.elapsed().as_secs() < 60);
+        println!("[INFO][RPC] reward_summary_cache_cleanup remaining={}", REWARD_SUMMARY_CACHE.len());
+    }
+
     // Update cache
     REWARD_SUMMARY_CACHE.insert(node_id, (summary.clone(), std::time::Instant::now()));
     
@@ -10074,6 +10563,15 @@ async fn handle_register_node(
     remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // SCALABILITY: Periodic cleanup of stale migration timestamps (>24h old)
+    {
+        let now = crate::node::get_timestamp_safe();
+        const MIGRATION_TTL_SECS: u64 = 86400; // 24 hours
+        if SUPER_NODE_MIGRATION_TIMESTAMPS.len() > 100 {
+            SUPER_NODE_MIGRATION_TIMESTAMPS.retain(|_, ts| now.saturating_sub(*ts) < MIGRATION_TTL_SECS);
+        }
+    }
+
     // SECURITY v6.1: IP rate limit
     if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "register_node") {
         return Ok(rate_limit_response);
@@ -10537,10 +11035,17 @@ async fn handle_register_node(
         
     if node_type == "light" {
         // Light node: store locally and gossip
-        let mut registry = match LIGHT_NODE_REGISTRY.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut registry = LIGHT_NODE_REGISTRY.lock();
+        // v10.0 SCALABILITY: Bound registry to 100K entries
+        const MAX_LIGHT_NODE_REGISTRY: usize = 100_000;
+        if registry.len() >= MAX_LIGHT_NODE_REGISTRY && !registry.contains_key(&node_id) {
+            if let Some(oldest_key) = registry.iter()
+                .min_by_key(|(_, v)| v.last_ping)
+                .map(|(k, _)| k.clone())
+            {
+                registry.remove(&oldest_key);
+            }
+        }
         let light_node = LightNodeInfo {
             node_id: node_id.clone(),
             devices: vec![LightNodeDevice {
@@ -10730,8 +11235,13 @@ struct AuthChallengeResponse {
 
 async fn handle_auth_challenge(
     request: AuthChallengeRequest,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // FIX M13: Rate limit auth challenge (write category)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "write") {
+        return Ok(rate_limit_response);
+    }
     // Validate protocol version
     if request.protocol_version != "qnet-v1.0" {
         return Ok(warp::reply::json(&json!({
@@ -10816,9 +11326,14 @@ async fn handle_auth_challenge(
 /// The old server queries this endpoint on a genesis node every 30 seconds.
 /// If device_id differs → migration detected → graceful shutdown.
 async fn handle_node_device_check(
+    remote_addr: Option<std::net::SocketAddr>,
     query: HashMap<String, String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v10.0: Rate limit device check queries
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
     let node_id = match query.get("node_id") {
         Some(id) if !id.is_empty() => id.as_str(),
         _ => {
@@ -10860,8 +11375,13 @@ async fn handle_node_device_check(
 /// Security: only allows node_ids starting with "super_" and validates node exists in RocksDB.
 async fn handle_register_device(
     body: serde_json::Value,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // v10.0: Rate limit device registration
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "activation") {
+        return Ok(rate_limit_response);
+    }
     let node_id = match body["node_id"].as_str() {
         Some(id) if !id.is_empty() => id,
         _ => {
@@ -10899,9 +11419,11 @@ async fn handle_register_device(
                 node_type.eq_ignore_ascii_case("super")
             }
             _ => {
-                // Pre-registration: trust body.node_type for nodes not yet in storage
-                let body_type = body["node_type"].as_str().unwrap_or("");
-                body_type.eq_ignore_ascii_case("super")
+                // SECURITY: Reject device registration for nodes not found in storage
+                if is_warn() {
+                    println!("[WARN][DEVICE] register_rejected node={} reason=not_registered_in_storage", node_id);
+                }
+                false
             }
         }
     };
@@ -10935,10 +11457,24 @@ async fn handle_register_device(
 /// SECURITY v6.2: QNET_ADMIN_SECRET is MANDATORY — without it shutdown is DENIED
 async fn handle_graceful_shutdown(
     shutdown_request: Value,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
+    // FIX L-L7: Restrict shutdown to internal IPs + strict rate limiting
+    let ip_str = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    if !is_internal_ip(&ip_str) {
+        println!("[WARN][API] shutdown_rejected_external ip={}", ip_str);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Shutdown endpoint restricted to internal network"
+        })));
+    }
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
+        return Ok(rate_limit_response);
+    }
+
     // SECURITY v6.2: QNET_ADMIN_SECRET must be configured, otherwise shutdown is blocked entirely
     let admin_secret = match std::env::var("QNET_ADMIN_SECRET") {
         Ok(s) if !s.is_empty() => s,
@@ -11614,9 +12150,19 @@ struct ConsensusSyncRequest {
 /// Handle consensus commit from validator nodes
 async fn handle_consensus_commit(
     commit_request: ConsensusCommitRequest,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    println!("[CONSENSUS] 📝 Received commit from {} for round {}", 
+    // v10.0 SECURITY: Restrict to internal/known peers + rate limit
+    let ip_str = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    if !is_internal_ip(&ip_str) {
+        println!("[WARN][RPC] consensus_commit_rejected ip={} reason=external_ip", ip_str);
+        return Ok(warp::reply::json(&json!({"error": "unauthorized", "message": "Consensus endpoints are restricted to internal peers"})));
+    }
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "consensus") {
+        return Ok(rate_limit_response);
+    }
+    println!("[INFO][CONSENSUS] commit_received node={} round={}",
              commit_request.node_id, commit_request.round);
     
     // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)
@@ -11688,9 +12234,19 @@ async fn handle_consensus_commit(
 /// Handle consensus reveal from validator nodes
 async fn handle_consensus_reveal(
     reveal_request: ConsensusRevealRequest,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    println!("[CONSENSUS] 🔓 Received reveal from {} for round {}", 
+    // v10.0 SECURITY: Restrict to internal/known peers + rate limit
+    let ip_str = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    if !is_internal_ip(&ip_str) {
+        println!("[WARN][RPC] consensus_reveal_rejected ip={} reason=external_ip", ip_str);
+        return Ok(warp::reply::json(&json!({"error": "unauthorized", "message": "Consensus endpoints are restricted to internal peers"})));
+    }
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "consensus") {
+        return Ok(rate_limit_response);
+    }
+    println!("[INFO][CONSENSUS] reveal_received node={} round={}",
              reveal_request.node_id, reveal_request.round);
     
     // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)
@@ -11722,7 +12278,11 @@ async fn handle_consensus_reveal(
         let reveal = Reveal {
             node_id: reveal_request.node_id.clone(),
             reveal_data: hex::decode(&reveal_request.reveal_hash).unwrap_or_default(),
-            nonce: [0u8; 32], // PRODUCTION: Use proper nonce
+            nonce: {
+                let mut n = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut n);
+                n
+            },
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             signature: String::new(), // RPC external API - no signature
         };
@@ -11762,18 +12322,24 @@ async fn handle_consensus_reveal(
 }
 
 /// Handle consensus round status query
+/// FIX R20-H4: Internal-IP only for detailed consensus state (commits/reveals/node_id)
+/// External callers get only public round info (round number, phase, height)
 async fn handle_consensus_round_status(
     round: u64,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    println!("[CONSENSUS] 📊 Status request for round {}", round);
-    
-    // PRODUCTION: Query actual consensus state
+    let ip_str = remote_addr
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let is_internal = is_internal_ip(&ip_str);
+
+    println!("[INFO][CONSENSUS] round_status_request round={} ip={} internal={}", round, ip_str, is_internal);
+
     let consensus_status = {
         let consensus = blockchain.get_consensus();
         let consensus_engine = consensus.read().await;
 
-        // Get current round state from consensus engine
         match consensus_engine.get_round_status() {
             Some(round_state) => {
                 let phase_str = match round_state.phase {
@@ -11783,48 +12349,59 @@ async fn handle_consensus_round_status(
                     qnet_consensus::commit_reveal::ConsensusPhase::Production => "production",
                 };
 
-                json!({
-                    "round": round_state.round_number,
-                    "status": "in_progress",
-                    "phase": phase_str,
-                    "participants": round_state.participants.len(),
-                    "commits_received": round_state.commits.len(),
-                    "reveals_received": round_state.reveals.len(),
-                    "leader": "TBD", // Leader determined after consensus
-                    "macroblock_height": blockchain.get_height().await,
-                    "timestamp": round_state.phase_start.elapsed().as_secs(),
-                    "node_id": blockchain.get_node_id()
-                })
+                if is_internal {
+                    // Internal nodes: full consensus detail for synchronization
+                    json!({
+                        "round": round_state.round_number,
+                        "status": "in_progress",
+                        "phase": phase_str,
+                        "participants": round_state.participants.len(),
+                        "commits_received": round_state.commits.len(),
+                        "reveals_received": round_state.reveals.len(),
+                        "macroblock_height": blockchain.get_height().await,
+                        "timestamp": round_state.phase_start.elapsed().as_secs(),
+                        "node_id": blockchain.get_node_id()
+                    })
+                } else {
+                    // External callers: public info only (no commit/reveal counts, no node_id)
+                    json!({
+                        "round": round_state.round_number,
+                        "status": "in_progress",
+                        "phase": phase_str,
+                        "macroblock_height": blockchain.get_height().await
+                    })
+                }
             }
             None => {
-                // No active round
                 json!({
                     "round": round,
                     "status": "completed",
                     "phase": "finalized",
-                    "participants": 0,
-                    "commits_received": 0,
-                    "reveals_received": 0,
-                    "leader": "unknown",
-                    "macroblock_height": blockchain.get_height().await,
-                    "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                    "node_id": blockchain.get_node_id()
+                    "macroblock_height": blockchain.get_height().await
                 })
             }
         }
     };
 
-    let response = consensus_status;
-    
-    Ok(warp::reply::json(&response))
+    Ok(warp::reply::json(&consensus_status))
 }
 
 /// PRODUCTION: Handle consensus synchronization request with real consensus data
 async fn handle_consensus_sync(
     sync_request: ConsensusSyncRequest,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    println!("[CONSENSUS] 🔄 Sync request from {} for rounds {}-{:?}", 
+    // v10.0 SECURITY: Restrict to internal/known peers + rate limit
+    let ip_str = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    if !is_internal_ip(&ip_str) {
+        println!("[WARN][RPC] consensus_sync_rejected ip={} reason=external_ip", ip_str);
+        return Ok(warp::reply::json(&json!({"error": "unauthorized", "message": "Consensus endpoints are restricted to internal peers"})));
+    }
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "consensus") {
+        return Ok(rate_limit_response);
+    }
+    println!("[INFO][CONSENSUS] sync_request node={} from_round={} to_round={:?}",
              sync_request.node_id, sync_request.from_round, sync_request.to_round);
     
     let to_round = sync_request.to_round.unwrap_or(sync_request.from_round + 10);
@@ -11913,16 +12490,32 @@ async fn handle_p2p_message(
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use crate::unified_p2p::NetworkMessage;
-    
+
+    // v10.0 SECURITY: Restrict to internal/known peers + rate limit
+    let ip_str = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    if !is_internal_ip(&ip_str) {
+        println!("[WARN][RPC] p2p_message_rejected ip={} reason=external_ip", ip_str);
+        return Ok(warp::reply::json(&json!({"error": "unauthorized", "message": "P2P endpoints are restricted to internal peers"})));
+    }
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "consensus") {
+        return Ok(rate_limit_response);
+    }
+
     // Parse the P2P message
     let message_result = serde_json::from_value::<NetworkMessage>(p2p_message);
     
     match message_result {
         Ok(message) => {
+            // SCALABILITY: Bound cache size, evict expired entries (>5min TTL)
+            const MAX_IP_CACHE_SIZE: usize = 10000;
+            if IP_TO_PSEUDONYM_CACHE.len() > MAX_IP_CACHE_SIZE {
+                IP_TO_PSEUDONYM_CACHE.retain(|_, (_, ts)| ts.elapsed().as_secs() < 300);
+            }
+
             // PRODUCTION: Extract peer IP using EXISTING pattern from peers endpoint
             let peer_addr = if let Some(addr) = remote_addr {
                 let raw_ip = addr.ip().to_string();
-                
+
                 // OPTIMIZATION: Check cache first for O(1) lookup
                 if let Some(cached) = IP_TO_PSEUDONYM_CACHE.get(&raw_ip) {
                     // Check TTL (5 minutes)
@@ -12128,8 +12721,8 @@ async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
         let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
         if let Err(e) = hybrid.initialize().await {
             // NO FALLBACK - hybrid crypto is mandatory
-            println!("[CRYPTO] ❌ FATAL: Hybrid crypto init failed: {}", e);
-            panic!("[FATAL] Cannot operate without hybrid quantum-resistant signatures!");
+            println!("[FATAL][CRYPTO] node_shutdown reason=hybrid_crypto_init_failed err={}", e);
+            std::process::exit(1);
         }
         instances_guard.insert(normalized_node_id.clone(), hybrid);
     }
@@ -12154,15 +12747,15 @@ async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
                     format!("compact_bin:{}", base64_data)  // Standard format for verification
                 }
                 Err(e) => {
-                    println!("[CRYPTO] ❌ FATAL: Failed to serialize hybrid signature: {}", e);
-                    panic!("[FATAL] Cannot serialize hybrid signature!");
+                    println!("[FATAL][CRYPTO] node_shutdown reason=hybrid_sig_serialize_failed err={}", e);
+                    std::process::exit(1);
                 }
             }
         }
         Err(e) => {
             // NO FALLBACK - hybrid crypto is mandatory
-            println!("[CRYPTO] ❌ FATAL: Hybrid signing failed: {:?}", e);
-            panic!("[FATAL] Cannot operate without hybrid quantum-resistant signatures!");
+            println!("[FATAL][CRYPTO] node_shutdown reason=hybrid_signing_failed err={:?}", e);
+            std::process::exit(1);
         }
     }
 }
@@ -12598,8 +13191,8 @@ async fn handle_stats(
 
 /// Cached public stats - updated every 10 minutes
 /// Safe to call frequently from website - same data for everyone
-static PUBLIC_STATS_CACHE: Lazy<std::sync::RwLock<(serde_json::Value, std::time::Instant)>> = 
-    Lazy::new(|| std::sync::RwLock::new((json!({}), std::time::Instant::now() - std::time::Duration::from_secs(600))));
+static PUBLIC_STATS_CACHE: Lazy<parking_lot::RwLock<(serde_json::Value, std::time::Instant)>> =
+    Lazy::new(|| parking_lot::RwLock::new((json!({}), std::time::Instant::now() - std::time::Duration::from_secs(600))));
 
 /// Handle public stats request (cached 10 minutes)
 /// GET /api/v1/public/stats
@@ -12616,7 +13209,7 @@ async fn handle_public_stats(
     
     // Check cache first
     {
-        let cache = match PUBLIC_STATS_CACHE.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let cache = PUBLIC_STATS_CACHE.read();
         if cache.1.elapsed().as_secs() < CACHE_TTL_SECS {
             return Ok(warp::reply::json(&cache.0));
         }
@@ -12657,7 +13250,7 @@ async fn handle_public_stats(
     
     // Update cache
     {
-        let mut cache = match PUBLIC_STATS_CACHE.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut cache = PUBLIC_STATS_CACHE.write();
         *cache = (stats.clone(), std::time::Instant::now());
     }
     
@@ -12739,9 +13332,15 @@ async fn handle_activation_price(
 
 /// Handle failover history request
 async fn handle_failover_history(
+    remote_addr: Option<std::net::SocketAddr>,
     params: HashMap<String, String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // FIX R25-M1: rate limit + access control on failover history
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
+
     let limit = params.get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
@@ -13052,6 +13651,37 @@ async fn handle_node_reactivation_submit(
         })));
     }
 
+    // v10.0 SECURITY: Verify requester owns the node via IP or signature
+    // Only allow from internal/known IPs or if the node_id matches this node
+    let remote_ip_str = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    let is_local = is_internal_ip(&remote_ip_str);
+    let is_self_node = {
+        let self_node_id = blockchain.get_public_display_name();
+        req.node_id == self_node_id
+    };
+    if !is_local && !is_self_node {
+        // External request for a different node — require signature proof
+        let signature = req.signature.as_deref().unwrap_or("");
+        if signature.is_empty() {
+            println!("[WARN][RPC] reactivation_rejected node={} ip={} reason=signature_required",
+                     req.node_id, remote_ip_str);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Signature required for remote reactivation. Sign node_id + current_height with node's registered key."
+            })));
+        }
+        // Verify signature: message = "reactivate:{node_id}:{current_height}"
+        let reactivation_msg = format!("reactivate:{}:{}", req.node_id, req.current_height);
+        let pubkey = req.public_key.as_deref().unwrap_or("");
+        if pubkey.is_empty() || !verify_ed25519_client_signature("reactivation", &reactivation_msg, signature, pubkey).await {
+            println!("[WARN][RPC] reactivation_sig_failed node={} ip={}", req.node_id, remote_ip_str);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Invalid signature for reactivation"
+            })));
+        }
+    }
+
     if req.last_macroblock_hash.is_empty() || req.last_macroblock_hash.len() < 16 {
         return Ok(warp::reply::json(&json!({
             "success": false,
@@ -13166,8 +13796,12 @@ async fn handle_sync_status(
 
 /// Handle network diagnostics request (includes QUIC metrics)
 async fn handle_network_diagnostics(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
     let (peers, quic_stats) = if let Some(p2p) = blockchain.get_unified_p2p() {
         let peers = p2p.get_peer_count();
         let stats = p2p.get_quic_stats().await;
@@ -13228,8 +13862,12 @@ async fn handle_network_diagnostics(
 
 /// Handle block statistics request
 async fn handle_block_statistics(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
     let current_height = blockchain.get_height().await;
     let blocks_per_minute = 60; // 1 block per second
     let avg_block_time = 1.0; // seconds
@@ -13254,8 +13892,12 @@ async fn handle_block_statistics(
 
 /// Handle performance metrics request
 async fn handle_performance_metrics(
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
     // REAL-TIME: Get actual mempool size
     let mempool_size = blockchain.get_mempool_size().await
         .unwrap_or(0);
@@ -13294,9 +13936,13 @@ async fn handle_performance_metrics(
 
 /// Handle reputation history request
 async fn handle_reputation_history(
+    remote_addr: Option<std::net::SocketAddr>,
     params: HashMap<String, String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
     let node_id = params.get("node_id")
         .cloned()
         .unwrap_or_else(|| blockchain.get_node_id());
@@ -13533,10 +14179,11 @@ async fn handle_contract_deploy(
     let wasm_code = match base64::engine::general_purpose::STANDARD.decode(&request.code) {
         Ok(code) => code,
         Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=deploy_contract err={}", e);
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "Invalid base64-encoded contract code",
-                "details": e.to_string()
+                "details": "request failed"
             })));
         }
     };
@@ -13558,13 +14205,13 @@ async fn handle_contract_deploy(
         // Format as EON address
         let part1 = &hash[0..19];
         let part2 = &hash[19..34];
-        // Generate SHA-256 checksum for wallet compatibility
+        // Generate SHA3-256 checksum (4 bytes = 32-bit collision resistance)
         let checksum_input = format!("{}eon{}", part1, part2);
         use sha3::{Sha3_256, Digest};
-        let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..2]);
+        let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..4]);
         format!("{}eon{}{}", part1, part2, checksum)
     };
-    
+
     // Calculate code hash (SHA3-256 - NIST FIPS 202)
     let code_hash = {
         let mut hasher = Sha3_256::new();
@@ -14074,8 +14721,13 @@ async fn handle_contract_call(
 /// Handle contract info query
 async fn handle_contract_info(
     contract_address: String,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // FIX M13: Rate limit contract info
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
     // Validate contract address
     if let Err(e) = validate_eon_address_with_error(&contract_address) {
         return Ok(warp::reply::json(&json!({
@@ -14128,8 +14780,13 @@ async fn handle_contract_info(
 async fn handle_contract_state(
     contract_address: String,
     query: ContractStateQuery,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // FIX M13: Rate limit contract state
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
     // Validate contract address
     if let Err(e) = validate_eon_address_with_error(&contract_address) {
         return Ok(warp::reply::json(&json!({
@@ -14207,8 +14864,13 @@ async fn handle_contract_state(
 /// Handle gas estimation for contract operations
 async fn handle_contract_estimate_gas(
     request: Value,
+    remote_addr: Option<std::net::SocketAddr>,
     _blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // FIX M13: Rate limit gas estimation (write category)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "write") {
+        return Ok(rate_limit_response);
+    }
     let operation = request.get("operation")
         .and_then(|v| v.as_str())
         .unwrap_or("call");
@@ -14266,6 +14928,7 @@ async fn handle_contract_estimate_gas(
 fn parse_ws_channels(channels_str: &str) -> Vec<WsChannel> {
     channels_str
         .split(',')
+        .take(50) // SCALABILITY: Max 50 channels per WS connection
         .filter_map(|ch| {
             let ch = ch.trim();
             if ch == "blocks" {
@@ -14483,11 +15146,11 @@ async fn handle_ws_connection_with_cleanup(
     let blockchain_for_ws = blockchain.clone();
     let ws_tx_for_rpc = ws_tx.clone();
     tokio::spawn(async move {
-        let mut rpc_request_count: u32 = 0;
-        let mut rpc_window_start = std::time::Instant::now();
-        const RPC_RATE_LIMIT: u32 = 100; // Max 100 RPC requests per minute
-        const RPC_WINDOW_SECS: u64 = 60;
-        
+        // SECURITY: Sliding window rate limit — prevents boundary burst exploit
+        let mut rpc_timestamps: std::collections::VecDeque<std::time::Instant> = std::collections::VecDeque::new();
+        const RPC_RATE_LIMIT: usize = 100;
+        const RPC_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
         while let Some(result) = ws_rx.next().await {
             match result {
                 Ok(msg) => {
@@ -14497,22 +15160,29 @@ async fn handle_ws_connection_with_cleanup(
                     }
                     if msg.is_text() {
                         if let Ok(text) = msg.to_str() {
+                            // SECURITY: Reject oversized WebSocket messages (max 64KB)
+                            if text.len() > 65536 {
+                                if is_warn() {
+                                    println!("[WARN][WS] message_too_large size={} max=65536", text.len());
+                                }
+                                continue;
+                            }
                             // Try to parse as JSON-RPC request
                             if let Ok(rpc_req) = serde_json::from_str::<serde_json::Value>(text) {
                                 if rpc_req.get("jsonrpc").is_some() && rpc_req.get("method").is_some() {
-                                    // SECURITY: Check rate limit
-                                    if rpc_window_start.elapsed().as_secs() >= RPC_WINDOW_SECS {
-                                        rpc_request_count = 0;
-                                        rpc_window_start = std::time::Instant::now();
+                                    // SECURITY: Sliding window rate limit check
+                                    let now = std::time::Instant::now();
+                                    while rpc_timestamps.front().map_or(false, |&t| now.duration_since(t) > RPC_WINDOW) {
+                                        rpc_timestamps.pop_front();
                                     }
-                                    rpc_request_count += 1;
-                                    
+
                                     let id = rpc_req["id"].as_u64().unwrap_or(0);
-                                    
-                                    if rpc_request_count > RPC_RATE_LIMIT {
+
+                                    if rpc_timestamps.len() >= RPC_RATE_LIMIT {
+                                        println!("[WARN][WS] rpc_rate_limited count={}", rpc_timestamps.len());
                                         let error_resp = json!({
-                                            "jsonrpc": "2.0", 
-                                            "id": id, 
+                                            "jsonrpc": "2.0",
+                                            "id": id,
                                             "error": {"code": -32029, "message": "Rate limit exceeded (100 req/min)"}
                                         });
                                         if let Ok(s) = serde_json::to_string(&error_resp) {
@@ -14520,6 +15190,7 @@ async fn handle_ws_connection_with_cleanup(
                                         }
                                         continue;
                                     }
+                                    rpc_timestamps.push_back(now);
                                     
                                     // Handle JSON-RPC via WebSocket
                                     let method = rpc_req["method"].as_str().unwrap_or("");
@@ -14761,10 +15432,10 @@ async fn handle_token_deploy(
         let part1 = &hash[0..19];
         let part2 = &hash[19..34];
         use sha3::{Sha3_256, Digest};
-        let checksum = hex::encode(&Sha3_256::digest(format!("{}eon{}", part1, part2).as_bytes())[..2]);
+        let checksum = hex::encode(&Sha3_256::digest(format!("{}eon{}", part1, part2).as_bytes())[..4]);
         format!("{}eon{}{}", part1, part2, checksum)
     };
-    
+
     // v3.40: Code hash for QRC-20 standard (deterministic from token params)
     let code_hash = {
         let mut hasher = Sha3_256::new();
@@ -14802,8 +15473,9 @@ async fn handle_token_deploy(
         })).unwrap_or_default()),
         dilithium_signature: Some(request.dilithium_signature.clone()),
         dilithium_public_key: Some(request.dilithium_public_key.clone()),
+        chain_id: 0,
     };
-    
+
     // Calculate hash BEFORE submit (same as all other TX handlers)
     tx.hash = tx.calculate_hash();
     let tx_hash = tx.hash.clone();
@@ -15005,28 +15677,49 @@ struct BenchmarkStartRequest {
     num_accounts: Option<usize>,
     /// Enable hybrid signing: Ed25519 + Dilithium3 (ML-DSA-65).
     /// Each TX is double-signed — real post-quantum throughput measurement.
-    /// Note: Dilithium3 is ~50× slower than Ed25519; expect ~1-2K TPS per core.
+    /// Note: Dilithium3 is ~50x slower than Ed25519; expect ~1-2K TPS per core.
     #[serde(default)]
     use_hybrid: Option<bool>,
+    /// v10.0: Authentication secret (must match QNET_BENCHMARK_SECRET env var)
+    #[serde(default)]
+    secret: Option<String>,
 }
 
 /// Handle POST /api/v1/benchmark/start
 /// SECURITY: Only Genesis/Bootstrap nodes can run benchmarks
 async fn handle_benchmark_start(
     request: BenchmarkStartRequest,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use crate::benchmark::{BENCHMARK_MANAGER, BenchmarkConfig};
-    
-    // SECURITY: Only allow benchmark on Genesis/Bootstrap nodes
+
+    // v10.0: Rate limit benchmark start
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
+        return Ok(rate_limit_response);
+    }
+
+    // SECURITY: Only allow benchmark on Genesis/Bootstrap nodes or with valid secret
     let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
     let benchmark_secret = std::env::var("QNET_BENCHMARK_SECRET").ok();
-    
+
     if !is_genesis_node && benchmark_secret.is_none() {
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "Benchmark only available on Genesis nodes or with QNET_BENCHMARK_SECRET"
         })));
+    }
+
+    // v10.0: Validate the secret value, not just its existence
+    if let Some(expected_secret) = &benchmark_secret {
+        let provided_secret = request.secret.as_deref().unwrap_or("");
+        if provided_secret != expected_secret.as_str() {
+            println!("[WARN][RPC] benchmark_auth_failed reason=invalid_secret");
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "unauthorized"
+            })));
+        }
     }
     
     // Build config from preset or custom values
@@ -15742,10 +16435,16 @@ async fn run_progressive_benchmark(
     println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 
-/// Handle GET /api/v1/benchmark/status
-async fn handle_benchmark_status() -> Result<impl Reply, Rejection> {
+/// Handle GET /api/v1/benchmark/status (v10.0: rate-limited)
+async fn handle_benchmark_status(
+    remote_addr: Option<std::net::SocketAddr>,
+) -> Result<impl Reply, Rejection> {
     use crate::benchmark::BENCHMARK_MANAGER;
-    
+
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
+        return Ok(rate_limit_response);
+    }
+
     let status = BENCHMARK_MANAGER.get_status().await;
     
     Ok(warp::reply::json(&json!({
@@ -15762,10 +16461,16 @@ async fn handle_benchmark_status() -> Result<impl Reply, Rejection> {
     })))
 }
 
-/// Handle GET /api/v1/benchmark/results
-async fn handle_benchmark_results() -> Result<impl Reply, Rejection> {
+/// Handle GET /api/v1/benchmark/results (v10.0: rate-limited)
+async fn handle_benchmark_results(
+    remote_addr: Option<std::net::SocketAddr>,
+) -> Result<impl Reply, Rejection> {
     use crate::benchmark::BENCHMARK_MANAGER;
-    
+
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
+        return Ok(rate_limit_response);
+    }
+
     let results = BENCHMARK_MANAGER.get_results().await;
     
     Ok(warp::reply::json(&json!({
@@ -15786,10 +16491,26 @@ async fn handle_benchmark_results() -> Result<impl Reply, Rejection> {
     })))
 }
 
-/// Handle POST /api/v1/benchmark/stop
-async fn handle_benchmark_stop() -> Result<impl Reply, Rejection> {
+/// Handle POST /api/v1/benchmark/stop (v10.0: auth + rate-limited)
+async fn handle_benchmark_stop(
+    remote_addr: Option<std::net::SocketAddr>,
+) -> Result<impl Reply, Rejection> {
     use crate::benchmark::BENCHMARK_MANAGER;
-    
+
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
+        return Ok(rate_limit_response);
+    }
+    // v10.0: Require QNET_BENCHMARK_SECRET for stop (same as start)
+    if let Some(_expected_secret) = std::env::var("QNET_BENCHMARK_SECRET").ok() {
+        // Stop requires auth but has no body — only allow from genesis nodes or internal IPs
+        let ip_str = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        if !is_genesis && !is_internal_ip(&ip_str) {
+            println!("[WARN][RPC] benchmark_stop_rejected ip={} reason=unauthorized", ip_str);
+            return Ok(warp::reply::json(&json!({"success": false, "error": "unauthorized"})));
+        }
+    }
+
     BENCHMARK_MANAGER.stop().await;
     let results = BENCHMARK_MANAGER.get_results().await;
     
@@ -15805,8 +16526,13 @@ async fn handle_benchmark_stop() -> Result<impl Reply, Rejection> {
     })))
 }
 
-/// Handle GET /api/v1/benchmark/presets
-async fn handle_benchmark_presets() -> Result<impl Reply, Rejection> {
+/// Handle GET /api/v1/benchmark/presets (v10.0: rate-limited)
+async fn handle_benchmark_presets(
+    remote_addr: Option<std::net::SocketAddr>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
+        return Ok(rate_limit_response);
+    }
     Ok(warp::reply::json(&json!({
         "success": true,
         "presets": [

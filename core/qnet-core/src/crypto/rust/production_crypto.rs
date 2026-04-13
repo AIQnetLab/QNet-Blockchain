@@ -4,11 +4,13 @@
 //! for quantum-resistant signatures and key exchange.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use std::fmt;
 use thiserror::Error;
 use rand::RngCore;
 use sha3::{Sha3_256, Sha3_512, Digest};
+use parking_lot::{Mutex, RwLock};
 
 // Post-quantum cryptography imports with traits
 use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SecretKey as PQSecretKey, DetachedSignature as PQDetachedSignature, SignedMessage as PQSignedMessage};
@@ -103,12 +105,22 @@ pub struct SphincsParams {
 }
 
 /// Cached key for performance
-#[derive(Debug, Clone)]
+/// FIX H17: Removed Clone to prevent key material duplication; added Drop for zeroization
+#[derive(Debug)]
 pub struct CachedKey {
     pub key_data: Vec<u8>,
     pub key_type: String,
     pub created_at: u64,
     pub used_count: u64,
+}
+
+impl Drop for CachedKey {
+    fn drop(&mut self) {
+        for byte in self.key_data.iter_mut() {
+            unsafe { core::ptr::write_volatile(byte, 0u8); }
+        }
+        core::hint::black_box(&self.key_data);
+    }
 }
 
 /// Crypto performance metrics
@@ -164,21 +176,21 @@ impl fmt::Display for KeyType {
 
 /// Production post-quantum cryptography manager
 pub struct ProductionCrypto {
-    /// Key cache for performance
-    key_cache: std::sync::Arc<std::sync::RwLock<HashMap<String, CachedKey>>>,
+    /// Key cache for performance (parking_lot: no poisoning, faster uncontended)
+    key_cache: Arc<RwLock<HashMap<String, CachedKey>>>,
     /// Random number generator pool
-    rng_pool: std::sync::Arc<std::sync::Mutex<Vec<Box<dyn rand::RngCore + Send>>>>,
+    rng_pool: Arc<Mutex<Vec<Box<dyn rand::RngCore + Send>>>>,
     /// Performance metrics
-    metrics: std::sync::Arc<std::sync::RwLock<CryptoMetrics>>,
+    metrics: Arc<RwLock<CryptoMetrics>>,
 }
 
 impl ProductionCrypto {
     /// Initialize the production cryptography system
     pub fn new() -> Self {
         Self {
-            key_cache: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
-            rng_pool: std::sync::Arc::new(std::sync::Mutex::new(Self::initialize_rng_pool())),
-            metrics: std::sync::Arc::new(std::sync::RwLock::new(CryptoMetrics::default())),
+            key_cache: Arc::new(RwLock::new(HashMap::new())),
+            rng_pool: Arc::new(Mutex::new(Self::initialize_rng_pool())),
+            metrics: Arc::new(RwLock::new(CryptoMetrics::default())),
         }
     }
 
@@ -306,7 +318,10 @@ impl ProductionCrypto {
                 
                 match dilithium2::open(&signed_message, &public_key) {
                     Ok(recovered_message) => Ok(ct_eq_open(&recovered_message, message_hash)),
-                    Err(_) => Ok(false),
+                    Err(e) => {
+                        println!("[WARN][CRYPTO] dilithium_verify_failed level=2 error={:?}", e);
+                        Ok(false)
+                    }
                 }
             }
             DilithiumLevel::Level3 => {
@@ -326,7 +341,10 @@ impl ProductionCrypto {
                 
                 match dilithium3::open(&signed_message, &public_key) {
                     Ok(recovered_message) => Ok(ct_eq_open(&recovered_message, message_hash)),
-                    Err(_) => Ok(false),
+                    Err(e) => {
+                        println!("[WARN][CRYPTO] dilithium_verify_failed level=3 error={:?}", e);
+                        Ok(false)
+                    }
                 }
             }
             DilithiumLevel::Level5 => {
@@ -346,7 +364,10 @@ impl ProductionCrypto {
                 
                 match dilithium5::open(&signed_message, &public_key) {
                     Ok(recovered_message) => Ok(ct_eq_open(&recovered_message, message_hash)),
-                    Err(_) => Ok(false),
+                    Err(e) => {
+                        println!("[WARN][CRYPTO] dilithium_verify_failed level=5 error={:?}", e);
+                        Ok(false)
+                    }
                 }
             }
         };
@@ -525,26 +546,23 @@ impl ProductionCrypto {
     }
 
     /// Update metrics for key generation
-    fn update_metrics_for_key_generation(&self, duration_ms: f64) {
-        if let Ok(mut metrics) = self.metrics.write() {
-            metrics.keys_generated += 1;
-        }
+    fn update_metrics_for_key_generation(&self, _duration_ms: f64) {
+        let mut metrics = self.metrics.write();
+        metrics.keys_generated += 1;
     }
 
     /// Update metrics for signing
     fn update_metrics_for_signing(&self, duration_ms: f64) {
-        if let Ok(mut metrics) = self.metrics.write() {
-            metrics.signatures_generated += 1;
-            metrics.avg_sign_time_ms = (metrics.avg_sign_time_ms * (metrics.signatures_generated - 1) as f64 + duration_ms) / metrics.signatures_generated as f64;
-        }
+        let mut metrics = self.metrics.write();
+        metrics.signatures_generated += 1;
+        metrics.avg_sign_time_ms = (metrics.avg_sign_time_ms * (metrics.signatures_generated - 1) as f64 + duration_ms) / metrics.signatures_generated as f64;
     }
 
     /// Update metrics for verification
     fn update_metrics_for_verification(&self, duration_ms: f64) {
-        if let Ok(mut metrics) = self.metrics.write() {
-            metrics.signatures_verified += 1;
-            metrics.avg_verify_time_ms = (metrics.avg_verify_time_ms * (metrics.signatures_verified - 1) as f64 + duration_ms) / metrics.signatures_verified as f64;
-        }
+        let mut metrics = self.metrics.write();
+        metrics.signatures_verified += 1;
+        metrics.avg_verify_time_ms = (metrics.avg_verify_time_ms * (metrics.signatures_verified - 1) as f64 + duration_ms) / metrics.signatures_verified as f64;
     }
 
     /// Initialize RNG pool
@@ -554,10 +572,7 @@ impl ProductionCrypto {
 
     /// Get performance metrics
     pub fn get_metrics(&self) -> CryptoResult<CryptoMetrics> {
-        let metrics = self.metrics.read().map_err(|_| CryptoErrorWithKind {
-            kind: CryptoErrorKind::SerializationFailed,
-            message: "Failed to read metrics".to_string(),
-        })?;
+        let metrics = self.metrics.read();
         Ok(metrics.clone())
     }
 }

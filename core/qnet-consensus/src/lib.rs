@@ -65,7 +65,7 @@ pub fn initialize_consensus_with_batch_operations(
     let reward_integration_for_batch = RewardIntegrationManager::new();
     
     // Wrap in Arc<Mutex> for batch operations
-    let reward_integration_shared = std::sync::Arc::new(std::sync::Mutex::new(reward_integration_for_batch));
+    let reward_integration_shared = std::sync::Arc::new(parking_lot::Mutex::new(reward_integration_for_batch));
     
     // Initialize batch operations manager
     let batch_manager = BatchOperationsManager::new(reward_integration_shared);

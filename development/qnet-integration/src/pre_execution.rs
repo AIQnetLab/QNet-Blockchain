@@ -150,14 +150,14 @@ impl PreExecutionManager {
                     // Sender balance decreases
                     state_changes.insert(tx.from.clone(), StateChange {
                         account: tx.from.clone(),
-                        balance_delta: -(tx.amount as i64),
+                        balance_delta: -(tx.amount.min(i64::MAX as u64) as i64),
                         nonce_delta: 1,
                     });
                     
                     // Receiver balance increases
                     state_changes.insert(to.clone(), StateChange {
                         account: to.clone(),
-                        balance_delta: tx.amount as i64,
+                        balance_delta: tx.amount.min(i64::MAX as u64) as i64,
                         nonce_delta: 0,
                     });
                 },
@@ -191,19 +191,33 @@ impl PreExecutionManager {
         Ok(pre_executed)
     }
     
-    /// Get pre-executed transaction from cache
-    pub async fn get_pre_executed(&self, tx_hash: &str) -> Option<PreExecutedTx> {
+    /// Get pre-executed transaction from cache with staleness validation
+    ///
+    /// Entries older than MAX_CACHE_AGE_BLOCKS are discarded to prevent
+    /// stale state from being used in block production.
+    pub async fn get_pre_executed(&self, tx_hash: &str, current_height: u64) -> Option<PreExecutedTx> {
+        const MAX_CACHE_AGE_BLOCKS: u64 = 5;
+
         let cache = self.cache.read().await;
         let result = cache.get(tx_hash).cloned();
-        
+
         // Update metrics
         let mut metrics = self.metrics.write().await;
-        if result.is_some() {
-            metrics.cache_hits += 1;
-        } else {
-            metrics.cache_misses += 1;
+        match &result {
+            Some(entry) => {
+                let age = current_height.saturating_sub(entry.block_height);
+                if age > MAX_CACHE_AGE_BLOCKS {
+                    println!("[DEBUG][PRE-EXEC] cache_stale tx={} age_blocks={} max={}", tx_hash, age, MAX_CACHE_AGE_BLOCKS);
+                    metrics.cache_misses += 1;
+                    return None;
+                }
+                metrics.cache_hits += 1;
+            }
+            None => {
+                metrics.cache_misses += 1;
+            }
         }
-        
+
         result
     }
     

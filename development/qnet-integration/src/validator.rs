@@ -800,8 +800,15 @@ impl BlockValidator {
                 }
                 // System transaction from Genesis - no gas fees
             }
+            TransactionType::KeyRotation { node_id, .. } => {
+                // Key rotation validation - system operation similar to NodeRegistration
+                if node_id.is_empty() {
+                    return Err(IntegrationError::ValidationError("KeyRotation: node_id cannot be empty".to_string()));
+                }
+                // System transaction - no gas fees
+            }
         }
-        
+
         Ok(())
     }
     

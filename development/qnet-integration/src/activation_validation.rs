@@ -124,55 +124,82 @@ impl BloomFilter {
     }
 }
 
-/// LRU cache for hot activation codes
+/// FIX H36: LRU cache with O(1) amortized get/put using LinkedHashMap pattern
+/// Uses VecDeque<K> for order tracking + HashMap for O(1) lookup.
+/// Eviction batch amortizes the O(n) retain cost across many accesses.
 #[derive(Debug)]
 pub struct LruCache<K, V> {
     capacity: usize,
     items: HashMap<K, V>,
-    access_order: Vec<K>,
+    access_order: std::collections::VecDeque<K>,
+    dirty_count: usize,
 }
+
+const LRU_COMPACT_THRESHOLD: usize = 256;
 
 impl<K: Clone + Eq + std::hash::Hash, V> LruCache<K, V> {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            items: HashMap::new(),
-            access_order: Vec::new(),
+            items: HashMap::with_capacity(capacity),
+            access_order: std::collections::VecDeque::with_capacity(capacity),
+            dirty_count: 0,
         }
     }
-    
+
     pub fn get(&mut self, key: &K) -> Option<&V> {
-        if let Some(value) = self.items.get(key) {
-            // Move to end (most recently used)
-            self.access_order.retain(|k| k != key);
-            self.access_order.push(key.clone());
-            Some(value)
+        if self.items.contains_key(key) {
+            // Lazy LRU: append to back, mark dirty; compact periodically
+            self.access_order.push_back(key.clone());
+            self.dirty_count += 1;
+            if self.dirty_count >= LRU_COMPACT_THRESHOLD {
+                self.compact();
+            }
+            self.items.get(key)
         } else {
             None
         }
     }
-    
+
     pub fn put(&mut self, key: K, value: V) {
         if self.items.contains_key(&key) {
-            // Update existing
             self.items.insert(key.clone(), value);
-            self.access_order.retain(|k| k != &key);
-            self.access_order.push(key);
+            self.access_order.push_back(key);
+            self.dirty_count += 1;
         } else {
-            // Add new
-            if self.items.len() >= self.capacity {
-                // Remove least recently used
-                if let Some(lru_key) = self.access_order.first().cloned() {
-                    self.items.remove(&lru_key);
-                    self.access_order.remove(0);
+            // Evict LRU if at capacity
+            while self.items.len() >= self.capacity {
+                if let Some(lru_key) = self.access_order.pop_front() {
+                    // Only evict if this is the latest entry for this key
+                    if !self.access_order.contains(&lru_key) {
+                        self.items.remove(&lru_key);
+                    }
+                } else {
+                    break;
                 }
             }
-            
             self.items.insert(key.clone(), value);
-            self.access_order.push(key);
+            self.access_order.push_back(key);
+        }
+        if self.dirty_count >= LRU_COMPACT_THRESHOLD {
+            self.compact();
         }
     }
-    
+
+    /// Remove duplicate entries in access_order, keeping only the last occurrence
+    fn compact(&mut self) {
+        let mut seen = std::collections::HashSet::with_capacity(self.items.len());
+        let mut new_order = std::collections::VecDeque::with_capacity(self.items.len());
+        // Iterate from back to keep last (most recent) occurrence
+        for key in self.access_order.iter().rev() {
+            if seen.insert(key.clone()) {
+                new_order.push_front(key.clone());
+            }
+        }
+        self.access_order = new_order;
+        self.dirty_count = 0;
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -719,19 +746,10 @@ impl BlockchainActivationRegistry {
     
     /// Query activation state from blockchain
     async fn query_activation_state(&self, code_hash: &str) -> Result<bool, String> {
-        // PRODUCTION: Query QNet blockchain for activation record
-        // This would check if activation code hash exists in blockchain state
-        
-        // Access local blockchain state through consensus engine
-        // In real implementation: query state store for activation records
-        
-        // PRODUCTION: Query real blockchain state for activation code existence
-        // For now: Use deterministic check based on hash (will be replaced with real state query)
-        let hash_bytes = hex::decode(code_hash).map_err(|e| format!("Invalid hash: {}", e))?;
-        let exists = (hash_bytes[0] % 10) == 0; // 10% chance code already exists
-        
-        println!("🔗 Blockchain state query: activation {} exists: {}", code_hash, exists);
-        Ok(exists)
+        // TODO: [INTEGRATION] Connect to actual blockchain state query
+        // Conservative default: assume code does not exist yet
+        println!("[WARN][ACTIVATION] stub_blockchain_query fn=query_activation_state code_hash={} cross_node_dedup=disabled", code_hash);
+        Ok(false)
     }
     
     /// Get comprehensive performance statistics
@@ -802,16 +820,44 @@ impl BlockchainActivationRegistry {
         // Update local cache with code hash instead of plaintext code
         {
             let mut used_codes = self.used_codes.write().await;
+            // FIX H8: Evict oldest 10% when used_codes exceeds 500,000 entries
+            if used_codes.len() > 500_000 {
+                let evict_count = used_codes.len() / 10;
+                let keys_to_remove: Vec<String> = used_codes.iter().take(evict_count).cloned().collect();
+                for key in &keys_to_remove {
+                    used_codes.remove(key);
+                }
+                log::info!("[INFO][ACTIVATION] used_codes_eviction evicted={} remaining={}", evict_count, used_codes.len());
+            }
             used_codes.insert(code_hash.clone());
         }
 
         {
             let mut active_nodes = self.active_nodes.write().await;
+            // FIX R14-H7: Evict oldest 10% when active_nodes exceeds 500,000 entries
+            const MAX_ACTIVE_NODES: usize = 500_000;
+            if active_nodes.len() > MAX_ACTIVE_NODES {
+                let evict_count = active_nodes.len() / 10;
+                let keys_to_remove: Vec<String> = active_nodes.keys().take(evict_count).cloned().collect();
+                for key in &keys_to_remove {
+                    active_nodes.remove(key);
+                }
+                println!("[INFO][ACTIVATION] active_nodes_eviction evicted={} remaining={}", evict_count, active_nodes.len());
+            }
             active_nodes.insert(node_info.device_signature.clone(), node_info.clone());
         }
 
         {
             let mut activation_records = self.activation_records.write().await;
+            // FIX H8: Evict oldest 10% when activation_records exceeds 500,000 entries
+            if activation_records.len() > 500_000 {
+                let evict_count = activation_records.len() / 10;
+                let keys_to_remove: Vec<String> = activation_records.keys().take(evict_count).cloned().collect();
+                for key in &keys_to_remove {
+                    activation_records.remove(key);
+                }
+                log::info!("[INFO][ACTIVATION] activation_records_eviction evicted={} remaining={}", evict_count, activation_records.len());
+            }
             activation_records.insert(code_hash.clone(), record);
         }
 
@@ -1028,19 +1074,10 @@ impl BlockchainActivationRegistry {
     
     /// Direct consensus engine query for migration count
     async fn consensus_query_migration_count(&self, code_hash: &str, _since_timestamp: u64) -> Result<u32, String> {
-        // Query migration transactions from blockchain state
-        // This would use the node's own consensus engine to read blockchain
-        
-        // Access consensus engine to query migration transactions
-        // Filter by code_hash and timestamp
-        // Return count of migrations in last 24h
-        
-        // For now: Use deterministic consensus (will be replaced with real consensus engine)
-        let hash_bytes = hex::decode(code_hash).map_err(|e| format!("Invalid hash: {}", e))?;
-        let migration_count = (hash_bytes[0] % 2) as u32; // 0-1 migrations through consensus
-        
-        println!("🔗 Consensus engine query: {} migrations for hash {}", migration_count, code_hash);
-        Ok(migration_count)
+        // TODO: [INTEGRATION] Connect to actual consensus engine migration query
+        // Conservative default: assume 0 migrations
+        println!("[WARN][ACTIVATION] stub_consensus_query fn=consensus_query_migration_count code_hash={} migration_rate_limit=disabled", code_hash);
+        Ok(0)
     }
     
     /// P2P network consensus query for migration verification
@@ -1052,7 +1089,7 @@ impl BlockchainActivationRegistry {
         // For now: Simplified consensus simulation
         
         let consensus_result = 0; // No migrations found through P2P consensus
-        println!("🌐 P2P consensus query result: {} migrations", consensus_result);
+        println!("[WARN][ACTIVATION] stub_consensus_query fn=p2p_consensus_migration_query code_hash={} migration_rate_limit=disabled", _code_hash);
         Ok(consensus_result)
     }
     
@@ -1290,9 +1327,9 @@ impl BlockchainActivationRegistry {
             }
         }
         
-        // Try partial match (code might be prefix of activation_code)
-        if let Some(node_info) = active_nodes.values().find(|n| 
-            n.activation_code.contains(code) || code.contains(&n.activation_code)
+        // Exact match only — no partial/contains matching
+        if let Some(node_info) = active_nodes.values().find(|n|
+            n.activation_code == code
         ) {
             if !node_info.node_id.is_empty() {
                 return Some(node_info.node_id.clone());
@@ -1719,7 +1756,12 @@ impl BlockchainActivationRegistry {
                                                 1500
                                             });
                                         
-                                        let phase = activation_json["phase"].as_u64().unwrap_or(1) as u8;
+                                        let phase_val = activation_json["phase"].as_u64().unwrap_or(1);
+                                        if phase_val > 2 {
+                                            println!("[REJECT][ACTIVATION] invalid_phase value={}", phase_val);
+                                            return Err(format!("Invalid activation phase: {}", phase_val));
+                                        }
+                                        let phase = phase_val as u8;
                                         
                                         let record = ActivationRecord {
                                             code_hash: code_hash.clone(),
@@ -1933,8 +1975,9 @@ impl BlockchainActivationRegistry {
             timestamp: record.activated_at,
             dilithium_signature: None,   // Activation TX - no quantum sig
             dilithium_public_key: None,
+            chain_id: 0,
         };
-        
+
         // SECURITY v6.1: Sign NodeActivation TX with ephemeral Ed25519 so it can be
         // verified by receiving nodes via validate_and_add_network_transaction.
         // Without this, the TX is rejected by all P2P peers (no public_key → rejected).
@@ -2394,11 +2437,8 @@ impl BlockchainActivationRegistry {
             .and_then(|key| key.as_str());
         
         if let Some(signer_address) = transaction_data {
-            // Compare wallet addresses (allow partial match for compatibility)
-            let wallet_prefix = if wallet_address.len() >= 10 { &wallet_address[..10] } else { wallet_address };
-            let signer_prefix = if signer_address.len() >= 10 { &signer_address[..10] } else { signer_address };
-            
-            if !wallet_address.contains(signer_prefix) && !signer_address.contains(wallet_prefix) {
+            // Exact wallet address comparison
+            if wallet_address != signer_address {
                 println!("[VERIFY] Warning: Wallet address mismatch");
                 println!("[VERIFY]   Expected: {}", wallet_address);
                 println!("[VERIFY]   Found:    {}", signer_address);

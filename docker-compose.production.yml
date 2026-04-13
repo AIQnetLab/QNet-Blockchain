@@ -15,13 +15,13 @@ services:
     environment:
       - RUST_LOG=info,qnet=debug
       - QNET_TESTNET=1
-      - QNET_FREE_GENESIS_ACTIVATION=1
+      # QNET_FREE_GENESIS_ACTIVATION removed (R22 cleanup: dead env var, never read by Rust code)
       - QNET_ENABLE_MICROBLOCKS=1
       - QNET_DETAILED_LOGGING=1
       - QNET_IS_LEADER=1
       - QNET_MICROBLOCK_PRODUCER=1
       - QNET_PRODUCTION_ENABLED=1
-      - QNET_SKIP_BURN_CHECK=1
+      # QNET_SKIP_BURN_CHECK removed (R22 cleanup: dead env var, never read by Rust code)
       - QNET_NODE_TYPE=super
       - QNET_DATA_DIR=/app/data
       - QNET_BOOTSTRAP_ID=001
@@ -73,12 +73,12 @@ services:
     environment:
       - RUST_LOG=info,qnet=debug
       - QNET_TESTNET=1
-      - QNET_FREE_GENESIS_ACTIVATION=1
+      # QNET_FREE_GENESIS_ACTIVATION removed (R22 cleanup: dead env var, never read by Rust code)
       - QNET_ENABLE_MICROBLOCKS=1
       - QNET_DETAILED_LOGGING=1
       - QNET_FULL_SYNC=1
       - QNET_SYNC_ALL_MICROBLOCKS=1
-      - QNET_SKIP_BURN_CHECK=1
+      # QNET_SKIP_BURN_CHECK removed (R22 cleanup: dead env var, never read by Rust code)
       - QNET_NODE_TYPE=full
       - QNET_DATA_DIR=/app/data
       - QNET_P2P_PORT=9877
@@ -126,12 +126,12 @@ services:
     environment:
       - RUST_LOG=info,qnet=debug
       - QNET_TESTNET=1
-      - QNET_FREE_GENESIS_ACTIVATION=1
+      # QNET_FREE_GENESIS_ACTIVATION removed (R22 cleanup: dead env var, never read by Rust code)
       - QNET_ENABLE_MICROBLOCKS=1
       - QNET_DETAILED_LOGGING=1
       - QNET_FULL_SYNC=1
       - QNET_SYNC_ALL_MICROBLOCKS=1
-      - QNET_SKIP_BURN_CHECK=1
+      # QNET_SKIP_BURN_CHECK removed (R22 cleanup: dead env var, never read by Rust code)
       - QNET_NODE_TYPE=full
       - QNET_DATA_DIR=/app/data
       - QNET_P2P_PORT=9878
@@ -163,6 +163,34 @@ services:
       timeout: 10s
       retries: 3
       start_period: 120s
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # FIX R22-C7: TLS Reverse Proxy — terminates HTTPS for all API endpoints
+  # Without this, API traffic (including registration with activation codes)
+  # was transmitted in plain HTTP on testnet production.
+  # Architecture: nginx terminates TLS → proxies to internal HTTP nodes
+  # ═══════════════════════════════════════════════════════════════════════════════
+  nginx-tls:
+    image: nginx:alpine
+    container_name: qnet-nginx-tls
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./infrastructure/nginx/production.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./infrastructure/nginx/ssl:/etc/nginx/ssl:ro
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+    depends_on:
+      - qnet-genesis
+      - qnet-validator1
+      - qnet-validator2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   # Monitoring Stack
   prometheus:
